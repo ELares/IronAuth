@@ -60,6 +60,21 @@
           "type": "string"
         },
         {
+          "const": "recovery_start",
+          "description": "The recovery identifier entry (the recovery start state).",
+          "type": "string"
+        },
+        {
+          "const": "recovery_ack",
+          "description": "The uniform recovery acknowledgment plus one-time-code entry: the #64 anti-enumeration\nrender (identical for a known and an unknown identifier) that ALSO carries the code\ninput, so an existing and an unknown identifier are indistinguishable while a genuine\nrecovery can still complete. The flow stays OPEN until a correct code mints the session.",
+          "type": "string"
+        },
+        {
+          "const": "federation_start",
+          "description": "The federated login launcher: the federation node group whose submission produces the\nredirect to the EXISTING outbound federation authorize leg.",
+          "type": "string"
+        },
+        {
           "const": "completed",
           "description": "The flow completed and a session was minted.",
           "type": "string"
@@ -127,6 +142,11 @@
         {
           "const": "recovery",
           "description": "Account recovery.",
+          "type": "string"
+        },
+        {
+          "const": "federation",
+          "description": "A federated (OIDC upstream) login launcher.",
           "type": "string"
         }
       ]

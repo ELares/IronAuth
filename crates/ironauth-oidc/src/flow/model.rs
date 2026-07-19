@@ -40,6 +40,8 @@ pub enum Journey {
     Mfa,
     /// Account recovery.
     Recovery,
+    /// A federated (OIDC upstream) login launcher.
+    Federation,
 }
 
 impl Journey {
@@ -51,6 +53,7 @@ impl Journey {
             Journey::Registration => "registration",
             Journey::Mfa => "mfa",
             Journey::Recovery => "recovery",
+            Journey::Federation => "federation",
         }
     }
 
@@ -62,6 +65,7 @@ impl Journey {
             "registration" => Some(Journey::Registration),
             "mfa" => Some(Journey::Mfa),
             "recovery" => Some(Journey::Recovery),
+            "federation" => Some(Journey::Federation),
             _ => None,
         }
     }
@@ -108,6 +112,16 @@ pub enum FlowStateTag {
     MfaChallenge,
     /// A second factor enrollment is required.
     MfaEnroll,
+    /// The recovery identifier entry (the recovery start state).
+    RecoveryStart,
+    /// The uniform recovery acknowledgment plus one-time-code entry: the #64 anti-enumeration
+    /// render (identical for a known and an unknown identifier) that ALSO carries the code
+    /// input, so an existing and an unknown identifier are indistinguishable while a genuine
+    /// recovery can still complete. The flow stays OPEN until a correct code mints the session.
+    RecoveryAck,
+    /// The federated login launcher: the federation node group whose submission produces the
+    /// redirect to the EXISTING outbound federation authorize leg.
+    FederationStart,
     /// The flow completed and a session was minted.
     Completed,
 }

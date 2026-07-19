@@ -172,12 +172,34 @@ pub const MFA_ENROLL_TITLE: MessageId = MessageId(1_030_004);
 /// The MFA enrollment instructions (scan the code, then enter a code to confirm).
 pub const MFA_ENROLL_INSTRUCTIONS: MessageId = MessageId(1_030_005);
 
+/// The recovery page title.
+pub const RECOVERY_TITLE: MessageId = MessageId(1_040_001);
+/// The recovery identifier field label.
+pub const RECOVERY_IDENTIFIER_LABEL: MessageId = MessageId(1_040_002);
+/// The recovery request submit button label.
+pub const RECOVERY_SUBMIT_LABEL: MessageId = MessageId(1_040_003);
+/// The UNIFORM recovery acknowledgment (the #64 anti enumeration ack): the SAME copy for a
+/// known and an unknown identifier, so it never discloses whether the account exists.
+pub const RECOVERY_ACK: MessageId = MessageId(1_040_004);
+/// The recovery one time code field label.
+pub const RECOVERY_CODE_LABEL: MessageId = MessageId(1_040_005);
+/// The recovery code submit button label.
+pub const RECOVERY_VERIFY_LABEL: MessageId = MessageId(1_040_006);
+
+/// The federated login launcher title.
+pub const FEDERATION_TITLE: MessageId = MessageId(1_060_001);
+/// The "continue with {provider}" affordance label. The provider slug rides the structured
+/// context, never the copy string, so i18n keys on the id and the context.
+pub const FEDERATION_CONTINUE_LABEL: MessageId = MessageId(1_060_002);
+
 /// The login success note.
 pub const LOGIN_SUCCESS: MessageId = MessageId(1_500_001);
 /// The registration success note (a new account was created and signed in).
 pub const REGISTER_SUCCESS: MessageId = MessageId(1_520_001);
 /// The MFA success note (a second factor was proven).
 pub const MFA_SUCCESS: MessageId = MessageId(1_530_001);
+/// The recovery success note (access was recovered and the session established).
+pub const RECOVERY_SUCCESS: MessageId = MessageId(1_540_001);
 
 /// The flow has expired.
 pub const FLOW_EXPIRED: MessageId = MessageId(4_000_001);
@@ -225,6 +247,18 @@ pub const MFA_CODE_INCORRECT: MessageId = MessageId(4_300_001);
 pub const MFA_CODE_REQUIRED: MessageId = MessageId(4_300_002);
 /// Too many second factor attempts (the #64/#72 second factor path throttle).
 pub const MFA_THROTTLED: MessageId = MessageId(4_300_003);
+
+/// The recovery identifier field is required (a per node validation error). Existence
+/// INDEPENDENT (an empty field does not depend on whether the identifier exists), so it is
+/// never an enumeration oracle.
+pub const RECOVERY_IDENTIFIER_REQUIRED: MessageId = MessageId(4_400_001);
+/// The recovery code field is required (a per node validation error).
+pub const RECOVERY_CODE_REQUIRED: MessageId = MessageId(4_400_002);
+/// The UNIFORM recovery code failure: the code was incorrect or expired. The SAME id whether
+/// the identifier was known with a wrong code, or unknown entirely (never an oracle).
+pub const RECOVERY_CODE_INCORRECT: MessageId = MessageId(4_400_003);
+/// Too many recovery attempts (the #64 recovery path throttle). Existence independent.
+pub const RECOVERY_THROTTLED: MessageId = MessageId(4_400_004);
 
 /// The complete message registry (issue #84): the single source of truth the runtime and
 /// the committed `docs/flow-messages.json` snapshot both read. Ordered by ascending id so
@@ -338,6 +372,63 @@ pub const REGISTRY: &[MessageSpec] = &[
         context_keys: &[],
     },
     MessageSpec {
+        id: RECOVERY_TITLE,
+        name: "recovery.title",
+        kind: MessageKind::Info,
+        text: "Recover your account",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: RECOVERY_IDENTIFIER_LABEL,
+        name: "recovery.identifier.label",
+        kind: MessageKind::Info,
+        text: "Identifier",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: RECOVERY_SUBMIT_LABEL,
+        name: "recovery.submit.label",
+        kind: MessageKind::Info,
+        text: "Send a recovery code",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: RECOVERY_ACK,
+        name: "recovery.ack",
+        kind: MessageKind::Info,
+        text: "If an account exists for that identifier, we have sent a recovery code. Enter \
+               it below to continue.",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: RECOVERY_CODE_LABEL,
+        name: "recovery.code.label",
+        kind: MessageKind::Info,
+        text: "Recovery code",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: RECOVERY_VERIFY_LABEL,
+        name: "recovery.verify.label",
+        kind: MessageKind::Info,
+        text: "Verify and sign in",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: FEDERATION_TITLE,
+        name: "federation.title",
+        kind: MessageKind::Info,
+        text: "Continue with a provider",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: FEDERATION_CONTINUE_LABEL,
+        name: "federation.continue.label",
+        kind: MessageKind::Info,
+        text: "Continue with your identity provider",
+        context_keys: &["provider"],
+    },
+    MessageSpec {
         id: LOGIN_SUCCESS,
         name: "login.success",
         kind: MessageKind::Success,
@@ -356,6 +447,13 @@ pub const REGISTRY: &[MessageSpec] = &[
         name: "mfa.success",
         kind: MessageKind::Success,
         text: "Your identity has been verified.",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: RECOVERY_SUCCESS,
+        name: "recovery.success",
+        kind: MessageKind::Success,
+        text: "You are signed in.",
         context_keys: &[],
     },
     MessageSpec {
@@ -480,6 +578,34 @@ pub const REGISTRY: &[MessageSpec] = &[
     MessageSpec {
         id: MFA_THROTTLED,
         name: "mfa.throttled",
+        kind: MessageKind::Error,
+        text: "Too many attempts. Wait a moment and try again.",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: RECOVERY_IDENTIFIER_REQUIRED,
+        name: "recovery.identifier_required",
+        kind: MessageKind::Error,
+        text: "Enter your identifier.",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: RECOVERY_CODE_REQUIRED,
+        name: "recovery.code_required",
+        kind: MessageKind::Error,
+        text: "Enter the recovery code.",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: RECOVERY_CODE_INCORRECT,
+        name: "recovery.code_incorrect",
+        kind: MessageKind::Error,
+        text: "Incorrect or expired code.",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: RECOVERY_THROTTLED,
+        name: "recovery.throttled",
         kind: MessageKind::Error,
         text: "Too many attempts. Wait a moment and try again.",
         context_keys: &[],

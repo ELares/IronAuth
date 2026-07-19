@@ -33,8 +33,10 @@ pub mod message;
 pub mod model;
 pub mod schema;
 
+mod federation;
 mod login;
 mod mfa;
+mod recovery;
 mod registration;
 mod transport;
 
@@ -163,6 +165,16 @@ pub enum Continuation {
         /// The `/authorize` resume target, or [`None`].
         return_to: Option<String>,
     },
+    /// The flow hands off to an EXTERNAL browser leg (issue #84, the federation launcher): the
+    /// client is redirected to `url` (the existing outbound federation authorize route). This
+    /// is NOT a completion (no session is minted here and the flow is NOT consumed); the
+    /// existing federation callback finalizes the login through its own cookie/redirect path.
+    /// The browser transport issues a 303 to `url`; the API transport returns it as a
+    /// `continue_with.redirect_to` affordance the native client opens in a browser.
+    Redirect {
+        /// The URL to redirect to (a same origin path to the existing federation authorize leg).
+        url: String,
+    },
 }
 
 /// The serialized state machine position stored in the `flows.state` column (issue #84).
@@ -187,16 +199,27 @@ struct PersistedState {
     /// The pending `tot_` credential id being enrolled during the MFA enroll state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     enroll_credential: Option<String>,
+    /// The recovery identifier (stored server side at the recovery initiation so the verify
+    /// step checks the one time code against it WITHOUT echoing it back to the client, keeping
+    /// the anti enumeration render clean). Never a secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    identifier: Option<String>,
+    /// The federation connector slug the launcher redirects to (the "continue with {provider}"
+    /// choice), stored so the redirect target is server side, never a client controllable field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    connector: Option<String>,
 }
 
 impl PersistedState {
-    /// A single step state (the login/registration start and render states).
+    /// A single step state (the login/registration/recovery start and render states).
     fn step(step: FlowStateTag) -> Self {
         Self {
             step,
             subject: None,
             methods: Vec::new(),
             enroll_credential: None,
+            identifier: None,
+            connector: None,
         }
     }
 }
@@ -298,25 +321,41 @@ fn build_flow(
     }
 }
 
-/// The start state (step + nodes) for a journey (issue #84). The login and registration
-/// journeys each seed their own first factor state; the MFA states are never a creation
-/// entry (they are reached FROM the login journey after the primary factor), so a `Mfa` or
-/// `Recovery` creation is rejected by the caller.
+/// The start state (persisted position + nodes) for a journey (issue #84). The login,
+/// registration, and recovery journeys each seed their own first state; the federation launcher
+/// seeds its connector on the persisted state (server side, never a client field). The MFA
+/// states are never a creation entry (they are reached FROM the login journey after the primary
+/// factor), so a `Mfa` creation is rejected by the caller. A federation creation without a
+/// connector slug is also rejected.
 fn start_state(
     journey: Journey,
     transport: Transport,
     flow_id: &str,
-) -> Option<(FlowStateTag, Vec<Node>)> {
+    connector: Option<&str>,
+) -> Option<(PersistedState, Vec<Node>)> {
     match journey {
         Journey::Login => Some((
-            FlowStateTag::IdentifierPassword,
+            PersistedState::step(FlowStateTag::IdentifierPassword),
             login::start_nodes(transport, flow_id),
         )),
         Journey::Registration => Some((
-            FlowStateTag::RegistrationDetails,
+            PersistedState::step(FlowStateTag::RegistrationDetails),
             registration::start_nodes(transport, flow_id),
         )),
-        Journey::Mfa | Journey::Recovery => None,
+        Journey::Recovery => Some((
+            PersistedState::step(recovery::start_state_tag()),
+            recovery::start_nodes(transport, flow_id),
+        )),
+        Journey::Federation => {
+            let connector = connector?;
+            let mut persisted = PersistedState::step(FlowStateTag::FederationStart);
+            persisted.connector = Some(connector.to_owned());
+            Some((
+                persisted,
+                federation::start_nodes(transport, flow_id, connector),
+            ))
+        }
+        Journey::Mfa => None,
     }
 }
 
@@ -339,11 +378,35 @@ pub async fn create_flow(
     journey: Journey,
     return_to: Option<&str>,
     transient_payload: Option<&serde_json::Value>,
+    connector: Option<&str>,
 ) -> Result<(FlowId, String, Flow), FlowError> {
+    // The federation launcher REQUIRES a resume target: the whole point is to resume a pending
+    // local `/authorize` after the federated login, and the existing authorize leg refuses an
+    // absent one. Reject at creation with a typed error rather than mint a dead flow.
+    if journey == Journey::Federation && return_to.is_none() {
+        return Err(FlowError::InvalidSubmission);
+    }
+    // Open redirect fix (issue #84, inherited from PR 1): a PRESENT `return_to` is validated
+    // at creation the SAME way the bootstrap `/login` and `/recover` validate theirs, via
+    // [`interaction::parse_resume`]. It must be a LOCAL `/authorize?...` resume target whose
+    // client id resolves into THIS flow's scope; an absolute or scheme relative external URL,
+    // a non `/authorize` local path, or a cross scope target is rejected here with a typed
+    // 400 (never stored). Because the check is at creation, EVERY completion (the browser 303
+    // and the API `continue_with.redirect_to`, across the login, registration, and recovery
+    // journeys) can only ever target a validated local resume. An ABSENT `return_to` is left
+    // as is: those journeys complete on the default landing (a hardened success notice), never
+    // a redirect, so there is nothing to validate.
+    if let Some(raw) = return_to {
+        match interaction::parse_resume(Some(raw)) {
+            Some(resume) if resume.scope == scope => {}
+            _ => return Err(FlowError::InvalidSubmission),
+        }
+    }
     let transient = normalize_transient_payload(transient_payload)?;
     let flow_id = FlowId::generate(state.env(), &scope);
-    let (start_step, nodes) =
-        start_state(journey, transport, &flow_id.to_string()).ok_or(FlowError::NotFound)?;
+    let (persisted, nodes) = start_state(journey, transport, &flow_id.to_string(), connector)
+        .ok_or(FlowError::NotFound)?;
+    let start_step = persisted.step;
     let submit_token = generate_submit_token(state);
     let now = state.now();
     let expires_at_micros = epoch_micros(
@@ -351,7 +414,6 @@ pub async fn create_flow(
             .unwrap_or(now),
     );
 
-    let persisted = PersistedState::step(start_step);
     let state_json = serde_json::to_string(&persisted).map_err(|_| FlowError::Store)?;
 
     state
@@ -489,9 +551,24 @@ pub async fn drive(
             )
             .await
         }
-        // The MFA states are reached FROM a login flow, never a creation entry; a standalone
-        // MFA or recovery journey lands in a later PR. Typed not found, never a 500.
-        Journey::Mfa | Journey::Recovery => Err(FlowError::NotFound),
+        Journey::Recovery => {
+            drive_recovery(
+                state,
+                scope,
+                flow_id,
+                transport,
+                &record,
+                &persisted,
+                &submission,
+                headers,
+                now_micros,
+            )
+            .await
+        }
+        Journey::Federation => drive_federation(scope, &record, &persisted),
+        // The MFA states are reached FROM a login flow, never a creation entry. Typed not
+        // found, never a 500.
+        Journey::Mfa => Err(FlowError::NotFound),
     }
 }
 
@@ -665,9 +742,13 @@ async fn drive_login(
             )
             .await
         }
-        // A login row on a registration/completed/ack state is corrupt; a uniform not found.
+        // A login row on a registration/recovery/federation/completed/ack state is corrupt; a
+        // uniform not found.
         FlowStateTag::RegistrationDetails
         | FlowStateTag::RegistrationAck
+        | FlowStateTag::RecoveryStart
+        | FlowStateTag::RecoveryAck
+        | FlowStateTag::FederationStart
         | FlowStateTag::Completed => Err(FlowError::NotFound),
     }
 }
@@ -678,7 +759,7 @@ async fn drive_login(
 /// challenge or enrollment is required, transition to that state WITHOUT minting a session or
 /// consuming the flow (the single mint happens once, at the MFA completion, with the honest
 /// combined amr).
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn complete_primary_or_step_up(
     state: &OidcState,
     scope: Scope,
@@ -754,6 +835,8 @@ async fn complete_primary_or_step_up(
                 subject: Some(success.subject.clone()),
                 methods: method_tokens(&primary_methods),
                 enroll_credential: None,
+                identifier: None,
+                connector: None,
             };
             let nodes = mfa::challenge_start_nodes(transport, &record.id);
             persist_and_render(
@@ -778,6 +861,8 @@ async fn complete_primary_or_step_up(
                 subject: Some(success.subject.clone()),
                 methods: method_tokens(&primary_methods),
                 enroll_credential: Some(begin.credential_id.clone()),
+                identifier: None,
+                connector: None,
             };
             let nodes = mfa::enroll_nodes(transport, &record.id, &begin, false);
             persist_and_render(
@@ -1061,4 +1146,146 @@ async fn drive_registration(
             .await
         }
     }
+}
+
+/// Drive the recovery journey one step (issue #84): the identifier initiation funnels through
+/// [`recovery::advance_start`] (the #64 anti enumeration mirror of the bootstrap `/recover`,
+/// creating the #81 case and delivering the one time code uniformly); the code verification
+/// funnels through [`recovery::advance_verify`] (the EXISTING `email_otp::verify_email_code`
+/// core), and a genuine verification consumes the flow and mints the honest email factor
+/// session. The uniform acknowledgment and every non completing outcome leave the flow OPEN, so
+/// recovery is never a completion or enumeration oracle. The #81 `hold_until` delay and
+/// downgrade invariant are UNCHANGED and live downstream at factor removal (see [`recovery`]).
+#[allow(clippy::too_many_arguments)]
+async fn drive_recovery(
+    state: &OidcState,
+    scope: Scope,
+    flow_id: &FlowId,
+    transport: Transport,
+    record: &FlowRecord,
+    persisted: &PersistedState,
+    submission: &Submission,
+    headers: &axum::http::HeaderMap,
+    now_micros: i64,
+) -> Result<Continuation, FlowError> {
+    match persisted.step {
+        FlowStateTag::RecoveryStart => {
+            match recovery::advance_start(state, scope, record, submission, headers).await? {
+                recovery::RecoveryStartStep::Render { nodes } => {
+                    persist_and_render(
+                        state,
+                        scope,
+                        flow_id,
+                        transport,
+                        Journey::Recovery,
+                        record,
+                        &PersistedState::step(recovery::start_state_tag()),
+                        nodes,
+                        Vec::new(),
+                        now_micros,
+                    )
+                    .await
+                }
+                recovery::RecoveryStartStep::Ack { identifier } => {
+                    // Transition to the uniform ack plus code entry, storing the identifier
+                    // server side so the verify step checks the code against it (never echoed).
+                    let mut next = PersistedState::step(FlowStateTag::RecoveryAck);
+                    next.identifier = Some(identifier);
+                    persist_and_render(
+                        state,
+                        scope,
+                        flow_id,
+                        transport,
+                        Journey::Recovery,
+                        record,
+                        &next,
+                        recovery::ack_nodes(transport, &record.id, false),
+                        vec![Message::of(message::RECOVERY_ACK)],
+                        now_micros,
+                    )
+                    .await
+                }
+            }
+        }
+        FlowStateTag::RecoveryAck => {
+            let identifier = persisted.identifier.as_deref().ok_or(FlowError::NotFound)?;
+            match recovery::advance_verify(state, scope, record, identifier, submission, headers)
+                .await?
+            {
+                recovery::RecoveryVerifyStep::Render { nodes, messages } => {
+                    persist_and_render(
+                        state,
+                        scope,
+                        flow_id,
+                        transport,
+                        Journey::Recovery,
+                        record,
+                        persisted,
+                        nodes,
+                        messages,
+                        now_micros,
+                    )
+                    .await
+                }
+                recovery::RecoveryVerifyStep::Complete(success) => {
+                    let fenced = recovery::ack_nodes(transport, &record.id, false);
+                    let continuation = consume_and_complete(
+                        state,
+                        scope,
+                        flow_id,
+                        transport,
+                        Journey::Recovery,
+                        record,
+                        &success.subject,
+                        success.actor,
+                        &success.event,
+                        fenced,
+                        headers,
+                        now_micros,
+                    )
+                    .await?;
+                    // Relax the recovery path counters on a genuine mint (best effort), exactly
+                    // as the hosted `/otp/verify` does through `establish_and_respond`.
+                    if matches!(continuation, Continuation::Complete { .. }) {
+                        state.reset_after_success(&success.ctx).await;
+                    }
+                    Ok(continuation)
+                }
+            }
+        }
+        // A recovery row on a non recovery state is corrupt; a uniform not found.
+        FlowStateTag::IdentifierPassword
+        | FlowStateTag::RegistrationDetails
+        | FlowStateTag::RegistrationAck
+        | FlowStateTag::MfaChallenge
+        | FlowStateTag::MfaEnroll
+        | FlowStateTag::FederationStart
+        | FlowStateTag::Completed => Err(FlowError::NotFound),
+    }
+}
+
+/// Drive the federation launcher (issue #84): produce the [`Continuation::Redirect`] to the
+/// EXISTING outbound federation authorize leg, threading the flow's `return_to`. The flow is
+/// NOT consumed (a redirect is not a completion; the existing `federation_callback` finalizes
+/// the login through its own honest [`AuthMethod::Federated`](crate::authn::AuthMethod) session,
+/// the #78 link decision, and the #77 overlay), and NO federation security is reimplemented
+/// here. A federation row on a non launcher state, or one missing its connector, is a uniform
+/// not found.
+fn drive_federation(
+    scope: Scope,
+    record: &FlowRecord,
+    persisted: &PersistedState,
+) -> Result<Continuation, FlowError> {
+    if persisted.step != FlowStateTag::FederationStart {
+        return Err(FlowError::NotFound);
+    }
+    let connector = persisted.connector.as_deref().ok_or(FlowError::NotFound)?;
+    // The launcher requires a resume target (enforced at creation); an absent one is a corrupt
+    // row, a typed error rather than a dead redirect.
+    let return_to = record
+        .return_to
+        .as_deref()
+        .ok_or(FlowError::InvalidSubmission)?;
+    let url = federation::authorize_url(scope, connector, return_to);
+    Ok(Continuation::Redirect { url })
 }
