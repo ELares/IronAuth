@@ -199,6 +199,25 @@ pub async fn send(
         return response;
     }
 
+    // Issue (or anti-enumeration-suppress) the code through the shared core, then the uniform
+    // acknowledgment. The core is the ONE place the issue/suppress sequence lives, so the
+    // headless recovery flow (issue #84) reuses it rather than re-deriving the send.
+    issue_email_code(&state, scope, purpose, identifier).await;
+    ack()
+}
+
+/// Issue and deliver (or anti-enumeration-SUPPRESS) an email-OTP code for `identifier` on
+/// `purpose` (issue #68 core, extracted for issue #84 reuse). A known recipient gets a fresh
+/// single-active code delivered; an unknown recipient burns the SAME single Argon2 spend
+/// (`verify_absent`, so the response time cannot distinguish a real from an unknown recipient)
+/// and the send is suppressed. Side-effect only; the caller owns the throttle and the uniform
+/// acknowledgment, so the send stays anti-enumeration-uniform on every surface that drives it.
+pub(crate) async fn issue_email_code(
+    state: &OidcState,
+    scope: ironauth_store::Scope,
+    purpose: EmailFactorPurpose,
+    identifier: &str,
+) {
     // Resolve the recipient ONLY to decide whether the send is permitted; the lookup runs
     // for both present and absent identifiers, so the ack is uniform.
     let user = state
@@ -212,10 +231,13 @@ pub async fn send(
 
     if let Some(user) = user {
         let digits = state.email_otp_code_digits();
-        let code = generate_numeric_code(&state, digits);
+        let code = generate_numeric_code(state, digits);
         let code_hash = match state.hash_password(&scope, &code).await {
             Ok(hash) => hash,
-            Err(rejection) => return rejection.to_response(),
+            // A pool rejection means no code was stored: for anti-enumeration this stays the
+            // SAME uniform (no delivery) outcome a suppressed send produces, never a
+            // distinguishable difference.
+            Err(_rejection) => return,
         };
         let ttl = state.email_otp_code_ttl();
         let now = epoch_micros(state.now());
@@ -242,12 +264,12 @@ pub async fn send(
             .issue(state.env(), spec, now)
             .await;
         if issued.is_err() {
-            // A failed issue means no code was stored: for anti-enumeration return the
-            // SAME uniform ack a suppressed send returns, never a status difference that
-            // would distinguish a present from an absent recipient. Recorded on the
-            // observability plane only.
+            // A failed issue means no code was stored: for anti-enumeration this is the SAME
+            // uniform (no delivery) outcome a suppressed send returns, never a status
+            // difference that would distinguish a present from an absent recipient. Recorded
+            // on the observability plane only.
             tracing::error!(target: "ironauth.verification", "email OTP issue failed");
-            return ack();
+            return;
         }
         let message = EmailOtpMessage {
             scope,
@@ -276,7 +298,6 @@ pub async fn send(
         };
         state.deliver_email_otp(&message, false);
     }
-    ack()
 }
 
 /// `POST /t/{tenant}/e/{environment}/otp/verify`: verify a numeric email-OTP code and, on
@@ -310,21 +331,78 @@ pub async fn verify(
         return invalid_code();
     }
 
+    // The resolve / constant-time-compare / attempt-count / consume sequence runs through the
+    // shared core, then the session mint. The core is the ONE place the email-factor verify
+    // security lives, so the headless recovery flow (issue #84) reuses it identically; only
+    // the mint differs (this handler responds directly, the flow trips its completion latch).
+    match verify_email_code(&state, scope, purpose, identifier, code, &headers).await {
+        EmailCodeOutcome::Verified { subject, ctx } => {
+            establish_and_respond(&state, scope, &subject, &ctx, &headers).await
+        }
+        EmailCodeOutcome::Invalid => invalid_code(),
+        EmailCodeOutcome::Throttled(snapshot) => {
+            let mut response = json_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                json!({ "error": "too_many_requests" }),
+            );
+            crate::abuse::stamp_rate_limit_headers(&mut response, &snapshot);
+            response
+        }
+        EmailCodeOutcome::Rejected(rejection) => rejection.to_response(),
+        EmailCodeOutcome::ServerError => server_error(),
+    }
+}
+
+/// The typed outcome of verifying an email-OTP code WITHOUT establishing a session (issue
+/// #84): the shared core the HTTP `verify` handler and the headless recovery flow both drive,
+/// so the two can never diverge. The caller owns the session mint (`establish_and_respond` for
+/// the handler; the flow engine's single-use completion latch plus `establish_session` for the
+/// flow), so a correct code is a genuine completing outcome exactly once.
+pub(crate) enum EmailCodeOutcome {
+    /// The code matched and was consumed single-use. `subject` is the verified account and
+    /// `ctx` the abuse context to relax on the successful mint.
+    Verified {
+        /// The verified account.
+        subject: UserId,
+        /// The abuse attempt context to relax after a successful mint.
+        ctx: crate::abuse::AttemptContext,
+    },
+    /// A wrong, expired, absent, or already-consumed code: the UNIFORM invalid result, never
+    /// an existence or state oracle.
+    Invalid,
+    /// The verify path is throttled (the #64 per-recipient / per-IP brute-force bound).
+    Throttled(ironauth_quota::RateLimitSnapshot),
+    /// The admission-controlled hashing pool refused the verify (saturated or disabled).
+    Rejected(crate::hashing_pool::HashRejection),
+    /// A genuine store fault.
+    ServerError,
+}
+
+/// Verify an email-OTP `code` for `identifier` on `purpose` against the single active code,
+/// consuming it single-use on a match (issue #68 core, extracted for issue #84 reuse). This is
+/// the ONE place the throttle / resolve / constant-time-compare / attempt-count / consume
+/// sequence lives; both the HTTP `verify` handler and the headless recovery flow call it, so
+/// neither re-derives the email-factor security. It performs the SAME anti-timing dummy spend
+/// on an absent recipient or an absent code, and does NOT establish a session (the caller owns
+/// the mint).
+pub(crate) async fn verify_email_code(
+    state: &OidcState,
+    scope: ironauth_store::Scope,
+    purpose: EmailFactorPurpose,
+    identifier: &str,
+    code: &str,
+    headers: &HeaderMap,
+) -> EmailCodeOutcome {
     // Throttle the VERIFY on the flow's path, keyed on the recipient and the peer IP, so a
-    // brute force escalates to a uniform 429 (issue #64).
-    let ctx = attempt_context(scope, purpose, identifier, &headers);
+    // brute force escalates to a uniform failure (issue #64).
+    let ctx = attempt_context(scope, purpose, identifier, headers);
     if let crate::abuse::RegulationOutcome::Throttled(snapshot) = state.regulate_before(&ctx).await
     {
-        let mut response = json_response(
-            StatusCode::TOO_MANY_REQUESTS,
-            json!({ "error": "too_many_requests" }),
-        );
-        crate::abuse::stamp_rate_limit_headers(&mut response, &snapshot);
-        return response;
+        return EmailCodeOutcome::Throttled(snapshot);
     }
 
     // Resolve the recipient. A missing account or missing active code both spend a full
-    // dummy verify (so the timing is uniform) and return the SAME invalid-code result.
+    // dummy verify (so the timing is uniform) and return the SAME invalid result.
     let user = state
         .store()
         .scoped(scope)
@@ -335,7 +413,7 @@ pub async fn verify(
         .flatten();
     let Some(user) = user else {
         let _ = state.verify_absent(&scope, code).await;
-        return invalid_code();
+        return EmailCodeOutcome::Invalid;
     };
     let active = match state
         .store()
@@ -347,14 +425,14 @@ pub async fn verify(
         Ok(Some(active)) => active,
         Ok(None) => {
             let _ = state.verify_absent(&scope, code).await;
-            return invalid_code();
+            return EmailCodeOutcome::Invalid;
         }
-        Err(_) => return server_error(),
+        Err(_) => return EmailCodeOutcome::ServerError,
     };
 
     let matched = match state.verify_password(&scope, code, &active.code_hash).await {
         Ok(matched) => matched,
-        Err(rejection) => return rejection.to_response(),
+        Err(rejection) => return EmailCodeOutcome::Rejected(rejection),
     };
     if !matched {
         // Record the wrong guess; the code dies once the attempt budget is spent.
@@ -368,10 +446,10 @@ pub async fn verify(
             .email_otp_codes()
             .record_wrong_guess(&active.id, epoch_micros(state.now()))
             .await;
-        return invalid_code();
+        return EmailCodeOutcome::Invalid;
     }
 
-    // Correct code: consume it single-use, then establish the session.
+    // Correct code: consume it single-use. The caller mints the session.
     let consumed = state
         .store()
         .scoped(scope)
@@ -383,13 +461,14 @@ pub async fn verify(
         .consume(state.env(), &active.id, epoch_micros(state.now()))
         .await;
     match consumed {
-        Ok(true) => {}
-        // A race already consumed it: the uniform invalid-code result.
-        Ok(false) => return invalid_code(),
-        Err(_) => return server_error(),
+        Ok(true) => EmailCodeOutcome::Verified {
+            subject: user.id,
+            ctx,
+        },
+        // A race already consumed it: the uniform invalid result.
+        Ok(false) => EmailCodeOutcome::Invalid,
+        Err(_) => EmailCodeOutcome::ServerError,
     }
-
-    establish_and_respond(&state, scope, &user.id, &ctx, &headers).await
 }
 
 /// Establish a session for a verified email-factor login and return a JSON result that

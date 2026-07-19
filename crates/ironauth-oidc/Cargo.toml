@@ -813,5 +813,10 @@ name = "flow_register_mfa"
 path = "tests/flow_register_mfa.rs"
 required-features = ["testing"]
 
+[[test]]
+name = "flow_recovery_federation"
+path = "tests/flow_recovery_federation.rs"
+required-features = ["testing"]
+
 [lints]
 workspace = true

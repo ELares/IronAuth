@@ -100,6 +100,10 @@ pub struct ApiCreateBody {
     /// Arbitrary client context carried through the flow (never persisted on the identity).
     #[serde(default)]
     transient_payload: Option<Value>,
+    /// The federation connector slug to launch (the "continue with {provider}" choice), for a
+    /// federation flow. Ignored by the other journeys.
+    #[serde(default)]
+    connector: Option<String>,
 }
 
 /// The API submit request body: the flow id, the submit token, the node values, and the
@@ -124,6 +128,10 @@ pub struct BrowserCreateQuery {
     /// The resume target to complete back to, or absent.
     #[serde(default)]
     return_to: Option<String>,
+    /// The federation connector slug to launch, for a federation flow. Ignored by the other
+    /// journeys.
+    #[serde(default)]
+    connector: Option<String>,
 }
 
 /// The browser POST form: the flow id (a hidden field), the node values, and the optional
@@ -188,6 +196,7 @@ pub async fn flow_api_create(
         journey,
         body.return_to.as_deref(),
         body.transient_payload.as_ref(),
+        body.connector.as_deref(),
     )
     .await
     {
@@ -196,12 +205,18 @@ pub async fn flow_api_create(
     }
 }
 
-/// Parse a creation journey (issue #84): [`Journey::Login`] or [`Journey::Registration`],
-/// or [`None`] for an unknown journey or one that is not a creation entry (the MFA states
-/// are reached from a login flow; recovery lands in a later PR).
+/// Parse a creation journey (issue #84): [`Journey::Login`], [`Journey::Registration`],
+/// [`Journey::Recovery`], or [`Journey::Federation`], or [`None`] for an unknown journey or one
+/// that is not a creation entry (the MFA states are reached from a login flow, never created
+/// directly).
 fn creation_journey(raw: &str) -> Option<Journey> {
     match Journey::parse(raw) {
-        Some(journey @ (Journey::Login | Journey::Registration)) => Some(journey),
+        Some(
+            journey @ (Journey::Login
+            | Journey::Registration
+            | Journey::Recovery
+            | Journey::Federation),
+        ) => Some(journey),
         _ => None,
     }
 }
@@ -257,6 +272,17 @@ pub async fn flow_api_submit(
             let response = with_contract_header((StatusCode::OK, Json(body)).into_response());
             interaction::attach_session_cookies(response, &session)
         }
+        // The federation launcher: return the authorize URL as a redirect affordance. A native
+        // client opens it in a browser; the EXISTING federation callback finalizes the login
+        // (the in JSON resume is honestly deferred, like PR 2's passkey deferral). No session is
+        // minted here.
+        Ok(Continuation::Redirect { url }) => {
+            let body = json!({
+                "state": "redirect",
+                "continue_with": { "redirect_to": url },
+            });
+            with_contract_header((StatusCode::OK, Json(body)).into_response())
+        }
         Err(error) => error_json(error),
     }
 }
@@ -295,6 +321,7 @@ pub async fn flow_browser_get(
         journey,
         query.return_to.as_deref(),
         None,
+        query.connector.as_deref(),
     )
     .await
     {
@@ -382,6 +409,10 @@ pub async fn flow_browser_post(
                 with_contract_header(interaction::attach_session_cookies(notice, &session))
             }
         }
+        // The federation launcher: 303 to the EXISTING outbound federation authorize leg (which
+        // persists the correlation row and redirects to the upstream provider; the existing
+        // callback finalizes the login). No session is minted here.
+        Ok(Continuation::Redirect { url }) => with_contract_header(interaction::redirect(&url)),
         Err(error) => error_html(error),
     }
 }
@@ -420,6 +451,8 @@ fn flow_title(flow: &Flow) -> message::MessageId {
         }
         FlowStateTag::MfaChallenge => message::MFA_CHALLENGE_TITLE,
         FlowStateTag::MfaEnroll => message::MFA_ENROLL_TITLE,
+        FlowStateTag::RecoveryStart | FlowStateTag::RecoveryAck => message::RECOVERY_TITLE,
+        FlowStateTag::FederationStart => message::FEDERATION_TITLE,
         FlowStateTag::IdentifierPassword | FlowStateTag::Completed => message::LOGIN_TITLE,
     }
 }

@@ -109,6 +109,64 @@
     },
     {
       "context_keys": [],
+      "id": 1040001,
+      "kind": "info",
+      "name": "recovery.title",
+      "text": "Recover your account"
+    },
+    {
+      "context_keys": [],
+      "id": 1040002,
+      "kind": "info",
+      "name": "recovery.identifier.label",
+      "text": "Identifier"
+    },
+    {
+      "context_keys": [],
+      "id": 1040003,
+      "kind": "info",
+      "name": "recovery.submit.label",
+      "text": "Send a recovery code"
+    },
+    {
+      "context_keys": [],
+      "id": 1040004,
+      "kind": "info",
+      "name": "recovery.ack",
+      "text": "If an account exists for that identifier, we have sent a recovery code. Enter it below to continue."
+    },
+    {
+      "context_keys": [],
+      "id": 1040005,
+      "kind": "info",
+      "name": "recovery.code.label",
+      "text": "Recovery code"
+    },
+    {
+      "context_keys": [],
+      "id": 1040006,
+      "kind": "info",
+      "name": "recovery.verify.label",
+      "text": "Verify and sign in"
+    },
+    {
+      "context_keys": [],
+      "id": 1060001,
+      "kind": "info",
+      "name": "federation.title",
+      "text": "Continue with a provider"
+    },
+    {
+      "context_keys": [
+        "provider"
+      ],
+      "id": 1060002,
+      "kind": "info",
+      "name": "federation.continue.label",
+      "text": "Continue with your identity provider"
+    },
+    {
+      "context_keys": [],
       "id": 1500001,
       "kind": "success",
       "name": "login.success",
@@ -127,6 +185,13 @@
       "kind": "success",
       "name": "mfa.success",
       "text": "Your identity has been verified."
+    },
+    {
+      "context_keys": [],
+      "id": 1540001,
+      "kind": "success",
+      "name": "recovery.success",
+      "text": "You are signed in."
     },
     {
       "context_keys": [],
@@ -252,6 +317,34 @@
       "id": 4300003,
       "kind": "error",
       "name": "mfa.throttled",
+      "text": "Too many attempts. Wait a moment and try again."
+    },
+    {
+      "context_keys": [],
+      "id": 4400001,
+      "kind": "error",
+      "name": "recovery.identifier_required",
+      "text": "Enter your identifier."
+    },
+    {
+      "context_keys": [],
+      "id": 4400002,
+      "kind": "error",
+      "name": "recovery.code_required",
+      "text": "Enter the recovery code."
+    },
+    {
+      "context_keys": [],
+      "id": 4400003,
+      "kind": "error",
+      "name": "recovery.code_incorrect",
+      "text": "Incorrect or expired code."
+    },
+    {
+      "context_keys": [],
+      "id": 4400004,
+      "kind": "error",
+      "name": "recovery.throttled",
       "text": "Too many attempts. Wait a moment and try again."
     }
   ]
