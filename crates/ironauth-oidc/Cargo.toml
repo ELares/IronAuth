@@ -818,5 +818,17 @@ name = "flow_recovery_federation"
 path = "tests/flow_recovery_federation.rs"
 required-features = ["testing"]
 
+# The headless flow API PR4 (issue #84), the acceptance closure: the cross-transport TEST
+# MATRIX (all journeys x both transports from ONE generic driver, proving no journey-specific
+# client logic; a native JSON client completes every journey with no HTML), cross-transport
+# equivalence (the API and browser render the SAME flow object modulo the documented deltas),
+# the contract VERSIONING consistency, the GOLDEN corpus (the committed docs/flow-golden.json
+# reproduces from the engine and validates against the published docs/flow-schema.json), and
+# the consolidated M7 timing harness on the JSON transport. Over a real database (DATABASE_URL).
+[[test]]
+name = "flow_matrix"
+path = "tests/flow_matrix.rs"
+required-features = ["testing"]
+
 [lints]
 workspace = true

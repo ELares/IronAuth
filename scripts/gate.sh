@@ -66,6 +66,14 @@ echo "==> connector schema freshness (definition + capability matrix)"
 scripts/connector-schema.sh
 git diff --exit-code docs/connector-schema.json docs/capability-matrix.schema.json
 
+echo "==> flow schema freshness (flow object schema + message id registry)"
+scripts/flow-schema.sh
+git diff --exit-code docs/flow-schema.json docs/flow-messages.json
+
+echo "==> flow golden corpus freshness (rendered flow shape, all journeys x both transports)"
+scripts/flow-golden.sh
+git diff --exit-code docs/flow-golden.json
+
 echo "==> openapi freshness (served management spec vs committed artifact)"
 scripts/openapi-check.sh
 

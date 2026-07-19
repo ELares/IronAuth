@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# The cargo-fuzz harness for the ironauth-oidc headless flow submission parser
+# (issue #84, PR 4). Deliberately NOT a workspace member (the empty [workspace]
+# table below detaches it): its libFuzzer dependency needs a nightly toolchain and
+# must not constrain the stable workspace or enter the cargo-deny graph, mirroring
+# ironauth-connector's fuzz/, ironauth-store's fuzz/, ironauth-jose's fuzz/, and
+# the sibling Iron projects. The `flow_submission_parse` target proves that
+# arbitrary (malformed) bytes never panic the submission decoder -- the node-values
+# decode and the transient-payload parse, on both the API (JSON envelope) and the
+# browser (JSON string) ingest edges -- and that a rejected submission is always a
+# TYPED FlowError, never a 500 and never a partial value. The same input space has
+# stable, in-CI coverage in the crate's flow_api / flow_matrix integration tests.
+[package]
+name = "ironauth-oidc-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ironauth-oidc = { path = ".." }
+serde_json = "1.0"
+
+[[bin]]
+name = "flow_submission_parse"
+path = "fuzz_targets/flow_submission_parse.rs"
+test = false
+doc = false
+bench = false

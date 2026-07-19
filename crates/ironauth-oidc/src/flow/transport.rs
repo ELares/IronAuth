@@ -16,6 +16,7 @@
 //! Every route answers a uniform 404 when `flows.enabled` is off (FORK D), so a deployment
 //! that does not use the flow API discloses nothing and the bootstrap pages are untouched.
 
+use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -28,6 +29,7 @@ use super::model::{Flow, Journey, Transport};
 use super::{
     Continuation, FLOW_CONTRACT_HEADER, FlowError, Submission, TransportAuth, create_flow, drive,
     message::{self, Message},
+    parse_api_submission, parse_form_transient_payload,
 };
 use crate::interaction;
 use crate::pages;
@@ -104,22 +106,6 @@ pub struct ApiCreateBody {
     /// federation flow. Ignored by the other journeys.
     #[serde(default)]
     connector: Option<String>,
-}
-
-/// The API submit request body: the flow id, the submit token, the node values, and the
-/// optional transient payload.
-#[derive(Debug, Deserialize)]
-pub struct ApiSubmitBody {
-    /// The flow id to advance.
-    id: String,
-    /// The per flow submit token (the API CSRF handle), matched against the row.
-    submit_token: String,
-    /// The submitted node values keyed by node name.
-    #[serde(default)]
-    nodes: std::collections::BTreeMap<String, Value>,
-    /// Arbitrary client context (never persisted on the identity).
-    #[serde(default)]
-    transient_payload: Option<Value>,
 }
 
 /// The browser GET query: the optional resume target seeded at creation.
@@ -228,7 +214,7 @@ pub async fn flow_api_submit(
     State(state): State<OidcState>,
     Path((tenant_id, environment_id, _journey)): Path<(String, String, String)>,
     headers: HeaderMap,
-    Json(body): Json<ApiSubmitBody>,
+    body: Bytes,
 ) -> Response {
     if !state.flows_enabled() {
         return disabled_not_found();
@@ -236,19 +222,19 @@ pub async fn flow_api_submit(
     let Some(scope) = parse_scope(&tenant_id, &environment_id) else {
         return error_json(FlowError::NotFound);
     };
-    let Ok(flow_id) = FlowId::parse_in_scope(&body.id, &scope) else {
+    // Decode the JSON submit envelope through the ONE pure parser (the fuzz target's subject):
+    // a malformed body or an oversized/malformed transient payload is a TYPED flow error here,
+    // never a 500 and never a generic non flow rejection.
+    let parsed = match parse_api_submission(&body) {
+        Ok(parsed) => parsed,
+        Err(error) => return error_json(error),
+    };
+    let Ok(flow_id) = FlowId::parse_in_scope(&parsed.id, &scope) else {
         return error_json(FlowError::NotFound);
     };
-    let transient_payload = match body.transient_payload {
-        Some(Value::Null) | None => None,
-        Some(value) => Some(value),
-    };
-    let submission = Submission {
-        node_values: body.nodes,
-        transient_payload,
-    };
+    let submission = parsed.submission;
     let auth = TransportAuth::Api {
-        presented_submit_token: body.submit_token,
+        presented_submit_token: parsed.submit_token,
     };
     match drive(
         &state,
@@ -355,13 +341,9 @@ pub async fn flow_browser_post(
     let Ok(flow_id) = FlowId::parse_in_scope(&form.flow, &scope) else {
         return error_html(FlowError::NotFound);
     };
-    let transient_payload = match form.transient_payload.as_deref() {
-        None => None,
-        Some(raw) => match serde_json::from_str::<Value>(raw) {
-            Ok(Value::Null) => None,
-            Ok(value) => Some(value),
-            Err(_) => return error_html(FlowError::MalformedTransientPayload),
-        },
+    let transient_payload = match parse_form_transient_payload(form.transient_payload.as_deref()) {
+        Ok(payload) => payload,
+        Err(error) => return error_html(error),
     };
     let mut node_values = std::collections::BTreeMap::new();
     let mut insert = |name: &str, value: Option<String>| {
