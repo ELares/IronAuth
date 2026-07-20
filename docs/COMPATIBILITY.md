@@ -8,6 +8,7 @@ table is the authoritative list of artifacts and their versions at HEAD.
 |----------|---------|------|------|
 | ironauth | 0.1.0 | binary | 1.85 |
 | ironauth-admin | 0.1.0 | library | 1.85 |
+| ironauth-admin-ui | 0.1.0 | library | 1.85 |
 | ironauth-apply | 0.1.0 | library | 1.85 |
 | ironauth-config | 0.1.0 | library | 1.85 |
 | ironauth-connector | 0.1.0 | library | 1.85 |
