@@ -462,6 +462,27 @@ async fn an_unlisted_subject_authenticates_at_oidc_but_is_rejected_by_management
 }
 
 #[tokio::test]
+async fn a_whitespace_padded_subject_does_not_alias_a_listed_operator() {
+    // The verified subject is matched BYTE EXACT: a token whose `sub` is a listed
+    // operator surrounded by whitespace is a DIFFERENT subject and must be rejected,
+    // so no padding variant can alias a real operator.
+    let harness = BridgeHarness::start().await;
+    let (tenant, env) = harness.create_tenant("k1").await;
+    let mut claims = harness.good_claims();
+    claims["sub"] = Value::String(format!("  {LISTED_SUB}\t\n"));
+    let token = harness.sign(&claims).await;
+
+    let (status, body) = harness
+        .get_as(&format!("/v1/tenants/{tenant}/environments/{env}"), &token)
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a padded subject must not alias a listed operator: {body}"
+    );
+}
+
+#[tokio::test]
 async fn the_bridge_rejects_everything_when_disarmed() {
     // With no bridge installed (an operator who never armed [admin_spa]), a
     // perfectly valid-looking console token is rejected: no `at+jwt` is accepted at

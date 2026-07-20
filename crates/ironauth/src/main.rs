@@ -198,6 +198,20 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // mounted on the PUBLIC plane under /admin; while off nothing is mounted there and
         // every /admin path is a uniform 404.
         let admin_spa_enabled = config.admin_spa.enabled;
+        // Whether the OIDC bridge is configured for the console (oidc on plus an admin
+        // issuer scope plus a management audience). The same-origin management proxy is
+        // wired ONLY when this holds, so enabling the console shell without configuring
+        // its OIDC login does NOT expose the management API on the public plane. This is
+        // the config level gate; `install_admin_oidc_bridge` re-checks it and arms the
+        // verifying arm.
+        let admin_bridge_configured = config.oidc.enabled
+            && [
+                config.admin_spa.admin_issuer_tenant.as_deref(),
+                config.admin_spa.admin_issuer_environment.as_deref(),
+                config.admin_spa.management_audience.as_deref(),
+            ]
+            .iter()
+            .all(|v| v.is_some_and(|s| !s.trim().is_empty()));
 
         // When advanced-recovery is armed, an IDV callback's signature is verified against each
         // provider's REGISTERED JWKS through the JOSE core. The config layer can only prove the
@@ -334,13 +348,22 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // and the same origin management proxy.
         if admin_spa_enabled {
             // Wire the same-origin management proxy (issue #90, PR 2): /admin/api/*
-            // on the public plane forwards to the in-process management router. When
-            // the management plane is not mounted (no bootstrap operator token) the
-            // proxy target is None and every /admin/api/* path is a uniform 404.
-            server = server.mount_public(ironauth_admin_ui::router(management_for_proxy));
+            // on the public plane forwards to the in-process management router, but
+            // ONLY when the OIDC bridge is configured. Absent that config the console
+            // has no login and no reason to reach management, so the proxy target is
+            // None and every /admin/api/* path is a uniform 404, keeping the management
+            // API off the public plane until the console is genuinely set up. When the
+            // management plane itself is not mounted (no bootstrap operator token) the
+            // target is likewise None.
+            let proxy_target = if admin_bridge_configured {
+                management_for_proxy
+            } else {
+                None
+            };
+            server = server.mount_public(ironauth_admin_ui::router(proxy_target));
             tracing::info!(
-                "admin console mounted on the public plane under /admin (management proxy at \
-                 /admin/api)"
+                proxy = admin_bridge_configured,
+                "admin console mounted on the public plane under /admin"
             );
         } else {
             tracing::info!("admin console not mounted: admin_spa.enabled is false");
@@ -514,7 +537,15 @@ async fn install_admin_oidc_bridge(state: AdminState, config: &Config) -> AdminS
     };
     let cache = JwksCacheWindow::clamped(config.oidc.jwks_cache_max_age_secs);
     let registry = Arc::new(IssuerRegistry::store_backed(issuer_base, cache, store));
-    let subjects = spa.operator_subjects.clone();
+    // Trim each allowlist entry ONCE at load (operator convenience against a stray
+    // space in config) and drop empties; the token subject is then matched byte
+    // exact against these canonical entries.
+    let subjects: Vec<String> = spa
+        .operator_subjects
+        .iter()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect();
     if subjects.is_empty() {
         tracing::warn!(
             "admin console OIDC bridge armed with an EMPTY operator_subjects allowlist: no \

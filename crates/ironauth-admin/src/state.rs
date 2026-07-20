@@ -62,11 +62,15 @@ pub(crate) const BOOTSTRAP_OPERATOR_DISPLAY_NAME: &str = "IronAuth bootstrap ope
 /// management audience. This value carries everything the third resolution arm
 /// needs to turn that bearer into a [`Principal`], and NOTHING else:
 ///
-/// - `issuers` is the SAME store-backed [`IssuerRegistry`] the OIDC data plane
-///   serves its JWKS and discovery from (shared as an `Arc`, exactly like the
-///   federation runtime and the lazy-migration hook). The verification keys come
-///   from the admin issuer's published signing keys ONLY, never an ambient "any
-///   issuer" trust anchor.
+/// - `issuers` is a store-backed [`IssuerRegistry`] built over the SAME data-plane
+///   store, master key, and config-derived issuer base the OIDC data plane serves
+///   its JWKS and discovery from. It is a SEPARATE `Arc` instance (the boot path
+///   builds it independently to avoid reordering the server construction), but it
+///   reads the identical RLS-scoped signing-key rows and derives the identical
+///   `iss` string, so the trusted keys are equivalent by construction. The
+///   verification keys come from the admin issuer's published signing keys ONLY,
+///   never an ambient "any issuer" trust anchor. (Sharing the exact `Arc` so the
+///   two instances share one key cache is a clean follow-up.)
 /// - `issuer_scope` is the admin issuer's `(tenant, environment)`, from which the
 ///   registry derives BOTH the trusted keys and the exact `iss` string the token
 ///   must carry (one source of truth: the enforced issuer is the value the
@@ -404,13 +408,11 @@ impl AdminState {
             return Ok(None);
         }
         // Map the verified subject to an operator via the fail-closed allowlist. An
-        // unlisted (or absent) subject is rejected.
-        let Some(subject) = verified
-            .claims()
-            .subject()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        else {
+        // unlisted (or absent) subject is rejected. The verified subject is matched
+        // BYTE EXACT (never trimmed here), like `iss` and `aud`; the allowlist entries
+        // are trimmed once at load, so a whitespace padded token subject can never
+        // alias a listed operator.
+        let Some(subject) = verified.claims().subject().filter(|s| !s.is_empty()) else {
             return Ok(None);
         };
         if !bridge

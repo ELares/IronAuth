@@ -222,6 +222,16 @@ pub struct AdminSpaConfig {
     /// Code + PKCE sign-in (issue #90, PR 2). A public client holds no secret, so
     /// this is a bounded identifier the browser reads from served config; it is
     /// never a credential. Unset leaves the console with no client to log in as.
+    ///
+    /// STAGING NOTE (issue #90): the browser reads this (and the admin issuer and
+    /// management audience) from `<meta>` tags in the served console document. PR 2
+    /// ships the server-side verifying arm, the proxy, and the complete client login
+    /// code, all tested; DELIVERING these values into the served document and
+    /// embedding the real Vite console (PR 1 embeds a placeholder shell so the Rust
+    /// build stays green without a Node toolchain) is the staged integration that
+    /// makes the login runtime reachable and flips `admin_spa.enabled` on by default.
+    /// Until then this field has no server-side reader by design; it is consumed only
+    /// by the browser once that integration lands.
     pub console_client_id: Option<String>,
 
     /// The OPERATOR-SUBJECT ALLOWLIST (issue #90, PR 2): the OIDC `sub` values, in
