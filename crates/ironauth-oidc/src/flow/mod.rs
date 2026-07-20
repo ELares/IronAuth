@@ -39,13 +39,14 @@ mod login;
 mod mfa;
 mod recovery;
 mod registration;
+mod render;
 mod transport;
 
 pub use golden::{GoldenFlow, golden_corpus, golden_flows};
 pub use schema::{flow_messages_snapshot, flow_object_schema};
 pub use transport::{
-    FLOW_API_SUBMIT_PATH, FLOW_BROWSER_PATH, FLOW_CREATE_API_PATH, flow_api_create,
-    flow_api_submit, flow_browser_get, flow_browser_post,
+    FLOW_API_SUBMIT_PATH, FLOW_BROWSER_PATH, FLOW_CREATE_API_PATH, FLOW_STYLESHEET_PATH,
+    flow_api_create, flow_api_submit, flow_browser_get, flow_browser_post, flow_stylesheet,
 };
 
 use std::collections::BTreeMap;

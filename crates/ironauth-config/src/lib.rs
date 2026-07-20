@@ -80,6 +80,15 @@ pub struct Config {
     /// bootstrap login, consent, and register pages are the only interactive surface.
     pub flows: FlowsConfig,
 
+    /// Hosted-page render app settings (issue #85): the in-process, server-rendered pages
+    /// that render from the headless flow contract (login, registration, MFA, recovery,
+    /// federation), plus the theme seam and the served stylesheet. Off by default and
+    /// SEPARATE from `flows.enabled`: enabling the headless flow API for native SDKs does
+    /// NOT also cut the browser login UI over to the flow engine, and vice versa. The
+    /// actual cutover (retargeting the `/authorize` interaction redirects onto the flow
+    /// render app) is a later, deliberate change; this toggle default-off ships the seam.
+    pub hosted_pages: HostedPagesConfig,
+
     /// Flexible-identifier settings (issue #54): the per-environment uniqueness
     /// policy for typed login identifiers. Safe default: environment-wide uniqueness.
     pub identifiers: IdentifiersConfig,
@@ -135,6 +144,25 @@ pub struct FlowsConfig {
     /// exposes only the bootstrap login, consent, and register pages. When on, the
     /// flow routes (the native JSON transport and the engine driven browser transport)
     /// answer, sharing one flow object and one state machine.
+    pub enabled: bool,
+}
+
+/// Hosted-page render app settings (issue #85).
+///
+/// The hosted pages are the in-process, server-rendered surface that renders entirely from
+/// the headless flow contract, so a new auth method (a new node group) renders without page
+/// code changes. This gate is SEPARATE from `flows.enabled` on purpose: an operator can
+/// expose the headless flow API to native SDKs WITHOUT cutting their browser login UI over to
+/// the flow engine, and vice versa. Off by default; the actual cutover (retargeting the
+/// `/authorize` interaction redirects onto the render app) is a later, deliberate change, so
+/// this toggle default-off ships the render app and the theme seam without changing which
+/// pages serve real users.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct HostedPagesConfig {
+    /// Whether the hosted flow render app is the live browser interaction surface. Off by
+    /// default: the bootstrap login, consent, and register pages stay the live UI until an
+    /// operator opts in. Enabling this is independent of `flows.enabled`.
     pub enabled: bool,
 }
 
@@ -5875,6 +5903,45 @@ mod tests {
 
         // An unknown key in the section is a hard startup failure, never silently ignored.
         let err = Config::from_toml_str("[flows]\nenbaled = true\n", "<inline>")
+            .expect_err("unknown key rejected");
+        assert!(format!("{err}").contains("enbaled"), "{err}");
+    }
+
+    #[test]
+    fn hosted_pages_section_defaults_off_and_is_separate_from_flows() {
+        // Default: the hosted flow render app is OFF, so the bootstrap login/consent/register
+        // pages stay the live UI (no cutover ships enabled).
+        let config = Config::from_toml_str("", "<inline>").expect("valid").config;
+        assert!(
+            !config.hosted_pages.enabled,
+            "hosted_pages.enabled defaults to false"
+        );
+
+        // The two toggles are INDEPENDENT: turning on the headless flow API does not turn on
+        // the hosted render app as the live UI, and vice versa.
+        let flows_only = Config::from_toml_str("[flows]\nenabled = true\n", "<inline>")
+            .expect("valid")
+            .config;
+        assert!(flows_only.flows.enabled, "flows.enabled = true parses");
+        assert!(
+            !flows_only.hosted_pages.enabled,
+            "flows.enabled does not imply hosted_pages.enabled"
+        );
+
+        let pages_only = Config::from_toml_str("[hosted_pages]\nenabled = true\n", "<inline>")
+            .expect("valid")
+            .config;
+        assert!(
+            pages_only.hosted_pages.enabled,
+            "hosted_pages.enabled = true parses"
+        );
+        assert!(
+            !pages_only.flows.enabled,
+            "hosted_pages.enabled does not imply flows.enabled"
+        );
+
+        // An unknown key in the section is a hard startup failure, never silently ignored.
+        let err = Config::from_toml_str("[hosted_pages]\nenbaled = true\n", "<inline>")
             .expect_err("unknown key rejected");
         assert!(format!("{err}").contains("enbaled"), "{err}");
     }

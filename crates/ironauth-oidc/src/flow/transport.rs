@@ -21,20 +21,27 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::{Form, Json};
-use ironauth_store::FlowId;
+use ironauth_store::{FlowId, Scope};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::model::{Flow, Journey, Transport};
+use super::render::{self, PageTheme};
 use super::{
     Continuation, FLOW_CONTRACT_HEADER, FlowError, Submission, TransportAuth, create_flow, drive,
-    message::{self, Message},
-    parse_api_submission, parse_form_transient_payload,
+    message::Message, parse_api_submission, parse_form_transient_payload,
 };
+use crate::hints::InteractionHints;
 use crate::interaction;
 use crate::pages;
 use crate::state::OidcState;
 use crate::wellknown::parse_scope;
+
+/// The served flow stylesheet path (issue #85, FORK C): a scope routed, same origin
+/// `text/css` asset the hosted flow render app links from its `<head>`, so the browser
+/// fetches the ONE embedded stylesheet under the `style-src 'self'` CSP. Gated behind
+/// `flows.enabled` like every flow route (a uniform 404 when off).
+pub const FLOW_STYLESHEET_PATH: &str = "/t/{tenant_id}/e/{environment_id}/pages.css";
 
 /// The browser transport path (GET creates and renders, POST submits): scope routed under
 /// the per environment issuer path so the flow runs under the right row level security
@@ -311,9 +318,9 @@ pub async fn flow_browser_get(
     )
     .await
     {
-        Ok((_id, _submit_token, flow)) => {
-            with_contract_header(pages::secure_html(StatusCode::OK, render_flow_html(&flow)))
-        }
+        Ok((_id, _submit_token, flow)) => with_contract_header(
+            render_browser_flow(&state, scope, &tenant_id, &environment_id, &flow).await,
+        ),
         Err(error) => error_html(error),
     }
 }
@@ -373,9 +380,9 @@ pub async fn flow_browser_post(
     )
     .await
     {
-        Ok(Continuation::Render { flow, .. }) => {
-            with_contract_header(pages::secure_html(StatusCode::OK, render_flow_html(&flow)))
-        }
+        Ok(Continuation::Render { flow, .. }) => with_contract_header(
+            render_browser_flow(&state, scope, &tenant_id, &environment_id, &flow).await,
+        ),
         Ok(Continuation::Complete { session, return_to }) => {
             if let Some(target) = return_to {
                 with_contract_header(interaction::redirect_setting_cookie(&target, &session))
@@ -399,117 +406,61 @@ pub async fn flow_browser_post(
     }
 }
 
-/// Render a flow object to a minimal, hardened HTML form (the browser transport). The
-/// hardening (CSP, framing, referrer) is applied by [`pages::secure_html`] at the call
-/// site; this builds only the body. Every value is HTML escaped.
-fn render_flow_html(flow: &Flow) -> String {
-    let mut body = String::new();
-    body.push_str("<h1>");
-    body.push_str(&escape(&Message::of(flow_title(flow)).text));
-    body.push_str("</h1>");
-    // Flow level messages.
-    for message in &flow.ui.messages {
-        body.push_str("<p class=\"message\">");
-        body.push_str(&escape(&message.text));
-        body.push_str("</p>");
+/// `GET /t/{tenant}/e/{env}/pages.css` (issue #85, FORK C): serve the ONE embedded, same
+/// origin flow stylesheet. Gated behind `flows.enabled` like every flow route, so a
+/// deployment that does not use the flow render app answers a uniform 404 and discloses
+/// nothing (no cutover, no live behavior change while the flag is off).
+pub async fn flow_stylesheet(State(state): State<OidcState>) -> Response {
+    if !state.flows_enabled() {
+        return disabled_not_found();
     }
-    body.push_str("<form method=\"post\" action=\"");
-    body.push_str(&escape(&flow.ui.action));
-    body.push_str("\">");
-    for node in &flow.ui.nodes {
-        render_node_html(&mut body, node);
-    }
-    body.push_str("</form>");
-    body
+    pages::stylesheet_response()
 }
 
-/// The page title message for a flow's journey and state (issue #84), so the browser render
-/// heads the right form. The title is a registered message, localized like every other.
-fn flow_title(flow: &Flow) -> message::MessageId {
-    use super::model::FlowStateTag;
-    match flow.state {
-        FlowStateTag::RegistrationDetails | FlowStateTag::RegistrationAck => {
-            message::REGISTER_TITLE
-        }
-        FlowStateTag::MfaChallenge => message::MFA_CHALLENGE_TITLE,
-        FlowStateTag::MfaEnroll => message::MFA_ENROLL_TITLE,
-        FlowStateTag::RecoveryStart | FlowStateTag::RecoveryAck => message::RECOVERY_TITLE,
-        FlowStateTag::FederationStart => message::FEDERATION_TITLE,
-        FlowStateTag::IdentifierPassword | FlowStateTag::Completed => message::LOGIN_TITLE,
+/// Render a flow object into the full hosted page (issue #85, the render app). Threads the
+/// neutral [`PageTheme`] seam, the request UX hints reconstructed from the resume
+/// `/authorize` target (`ui_locales`/`display`), the issue #42 environment banner, and the
+/// passkey conditional-UI wiring (only when WebAuthn is enabled). The strict headers are
+/// attached here by the flow response builder: the passkey ceremony CSP when the passkey
+/// node group was rendered as the ceremony, else the plain flow CSP. This is the ONLY thing
+/// the browser transport emits differently under `flows.enabled`; the flow OBJECT is
+/// unchanged.
+async fn render_browser_flow(
+    state: &OidcState,
+    scope: Scope,
+    tenant_id: &str,
+    environment_id: &str,
+    flow: &Flow,
+) -> Response {
+    let scope_path = format!("/t/{tenant_id}/e/{environment_id}");
+    // Honor the authorization request UX parameters surfaced through the flow contract: the
+    // resume target is a local `/authorize?...` URL carrying `ui_locales` and `display`, so
+    // reconstruct the typed hints from its query (absent or unparsable falls back to the
+    // neutral default, an English `page` shell).
+    let hints = flow
+        .request_url
+        .as_deref()
+        .and_then(|url| url.split_once('?'))
+        .map_or_else(InteractionHints::default, |(_, query)| {
+            InteractionHints::from_query(query)
+        });
+    let banner = state.environment_banner(&scope).await;
+    let theme = PageTheme::default();
+    // The passkey conditional-UI wiring, present only when WebAuthn is enabled for this
+    // deployment (the SAME gate the bootstrap login page uses). The per response nonce is
+    // drawn from the SAME entropy seam and hex scheme as the bootstrap ceremony.
+    let nonce = state
+        .webauthn_enabled()
+        .then(|| crate::login::passkey_nonce(state));
+    let passkey = nonce.as_deref().map(|nonce| pages::PasskeyUi {
+        nonce,
+        scope_path: &scope_path,
+        signal_api: state.webauthn_signal_api_enabled(),
+    });
+    let rendered =
+        render::render_flow_page(flow, &theme, &hints, banner, &scope_path, passkey.as_ref());
+    match rendered.passkey_nonce {
+        Some(nonce) => pages::flow_login_html(StatusCode::OK, rendered.body, &nonce),
+        None => pages::flow_html(StatusCode::OK, rendered.body),
     }
-}
-
-/// Render one node into the form body.
-fn render_node_html(body: &mut String, node: &super::model::Node) {
-    use super::model::{InputType, NodeAttributes};
-    match &node.attributes {
-        NodeAttributes::Input {
-            name,
-            input_type,
-            value,
-            required,
-            ..
-        } => {
-            let type_attr = match input_type {
-                InputType::Text => "text",
-                InputType::Password => "password",
-                InputType::Email => "email",
-                InputType::Tel => "tel",
-                InputType::Hidden => "hidden",
-                InputType::Checkbox => "checkbox",
-                InputType::Submit => "submit",
-            };
-            if let Some(label) = &node.label {
-                if !matches!(input_type, InputType::Hidden | InputType::Submit) {
-                    body.push_str("<label>");
-                    body.push_str(&escape(&label.text));
-                    body.push(' ');
-                }
-            }
-            body.push_str("<input type=\"");
-            body.push_str(type_attr);
-            body.push_str("\" name=\"");
-            body.push_str(&escape(name));
-            body.push('"');
-            if let Some(value) = value {
-                body.push_str(" value=\"");
-                body.push_str(&escape(value));
-                body.push('"');
-            }
-            if *required {
-                body.push_str(" required");
-            }
-            body.push('>');
-            if node.label.is_some() && !matches!(input_type, InputType::Hidden | InputType::Submit)
-            {
-                body.push_str("</label>");
-            }
-            for message in &node.messages {
-                body.push_str("<span class=\"error\">");
-                body.push_str(&escape(&message.text));
-                body.push_str("</span>");
-            }
-        }
-        NodeAttributes::Text { message } => {
-            body.push_str("<p>");
-            body.push_str(&escape(&message.text));
-            body.push_str("</p>");
-        }
-    }
-}
-
-/// Minimal HTML escaping for the values interpolated into the flow form.
-fn escape(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    for ch in raw.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#x27;"),
-            other => out.push(other),
-        }
-    }
-    out
 }
