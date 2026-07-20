@@ -351,6 +351,12 @@ fn promoted_projection(snapshot: &Snapshot) -> Snapshot {
             // yet (a grant's client / org-connection references must resolve against the
             // target env, a later slice), so the promoted projection omits them.
             upstream_token_grant: Vec::new(),
+            // Brands (issue #86) are carried in the config-snapshot EXPORT (a promotable,
+            // diffable, committable definition), but the transactional promotion ENGINE
+            // does not yet apply them (the apply arm is a later slice), so the promoted
+            // projection empties them exactly like `connector`, keeping the revision
+            // consistent between the source projection and the target read.
+            brand: Vec::new(),
         },
     }
 }

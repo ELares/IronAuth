@@ -77,6 +77,7 @@ pub mod advanced_recovery;
 mod authn;
 mod authorize;
 mod backchannel;
+pub mod branding;
 mod broker_overlay;
 mod claims_request;
 mod client_auth;

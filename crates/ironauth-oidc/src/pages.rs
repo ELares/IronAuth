@@ -572,6 +572,75 @@ pub fn stylesheet_response() -> Response {
         .into_response()
 }
 
+/// The BRANDED layout rules (issue #86): the SAME neutral layout as [`PAGES_STYLESHEET`],
+/// but every color, font, and radius reads a CSS custom property instead of a literal. The
+/// property values are emitted ahead of these rules by
+/// [`crate::branding::tokens_to_css`] from a brand's TYPED design tokens, so a branded page
+/// is styled entirely from validated scalars. It is served (prefixed with the `:root`
+/// variable block) ONLY for a scope that has a brand; a scope with no brand keeps the
+/// byte identical [`PAGES_STYLESHEET`]. The environment banner and brand-token badge chrome
+/// keep fixed guardrail colors; the dark banner override is a fixed literal. No `url()`, no
+/// external host, no inline style: the strict `style-src 'self'` CSP is untouched.
+const BRAND_STYLESHEET_RULES: &str = ":root{color-scheme:light dark}\
+*{box-sizing:border-box}\
+body{margin:0;font-family:var(--font-family);line-height:1.5;color:var(--color-fg);background:var(--color-bg)}\
+body{display:flex;min-height:100vh;align-items:center;justify-content:center;padding:1.5rem}\
+form,main,.page{width:100%;max-width:24rem}\
+h1{font-size:1.5rem;margin:0 0 1rem}\
+label{display:block;margin:0 0 .75rem;font-weight:500}\
+input[type=text],input[type=email],input[type=tel],input[type=password]{\
+display:block;width:100%;margin-top:.25rem;padding:.5rem .625rem;font-size:1rem;\
+border:1px solid var(--color-border);border-radius:var(--radius);\
+background:var(--color-surface);color:var(--color-fg)}\
+button,input[type=submit]{\
+display:inline-block;padding:.5rem 1rem;font-size:1rem;font-weight:600;cursor:pointer;\
+border:0;border-radius:var(--radius);background:var(--color-accent);color:var(--color-accent-fg)}\
+button:hover,input[type=submit]:hover{filter:brightness(.92)}\
+p[role=alert],span.error{color:var(--color-error)}\
+p[role=status][data-environment-banner]{\
+background:#fff4d6;border:1px solid #e0c060;border-radius:var(--radius);padding:.5rem .75rem}\
+[data-brand]{margin:0 0 1rem;font-weight:700}\
+[data-brand-token]{display:inline-block;margin-left:.5rem;padding:.125rem .5rem;\
+font-size:.75rem;border-radius:1rem;background:var(--color-surface);color:var(--color-accent)}\
+[data-brand-slot]{margin:1rem 0;font-size:.9rem}\
+[data-brand-footer]{margin-top:1.5rem;font-size:.8rem;opacity:.85}\
+@media (prefers-color-scheme:dark){\
+p[role=status][data-environment-banner]{background:#3a2f10;border-color:#7a6320}}";
+
+/// Compose the served BRANDED stylesheet for a scope with a brand (issue #86): the
+/// `:root { ... }` custom-property block generated from the brand's TYPED design tokens
+/// (and the `@media (prefers-color-scheme: dark)` variants, when authored) prepended to the
+/// variable-referencing [`BRAND_STYLESHEET_RULES`]. Because every emitted value passed the
+/// typed token grammar, the result is CSP-clean by construction: no `url()`, no external
+/// host, no `}`/`;` breakout, no inline style. `style-src 'self'` is untouched.
+#[must_use]
+pub(crate) fn brand_stylesheet(
+    tokens: &crate::branding::DesignTokens,
+    tokens_dark: Option<&crate::branding::DesignTokens>,
+) -> String {
+    let mut css = crate::branding::tokens_to_css(tokens, tokens_dark);
+    css.push_str(BRAND_STYLESHEET_RULES);
+    css
+}
+
+/// Build the `200 OK` response serving a COMPUTED `text/css` body (issue #86): the branded
+/// per-environment stylesheet, carrying exactly the same server-fixed headers as
+/// [`stylesheet_response`] (`nosniff`, a cacheable `max-age`), so a branded stylesheet sits
+/// under the identical `style-src 'self'` CSP with no customer-controlled header.
+#[must_use]
+pub fn css_response(body: String) -> Response {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/css; charset=utf-8"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::CACHE_CONTROL, "public, max-age=3600"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
 /// The wiring for the hosted WebAuthn passkey-management page (issue #73): the
 /// per-response nonce, the scope path the ceremony/signal endpoints live under, and the
 /// two feature gates.
@@ -1479,6 +1548,43 @@ mod tests {
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default();
         assert_eq!(content_type, "text/css; charset=utf-8");
+    }
+
+    #[test]
+    fn the_branded_stylesheet_is_token_driven_and_csp_clean() {
+        // Issue #86: the branded stylesheet is the :root token variables (from typed
+        // scalars) prepended to the variable-referencing layout rules. It stays CSP-clean:
+        // no url(), no external host, no inline-style vector, and no breakout.
+        use crate::branding::{Color, DesignTokens};
+        let light = DesignTokens::default();
+        let dark = DesignTokens {
+            color_bg: Color::parse("#141414").unwrap(),
+            ..DesignTokens::default()
+        };
+        let css = brand_stylesheet(&light, Some(&dark));
+        // The token variables and their references are present.
+        assert!(css.contains(":root{color-scheme:light dark}"), "{css}");
+        assert!(css.contains("--color-accent:#2f5bde;"), "{css}");
+        assert!(css.contains("background:var(--color-bg)"), "{css}");
+        assert!(
+            css.contains("@media (prefers-color-scheme:dark){:root{--color-bg:#141414;"),
+            "{css}"
+        );
+        // CSP-clean.
+        assert!(!css.contains("url("), "no url(): {css}");
+        assert!(!css.contains("http"), "no external host: {css}");
+        assert!(!css.contains("expression("), "no expression(): {css}");
+        assert!(!css.contains('<'), "no markup: {css}");
+        // The css_response carries the same server-fixed headers as the neutral one.
+        let branded = css_response(css);
+        let neutral = stylesheet_response();
+        for header_name in [header::CONTENT_TYPE, header::X_CONTENT_TYPE_OPTIONS] {
+            assert_eq!(
+                branded.headers().get(&header_name),
+                neutral.headers().get(&header_name),
+                "branded and neutral stylesheet share the {header_name} header"
+            );
+        }
     }
 
     #[test]

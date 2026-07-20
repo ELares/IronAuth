@@ -31,7 +31,10 @@ scan() {
 }
 
 scan time-via-env 'SystemTime::now|Instant::now'
-scan entropy-via-env 'getrandom::|(^|[^a-z_])rand::|rand_core::'
+# The `rand::` guard requires a non-identifier char (or start of line) before `rand`
+# so a real `rand` crate path is caught while an identifier that merely ENDS in "rand"
+# (for example a `Brand::` associated call) is not a false positive.
+scan entropy-via-env 'getrandom::|(^|[^A-Za-z0-9_])rand::|rand_core::'
 
 if [ "$fail" -ne 0 ]; then
   exit 1

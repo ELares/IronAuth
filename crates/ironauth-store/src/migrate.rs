@@ -674,6 +674,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0067_headless_flows.sql"),
         },
+        Migration {
+            version: 68,
+            name: "branding",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0068_branding.sql"),
+        },
     ]
 }
 

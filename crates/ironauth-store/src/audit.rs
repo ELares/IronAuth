@@ -527,6 +527,11 @@ pub enum Action {
     /// and the domain row was pointed at the sealed bundle. The key never touches
     /// a plaintext column.
     CustomDomainCertificateStore,
+    /// A per-environment BRAND was set through the management API (issue #86): a first
+    /// write or an overwrite of a named branding definition (design tokens, dark-mode
+    /// variants, wordmark, and sanitized rich-text slots). The audit row names the brand
+    /// id and scope; the branding values themselves are not recorded here.
+    BrandSet,
     /// An environment VARIABLE (a non-secret named config value) was set through
     /// the management API (issue #45): a first write or an overwrite. The audit row
     /// names the variable id and scope; the value itself is not recorded here.
@@ -1007,6 +1012,7 @@ impl Action {
             Action::CustomDomainChallengeSucceed => "custom_domain.challenge.succeed",
             Action::CustomDomainChallengeFail => "custom_domain.challenge.fail",
             Action::CustomDomainCertificateStore => "custom_domain.certificate.store",
+            Action::BrandSet => "brand.set",
             Action::EnvironmentVariableSet => "environment_variable.set",
             Action::EnvironmentVariableDelete => "environment_variable.delete",
             Action::EnvironmentSecretPut => "environment_secret.put",

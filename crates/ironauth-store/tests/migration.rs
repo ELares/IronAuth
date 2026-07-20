@@ -471,13 +471,13 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
     );
 }
 
-/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the sixty-one
+/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the sixty-eight
 /// real migrations and leaves no throwaway demo object in a real database.
 // A long but linear ledger-and-table assertion sweep (one line per migration and
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_sixty_seven_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_sixty_eight_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
@@ -494,8 +494,8 @@ async fn production_chain_is_only_the_sixty_seven_real_migrations_and_ships_no_d
     );
     assert_eq!(
         report.already_applied(),
-        67,
-        "the production chain is exactly sixty-seven migrations (isolation, audit log, management \
+        68,
+        "the production chain is exactly sixty-eight migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -512,16 +512,17 @@ async fn production_chain_is_only_the_sixty_seven_real_migrations_and_ships_no_d
          risk engine, account recovery, federation connectors, registration abuse defenses, \
          federation login state, enterprise inbound routing, upstream token vault, \
          guarded account links, account linking wiring, FedCM assertion nonces, third-party \
-         risk signals, signup fraud review, advanced recovery modes, headless flows)"
+         risk signals, signup fraud review, advanced recovery modes, headless flows, branding)"
     );
 
-    // The ledger holds exactly versions 1 through 67.
+    // The ledger holds exactly versions 1 through 68.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
-            46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67
+            46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67,
+            68
         ]
     );
     let phase_of = |version: i64| async move {
@@ -1254,6 +1255,53 @@ async fn production_chain_is_only_the_sixty_seven_real_migrations_and_ships_no_d
     assert!(
         column_exists(pool, "flows", "transient_payload").await,
         "flows.transient_payload exists (the transient payload lives only here)"
+    );
+
+    // The branding migration (issue #86) is an EXPAND: one new tenant-scoped table (brands),
+    // no rewrite of existing state.
+    assert_eq!(phase_of(68).await, "expand");
+
+    // The brands store (issue #86) is a NEW tenant-scoped table, so it must ENABLE and FORCE
+    // row-level security, carry the (tenant, environment) isolation policy, and pin the
+    // nonempty-scope CHECK, exactly like every other scoped table.
+    assert!(
+        rls_enabled_and_forced(pool, "brands").await,
+        "brands must ENABLE and FORCE row-level security"
+    );
+    assert!(
+        policy_exists(pool, "brands", "brands_tenant_isolation").await,
+        "brands must carry the (tenant, environment) isolation policy"
+    );
+    assert!(
+        check_constraint_exists(pool, "brands", "brands_scope_nonempty").await,
+        "brands must carry the nonempty-scope CHECK"
+    );
+    // At most one DEFAULT brand per scope: the partial unique index is the structural
+    // single-default invariant.
+    assert!(
+        partial_unique_index_exists(pool, "brands", "brands_default_idx").await,
+        "brands must carry the one-default-per-scope partial unique index"
+    );
+    // The typed tokens and sanitized slots are jsonb, never a raw HTML/CSS text column.
+    assert_eq!(
+        column_data_type(pool, "brands", "tokens").await,
+        "jsonb",
+        "brands.tokens must be jsonb (typed design tokens, never free-form CSS)"
+    );
+    assert_eq!(
+        column_data_type(pool, "brands", "slots").await,
+        "jsonb",
+        "brands.slots must be jsonb (sanitized rich-text slots, never raw HTML)"
+    );
+    // The data plane READS a brand on the render path but never writes it: SELECT only, no
+    // INSERT/UPDATE/DELETE (the control plane owns the brand lifecycle).
+    assert!(
+        role_has_table_privilege(pool, "ironauth_app", "brands", "SELECT").await,
+        "the data-plane role must hold SELECT on brands (the render read)"
+    );
+    assert!(
+        !role_has_table_privilege(pool, "ironauth_app", "brands", "INSERT").await,
+        "the data-plane role must NOT hold INSERT on brands (the control plane owns writes)"
     );
 
     // The demo object never reaches a production database.
