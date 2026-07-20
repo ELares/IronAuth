@@ -715,7 +715,13 @@ pub fn oidc_router(state: OidcState) -> Router {
         // origin `.../pages.css` the server rendered flow pages link, served under the
         // `style-src 'self'` CSP. Gated behind `flows.enabled` (a uniform 404 when off), so
         // the render app adds no live surface while the flag is off (no cutover in this PR).
-        .route(flow::FLOW_STYLESHEET_PATH, get(flow::flow_stylesheet));
+        .route(flow::FLOW_STYLESHEET_PATH, get(flow::flow_stylesheet))
+        // The served brand assets (issue #86, PR 3): the same origin `.../brand/{slug}/{kind}`
+        // GET that streams a brand's stored logo / favicon raster with server-fixed headers, the
+        // source the flow page's `<img>` and favicon `<link>` point at under `img-src 'self'`.
+        // Gated behind `flows.enabled` (a uniform 404 when off), so it adds no live surface while
+        // the flag is off.
+        .route(flow::FLOW_BRAND_ASSET_PATH, get(flow::flow_brand_asset));
 
     // Dynamic Client Registration (issue #30, RFC 7591 + RFC 7592), mounted ONLY
     // when enabled (default off; issue #31 owns the real abuse gating). The routes

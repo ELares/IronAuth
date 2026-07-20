@@ -59,6 +59,8 @@ fn operation_ids_are_the_stable_set() {
             "createOrganization",
             "createTenant",
             "createUser",
+            "deleteBrandFavicon",
+            "deleteBrandLogo",
             "deleteConnector",
             "deleteEnvironment",
             "deleteLocale",
@@ -116,6 +118,8 @@ fn operation_ids_are_the_stable_set() {
             "revokeInvitation",
             "revokeSession",
             "revokeUserSessions",
+            "setBrandFavicon",
+            "setBrandLogo",
             "setLocale",
             "setUserState",
             "suspendTenant",
@@ -219,6 +223,7 @@ fn every_post_documents_the_idempotency_key_header() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // an exhaustive pinned (method, path) list reads clearest inline
 fn documented_paths_are_the_expected_set() {
     // The router is wired by hand (utoipa-axum, which would fuse the router and
     // the spec into one builder, pulls the unmaintained `paste` crate that cargo
@@ -244,6 +249,8 @@ fn documented_paths_are_the_expected_set() {
         vec![
             "DELETE /v1/tenants/{tenant_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}",
+            "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}/favicon",
+            "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}/logo",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/connectors/{connector_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/keys/{key_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/locales/{locale}",
@@ -318,6 +325,8 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/restore",
             "POST /v1/tenants/{tenant_id}/resume",
             "POST /v1/tenants/{tenant_id}/suspend",
+            "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}/favicon",
+            "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}/logo",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/connectors/{connector_id}",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/locales/{locale}",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/external-id",
@@ -359,7 +368,7 @@ fn committed_artifact_matches_generated_spec() {
 async fn served_routes_match_documented_routes() {
     let router = db_free_router();
     let documented = documented_method_paths();
-    assert_eq!(documented.len(), 79, "the documented route count is pinned");
+    assert_eq!(documented.len(), 83, "the documented route count is pinned");
 
     // The OUTBOUND lazy-migration endpoint (issue #58) is the one documented route
     // that is NOT gated by the management `Principal` at 401. It is DISABLED BY

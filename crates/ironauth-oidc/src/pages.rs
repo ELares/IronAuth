@@ -170,6 +170,7 @@ fn document(
         "ltr",
         environment_banner,
         None,
+        None,
     )
 }
 
@@ -180,6 +181,15 @@ fn document(
 /// path, escaped as an attribute) to load the one embedded stylesheet under a `style-src
 /// 'self'` CSP. The href is a scope routed local path, never customer supplied HTML, so it
 /// stays escape safe by construction.
+///
+/// `favicon_href` is the OPTIONAL same origin brand favicon (issue #86, PR 3): `Some(href)` adds
+/// exactly one `<link rel="icon">` pointing at a server known `.../brand/{slug}/favicon` path
+/// (escaped as an attribute), served under `img-src 'self'`; `None` emits no icon link, so a
+/// page with no favicon stays byte-identical.
+// The document shell has a fixed set of orthogonal chrome inputs (lang, display, dir, banner,
+// stylesheet, favicon); each is an independent server-known value, so threading them as
+// parameters reads clearer than bundling them into a one-off struct.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn document_styled(
     title: &str,
     body_html: &str,
@@ -188,6 +198,7 @@ pub(crate) fn document_styled(
     dir: &str,
     environment_banner: Option<&str>,
     stylesheet_href: Option<&str>,
+    favicon_href: Option<&str>,
 ) -> String {
     let lang = escape_html(lang);
     let display = escape_html(display);
@@ -205,6 +216,13 @@ pub(crate) fn document_styled(
         Some(href) => format!("<link rel=\"stylesheet\" href=\"{}\">", escape_html(href)),
         None => String::new(),
     };
+    // The brand favicon (issue #86, PR 3): a same origin `<link rel="icon">` under `img-src
+    // 'self'`, or nothing when no favicon is installed (a page with no favicon stays
+    // byte-identical). The href is a server known scope routed path, escaped as an attribute.
+    let favicon = match favicon_href {
+        Some(href) => format!("<link rel=\"icon\" href=\"{}\">", escape_html(href)),
+        None => String::new(),
+    };
     let banner = match environment_banner {
         Some(label) => format!(
             "<p role=\"status\" data-environment-banner=\"{label}\">\
@@ -215,7 +233,7 @@ pub(crate) fn document_styled(
     };
     format!(
         "<!doctype html><html lang=\"{lang}\"{dir_attr}><head><meta charset=\"utf-8\">\
-         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">{robots}{stylesheet}\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">{robots}{stylesheet}{favicon}\
          <title>{title}</title></head>\
          <body data-display=\"{display}\">{banner}{body_html}</body></html>"
     )
@@ -470,14 +488,16 @@ pub fn login_html(status: StatusCode, body: String, nonce: &str) -> Response {
         .into_response()
 }
 
-/// The Content-Security-Policy for a hosted flow render app page (issue #85, FORK C). It
-/// keeps the strict discipline of [`CONTENT_SECURITY_POLICY`] (`default-src 'none'`,
-/// `base-uri 'none'`, `form-action 'self'`, `frame-ancestors 'none'`) and opens exactly
-/// ONE extra source: `style-src 'self'`, so the one served same origin stylesheet loads.
-/// No script, image, or font source is opened and there is no `unsafe-inline` anywhere.
-/// `object-src 'none'` is stated explicitly (issue #89) for a uniform plugin denial.
+/// The Content-Security-Policy for a hosted flow render app page (issue #85, FORK C; issue #86,
+/// PR 3). It keeps the strict discipline of [`CONTENT_SECURITY_POLICY`] (`default-src 'none'`,
+/// `base-uri 'none'`, `form-action 'self'`, `frame-ancestors 'none'`) and opens exactly TWO extra
+/// sources: `style-src 'self'`, so the one served same origin stylesheet loads, and `img-src
+/// 'self'` (issue #86, PR 3), so the same origin brand logo and favicon load. Both are `'self'`
+/// only: no external host, no wildcard, no `unsafe-inline`. `object-src 'none'` is stated
+/// explicitly (issue #89) for a uniform plugin denial. With no brand asset installed the page
+/// renders no `<img>` and no icon `<link>`, so `img-src 'self'` is inert.
 const FLOW_PAGE_CSP: &str = "default-src 'none'; base-uri 'none'; object-src 'none'; form-action 'self'; \
-     frame-ancestors 'none'; style-src 'self'";
+     frame-ancestors 'none'; style-src 'self'; img-src 'self'";
 
 /// The Content-Security-Policy for a hosted flow page that ALSO carries the passkey
 /// conditional-UI ceremony (issue #85, the §4 cutover gap). It is [`FLOW_PAGE_CSP`] plus the
@@ -491,8 +511,8 @@ const FLOW_PAGE_CSP: &str = "default-src 'none'; base-uri 'none'; object-src 'no
 pub fn flow_login_csp(nonce: &str) -> String {
     format!(
         "default-src 'none'; base-uri 'none'; object-src 'none'; form-action 'self'; \
-         frame-ancestors 'none'; style-src 'self'; script-src 'nonce-{nonce}' 'strict-dynamic'; \
-         connect-src 'self'"
+         frame-ancestors 'none'; style-src 'self'; img-src 'self'; \
+         script-src 'nonce-{nonce}' 'strict-dynamic'; connect-src 'self'"
     )
 }
 
@@ -653,6 +673,41 @@ pub fn css_response(body: String) -> Response {
             (header::CACHE_CONTROL, "public, max-age=3600"),
         ],
         body,
+    )
+        .into_response()
+}
+
+/// Build the `200 OK` response serving a stored brand asset's raster bytes (issue #86, PR 3).
+///
+/// Every header is SERVER-FIXED, none customer-controlled: the `Content-Type` is the SNIFFED
+/// media type stored at ingest (the magic-byte sniff of the actual bytes, never the client's
+/// declared header), `X-Content-Type-Options: nosniff` refuses browser content sniffing, and the
+/// `Cache-Control` rides a strong `ETag` built from the asset's sha256 (a content validator, so a
+/// changed asset invalidates the cache). Served from the auth origin under the flow page's
+/// `img-src 'self'`, so no external host is ever contacted. A stored `content_type` is always one
+/// of the fixed sniffed raster set, so it parses as a header value; the octet-stream fallback
+/// keeps the builder total.
+#[must_use]
+pub fn brand_asset_response(content_type: &str, bytes: Vec<u8>, sha256: &str) -> Response {
+    let content_type = header::HeaderValue::from_str(content_type)
+        .unwrap_or_else(|_| header::HeaderValue::from_static("application/octet-stream"));
+    let etag = header::HeaderValue::from_str(&format!("\"{sha256}\""))
+        .unwrap_or_else(|_| header::HeaderValue::from_static("\"brand-asset\""));
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, content_type),
+            (
+                header::X_CONTENT_TYPE_OPTIONS,
+                header::HeaderValue::from_static("nosniff"),
+            ),
+            (
+                header::CACHE_CONTROL,
+                header::HeaderValue::from_static("public, max-age=3600"),
+            ),
+            (header::ETAG, etag),
+        ],
+        bytes,
     )
         .into_response()
 }
@@ -1507,12 +1562,24 @@ mod tests {
     fn flow_page_csp_opens_only_style_src_self_and_no_unsafe_inline() {
         assert!(FLOW_PAGE_CSP.contains("default-src 'none'"));
         assert!(FLOW_PAGE_CSP.contains("style-src 'self'"));
+        // Issue #86, PR 3: the ONE new directive is `img-src 'self'` (the same origin brand logo /
+        // favicon). It is 'self' only: no external host, no wildcard.
+        assert!(FLOW_PAGE_CSP.contains("img-src 'self'"));
         assert!(FLOW_PAGE_CSP.contains("form-action 'self'"));
         assert!(FLOW_PAGE_CSP.contains("frame-ancestors 'none'"));
         assert!(!FLOW_PAGE_CSP.contains("unsafe-inline"));
         assert!(
+            !FLOW_PAGE_CSP.contains('*'),
+            "no wildcard source: {FLOW_PAGE_CSP}"
+        );
+        assert!(
             !FLOW_PAGE_CSP.contains("script-src"),
             "the plain flow page runs no script"
+        );
+        // `img-src 'self'` is the ONLY image source: no external host is ever permitted.
+        assert!(
+            !FLOW_PAGE_CSP.contains("img-src http") && !FLOW_PAGE_CSP.contains("img-src https"),
+            "img-src is 'self' only, never an external host: {FLOW_PAGE_CSP}"
         );
     }
 
@@ -1522,6 +1589,8 @@ mod tests {
         assert!(csp.contains("default-src 'none'"));
         assert!(csp.contains("object-src 'none'"));
         assert!(csp.contains("style-src 'self'"));
+        // Issue #86, PR 3: the flow login page also renders the brand logo / favicon.
+        assert!(csp.contains("img-src 'self'"));
         // Issue #89: the nonce script-src carries 'strict-dynamic'.
         assert!(csp.contains("script-src 'nonce-deadbeef' 'strict-dynamic'"));
         assert!(csp.contains("connect-src 'self'"));
@@ -1608,7 +1677,16 @@ mod tests {
         // The bootstrap pages stay byte-identical: document() delegates to document_styled with
         // no href, so no <link> is emitted and the shell is unchanged.
         let plain = document("Title", "<p>body</p>", "en", "page", None);
-        let via = document_styled("Title", "<p>body</p>", "en", "page", "ltr", None, None);
+        let via = document_styled(
+            "Title",
+            "<p>body</p>",
+            "en",
+            "page",
+            "ltr",
+            None,
+            None,
+            None,
+        );
         assert_eq!(plain, via);
         assert!(
             !plain.contains("<link"),
@@ -1617,7 +1695,16 @@ mod tests {
         // A left-to-right page carries NO dir attribute (byte-identical to before PR 2).
         assert!(!plain.contains("dir="), "no dir attribute for ltr: {plain}");
         // A right-to-left locale sets dir="rtl" on the html element.
-        let rtl = document_styled("Title", "<p>body</p>", "ar", "page", "rtl", None, None);
+        let rtl = document_styled(
+            "Title",
+            "<p>body</p>",
+            "ar",
+            "page",
+            "rtl",
+            None,
+            None,
+            None,
+        );
         assert!(
             rtl.contains("<html lang=\"ar\" dir=\"rtl\">"),
             "rtl sets the dir attribute: {rtl}"
@@ -1631,8 +1718,28 @@ mod tests {
             "ltr",
             None,
             Some("/t/a/e/b/pages.css"),
+            None,
         );
         assert!(styled.contains("<link rel=\"stylesheet\" href=\"/t/a/e/b/pages.css\">"));
+        // A favicon href adds exactly one escaped icon link (issue #86, PR 3); absent, none.
+        assert!(
+            !styled.contains("rel=\"icon\""),
+            "no favicon link when absent"
+        );
+        let with_icon = document_styled(
+            "Title",
+            "<p>body</p>",
+            "en",
+            "page",
+            "ltr",
+            None,
+            Some("/t/a/e/b/pages.css?b=acme"),
+            Some("/t/a/e/b/brand/acme/favicon"),
+        );
+        assert!(
+            with_icon.contains("<link rel=\"icon\" href=\"/t/a/e/b/brand/acme/favicon\">"),
+            "the favicon link is emitted: {with_icon}"
+        );
     }
 
     // Issue #73: the Signal API management page emits the feature-detected signal calls
@@ -2285,6 +2392,22 @@ mod tests {
             let (csp, xfo) = header_snapshot(response);
             assert_strict_csp_hygiene(label, &csp);
             assert_framing_denied(label, &csp, xfo.as_deref());
+            // Issue #86, PR 3: the flow render pages (and ONLY those) gain `img-src 'self'`, the
+            // one new CSP directive, for the same origin brand logo / favicon. No OTHER page's CSP
+            // is loosened: the new `img-src 'self'` directive appears on the flow pages ONLY (the
+            // device-verify page's pre-existing `img-src https:` for a client logo is a separate,
+            // untouched directive, so it is asserted by absence-of-'self', not absence-of-img-src).
+            if label.starts_with("flow_") {
+                assert!(
+                    csp.contains("img-src 'self'"),
+                    "{label}: flow pages carry img-src 'self': {csp}"
+                );
+            } else {
+                assert!(
+                    !csp.contains("img-src 'self'"),
+                    "{label}: the new img-src 'self' directive appears on flow pages only: {csp}"
+                );
+            }
         }
 
         // The two nonce-script pages additionally carry exactly one nonce script-src with

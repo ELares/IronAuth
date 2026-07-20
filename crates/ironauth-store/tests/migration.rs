@@ -477,7 +477,7 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_sixty_eight_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
@@ -494,8 +494,8 @@ async fn production_chain_is_only_the_sixty_eight_real_migrations_and_ships_no_d
     );
     assert_eq!(
         report.already_applied(),
-        69,
-        "the production chain is exactly sixty-nine migrations (isolation, audit log, management \
+        70,
+        "the production chain is exactly seventy migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -513,17 +513,17 @@ async fn production_chain_is_only_the_sixty_eight_real_migrations_and_ships_no_d
          federation login state, enterprise inbound routing, upstream token vault, \
          guarded account links, account linking wiring, FedCM assertion nonces, third-party \
          risk signals, signup fraud review, advanced recovery modes, headless flows, branding, \
-         locale bundles)"
+         locale bundles, brand assets)"
     );
 
-    // The ledger holds exactly versions 1 through 69.
+    // The ledger holds exactly versions 1 through 70.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
             46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67,
-            68, 69
+            68, 69, 70
         ]
     );
     let phase_of = |version: i64| async move {
@@ -1345,6 +1345,93 @@ async fn production_chain_is_only_the_sixty_eight_real_migrations_and_ships_no_d
     assert!(
         !role_has_table_privilege(pool, "ironauth_app", "locale_bundles", "INSERT").await,
         "the data-plane role must NOT hold INSERT on locale_bundles (control plane owns writes)"
+    );
+
+    // The brand-assets migration (issue #86, PR 3) is an EXPAND: one new tenant-scoped table
+    // (brand_assets) plus two additive partial unique indexes on the existing brands columns, no
+    // rewrite of existing state.
+    assert_eq!(phase_of(70).await, "expand");
+
+    // The brand_assets store (issue #86, PR 3) is a NEW tenant-scoped table, so it must ENABLE and
+    // FORCE row-level security, carry the (tenant, environment) isolation policy, and pin the
+    // nonempty-scope CHECK, exactly like every other scoped table.
+    assert!(
+        rls_enabled_and_forced(pool, "brand_assets").await,
+        "brand_assets must ENABLE and FORCE row-level security"
+    );
+    assert!(
+        policy_exists(pool, "brand_assets", "brand_assets_tenant_isolation").await,
+        "brand_assets must carry the (tenant, environment) isolation policy"
+    );
+    assert!(
+        check_constraint_exists(pool, "brand_assets", "brand_assets_scope_nonempty").await,
+        "brand_assets must carry the nonempty-scope CHECK"
+    );
+    // The closed kind CHECK pins the raster set of asset kinds: an unknown kind can never be
+    // written.
+    let asset_kind_check: String = sqlx::query(
+        "SELECT pg_get_constraintdef(oid) AS def FROM pg_catalog.pg_constraint \
+         WHERE conrelid = 'brand_assets'::regclass AND conname = 'brand_assets_kind_known'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("brand_assets kind check lookup")
+    .get("def");
+    for kind in ["logo", "favicon"] {
+        assert!(
+            asset_kind_check.contains(kind),
+            "the brand_assets kind CHECK must admit {kind}, got: {asset_kind_check}"
+        );
+    }
+    // The size ceiling CHECK bounds the stored payload, so a management key holder cannot store an
+    // oversize asset that inflates the serve cost.
+    assert!(
+        check_constraint_exists(pool, "brand_assets", "brand_assets_size_bounded").await,
+        "brand_assets must carry the size-bounded CHECK"
+    );
+    // One logo and one favicon per brand: the natural key (scope, brand_slug, kind) is the
+    // PRIMARY KEY, so a second asset of the same kind for the same brand is a structural conflict.
+    let asset_pk: String = sqlx::query(
+        "SELECT pg_get_constraintdef(oid) AS def FROM pg_catalog.pg_constraint \
+         WHERE conrelid = 'brand_assets'::regclass AND conname = 'brand_assets_pkey'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("brand_assets pkey lookup")
+    .get("def");
+    assert!(
+        asset_pk.starts_with("PRIMARY KEY")
+            && asset_pk.contains("brand_slug")
+            && asset_pk.contains("kind"),
+        "brand_assets must pin the one-asset-per-(brand,kind) PRIMARY KEY, got: {asset_pk}"
+    );
+    // The bytes are jsonb-free binary: a bytea column, never a text HTML/CSS column.
+    assert_eq!(
+        column_data_type(pool, "brand_assets", "bytes").await,
+        "bytea",
+        "brand_assets.bytes must be a bytea (inert raster bytes, never markup)"
+    );
+    // The data plane READS an asset on the serve path but never writes it: SELECT only.
+    assert!(
+        role_has_table_privilege(pool, "ironauth_app", "brand_assets", "SELECT").await,
+        "the data-plane role must hold SELECT on brand_assets (the serve read)"
+    );
+    assert!(
+        !role_has_table_privilege(pool, "ironauth_app", "brand_assets", "INSERT").await,
+        "the data-plane role must NOT hold INSERT on brand_assets (control plane owns writes)"
+    );
+
+    // The two brands selection partial unique indexes (issue #86, PR 3): the routing-confusion
+    // structural defense on the EXISTING brands columns. Within a scope, a host_pattern and a
+    // client_id each select at most one brand, so per-domain / per-client selection is never
+    // ambiguous.
+    assert!(
+        partial_unique_index_exists(pool, "brands", "brands_host_pattern_idx").await,
+        "brands must carry the per-scope host_pattern partial unique index"
+    );
+    assert!(
+        partial_unique_index_exists(pool, "brands", "brands_client_id_idx").await,
+        "brands must carry the per-scope client_id partial unique index"
     );
 
     // The demo object never reaches a production database.
