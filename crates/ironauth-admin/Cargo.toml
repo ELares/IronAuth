@@ -78,7 +78,7 @@ http-body-util.workspace = true
 # native Argon2id and foreign bcrypt hashes so the round-trip covers both a native
 # credential and an imported foreign one. Both crates are already in the tree.
 argon2.workspace = true
-bcrypt = "0.16"
+bcrypt = "0.19"
 # The per-connector health-read test (issue #76) builds a real FederationRuntime (which
 # needs an SSRF-hardened fetcher; no network is touched, only the in-memory health registry)
 # and installs it on the AdminState to prove the mgmt read reflects an induced outage.
