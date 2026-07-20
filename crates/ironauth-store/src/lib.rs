@@ -89,6 +89,7 @@ pub use abuse::{AbuseBanView, AbuseSubject, AbuseSubjectKind, AuthPath, NewBan};
 pub use audit::{ActingContext, Action, ActorRef};
 pub use brand::{
     BrandAssetKind, BrandAssetMeta, BrandAssetRecord, BrandRecord, NewBrand, NewBrandAsset,
+    canonicalize_host,
 };
 pub use classification::{ResourceClassification, ResourceLevel, ResourceType, classify};
 pub use connector::{ConnectorCapabilities, ConnectorRecord, NewConnector, StoredCapabilities};

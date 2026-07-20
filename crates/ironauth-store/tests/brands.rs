@@ -385,3 +385,61 @@ async fn a_brand_is_scoped_and_never_leaks_across_environments() {
         "scope B's export carries no brand"
     );
 }
+
+#[tokio::test]
+async fn two_brands_cannot_claim_the_same_host_after_canonicalization() {
+    // Issue #86, PR 3: the per-scope unique index on host_pattern is the routing-confusion
+    // structural defense. Because the store canonicalizes host_pattern at ingest, two brands whose
+    // host patterns differ only in case or port (both canonicalizing to "acme.test") cannot both
+    // claim it in one scope: the second set is a unique violation, and the stored form is the
+    // canonical one the selection matcher compares against.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let control = db.control_store();
+
+    let brand = |slug: &'static str, host: &'static str| NewBrand {
+        slug,
+        is_default: false,
+        product_name: "Acme",
+        show_wordmark: true,
+        brand_token: None,
+        tokens_json: TOKENS_JSON,
+        tokens_dark_json: None,
+        slots_json: SLOTS_JSON,
+        host_pattern: Some(host),
+        client_id: None,
+    };
+
+    let id_a = BrandId::generate(&env, &scope);
+    control
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .brands()
+        .set(&env, &id_a, 1_000_000, brand("acme", "acme.test"))
+        .await
+        .expect("the first brand claims acme.test");
+
+    // A DIFFERENT slug whose host_pattern canonicalizes to the SAME "acme.test".
+    let id_b = BrandId::generate(&env, &scope);
+    let collision = control
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .brands()
+        .set(&env, &id_b, 2_000_000, brand("beta", "ACME.test:443"))
+        .await;
+    assert!(
+        collision.is_err(),
+        "a second brand cannot claim the same canonical host"
+    );
+
+    // The stored host is the canonical form, matching what the selection matcher normalizes to.
+    let stored = control
+        .scoped(scope)
+        .brands()
+        .get("acme")
+        .await
+        .expect("get brand")
+        .expect("brand present");
+    assert_eq!(stored.host_pattern.as_deref(), Some("acme.test"));
+}

@@ -37,32 +37,24 @@ pub struct BrandCandidate<'a> {
 /// Normalize a Host header value for matching (issue #86, PR 3): trim, drop any `:port` suffix,
 /// and lowercase. An IPv6 literal keeps its bracketed form (the port sits after the closing
 /// bracket). An empty result yields [`None`] (there is no host to match on).
+///
+/// This DELEGATES to [`ironauth_store::canonicalize_host`], the single source of truth the store
+/// also canonicalizes a brand's `host_pattern` through at ingest, so the match form and the stored
+/// key form can never drift.
 #[must_use]
 pub fn normalize_host(raw: &str) -> Option<String> {
-    let host = raw.trim();
-    // For a bracketed IPv6 literal (`[::1]:443`) the port follows the closing bracket; for a
-    // regular host the port follows the single colon. Split off the port accordingly.
-    let without_port = if let Some(end) = host.strip_prefix('[').and_then(|_| host.find(']')) {
-        // Keep through the closing bracket, dropping any `:port` after it.
-        &host[..=end]
-    } else {
-        host.split(':').next().unwrap_or(host)
-    };
-    let normalized = without_port.trim().to_ascii_lowercase();
-    if normalized.is_empty() {
-        None
-    } else {
-        Some(normalized)
-    }
+    ironauth_store::canonicalize_host(raw)
 }
 
 /// Select the winning brand index by the precedence client > host > env-default > none (issue
 /// #86, PR 3). `host` is the raw request Host (normalized here); `client_id` is the authorize
 /// request's client id. Returns the index into `candidates` of the chosen brand, or [`None`]
 /// when nothing matches and no default is installed (the caller then renders the neutral
-/// default). The scan is deterministic (first match wins); the per-scope partial unique indexes
-/// on `host_pattern` and `client_id` mean at most one candidate can match either selector, so
-/// "first match" is also "the only match" in practice.
+/// default). The scan is deterministic (first match wins); because the store canonicalizes a
+/// brand's `host_pattern` at ingest through the same normalization used here (and `client_id` is
+/// matched exactly), the per-scope partial unique indexes on `host_pattern` and `client_id`
+/// reject two brands that would resolve for the same host or client, so at most one candidate can
+/// match either selector: "first match" is also "the only match".
 #[must_use]
 pub fn select_brand(
     candidates: &[BrandCandidate<'_>],

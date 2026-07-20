@@ -13,11 +13,39 @@
 //! CSS at the store boundary; a slot string is sanitizer output and a token blob is typed
 //! scalars.
 
+/// Canonicalize a `host_pattern` (or a request Host) to the single form the per-domain brand
+/// selection keys on (issue #86, PR 3): trim, drop any `:port` suffix (an IPv6 literal keeps its
+/// bracketed form, whose port sits after the closing bracket), and lowercase. An empty result
+/// yields [`None`] (there is no host to key on).
+///
+/// This is the SINGLE source of truth for the canonical host key. The store canonicalizes a
+/// brand's `host_pattern` through it AT INGEST, so the per-scope unique index on `host_pattern`
+/// rejects two brands that would resolve for the same host, and the OIDC selection matcher
+/// normalizes the request Host through the SAME function so ingest and match never diverge.
+#[must_use]
+pub fn canonicalize_host(raw: &str) -> Option<String> {
+    let host = raw.trim();
+    // For a bracketed IPv6 literal (`[::1]:443`) the port follows the closing bracket; for a
+    // regular host the port follows the single colon. Split off the port accordingly.
+    let without_port = if let Some(end) = host.strip_prefix('[').and_then(|_| host.find(']')) {
+        &host[..=end]
+    } else {
+        host.split(':').next().unwrap_or(host)
+    };
+    let normalized = without_port.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
 /// A brand to create or overwrite (issue #86). Every rich-text and token field is passed
 /// in as an already-validated / already-sanitized serialized JSON string; the store never
 /// interprets it. The `is_default` flag marks the one per-environment default brand a
-/// scope resolves when nothing more specific is selected (per-domain / per-client selection
-/// is deferred to PR3).
+/// scope resolves when nothing more specific is selected. A non-empty `host_pattern` is
+/// canonicalized through [`canonicalize_host`] at ingest so the per-scope unique index enforces
+/// one brand per host.
 #[derive(Debug, Clone, Copy)]
 pub struct NewBrand<'a> {
     /// The stable, human-readable per-environment brand slug (the promotion / diff key).

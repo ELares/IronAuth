@@ -20954,7 +20954,12 @@ impl ActingBrandRepo<'_> {
         let tokens = params.tokens_json.to_owned();
         let tokens_dark = params.tokens_dark_json.map(str::to_owned);
         let slots = params.slots_json.to_owned();
-        let host_pattern = params.host_pattern.map(str::to_owned);
+        // Canonicalize the host key at ingest so the per-scope unique index enforces one brand
+        // per host on the SAME form the selection matcher compares (a bare or port/case variant
+        // that would otherwise slip past the raw-column index is folded here).
+        let host_pattern = params
+            .host_pattern
+            .and_then(crate::brand::canonicalize_host);
         let client_id = params.client_id.map(str::to_owned);
         write_audited(
             AuditedWrite {
