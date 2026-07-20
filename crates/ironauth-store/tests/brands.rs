@@ -17,7 +17,10 @@
 
 use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
-use ironauth_store::{BrandId, CorrelationId, NewBrand, export_snapshot, validate_document};
+use ironauth_store::{
+    BrandAssetKind, BrandId, CorrelationId, NewBrand, NewBrandAsset, export_snapshot,
+    validate_document,
+};
 
 /// A valid serialized design-token blob (the typed scalars the branding module validates).
 const TOKENS_JSON: &str = r##"{"color_bg":"#f5f5f5","color_fg":"#1a1a1a","color_accent":"#2f5bde","color_accent_fg":"#ffffff","color_error":"#b00020","color_surface":"#ffffff","color_border":"#bbbbbb","font_family":"system_ui","radius":6,"space":16}"##;
@@ -35,6 +38,8 @@ fn set_brand<'a>(slug: &'a str, is_default: bool, product_name: &'a str) -> NewB
         tokens_json: TOKENS_JSON,
         tokens_dark_json: None,
         slots_json: SLOTS_JSON,
+        host_pattern: None,
+        client_id: None,
     }
 }
 
@@ -190,6 +195,158 @@ async fn an_overwrite_is_idempotent_on_the_slug() {
         .expect("list");
     assert_eq!(all.len(), 1, "an overwrite keeps a single row per slug");
     assert_eq!(all[0].product_name, "Acme Renamed");
+}
+
+#[tokio::test]
+async fn a_brand_with_selection_and_an_asset_round_trips_through_a_snapshot() {
+    // Issue #86, PR 3 (AC #4): a brand carrying a host_pattern + client_id + an installed asset
+    // (metadata only) round-trips export -> validate byte-identically, and a re-export is
+    // byte-identical. The asset BYTES stay in the store (by-reference in the snapshot).
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let control = db.control_store();
+
+    // A brand with per-domain AND per-client selection set.
+    let id = BrandId::generate(&env, &scope);
+    let brand = NewBrand {
+        slug: "acme",
+        is_default: true,
+        product_name: "Acme",
+        show_wordmark: true,
+        brand_token: None,
+        tokens_json: TOKENS_JSON,
+        tokens_dark_json: None,
+        slots_json: SLOTS_JSON,
+        host_pattern: Some("login.acme.test"),
+        client_id: Some("cli_acme"),
+    };
+    control
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .brands()
+        .set(&env, &id, 1_000_000, brand)
+        .await
+        .expect("set brand with selection");
+
+    // Upload a PNG logo asset (the bytes ride the store; the metadata rides the snapshot).
+    let png_bytes = [
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x01, 0x02, 0x03,
+    ];
+    control
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .brand_assets()
+        .set(
+            &env,
+            &id,
+            2_000_000,
+            NewBrandAsset {
+                brand_slug: "acme",
+                kind: BrandAssetKind::Logo,
+                content_type: "image/png",
+                bytes: &png_bytes,
+                sha256: "abc123",
+                size_bytes: 11,
+            },
+        )
+        .await
+        .expect("upload logo asset");
+
+    // Export: the brand carries its selection fields and the asset metadata by reference.
+    let snapshot = export_snapshot(&control.scoped(scope))
+        .await
+        .expect("export snapshot");
+    assert_eq!(snapshot.resources.brand.len(), 1);
+    let exported = &snapshot.resources.brand[0];
+    assert_eq!(exported.host_pattern.as_deref(), Some("login.acme.test"));
+    assert_eq!(exported.client_id.as_deref(), Some("cli_acme"));
+    assert_eq!(exported.assets.len(), 1, "one asset metadata carried");
+    assert_eq!(exported.assets[0].kind, "logo");
+    assert_eq!(exported.assets[0].content_type, "image/png");
+    assert_eq!(exported.assets[0].sha256, "abc123");
+    assert_eq!(exported.assets[0].size_bytes, 11);
+
+    // The exported bytes validate, and a re-export is byte-identical (deterministic).
+    let bytes = snapshot.to_canonical_bytes().expect("canonical bytes");
+    validate_document(&bytes).expect("the exported brand must validate");
+    let again = export_snapshot(&control.scoped(scope))
+        .await
+        .expect("re-export")
+        .to_canonical_bytes()
+        .expect("canonical bytes");
+    assert_eq!(bytes, again, "a re-export is byte-identical");
+}
+
+#[tokio::test]
+async fn a_brand_asset_reads_back_on_the_data_plane_and_deletes() {
+    // Issue #86, PR 3: an asset uploaded on the control plane reads back on the data-plane role
+    // (the serve read), and a delete removes it (a subsequent read is absent).
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let control = db.control_store();
+    let app = db.store();
+
+    let id = BrandId::generate(&env, &scope);
+    control
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .brands()
+        .set(&env, &id, 1_000_000, set_brand("acme", true, "Acme"))
+        .await
+        .expect("set brand");
+
+    let favicon_bytes = [0x00, 0x00, 0x01, 0x00, 0x10, 0x20];
+    control
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .brand_assets()
+        .set(
+            &env,
+            &id,
+            2_000_000,
+            NewBrandAsset {
+                brand_slug: "acme",
+                kind: BrandAssetKind::Favicon,
+                content_type: "image/x-icon",
+                bytes: &favicon_bytes,
+                sha256: "deadbeef",
+                size_bytes: 6,
+            },
+        )
+        .await
+        .expect("upload favicon");
+
+    // The DATA-plane role reads the serve projection (sniffed type, bytes, sha256).
+    let record = app
+        .scoped(scope)
+        .brands()
+        .get_asset("acme", BrandAssetKind::Favicon)
+        .await
+        .expect("read asset")
+        .expect("asset exists");
+    assert_eq!(record.content_type, "image/x-icon");
+    assert_eq!(record.bytes, favicon_bytes.to_vec());
+    assert_eq!(record.sha256, "deadbeef");
+
+    // Delete removes it (audited); a subsequent read is absent.
+    control
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .brand_assets()
+        .delete(&env, &id, "acme", BrandAssetKind::Favicon)
+        .await
+        .expect("delete asset");
+    assert!(
+        app.scoped(scope)
+            .brands()
+            .get_asset("acme", BrandAssetKind::Favicon)
+            .await
+            .expect("read after delete")
+            .is_none(),
+        "the asset is gone after delete"
+    );
 }
 
 #[tokio::test]

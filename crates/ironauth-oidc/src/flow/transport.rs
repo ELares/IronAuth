@@ -32,17 +32,27 @@ use super::{
     Continuation, FLOW_CONTRACT_HEADER, FlowError, Submission, TransportAuth, create_flow, drive,
     message::Message, parse_api_submission, parse_form_transient_payload,
 };
+use crate::branding::{BrandCandidate, select_brand};
 use crate::hints::InteractionHints;
 use crate::interaction;
 use crate::pages;
 use crate::state::OidcState;
+use crate::util::query_get;
 use crate::wellknown::parse_scope;
+use ironauth_store::BrandAssetKind;
 
 /// The served flow stylesheet path (issue #85, FORK C): a scope routed, same origin
 /// `text/css` asset the hosted flow render app links from its `<head>`, so the browser
 /// fetches the ONE embedded stylesheet under the `style-src 'self'` CSP. Gated behind
 /// `flows.enabled` like every flow route (a uniform 404 when off).
 pub const FLOW_STYLESHEET_PATH: &str = "/t/{tenant_id}/e/{environment_id}/pages.css";
+
+/// The served brand asset path (issue #86, PR 3): a scope routed, same origin GET that streams a
+/// brand's stored raster (`{kind}` is `logo` or `favicon`) with SERVER-FIXED headers only (the
+/// sniffed `Content-Type`, `nosniff`, and a sha256 `ETag`). The flow page's `<img>` and favicon
+/// `<link>` point here, loaded under the page's `img-src 'self'`. Gated behind `flows.enabled`
+/// like every flow route (a uniform 404 when off, or when the asset is absent).
+pub const FLOW_BRAND_ASSET_PATH: &str = "/t/{tenant_id}/e/{environment_id}/brand/{slug}/{kind}";
 
 /// The browser transport path (GET creates and renders, POST submits): scope routed under
 /// the per environment issuer path so the flow runs under the right row level security
@@ -298,6 +308,7 @@ pub async fn flow_browser_get(
     State(state): State<OidcState>,
     Path((tenant_id, environment_id, journey)): Path<(String, String, String)>,
     Query(query): Query<BrowserCreateQuery>,
+    headers: HeaderMap,
 ) -> Response {
     if !state.flows_enabled() {
         return disabled_not_found();
@@ -320,7 +331,7 @@ pub async fn flow_browser_get(
     .await
     {
         Ok((_id, _submit_token, flow)) => with_contract_header(
-            render_browser_flow(&state, scope, &tenant_id, &environment_id, &flow).await,
+            render_browser_flow(&state, scope, &tenant_id, &environment_id, &flow, &headers).await,
         ),
         Err(error) => error_html(error),
     }
@@ -382,7 +393,7 @@ pub async fn flow_browser_post(
     .await
     {
         Ok(Continuation::Render { flow, .. }) => with_contract_header(
-            render_browser_flow(&state, scope, &tenant_id, &environment_id, &flow).await,
+            render_browser_flow(&state, scope, &tenant_id, &environment_id, &flow, &headers).await,
         ),
         Ok(Continuation::Complete { session, return_to }) => {
             if let Some(target) = return_to {
@@ -422,6 +433,7 @@ pub async fn flow_browser_post(
 pub async fn flow_stylesheet(
     State(state): State<OidcState>,
     Path((tenant_id, environment_id)): Path<(String, String)>,
+    Query(query): Query<StylesheetQuery>,
 ) -> Response {
     if !state.flows_enabled() {
         return disabled_not_found();
@@ -432,36 +444,156 @@ pub async fn flow_stylesheet(
     let Some(scope) = parse_scope(&tenant_id, &environment_id) else {
         return pages::stylesheet_response();
     };
-    match resolve_env_brand(&state, scope).await {
-        Some(brand) => pages::css_response(pages::brand_stylesheet(
-            &brand.tokens,
-            brand.tokens_dark.as_ref(),
-        )),
-        None => pages::stylesheet_response(),
+    // The flow page routes the stylesheet to the SAME brand it rendered by threading the resolved
+    // brand slug as `?b={slug}` (issue #86, PR 3): read that exact brand's tokens so the page and
+    // its stylesheet never diverge under per-client / per-domain selection. An absent or unknown
+    // slug (a bare stylesheet fetch, or an unbranded environment) falls back to the byte-identical
+    // neutral stylesheet.
+    let Some(slug) = query.b else {
+        return pages::stylesheet_response();
+    };
+    match state.store().scoped(scope).brands().get(&slug).await {
+        Ok(Some(record)) => {
+            let brand = brand_from_record(record);
+            pages::css_response(pages::brand_stylesheet(
+                &brand.tokens,
+                brand.tokens_dark.as_ref(),
+            ))
+        }
+        _ => pages::stylesheet_response(),
     }
 }
 
-/// Resolve the environment's DEFAULT brand for rendering (issue #86): read the default brand
-/// row and build the typed, sanitized [`crate::branding::Brand`] from it. Returns [`None`]
-/// when the environment has no brand installed OR the read fails, so the render path uses the
-/// neutral default (unchanged from issue #85) and a store hiccup never breaks a page. Per env
-/// selection only in PR1; per domain / per client selection is deferred to PR3.
-async fn resolve_env_brand(state: &OidcState, scope: Scope) -> Option<crate::branding::Brand> {
-    let record = state
+/// The brand asset serve GET (issue #86, PR 3): stream a brand's stored raster (`logo` or
+/// `favicon`) with SERVER-FIXED headers only. Gated behind `flows.enabled` like every flow route
+/// (a uniform 404 when off). An unknown scope, an unknown kind, or an absent asset is the SAME
+/// uniform 404, so the serve path discloses nothing about which brands or assets exist.
+pub async fn flow_brand_asset(
+    State(state): State<OidcState>,
+    Path((tenant_id, environment_id, slug, kind)): Path<(String, String, String, String)>,
+) -> Response {
+    if !state.flows_enabled() {
+        return disabled_not_found();
+    }
+    let Some(scope) = parse_scope(&tenant_id, &environment_id) else {
+        return disabled_not_found();
+    };
+    let Some(kind) = BrandAssetKind::parse(&kind) else {
+        return disabled_not_found();
+    };
+    match state
         .store()
         .scoped(scope)
         .brands()
-        .default_brand()
+        .get_asset(&slug, kind)
         .await
-        .ok()??;
-    Some(crate::branding::Brand::from_stored(
+    {
+        Ok(Some(asset)) => {
+            pages::brand_asset_response(&asset.content_type, asset.bytes, &asset.sha256)
+        }
+        // An absent asset, or a store hiccup, is the uniform not found (no disclosure).
+        _ => disabled_not_found(),
+    }
+}
+
+/// The flow stylesheet query (issue #86, PR 3): the optional resolved brand slug the page routed
+/// its stylesheet to, so the stylesheet resolves the SAME brand's tokens as the page.
+#[derive(Debug, Deserialize)]
+pub struct StylesheetQuery {
+    /// The resolved brand slug (`b`), or absent for the neutral stylesheet.
+    #[serde(default)]
+    b: Option<String>,
+}
+
+/// Build a typed, sanitized [`crate::branding::Brand`] from a stored brand record.
+fn brand_from_record(record: ironauth_store::BrandRecord) -> crate::branding::Brand {
+    crate::branding::Brand::from_stored(
         record.product_name,
         record.show_wordmark,
         record.brand_token,
         &record.tokens_json,
         record.tokens_dark_json.as_deref(),
         &record.slots_json,
-    ))
+    )
+}
+
+/// The brand resolved for one flow request (issue #86, PR 3): the typed, sanitized brand plus its
+/// slug (which routes the served stylesheet and the asset hrefs) and which assets are installed.
+struct ResolvedBrand {
+    /// The typed, sanitized brand (wordmark, slots, tokens).
+    brand: crate::branding::Brand,
+    /// The resolved brand's slug.
+    slug: String,
+    /// Whether the brand has a logo installed.
+    has_logo: bool,
+    /// Whether the brand has a favicon installed.
+    has_favicon: bool,
+}
+
+/// Resolve the brand for one request by the per-CLIENT > per-DOMAIN > env-DEFAULT > NEUTRAL
+/// precedence (issue #86, PR 3): read the scope's brands, run the pure [`select_brand`] precedence
+/// over the request Host and `client_id`, and build the typed brand plus its installed-asset
+/// flags. Returns [`None`] when the environment has no brand OR nothing matches and no default is
+/// installed OR a read fails, so the render path uses the neutral default (unchanged from issue
+/// #85) and a store hiccup never breaks a page.
+async fn resolve_brand(
+    state: &OidcState,
+    scope: Scope,
+    host: Option<&str>,
+    client_id: Option<&str>,
+) -> Option<ResolvedBrand> {
+    let records = state
+        .store()
+        .scoped(scope)
+        .brands()
+        .list_all()
+        .await
+        .unwrap_or_default();
+    if records.is_empty() {
+        return None;
+    }
+    // Run the pure precedence over the candidate rows, then take the chosen owned record.
+    let index = {
+        let candidates: Vec<BrandCandidate<'_>> = records
+            .iter()
+            .map(|record| BrandCandidate {
+                slug: &record.slug,
+                is_default: record.is_default,
+                host_pattern: record.host_pattern.as_deref(),
+                client_id: record.client_id.as_deref(),
+            })
+            .collect();
+        select_brand(&candidates, host, client_id)
+    }?;
+    let chosen = records.into_iter().nth(index)?;
+    let slug = chosen.slug.clone();
+    // Which assets are installed for the chosen brand (metadata only, no bytes): a store hiccup
+    // fails safe to "no assets", so the page renders with no logo / favicon rather than erroring.
+    let assets = state
+        .store()
+        .scoped(scope)
+        .brands()
+        .asset_metadata(&slug)
+        .await
+        .unwrap_or_default();
+    let has_logo = assets.iter().any(|meta| meta.kind == BrandAssetKind::Logo);
+    let has_favicon = assets
+        .iter()
+        .any(|meta| meta.kind == BrandAssetKind::Favicon);
+    Some(ResolvedBrand {
+        brand: brand_from_record(chosen),
+        slug,
+        has_logo,
+        has_favicon,
+    })
+}
+
+/// The request Host for per-domain brand selection (issue #86, PR 3): the `Host` header value as
+/// a borrowed str, or [`None`] when absent or non-ASCII. [`select_brand`] normalizes it.
+fn request_host(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
 }
 
 /// Resolve the end user's locale for rendering (issue #86, PR 2): read the environment's
@@ -515,33 +647,42 @@ async fn render_browser_flow(
     tenant_id: &str,
     environment_id: &str,
     flow: &Flow,
+    headers: &HeaderMap,
 ) -> Response {
     let scope_path = format!("/t/{tenant_id}/e/{environment_id}");
-    // Honor the authorization request UX parameters surfaced through the flow contract: the
-    // resume target is a local `/authorize?...` URL carrying `ui_locales` and `display`, so
-    // reconstruct the typed hints from its query (absent or unparsable falls back to the
-    // neutral default, an English `page` shell).
-    let hints = flow
+    // The resume target is a local `/authorize?...` URL carrying the UX parameters through the
+    // flow contract; split its query once and reuse it for both the hints and the per-client
+    // brand selection (the `client_id` the request named).
+    let request_query = flow
         .request_url
         .as_deref()
         .and_then(|url| url.split_once('?'))
-        .map_or_else(InteractionHints::default, |(_, query)| {
-            InteractionHints::from_query(query)
-        });
+        .map(|(_, query)| query);
+    // Honor the authorization request UX parameters surfaced through the flow contract (absent or
+    // unparsable falls back to the neutral default, an English `page` shell).
+    let hints = request_query.map_or_else(InteractionHints::default, InteractionHints::from_query);
     // Resolve the locale from the SAME `ui_locales` the hints carry, against this environment's
     // installed bundles (issue #86). No bundles resolves to neutral English (byte-identical).
     let locale = resolve_env_locale(state, scope, &hints).await;
     let banner = state.environment_banner(&scope).await;
-    // The per environment brand (issue #86): the resolved default brand fills the wordmark
-    // fields and the sanitized rich-text slots; a NULL/absent brand keeps the neutral default
-    // (unchanged from issue #85). The design tokens drive the SERVED stylesheet (a separate
-    // request), never inline style, so the strict CSP is untouched.
-    let theme = match resolve_env_brand(state, scope).await {
-        Some(brand) => PageTheme {
-            product_name: brand.product_name,
-            show_wordmark: brand.show_wordmark,
-            brand_token: brand.brand_token,
-            slots: brand.slots,
+    // The per environment brand (issue #86, PR 3): resolve by the per-CLIENT > per-DOMAIN >
+    // env-DEFAULT > NEUTRAL precedence over the request Host and the authorize `client_id`. The
+    // resolved brand fills the wordmark fields and the sanitized rich-text slots, and its slug
+    // routes the served stylesheet (`?b={slug}`) and the same origin asset hrefs; a NULL/absent
+    // brand keeps the neutral default (byte-identical to before PR 3). The design tokens drive
+    // the SERVED stylesheet (a separate request), never inline style, so the strict CSP is
+    // untouched.
+    let host = request_host(headers);
+    let client_id = request_query.and_then(|query| query_get(query, "client_id"));
+    let theme = match resolve_brand(state, scope, host, client_id.as_deref()).await {
+        Some(resolved) => PageTheme {
+            product_name: resolved.brand.product_name,
+            show_wordmark: resolved.brand.show_wordmark,
+            brand_token: resolved.brand.brand_token,
+            slots: resolved.brand.slots,
+            asset_slug: Some(resolved.slug),
+            has_logo: resolved.has_logo,
+            has_favicon: resolved.has_favicon,
         },
         None => PageTheme::default(),
     };

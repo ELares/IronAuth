@@ -40,6 +40,14 @@ pub struct NewBrand<'a> {
     /// The serialized sanitized rich-text slots (a JSON object of slot key to sanitized
     /// markup string), stored verbatim as `jsonb`.
     pub slots_json: &'a str,
+    /// The per-environment per-DOMAIN selection key (issue #86, PR 3): the normalized Host
+    /// this brand is selected for, or [`None`]. Within a scope, no two brands may claim the
+    /// same host (a partial unique index enforces it).
+    pub host_pattern: Option<&'a str>,
+    /// The per-environment per-CLIENT selection key (issue #86, PR 3): the authorize request
+    /// `client_id` this brand is selected for, or [`None`]. Within a scope, no two brands may
+    /// claim the same client id (a partial unique index enforces it).
+    pub client_id: Option<&'a str>,
 }
 
 /// A stored brand, read back (issue #86). The renderer resolves the typed tokens and
@@ -65,4 +73,89 @@ pub struct BrandRecord {
     pub tokens_dark_json: Option<String>,
     /// The serialized sanitized rich-text slots (a JSON object).
     pub slots_json: String,
+    /// The per-DOMAIN selection key (issue #86, PR 3): the normalized Host this brand is
+    /// selected for, or [`None`].
+    pub host_pattern: Option<String>,
+    /// The per-CLIENT selection key (issue #86, PR 3): the authorize `client_id` this brand
+    /// is selected for, or [`None`].
+    pub client_id: Option<String>,
+}
+
+/// A brand asset kind (issue #86, PR 3): the closed set of per-brand raster chrome. A logo
+/// renders as an `<img>` on the flow page; a favicon rides the `<link rel="icon">`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BrandAssetKind {
+    /// The brand logo (`<img>`). Accepts PNG, WebP, or JPEG.
+    Logo,
+    /// The brand favicon (`<link rel="icon">`). Accepts PNG, WebP, JPEG, or ICO.
+    Favicon,
+}
+
+impl BrandAssetKind {
+    /// Every asset kind, in a stable order.
+    pub const ALL: [BrandAssetKind; 2] = [BrandAssetKind::Logo, BrandAssetKind::Favicon];
+
+    /// The stable wire key this kind stores under (the `kind` column and the serve path).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BrandAssetKind::Logo => "logo",
+            BrandAssetKind::Favicon => "favicon",
+        }
+    }
+
+    /// Parse a stored / path kind key back to a kind, or [`None`] for an unknown key.
+    #[must_use]
+    pub fn parse(key: &str) -> Option<Self> {
+        BrandAssetKind::ALL.into_iter().find(|k| k.as_str() == key)
+    }
+}
+
+/// A brand asset to upload or overwrite (issue #86, PR 3). The `content_type` is the SNIFFED
+/// media type (the magic-byte sniff of `bytes`, never the client's declared header), the
+/// `sha256` is the lowercase hex digest, and `size_bytes` is the payload length. The bytes are
+/// bounded by the store's size CHECK and by the per-kind cap enforced at ingest.
+#[derive(Debug, Clone, Copy)]
+pub struct NewBrandAsset<'a> {
+    /// The brand's per-environment natural key within scope (the brand this asset belongs to).
+    pub brand_slug: &'a str,
+    /// The asset kind (logo or favicon).
+    pub kind: BrandAssetKind,
+    /// The SNIFFED media type of the bytes (never the client's declared header).
+    pub content_type: &'a str,
+    /// The raster payload bytes.
+    pub bytes: &'a [u8],
+    /// The lowercase hex sha256 digest of the bytes.
+    pub sha256: &'a str,
+    /// The payload length in bytes.
+    pub size_bytes: i32,
+}
+
+/// A stored brand asset read back for the serve path (issue #86, PR 3): the sniffed content
+/// type, the raster bytes, and the sha256 the serve path turns into a strong `ETag` validator.
+#[derive(Debug, Clone)]
+pub struct BrandAssetRecord {
+    /// The sniffed media type (the server-fixed `Content-Type` the serve path sets).
+    pub content_type: String,
+    /// The raster payload bytes streamed to the browser.
+    pub bytes: Vec<u8>,
+    /// The lowercase hex sha256 digest (the strong `ETag` validator).
+    pub sha256: String,
+}
+
+/// The METADATA of a stored brand asset, WITHOUT the bytes (issue #86, PR 3): the by-reference
+/// projection the brand snapshot carries and the render path uses to decide which asset hrefs
+/// to thread. The bytes stay in the store and travel on the deferred promotion apply.
+#[derive(Debug, Clone)]
+pub struct BrandAssetMeta {
+    /// The brand this asset belongs to.
+    pub brand_slug: String,
+    /// The asset kind (logo or favicon).
+    pub kind: BrandAssetKind,
+    /// The sniffed media type.
+    pub content_type: String,
+    /// The lowercase hex sha256 digest.
+    pub sha256: String,
+    /// The payload length in bytes.
+    pub size_bytes: i32,
 }

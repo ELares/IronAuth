@@ -43,6 +43,7 @@
 
 mod auth;
 mod bans;
+mod brand_assets;
 mod config;
 mod connectors;
 mod dcr;
@@ -291,6 +292,18 @@ pub fn management_router(state: AdminState) -> Router {
             put(locales::set_locale)
                 .get(locales::get_locale)
                 .delete(locales::delete_locale),
+        )
+        // Per-environment brand assets (issue #86, PR 3): upload (magic-byte sniffed, size capped,
+        // sudo gated) or delete a brand's logo / favicon. The `/logo` and `/favicon` static
+        // suffixes are siblings of the parameterized `{slug}`; the router matches them as fixed
+        // segments.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}/logo",
+            put(brand_assets::set_brand_logo).delete(brand_assets::delete_brand_logo),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}/favicon",
+            put(brand_assets::set_brand_favicon).delete(brand_assets::delete_brand_favicon),
         )
         // Session and refresh-family fleet operations (issue #32). The static
         // `/sessions/revoke` (the bulk surface) and the parameterized

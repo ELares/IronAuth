@@ -57,7 +57,9 @@ use sqlx::{PgConnection, Postgres, Row, Transaction};
 
 use crate::abuse::{AbuseBanView, AbuseSubject, AbuseSubjectKind, AuthPath, NewBan};
 use crate::audit::{ActingContext, Action, ActorRef};
-use crate::brand::{BrandRecord, NewBrand};
+use crate::brand::{
+    BrandAssetKind, BrandAssetMeta, BrandAssetRecord, BrandRecord, NewBrand, NewBrandAsset,
+};
 use crate::classification::ResourceType;
 use crate::connector::{ConnectorCapabilities, ConnectorRecord, NewConnector, StoredCapabilities};
 use crate::custom_domain::{
@@ -1343,6 +1345,20 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn brands(&self) -> ActingBrandRepo<'a> {
         ActingBrandRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating per-environment brand ASSET repository for this scope and actor (issue #86,
+    /// PR 3): upload (create or overwrite) and delete a brand's magic-byte-sniffed raster,
+    /// audited against the owning brand's id. The bytes are stored already sniffed and size
+    /// capped by the admin asset path. Every write carries the actor and correlation id into its
+    /// audit row.
+    #[must_use]
+    pub fn brand_assets(&self) -> ActingBrandAssetRepo<'a> {
+        ActingBrandAssetRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -20717,7 +20733,7 @@ impl BrandRepo<'_> {
         let row = sqlx::query(
             "SELECT id, slug, is_default, product_name, show_wordmark, brand_token, \
                     tokens::text AS tokens, tokens_dark::text AS tokens_dark, \
-                    slots::text AS slots \
+                    slots::text AS slots, host_pattern, client_id \
              FROM brands \
              WHERE tenant_id = $1 AND environment_id = $2 AND is_default \
              LIMIT 1",
@@ -20741,7 +20757,7 @@ impl BrandRepo<'_> {
         let row = sqlx::query(
             "SELECT id, slug, is_default, product_name, show_wordmark, brand_token, \
                     tokens::text AS tokens, tokens_dark::text AS tokens_dark, \
-                    slots::text AS slots \
+                    slots::text AS slots, host_pattern, client_id \
              FROM brands \
              WHERE tenant_id = $1 AND environment_id = $2 AND slug = $3",
         )
@@ -20766,7 +20782,7 @@ impl BrandRepo<'_> {
         let rows = sqlx::query(
             "SELECT id, slug, is_default, product_name, show_wordmark, brand_token, \
                     tokens::text AS tokens, tokens_dark::text AS tokens_dark, \
-                    slots::text AS slots \
+                    slots::text AS slots, host_pattern, client_id \
              FROM brands \
              WHERE tenant_id = $1 AND environment_id = $2 ORDER BY slug",
         )
@@ -20777,6 +20793,99 @@ impl BrandRepo<'_> {
         tx.commit().await?;
         Ok(rows.iter().map(brand_from_row).collect())
     }
+
+    /// A brand asset by (slug, kind) within scope (issue #86, PR 3), or [`None`] when no such
+    /// asset exists. This is the data-plane serve read: it returns the SNIFFED content type, the
+    /// raster bytes, and the sha256 the serve path turns into a strong `ETag` validator.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn get_asset(
+        &self,
+        slug: &str,
+        kind: BrandAssetKind,
+    ) -> Result<Option<BrandAssetRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT content_type, bytes, sha256 \
+             FROM brand_assets \
+             WHERE tenant_id = $1 AND environment_id = $2 AND brand_slug = $3 AND kind = $4",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(slug)
+        .bind(kind.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| BrandAssetRecord {
+            content_type: row.get("content_type"),
+            bytes: row.get("bytes"),
+            sha256: row.get("sha256"),
+        }))
+    }
+
+    /// The METADATA of the assets installed for one brand within scope (issue #86, PR 3),
+    /// ordered by kind, WITHOUT the bytes. The render path uses it to decide which asset hrefs to
+    /// thread onto the page; the brand snapshot uses it to carry the by-reference asset metadata.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn asset_metadata(&self, slug: &str) -> Result<Vec<BrandAssetMeta>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT brand_slug, kind, content_type, sha256, size_bytes \
+             FROM brand_assets \
+             WHERE tenant_id = $1 AND environment_id = $2 AND brand_slug = $3 \
+             ORDER BY kind",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(slug)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows.iter().filter_map(brand_asset_meta_from_row).collect())
+    }
+
+    /// EVERY brand asset's METADATA in this scope (no pagination), ordered by (`brand_slug`, kind):
+    /// the set the config-snapshot export (issue #43) carries by reference under each brand. The
+    /// bytes are NOT read here; they travel on the deferred promotion apply.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_all_asset_metadata(&self) -> Result<Vec<BrandAssetMeta>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT brand_slug, kind, content_type, sha256, size_bytes \
+             FROM brand_assets \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+             ORDER BY brand_slug, kind",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows.iter().filter_map(brand_asset_meta_from_row).collect())
+    }
+}
+
+/// Build a [`BrandAssetMeta`] from a `brand_assets` row. A row whose `kind` is not a recognized
+/// [`BrandAssetKind`] is dropped (the CHECK makes this unreachable in practice, but the parse
+/// keeps the projection total without a panic).
+fn brand_asset_meta_from_row(row: &sqlx::postgres::PgRow) -> Option<BrandAssetMeta> {
+    let kind = BrandAssetKind::parse(&row.get::<String, _>("kind"))?;
+    Some(BrandAssetMeta {
+        brand_slug: row.get("brand_slug"),
+        kind,
+        content_type: row.get("content_type"),
+        sha256: row.get("sha256"),
+        size_bytes: row.get("size_bytes"),
+    })
 }
 
 /// Build a [`BrandRecord`] from a `brands` row (the shared read projection).
@@ -20791,6 +20900,8 @@ fn brand_from_row(row: &sqlx::postgres::PgRow) -> BrandRecord {
         tokens_json: row.get("tokens"),
         tokens_dark_json: row.get("tokens_dark"),
         slots_json: row.get("slots"),
+        host_pattern: row.get("host_pattern"),
+        client_id: row.get("client_id"),
     }
 }
 
@@ -20843,6 +20954,8 @@ impl ActingBrandRepo<'_> {
         let tokens = params.tokens_json.to_owned();
         let tokens_dark = params.tokens_dark_json.map(str::to_owned);
         let slots = params.slots_json.to_owned();
+        let host_pattern = params.host_pattern.map(str::to_owned);
+        let client_id = params.client_id.map(str::to_owned);
         write_audited(
             AuditedWrite {
                 store: self.store,
@@ -20872,8 +20985,10 @@ impl ActingBrandRepo<'_> {
                 sqlx::query(
                     "INSERT INTO brands \
                      (id, tenant_id, environment_id, slug, is_default, product_name, \
-                      show_wordmark, brand_token, tokens, tokens_dark, slots, created_at, updated_at) \
+                      show_wordmark, brand_token, tokens, tokens_dark, slots, \
+                      host_pattern, client_id, created_at, updated_at) \
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb, $11::jsonb, \
+                             $13, $14, \
                              TIMESTAMPTZ 'epoch' + ($12::text || ' microseconds')::interval, \
                              TIMESTAMPTZ 'epoch' + ($12::text || ' microseconds')::interval) \
                      ON CONFLICT (tenant_id, environment_id, slug) DO UPDATE \
@@ -20884,6 +20999,8 @@ impl ActingBrandRepo<'_> {
                          tokens = EXCLUDED.tokens, \
                          tokens_dark = EXCLUDED.tokens_dark, \
                          slots = EXCLUDED.slots, \
+                         host_pattern = EXCLUDED.host_pattern, \
+                         client_id = EXCLUDED.client_id, \
                          updated_at = EXCLUDED.updated_at",
                 )
                 .bind(target.to_string())
@@ -20898,6 +21015,8 @@ impl ActingBrandRepo<'_> {
                 .bind(tokens_dark.as_deref())
                 .bind(&slots)
                 .bind(created_micros)
+                .bind(host_pattern.as_deref())
+                .bind(client_id.as_deref())
                 .execute(&mut **tx)
                 .await?;
                 Ok(())
@@ -20921,6 +21040,143 @@ impl ActingBrandRepo<'_> {
         .await?;
         tx.commit().await?;
         Ok(row.map(|row| row.get::<String, _>("id")))
+    }
+}
+
+/// The mutating per-environment brand ASSET repository for one scope and actor (issue #86, PR
+/// 3): upload (create or overwrite) and delete a brand's magic-byte-sniffed raster, audited. The
+/// bytes and the SNIFFED content type are stored verbatim (the admin asset path sniffs and size
+/// caps before the write); the write is audited against the owning brand's id.
+pub struct ActingBrandAssetRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingBrandAssetRepo<'_> {
+    /// Upload a brand asset (a first write or an overwrite) and audit `brand.asset.set` in the
+    /// same transaction (issue #86, PR 3). One row per (scope, `brand_slug`, kind): a repeat write
+    /// overwrites the stored bytes in place. `brand_id` is the owning brand's id (the audit
+    /// target); the caller has already confirmed the brand exists and sniffed / size-capped the
+    /// bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `brand_id` is out of scope; [`StoreError::Database`] on a
+    /// persistence failure.
+    pub async fn set(
+        &self,
+        env: &Env,
+        brand_id: &BrandId,
+        created_at_micros: i64,
+        params: NewBrandAsset<'_>,
+    ) -> Result<(), StoreError> {
+        if brand_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let target = *brand_id;
+        let scope = self.scope;
+        let brand_slug = params.brand_slug.to_owned();
+        let kind = params.kind.as_str();
+        let content_type = params.content_type.to_owned();
+        let bytes = params.bytes.to_vec();
+        let sha256 = params.sha256.to_owned();
+        let size_bytes = params.size_bytes;
+        let created_micros = created_at_micros;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::BrandAssetSet,
+                target: &target,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "INSERT INTO brand_assets \
+                     (tenant_id, environment_id, brand_slug, kind, content_type, bytes, sha256, \
+                      size_bytes, created_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, \
+                             TIMESTAMPTZ 'epoch' + ($9::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($9::text || ' microseconds')::interval) \
+                     ON CONFLICT (tenant_id, environment_id, brand_slug, kind) DO UPDATE \
+                     SET content_type = EXCLUDED.content_type, \
+                         bytes = EXCLUDED.bytes, \
+                         sha256 = EXCLUDED.sha256, \
+                         size_bytes = EXCLUDED.size_bytes, \
+                         updated_at = EXCLUDED.updated_at",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&brand_slug)
+                .bind(kind)
+                .bind(&content_type)
+                .bind(&bytes)
+                .bind(&sha256)
+                .bind(size_bytes)
+                .bind(created_micros)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Delete a brand asset by (slug, kind) and audit `brand.asset.delete` in the same
+    /// transaction (issue #86, PR 3). A delete of an id out of scope, or of an asset with no row,
+    /// is a uniform [`StoreError::NotFound`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `brand_id` is out of scope or the asset is absent;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn delete(
+        &self,
+        env: &Env,
+        brand_id: &BrandId,
+        brand_slug: &str,
+        kind: BrandAssetKind,
+    ) -> Result<(), StoreError> {
+        if brand_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let target = *brand_id;
+        let scope = self.scope;
+        let brand_slug = brand_slug.to_owned();
+        let kind = kind.as_str();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::BrandAssetDelete,
+                target: &target,
+            },
+            async move |tx| {
+                let affected = sqlx::query(
+                    "DELETE FROM brand_assets \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND brand_slug = $3 AND kind = $4",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&brand_slug)
+                .bind(kind)
+                .execute(&mut **tx)
+                .await?
+                .rows_affected();
+                // A delete of an absent asset rolls back the audit row too (a uniform not-found).
+                if affected == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
     }
 }
 

@@ -43,6 +43,7 @@ use super::message::{self, Message, MessageContext};
 use super::model::{Autocomplete, Flow, FlowStateTag, InputType, Node, NodeAttributes, NodeGroup};
 use crate::hints::InteractionHints;
 use crate::pages;
+use crate::util::percent_encode_query;
 
 /// The bounded, server known theme render context (issue #85, the seam issue #86 fills). It
 /// carries NO customer supplied HTML: every field is a server known string escaped on render,
@@ -64,6 +65,17 @@ pub struct PageTheme {
     /// allowlist-sanitizer output, so a slot renders safe markup by construction. The
     /// neutral default carries no slots (an unbranded page renders no extra chrome).
     pub slots: crate::branding::BrandSlots,
+    /// The resolved brand's slug (issue #86, PR 3), or [`None`] for the neutral default. It routes
+    /// the served stylesheet (`.../pages.css?b={slug}`, so the page and its stylesheet resolve the
+    /// SAME brand's tokens) and the same origin asset hrefs. The neutral default carries none, so
+    /// the stylesheet href stays the byte-identical `.../pages.css`.
+    pub asset_slug: Option<String>,
+    /// Whether the resolved brand has a logo installed (issue #86, PR 3). When true (and a slug is
+    /// present) a same origin `<img>` is emitted under `img-src 'self'`; else no `<img>` renders.
+    pub has_logo: bool,
+    /// Whether the resolved brand has a favicon installed (issue #86, PR 3). When true (and a slug
+    /// is present) a same origin `<link rel="icon">` is emitted; else no icon link renders.
+    pub has_favicon: bool,
 }
 
 impl Default for PageTheme {
@@ -73,6 +85,9 @@ impl Default for PageTheme {
             show_wordmark: true,
             brand_token: None,
             slots: crate::branding::BrandSlots::default(),
+            asset_slug: None,
+            has_logo: false,
+            has_favicon: false,
         }
     }
 }
@@ -122,8 +137,23 @@ pub(crate) fn render_flow_page(
     // page is byte-identical to before PR 2.
     let title = localize(flow_title(flow), &MessageContext::empty(), locale);
 
+    // The scope-routed brand asset hrefs (issue #86, PR 3): built from the resolved brand slug
+    // (percent-encoded for the path / query) so the page and its stylesheet resolve the SAME
+    // brand. The neutral default carries no slug, so no asset href is built and the page stays
+    // byte-identical to before PR 3.
+    let logo_href = theme
+        .asset_slug
+        .as_deref()
+        .filter(|_| theme.has_logo)
+        .map(|slug| format!("{scope_path}/brand/{}/logo", percent_encode_query(slug)));
+    let favicon_href = theme
+        .asset_slug
+        .as_deref()
+        .filter(|_| theme.has_favicon)
+        .map(|slug| format!("{scope_path}/brand/{}/favicon", percent_encode_query(slug)));
+
     let mut inner = String::new();
-    inner.push_str(&brand_header(theme));
+    inner.push_str(&brand_header(theme, logo_href.as_deref()));
     inner.push_str("<main class=\"page\">");
     inner.push_str("<h1>");
     inner.push_str(&pages::escape_html(&title));
@@ -170,7 +200,13 @@ pub(crate) fn render_flow_page(
     }
     inner.push_str("</main>");
 
-    let stylesheet_href = format!("{scope_path}/pages.css");
+    // The served stylesheet href carries the resolved brand slug (issue #86, PR 3), so the
+    // stylesheet request resolves the SAME brand's tokens as this page (per-client / per-domain
+    // consistency). With no brand the href is the byte-identical neutral `.../pages.css`.
+    let stylesheet_href = match theme.asset_slug.as_deref() {
+        Some(slug) => format!("{scope_path}/pages.css?b={}", percent_encode_query(slug)),
+        None => format!("{scope_path}/pages.css"),
+    };
     // The document shell reflects the RESOLVED locale, not the raw request: `<html lang>` is
     // the tag actually rendered (the honest set), and `<html dir>` is its text direction (issue
     // #86). The `display` layout hint still comes from the request hints.
@@ -182,6 +218,7 @@ pub(crate) fn render_flow_page(
         locale.direction().as_str(),
         environment_banner,
         Some(&stylesheet_href),
+        favicon_href.as_deref(),
     );
     RenderedPage {
         body,
@@ -192,13 +229,24 @@ pub(crate) fn render_flow_page(
 /// The bounded theme wordmark header (issue #85): the product name plus an optional brand
 /// token, each escaped on render. Empty when the theme hides the wordmark and carries no
 /// token, so a neutral render adds no chrome.
-fn brand_header(theme: &PageTheme) -> String {
+fn brand_header(theme: &PageTheme, logo_href: Option<&str>) -> String {
     let mut out = String::new();
     let wordmark = theme.show_wordmark && !theme.product_name.is_empty();
-    if !wordmark && theme.brand_token.is_none() {
+    if !wordmark && theme.brand_token.is_none() && logo_href.is_none() {
         return out;
     }
     out.push_str("<header data-brand>");
+    // The brand logo (issue #86, PR 3): a same origin `<img>` under `img-src 'self'`, with the
+    // product name as its alt text (escaped). The src is a server known scope routed path, never
+    // customer supplied HTML. Absent for the neutral default (no logo installed), so an unbranded
+    // header is byte-identical.
+    if let Some(href) = logo_href {
+        out.push_str("<img data-brand-logo src=\"");
+        out.push_str(&pages::escape_html(href));
+        out.push_str("\" alt=\"");
+        out.push_str(&pages::escape_html(&theme.product_name));
+        out.push_str("\">");
+    }
     if wordmark {
         out.push_str("<span data-product-name>");
         out.push_str(&pages::escape_html(&theme.product_name));
@@ -720,6 +768,7 @@ mod tests {
             show_wordmark: true,
             brand_token: Some(HOSTILE.to_owned()),
             slots: crate::branding::BrandSlots::default(),
+            ..PageTheme::default()
         };
         let flow = flow_with(
             FlowStateTag::IdentifierPassword,
@@ -780,6 +829,7 @@ mod tests {
             show_wordmark: true,
             brand_token: None,
             slots,
+            ..PageTheme::default()
         };
         let flow = flow_with(
             FlowStateTag::IdentifierPassword,
@@ -845,6 +895,104 @@ mod tests {
         let page = render_default(&flow);
         assert!(!page.body.contains("data-brand-slot"), "{}", page.body);
         assert!(!page.body.contains("data-brand-footer"), "{}", page.body);
+    }
+
+    #[test]
+    fn a_neutral_theme_renders_no_asset_chrome_and_a_plain_stylesheet_href() {
+        // Issue #86, PR 3 no-regression: the neutral default carries no brand slug, so the page
+        // emits NO logo `<img>`, NO favicon `<link rel="icon">`, and the byte-identical plain
+        // `.../pages.css` href (no `?b=` selector). With no image to load, `img-src 'self'` is
+        // inert. This keeps an unbranded page byte-identical to before PR 3.
+        let flow = flow_with(
+            FlowStateTag::IdentifierPassword,
+            Journey::Login,
+            vec![input(
+                NodeGroup::Default,
+                0,
+                "identifier",
+                InputType::Text,
+                None,
+            )],
+            Vec::new(),
+        );
+        let page = render_default(&flow);
+        assert!(
+            !page.body.contains("data-brand-logo"),
+            "no logo img on a neutral page: {}",
+            page.body
+        );
+        assert!(
+            !page.body.contains("rel=\"icon\""),
+            "no favicon link on a neutral page: {}",
+            page.body
+        );
+        assert!(
+            page.body.contains("href=\"/t/tnt/e/env/pages.css\""),
+            "the neutral stylesheet href carries no ?b selector: {}",
+            page.body
+        );
+        assert!(
+            !page.body.contains("pages.css?b="),
+            "no brand selector on the neutral stylesheet href: {}",
+            page.body
+        );
+    }
+
+    #[test]
+    fn a_branded_theme_with_assets_emits_same_origin_logo_favicon_and_scoped_stylesheet() {
+        // Issue #86, PR 3: a resolved brand with a logo + favicon emits a same origin `<img>` and
+        // favicon `<link>` pointing at the scope-routed serve path, and routes the stylesheet to
+        // the SAME brand via `?b={slug}`. All hrefs are same origin (no external host).
+        let flow = flow_with(
+            FlowStateTag::IdentifierPassword,
+            Journey::Login,
+            vec![input(
+                NodeGroup::Default,
+                0,
+                "identifier",
+                InputType::Text,
+                None,
+            )],
+            Vec::new(),
+        );
+        let theme = PageTheme {
+            product_name: "Acme".to_owned(),
+            asset_slug: Some("acme".to_owned()),
+            has_logo: true,
+            has_favicon: true,
+            ..PageTheme::default()
+        };
+        let hints = InteractionHints::default();
+        let locale = ResolvedLocale::default();
+        let page = render_flow_page(&flow, &theme, &hints, &locale, None, SCOPE_PATH, None);
+        assert!(
+            page.body
+                .contains("<img data-brand-logo src=\"/t/tnt/e/env/brand/acme/logo\""),
+            "the logo img points at the scoped serve path: {}",
+            page.body
+        );
+        assert!(
+            page.body
+                .contains("<link rel=\"icon\" href=\"/t/tnt/e/env/brand/acme/favicon\">"),
+            "the favicon link points at the scoped serve path: {}",
+            page.body
+        );
+        assert!(
+            page.body.contains("href=\"/t/tnt/e/env/pages.css?b=acme\""),
+            "the stylesheet routes to the same brand: {}",
+            page.body
+        );
+        // Every referenced host is same origin: no external URL appears.
+        assert!(
+            !page.body.contains("http://"),
+            "no external host: {}",
+            page.body
+        );
+        assert!(
+            !page.body.contains("https://"),
+            "no external host: {}",
+            page.body
+        );
     }
 
     #[test]

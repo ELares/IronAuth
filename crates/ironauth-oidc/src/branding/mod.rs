@@ -21,9 +21,11 @@
 //! branding is deferred to M10; this module reserves the seam without building it.
 
 mod sanitize;
+mod select;
 mod tokens;
 
 pub use sanitize::{SanitizedRichText, sanitize};
+pub use select::{BrandCandidate, normalize_host, select_brand};
 pub use tokens::{Color, DesignTokens, FontFamily, Radius, Space, tokens_to_css};
 
 use std::collections::BTreeMap;

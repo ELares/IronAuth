@@ -21,7 +21,7 @@ use utoipa::{Modify, OpenApi};
 
 use crate::error::ErrorBody;
 use crate::views::{
-    BulkRevocationView, BulkRevokeSessionsRequest, ClientVerificationView,
+    BrandAssetView, BulkRevocationView, BulkRevokeSessionsRequest, ClientVerificationView,
     ConnectorCapabilitiesView, ConnectorHealthView, ConnectorList, ConnectorView,
     CreateConnectorRequest, CreateDcrPolicyRequest, CreateEnvironmentRequest,
     CreateInitialAccessTokenRequest, CreateInvitationRequest, CreateManagementKeyRequest,
@@ -77,6 +77,9 @@ use crate::views::{
         (name = "locales", description = "Per-environment localization bundles: set, get, and \
                                          delete a bundle of numeric message id to plain-text \
                                          render, strict-validated against the message registry"),
+        (name = "brand-assets", description = "Per-environment brand assets: upload (magic-byte \
+                                              sniffed, size-capped, sudo-gated raster) or delete a \
+                                              brand's logo and favicon; svg is refused"),
         (name = "sessions", description = "Session and refresh-family fleet operations: \
                                           search, inspect, revoke (single, bulk, and \
                                           everything-for-a-user with a token-family cascade)"),
@@ -148,6 +151,10 @@ use crate::views::{
         crate::locales::set_locale,
         crate::locales::get_locale,
         crate::locales::delete_locale,
+        crate::brand_assets::set_brand_logo,
+        crate::brand_assets::delete_brand_logo,
+        crate::brand_assets::set_brand_favicon,
+        crate::brand_assets::delete_brand_favicon,
         crate::sessions::list_sessions,
         crate::sessions::get_session,
         crate::sessions::revoke_session,
@@ -224,6 +231,7 @@ use crate::views::{
         ConnectorHealthView,
         SetLocaleRequest,
         LocaleBundleView,
+        BrandAssetView,
         SessionView,
         SessionList,
         RefreshFamilyView,

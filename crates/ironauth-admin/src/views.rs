@@ -1573,3 +1573,20 @@ pub struct LocaleBundleView {
     /// The bundle entries: a map of numeric message id (as a string) to the plain-text render.
     pub entries: std::collections::BTreeMap<String, String>,
 }
+
+/// A stored brand asset's METADATA, as returned by the management API upload (issue #86, PR 3).
+/// The bytes are never echoed back; only the by-reference metadata is (the same shape the brand
+/// snapshot carries).
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct BrandAssetView {
+    /// The brand slug this asset belongs to.
+    pub slug: String,
+    /// The asset kind (`logo` or `favicon`).
+    pub kind: String,
+    /// The SNIFFED media type stored (never the client's declared header).
+    pub content_type: String,
+    /// The lowercase hex sha256 digest of the stored bytes.
+    pub sha256: String,
+    /// The stored payload length in bytes.
+    pub size_bytes: i64,
+}

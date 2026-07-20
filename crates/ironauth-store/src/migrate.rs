@@ -686,6 +686,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0069_locale_bundles.sql"),
         },
+        Migration {
+            version: 70,
+            name: "brand_assets",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0070_brand_assets.sql"),
+        },
     ]
 }
 

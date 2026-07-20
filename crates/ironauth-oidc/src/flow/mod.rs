@@ -49,8 +49,9 @@ pub use localize::{
 };
 pub use schema::{flow_messages_snapshot, flow_object_schema};
 pub use transport::{
-    FLOW_API_SUBMIT_PATH, FLOW_BROWSER_PATH, FLOW_CREATE_API_PATH, FLOW_STYLESHEET_PATH,
-    flow_api_create, flow_api_submit, flow_browser_get, flow_browser_post, flow_stylesheet,
+    FLOW_API_SUBMIT_PATH, FLOW_BRAND_ASSET_PATH, FLOW_BROWSER_PATH, FLOW_CREATE_API_PATH,
+    FLOW_STYLESHEET_PATH, flow_api_create, flow_api_submit, flow_brand_asset, flow_browser_get,
+    flow_browser_post, flow_stylesheet,
 };
 
 use std::collections::BTreeMap;

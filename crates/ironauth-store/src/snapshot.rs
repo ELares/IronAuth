@@ -334,6 +334,39 @@ pub struct BrandSnapshot {
     /// The sanitized rich-text slots (a JSON object of slot key to sanitized markup),
     /// embedded as parsed JSON.
     pub slots: serde_json::Value,
+    /// The per-DOMAIN selection key (issue #86, PR 3): the normalized Host this brand is
+    /// selected for, or absent. It is PROMOTABLE per-brand selection config that a promotion
+    /// copies as authored; the target-env operator adjusts hostnames if they differ (the same
+    /// "reference travels, value is env-local" spirit as [`SecretRef`]).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub host_pattern: Option<String>,
+    /// The per-CLIENT selection key (issue #86, PR 3): the authorize `client_id` this brand is
+    /// selected for, or absent. Promotable per-brand selection config, copied as authored.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub client_id: Option<String>,
+    /// The by-reference METADATA of the brand's installed assets (issue #86, PR 3): for each
+    /// installed logo/favicon, its kind, sniffed content type, sha256, and size. The asset BYTES
+    /// are NOT carried here; they stay in the `brand_assets` table and travel on the deferred
+    /// promotion apply (consistent with how the brand tokens/slots and the locale bundle apply
+    /// are already staged). Absent (an empty list is omitted) when the brand has no asset.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assets: Vec<BrandAssetMetaSnapshot>,
+}
+
+/// The by-reference metadata of one brand asset in a snapshot (issue #86, PR 3): the kind, the
+/// sniffed content type, the sha256, and the size. NOT the bytes: an asset's bytes stay in the
+/// store and their cross-environment transport rides the deferred promotion apply, so a snapshot
+/// stays a small, diffable text document and never a binary side channel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrandAssetMetaSnapshot {
+    /// The asset kind (`logo` or `favicon`).
+    pub kind: String,
+    /// The SNIFFED media type of the bytes (raster only; SVG is refused at ingest).
+    pub content_type: String,
+    /// The lowercase hex sha256 digest of the bytes (the content reference the apply resolves).
+    pub sha256: String,
+    /// The payload length in bytes.
+    pub size_bytes: i64,
 }
 
 /// The secret-free projection of one per-environment locale bundle (issue #86, PR 2). A locale
@@ -715,6 +748,22 @@ pub async fn export(scoped: &ScopedStore<'_>) -> Result<Snapshot, StoreError> {
     // canonicalize recursively (a decode fault here is a real persistence corruption,
     // surfaced rather than swallowed). No secret and no PII travels. Ordered by the
     // stable slug natural key.
+    // The brand asset METADATA rides the BrandSnapshot BY REFERENCE (issue #86, PR 3): read every
+    // asset's metadata once (the bytes are NOT read; they travel on the deferred apply) and group
+    // it under its brand slug so each brand carries its own installed logo / favicon references.
+    let mut assets_by_slug: std::collections::BTreeMap<String, Vec<BrandAssetMetaSnapshot>> =
+        std::collections::BTreeMap::new();
+    for meta in scoped.brands().list_all_asset_metadata().await? {
+        assets_by_slug
+            .entry(meta.brand_slug)
+            .or_default()
+            .push(BrandAssetMetaSnapshot {
+                kind: meta.kind.as_str().to_string(),
+                content_type: meta.content_type,
+                sha256: meta.sha256,
+                size_bytes: i64::from(meta.size_bytes),
+            });
+    }
     let mut brand = Vec::new();
     for record in scoped.brands().list_all().await? {
         let tokens: serde_json::Value =
@@ -725,6 +774,9 @@ pub async fn export(scoped: &ScopedStore<'_>) -> Result<Snapshot, StoreError> {
         };
         let slots: serde_json::Value =
             serde_json::from_str(&record.slots_json).map_err(serde_fault)?;
+        // The asset metadata for this brand, already ordered by kind (the store read's ORDER BY).
+        let mut assets = assets_by_slug.remove(&record.slug).unwrap_or_default();
+        assets.sort_by(|a, b| a.kind.cmp(&b.kind));
         brand.push(BrandSnapshot {
             slug: record.slug,
             is_default: record.is_default,
@@ -734,6 +786,9 @@ pub async fn export(scoped: &ScopedStore<'_>) -> Result<Snapshot, StoreError> {
             tokens,
             tokens_dark,
             slots,
+            host_pattern: record.host_pattern,
+            client_id: record.client_id,
+            assets,
         });
     }
     brand.sort_by(|a, b| a.slug.cmp(&b.slug));
@@ -912,8 +967,10 @@ const DCR_POLICY_KEYS: [&str; 2] = ["name", "primitives"];
 const VARIABLE_KEYS: [&str; 2] = ["name", "value"];
 
 /// Every key a snapshot `brand` element may carry (issue #86). No secret slot: a brand
-/// holds no secret material. The published schema pins `additionalProperties: false`.
-const BRAND_KEYS: [&str; 8] = [
+/// holds no secret material. The published schema pins `additionalProperties: false`. PR 3
+/// adds the per-brand selection keys (`host_pattern`, `client_id`) and the by-reference asset
+/// metadata list (`assets`).
+const BRAND_KEYS: [&str; 11] = [
     "slug",
     "is_default",
     "product_name",
@@ -922,7 +979,18 @@ const BRAND_KEYS: [&str; 8] = [
     "tokens",
     "tokens_dark",
     "slots",
+    "host_pattern",
+    "client_id",
+    "assets",
 ];
+
+/// Every key a snapshot brand `assets` element may carry (issue #86, PR 3). No bytes: an asset
+/// travels by reference (its digest), never inline. The schema pins `additionalProperties:
+/// false`.
+const BRAND_ASSET_KEYS: [&str; 4] = ["kind", "content_type", "sha256", "size_bytes"];
+
+/// The recognized `kind` values a snapshot brand asset may carry (issue #86, PR 3).
+const BRAND_ASSET_KINDS: [&str; 2] = ["logo", "favicon"];
 
 /// Every key a snapshot `locale_bundle` element may carry (issue #86, PR 2). No secret slot: a
 /// locale bundle holds no secret material. The published schema pins `additionalProperties:
@@ -1245,6 +1313,24 @@ fn validate_resource(
                     )),
                 }
             }
+            // The per-brand selection keys (issue #86, PR 3) are OPTIONAL nullable strings: a
+            // brand with no host / client selection omits them (export skips a None), and a
+            // present value must be a string.
+            for field in ["host_pattern", "client_id"] {
+                if let Some(value) = object.get(field) {
+                    if !value.is_string() {
+                        violations.push(SnapshotViolation::new(
+                            format!("{path}/{field}"),
+                            "must be a JSON string",
+                        ));
+                    }
+                }
+            }
+            // The by-reference asset metadata (issue #86, PR 3) is an OPTIONAL array; each element
+            // is the kind + sniffed content type + sha256 + size, and NEVER any inline bytes.
+            if let Some(assets) = object.get("assets") {
+                validate_brand_assets(assets, &format!("{path}/assets"), violations);
+            }
         }
         ResourceType::LocaleBundle => {
             // A locale bundle is secret-free localization config (issue #86, PR 2): a BCP47
@@ -1477,6 +1563,44 @@ fn require_enum(
             format!("{path}/{field}"),
             "missing required string field",
         )),
+    }
+}
+
+/// Validate a brand's by-reference `assets` array (issue #86, PR 3): each element is the asset
+/// kind (a closed enum), the sniffed content type, the sha256 reference, and the integer size,
+/// with NO inline bytes and no unknown key. The parent brand element's recursive
+/// forbidden-secret-key scan already covers these nested objects, so an asset can carry no
+/// secret-shaped material either.
+fn validate_brand_assets(
+    value: &serde_json::Value,
+    path: &str,
+    violations: &mut Vec<SnapshotViolation>,
+) {
+    let Some(items) = value.as_array() else {
+        violations.push(SnapshotViolation::new(path, "must be a JSON array"));
+        return;
+    };
+    for (index, item) in items.iter().enumerate() {
+        let item_path = format!("{path}/{index}");
+        let Some(object) = item.as_object() else {
+            violations.push(SnapshotViolation::new(item_path, "must be a JSON object"));
+            continue;
+        };
+        reject_unknown_keys(object, &BRAND_ASSET_KEYS, None, &item_path, violations);
+        require_enum(object, "kind", &BRAND_ASSET_KINDS, &item_path, violations);
+        require_nonempty_string(object, "content_type", &item_path, violations);
+        require_nonempty_string(object, "sha256", &item_path, violations);
+        match object.get("size_bytes") {
+            Some(value) if value.is_i64() || value.is_u64() => {}
+            Some(_) => violations.push(SnapshotViolation::new(
+                format!("{item_path}/size_bytes"),
+                "must be an integer",
+            )),
+            None => violations.push(SnapshotViolation::new(
+                format!("{item_path}/size_bytes"),
+                "missing required integer field",
+            )),
+        }
     }
 }
 
