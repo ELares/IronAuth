@@ -11,8 +11,8 @@
 //! registration, MFA, recovery, federation) and any FUTURE node group renders with no page
 //! code change (the forward compatibility acceptance criterion). Every human string is a
 //! numeric [`MessageId`](super::message::MessageId): this renderer resolves it through
-//! [`localize`](super::localize::localize) against the request's [`ResolvedLocale`]
-//! (super::localize), so issue #86 localizes BY ID without any structural change to the
+//! [`localize`](super::localize::localize) against the request's [`ResolvedLocale`],
+//! so issue #86 localizes BY ID without any structural change to the
 //! renderer. A bundle-less environment resolves every id to the compiled English registry, so
 //! the page stays byte-identical to before PR 2. A locale string is PLAIN TEXT, escaped exactly
 //! like the compiled default, never markup.

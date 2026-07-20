@@ -1253,6 +1253,17 @@ fn validate_resource(
             // material; a bundle string is plain text, escaped on render, never markup.
             reject_unknown_keys(object, &LOCALE_BUNDLE_KEYS, None, path, violations);
             require_nonempty_string(object, "locale", path, violations);
+            // The default marker is a bool; a hand authored or future apply document that
+            // supplies a non bool here is a fault (export always emits a real bool, so a genuine
+            // round trip never trips this).
+            if let Some(value) = object.get("is_env_default") {
+                if !value.is_boolean() {
+                    violations.push(SnapshotViolation::new(
+                        format!("{path}/is_env_default"),
+                        "must be a boolean",
+                    ));
+                }
+            }
             match object.get("entries") {
                 Some(serde_json::Value::Object(_)) => {}
                 Some(_) => violations.push(SnapshotViolation::new(

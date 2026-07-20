@@ -109,12 +109,24 @@ impl LanguageTag {
     }
 
     /// This tag with its last subtag dropped (`fr-ca` to `fr`), or [`None`] when the tag has a
-    /// single subtag: the RFC 4647 section 3.4 progressive truncation step.
+    /// single subtag: the RFC 4647 section 3.4 progressive truncation step. Per that section, when
+    /// dropping the last subtag leaves a single character (singleton) subtag at the end, that
+    /// subtag is removed too (`en-x-foo` truncates straight to `en`, never probing `en-x`), because
+    /// a singleton like `x` introduces a private use sequence that is meaningless without the
+    /// subtag that followed it.
     #[must_use]
     fn parent(&self) -> Option<Self> {
-        self.0
-            .rsplit_once('-')
-            .map(|(prefix, _)| Self(prefix.to_owned()))
+        let (mut prefix, _) = self.0.rsplit_once('-')?;
+        if let Some((head, last)) = prefix.rsplit_once('-') {
+            if last.len() == 1 {
+                prefix = head;
+            }
+        } else if prefix.len() == 1 {
+            // The remaining tag is itself a lone singleton (for example `x` from `x-foo`); there
+            // is no meaningful parent to probe.
+            return None;
+        }
+        Some(Self(prefix.to_owned()))
     }
 }
 
@@ -367,6 +379,24 @@ mod tests {
             localize(LOGIN_TITLE, &MessageContext::empty(), &fallback),
             "Sign in",
             "the compiled en registry is the ultimate fallback"
+        );
+    }
+
+    #[test]
+    fn rfc4647_truncation_drops_a_trailing_singleton_subtag_with_its_predecessor() {
+        // RFC 4647 section 3.4: truncating `en-x-foo` removes `foo` and then the singleton `x`
+        // together, so lookup probes `en` directly and never `en-x`. Install BOTH `en-x` and `en`;
+        // the resolve must pick `en`, proving the `en-x` step was skipped.
+        let map = installed(vec![
+            bundle("en-x", &[(LOGIN_TITLE.0, "singleton bundle")]),
+            bundle("en", &[(LOGIN_TITLE.0, "Sign in (en)")]),
+        ]);
+        let resolved = resolve_locale(Some("en-x-foo"), &tag("en"), &map);
+        assert_eq!(resolved.primary().as_str(), "en");
+        assert_eq!(
+            localize(LOGIN_TITLE, &MessageContext::empty(), &resolved),
+            "Sign in (en)",
+            "the singleton en-x step is skipped per RFC 4647 section 3.4"
         );
     }
 

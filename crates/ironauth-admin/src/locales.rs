@@ -85,10 +85,18 @@ fn placeholders(template: &str) -> Vec<String> {
     names
 }
 
+/// The largest a single localized string may be. A UI label, title, or error line is short; this
+/// bound (generous for any real translation) keeps a management key holder from storing a huge
+/// string that then inflates the cost of every subsequent flow render for the environment.
+const MAX_LOCALE_STRING_BYTES: usize = 4096;
+
 /// Strictly validate a set request (issue #86): every entry key must be a REGISTERED numeric
-/// message id, and every `{placeholder}` in an entry string must be one that id declares in its
-/// `context_keys`. On success returns the validated entries serialized as the JSON object the
-/// store persists verbatim (a decode/encode fault is an internal error, not a client fault).
+/// message id, every entry string is bounded by [`MAX_LOCALE_STRING_BYTES`], and every
+/// `{placeholder}` in an entry string must be one that id declares in its `context_keys`. On
+/// success returns the validated entries serialized as the JSON object the store persists verbatim
+/// (a decode/encode fault is an internal error, not a client fault). The entry COUNT is bounded
+/// intrinsically: a duplicate key cannot exist in the map and every key must be a registered id,
+/// so at most the registry size of entries can validate.
 fn validate_and_serialize(request: &SetLocaleRequest) -> Result<String, ApiError> {
     for (key, value) in &request.entries {
         let id: u32 = key.parse().map_err(|_| {
@@ -96,6 +104,13 @@ fn validate_and_serialize(request: &SetLocaleRequest) -> Result<String, ApiError
                 "locale entry key {key:?} is not a numeric message id"
             ))
         })?;
+        if value.len() > MAX_LOCALE_STRING_BYTES {
+            return Err(ApiError::BadRequest(format!(
+                "locale entry for message {key} is {} bytes, over the {MAX_LOCALE_STRING_BYTES} \
+                 byte limit",
+                value.len()
+            )));
+        }
         let spec = spec_for(MessageId(id)).ok_or_else(|| {
             ApiError::BadRequest(format!(
                 "locale entry key {key:?} is not a registered message id"
@@ -156,6 +171,10 @@ pub async fn set_locale(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // A locale write rewrites the plain text of the auth pages (login, recovery, error copy), a
+    // social engineering surface, so it demands fresh privilege exactly like the other environment
+    // scoped management writes (organizations, connectors).
+    crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     let locale = parse_locale(&locale)?;
 
     // The environment must exist (a clean 404 rather than a foreign-key error).
@@ -258,6 +277,7 @@ pub async fn delete_locale(
     Path((tenant_id, environment_id, locale)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     let locale = parse_locale(&locale)?;
     // Resolve the stored id by tag (a uniform not-found when absent), then delete by id so the
     // audit row names the immutable bundle id.
@@ -357,6 +377,22 @@ mod tests {
             validate_and_serialize(&request(vec![("9999999".to_owned(), "x")])),
             Err(ApiError::BadRequest(_))
         ));
+    }
+
+    #[test]
+    fn an_oversize_entry_string_is_rejected() {
+        // A string over the byte cap is a loud 400, so a management key holder cannot store a huge
+        // string that inflates every subsequent flow render for the environment.
+        let big = "a".repeat(super::MAX_LOCALE_STRING_BYTES + 1);
+        match validate_and_serialize(&request(vec![(id(LOGIN_TITLE), big.as_str())])) {
+            Err(ApiError::BadRequest(message)) => {
+                assert!(message.contains("limit"), "{message}");
+            }
+            other => panic!("expected a 400 for an oversize entry, got {other:?}"),
+        }
+        // A string exactly at the cap is accepted.
+        let at_cap = "a".repeat(super::MAX_LOCALE_STRING_BYTES);
+        assert!(validate_and_serialize(&request(vec![(id(LOGIN_TITLE), at_cap.as_str())])).is_ok());
     }
 
     #[test]
