@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "ironauth-admin-ui"
+version = "0.1.0"
+description = "In-process serving of the IronAuth admin console single page app: rust-embed of the built dist, mounted on the public plane under /admin with a SPA fallback and its own Content Security Policy, behind the admin_spa.enabled gate (default off)"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The public plane router this crate builds is merged onto the server's public
+# plane via Server::mount_public, mirroring how ironauth-oidc mounts. Only the
+# routing core is needed (no json/query/form extractors), so the workspace axum
+# stays at default-features = false.
+axum = { workspace = true }
+# rust-embed bakes the built dist into the binary at compile time. default
+# features are off (no mime-guess: content types are mapped here from the file
+# extension), and debug-embed is on so the assets are always embedded rather
+# than read from disk at runtime, which keeps tests independent of the working
+# directory.
+rust-embed = { version = "8", default-features = false, features = ["debug-embed"] }
+
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }
+http-body-util.workspace = true
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+[lints]
+workspace = true

@@ -9,6 +9,13 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+  # The admin console SPA (issue #90), the repo's first npm prod dependency tree.
+  # package-lock.json is committed and CI runs npm ci, so dependabot keeps the
+  # locked tree current.
+  - package-ecosystem: npm
+    directory: "/packages/admin-spa"
+    schedule:
+      interval: weekly
     ignore:
       # The @1.85 ref IS the MSRV policy, not a dependency version; MSRV
       # bumps are deliberate PRs with changelog entries (docs/RELEASING.md).

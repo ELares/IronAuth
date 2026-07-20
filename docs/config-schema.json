@@ -121,6 +121,18 @@
       },
       "type": "object"
     },
+    "AdminSpaConfig": {
+      "additionalProperties": false,
+      "description": "Admin console SPA settings (issue #90).\n\nThe admin console is a Preact single page app served in process on the public\nplane under `/admin`, embedded in the binary and speaking the public\nmanagement API through one generated typed client. This gate mirrors\n`flows.enabled` and `hosted_pages.enabled`: a plain operator toggle, off by\ndefault, that mounts nothing on the wire until it is turned on (every\n`/admin` path answers a uniform 404 while off, so a deployment that does not\nuse the console discloses nothing). Off in PR1 because the console is a\nstatic shell with no auth yet; a later change flips the default on once it is\nfunctional.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "description": "Whether to serve the in-process admin console. Off by default so the\ndefault boot mounts nothing under `/admin` and every such path is a\nuniform 404. When on, the embedded console is served on the public plane.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "AdvancedRecoveryConfig": {
       "additionalProperties": false,
       "description": "The advanced-recovery-modes policy (issue #82, PR 3): the three mode sub-toggles under the\nsingle `advanced-recovery` experimental ack, the trusted-contact confirmation threshold\n(fork F7), and the registered IDV providers (fork F8). Consulted ONLY when the\n`advanced-recovery` experimental feature is armed (enabled AND acknowledged); with the\nfeature off every advanced-recovery path is a uniform 404 regardless of these toggles, so\nconfig data can never arm the surface. Each mode completes THROUGH the recovery delay\nwindow and the downgrade invariant, never around them.",
@@ -2255,6 +2267,13 @@
         "sudo_mode_window_secs": 600
       },
       "description": "Management API settings (issue #11)."
+    },
+    "admin_spa": {
+      "$ref": "#/$defs/AdminSpaConfig",
+      "default": {
+        "enabled": false
+      },
+      "description": "Admin console SPA settings (issue #90): the in-process serving of the\nPreact admin console on the public plane under `/admin`. Off by default:\nPR1 ships the serving skeleton (a static shell over the public management\nAPI, no auth yet), so a default deployment mounts nothing and every\n`/admin` path is a uniform 404. A later change flips the default on once\nthe console is functional."
     },
     "byok": {
       "$ref": "#/$defs/ByokConfig",

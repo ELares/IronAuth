@@ -1,0 +1,95 @@
+/* SPDX-License-Identifier: MIT OR Apache-2.0
+ *
+ * The admin console styles. Shipped as one external, content hashed stylesheet
+ * (imported from main.tsx) so the served Content Security Policy needs no
+ * unsafe-inline for styles.
+ */
+
+:root {
+  --ink: #1a1a2e;
+  --muted: #5a5a72;
+  --line: #e2e2ec;
+  --accent: #3a3a8c;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, sans-serif;
+  color: var(--ink);
+}
+
+.app-header {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  padding: 0.9rem 1.25rem;
+  border-bottom: 1px solid var(--line);
+}
+
+.brand {
+  font-weight: 700;
+}
+
+.subtitle {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.app-body {
+  display: flex;
+  min-height: calc(100vh - 3.4rem);
+}
+
+.nav {
+  width: 12rem;
+  border-right: 1px solid var(--line);
+  padding: 1rem 0.75rem;
+}
+
+.nav ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.nav li {
+  margin: 0.15rem 0;
+}
+
+.nav a {
+  display: block;
+  padding: 0.4rem 0.6rem;
+  border-radius: 0.4rem;
+  color: var(--ink);
+  text-decoration: none;
+}
+
+.nav a:hover {
+  background: var(--line);
+}
+
+.app-main {
+  flex: 1;
+  padding: 1.5rem;
+}
+
+.signin button {
+  padding: 0.45rem 0.9rem;
+  border: 1px solid var(--accent);
+  border-radius: 0.4rem;
+  background: var(--accent);
+  color: #fff;
+}
+
+.signin button:disabled {
+  opacity: 0.5;
+}
+
+.placeholder,
+.signin p {
+  color: var(--muted);
+}
