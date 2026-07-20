@@ -1,21 +1,47 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //
-// The admin console app shell. PR1 ships the frame ONLY: a layout with a nav
-// and a "not signed in" placeholder. There is NO real auth here. The sign in
-// button is inert; performing the OIDC login, holding the bearer token, and
-// attaching it to the typed management client all land in PR2. Nothing in this
-// module performs a network call or names a server API path (the route audit
-// enforces both), so the shell is a pure static frame over the future client.
+// The admin console app shell. PR2 wires the real login: the sign in button
+// starts an Authorization Code + PKCE flow against the admin issuer, and on the
+// authorization callback the shell exchanges the code for a short lived at+jwt it
+// holds in memory (src/auth/session.ts). Nothing in this module performs a
+// network call or names a server API path directly (the route audit enforces
+// both): it delegates to src/auth/login.ts, which delegates to the one audited
+// client. The typed management client attaches the in memory bearer per request.
 
 import { LocationProvider, Route, Router } from "preact-iso";
 import { signal } from "@preact/signals";
 import { loadConfig } from "./config";
+import { beginLogin, canSignIn, completeLoginFromRedirect } from "./auth/login";
+import { isSignedIn } from "./auth/session";
 
-// UI state lives in signals (the locked state primitive). PR1 has one flag: the
-// session is always signed out because there is no login yet.
-const signedIn = signal(false);
+// UI state lives in signals (the locked state primitive). `signedIn` flips true
+// once a token is held; `authError` surfaces a failed login verbatim.
+const signedIn = signal(isSignedIn());
+const authError = signal<string>("");
 
 const config = loadConfig();
+
+// On load, complete an authorization callback if the URL carries one, then
+// reflect whether a token is held. A failed exchange leaves the console signed
+// out with the error shown, never a half authenticated state.
+void completeLoginFromRedirect()
+  .then((ok) => {
+    if (ok) {
+      signedIn.value = true;
+    }
+  })
+  .catch((error: unknown) => {
+    authError.value = error instanceof Error ? error.message : "sign in failed";
+  });
+
+// Start the login. A failure (discovery or redirect) surfaces as an error rather
+// than a silent no op.
+function onSignIn(): void {
+  authError.value = "";
+  void beginLogin().catch((error: unknown) => {
+    authError.value = error instanceof Error ? error.message : "sign in failed";
+  });
+}
 
 // The nav placeholders. These are the future console sections; PR1 renders them
 // as inert labels so the frame reads as the real console without wiring any
@@ -43,17 +69,22 @@ function Nav() {
   );
 }
 
-function SignInPlaceholder() {
-  const target = config.issuerBase || "this origin";
+function SignIn() {
+  const ready = canSignIn();
+  const target = config.adminIssuer || config.issuerBase || "this origin";
   return (
     <section class="signin" aria-labelledby="signin-heading">
       <h2 id="signin-heading">Not signed in</h2>
       <p>
-        The admin console signs in against <code>{target}</code>. Sign in is not
-        wired yet; it arrives in the next change together with the management
-        proxy.
+        The admin console signs in against <code>{target}</code> using the
+        IronAuth OIDC provider. {ready ? "" : "Sign in is unavailable until the admin issuer and console client are configured."}
       </p>
-      <button type="button" disabled>
+      {authError.value === "" ? null : (
+        <p class="error" role="alert">
+          {authError.value}
+        </p>
+      )}
+      <button type="button" disabled={!ready} onClick={onSignIn}>
         Sign in
       </button>
     </section>
@@ -84,7 +115,7 @@ function Shell() {
               <Route default component={Placeholder} />
             </Router>
           ) : (
-            <SignInPlaceholder />
+            <SignIn />
           )}
         </main>
       </div>

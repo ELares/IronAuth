@@ -6,15 +6,26 @@
     <title>IronAuth admin console</title>
 
     <!--
-      The deployment config surface. An embedded deploy leaves these empty (the
-      app calls its own origin); a standalone deploy points ironauth-issuer at
-      the IronAuth public plane and ironauth-management-base at the management
-      proxy origin. There are NO secrets here: the browser holds a bearer token
-      it obtains through the OIDC login it performs (that lands in PR2), never a
-      client secret.
+      The deployment config surface (issue #90, PR 2). An embedded deploy may
+      leave the bases empty (the app then calls its own origin and reaches the
+      management API through the same origin proxy under /admin/api); a standalone
+      deploy points ironauth-issuer at the IronAuth public plane and
+      ironauth-management-base at the management proxy origin.
+
+      The console signs in via IronAuth's own OIDC as a PUBLIC client: set
+      ironauth-admin-issuer to the system environment's OIDC issuer (a same origin
+      path such as /t/<tenant>/e/<env> for the embedded deploy, or an absolute
+      issuer URL for a standalone one), ironauth-console-client-id to the public
+      client id, and ironauth-management-audience to the management API audience
+      the token is bound to. There are NO secrets here: the browser holds only the
+      short lived at+jwt it obtains through the login, never a client secret,
+      operator token, or management key.
     -->
     <meta name="ironauth-issuer" content="" />
     <meta name="ironauth-management-base" content="" />
+    <meta name="ironauth-admin-issuer" content="" />
+    <meta name="ironauth-console-client-id" content="" />
+    <meta name="ironauth-management-audience" content="" />
   </head>
   <body>
     <div id="app"></div>

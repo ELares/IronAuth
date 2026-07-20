@@ -192,6 +192,56 @@ pub struct AdminSpaConfig {
     /// default boot mounts nothing under `/admin` and every such path is a
     /// uniform 404. When on, the embedded console is served on the public plane.
     pub enabled: bool,
+
+    /// The tenant identifier of the ADMIN ISSUER (issue #90, PR 2): the system
+    /// `(tenant, environment)` whose OIDC provider the console signs in against.
+    /// The console obtains a short-lived `at+jwt` from this issuer and the
+    /// management API verifies it against exactly this issuer's published JWKS
+    /// (never any issuer). Unset leaves the OIDC credential bridge disarmed
+    /// (fail closed): no `at+jwt` is ever accepted by the management API and the
+    /// console can authenticate only if a bootstrap operator token path is used
+    /// out of band. This is a bounded identifier datum; it carries no secret.
+    pub admin_issuer_tenant: Option<String>,
+
+    /// The environment identifier of the ADMIN ISSUER (issue #90, PR 2), paired
+    /// with `admin_issuer_tenant`. Together they name the system environment the
+    /// console signs in against. Unset leaves the bridge disarmed (fail closed).
+    pub admin_issuer_environment: Option<String>,
+
+    /// The management API AUDIENCE the console's `at+jwt` must be bound to (issue
+    /// #90, PR 2): an RFC 8707 resource-server audience registered under the admin
+    /// issuer. The console requests `resource=<this>` at `/token`, and the
+    /// management API requires the presented token's `aud` to EQUAL this value
+    /// exactly. That exact match is the cross-RP replay defense: a token minted
+    /// for any other client or resource, even by the same issuer, is rejected.
+    /// Unset leaves the bridge disarmed (fail closed). A bounded URL datum, no
+    /// secret.
+    pub management_audience: Option<String>,
+
+    /// The PUBLIC OAuth client identifier the console uses for its Authorization
+    /// Code + PKCE sign-in (issue #90, PR 2). A public client holds no secret, so
+    /// this is a bounded identifier the browser reads from served config; it is
+    /// never a credential. Unset leaves the console with no client to log in as.
+    ///
+    /// STAGING NOTE (issue #90): the browser reads this (and the admin issuer and
+    /// management audience) from `<meta>` tags in the served console document. PR 2
+    /// ships the server-side verifying arm, the proxy, and the complete client login
+    /// code, all tested; DELIVERING these values into the served document and
+    /// embedding the real Vite console (PR 1 embeds a placeholder shell so the Rust
+    /// build stays green without a Node toolchain) is the staged integration that
+    /// makes the login runtime reachable and flips `admin_spa.enabled` on by default.
+    /// Until then this field has no server-side reader by design; it is consumed only
+    /// by the browser once that integration lands.
+    pub console_client_id: Option<String>,
+
+    /// The OPERATOR-SUBJECT ALLOWLIST (issue #90, PR 2): the OIDC `sub` values, in
+    /// the admin issuer, that map to the management operator plane. A verified
+    /// `at+jwt` whose `sub` is a member is resolved to `Principal::Operator`; ANY
+    /// other subject is REJECTED (fail closed). This is the entire human-to-authz
+    /// mapping in PR 2: operator or nothing, no scoped binding, no migration, no
+    /// auto-provisioning. Empty (the default) authorizes nobody, so arming the
+    /// bridge without listing a subject grants no one console access.
+    pub operator_subjects: Vec<String>,
 }
 
 /// HTTP server settings.
