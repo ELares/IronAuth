@@ -30,6 +30,7 @@
 //! this engine is deferred to issue #85).
 
 pub mod golden;
+pub mod localize;
 pub mod message;
 pub mod model;
 pub mod schema;
@@ -43,6 +44,9 @@ mod render;
 mod transport;
 
 pub use golden::{GoldenFlow, golden_corpus, golden_flows};
+pub use localize::{
+    LanguageTag, LocaleBundle, ResolvedLocale, TextDirection, localize, resolve_locale,
+};
 pub use schema::{flow_messages_snapshot, flow_object_schema};
 pub use transport::{
     FLOW_API_SUBMIT_PATH, FLOW_BROWSER_PATH, FLOW_CREATE_API_PATH, FLOW_STYLESHEET_PATH,

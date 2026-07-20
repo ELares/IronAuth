@@ -10,8 +10,12 @@
 //! and dispatches on the typed [`NodeAttributes`] (input vs text), so ANY journey (login,
 //! registration, MFA, recovery, federation) and any FUTURE node group renders with no page
 //! code change (the forward compatibility acceptance criterion). Every human string is a
-//! numeric [`MessageId`](super::message::MessageId); this renderer emits the default English
-//! `Message.text`, and issue #86 localizes by id without touching the renderer.
+//! numeric [`MessageId`](super::message::MessageId): this renderer resolves it through
+//! [`localize`](super::localize::localize) against the request's [`ResolvedLocale`]
+//! (super::localize), so issue #86 localizes BY ID without any structural change to the
+//! renderer. A bundle-less environment resolves every id to the compiled English registry, so
+//! the page stays byte-identical to before PR 2. A locale string is PLAIN TEXT, escaped exactly
+//! like the compiled default, never markup.
 //!
 //! Hardening is REUSED verbatim, never re implemented:
 //!
@@ -22,9 +26,9 @@
 //!   same-origin`, `nosniff`, `no-store`) are attached by [`pages::flow_html`] /
 //!   [`pages::flow_login_html`] at the transport call site, exactly as the bootstrap pages
 //!   attach them through `secure_html`;
-//! - the document shell ([`pages::document_styled`]) gives the `<html lang>`, viewport, the
-//!   `data-display` layout hint, the robots noindex, and the issue #42 non production
-//!   environment banner FOR FREE;
+//! - the document shell ([`pages::document_styled`]) gives the `<html lang>` / `<html dir>`
+//!   (from the resolved locale), viewport, the `data-display` layout hint, the robots noindex,
+//!   and the issue #42 non production environment banner FOR FREE;
 //! - the passkey conditional-UI ceremony reuses the bootstrap `PASSKEY_SCRIPT` and nonce CSP
 //!   ([`pages::passkey_block`] + [`pages::flow_login_csp`]), so a flow login or step up that
 //!   presents the passkey node group runs the ceremony IDENTICALLY to the bootstrap login.
@@ -34,7 +38,8 @@
 //! the same discipline as `pages.rs`). Issue #85 ships the seam with a neutral default; issue
 //! #86 fills safe branding and localization.
 
-use super::message::{self, Message};
+use super::localize::{ResolvedLocale, localize};
+use super::message::{self, Message, MessageContext};
 use super::model::{Autocomplete, Flow, FlowStateTag, InputType, Node, NodeAttributes, NodeGroup};
 use crate::hints::InteractionHints;
 use crate::pages;
@@ -94,6 +99,7 @@ pub(crate) fn render_flow_page(
     flow: &Flow,
     theme: &PageTheme,
     hints: &InteractionHints,
+    locale: &ResolvedLocale,
     environment_banner: Option<&str>,
     scope_path: &str,
     passkey: Option<&pages::PasskeyUi<'_>>,
@@ -110,7 +116,11 @@ pub(crate) fn render_flow_page(
     // group behaves identically to the bootstrap login page.
     let ceremony = passkey.filter(|_| has_passkey_group);
 
-    let title = Message::of(flow_title(flow)).text;
+    // Every human string is localized BY ID (issue #86): the renderer emits `localize(id,
+    // context, locale)` in place of the compiled English `Message.text`, without any structural
+    // change. A bundle-less environment resolves every id to the compiled `en` registry, so the
+    // page is byte-identical to before PR 2.
+    let title = localize(flow_title(flow), &MessageContext::empty(), locale);
 
     let mut inner = String::new();
     inner.push_str(&brand_header(theme));
@@ -127,7 +137,7 @@ pub(crate) fn render_flow_page(
 
     // Flow level messages (errors and info not attached to a single node).
     for message in &flow.ui.messages {
-        inner.push_str(&message_block(message));
+        inner.push_str(&message_block(message, locale));
     }
 
     inner.push_str("<form method=\"post\" action=\"");
@@ -139,7 +149,7 @@ pub(crate) fn render_flow_page(
         if ceremony.is_some() && node.group == NodeGroup::Passkey {
             continue;
         }
-        render_node(&mut inner, node);
+        render_node(&mut inner, node, locale);
     }
     inner.push_str("</form>");
 
@@ -161,11 +171,15 @@ pub(crate) fn render_flow_page(
     inner.push_str("</main>");
 
     let stylesheet_href = format!("{scope_path}/pages.css");
+    // The document shell reflects the RESOLVED locale, not the raw request: `<html lang>` is
+    // the tag actually rendered (the honest set), and `<html dir>` is its text direction (issue
+    // #86). The `display` layout hint still comes from the request hints.
     let body = pages::document_styled(
         &pages::escape_html(&title),
         &inner,
-        hints.lang(),
+        locale.primary().as_str(),
         hints.display().as_str(),
+        locale.direction().as_str(),
         environment_banner,
         Some(&stylesheet_href),
     );
@@ -222,25 +236,20 @@ fn push_slot(out: &mut String, hook: &str, slot: &crate::branding::SanitizedRich
 /// Render a flow level or node level message as a styled block (issue #85), keyed on its kind
 /// so an error is distinguishable from an info or success note WITHOUT the copy. The text is
 /// escaped; the kind selects a fixed, server known role or class.
-fn message_block(message: &Message) -> String {
+fn message_block(message: &Message, locale: &ResolvedLocale) -> String {
+    let text = localize(message.id, &message.context, locale);
     match message.kind {
         message::MessageKind::Error => {
-            format!(
-                "<p role=\"alert\">{}</p>",
-                pages::escape_html(&message.text)
-            )
+            format!("<p role=\"alert\">{}</p>", pages::escape_html(&text))
         }
         message::MessageKind::Success => {
             format!(
                 "<p role=\"status\" class=\"success\">{}</p>",
-                pages::escape_html(&message.text)
+                pages::escape_html(&text)
             )
         }
         message::MessageKind::Info => {
-            format!(
-                "<p class=\"message\">{}</p>",
-                pages::escape_html(&message.text)
-            )
+            format!("<p class=\"message\">{}</p>", pages::escape_html(&text))
         }
     }
 }
@@ -263,7 +272,7 @@ fn flow_title(flow: &Flow) -> message::MessageId {
 /// Render one node into the page body (issue #85, the generic node renderer). Dispatches on
 /// the typed [`NodeAttributes`], so a node of ANY group (including a group unknown to this
 /// code) renders via the same input or text path. Every interpolated value is escaped.
-fn render_node(body: &mut String, node: &Node) {
+fn render_node(body: &mut String, node: &Node, locale: &ResolvedLocale) {
     match &node.attributes {
         NodeAttributes::Input {
             name,
@@ -278,7 +287,11 @@ fn render_node(body: &mut String, node: &Node) {
             if labelled {
                 if let Some(label) = &node.label {
                     body.push_str("<label>");
-                    body.push_str(&pages::escape_html(&label.text));
+                    body.push_str(&pages::escape_html(&localize(
+                        label.id,
+                        &label.context,
+                        locale,
+                    )));
                     body.push(' ');
                 }
             }
@@ -313,13 +326,21 @@ fn render_node(body: &mut String, node: &Node) {
             }
             for message in &node.messages {
                 body.push_str("<span class=\"error\">");
-                body.push_str(&pages::escape_html(&message.text));
+                body.push_str(&pages::escape_html(&localize(
+                    message.id,
+                    &message.context,
+                    locale,
+                )));
                 body.push_str("</span>");
             }
         }
         NodeAttributes::Text { message } => {
             body.push_str("<p>");
-            body.push_str(&pages::escape_html(&message.text));
+            body.push_str(&pages::escape_html(&localize(
+                message.id,
+                &message.context,
+                locale,
+            )));
             body.push_str("</p>");
         }
     }
@@ -354,7 +375,8 @@ fn autocomplete_attr(hint: Autocomplete) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{PageTheme, render_flow_page};
-    use crate::flow::message::{Message, MessageContext, MessageId, MessageKind};
+    use crate::flow::localize::{LanguageTag, LocaleBundle, ResolvedLocale, resolve_locale};
+    use crate::flow::message::{self, Message, MessageContext, MessageId, MessageKind};
     use crate::flow::model::{
         Autocomplete, CONTRACT_VERSION, Flow, FlowStateTag, InputType, Journey, Node,
         NodeAttributes, NodeGroup, Transport, Ui,
@@ -420,6 +442,7 @@ mod tests {
             flow,
             &PageTheme::default(),
             &InteractionHints::default(),
+            &ResolvedLocale::default(),
             None,
             SCOPE_PATH,
             None,
@@ -635,6 +658,7 @@ mod tests {
             &flow,
             &PageTheme::default(),
             &InteractionHints::default(),
+            &ResolvedLocale::default(),
             None,
             SCOPE_PATH,
             Some(&ui),
@@ -713,6 +737,7 @@ mod tests {
             &flow,
             &theme,
             &InteractionHints::default(),
+            &ResolvedLocale::default(),
             None,
             SCOPE_PATH,
             None,
@@ -772,6 +797,7 @@ mod tests {
             &flow,
             &theme,
             &InteractionHints::default(),
+            &ResolvedLocale::default(),
             None,
             SCOPE_PATH,
             None,
@@ -851,5 +877,148 @@ mod tests {
             "the autocomplete hint renders"
         );
         assert!(page.body.contains(" required"), "required renders");
+    }
+
+    /// A login flow with a localized label node, for the localization render tests.
+    fn login_flow_with_label() -> Flow {
+        let mut node = input(NodeGroup::Default, 0, "identifier", InputType::Text, None);
+        node.label = Some(Message::of(message::LOGIN_IDENTIFIER_LABEL));
+        flow_with(
+            FlowStateTag::IdentifierPassword,
+            Journey::Login,
+            vec![node],
+            Vec::new(),
+        )
+    }
+
+    /// Build a resolved locale from a single installed bundle, requested by its own tag.
+    fn resolved_with(tag: &str, entries: &[(u32, &str)]) -> ResolvedLocale {
+        let language = LanguageTag::parse(tag).expect("valid tag");
+        let map: std::collections::BTreeMap<u32, String> = entries
+            .iter()
+            .map(|(id, text)| (*id, (*text).to_owned()))
+            .collect();
+        let mut installed = std::collections::BTreeMap::new();
+        installed.insert(language.clone(), LocaleBundle::new(language.clone(), map));
+        resolve_locale(Some(tag), &LanguageTag::parse("en").unwrap(), &installed)
+    }
+
+    fn render_localized(flow: &Flow, locale: &ResolvedLocale) -> super::RenderedPage {
+        render_flow_page(
+            flow,
+            &PageTheme::default(),
+            &InteractionHints::default(),
+            locale,
+            None,
+            SCOPE_PATH,
+            None,
+        )
+    }
+
+    #[test]
+    fn the_default_locale_renders_byte_identical_english_ltr() {
+        // No-regression (acceptance criterion a): a bundle-less environment renders `lang="en"`,
+        // NO dir attribute, and the compiled English strings, exactly as before PR 2.
+        let flow = login_flow_with_label();
+        let page = render_default(&flow);
+        assert!(
+            page.body
+                .starts_with("<!doctype html><html lang=\"en\"><head>"),
+            "lang=en and no dir attribute: {}",
+            page.body
+        );
+        assert!(!page.body.contains("dir="), "no dir attribute for ltr");
+        assert!(page.body.contains("<h1>Sign in</h1>"), "English title");
+        assert!(
+            page.body.contains(">Identifier "),
+            "English label: {}",
+            page.body
+        );
+    }
+
+    #[test]
+    fn a_fully_translated_fr_env_renders_a_french_page() {
+        // Acceptance criterion b: an fr override renders the translated title and label.
+        let locale = resolved_with(
+            "fr",
+            &[
+                (message::LOGIN_TITLE.0, "Se connecter"),
+                (message::LOGIN_IDENTIFIER_LABEL.0, "Identifiant"),
+            ],
+        );
+        let flow = login_flow_with_label();
+        let page = render_localized(&flow, &locale);
+        assert!(
+            page.body.contains("<html lang=\"fr\">"),
+            "the html lang is the resolved fr tag: {}",
+            page.body
+        );
+        assert!(page.body.contains("<h1>Se connecter</h1>"), "French title");
+        assert!(page.body.contains(">Identifiant "), "French label");
+    }
+
+    #[test]
+    fn a_partial_fr_bundle_falls_back_per_id_never_blank() {
+        // Acceptance criterion c: a partial bundle renders the translated title but falls back to
+        // the compiled English label (mixed, never blank).
+        let locale = resolved_with("fr", &[(message::LOGIN_TITLE.0, "Se connecter")]);
+        let flow = login_flow_with_label();
+        let page = render_localized(&flow, &locale);
+        assert!(page.body.contains("<h1>Se connecter</h1>"), "French title");
+        assert!(
+            page.body.contains(">Identifier "),
+            "untranslated label falls back to English: {}",
+            page.body
+        );
+    }
+
+    #[test]
+    fn a_locale_string_with_markup_renders_escaped_as_inert_text() {
+        // The CRITICAL security invariant: a bundle string is PLAIN TEXT, escaped on render
+        // exactly like the compiled default. A locale string carrying <script>/<img onerror> is
+        // shown as inert escaped text, never markup, and is never routed through the sanitizer.
+        let locale = resolved_with(
+            "fr",
+            &[(
+                message::LOGIN_TITLE.0,
+                "<script>alert(1)</script><img src=x onerror=alert(2)>",
+            )],
+        );
+        let flow = login_flow_with_label();
+        let page = render_localized(&flow, &locale);
+        // No raw markup survives: the `<` of every dangerous construct is escaped, so the
+        // `onerror` text is inert (it is not an attribute of any real element).
+        let lower = page.body.to_ascii_lowercase();
+        assert!(!lower.contains("<script"), "no raw script: {lower}");
+        assert!(!lower.contains("<img"), "no raw img: {lower}");
+        assert!(
+            page.body.contains("&lt;script&gt;"),
+            "the locale string is escaped as inert text: {}",
+            page.body
+        );
+        assert!(
+            page.body.contains("&lt;img src=x onerror=alert(2)&gt;"),
+            "the img/onerror payload is escaped whole into inert text: {}",
+            page.body
+        );
+    }
+
+    #[test]
+    fn a_right_to_left_locale_renders_dir_rtl() {
+        // Acceptance criterion e: an RTL locale sets dir="rtl" on the html element (the served
+        // stylesheet uses logical CSS properties, so one stylesheet is correct in both
+        // directions).
+        let locale = resolved_with("ar", &[(message::LOGIN_TITLE.0, "تسجيل الدخول")]);
+        assert_eq!(
+            locale.direction(),
+            crate::flow::localize::TextDirection::Rtl
+        );
+        let flow = login_flow_with_label();
+        let page = render_localized(&flow, &locale);
+        assert!(
+            page.body.contains("<html lang=\"ar\" dir=\"rtl\">"),
+            "the html element carries dir=rtl: {}",
+            page.body
+        );
     }
 }

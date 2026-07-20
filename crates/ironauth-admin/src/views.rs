@@ -1543,3 +1543,33 @@ pub struct ConnectorList {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
 }
+
+/// The body to set (create or overwrite) a per-environment locale bundle (issue #86, PR 2).
+///
+/// The entries map keys on the STABLE NUMERIC message id (as a string) and values are the
+/// PLAIN TEXT render. On write, every key must be a REGISTERED message id and every
+/// `{placeholder}` in a value must be one the id declares, so a translator cannot invent an
+/// interpolation that leaks unintended context or reword a string to reference a variable the
+/// id does not carry; a violation is a loud 400 and nothing is stored. A bundle string is
+/// plain text, escaped on render exactly like the compiled default, never markup.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct SetLocaleRequest {
+    /// The bundle entries: a map of numeric message id (as a string) to the plain-text render.
+    pub entries: std::collections::BTreeMap<String, String>,
+    /// Whether this is the environment's DEFAULT locale (resolved when an end user requests no
+    /// `ui_locales` the environment can render). At most one default per environment; setting a
+    /// new default demotes the previous one. Defaults to false.
+    #[serde(default)]
+    pub is_env_default: bool,
+}
+
+/// A per-environment locale bundle, as returned by the management API (issue #86, PR 2).
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct LocaleBundleView {
+    /// The BCP47 language tag (the per-environment natural key).
+    pub locale: String,
+    /// Whether this is the environment's default locale.
+    pub is_env_default: bool,
+    /// The bundle entries: a map of numeric message id (as a string) to the plain-text render.
+    pub entries: std::collections::BTreeMap<String, String>,
+}

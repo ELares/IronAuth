@@ -61,6 +61,7 @@ fn operation_ids_are_the_stable_set() {
             "createUser",
             "deleteConnector",
             "deleteEnvironment",
+            "deleteLocale",
             "deleteManagementKey",
             "deleteOrganization",
             "deleteTenant",
@@ -75,6 +76,7 @@ fn operation_ids_are_the_stable_set() {
             "getDcrClient",
             "getEnvironment",
             "getInvitation",
+            "getLocale",
             "getManagementKey",
             "getMds3Health",
             "getMigrationProgress",
@@ -114,6 +116,7 @@ fn operation_ids_are_the_stable_set() {
             "revokeInvitation",
             "revokeSession",
             "revokeUserSessions",
+            "setLocale",
             "setUserState",
             "suspendTenant",
             "unlinkUserExternalId",
@@ -243,6 +246,7 @@ fn documented_paths_are_the_expected_set() {
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/connectors/{connector_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/keys/{key_id}",
+            "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/locales/{locale}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/external-id",
@@ -266,6 +270,7 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/invitations/{invitation_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/keys",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/keys/{key_id}",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/locales/{locale}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/migration-runs",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/migration-runs/{run_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/migration-runs/{run_id}/violations",
@@ -314,6 +319,7 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/resume",
             "POST /v1/tenants/{tenant_id}/suspend",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/connectors/{connector_id}",
+            "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/locales/{locale}",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/external-id",
         ]
     );
@@ -353,7 +359,7 @@ fn committed_artifact_matches_generated_spec() {
 async fn served_routes_match_documented_routes() {
     let router = db_free_router();
     let documented = documented_method_paths();
-    assert_eq!(documented.len(), 76, "the documented route count is pinned");
+    assert_eq!(documented.len(), 79, "the documented route count is pinned");
 
     // The OUTBOUND lazy-migration endpoint (issue #58) is the one documented route
     // that is NOT gated by the management `Principal` at 401. It is DISABLED BY

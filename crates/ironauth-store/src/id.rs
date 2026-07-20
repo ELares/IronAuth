@@ -529,6 +529,18 @@ impl ScopedKind for BrandKind {
     const PREFIX: &'static str = "brd";
 }
 
+/// Marker for a per-environment locale bundle (`lcb_`), one installed localization (a BCP47
+/// language tag and its map of numeric message id to plain text render) per environment
+/// (issue #86, PR 2). A tenant-scoped resource: the id embeds its (tenant, environment), so a
+/// bundle minted in one scope parses as a uniform not-found under another. A locale bundle is
+/// PROMOTABLE (issue #41): the whole map is non-secret per-environment config that travels in
+/// a config snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LocaleBundleKind;
+impl ScopedKind for LocaleBundleKind {
+    const PREFIX: &'static str = "lcb";
+}
+
 /// Marker for a federation outbound-login correlation-state row (`fls_`), the
 /// short-lived single-use row that correlates an upstream authorize leg to its
 /// callback (issue #75, PR B). A tenant-scoped resource: the id embeds its (tenant,
@@ -1333,6 +1345,9 @@ pub type ConnectorId = ScopedId<ConnectorKind>;
 /// A per-environment brand identifier (`brd_...`), one named branding definition per
 /// environment (issue #86). Promotable.
 pub type BrandId = ScopedId<BrandKind>;
+/// A per-environment locale bundle identifier (`lcb_...`), one installed localization per
+/// environment (issue #86, PR 2). Promotable.
+pub type LocaleBundleId = ScopedId<LocaleBundleKind>;
 /// A federation outbound-login correlation-state identifier (`fls_...`), the
 /// short-lived single-use row correlating an upstream authorize leg to its callback
 /// (issue #75, PR B).

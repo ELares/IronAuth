@@ -61,6 +61,7 @@ pub mod federation_state;
 pub mod flow;
 mod id;
 pub mod identifier;
+pub mod locale_bundle;
 mod migrate;
 pub mod pow_challenge;
 pub mod promotion;
@@ -123,30 +124,32 @@ pub use id::{
     FederationLoginStateId, FederationLoginStateKind, FlowId, FlowKind, GrantId, GrantKind,
     HumanId, HumanKind, IdParseError, InitialAccessTokenId, InitialAccessTokenKind, InvitationId,
     InvitationKind, IssuedTokenId, IssuedTokenKind, KekId, KekKind, LevelId, LevelKind,
-    MagicLinkTokenId, MagicLinkTokenKind, ManagementKeyId, ManagementKeyKind, MigrationRunId,
-    MigrationRunKind, MigrationRunRecordId, MigrationRunRecordKind, NotInScope, OperatorId,
-    OperatorKind, OrgConnectionId, OrgConnectionKind, OrganizationId, OrganizationKind,
-    PowChallengeId, PowChallengeKind, PushedRequestId, PushedRequestKind, RecoveryApprovalId,
-    RecoveryApprovalKind, RecoveryCodeId, RecoveryCodeKind, RecoveryContactConfirmationId,
-    RecoveryContactConfirmationKind, RecoveryFlowId, RecoveryFlowKind, RecoveryIdvSessionId,
-    RecoveryIdvSessionKind, RecoveryTrustedContactId, RecoveryTrustedContactKind, RefreshFamilyId,
-    RefreshFamilyKind, RefreshTokenId, RefreshTokenKind, ResourceServerId, ResourceServerKind,
-    RiskDecisionId, RiskDecisionKind, RiskDisavowalId, RiskDisavowalKind, RiskLoginGeoId,
-    RiskLoginGeoKind, RiskSignalId, RiskSignalKind, RoutingRuleId, RoutingRuleKind,
-    ScopeStepUpPolicyId, ScopeStepUpPolicyKind, ScopedId, ScopedKind, ServiceAccountId,
-    ServiceAccountKind, ServiceId, ServiceKind, SessionEventId, SessionEventKind, SessionId,
-    SessionKind, SigningKeyId, SigningKeyKind, SignupQuarantineId, SignupQuarantineKind,
-    SmsOtpCodeId, SmsOtpCodeKind, SmsRouteStatId, SmsRouteStatKind, TenantId, TenantKind,
-    TotpCredentialId, TotpCredentialKind, TraitMigrationJobId, TraitMigrationJobKind,
-    TraitSchemaId, TraitSchemaKind, TrustedDeviceId, TrustedDeviceKind, UpstreamTokenGrantId,
-    UpstreamTokenGrantKind, UpstreamTokenId, UpstreamTokenKind, UserId, UserIdentifierId,
-    UserIdentifierKind, UserKind, VariableId, VariableKind, WebauthnChallengeId,
-    WebauthnChallengeKind, WebauthnCredentialId, WebauthnCredentialKind,
+    LocaleBundleId, LocaleBundleKind, MagicLinkTokenId, MagicLinkTokenKind, ManagementKeyId,
+    ManagementKeyKind, MigrationRunId, MigrationRunKind, MigrationRunRecordId,
+    MigrationRunRecordKind, NotInScope, OperatorId, OperatorKind, OrgConnectionId,
+    OrgConnectionKind, OrganizationId, OrganizationKind, PowChallengeId, PowChallengeKind,
+    PushedRequestId, PushedRequestKind, RecoveryApprovalId, RecoveryApprovalKind, RecoveryCodeId,
+    RecoveryCodeKind, RecoveryContactConfirmationId, RecoveryContactConfirmationKind,
+    RecoveryFlowId, RecoveryFlowKind, RecoveryIdvSessionId, RecoveryIdvSessionKind,
+    RecoveryTrustedContactId, RecoveryTrustedContactKind, RefreshFamilyId, RefreshFamilyKind,
+    RefreshTokenId, RefreshTokenKind, ResourceServerId, ResourceServerKind, RiskDecisionId,
+    RiskDecisionKind, RiskDisavowalId, RiskDisavowalKind, RiskLoginGeoId, RiskLoginGeoKind,
+    RiskSignalId, RiskSignalKind, RoutingRuleId, RoutingRuleKind, ScopeStepUpPolicyId,
+    ScopeStepUpPolicyKind, ScopedId, ScopedKind, ServiceAccountId, ServiceAccountKind, ServiceId,
+    ServiceKind, SessionEventId, SessionEventKind, SessionId, SessionKind, SigningKeyId,
+    SigningKeyKind, SignupQuarantineId, SignupQuarantineKind, SmsOtpCodeId, SmsOtpCodeKind,
+    SmsRouteStatId, SmsRouteStatKind, TenantId, TenantKind, TotpCredentialId, TotpCredentialKind,
+    TraitMigrationJobId, TraitMigrationJobKind, TraitSchemaId, TraitSchemaKind, TrustedDeviceId,
+    TrustedDeviceKind, UpstreamTokenGrantId, UpstreamTokenGrantKind, UpstreamTokenId,
+    UpstreamTokenKind, UserId, UserIdentifierId, UserIdentifierKind, UserKind, VariableId,
+    VariableKind, WebauthnChallengeId, WebauthnChallengeKind, WebauthnCredentialId,
+    WebauthnCredentialKind,
 };
 pub use identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
     normalize_routing_domain,
 };
+pub use locale_bundle::{LocaleBundleRecord, NewLocaleBundle};
 pub use migrate::{Migration, MigrationError, MigrationReport, MigrationRunner, Phase};
 pub use pow_challenge::{NewPowChallenge, PowChallengeView};
 pub use promotion::{

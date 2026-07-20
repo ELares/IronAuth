@@ -54,6 +54,7 @@ mod idempotency;
 mod input;
 mod invitations;
 mod keys;
+mod locales;
 mod mds3_health;
 mod migration;
 mod migration_runs;
@@ -282,6 +283,14 @@ pub fn management_router(state: AdminState) -> Router {
             get(connectors::get_connector)
                 .put(connectors::update_connector)
                 .delete(connectors::delete_connector),
+        )
+        // Per-environment locale bundles (issue #86, PR 2): set (create or overwrite), get, and
+        // delete a bundle keyed on its BCP47 tag.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/locales/{locale}",
+            put(locales::set_locale)
+                .get(locales::get_locale)
+                .delete(locales::delete_locale),
         )
         // Session and refresh-family fleet operations (issue #32). The static
         // `/sessions/revoke` (the bulk surface) and the parameterized

@@ -357,6 +357,10 @@ fn promoted_projection(snapshot: &Snapshot) -> Snapshot {
             // projection empties them exactly like `connector`, keeping the revision
             // consistent between the source projection and the target read.
             brand: Vec::new(),
+            // Locale bundles (issue #86, PR 2) are carried in the EXPORT but not applied by the
+            // transactional engine yet (a later slice), so the promoted projection empties them
+            // exactly like `brand`.
+            locale_bundle: Vec::new(),
         },
     }
 }

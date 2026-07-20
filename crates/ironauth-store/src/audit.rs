@@ -532,6 +532,14 @@ pub enum Action {
     /// variants, wordmark, and sanitized rich-text slots). The audit row names the brand
     /// id and scope; the branding values themselves are not recorded here.
     BrandSet,
+    /// A per-environment LOCALE BUNDLE was set through the management API (issue #86, PR 2):
+    /// a first write or an overwrite of an installed localization (a BCP47 tag and its map of
+    /// numeric message id to plain text render). The audit row names the locale bundle id and
+    /// scope; the bundle entries themselves are not recorded here.
+    LocaleSet,
+    /// A per-environment LOCALE BUNDLE was deleted through the management API (issue #86,
+    /// PR 2). The audit row names the locale bundle id and scope.
+    LocaleDelete,
     /// An environment VARIABLE (a non-secret named config value) was set through
     /// the management API (issue #45): a first write or an overwrite. The audit row
     /// names the variable id and scope; the value itself is not recorded here.
@@ -1013,6 +1021,8 @@ impl Action {
             Action::CustomDomainChallengeFail => "custom_domain.challenge.fail",
             Action::CustomDomainCertificateStore => "custom_domain.certificate.store",
             Action::BrandSet => "brand.set",
+            Action::LocaleSet => "locale.set",
+            Action::LocaleDelete => "locale.delete",
             Action::EnvironmentVariableSet => "environment_variable.set",
             Action::EnvironmentVariableDelete => "environment_variable.delete",
             Action::EnvironmentSecretPut => "environment_secret.put",

@@ -25,6 +25,7 @@ use ironauth_store::{FlowId, Scope};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use super::localize::{LanguageTag, LocaleBundle, ResolvedLocale, resolve_locale};
 use super::model::{Flow, Journey, Transport};
 use super::render::{self, PageTheme};
 use super::{
@@ -463,14 +464,51 @@ async fn resolve_env_brand(state: &OidcState, scope: Scope) -> Option<crate::bra
     ))
 }
 
+/// Resolve the end user's locale for rendering (issue #86, PR 2): read the environment's
+/// installed locale bundles and its default locale, then run the RFC 4647 lookup over the
+/// request's `ui_locales` (`fr-CA` to `fr` to the env default to the compiled `en` registry).
+/// The `ui_locales` input already flows end-to-end (authorize to the resume `return_to` to the
+/// reconstructed [`InteractionHints`]); this consumes it, adding no new request plumbing. A
+/// bundle-less environment (or a store hiccup, which fails safe to no bundles) resolves to the
+/// neutral English default, so the page is byte-identical to before PR 2.
+async fn resolve_env_locale(
+    state: &OidcState,
+    scope: Scope,
+    hints: &InteractionHints,
+) -> ResolvedLocale {
+    let records = state
+        .store()
+        .scoped(scope)
+        .locale_bundles()
+        .list_all()
+        .await
+        .unwrap_or_default();
+    let mut installed = std::collections::BTreeMap::new();
+    let mut env_default: Option<LanguageTag> = None;
+    for record in records {
+        let Some(tag) = LanguageTag::parse(&record.locale) else {
+            continue;
+        };
+        if record.is_env_default {
+            env_default = Some(tag.clone());
+        }
+        installed.insert(tag.clone(), LocaleBundle::parse(tag, &record.entries_json));
+    }
+    // No installed default falls back to English (the compiled registry language), so a scope
+    // with bundles but no marked default still resolves sensibly.
+    let env_default =
+        env_default.unwrap_or_else(|| LanguageTag::parse("en").expect("en is a valid tag"));
+    resolve_locale(hints.ui_locales(), &env_default, &installed)
+}
+
 /// Render a flow object into the full hosted page (issue #85, the render app). Threads the
 /// neutral [`PageTheme`] seam, the request UX hints reconstructed from the resume
-/// `/authorize` target (`ui_locales`/`display`), the issue #42 environment banner, and the
-/// passkey conditional-UI wiring (only when WebAuthn is enabled). The strict headers are
-/// attached here by the flow response builder: the passkey ceremony CSP when the passkey
-/// node group was rendered as the ceremony, else the plain flow CSP. This is the ONLY thing
-/// the browser transport emits differently under `flows.enabled`; the flow OBJECT is
-/// unchanged.
+/// `/authorize` target (`ui_locales`/`display`), the resolved locale (issue #86), the issue #42
+/// environment banner, and the passkey conditional-UI wiring (only when WebAuthn is enabled).
+/// The strict headers are attached here by the flow response builder: the passkey ceremony CSP
+/// when the passkey node group was rendered as the ceremony, else the plain flow CSP. This is
+/// the ONLY thing the browser transport emits differently under `flows.enabled`; the flow
+/// OBJECT is unchanged.
 async fn render_browser_flow(
     state: &OidcState,
     scope: Scope,
@@ -490,6 +528,9 @@ async fn render_browser_flow(
         .map_or_else(InteractionHints::default, |(_, query)| {
             InteractionHints::from_query(query)
         });
+    // Resolve the locale from the SAME `ui_locales` the hints carry, against this environment's
+    // installed bundles (issue #86). No bundles resolves to neutral English (byte-identical).
+    let locale = resolve_env_locale(state, scope, &hints).await;
     let banner = state.environment_banner(&scope).await;
     // The per environment brand (issue #86): the resolved default brand fills the wordmark
     // fields and the sanitized rich-text slots; a NULL/absent brand keeps the neutral default
@@ -515,8 +556,15 @@ async fn render_browser_flow(
         scope_path: &scope_path,
         signal_api: state.webauthn_signal_api_enabled(),
     });
-    let rendered =
-        render::render_flow_page(flow, &theme, &hints, banner, &scope_path, passkey.as_ref());
+    let rendered = render::render_flow_page(
+        flow,
+        &theme,
+        &hints,
+        &locale,
+        banner,
+        &scope_path,
+        passkey.as_ref(),
+    );
     match rendered.passkey_nonce {
         Some(nonce) => pages::flow_login_html(StatusCode::OK, rendered.body, &nonce),
         None => pages::flow_html(StatusCode::OK, rendered.body),

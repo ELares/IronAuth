@@ -266,6 +266,16 @@ impl IssuerRegistry {
         self.cache
     }
 
+    /// The data-plane store this registry loads through, or [`None`] for a pre-populated
+    /// (loader-less) registry. The store-backed discovery path reads a scope's installed locale
+    /// bundles through it (issue #86, PR 2) so discovery advertises exactly the UI locales the
+    /// environment can render; a loader-less test registry has no store and advertises the
+    /// minimal `["en"]`.
+    #[must_use]
+    pub fn store(&self) -> Option<&Store> {
+        self.loader.as_ref()
+    }
+
     /// The issuer entry for `scope`, loading and caching it on the first access
     /// when this registry is store-backed. `None` when the environment has no
     /// provisioned signing key (fail closed) or names a cross-tenant environment

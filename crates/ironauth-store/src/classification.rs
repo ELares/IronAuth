@@ -182,13 +182,18 @@ pub enum ResourceType {
     /// replays, so it is Promotable. Per-organization branding is deferred to M10 and
     /// rides org export, never the snapshot.
     Brand,
+    /// A per-environment locale bundle (issue #86, PR 2): one installed localization (a BCP47
+    /// language tag and its map of numeric message id to the plain-text render). It is
+    /// non-secret per-environment config a config snapshot carries and a promotion replays, so
+    /// it is Promotable. Per-organization localization is out of scope for #86.
+    LocaleBundle,
 }
 
 impl ResourceType {
     /// Every resource type, in a stable order. The classification lint and the
     /// metadata endpoint both iterate this; a variant missing here is caught by
     /// the `all_lists_every_variant` test and by `scripts/classification-lint.sh`.
-    pub const ALL: [ResourceType; 25] = [
+    pub const ALL: [ResourceType; 26] = [
         ResourceType::Operator,
         ResourceType::Tenant,
         ResourceType::Environment,
@@ -214,6 +219,7 @@ impl ResourceType {
         ResourceType::UpstreamTokenGrant,
         ResourceType::Flow,
         ResourceType::Brand,
+        ResourceType::LocaleBundle,
     ];
 
     /// The stable wire name of this resource type (for example `organization`).
@@ -245,6 +251,7 @@ impl ResourceType {
             ResourceType::UpstreamTokenGrant => "upstream_token_grant",
             ResourceType::Flow => "flow",
             ResourceType::Brand => "brand",
+            ResourceType::LocaleBundle => "locale_bundle",
         }
     }
 
@@ -277,7 +284,8 @@ impl ResourceType {
             | ResourceType::UpstreamToken
             | ResourceType::UpstreamTokenGrant
             | ResourceType::Flow
-            | ResourceType::Brand => ResourceLevel::Environment,
+            | ResourceType::Brand
+            | ResourceType::LocaleBundle => ResourceLevel::Environment,
         }
     }
 
@@ -323,6 +331,11 @@ pub fn classify(resource: ResourceType) -> ResourceClassification {
         // slots): a config snapshot carries it and a promotion replays it, exactly the
         // "static configuration" the promotion story moves. Per-organization branding is
         // deferred to M10 and rides org export, never the snapshot.
+        // A per-environment locale bundle (issue #86, PR 2) is non-secret per-environment
+        // localization config (a BCP47 tag and its map of numeric message id to plain text): a
+        // config snapshot carries it and a promotion replays it, exactly the "static
+        // configuration" the promotion story moves. Per-organization localization is out of
+        // scope for #86.
         ResourceType::Client
         | ResourceType::ResourceServer
         | ResourceType::DcrPolicy
@@ -331,7 +344,8 @@ pub fn classify(resource: ResourceType) -> ResourceClassification {
         | ResourceType::OrgConnection
         | ResourceType::RoutingRule
         | ResourceType::UpstreamTokenGrant
-        | ResourceType::Brand => Promotable,
+        | ResourceType::Brand
+        | ResourceType::LocaleBundle => Promotable,
 
         // Environment-intrinsic identity, excluded from every snapshot so a
         // promotion never copies one environment's identity onto another: the

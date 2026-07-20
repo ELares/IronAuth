@@ -160,7 +160,17 @@ fn document(
     display: &str,
     environment_banner: Option<&str>,
 ) -> String {
-    document_styled(title, body_html, lang, display, environment_banner, None)
+    // The bootstrap shell is left-to-right (its copy is English): `ltr` emits no dir attribute,
+    // so the bootstrap pages stay byte-identical.
+    document_styled(
+        title,
+        body_html,
+        lang,
+        display,
+        "ltr",
+        environment_banner,
+        None,
+    )
 }
 
 /// The document shell with an OPTIONAL served stylesheet link (issue #85, FORK C). This is
@@ -175,11 +185,17 @@ pub(crate) fn document_styled(
     body_html: &str,
     lang: &str,
     display: &str,
+    dir: &str,
     environment_banner: Option<&str>,
     stylesheet_href: Option<&str>,
 ) -> String {
     let lang = escape_html(lang);
     let display = escape_html(display);
+    // The text direction (issue #86): `dir="rtl"` is emitted ONLY for a right-to-left locale,
+    // so a left-to-right (or unlocalized) page carries NO dir attribute and stays byte-identical
+    // to before PR 2 (left-to-right is the HTML default). The served stylesheet uses logical
+    // CSS properties, so one stylesheet is correct in both directions.
+    let dir_attr = if dir == "rtl" { " dir=\"rtl\"" } else { "" };
     let robots = if environment_banner.is_some() {
         "<meta name=\"robots\" content=\"noindex\">"
     } else {
@@ -198,7 +214,7 @@ pub(crate) fn document_styled(
         None => String::new(),
     };
     format!(
-        "<!doctype html><html lang=\"{lang}\"><head><meta charset=\"utf-8\">\
+        "<!doctype html><html lang=\"{lang}\"{dir_attr}><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">{robots}{stylesheet}\
          <title>{title}</title></head>\
          <body data-display=\"{display}\">{banner}{body_html}</body></html>"
@@ -547,7 +563,7 @@ p[role=alert],span.error{color:#b00020}\
 p[role=status][data-environment-banner]{\
 background:#fff4d6;border:1px solid #e0c060;border-radius:.375rem;padding:.5rem .75rem}\
 [data-brand]{margin:0 0 1rem;font-weight:700}\
-[data-brand-token]{display:inline-block;margin-left:.5rem;padding:.125rem .5rem;\
+[data-brand-token]{display:inline-block;margin-inline-start:.5rem;padding:.125rem .5rem;\
 font-size:.75rem;border-radius:1rem;background:#e6ecff;color:#2848b0}\
 @media (prefers-color-scheme:dark){\
 body{color:#eee;background:#141414}\
@@ -600,7 +616,7 @@ p[role=alert],span.error{color:var(--color-error)}\
 p[role=status][data-environment-banner]{\
 background:#fff4d6;border:1px solid #e0c060;border-radius:var(--radius);padding:.5rem .75rem}\
 [data-brand]{margin:0 0 1rem;font-weight:700}\
-[data-brand-token]{display:inline-block;margin-left:.5rem;padding:.125rem .5rem;\
+[data-brand-token]{display:inline-block;margin-inline-start:.5rem;padding:.125rem .5rem;\
 font-size:.75rem;border-radius:1rem;background:var(--color-surface);color:var(--color-accent)}\
 [data-brand-slot]{margin:1rem 0;font-size:.9rem}\
 [data-brand-footer]{margin-top:1.5rem;font-size:.8rem;opacity:.85}\
@@ -1592,11 +1608,19 @@ mod tests {
         // The bootstrap pages stay byte-identical: document() delegates to document_styled with
         // no href, so no <link> is emitted and the shell is unchanged.
         let plain = document("Title", "<p>body</p>", "en", "page", None);
-        let via = document_styled("Title", "<p>body</p>", "en", "page", None, None);
+        let via = document_styled("Title", "<p>body</p>", "en", "page", "ltr", None, None);
         assert_eq!(plain, via);
         assert!(
             !plain.contains("<link"),
             "no stylesheet link on the bootstrap shell"
+        );
+        // A left-to-right page carries NO dir attribute (byte-identical to before PR 2).
+        assert!(!plain.contains("dir="), "no dir attribute for ltr: {plain}");
+        // A right-to-left locale sets dir="rtl" on the html element.
+        let rtl = document_styled("Title", "<p>body</p>", "ar", "page", "rtl", None, None);
+        assert!(
+            rtl.contains("<html lang=\"ar\" dir=\"rtl\">"),
+            "rtl sets the dir attribute: {rtl}"
         );
         // With an href, exactly one escaped link is added.
         let styled = document_styled(
@@ -1604,6 +1628,7 @@ mod tests {
             "<p>body</p>",
             "en",
             "page",
+            "ltr",
             None,
             Some("/t/a/e/b/pages.css"),
         );
