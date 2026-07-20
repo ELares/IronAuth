@@ -179,6 +179,16 @@ jobs:
         run: scripts/discovery-scan.sh
       - name: rfc9700 scan (every OAuth endpoint bound to a conformance test)
         run: scripts/rfc9700-scan.sh
+      - name: route audit (reference app calls only documented public endpoints)
+        # The standalone TypeScript reference app (packages/reference-app) is a
+        # pure client of the public flow API. This audit is the structural
+        # guarantee that every network call it makes targets a documented public
+        # endpoint: it diffs the app's declared endpoints against the Rust
+        # FLOW_*_PATH constants plus the documented public session endpoints, and
+        # fails if any module outside the one audited client performs a network
+        # call or names a server path or external URL. It is a static check (no
+        # Node needed), so it lives in this python lane.
+        run: scripts/route-audit.sh
       - name: conformance harness static checks (results gate, matrix, digest pins, plan config, downgrade confinement)
         # THIS is the conformance enforcement that is real today. It is always-on,
         # runner-independent, gated by NO repository variable, and required on
@@ -206,6 +216,13 @@ jobs:
         run: |
           scripts/flow-schema.sh
           git diff --exit-code docs/flow-schema.json docs/flow-messages.json
+      - name: reference app bindings freshness (generated from the published contract)
+        # The reference app's TypeScript types, its schema derived validation
+        # constants, and its numeric id to copy map are GENERATED from
+        # docs/flow-schema.json and docs/flow-messages.json, so the app and the
+        # server cannot diverge on the flow object shape or the message copy.
+        # This regenerates them and fails if the committed bindings drift.
+        run: scripts/reference-app-bindings.sh
       - name: flow golden corpus freshness (rendered flow shape, all journeys x both transports)
         # The golden corpus LOCKS the rendered flow shape (node set, deterministic order,
         # groups, message ids) for every journey/state on both transports. A breaking change
@@ -246,6 +263,33 @@ jobs:
               sys.exit(f'security.txt Expires more than ~13 months out: {expires}')
           print('security.txt: valid, expires', expires)
           EOF
+
+  # The standalone TypeScript reference app (packages/reference-app, issue #85):
+  # build and typecheck it so it cannot rot. It is a SEPARATE deployable that
+  # runs OUTSIDE the Rust binary, so it is built independently here and is NEVER
+  # part of the Rust release pipeline. The build is deliberately minimal: `tsc`
+  # over pinned TypeScript, no bundler, no runtime dependency. The route audit
+  # and the bindings freshness gate for this app run in the `invariants` job
+  # above (they are static python checks that need no Node).
+  reference-app:
+    name: reference app (tsc build + typecheck)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: install (pinned toolchain)
+        working-directory: packages/reference-app
+        run: npm install --no-audit --no-fund
+      - name: build and typecheck
+        working-directory: packages/reference-app
+        # `tsc` typechecks and emits; noEmitOnError is on by default, so a type
+        # error fails the build.
+        run: npm run build
 
   # The LIVE OIDF suite drive. Read the name: this job is NOT a merge gate and
   # must NOT be added to branch protection while it is unprovisioned.
