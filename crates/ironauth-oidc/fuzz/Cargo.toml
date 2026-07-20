@@ -33,3 +33,13 @@ path = "fuzz_targets/flow_submission_parse.rs"
 test = false
 doc = false
 bench = false
+
+# The branding rich-text sanitizer target (issue #86): arbitrary bytes never panic the
+# allowlist sanitizer and its output is always inert (no script, no on* handler, no
+# scripting scheme) and idempotent.
+[[bin]]
+name = "branding_sanitize"
+path = "fuzz_targets/branding_sanitize.rs"
+test = false
+doc = false
+bench = false

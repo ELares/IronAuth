@@ -82,7 +82,7 @@ pub const CONNECTOR_CLIENT_SECRET_REFERENCE: &str = "connector_client_secret";
 /// (and by the export), and an environment-identity or runtime type can never be
 /// added without failing it. This is the live binding between the snapshot and the
 /// single source of truth, not a hand-maintained parallel list.
-pub const SNAPSHOT_RESOURCE_TYPES: [ResourceType; 8] = [
+pub const SNAPSHOT_RESOURCE_TYPES: [ResourceType; 9] = [
     ResourceType::Client,
     ResourceType::ResourceServer,
     ResourceType::DcrPolicy,
@@ -91,6 +91,7 @@ pub const SNAPSHOT_RESOURCE_TYPES: [ResourceType; 8] = [
     ResourceType::OrgConnection,
     ResourceType::RoutingRule,
     ResourceType::UpstreamTokenGrant,
+    ResourceType::Brand,
 ];
 
 /// A named reference to a secret in the environment-scoped secret store (issue
@@ -306,6 +307,34 @@ pub struct UpstreamTokenGrantSnapshot {
     pub enabled: bool,
 }
 
+/// The secret-free projection of one per-environment brand (issue #86). A brand is
+/// NON-secret promotable branding config: the design tokens (and dark variants) and
+/// the sanitized rich-text slots travel as embedded parsed JSON so they canonicalize
+/// recursively, and the plain wordmark fields travel as scalars. No secret and no PII.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrandSnapshot {
+    /// The brand slug, unique per scope: the stable natural key the export orders by.
+    pub slug: String,
+    /// Whether this is the environment's default brand.
+    pub is_default: bool,
+    /// The plain-text product name / wordmark.
+    pub product_name: String,
+    /// Whether to show the wordmark header.
+    pub show_wordmark: bool,
+    /// The optional plain-text brand-token badge.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub brand_token: Option<String>,
+    /// The TYPED design tokens (a JSON object of validated scalars), embedded as parsed
+    /// JSON so it canonicalizes recursively.
+    pub tokens: serde_json::Value,
+    /// The dark-mode token variants, if authored.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tokens_dark: Option<serde_json::Value>,
+    /// The sanitized rich-text slots (a JSON object of slot key to sanitized markup),
+    /// embedded as parsed JSON.
+    pub slots: serde_json::Value,
+}
+
 /// The promotable resources a snapshot carries, keyed by resource-type wire name
 /// (issue #41 classification). Each array is ordered by its type's stable natural
 /// key, so the collection order is deterministic and documented.
@@ -342,6 +371,11 @@ pub struct SnapshotResources {
     /// and never exported (issue #77, PR 3).
     #[serde(default)]
     pub upstream_token_grant: Vec<UpstreamTokenGrantSnapshot>,
+    /// The environment's per-environment brands (`brand`). Each is secret-free branding
+    /// config (typed design tokens and sanitized rich-text slots); per-organization
+    /// branding is deferred to M10 and rides org export, never the snapshot (issue #86).
+    #[serde(default)]
+    pub brand: Vec<BrandSnapshot>,
 }
 
 /// A canonical, deterministic, secret-free snapshot of one environment's
@@ -654,6 +688,34 @@ pub async fn export(scoped: &ScopedStore<'_>) -> Result<Snapshot, StoreError> {
             .cmp(&(b.client_id.as_str(), b.org_connection_id.as_str()))
     });
 
+    // Per-environment brands (issue #86): non-secret promotable branding config. The
+    // TYPED tokens and the sanitized slots are embedded as PARSED JSON so they
+    // canonicalize recursively (a decode fault here is a real persistence corruption,
+    // surfaced rather than swallowed). No secret and no PII travels. Ordered by the
+    // stable slug natural key.
+    let mut brand = Vec::new();
+    for record in scoped.brands().list_all().await? {
+        let tokens: serde_json::Value =
+            serde_json::from_str(&record.tokens_json).map_err(serde_fault)?;
+        let tokens_dark = match record.tokens_dark_json {
+            Some(json) => Some(serde_json::from_str(&json).map_err(serde_fault)?),
+            None => None,
+        };
+        let slots: serde_json::Value =
+            serde_json::from_str(&record.slots_json).map_err(serde_fault)?;
+        brand.push(BrandSnapshot {
+            slug: record.slug,
+            is_default: record.is_default,
+            product_name: record.product_name,
+            show_wordmark: record.show_wordmark,
+            brand_token: record.brand_token,
+            tokens,
+            tokens_dark,
+            slots,
+        });
+    }
+    brand.sort_by(|a, b| a.slug.cmp(&b.slug));
+
     Ok(Snapshot {
         schema_version: SNAPSHOT_SCHEMA_VERSION.to_string(),
         resources: SnapshotResources {
@@ -665,6 +727,7 @@ pub async fn export(scoped: &ScopedStore<'_>) -> Result<Snapshot, StoreError> {
             org_connection,
             routing_rule,
             upstream_token_grant,
+            brand,
         },
     })
 }
@@ -808,6 +871,19 @@ const DCR_POLICY_KEYS: [&str; 2] = ["name", "primitives"];
 
 /// Every key a snapshot `variable` element may carry (issue #45).
 const VARIABLE_KEYS: [&str; 2] = ["name", "value"];
+
+/// Every key a snapshot `brand` element may carry (issue #86). No secret slot: a brand
+/// holds no secret material. The published schema pins `additionalProperties: false`.
+const BRAND_KEYS: [&str; 8] = [
+    "slug",
+    "is_default",
+    "product_name",
+    "show_wordmark",
+    "brand_token",
+    "tokens",
+    "tokens_dark",
+    "slots",
+];
 
 /// Every key a snapshot `connector` element may carry, besides the secret REFERENCE
 /// slot (issue #75). The published schema pins `additionalProperties: false`.
@@ -1105,6 +1181,27 @@ fn validate_resource(
             require_nonempty_string(object, "client_id", path, violations);
             require_nonempty_string(object, "org_connection_id", path, violations);
         }
+        ResourceType::Brand => {
+            // A brand is secret-free branding config (issue #86): a slug, plain wordmark
+            // fields, and the TYPED tokens / sanitized slots as JSON objects. The
+            // forbidden-secret-key scan above already blocks secret-shaped material.
+            reject_unknown_keys(object, &BRAND_KEYS, None, path, violations);
+            require_nonempty_string(object, "slug", path, violations);
+            require_nonempty_string(object, "product_name", path, violations);
+            for field in ["tokens", "slots"] {
+                match object.get(field) {
+                    Some(serde_json::Value::Object(_)) => {}
+                    Some(_) => violations.push(SnapshotViolation::new(
+                        format!("{path}/{field}"),
+                        "must be a JSON object",
+                    )),
+                    None => violations.push(SnapshotViolation::new(
+                        format!("{path}/{field}"),
+                        "missing required object field",
+                    )),
+                }
+            }
+        }
         // Only the promotable set is ever passed here (the caller iterates
         // SNAPSHOT_RESOURCE_TYPES); a non-promotable type is a programmer error, not
         // a document fault, so it is reported at the element path.
@@ -1389,9 +1486,10 @@ mod tests {
         // variable) regardless of struct field order.
         assert_eq!(
             text,
-            "{\"resources\":{\"client\":[],\"connector\":[],\"dcr_policy\":[],\"org_connection\":[],\
-             \"resource_server\":[],\"routing_rule\":[],\"upstream_token_grant\":[],\
-             \"variable\":[]},\"schema_version\":\"ironauth.config-snapshot/v1\"}"
+            "{\"resources\":{\"brand\":[],\"client\":[],\"connector\":[],\"dcr_policy\":[],\
+             \"org_connection\":[],\"resource_server\":[],\"routing_rule\":[],\
+             \"upstream_token_grant\":[],\"variable\":[]},\
+             \"schema_version\":\"ironauth.config-snapshot/v1\"}"
         );
     }
 

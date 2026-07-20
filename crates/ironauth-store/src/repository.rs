@@ -57,6 +57,7 @@ use sqlx::{PgConnection, Postgres, Row, Transaction};
 
 use crate::abuse::{AbuseBanView, AbuseSubject, AbuseSubjectKind, AuthPath, NewBan};
 use crate::audit::{ActingContext, Action, ActorRef};
+use crate::brand::{BrandRecord, NewBrand};
 use crate::classification::ResourceType;
 use crate::connector::{ConnectorCapabilities, ConnectorRecord, NewConnector, StoredCapabilities};
 use crate::custom_domain::{
@@ -74,19 +75,20 @@ use crate::flow::{FlowRecord, NewFlow};
 use crate::id::{
     AaguidRuleId, AbuseBanId, AccountLinkId, AcmeChallengeId, AdminSudoElevationId,
     AssertionMappingId, AttestationConfigId, AuditId, AuditTarget, AuthorizationCodeId,
-    BackChannelDeliveryId, ClientId, ClientSessionId, ConnectorId, ConsentId, CorrelationId,
-    CredentialClassPolicyId, CredentialId, CustomDomainId, DcrPolicyId, DekId, DeviceCodeId,
-    EmailOtpCodeId, EncryptedSecretId, EnvironmentId, EnvironmentSecretId, ExternalIssuerId,
-    FedcmNonceId, FederationLoginStateId, FlowId, GrantId, InitialAccessTokenId, InvitationId,
-    IssuedTokenId, KekId, MagicLinkTokenId, ManagementKeyId, Mds3BlobCacheId, MigrationRunId,
-    MigrationRunRecordId, OperatorId, OrgConnectionId, OrganizationId, PowChallengeId,
-    PushedRequestId, RecoveryApprovalId, RecoveryCodeId, RecoveryContactConfirmationId,
-    RecoveryFlowId, RecoveryIdvSessionId, RecoveryTrustedContactId, RefreshFamilyId,
-    RefreshTokenId, ResourceServerId, RiskDecisionId, RiskDisavowalId, RiskLoginGeoId,
-    RiskSignalId, RoutingRuleId, ScopeStepUpPolicyId, ServiceAccountId, SessionEventId, SessionId,
-    SigningKeyId, SignupQuarantineId, SmsOtpCodeId, SmsRouteStatId, TenantId, TotpCredentialId,
-    TraitMigrationJobId, TraitSchemaId, TrustedDeviceId, UpstreamTokenGrantId, UpstreamTokenId,
-    UserId, UserIdentifierId, VariableId, WebauthnChallengeId, WebauthnCredentialId,
+    BackChannelDeliveryId, BrandId, ClientId, ClientSessionId, ConnectorId, ConsentId,
+    CorrelationId, CredentialClassPolicyId, CredentialId, CustomDomainId, DcrPolicyId, DekId,
+    DeviceCodeId, EmailOtpCodeId, EncryptedSecretId, EnvironmentId, EnvironmentSecretId,
+    ExternalIssuerId, FedcmNonceId, FederationLoginStateId, FlowId, GrantId, InitialAccessTokenId,
+    InvitationId, IssuedTokenId, KekId, MagicLinkTokenId, ManagementKeyId, Mds3BlobCacheId,
+    MigrationRunId, MigrationRunRecordId, OperatorId, OrgConnectionId, OrganizationId,
+    PowChallengeId, PushedRequestId, RecoveryApprovalId, RecoveryCodeId,
+    RecoveryContactConfirmationId, RecoveryFlowId, RecoveryIdvSessionId, RecoveryTrustedContactId,
+    RefreshFamilyId, RefreshTokenId, ResourceServerId, RiskDecisionId, RiskDisavowalId,
+    RiskLoginGeoId, RiskSignalId, RoutingRuleId, ScopeStepUpPolicyId, ServiceAccountId,
+    SessionEventId, SessionId, SigningKeyId, SignupQuarantineId, SmsOtpCodeId, SmsRouteStatId,
+    TenantId, TotpCredentialId, TraitMigrationJobId, TraitSchemaId, TrustedDeviceId,
+    UpstreamTokenGrantId, UpstreamTokenId, UserId, UserIdentifierId, VariableId,
+    WebauthnChallengeId, WebauthnCredentialId,
 };
 use crate::identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
@@ -477,6 +479,20 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn connectors(&self) -> ConnectorRepo<'a> {
         ConnectorRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only per-environment brand repository for this scope (issue #86): read
+    /// the environment's DEFAULT brand (for the render path), read a brand by slug, and
+    /// list the scope's brands (for the config-snapshot export). Every branding value is
+    /// stored already validated / already sanitized; the renderer re-validates the tokens
+    /// and re-sanitizes the slots on read. The mutating set lives on
+    /// [`ActingStore::brands`].
+    #[must_use]
+    pub fn brands(&self) -> BrandRepo<'a> {
+        BrandRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -1299,6 +1315,19 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn risk(&self) -> ActingRiskRepo<'a> {
         ActingRiskRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating per-environment brand repository for this scope and actor (issue
+    /// #86): set (create or overwrite) the environment's brand, audited. The tokens and
+    /// slots are stored already validated / already sanitized by the branding module.
+    /// Every write carries the actor and correlation id into its audit row.
+    #[must_use]
+    pub fn brands(&self) -> ActingBrandRepo<'a> {
+        ActingBrandRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -20636,6 +20665,236 @@ impl FlowRepo<'_> {
     }
 }
 
+/// The read-only per-environment brand repository (issue #86): read the environment's
+/// DEFAULT brand for the render path, read a brand by slug, and list a scope's brands for
+/// the config-snapshot export. Every read is scope-forced under row-level security, so a
+/// brand of another scope is a uniform not-found.
+pub struct BrandRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl BrandRepo<'_> {
+    /// The environment's DEFAULT brand (issue #86), or [`None`] when the environment has
+    /// no brand installed (the render path then uses the neutral default, unchanged from
+    /// issue #85). At most one default exists per scope (a partial unique index enforces
+    /// it).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn default_brand(&self) -> Result<Option<BrandRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, slug, is_default, product_name, show_wordmark, brand_token, \
+                    tokens::text AS tokens, tokens_dark::text AS tokens_dark, \
+                    slots::text AS slots \
+             FROM brands \
+             WHERE tenant_id = $1 AND environment_id = $2 AND is_default \
+             LIMIT 1",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| brand_from_row(&row)))
+    }
+
+    /// A brand by slug within scope (issue #86), or [`None`] when no such brand exists in
+    /// this scope.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn get(&self, slug: &str) -> Result<Option<BrandRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, slug, is_default, product_name, show_wordmark, brand_token, \
+                    tokens::text AS tokens, tokens_dark::text AS tokens_dark, \
+                    slots::text AS slots \
+             FROM brands \
+             WHERE tenant_id = $1 AND environment_id = $2 AND slug = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(slug)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| brand_from_row(&row)))
+    }
+
+    /// EVERY brand in this scope (no pagination), ordered by slug: the set the config
+    /// snapshot export (issue #43) projects. A brand is promotable config, so its whole
+    /// non-secret definition travels in the snapshot.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_all(&self) -> Result<Vec<BrandRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, slug, is_default, product_name, show_wordmark, brand_token, \
+                    tokens::text AS tokens, tokens_dark::text AS tokens_dark, \
+                    slots::text AS slots \
+             FROM brands \
+             WHERE tenant_id = $1 AND environment_id = $2 ORDER BY slug",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows.iter().map(brand_from_row).collect())
+    }
+}
+
+/// Build a [`BrandRecord`] from a `brands` row (the shared read projection).
+fn brand_from_row(row: &sqlx::postgres::PgRow) -> BrandRecord {
+    BrandRecord {
+        id: row.get("id"),
+        slug: row.get("slug"),
+        is_default: row.get("is_default"),
+        product_name: row.get("product_name"),
+        show_wordmark: row.get("show_wordmark"),
+        brand_token: row.get("brand_token"),
+        tokens_json: row.get("tokens"),
+        tokens_dark_json: row.get("tokens_dark"),
+        slots_json: row.get("slots"),
+    }
+}
+
+/// The mutating per-environment brand repository for one scope and actor (issue #86):
+/// set (create or overwrite) a brand, audited. The tokens and slots are stored verbatim
+/// as the caller's ALREADY-validated / ALREADY-sanitized JSON strings (the branding
+/// module validates the tokens and sanitizes the slots before they reach here).
+pub struct ActingBrandRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingBrandRepo<'_> {
+    /// Set a brand (a first write or an overwrite) and audit `brand.set` in the same
+    /// transaction (issue #86). One row per (scope, slug): a repeat write to the same slug
+    /// overwrites in place and reuses the row's id (a stable audit target across
+    /// overwrites), so a set is idempotent on the slug. When `params.is_default` is set,
+    /// any OTHER default in the scope is first demoted, so the partial unique index (one
+    /// default per scope) is never violated and the new brand becomes the sole default.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `id` is out of scope; [`StoreError::Database`] on a
+    /// persistence failure.
+    pub async fn set(
+        &self,
+        env: &Env,
+        id: &BrandId,
+        created_at_micros: i64,
+        params: NewBrand<'_>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        // Reuse the existing row id for this slug so an overwrite keeps a stable audit
+        // target; a first write uses the caller-minted id.
+        let target_id = match self.brand_id_for_slug(params.slug).await? {
+            Some(existing) => existing,
+            None => id.to_string(),
+        };
+        let target = BrandId::parse_in_scope(&target_id, &scope)?;
+        let created_micros = created_at_micros;
+        let slug = params.slug.to_owned();
+        let is_default = params.is_default;
+        let product_name = params.product_name.to_owned();
+        let show_wordmark = params.show_wordmark;
+        let brand_token = params.brand_token.map(str::to_owned);
+        let tokens = params.tokens_json.to_owned();
+        let tokens_dark = params.tokens_dark_json.map(str::to_owned);
+        let slots = params.slots_json.to_owned();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::BrandSet,
+                target: &target,
+            },
+            async move |tx| {
+                // Demote any other default so the new default is the sole one (the partial
+                // unique index tolerates only one default per scope).
+                if is_default {
+                    sqlx::query(
+                        "UPDATE brands SET is_default = false, updated_at = \
+                         TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval \
+                         WHERE tenant_id = $1 AND environment_id = $2 AND is_default \
+                           AND slug <> $4",
+                    )
+                    .bind(scope.tenant().to_string())
+                    .bind(scope.environment().to_string())
+                    .bind(created_micros)
+                    .bind(&slug)
+                    .execute(&mut **tx)
+                    .await?;
+                }
+                sqlx::query(
+                    "INSERT INTO brands \
+                     (id, tenant_id, environment_id, slug, is_default, product_name, \
+                      show_wordmark, brand_token, tokens, tokens_dark, slots, created_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb, $11::jsonb, \
+                             TIMESTAMPTZ 'epoch' + ($12::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($12::text || ' microseconds')::interval) \
+                     ON CONFLICT (tenant_id, environment_id, slug) DO UPDATE \
+                     SET is_default = EXCLUDED.is_default, \
+                         product_name = EXCLUDED.product_name, \
+                         show_wordmark = EXCLUDED.show_wordmark, \
+                         brand_token = EXCLUDED.brand_token, \
+                         tokens = EXCLUDED.tokens, \
+                         tokens_dark = EXCLUDED.tokens_dark, \
+                         slots = EXCLUDED.slots, \
+                         updated_at = EXCLUDED.updated_at",
+                )
+                .bind(target.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&slug)
+                .bind(is_default)
+                .bind(&product_name)
+                .bind(show_wordmark)
+                .bind(brand_token.as_deref())
+                .bind(&tokens)
+                .bind(tokens_dark.as_deref())
+                .bind(&slots)
+                .bind(created_micros)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// The stored id of the brand named `slug`, or [`None`] for a first write.
+    async fn brand_id_for_slug(&self, slug: &str) -> Result<Option<String>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id FROM brands \
+             WHERE tenant_id = $1 AND environment_id = $2 AND slug = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(slug)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| row.get::<String, _>("id")))
+    }
+}
+
 /// The mutating federation connector repository (issue #75): create (seal the
 /// upstream client secret inline, audited), update (replace and reseal, audited),
 /// and delete (audited). Every write is scope-bound.
@@ -33287,6 +33546,10 @@ async fn read_promoted_snapshot(
             routing_rule: Vec::new(),
             // Upstream-token grants (issue #77, PR 3) are likewise not promoted yet.
             upstream_token_grant: Vec::new(),
+            // Brands (issue #86) are exported and diffable but not applied by the
+            // transactional engine yet (a later slice), so the promoted target read omits
+            // them exactly like `client`, keeping the promotion revision consistent.
+            brand: Vec::new(),
         },
     })
 }

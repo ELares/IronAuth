@@ -40,6 +40,8 @@ jobs:
             target: canonicalize_identifier
           - crate: ironauth-oidc
             target: flow_submission_parse
+          - crate: ironauth-oidc
+            target: branding_sanitize
     steps:
       - uses: actions/checkout@v4
       # cargo-fuzz needs a nightly toolchain for the sanitizer build. The

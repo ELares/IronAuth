@@ -88,6 +88,14 @@ sqlx = { version = "0.8", default-features = false, features = [
     "postgres",
 ] }
 base64 = "0.22"
+# The vetted allowlist HTML sanitizer (crates/ironauth-oidc, issue #86): the security
+# core of safe branding rich text. Built on html5ever, it parses to a DOM and reserializes
+# ONLY an explicit allowlist of tags and attributes, so the Casdoor class of stored XSS is
+# closed by construction rather than by a fragile blocklist. Configured to a minimal subset
+# (b i strong em u p br, plus a[href] on an https only scheme with a forced rel). Pure Rust,
+# permissive (MIT OR Apache-2.0), and its html5ever/markup5ever/tendril subtree is permissive
+# too (see deny.toml); no C dependency, so the musl static lane holds.
+ammonia = "4"
 # Unicode NFKC normalization for the central identifier canonicalization seam
 # (crates/ironauth-store, issue #54). NFKC folds the compatibility-confusable class
 # (fullwidth ASCII, ligatures, circled forms) onto ordinary forms so a homoglyph

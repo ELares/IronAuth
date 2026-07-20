@@ -176,13 +176,19 @@ pub enum ResourceType {
     /// per-environment data bound to a specific environment's users and short lived; it
     /// STRUCTURALLY never enters a config snapshot.
     Flow,
+    /// A per-environment brand (issue #86): one named branding definition (design tokens,
+    /// dark-mode variants, the product wordmark, and the sanitized rich-text slots). It is
+    /// non-secret per-environment config a config snapshot carries and a promotion
+    /// replays, so it is Promotable. Per-organization branding is deferred to M10 and
+    /// rides org export, never the snapshot.
+    Brand,
 }
 
 impl ResourceType {
     /// Every resource type, in a stable order. The classification lint and the
     /// metadata endpoint both iterate this; a variant missing here is caught by
     /// the `all_lists_every_variant` test and by `scripts/classification-lint.sh`.
-    pub const ALL: [ResourceType; 24] = [
+    pub const ALL: [ResourceType; 25] = [
         ResourceType::Operator,
         ResourceType::Tenant,
         ResourceType::Environment,
@@ -207,6 +213,7 @@ impl ResourceType {
         ResourceType::UpstreamToken,
         ResourceType::UpstreamTokenGrant,
         ResourceType::Flow,
+        ResourceType::Brand,
     ];
 
     /// The stable wire name of this resource type (for example `organization`).
@@ -237,6 +244,7 @@ impl ResourceType {
             ResourceType::UpstreamToken => "upstream_token",
             ResourceType::UpstreamTokenGrant => "upstream_token_grant",
             ResourceType::Flow => "flow",
+            ResourceType::Brand => "brand",
         }
     }
 
@@ -268,7 +276,8 @@ impl ResourceType {
             | ResourceType::RoutingRule
             | ResourceType::UpstreamToken
             | ResourceType::UpstreamTokenGrant
-            | ResourceType::Flow => ResourceLevel::Environment,
+            | ResourceType::Flow
+            | ResourceType::Brand => ResourceLevel::Environment,
         }
     }
 
@@ -309,6 +318,11 @@ pub fn classify(resource: ResourceType) -> ResourceClassification {
         // authorization config a snapshot carries and a promotion replays: it names
         // which client may retrieve a session's captured upstream tokens and holds no
         // secret, so it is Promotable and snapshot-exported.
+        // A per-environment brand (issue #86) is non-secret per-environment branding
+        // config (design tokens, dark-mode variants, wordmark, and sanitized rich-text
+        // slots): a config snapshot carries it and a promotion replays it, exactly the
+        // "static configuration" the promotion story moves. Per-organization branding is
+        // deferred to M10 and rides org export, never the snapshot.
         ResourceType::Client
         | ResourceType::ResourceServer
         | ResourceType::DcrPolicy
@@ -316,7 +330,8 @@ pub fn classify(resource: ResourceType) -> ResourceClassification {
         | ResourceType::Connector
         | ResourceType::OrgConnection
         | ResourceType::RoutingRule
-        | ResourceType::UpstreamTokenGrant => Promotable,
+        | ResourceType::UpstreamTokenGrant
+        | ResourceType::Brand => Promotable,
 
         // Environment-intrinsic identity, excluded from every snapshot so a
         // promotion never copies one environment's identity onto another: the

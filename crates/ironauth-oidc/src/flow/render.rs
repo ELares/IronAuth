@@ -54,6 +54,11 @@ pub struct PageTheme {
     /// An optional per environment brand token (a bounded, server known label, escaped on
     /// render): the seam issue #86 fills with safe branding. NEVER operator HTML.
     pub brand_token: Option<String>,
+    /// The per environment sanitized rich-text slots (issue #86). Each slot value is a
+    /// [`SanitizedRichText`](crate::branding::SanitizedRichText), which can ONLY be an
+    /// allowlist-sanitizer output, so a slot renders safe markup by construction. The
+    /// neutral default carries no slots (an unbranded page renders no extra chrome).
+    pub slots: crate::branding::BrandSlots,
 }
 
 impl Default for PageTheme {
@@ -62,6 +67,7 @@ impl Default for PageTheme {
             product_name: "IronAuth".to_owned(),
             show_wordmark: true,
             brand_token: None,
+            slots: crate::branding::BrandSlots::default(),
         }
     }
 }
@@ -113,6 +119,12 @@ pub(crate) fn render_flow_page(
     inner.push_str(&pages::escape_html(&title));
     inner.push_str("</h1>");
 
+    // The login-help rich-text slot (issue #86): rendered at a FIXED position just under
+    // the title, from the brand's sanitized slot markup.
+    if let Some(slot) = theme.slots.get(crate::branding::SlotId::LoginHelp) {
+        push_slot(&mut inner, "data-brand-slot", slot);
+    }
+
     // Flow level messages (errors and info not attached to a single node).
     for message in &flow.ui.messages {
         inner.push_str(&message_block(message));
@@ -141,6 +153,11 @@ pub(crate) fn render_flow_page(
         }
         None => None,
     };
+    // The legal/consent footer rich-text slot (issue #86): rendered at a FIXED position at
+    // the bottom of the page, from the brand's sanitized slot markup.
+    if let Some(slot) = theme.slots.get(crate::branding::SlotId::FooterLegal) {
+        push_slot(&mut inner, "data-brand-footer", slot);
+    }
     inner.push_str("</main>");
 
     let stylesheet_href = format!("{scope_path}/pages.css");
@@ -180,6 +197,26 @@ fn brand_header(theme: &PageTheme) -> String {
     }
     out.push_str("</header>");
     out
+}
+
+/// Emit a branding rich-text slot at a fixed, server-authored position (issue #86).
+///
+/// This is the ONE place the flow render app emits PRE-SANITIZED HTML verbatim rather than
+/// [`pages::escape_html`] escaped text. It is safe because the value is a
+/// [`SanitizedRichText`](crate::branding::SanitizedRichText), whose ONLY constructor is the
+/// ammonia allowlist sanitizer: the inner string is guaranteed to contain only the
+/// allowlisted tags (`b i strong em u p br a`), an `https` `href` with a forced `rel`, and
+/// NO script, `on*` handler, `style`, or non-https scheme. The wrapping element and its
+/// `data-*` hook are fixed server-authored tokens. Every OTHER value on the page stays
+/// escaped; only a sanitized slot is emitted raw.
+fn push_slot(out: &mut String, hook: &str, slot: &crate::branding::SanitizedRichText) {
+    out.push_str("<div ");
+    out.push_str(hook);
+    out.push('>');
+    // SAFETY (XSS): `slot` is allowlist-sanitized markup (see the function doc); emitting it
+    // verbatim is the intended, documented single raw-HTML path.
+    out.push_str(slot.as_str());
+    out.push_str("</div>");
 }
 
 /// Render a flow level or node level message as a styled block (issue #85), keyed on its kind
@@ -658,6 +695,7 @@ mod tests {
             product_name: "Acme Login".to_owned(),
             show_wordmark: true,
             brand_token: Some(HOSTILE.to_owned()),
+            slots: crate::branding::BrandSlots::default(),
         };
         let flow = flow_with(
             FlowStateTag::IdentifierPassword,
@@ -692,6 +730,95 @@ mod tests {
             page.body.contains("&lt;script&gt;"),
             "the brand token is escaped"
         );
+    }
+
+    #[test]
+    fn branding_slots_render_sanitized_markup_at_fixed_positions() {
+        // Issue #86: a brand's rich-text slots render as pre-sanitized markup at fixed
+        // positions. A slot carrying a stored-XSS payload is inert (it was sanitized at
+        // ingest AND is re-sanitized on the way into the theme), while the allowlisted
+        // markup survives.
+        use crate::branding::{BrandSlots, SlotId};
+        let slots = BrandSlots::from_raw([
+            (
+                SlotId::LoginHelp,
+                "<p>Trouble? <a href=\"https://acme.test/help\">Get help</a><script>alert(1)</script></p>"
+                    .to_owned(),
+            ),
+            (
+                SlotId::FooterLegal,
+                "<img src=x onerror=alert(1)><strong>Legal</strong>".to_owned(),
+            ),
+        ]);
+        let theme = PageTheme {
+            product_name: "Acme".to_owned(),
+            show_wordmark: true,
+            brand_token: None,
+            slots,
+        };
+        let flow = flow_with(
+            FlowStateTag::IdentifierPassword,
+            Journey::Login,
+            vec![input(
+                NodeGroup::Default,
+                0,
+                "identifier",
+                InputType::Text,
+                None,
+            )],
+            Vec::new(),
+        );
+        let page = render_flow_page(
+            &flow,
+            &theme,
+            &InteractionHints::default(),
+            None,
+            SCOPE_PATH,
+            None,
+        );
+        // The allowlisted markup survives verbatim.
+        assert!(
+            page.body.contains("<strong>Legal</strong>"),
+            "the sanitized footer markup renders: {}",
+            page.body
+        );
+        assert!(
+            page.body.contains("href=\"https://acme.test/help\""),
+            "the sanitized https link renders: {}",
+            page.body
+        );
+        // The slots sit at their fixed hooks.
+        assert!(page.body.contains("<div data-brand-slot>"), "{}", page.body);
+        assert!(
+            page.body.contains("<div data-brand-footer>"),
+            "{}",
+            page.body
+        );
+        // Zero dangerous output survived either slot.
+        let lower = page.body.to_ascii_lowercase();
+        assert!(!lower.contains("<script"), "no script survives: {lower}");
+        assert!(!lower.contains("onerror"), "no handler survives: {lower}");
+        assert!(!lower.contains("<img"), "no img survives: {lower}");
+    }
+
+    #[test]
+    fn a_neutral_theme_renders_no_branding_slots() {
+        // The neutral default carries no slots, so an unbranded page adds no slot chrome.
+        let flow = flow_with(
+            FlowStateTag::IdentifierPassword,
+            Journey::Login,
+            vec![input(
+                NodeGroup::Default,
+                0,
+                "identifier",
+                InputType::Text,
+                None,
+            )],
+            Vec::new(),
+        );
+        let page = render_default(&flow);
+        assert!(!page.body.contains("data-brand-slot"), "{}", page.body);
+        assert!(!page.body.contains("data-brand-footer"), "{}", page.body);
     }
 
     #[test]

@@ -51,6 +51,13 @@ ironauth-connector.workspace = true
 # outbound path is ironauth-fetch, so http-audit stays satisfied.
 ironauth-screening.workspace = true
 
+# The vetted allowlist HTML sanitizer (issue #86): the security core of safe branding
+# rich text. Every branding rich-text slot is parsed and reserialized through ammonia's
+# minimal allowlist, so only b i strong em u p br and a[href] (https only, forced rel)
+# survive and the Casdoor stored-XSS class is closed by construction. The one place raw
+# HTML is emitted into a page is the sanitized output of this crate.
+ammonia.workspace = true
+
 # Argon2id verification/hashing for the bootstrap login and registration surface
 # (issue #20), at OWASP defaults. Salt bytes come from the ironauth-env entropy
 # seam, never the crate's own RNG.

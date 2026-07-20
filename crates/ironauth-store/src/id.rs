@@ -516,6 +516,19 @@ impl ScopedKind for ConnectorKind {
     const PREFIX: &'static str = "cnr";
 }
 
+/// Marker for a per-environment brand (`brd_`), one named branding definition (design
+/// tokens, dark-mode variants, the product wordmark, and the sanitized rich-text slots)
+/// per environment (issue #86). A tenant-scoped resource: the id embeds its (tenant,
+/// environment), so a brand minted in one scope parses as a uniform not-found under
+/// another. A brand is PROMOTABLE (issue #41): the whole definition is non-secret
+/// per-environment config that travels in a config snapshot; per-organization branding is
+/// deferred to M10.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BrandKind;
+impl ScopedKind for BrandKind {
+    const PREFIX: &'static str = "brd";
+}
+
 /// Marker for a federation outbound-login correlation-state row (`fls_`), the
 /// short-lived single-use row that correlates an upstream authorize leg to its
 /// callback (issue #75, PR B). A tenant-scoped resource: the id embeds its (tenant,
@@ -1317,6 +1330,9 @@ pub type ConsentId = ScopedId<ConsentKind>;
 /// inbound-federation upstream definition per environment (issue #75). The prefix
 /// is `cnr` (distinct from consent's `con`).
 pub type ConnectorId = ScopedId<ConnectorKind>;
+/// A per-environment brand identifier (`brd_...`), one named branding definition per
+/// environment (issue #86). Promotable.
+pub type BrandId = ScopedId<BrandKind>;
 /// A federation outbound-login correlation-state identifier (`fls_...`), the
 /// short-lived single-use row correlating an upstream authorize leg to its callback
 /// (issue #75, PR B).

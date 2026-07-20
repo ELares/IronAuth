@@ -19,6 +19,16 @@ allow = [
   "Unicode-3.0",
   "Zlib",
 ]
+# Scoped exceptions (issue #86): the vetted allowlist HTML sanitizer `ammonia`, the
+# security core of safe branding rich text, pulls `cssparser` and its `dtoa-short`
+# helper, both Mozilla-authored and MPL-2.0. MPL-2.0 is a weak, file-scoped copyleft
+# that imposes no obligation on the rest of the tree; these two crates are used
+# unmodified. The exception is pinned to EXACTLY these crates rather than allowing
+# MPL-2.0 platform-wide, so no other MPL crate can enter unnoticed.
+exceptions = [
+  { crate = "cssparser", allow = ["MPL-2.0"] },
+  { crate = "dtoa-short", allow = ["MPL-2.0"] },
+]
 
 [bans]
 multiple-versions = "warn"

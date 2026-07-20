@@ -406,15 +406,61 @@ pub async fn flow_browser_post(
     }
 }
 
-/// `GET /t/{tenant}/e/{env}/pages.css` (issue #85, FORK C): serve the ONE embedded, same
-/// origin flow stylesheet. Gated behind `flows.enabled` like every flow route, so a
+/// `GET /t/{tenant}/e/{env}/pages.css` (issue #85, FORK C; issue #86 branding): serve the
+/// per environment flow stylesheet. Gated behind `flows.enabled` like every flow route, so a
 /// deployment that does not use the flow render app answers a uniform 404 and discloses
 /// nothing (no cutover, no live behavior change while the flag is off).
-pub async fn flow_stylesheet(State(state): State<OidcState>) -> Response {
+///
+/// When the environment has a DEFAULT brand (issue #86), the stylesheet is the brand's TYPED
+/// design tokens emitted as `:root` CSS custom properties (plus the dark variants) prepended
+/// to the variable referencing layout rules. Because every emitted value passed the typed
+/// token grammar, the served CSS is CSP-clean (no `url()`, no external host, no breakout),
+/// so the strict `style-src 'self'` CSP (issue #89) is untouched. With NO brand installed
+/// the response is the BYTE IDENTICAL neutral stylesheet, so an unbranded environment is
+/// unchanged from issue #85.
+pub async fn flow_stylesheet(
+    State(state): State<OidcState>,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+) -> Response {
     if !state.flows_enabled() {
         return disabled_not_found();
     }
-    pages::stylesheet_response()
+    // A malformed scope (the route matched the shape but the ids do not parse) falls back to
+    // the neutral stylesheet: the stylesheet is public chrome, so failing open to the neutral
+    // default discloses nothing and never errors the page.
+    let Some(scope) = parse_scope(&tenant_id, &environment_id) else {
+        return pages::stylesheet_response();
+    };
+    match resolve_env_brand(&state, scope).await {
+        Some(brand) => pages::css_response(pages::brand_stylesheet(
+            &brand.tokens,
+            brand.tokens_dark.as_ref(),
+        )),
+        None => pages::stylesheet_response(),
+    }
+}
+
+/// Resolve the environment's DEFAULT brand for rendering (issue #86): read the default brand
+/// row and build the typed, sanitized [`crate::branding::Brand`] from it. Returns [`None`]
+/// when the environment has no brand installed OR the read fails, so the render path uses the
+/// neutral default (unchanged from issue #85) and a store hiccup never breaks a page. Per env
+/// selection only in PR1; per domain / per client selection is deferred to PR3.
+async fn resolve_env_brand(state: &OidcState, scope: Scope) -> Option<crate::branding::Brand> {
+    let record = state
+        .store()
+        .scoped(scope)
+        .brands()
+        .default_brand()
+        .await
+        .ok()??;
+    Some(crate::branding::Brand::from_stored(
+        record.product_name,
+        record.show_wordmark,
+        record.brand_token,
+        &record.tokens_json,
+        record.tokens_dark_json.as_deref(),
+        &record.slots_json,
+    ))
 }
 
 /// Render a flow object into the full hosted page (issue #85, the render app). Threads the
@@ -445,7 +491,19 @@ async fn render_browser_flow(
             InteractionHints::from_query(query)
         });
     let banner = state.environment_banner(&scope).await;
-    let theme = PageTheme::default();
+    // The per environment brand (issue #86): the resolved default brand fills the wordmark
+    // fields and the sanitized rich-text slots; a NULL/absent brand keeps the neutral default
+    // (unchanged from issue #85). The design tokens drive the SERVED stylesheet (a separate
+    // request), never inline style, so the strict CSP is untouched.
+    let theme = match resolve_env_brand(state, scope).await {
+        Some(brand) => PageTheme {
+            product_name: brand.product_name,
+            show_wordmark: brand.show_wordmark,
+            brand_token: brand.brand_token,
+            slots: brand.slots,
+        },
+        None => PageTheme::default(),
+    };
     // The passkey conditional-UI wiring, present only when WebAuthn is enabled for this
     // deployment (the SAME gate the bootstrap login page uses). The per response nonce is
     // drawn from the SAME entropy seam and hex scheme as the bootstrap ceremony.
