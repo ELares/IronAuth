@@ -10,8 +10,12 @@
 //! ([`secure_html`]) so no page can forget them:
 //!
 //! - a strict Content-Security-Policy (`default-src 'none'`, so nothing loads
-//!   except what a directive re-permits; `form-action 'self'`, so a form can only
-//!   post back to this origin; `base-uri 'none'` and `frame-ancestors 'none'`);
+//!   except what a directive re-permits; `object-src 'none'`, stated explicitly to
+//!   deny the plugin surface uniformly; `form-action 'self'`, so a form can only
+//!   post back to this origin; `base-uri 'none'` and `frame-ancestors 'none'`), with
+//!   no `unsafe-inline`, no `unsafe-eval`, and no wildcard source anywhere; a page
+//!   that runs a ceremony script opens exactly one `script-src 'nonce-{per-response}'
+//!   'strict-dynamic'` and nothing else (issue #89);
 //! - `X-Frame-Options: DENY` alongside `frame-ancestors 'none'`, so a legacy
 //!   browser that ignores the CSP directive still refuses to frame the page
 //!   (clickjacking defense in depth);
@@ -43,10 +47,12 @@ use crate::hints::InteractionHints;
 /// The strict Content-Security-Policy every bootstrap page carries. `default-src
 /// 'none'` denies everything not explicitly re-permitted; the pages load no
 /// script, style, image, or font, so only `form-action 'self'` (a form may post
-/// back to this origin) is opened. `frame-ancestors 'none'` refuses framing and
-/// `base-uri 'none'` refuses a `<base>` override.
-const CONTENT_SECURITY_POLICY: &str =
-    "default-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+/// back to this origin) is opened. `frame-ancestors 'none'` refuses framing,
+/// `base-uri 'none'` refuses a `<base>` override, and `object-src 'none'` is stated
+/// explicitly (issue #89) so the plugin surface is denied uniformly across every
+/// page, even where a directive re-permits another source. There is no
+/// `unsafe-inline`, no `unsafe-eval`, and no wildcard source anywhere.
+const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; base-uri 'none'; object-src 'none'; form-action 'self'; frame-ancestors 'none'";
 
 /// The referrer policy every bootstrap PAGE carries.
 ///
@@ -92,6 +98,23 @@ pub fn escape_html(value: &str) -> String {
     }
     out
 }
+
+// ===========================================================================
+// The server-rendered HTML response builders (issue #89).
+//
+// INVARIANT: every server-rendered HTML page MUST be produced by one of the
+// builders in this section (`secure_html`, `login_html`, `flow_html`,
+// `flow_login_html`, `device_verify_html`, `form_post_response`, plus the two
+// flag-gated M4 carve-out builders `check_session_iframe_response` and
+// `frontchannel_logout_response`). They are the ONE place the strict CSP,
+// `frame-ancestors 'none'`, and `X-Frame-Options: DENY` are attached, so the
+// hardening is uniform and code-owned. Any NEW HTML response builder MUST be
+// added here AND to the `csp_enforcement_page_walk_covers_every_auth_page_and_
+// only_the_two_carveouts` walk test below -- a page that hand-rolls its own
+// headers via `Response::builder()` would NOT auto-fail that walk, so the
+// "all pages funnel through these builders" convention is what keeps the
+// strict-CSP invariant from silently regressing.
+// ===========================================================================
 
 /// Build an HTML response at `status` with the full hardening header set. This is
 /// the ONE place the security headers are attached, so every bootstrap page (and
@@ -397,14 +420,17 @@ const PASSKEY_SCRIPT: &str = r#"(async () => {
 
 /// The Content-Security-Policy for the hosted login page WITH conditional UI (issue
 /// #65). It keeps the strict discipline of [`CONTENT_SECURITY_POLICY`] and opens
-/// exactly two sources: `script-src 'nonce-{nonce}'` permits ONLY the one
-/// server-authored ceremony script (no other inline or external script can run), and
-/// `connect-src 'self'` permits the same-origin `fetch` to the ceremony endpoints.
+/// exactly two sources: `script-src 'nonce-{nonce}' 'strict-dynamic'` permits ONLY the
+/// one server-authored ceremony script (the per-response nonce), and `'strict-dynamic'`
+/// (issue #89) confines trust to that nonced script and any script IT chooses to load,
+/// ignoring host allowlists entirely, so no injected inline or external script can run;
+/// `connect-src 'self'` permits the same-origin `fetch` to the ceremony endpoints. The
+/// explicit `object-src 'none'` denies the plugin surface uniformly.
 #[must_use]
 pub fn login_csp(nonce: &str) -> String {
     format!(
-        "default-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; \
-         script-src 'nonce-{nonce}'; connect-src 'self'"
+        "default-src 'none'; base-uri 'none'; object-src 'none'; form-action 'self'; \
+         frame-ancestors 'none'; script-src 'nonce-{nonce}' 'strict-dynamic'; connect-src 'self'"
     )
 }
 
@@ -433,21 +459,24 @@ pub fn login_html(status: StatusCode, body: String, nonce: &str) -> Response {
 /// `base-uri 'none'`, `form-action 'self'`, `frame-ancestors 'none'`) and opens exactly
 /// ONE extra source: `style-src 'self'`, so the one served same origin stylesheet loads.
 /// No script, image, or font source is opened and there is no `unsafe-inline` anywhere.
-const FLOW_PAGE_CSP: &str = "default-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; \
-     style-src 'self'";
+/// `object-src 'none'` is stated explicitly (issue #89) for a uniform plugin denial.
+const FLOW_PAGE_CSP: &str = "default-src 'none'; base-uri 'none'; object-src 'none'; form-action 'self'; \
+     frame-ancestors 'none'; style-src 'self'";
 
 /// The Content-Security-Policy for a hosted flow page that ALSO carries the passkey
 /// conditional-UI ceremony (issue #85, the §4 cutover gap). It is [`FLOW_PAGE_CSP`] plus the
 /// SAME two sources [`login_csp`] opens for the bootstrap login ceremony: `script-src
-/// 'nonce-{nonce}'` permits ONLY the one server authored ceremony script (no other inline or
-/// external script can run), and `connect-src 'self'` permits the same origin `fetch` to the
-/// scope's webauthn endpoints. There is no `unsafe-inline`, so the ceremony runs under the
-/// SAME nonce discipline as the bootstrap login page.
+/// 'nonce-{nonce}' 'strict-dynamic'` permits ONLY the one server authored ceremony script
+/// (no other inline or external script can run, and `'strict-dynamic'` ignores host
+/// allowlists), and `connect-src 'self'` permits the same origin `fetch` to the scope's
+/// webauthn endpoints. There is no `unsafe-inline`, so the ceremony runs under the SAME
+/// nonce discipline as the bootstrap login page.
 #[must_use]
 pub fn flow_login_csp(nonce: &str) -> String {
     format!(
-        "default-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; \
-         style-src 'self'; script-src 'nonce-{nonce}'; connect-src 'self'"
+        "default-src 'none'; base-uri 'none'; object-src 'none'; form-action 'self'; \
+         frame-ancestors 'none'; style-src 'self'; script-src 'nonce-{nonce}' 'strict-dynamic'; \
+         connect-src 'self'"
     )
 }
 
@@ -921,9 +950,10 @@ pub fn notice_page(title: &str, message: &str) -> String {
 /// exactly ONE extra source: `img-src https:` so a client's REGISTERED `logo_uri`
 /// renders as an `<img>` the BROWSER fetches (the server never fetches it, closing the
 /// SSRF surface), restricted to `https` so an `http` or `javascript:` logo cannot
-/// load. No script, style, or font is ever permitted.
-const DEVICE_VERIFY_CSP: &str = "default-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; \
-     img-src https:";
+/// load. No script, style, or font is ever permitted. `object-src 'none'` is stated
+/// explicitly (issue #89) for a uniform plugin denial.
+const DEVICE_VERIFY_CSP: &str = "default-src 'none'; base-uri 'none'; object-src 'none'; form-action 'self'; \
+     frame-ancestors 'none'; img-src https:";
 
 /// Build a device-verification HTML response at `status` with the hardening header
 /// set, using the device CSP that permits a browser-fetched `https` logo image (issue
@@ -1094,7 +1124,7 @@ fn form_post_script_hash() -> String {
 ///   the single, minimal relaxation, scoped to the exact redirect origin.
 fn form_post_csp(form_action: &str) -> String {
     format!(
-        "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; \
+        "default-src 'none'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; \
          script-src {hash}; form-action {form_action}",
         hash = form_post_script_hash(),
     )
@@ -1250,7 +1280,7 @@ fn check_session_script_hash() -> String {
 /// other page keeps `frame-ancestors 'none'` and `X-Frame-Options: DENY`.
 fn check_session_iframe_csp() -> String {
     format!(
-        "default-src 'none'; base-uri 'none'; script-src {hash}",
+        "default-src 'none'; base-uri 'none'; object-src 'none'; script-src {hash}",
         hash = check_session_script_hash(),
     )
 }
@@ -1303,14 +1333,37 @@ pub fn frontchannel_logout_page(iframe_urls: &[String]) -> String {
     notice_document("Signing out", &body)
 }
 
+/// Whether `origin` is a syntactically clean web origin safe to place verbatim in a
+/// `frame-src` source list: an `https`/`http` scheme followed by a `host[:port]`
+/// authority built ONLY from host and port characters (ASCII alphanumerics, `.`, `-`,
+/// `:`, and the `[` `]` of an IPv6 literal). A registered `frontchannel_logout_uri`
+/// whose authority carried whitespace, a `;`, a quote, or any other CSP delimiter would
+/// otherwise smuggle extra sources or directives into the header once its origin is
+/// joined into the source list; such an origin is dropped (fail closed) rather than
+/// emitted. This is the last line before the CSP header, so it holds even if a malformed
+/// value ever reaches here past registration-time validation.
+fn is_clean_frame_src_origin(origin: &str) -> bool {
+    let Some(authority) = ["https://", "http://"]
+        .iter()
+        .find_map(|scheme| origin.strip_prefix(scheme))
+    else {
+        return false;
+    };
+    !authority.is_empty()
+        && authority
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'[' | b']'))
+}
+
 /// The `frame-src` CSP source list for the front-channel logout page: EXACTLY the
 /// participating RPs' registered `frontchannel_logout_uri` origins, de-duplicated in
-/// first-seen order. With no participants the source is `'none'`, so the page can frame
-/// nothing.
+/// first-seen order and with any malformed origin dropped (see
+/// [`is_clean_frame_src_origin`]). With no clean participant the source is `'none'`, so
+/// the page can frame nothing.
 fn frontchannel_frame_src(origins: &[String]) -> String {
     let mut seen: Vec<&str> = Vec::new();
     for origin in origins {
-        if !seen.contains(&origin.as_str()) {
+        if is_clean_frame_src_origin(origin) && !seen.contains(&origin.as_str()) {
             seen.push(origin.as_str());
         }
     }
@@ -1329,7 +1382,7 @@ fn frontchannel_frame_src(origins: &[String]) -> String {
 /// those RP iframes and nothing else.
 fn frontchannel_logout_csp(origins: &[String]) -> String {
     format!(
-        "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; frame-src {}",
+        "default-src 'none'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; frame-src {}",
         frontchannel_frame_src(origins),
     )
 }
@@ -1382,10 +1435,30 @@ mod tests {
     fn flow_login_csp_pins_the_nonce_and_carries_no_unsafe_inline() {
         let csp = flow_login_csp("deadbeef");
         assert!(csp.contains("default-src 'none'"));
+        assert!(csp.contains("object-src 'none'"));
         assert!(csp.contains("style-src 'self'"));
-        assert!(csp.contains("script-src 'nonce-deadbeef'"));
+        // Issue #89: the nonce script-src carries 'strict-dynamic'.
+        assert!(csp.contains("script-src 'nonce-deadbeef' 'strict-dynamic'"));
         assert!(csp.contains("connect-src 'self'"));
         assert!(!csp.contains("unsafe-inline"));
+        assert!(!csp.contains("unsafe-eval"));
+    }
+
+    #[test]
+    fn login_csp_pins_the_nonce_with_strict_dynamic_and_object_src_none() {
+        // Issue #89: the bootstrap login ceremony CSP opens exactly one nonce script
+        // source with 'strict-dynamic', denies the plugin surface explicitly, and grants
+        // no unsafe-inline, unsafe-eval, or wildcard.
+        let csp = login_csp("cafef00d");
+        assert!(csp.contains("default-src 'none'"));
+        assert!(csp.contains("object-src 'none'"));
+        assert!(csp.contains("form-action 'self'"));
+        assert!(csp.contains("frame-ancestors 'none'"));
+        assert!(csp.contains("script-src 'nonce-cafef00d' 'strict-dynamic'"));
+        assert!(csp.contains("connect-src 'self'"));
+        assert!(!csp.contains("unsafe-inline"));
+        assert!(!csp.contains("unsafe-eval"));
+        assert!(!csp.contains('*'), "no wildcard source: {csp}");
     }
 
     #[test]
@@ -1897,5 +1970,369 @@ mod tests {
         // No participants: frame-src is 'none' (the page frames nothing).
         let empty = frontchannel_logout_csp(&[]);
         assert!(empty.contains("frame-src 'none'"), "{empty}");
+    }
+
+    #[test]
+    fn frontchannel_frame_src_drops_an_authority_that_would_smuggle_a_directive() {
+        // Security hardening (issue #89): the frame-src is the last line before the CSP
+        // header. If a registered frontchannel_logout_uri ever reached here with a
+        // whitespace or `;` in its authority, its origin would carry an extra CSP source
+        // or directive verbatim into the header. Such an origin is dropped (fail closed),
+        // never joined into the source list.
+        let smuggled = vec![
+            "https://a.test frame-src *".to_owned(),
+            "https://b.test;script-src 'unsafe-inline'".to_owned(),
+            "https://c.test'".to_owned(),
+        ];
+        let csp = frontchannel_logout_csp(&smuggled);
+        assert!(
+            csp.ends_with("frame-src 'none'"),
+            "every malformed origin is dropped, leaving no framing source: {csp}"
+        );
+        assert!(!csp.contains("script-src"), "no smuggled directive: {csp}");
+        assert!(!csp.contains('*'), "no smuggled wildcard source: {csp}");
+        // No smuggled host origin leaks into the source list; only the code-owned
+        // `'none'` keywords remain (the CSP's own `default-src 'none'` etc.).
+        assert!(!csp.contains(".test"), "no smuggled host origin: {csp}");
+
+        // A clean origin still contributes its EXACT origin, and a malformed sibling is
+        // dropped without taking the good one down with it.
+        let mixed = vec![
+            "https://good.test:8443".to_owned(),
+            "https://bad.test frame-src *".to_owned(),
+        ];
+        assert_eq!(
+            frontchannel_frame_src(&mixed),
+            "https://good.test:8443",
+            "the clean origin survives; only the malformed one is dropped"
+        );
+        // An IPv6 literal authority is clean and kept intact.
+        assert!(is_clean_frame_src_origin("https://[::1]:443"));
+    }
+
+    // =======================================================================
+    // Issue #89: the CI enforcement page-walk + the reflected-parameter
+    // injection corpus. These are the permanent, header-level merge gate: any
+    // page that regresses the strict CSP / framing policy, or fails to escape a
+    // reflected value, fails the build here.
+    // =======================================================================
+
+    /// The CSP string and X-Frame-Options of a built page response.
+    fn header_snapshot(response: &Response) -> (String, Option<String>) {
+        let headers = response.headers();
+        let csp = headers
+            .get(header::CONTENT_SECURITY_POLICY)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        let xfo = headers
+            .get(header::X_FRAME_OPTIONS)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        (csp, xfo)
+    }
+
+    /// Assert the strict CSP hygiene every served auth page shares (issue #89), regardless
+    /// of its framing posture: a non-empty CSP that keeps the default-deny baseline, denies
+    /// the plugin surface and the base URI explicitly, and grants no unsafe-inline, no
+    /// unsafe-eval, and no wildcard source.
+    fn assert_strict_csp_hygiene(label: &str, csp: &str) {
+        assert!(!csp.is_empty(), "{label}: a CSP must be present");
+        assert!(
+            csp.contains("default-src 'none'"),
+            "{label}: default-src 'none' baseline: {csp}"
+        );
+        assert!(
+            csp.contains("object-src 'none'"),
+            "{label}: object-src 'none' explicit: {csp}"
+        );
+        assert!(
+            csp.contains("base-uri 'none'"),
+            "{label}: base-uri 'none': {csp}"
+        );
+        assert!(
+            !csp.contains("unsafe-inline"),
+            "{label}: no unsafe-inline: {csp}"
+        );
+        assert!(
+            !csp.contains("unsafe-eval"),
+            "{label}: no unsafe-eval: {csp}"
+        );
+        assert!(!csp.contains('*'), "{label}: no wildcard source: {csp}");
+    }
+
+    /// Assert the blanket anti-clickjacking posture EVERY auth page carries except the two
+    /// flagged M4 carve-outs (issue #89): CSP `frame-ancestors 'none'` AND the legacy
+    /// `X-Frame-Options: DENY` (defense in depth for a browser that ignores the CSP).
+    fn assert_framing_denied(label: &str, csp: &str, xfo: Option<&str>) {
+        assert!(
+            csp.contains("frame-ancestors 'none'"),
+            "{label}: frame-ancestors 'none': {csp}"
+        );
+        assert_eq!(xfo, Some("DENY"), "{label}: X-Frame-Options must be DENY");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // an exhaustive page-walk over every builder reads clearest inline
+    fn csp_enforcement_page_walk_covers_every_auth_page_and_only_the_two_carveouts() {
+        // INVARIANT (issue #89): EVERY server-rendered HTML page MUST be produced by one
+        // of the response builders walked here: `secure_html` (login/register/consent/
+        // recover/mfa/notice/error/logout-confirmation/logged-out/magic/risk/device-step
+        // pages), `login_html` and `flow_login_html` (the passkey ceremony), `flow_html`
+        // (the headless-render pages), `device_verify_html` (device confirmation), and
+        // `form_post_response` (the code carrier) -- plus the two flag-gated M4 carve-out
+        // builders asserted at the end. This walk snapshots each builder's CSP and framing
+        // headers and asserts the strict baseline, so a page that regresses the policy fails
+        // the build.
+        //
+        // The guarantee is by CONVENTION, not by the compiler: a future page that
+        // hand-rolls its own headers via `Response::builder()` instead of reusing a walked
+        // builder would NOT auto-fail this walk. So the rule is load-bearing: any NEW
+        // server-rendered HTML response builder MUST be added to this walk (and route it
+        // through the strict headers), or the strict-CSP invariant can silently regress. A
+        // compile-enforced version is not practical in Rust; funneling every page through
+        // these builders, plus this walk, is the guarantee. The ONLY exemptions are the two
+        // flag-gated M4 carve-outs asserted at the end; nothing else is ever exempt.
+        let hints = InteractionHints::default();
+
+        // The blanket-framed pages: frame-ancestors 'none' + X-Frame-Options: DENY.
+        let framed: Vec<(&str, Response)> = vec![
+            (
+                "secure_html/login",
+                secure_html(
+                    StatusCode::OK,
+                    login_page("", "/authorize?x=1", None, &hints, None, None),
+                ),
+            ),
+            (
+                "secure_html/consent",
+                secure_html(
+                    StatusCode::OK,
+                    consent_page("Acme", &["openid"], "/authorize?x=1", &hints, None),
+                ),
+            ),
+            (
+                "secure_html/error",
+                secure_html(
+                    StatusCode::BAD_REQUEST,
+                    notice_page("Authorization request rejected", "the request was rejected"),
+                ),
+            ),
+            (
+                "secure_html/logout_confirm",
+                secure_html(
+                    StatusCode::OK,
+                    logout_confirm_page("/end_session", &[("state", "s")]),
+                ),
+            ),
+            (
+                "secure_html/logged_out",
+                secure_html(StatusCode::OK, logged_out_page()),
+            ),
+            (
+                "login_html",
+                login_html(StatusCode::OK, "<h1>x</h1>".to_owned(), "n0nce"),
+            ),
+            (
+                "flow_html",
+                flow_html(StatusCode::OK, "<h1>x</h1>".to_owned()),
+            ),
+            (
+                "flow_login_html",
+                flow_login_html(StatusCode::OK, "<h1>x</h1>".to_owned(), "n0nce"),
+            ),
+            (
+                "device_verify_html",
+                device_verify_html(StatusCode::OK, "<h1>x</h1>".to_owned()),
+            ),
+            (
+                "form_post_response",
+                form_post_response("https://client.test/cb", &[("code", Some("ac_1"))]),
+            ),
+        ];
+        for (label, response) in &framed {
+            let (csp, xfo) = header_snapshot(response);
+            assert_strict_csp_hygiene(label, &csp);
+            assert_framing_denied(label, &csp, xfo.as_deref());
+        }
+
+        // The two nonce-script pages additionally carry exactly one nonce script-src with
+        // 'strict-dynamic' and nothing else.
+        for (label, response) in [
+            (
+                "login_html",
+                login_html(StatusCode::OK, String::new(), "abc"),
+            ),
+            (
+                "flow_login_html",
+                flow_login_html(StatusCode::OK, String::new(), "abc"),
+            ),
+        ] {
+            let (csp, _) = header_snapshot(&response);
+            assert!(
+                csp.contains("script-src 'nonce-abc' 'strict-dynamic'"),
+                "{label}: nonce script-src with strict-dynamic: {csp}"
+            );
+        }
+
+        // CARVE-OUT 1: the check_session_iframe is the ONE page an RP embeds cross-origin,
+        // so it deliberately OMITS frame-ancestors and X-Frame-Options. It exists only while
+        // session management is enabled (the route is otherwise unmounted). Its CSP stays
+        // otherwise strict and its inline script is hash-pinned.
+        let iframe = check_session_iframe_response();
+        let (iframe_csp, iframe_xfo) = header_snapshot(&iframe);
+        assert!(iframe_csp.contains("default-src 'none'"), "{iframe_csp}");
+        assert!(iframe_csp.contains("object-src 'none'"), "{iframe_csp}");
+        assert!(!iframe_csp.contains("unsafe-inline"), "{iframe_csp}");
+        assert!(iframe_csp.contains("script-src 'sha256-"), "{iframe_csp}");
+        assert!(
+            !iframe_csp.contains("frame-ancestors"),
+            "the check_session carve-out must not deny framing: {iframe_csp}"
+        );
+        assert!(
+            iframe_xfo.is_none(),
+            "the check_session carve-out must be framable: no X-Frame-Options"
+        );
+
+        // CARVE-OUT 2: the front-channel logout page KEEPS its framing defense but opens a
+        // frame-src of EXACTLY the participating RP origins (built from their registered
+        // frontchannel_logout_uri origins) and nothing else.
+        let fc = frontchannel_logout_response(
+            &["https://rp.test/fc?iss=x".to_owned()],
+            &["https://rp.test".to_owned()],
+        );
+        let (fc_csp, fc_xfo) = header_snapshot(&fc);
+        assert_strict_csp_hygiene("frontchannel_logout", &fc_csp);
+        assert_framing_denied("frontchannel_logout", &fc_csp, fc_xfo.as_deref());
+        assert!(
+            fc_csp.contains("frame-src https://rp.test"),
+            "frame-src is exactly the participating origins: {fc_csp}"
+        );
+        // No participants: frame-src is 'none', still under the blanket framing defense.
+        let fc_empty = frontchannel_logout_response(&[], &[]);
+        let (fc_empty_csp, fc_empty_xfo) = header_snapshot(&fc_empty);
+        assert!(fc_empty_csp.contains("frame-src 'none'"), "{fc_empty_csp}");
+        assert_framing_denied(
+            "frontchannel_logout/empty",
+            &fc_empty_csp,
+            fc_empty_xfo.as_deref(),
+        );
+    }
+
+    #[test]
+    fn injection_corpus_every_reflected_parameter_renders_fully_escaped() {
+        // The reflected-parameter injection corpus. Every value echoed into a page
+        // (error_description, login_hint/identifier, user_code, return_to, client name,
+        // scope, logo/enroll URLs, magic/recovery tokens, carried logout parameters) is
+        // HTML-escaped, so no crafted parameter can break out of its element or attribute
+        // context. error_description is the canonical reflected sink (RFC 6749 4.1.2.1, the
+        // Keycloak error-page lesson): the authorization error page renders it through the
+        // same escaping choke point as every other page.
+        let hints = InteractionHints::default();
+        let xss = "\"><script>alert(1)</script>";
+        let esc = "&lt;script&gt;alert(1)";
+
+        // The authorization error page reflects the human-readable error_description.
+        let error_page = notice_page("Authorization request rejected", xss);
+        assert!(
+            !error_page.contains("<script>alert(1)"),
+            "error_description must be escaped: {error_page}"
+        );
+        assert!(
+            error_page.contains(esc),
+            "the escaped error_description must be present: {error_page}"
+        );
+
+        let pages: Vec<(&str, String)> = vec![
+            (
+                "login/identifier",
+                login_page(xss, "/a", None, &hints, None, None),
+            ),
+            (
+                "login/return_to",
+                login_page("", xss, None, &hints, None, None),
+            ),
+            (
+                "login/error",
+                login_page("", "/a", Some(xss), &hints, None, None),
+            ),
+            (
+                "register/identifier",
+                register_page(xss, "/a", None, &hints, None),
+            ),
+            (
+                "recover/identifier",
+                recover_page(xss, "/a", None, &hints, None),
+            ),
+            (
+                "consent/client_name",
+                consent_page(xss, &["openid"], "/a", &hints, None),
+            ),
+            (
+                "consent/scope",
+                consent_page("Acme", &[xss], "/a", &hints, None),
+            ),
+            (
+                "mfa/enroll_url",
+                mfa_challenge_page("/a", None, Some(xss), false, &hints, None),
+            ),
+            ("device_enter/user_code", device_enter_page("/a", xss, None)),
+            ("device_login/user_code", device_login_page("/a", xss, None)),
+            (
+                "magic_confirm/token",
+                magic_confirm_page("/a", Some(xss), false, "n"),
+            ),
+            ("magic_ack/action", magic_ack_page(xss)),
+            ("recover_cancel/token", recover_cancel_page("/a", xss)),
+            (
+                "logout_confirm/carried",
+                logout_confirm_page("/end_session", &[("state", xss)]),
+            ),
+            ("notice/message", notice_page("Title", xss)),
+        ];
+        for (label, html) in &pages {
+            assert!(
+                !html.contains("<script>alert(1)"),
+                "{label}: the reflected value must be escaped: {html}"
+            );
+            assert!(
+                html.contains(esc),
+                "{label}: the escaped form must be present: {html}"
+            );
+        }
+
+        // The device confirmation page reflects the client name, user code, logo URI, the
+        // initiation hint, and each scope; all are escaped.
+        let confirm = device_confirm_page(&DeviceConfirmPage {
+            action: "/a",
+            client_name: xss,
+            logo_uri: Some("https://logo.test/x\"><script>alert(1)</script>"),
+            initiation_hint: Some(xss),
+            scopes: &[xss],
+            user_code: xss,
+            device_code_id: "dc1",
+        });
+        assert!(
+            !confirm.contains("<script>alert(1)"),
+            "device_confirm must escape every reflected value: {confirm}"
+        );
+        assert!(
+            confirm.contains(esc),
+            "the escaped form must be present: {confirm}"
+        );
+
+        // The form_post code carrier escapes every authorization-response parameter value.
+        let carrier = form_post_page(
+            "https://client.test/cb",
+            &[("code", Some(xss)), ("state", Some("s&s"))],
+        );
+        assert!(
+            !carrier.contains("<script>alert(1)"),
+            "form_post must escape every parameter value: {carrier}"
+        );
+        assert!(
+            carrier.contains(esc),
+            "the escaped form must be present: {carrier}"
+        );
     }
 }

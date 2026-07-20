@@ -6789,6 +6789,125 @@ enabled = true
         assert_eq!(bind["default"], serde_json::json!("127.0.0.1:8443"));
     }
 
+    /// Collect every property NAME declared anywhere in a JSON Schema value: the keys of
+    /// each `properties` map and of `patternProperties`, recursing through `$defs`, nested
+    /// object schemas, `additionalProperties`, and the `oneOf`/`anyOf`/`allOf`/`items`
+    /// composition keywords. Schema metadata keywords (`description`, `type`, `default`,
+    /// and so on) are NOT property names, so they are never collected.
+    fn collect_property_names(node: &serde_json::Value, out: &mut Vec<String>) {
+        match node {
+            serde_json::Value::Object(map) => {
+                for holder in ["properties", "patternProperties"] {
+                    if let Some(serde_json::Value::Object(props)) = map.get(holder) {
+                        for (name, child) in props {
+                            out.push(name.clone());
+                            collect_property_names(child, out);
+                        }
+                    }
+                }
+                for keyword in ["$defs", "definitions"] {
+                    if let Some(serde_json::Value::Object(defs)) = map.get(keyword) {
+                        for child in defs.values() {
+                            collect_property_names(child, out);
+                        }
+                    }
+                }
+                for keyword in ["additionalProperties", "items", "not"] {
+                    if let Some(child) = map.get(keyword) {
+                        collect_property_names(child, out);
+                    }
+                }
+                for keyword in ["oneOf", "anyOf", "allOf"] {
+                    if let Some(serde_json::Value::Array(members)) = map.get(keyword) {
+                        for child in members {
+                            collect_property_names(child, out);
+                        }
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for child in items {
+                    collect_property_names(child, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Issue #89 (the schema-level branding-cannot-loosen assertion): the branding, theme,
+    /// and tenant configuration surface is bounded DATA. The strict CSP, `frame-ancestors
+    /// 'none'`, and `X-Frame-Options: DENY` a hosted page carries are built from compile-time
+    /// constants in `ironauth-oidc`; NO configuration value ever reaches those headers, and a
+    /// config-supplied string can only be rendered as an ESCAPED data value or swapped into the
+    /// served stylesheet, never into a response header, a `script-src`, or inline script.
+    ///
+    /// This test asserts that boundary at the schema level: no property in the entire `Config`
+    /// schema is named like a header, a CSP directive, a raw-markup, or a script sink. A future
+    /// field such as `custom_csp`, `head_html`, `extra_headers`, or `inline_script` would trip
+    /// this gate and force a review before any config knob could loosen the page hardening.
+    #[test]
+    fn no_config_field_can_alter_response_headers_or_inject_script() {
+        // Tokens that would only ever appear in a field that opens a header, a CSP, or a
+        // script/markup sink. A bounded branding datum (a color, a name, a URL) never needs
+        // any of these in its field name.
+        const FORBIDDEN_SUBSTRINGS: &[&str] = &[
+            "csp",
+            "content_security_policy",
+            "content-security-policy",
+            "frame_ancestors",
+            "frame-ancestors",
+            "x_frame_options",
+            "x-frame-options",
+            "unsafe_inline",
+            "unsafe-inline",
+            "unsafe_eval",
+            "script_src",
+            "script-src",
+            "inline_script",
+            "custom_script",
+            "raw_html",
+            "head_html",
+            "custom_html",
+            "extra_header",
+            "extra_headers",
+            "response_header",
+            "custom_header",
+            "javascript",
+        ];
+        let schema = Config::json_schema();
+        let value = serde_json::to_value(&schema).expect("schema serializes");
+        let mut names = Vec::new();
+        collect_property_names(&value, &mut names);
+        // Sanity anchor: the walker must reach a top-level field AND a DEEPLY NESTED one
+        // that lives only inside a `$defs` object schema (`background_color` is a branding
+        // sub-field, issue #83). If a `$defs`-recursion regression stopped the walk from
+        // descending into referenced definitions, `bind` would still be found but the
+        // nested coverage would silently vanish; anchoring on both keeps this gate
+        // non-vacuous, so the forbidden-substring sweep below always spans nested fields.
+        assert!(
+            names.iter().any(|n| n == "bind"),
+            "the walker must reach top-level config fields (sanity check)"
+        );
+        assert!(
+            names.iter().any(|n| n == "background_color"),
+            "the walker must descend through $defs into nested object schemas: the branding \
+             sub-field `background_color` is unreachable, so a $defs-recursion regression would \
+             hide nested fields from the forbidden-substring sweep (sanity check)"
+        );
+        for name in &names {
+            let lower = name.to_ascii_lowercase();
+            for forbidden in FORBIDDEN_SUBSTRINGS {
+                assert!(
+                    !lower.contains(forbidden),
+                    "config field `{name}` looks like a response-header or script sink \
+                     (matched `{forbidden}`); issue #89 forbids ANY config, branding, or tenant \
+                     knob that can alter response headers, add a script source, or emit inline \
+                     script. The page hardening headers must stay code-owned constants."
+                );
+            }
+        }
+    }
+
     /// Minor-7: the TOTP config bounds are enforced at boot. The default is valid, and
     /// each out-of-range parameter (digits, period, drift, recovery count) and a
     /// malformed factor order (unknown or duplicate) is a boot-time `Invalid`.
