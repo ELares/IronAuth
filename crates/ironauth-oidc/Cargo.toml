@@ -830,5 +830,16 @@ name = "flow_matrix"
 path = "tests/flow_matrix.rs"
 required-features = ["testing"]
 
+# The hosted flow render app (issue #85, PR 1): the flow browser transport renders a FULL
+# themed document over pages::document (doctype + the served same-origin stylesheet link)
+# under the flow CSP with style-src 'self' and no unsafe-inline; the ONE served stylesheet is
+# same-origin text/css answering only under the flag; the flag-off posture holds (the
+# stylesheet route 404s and the bootstrap /login is untouched, no cutover). Over a real
+# database (DATABASE_URL).
+[[test]]
+name = "flow_render"
+path = "tests/flow_render.rs"
+required-features = ["testing"]
+
 [lints]
 workspace = true

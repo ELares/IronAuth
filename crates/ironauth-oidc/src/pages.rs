@@ -137,12 +137,34 @@ fn document(
     display: &str,
     environment_banner: Option<&str>,
 ) -> String {
+    document_styled(title, body_html, lang, display, environment_banner, None)
+}
+
+/// The document shell with an OPTIONAL served stylesheet link (issue #85, FORK C). This is
+/// the ONE place the shell chrome is built; [`document`] delegates here with `None`, so the
+/// bootstrap pages stay byte identical (no `<link>` is emitted when the href is `None`). The
+/// hosted flow render app passes `Some(href)` (a server known, same origin `.../pages.css`
+/// path, escaped as an attribute) to load the one embedded stylesheet under a `style-src
+/// 'self'` CSP. The href is a scope routed local path, never customer supplied HTML, so it
+/// stays escape safe by construction.
+pub(crate) fn document_styled(
+    title: &str,
+    body_html: &str,
+    lang: &str,
+    display: &str,
+    environment_banner: Option<&str>,
+    stylesheet_href: Option<&str>,
+) -> String {
     let lang = escape_html(lang);
     let display = escape_html(display);
     let robots = if environment_banner.is_some() {
         "<meta name=\"robots\" content=\"noindex\">"
     } else {
         ""
+    };
+    let stylesheet = match stylesheet_href {
+        Some(href) => format!("<link rel=\"stylesheet\" href=\"{}\">", escape_html(href)),
+        None => String::new(),
     };
     let banner = match environment_banner {
         Some(label) => format!(
@@ -154,7 +176,7 @@ fn document(
     };
     format!(
         "<!doctype html><html lang=\"{lang}\"><head><meta charset=\"utf-8\">\
-         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">{robots}\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">{robots}{stylesheet}\
          <title>{title}</title></head>\
          <body data-display=\"{display}\">{banner}{body_html}</body></html>"
     )
@@ -325,7 +347,7 @@ fn signal_unknown_snippet(signal_api: bool) -> &'static str {
 /// page (issue #65). The script drives `navigator.credentials.get` with conditional
 /// mediation (autofill) on load and modal mediation on the button click, posting the
 /// assertion to the scope's `authenticate/verify` endpoint.
-fn passkey_block(ui: &PasskeyUi<'_>) -> String {
+pub(crate) fn passkey_block(ui: &PasskeyUi<'_>) -> String {
     // The scope path is server-known (a validated Scope), so it is safe to embed.
     let script = PASSKEY_SCRIPT
         .replace("__BASE__", ui.scope_path)
@@ -402,6 +424,121 @@ pub fn login_html(status: StatusCode, body: String, nonce: &str) -> Response {
             (header::CACHE_CONTROL, "no-store".to_owned()),
         ],
         body,
+    )
+        .into_response()
+}
+
+/// The Content-Security-Policy for a hosted flow render app page (issue #85, FORK C). It
+/// keeps the strict discipline of [`CONTENT_SECURITY_POLICY`] (`default-src 'none'`,
+/// `base-uri 'none'`, `form-action 'self'`, `frame-ancestors 'none'`) and opens exactly
+/// ONE extra source: `style-src 'self'`, so the one served same origin stylesheet loads.
+/// No script, image, or font source is opened and there is no `unsafe-inline` anywhere.
+const FLOW_PAGE_CSP: &str = "default-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; \
+     style-src 'self'";
+
+/// The Content-Security-Policy for a hosted flow page that ALSO carries the passkey
+/// conditional-UI ceremony (issue #85, the §4 cutover gap). It is [`FLOW_PAGE_CSP`] plus the
+/// SAME two sources [`login_csp`] opens for the bootstrap login ceremony: `script-src
+/// 'nonce-{nonce}'` permits ONLY the one server authored ceremony script (no other inline or
+/// external script can run), and `connect-src 'self'` permits the same origin `fetch` to the
+/// scope's webauthn endpoints. There is no `unsafe-inline`, so the ceremony runs under the
+/// SAME nonce discipline as the bootstrap login page.
+#[must_use]
+pub fn flow_login_csp(nonce: &str) -> String {
+    format!(
+        "default-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; \
+         style-src 'self'; script-src 'nonce-{nonce}'; connect-src 'self'"
+    )
+}
+
+/// Build a hosted flow render app HTML response carrying [`FLOW_PAGE_CSP`] (issue #85): the
+/// strict headers of [`secure_html`] plus the `style-src 'self'` for the served stylesheet.
+/// Used for every flow page that presents no passkey ceremony.
+#[must_use]
+pub fn flow_html(status: StatusCode, body: String) -> Response {
+    (
+        status,
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CONTENT_SECURITY_POLICY, FLOW_PAGE_CSP),
+            (header::X_FRAME_OPTIONS, "DENY"),
+            (header::REFERRER_POLICY, PAGE_REFERRER_POLICY),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+/// Build a hosted flow render app HTML response carrying the passkey ceremony CSP (issue
+/// #85) whose `script-src` nonce matches the page's one ceremony script, so a flow login or
+/// step up that presents the passkey node group runs the conditional-UI ceremony IDENTICALLY
+/// to the bootstrap login page. Every other header matches [`secure_html`].
+#[must_use]
+pub fn flow_login_html(status: StatusCode, body: String, nonce: &str) -> Response {
+    (
+        status,
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8".to_owned()),
+            (header::CONTENT_SECURITY_POLICY, flow_login_csp(nonce)),
+            (header::X_FRAME_OPTIONS, "DENY".to_owned()),
+            (header::REFERRER_POLICY, PAGE_REFERRER_POLICY.to_owned()),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_owned()),
+            (header::CACHE_CONTROL, "no-store".to_owned()),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+/// The ONE embedded, same origin stylesheet the hosted flow render app loads (issue #85,
+/// FORK C). A neutral, bounded default kept deliberately small: it carries the layout and
+/// legibility baseline the bootstrap pages lack, with NO external font, NO image, and NO
+/// remote reference (a network capture during a full login shows no external host). Issue
+/// #86 fills safe per environment branding by swapping this file (or a per environment
+/// variables block) WITHOUT touching the HTML, which stays free of inline style. Served as a
+/// `const &str` so the single binary answers `.../pages.css` with no CDN and no runtime
+/// fetch.
+pub const PAGES_STYLESHEET: &str = ":root{color-scheme:light dark}\
+*{box-sizing:border-box}\
+body{margin:0;font-family:system-ui,sans-serif;line-height:1.5;color:#1a1a1a;background:#f5f5f5}\
+body{display:flex;min-height:100vh;align-items:center;justify-content:center;padding:1.5rem}\
+form,main,.page{width:100%;max-width:24rem}\
+h1{font-size:1.5rem;margin:0 0 1rem}\
+label{display:block;margin:0 0 .75rem;font-weight:500}\
+input[type=text],input[type=email],input[type=tel],input[type=password]{\
+display:block;width:100%;margin-top:.25rem;padding:.5rem .625rem;font-size:1rem;\
+border:1px solid #bbb;border-radius:.375rem;background:#fff;color:inherit}\
+button,input[type=submit]{\
+display:inline-block;padding:.5rem 1rem;font-size:1rem;font-weight:600;cursor:pointer;\
+border:0;border-radius:.375rem;background:#2f5bde;color:#fff}\
+button:hover,input[type=submit]:hover{background:#2848b0}\
+p[role=alert],span.error{color:#b00020}\
+p[role=status][data-environment-banner]{\
+background:#fff4d6;border:1px solid #e0c060;border-radius:.375rem;padding:.5rem .75rem}\
+[data-brand]{margin:0 0 1rem;font-weight:700}\
+[data-brand-token]{display:inline-block;margin-left:.5rem;padding:.125rem .5rem;\
+font-size:.75rem;border-radius:1rem;background:#e6ecff;color:#2848b0}\
+@media (prefers-color-scheme:dark){\
+body{color:#eee;background:#141414}\
+input[type=text],input[type=email],input[type=tel],input[type=password]{\
+background:#1e1e1e;border-color:#444;color:#eee}\
+p[role=status][data-environment-banner]{background:#3a2f10;border-color:#7a6320}}";
+
+/// Build the `200 OK` response serving the one embedded flow stylesheet (issue #85, FORK C):
+/// a same origin `text/css` asset with `nosniff` and a cacheable `max-age`, so the browser
+/// fetches it once under the `style-src 'self'` CSP. No external host, no CDN.
+#[must_use]
+pub fn stylesheet_response() -> Response {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/css; charset=utf-8"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::CACHE_CONTROL, "public, max-age=3600"),
+        ],
+        PAGES_STYLESHEET,
     )
         .into_response()
 }
@@ -1224,6 +1361,75 @@ pub fn frontchannel_logout_response(iframe_urls: &[String], frame_origins: &[Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Issue #85 (FORK C): the flow render app CSP variants keep the strict discipline and add
+    // exactly the sources the served stylesheet and the passkey ceremony need, with no
+    // unsafe-inline anywhere (#89 owns final enforcement; #85 must be strict-clean).
+    #[test]
+    fn flow_page_csp_opens_only_style_src_self_and_no_unsafe_inline() {
+        assert!(FLOW_PAGE_CSP.contains("default-src 'none'"));
+        assert!(FLOW_PAGE_CSP.contains("style-src 'self'"));
+        assert!(FLOW_PAGE_CSP.contains("form-action 'self'"));
+        assert!(FLOW_PAGE_CSP.contains("frame-ancestors 'none'"));
+        assert!(!FLOW_PAGE_CSP.contains("unsafe-inline"));
+        assert!(
+            !FLOW_PAGE_CSP.contains("script-src"),
+            "the plain flow page runs no script"
+        );
+    }
+
+    #[test]
+    fn flow_login_csp_pins_the_nonce_and_carries_no_unsafe_inline() {
+        let csp = flow_login_csp("deadbeef");
+        assert!(csp.contains("default-src 'none'"));
+        assert!(csp.contains("style-src 'self'"));
+        assert!(csp.contains("script-src 'nonce-deadbeef'"));
+        assert!(csp.contains("connect-src 'self'"));
+        assert!(!csp.contains("unsafe-inline"));
+    }
+
+    #[test]
+    fn the_served_stylesheet_is_same_origin_css_with_no_external_host() {
+        // A network capture shows no external requests: the stylesheet is an embedded
+        // const &str served as same-origin text/css, referencing no remote host, no CDN.
+        assert!(!PAGES_STYLESHEET.contains("http://"));
+        assert!(!PAGES_STYLESHEET.contains("https://"));
+        assert!(
+            !PAGES_STYLESHEET.contains("url("),
+            "no external url() reference"
+        );
+        let response = stylesheet_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert_eq!(content_type, "text/css; charset=utf-8");
+    }
+
+    #[test]
+    fn document_styled_is_byte_identical_to_document_when_no_stylesheet() {
+        // The bootstrap pages stay byte-identical: document() delegates to document_styled with
+        // no href, so no <link> is emitted and the shell is unchanged.
+        let plain = document("Title", "<p>body</p>", "en", "page", None);
+        let via = document_styled("Title", "<p>body</p>", "en", "page", None, None);
+        assert_eq!(plain, via);
+        assert!(
+            !plain.contains("<link"),
+            "no stylesheet link on the bootstrap shell"
+        );
+        // With an href, exactly one escaped link is added.
+        let styled = document_styled(
+            "Title",
+            "<p>body</p>",
+            "en",
+            "page",
+            None,
+            Some("/t/a/e/b/pages.css"),
+        );
+        assert!(styled.contains("<link rel=\"stylesheet\" href=\"/t/a/e/b/pages.css\">"));
+    }
 
     // Issue #73: the Signal API management page emits the feature-detected signal calls
     // (under a nonce) only when the flag is on, and the conditional-create block only

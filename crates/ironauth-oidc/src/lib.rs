@@ -709,7 +709,12 @@ pub fn oidc_router(state: OidcState) -> Router {
             get(flow::flow_browser_get).post(flow::flow_browser_post),
         )
         .route(flow::FLOW_CREATE_API_PATH, post(flow::flow_api_create))
-        .route(flow::FLOW_API_SUBMIT_PATH, post(flow::flow_api_submit));
+        .route(flow::FLOW_API_SUBMIT_PATH, post(flow::flow_api_submit))
+        // The hosted flow render app stylesheet (issue #85, FORK C): the ONE embedded, same
+        // origin `.../pages.css` the server rendered flow pages link, served under the
+        // `style-src 'self'` CSP. Gated behind `flows.enabled` (a uniform 404 when off), so
+        // the render app adds no live surface while the flag is off (no cutover in this PR).
+        .route(flow::FLOW_STYLESHEET_PATH, get(flow::flow_stylesheet));
 
     // Dynamic Client Registration (issue #30, RFC 7591 + RFC 7592), mounted ONLY
     // when enabled (default off; issue #31 owns the real abuse gating). The routes
