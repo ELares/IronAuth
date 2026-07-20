@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>IronAuth hosted pages (reference app)</title>
+
+    <!--
+      The single configuration surface an operator edits when they fork and
+      deploy this app. Point ironauth-issuer at your IronAuth server (leave it
+      empty to call the same origin), and set the tenant and environment scope.
+      A build or deploy step may inject these instead of editing them here.
+      There are NO secrets: the flow API is a public client protocol.
+    -->
+    <meta name="ironauth-issuer" content="" />
+    <meta name="ironauth-tenant" content="default" />
+    <meta name="ironauth-environment" content="default" />
+    <meta name="ironauth-journey" content="login" />
+
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        max-width: 26rem;
+        margin: 3rem auto;
+        padding: 0 1rem;
+      }
+      .flow-node {
+        margin: 0.75rem 0;
+      }
+      .flow-label {
+        display: block;
+      }
+      .flow-label-text {
+        display: block;
+        margin-bottom: 0.25rem;
+      }
+      .flow-form input:not([type="hidden"]) {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 0.4rem;
+      }
+      .flow-message-error {
+        color: #b00020;
+      }
+      .flow-message-success {
+        color: #0b6b1f;
+      }
+    </style>
+  </head>
+  <body>
+    <!-- The compiled reference app. It is a standalone deployable built with tsc
+         (npm run build); it runs OUTSIDE the IronAuth binary against the issuer
+         configured above, speaking only the public flow API. -->
+    <script type="module" src="./dist/main.js"></script>
+  </body>
+</html>

@@ -1,0 +1,7 @@
+# Build output and installed dependencies for the TypeScript packages. The
+# generated contract bindings (src/contract/*.gen.ts) are committed on purpose
+# (a freshness gate keeps them in sync with docs/flow-*.json), so they are NOT
+# ignored here.
+node_modules/
+dist/
+*.tsbuildinfo
