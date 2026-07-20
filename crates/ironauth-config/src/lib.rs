@@ -3351,6 +3351,13 @@ pub enum Warning {
         /// The browser label budget the count has reached or exceeded.
         budget: usize,
     },
+    /// `hosted_pages.enabled` is on but `flows.enabled` is off (issue #85). The hosted pages
+    /// render THROUGH the flow engine, so the cutover is inert without it: the `/authorize`
+    /// interaction redirects keep targeting the bootstrap login and registration pages. This is
+    /// advisory (the deployment stays safe and serves the bootstrap pages), not a boot error, so
+    /// an operator who genuinely wants the two toggles independent is never blocked; it just
+    /// surfaces that the intended cutover will NOT take effect until the flow engine is also on.
+    HostedPagesEnabledWithoutFlows,
 }
 
 impl fmt::Display for Warning {
@@ -3378,6 +3385,13 @@ impl fmt::Display for Warning {
                  browser silently ignores origins past its cap, so some listed origins may never \
                  work (this is an advisory approximation by SLD label; the browser enforces the \
                  real limit)"
+            ),
+            Warning::HostedPagesEnabledWithoutFlows => write!(
+                f,
+                "hosted_pages.enabled is on but flows.enabled is off; the hosted pages render \
+                 through the flow engine, so the cutover is inert and the /authorize interaction \
+                 redirects keep targeting the bootstrap login and registration pages. Set \
+                 flows.enabled = true to make the hosted pages the live browser surface"
             ),
         }
     }
@@ -3456,6 +3470,12 @@ impl Config {
                     budget: WEBAUTHN_RELATED_ORIGIN_LABEL_BUDGET,
                 });
             }
+        }
+        // The hosted-pages cutover (issue #85) renders through the flow engine, so arming the
+        // pages without the engine is inert: surface it so an operator who meant to cut over is
+        // not left believing the flow pages are live when the bootstrap pages still serve.
+        if self.hosted_pages.enabled && !self.flows.enabled {
+            warnings.push(Warning::HostedPagesEnabledWithoutFlows);
         }
         warnings
     }
@@ -5944,6 +5964,54 @@ mod tests {
         let err = Config::from_toml_str("[hosted_pages]\nenbaled = true\n", "<inline>")
             .expect_err("unknown key rejected");
         assert!(format!("{err}").contains("enbaled"), "{err}");
+    }
+
+    #[test]
+    fn hosted_pages_without_flows_warns_but_does_not_gate_startup() {
+        // hosted_pages.enabled requires flows.enabled (the pages render through the flow engine).
+        // The contradictory combination LOADS (it is not a boot error, so the two toggles stay
+        // independent) but surfaces an advisory warning so an operator is not left believing the
+        // cutover is live when the bootstrap pages still serve.
+        let loaded = Config::from_toml_str(
+            "[hosted_pages]\nenabled = true\n[flows]\nenabled = false\n",
+            "<inline>",
+        )
+        .expect("the pages-on / flows-off combination loads (advisory, not a boot error)");
+        assert!(
+            loaded
+                .warnings
+                .iter()
+                .any(|w| matches!(w, Warning::HostedPagesEnabledWithoutFlows)),
+            "pages-on / flows-off warns: {:?}",
+            loaded.warnings
+        );
+
+        // With BOTH on (the intended cutover posture) there is no warning: the pages have their
+        // flow engine.
+        let both = Config::from_toml_str(
+            "[hosted_pages]\nenabled = true\n[flows]\nenabled = true\n",
+            "<inline>",
+        )
+        .expect("valid");
+        assert!(
+            !both
+                .warnings
+                .iter()
+                .any(|w| matches!(w, Warning::HostedPagesEnabledWithoutFlows)),
+            "pages-on / flows-on does not warn: {:?}",
+            both.warnings
+        );
+
+        // The default posture (both off) does not warn either.
+        let neither = Config::from_toml_str("", "<inline>").expect("valid");
+        assert!(
+            !neither
+                .warnings
+                .iter()
+                .any(|w| matches!(w, Warning::HostedPagesEnabledWithoutFlows)),
+            "the default posture does not warn: {:?}",
+            neither.warnings
+        );
     }
 
     #[test]

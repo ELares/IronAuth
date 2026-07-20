@@ -252,6 +252,17 @@ pub struct OidcState {
     // route answers a uniform 404 and the bootstrap login/consent/register pages are the only
     // interactive surface (the flow-object contract is inert until an operator turns it on).
     flows_enabled: bool,
+    // Whether the hosted-page render app is the LIVE browser interaction surface (issue #85,
+    // the cutover). Kept OUTSIDE `Inner` and set through the builder because it is sourced from
+    // the TOP-LEVEL `[hosted_pages]` config section (`hosted_pages.enabled`), a plain operator
+    // toggle (like `oidc.enabled`), off by default. When on (AND `flows_enabled` is on, since the
+    // pages render THROUGH the flow engine), the `/authorize` login and registration interaction
+    // redirects are retargeted onto the scope-routed flow browser page instead of the bootstrap
+    // `/login` and `/register`. Default: false, so the redirect targets are byte-identical to the
+    // bootstrap pages and there is NO live behavior change until an operator turns it on. The
+    // cutover is gated on BOTH flags through `hosted_pages_cutover` so it is inert whenever the
+    // flow engine that renders the pages is itself off.
+    hosted_pages_enabled: bool,
     // The per-tenant/per-environment quota enforcer (issue #50), the data plane's
     // tenant-fairness layer. Kept OUTSIDE `Inner` and installed by the boot path
     // (built from the [quota] config, seeded with the SAME env clock), so a spend
@@ -810,6 +821,7 @@ impl OidcState {
             signup_quarantine_enabled: false,
             advanced_recovery_enabled: false,
             flows_enabled: false,
+            hosted_pages_enabled: false,
             quota: None,
             migration_hook: None,
             hashing_pool: None,
@@ -1001,6 +1013,37 @@ impl OidcState {
     #[must_use]
     pub fn flows_enabled(&self) -> bool {
         self.flows_enabled
+    }
+
+    /// Arm the hosted-page render app as the live browser interaction surface (issue #85, the
+    /// cutover). The boot path resolves the top-level `hosted_pages.enabled` config toggle and
+    /// passes it here (a plain operator toggle like `oidc.enabled`, off by default). When false,
+    /// the `/authorize` interaction redirects target the bootstrap `/login` and `/register`
+    /// exactly as before (no live behavior change).
+    #[must_use]
+    pub fn with_hosted_pages_enabled(mut self, enabled: bool) -> Self {
+        self.hosted_pages_enabled = enabled;
+        self
+    }
+
+    /// Whether the hosted-page render app is configured as the live browser surface (issue #85).
+    /// This is the raw operator toggle; the cutover itself is gated on
+    /// [`Self::hosted_pages_cutover`], which additionally requires the flow engine to be on.
+    #[must_use]
+    pub fn hosted_pages_enabled(&self) -> bool {
+        self.hosted_pages_enabled
+    }
+
+    /// Whether the `/authorize` login and registration interaction redirects should retarget onto
+    /// the scope-routed flow browser page (issue #85, the cutover). This requires BOTH the
+    /// hosted-pages toggle AND the flow engine, because the hosted pages render THROUGH the flow
+    /// engine: `hosted_pages.enabled` has no effect unless `flows.enabled` is also on, so a
+    /// deployment that arms the pages without the engine keeps the bootstrap pages live rather
+    /// than redirecting to a flow surface that answers a uniform 404. Off by default, so the
+    /// interaction redirects are byte-identical to the bootstrap pages until an operator opts in.
+    #[must_use]
+    pub fn hosted_pages_cutover(&self) -> bool {
+        self.hosted_pages_enabled && self.flows_enabled
     }
 
     /// The advanced-recovery-modes policy (issue #82, PR 3): the three mode sub-toggles, the

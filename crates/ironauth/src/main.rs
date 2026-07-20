@@ -185,6 +185,14 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // routes answer a uniform 404 until an operator turns it on.
         let flows_enabled = config.flows.enabled;
 
+        // The hosted-page render app cutover (issue #85): a plain top-level operator toggle,
+        // off by default, resolved here before `config` is moved. It retargets the `/authorize`
+        // login and registration interaction redirects onto the flow browser page, but ONLY in
+        // composition with `flows_enabled` (the pages render through the flow engine), which the
+        // state builder enforces via `hosted_pages_cutover`. A config that arms the pages without
+        // the flow engine is surfaced as a load-time warning (see the config `collect_warnings`).
+        let hosted_pages_enabled = config.hosted_pages.enabled;
+
         // When advanced-recovery is armed, an IDV callback's signature is verified against each
         // provider's REGISTERED JWKS through the JOSE core. The config layer can only prove the
         // JWKS is NON-EMPTY (it carries no jose dep); parse it HERE, where jose IS available, so
@@ -293,6 +301,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
                 signup_quarantine_enabled,
                 advanced_recovery_enabled,
                 flows_enabled,
+                hosted_pages_enabled,
                 master_key,
                 &quota_config,
                 &hashing_config,
@@ -456,6 +465,7 @@ async fn build_oidc_router(
     signup_quarantine_enabled: bool,
     advanced_recovery_enabled: bool,
     flows_enabled: bool,
+    hosted_pages_enabled: bool,
     master_key: Option<Arc<MasterKey>>,
     quota_config: &QuotaConfig,
     hashing_config: &PasswordHashingConfig,
@@ -569,6 +579,7 @@ async fn build_oidc_router(
         .with_signup_quarantine_enabled(signup_quarantine_enabled)
         .with_advanced_recovery_enabled(advanced_recovery_enabled)
         .with_flows_enabled(flows_enabled)
+        .with_hosted_pages_enabled(hosted_pages_enabled)
         .with_quota_enforcer(quota_enforcer)
         .with_hashing_pool(hashing_pool)
         .with_password_policy(password_policy, screening_failure, screen_on_login)

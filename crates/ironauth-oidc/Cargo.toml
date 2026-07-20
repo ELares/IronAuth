@@ -851,5 +851,16 @@ name = "flow_render"
 path = "tests/flow_render.rs"
 required-features = ["testing"]
 
+# The hosted-pages cutover (issue #85, PR 3): hosted_pages.enabled retargets the /authorize
+# login and registration interaction redirects onto the scope-routed flow browser page. Pins the
+# OFF postures (default, flows-on/pages-off, pages-on/flows-off) targeting the bootstrap /login,
+# the ON retarget onto the flow page, the return_to staying parse_resume-validated (no open
+# redirect), the same-origin CSRF gate, and the full /authorize -> flow login -> code -> token
+# end to end with consent staying server-rendered. Over a real database (DATABASE_URL).
+[[test]]
+name = "hosted_pages_cutover"
+path = "tests/hosted_pages_cutover.rs"
+required-features = ["testing"]
+
 [lints]
 workspace = true

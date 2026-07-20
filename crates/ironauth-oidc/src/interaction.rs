@@ -717,6 +717,47 @@ fn interaction_url(path: &str, return_to: &str) -> String {
     append_query(path, &[("return_to", Some(return_to))])
 }
 
+/// The scope-routed flow browser page path for a journey (issue #85, the cutover): the SAME
+/// shape as the flow transport's `FLOW_BROWSER_PATH`
+/// (`/t/{tenant}/e/{environment}/flow/{journey}`), built here with the concrete scope so a
+/// retargeted interaction redirect lands on the flow render app's GET handler, which creates the
+/// flow (re-validating `return_to` through [`parse_resume`]) and renders the page. The
+/// `{journey}` segment must be a browser creation journey; the two callers pass the exact
+/// `Journey::as_str` literals (`login`, `registration`).
+fn flow_browser_path(scope: Scope, journey: &str) -> String {
+    format!(
+        "/t/{}/e/{}/flow/{}",
+        scope.tenant(),
+        scope.environment(),
+        journey
+    )
+}
+
+/// A `303` redirect to the scope-routed flow browser LOGIN page carrying `return_to` (issue #85,
+/// the cutover). Used in place of [`login_redirect`] when the hosted-pages cutover is active. The
+/// `return_to` is percent-encoded into the query and is re-validated as a local `/authorize`
+/// resume by the flow GET handler (via [`parse_resume`] at flow creation), so the open-redirect
+/// defense holds unchanged through the retarget.
+#[must_use]
+pub fn login_flow_redirect(scope: Scope, return_to: &str) -> Response {
+    redirect(&interaction_url(
+        &flow_browser_path(scope, "login"),
+        return_to,
+    ))
+}
+
+/// A `303` redirect to the scope-routed flow browser REGISTRATION page carrying `return_to`
+/// (issue #85, the cutover). Used in place of [`register_redirect`] when the hosted-pages cutover
+/// is active. The `return_to` stays [`parse_resume`]-validated at flow creation, so there is no
+/// open redirect via the retarget.
+#[must_use]
+pub fn register_flow_redirect(scope: Scope, return_to: &str) -> Response {
+    redirect(&interaction_url(
+        &flow_browser_path(scope, "registration"),
+        return_to,
+    ))
+}
+
 /// A `303 See Other` to `location` with `Cache-Control: no-store` and
 /// `Referrer-Policy: no-referrer`.
 ///
