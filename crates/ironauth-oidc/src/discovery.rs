@@ -70,7 +70,7 @@ use axum::response::Response;
 use axum::routing::get;
 use ironauth_config::OidcConfig;
 use ironauth_jose::{JwsAlgorithm, SigningPolicy};
-use ironauth_store::Scope;
+use ironauth_store::{Scope, Store};
 use serde_json::{Value, json};
 
 use crate::client_auth::ClientAuthMethod;
@@ -283,6 +283,15 @@ pub struct DiscoveryCapabilities {
     /// (per OIDC Front-Channel Logout 1.0 a missing field means unsupported).
     /// Default-off, gated by `oidc.frontchannel_logout_enabled`.
     frontchannel_logout_enabled: bool,
+    /// The `ui_locales_supported` set this environment can actually render (issue #86, PR 2):
+    /// the installed [`crate::flow::localize::LocaleBundle`] locales unioned with `en` (the
+    /// compiled fallback language). EMPTY here means "not populated from the store"; the
+    /// discovery document then advertises the honest minimal [`UI_LOCALES_SUPPORTED`]
+    /// (`["en"]`), so a store-free path and a bundle-less environment both advertise exactly
+    /// `["en"]`, byte-identical to before PR 2. The store-backed discovery path fills it per
+    /// environment so discovery advertises exactly what the pages can produce (the honest set),
+    /// never a language they cannot render.
+    supported_ui_locales: Vec<String>,
 }
 
 impl DiscoveryCapabilities {
@@ -387,6 +396,16 @@ impl DiscoveryCapabilities {
     #[must_use]
     pub fn with_registration_endpoint(mut self, enabled: bool) -> Self {
         self.registration_endpoint_enabled = enabled;
+        self
+    }
+
+    /// Declare the `ui_locales_supported` set this environment can render (issue #86, PR 2):
+    /// the installed locale-bundle tags unioned with `en`. The store-backed discovery path sets
+    /// this per environment so discovery advertises exactly what the pages can produce (the
+    /// honest set); left unset (empty), discovery advertises the minimal `["en"]`.
+    #[must_use]
+    pub fn with_supported_ui_locales(mut self, locales: Vec<String>) -> Self {
+        self.supported_ui_locales = locales;
         self
     }
 }
@@ -562,9 +581,20 @@ pub fn discovery_document(
             Display::SUPPORTED.iter().map(|value| value.as_str())
         )),
     );
+    // The UI locales the pages can ACTUALLY render (issue #86, PR 2): the store-backed path
+    // fills `supported_ui_locales` with the installed locale-bundle tags unioned with `en`, so
+    // discovery advertises exactly the honest set. Unset (empty), it advertises the minimal
+    // `UI_LOCALES_SUPPORTED` (`["en"]`), so a bundle-less environment is byte-identical to
+    // before PR 2. `claims_locales_supported` stays `en`: claim-value localization is out of
+    // scope for #86.
+    let ui_locales_supported: Vec<String> = if capabilities.supported_ui_locales.is_empty() {
+        UI_LOCALES_SUPPORTED.iter().map(|&s| s.to_owned()).collect()
+    } else {
+        capabilities.supported_ui_locales.clone()
+    };
     document.insert(
         "ui_locales_supported".to_owned(),
-        json!(UI_LOCALES_SUPPORTED),
+        json!(ui_locales_supported),
     );
     document.insert(
         "claims_locales_supported".to_owned(),
@@ -653,6 +683,24 @@ fn to_strings<'a>(values: impl Iterator<Item = &'a str>) -> Vec<String> {
     values.map(ToOwned::to_owned).collect()
 }
 
+/// The `ui_locales_supported` set an environment can render (issue #86, PR 2): the installed
+/// locale-bundle tags unioned with `en` (the compiled fallback language), sorted and
+/// deduplicated. A store read failure fails safe to just `["en"]`, so a store hiccup never
+/// advertises a locale the pages cannot render and never errors discovery. The data-plane role
+/// holds SELECT on `locale_bundles`, so this scoped read runs beneath forced row-level
+/// security.
+async fn supported_ui_locales(store: &Store, scope: &Scope) -> Vec<String> {
+    let installed = store
+        .scoped(*scope)
+        .locale_bundles()
+        .installed_locales()
+        .await
+        .unwrap_or_default();
+    let mut set: std::collections::BTreeSet<String> = installed.into_iter().collect();
+    set.insert("en".to_owned());
+    set.into_iter().collect()
+}
+
 /// The shared state for the discovery surface.
 ///
 /// Holds the deployment base URL, the JWKS/discovery cache window, the
@@ -722,12 +770,24 @@ impl DiscoveryState {
         };
         let issuer = self.issuer_for(scope);
         let jwks_uri = format!("{issuer}/jwks.json");
+        // Populate the per-environment `ui_locales_supported` from the installed locale bundles
+        // (issue #86, PR 2): the installed tags unioned with `en`, so discovery advertises
+        // exactly what THIS environment can render (the honest set). A store-free (pre-populated)
+        // registry, or a store read that fails, leaves the capability unset, so discovery
+        // advertises the minimal `["en"]`, byte-identical to before PR 2.
+        let capabilities = match self.registry.store() {
+            Some(store) => self
+                .capabilities
+                .clone()
+                .with_supported_ui_locales(supported_ui_locales(store, scope).await),
+            None => self.capabilities.clone(),
+        };
         let document = discovery_document(
             &issuer,
             self.base(),
             &jwks_uri,
             entry.policy(),
-            &self.capabilities,
+            &capabilities,
         );
         cacheable_response(
             headers,
@@ -945,6 +1005,41 @@ mod tests {
         // PKCE is S256-only: plain is structurally absent from the registry, so it
         // can never be advertised.
         assert_eq!(doc["code_challenge_methods_supported"], json!(["S256"]));
+    }
+
+    #[test]
+    fn ui_locales_supported_defaults_to_en_and_reflects_the_installed_set() {
+        // Issue #86: with no store-backed population (the default), discovery advertises the
+        // honest minimal `["en"]`, byte-identical to before PR 2. When the store-backed path
+        // fills the capability with the installed locales unioned with `en`, discovery
+        // advertises exactly that set (the honest set), never a language the pages cannot render.
+        let policy = SigningPolicy::eddsa_default();
+        let doc = |caps: &DiscoveryCapabilities| {
+            discovery_document(
+                "https://i.test/t/a/e/b",
+                "https://i.test",
+                "https://i.test/t/a/e/b/jwks.json",
+                &policy,
+                caps,
+            )
+        };
+        // The default: exactly `["en"]`.
+        assert_eq!(
+            doc(&DiscoveryCapabilities::default())["ui_locales_supported"],
+            json!(["en"])
+        );
+        // The installed set (acceptance criterion d): exactly the advertised locales.
+        let caps = DiscoveryCapabilities::default().with_supported_ui_locales(vec![
+            "ar".to_owned(),
+            "en".to_owned(),
+            "fr".to_owned(),
+        ]);
+        assert_eq!(
+            doc(&caps)["ui_locales_supported"],
+            json!(["ar", "en", "fr"])
+        );
+        // `claims_locales_supported` stays `en` (claim-value localization is out of #86 scope).
+        assert_eq!(doc(&caps)["claims_locales_supported"], json!(["en"]));
     }
 
     #[test]

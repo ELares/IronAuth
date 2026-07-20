@@ -79,9 +79,9 @@ use crate::id::{
     CorrelationId, CredentialClassPolicyId, CredentialId, CustomDomainId, DcrPolicyId, DekId,
     DeviceCodeId, EmailOtpCodeId, EncryptedSecretId, EnvironmentId, EnvironmentSecretId,
     ExternalIssuerId, FedcmNonceId, FederationLoginStateId, FlowId, GrantId, InitialAccessTokenId,
-    InvitationId, IssuedTokenId, KekId, MagicLinkTokenId, ManagementKeyId, Mds3BlobCacheId,
-    MigrationRunId, MigrationRunRecordId, OperatorId, OrgConnectionId, OrganizationId,
-    PowChallengeId, PushedRequestId, RecoveryApprovalId, RecoveryCodeId,
+    InvitationId, IssuedTokenId, KekId, LocaleBundleId, MagicLinkTokenId, ManagementKeyId,
+    Mds3BlobCacheId, MigrationRunId, MigrationRunRecordId, OperatorId, OrgConnectionId,
+    OrganizationId, PowChallengeId, PushedRequestId, RecoveryApprovalId, RecoveryCodeId,
     RecoveryContactConfirmationId, RecoveryFlowId, RecoveryIdvSessionId, RecoveryTrustedContactId,
     RefreshFamilyId, RefreshTokenId, ResourceServerId, RiskDecisionId, RiskDisavowalId,
     RiskLoginGeoId, RiskSignalId, RoutingRuleId, ScopeStepUpPolicyId, ServiceAccountId,
@@ -93,6 +93,7 @@ use crate::id::{
 use crate::identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
 };
+use crate::locale_bundle::{LocaleBundleRecord, NewLocaleBundle};
 use crate::pow_challenge::{NewPowChallenge, PowChallengeView};
 use crate::recovery::{
     NewRecoveryFlow, RecoveryCancelReason, RecoveryEntryPoint, RecoveryFlowRecord, RecoveryMethod,
@@ -493,6 +494,20 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn brands(&self) -> BrandRepo<'a> {
         BrandRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only per-environment locale bundle repository for this scope (issue #86, PR
+    /// 2): read the environment's DEFAULT locale, read a bundle by tag, list the installed
+    /// locale tags (the discovery `ui_locales_supported` read), and list the scope's bundles
+    /// (for the config-snapshot export). Every bundle value is stored already validated; the
+    /// renderer resolves the plain text per id and escapes it on render. The mutating set
+    /// lives on [`ActingStore::locale_bundles`].
+    #[must_use]
+    pub fn locale_bundles(&self) -> LocaleBundleRepo<'a> {
+        LocaleBundleRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -1328,6 +1343,20 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn brands(&self) -> ActingBrandRepo<'a> {
         ActingBrandRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating per-environment locale bundle repository for this scope and actor (issue
+    /// #86, PR 2): set (create or overwrite) an installed locale, audited, and delete an
+    /// installed locale, audited. The entries are stored already validated by the admin
+    /// locales path (registered ids, declared placeholders only). Every write carries the
+    /// actor and correlation id into its audit row.
+    #[must_use]
+    pub fn locale_bundles(&self) -> ActingLocaleBundleRepo<'a> {
+        ActingLocaleBundleRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -20895,6 +20924,283 @@ impl ActingBrandRepo<'_> {
     }
 }
 
+/// The read-only per-environment locale bundle repository (issue #86, PR 2): read the
+/// environment's DEFAULT locale for the render path, read a bundle by tag, list the installed
+/// locale tags (the discovery `ui_locales_supported` read), and list a scope's bundles for the
+/// config-snapshot export. Every read is scope-forced under row-level security, so a bundle of
+/// another scope is a uniform not-found.
+pub struct LocaleBundleRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl LocaleBundleRepo<'_> {
+    /// The environment's DEFAULT locale bundle (issue #86), or [`None`] when the environment
+    /// has installed no default locale (the render path then resolves against the compiled
+    /// `en` registry, unchanged from before PR 2). At most one default exists per scope (a
+    /// partial unique index enforces it).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn env_default(&self) -> Result<Option<LocaleBundleRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, locale, is_env_default, entries::text AS entries \
+             FROM locale_bundles \
+             WHERE tenant_id = $1 AND environment_id = $2 AND is_env_default \
+             LIMIT 1",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| locale_bundle_from_row(&row)))
+    }
+
+    /// A locale bundle by tag within scope (issue #86), or [`None`] when no such locale exists
+    /// in this scope.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn get(&self, locale: &str) -> Result<Option<LocaleBundleRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, locale, is_env_default, entries::text AS entries \
+             FROM locale_bundles \
+             WHERE tenant_id = $1 AND environment_id = $2 AND locale = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(locale)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| locale_bundle_from_row(&row)))
+    }
+
+    /// The installed locale TAGS in this scope, ordered by tag (issue #86): the set the
+    /// discovery `ui_locales_supported` read unions with `en` to advertise exactly what the
+    /// environment can render. A lightweight projection (no entries), so discovery never
+    /// decodes a bundle it does not render.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn installed_locales(&self) -> Result<Vec<String>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT locale FROM locale_bundles \
+             WHERE tenant_id = $1 AND environment_id = $2 ORDER BY locale",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows
+            .iter()
+            .map(|row| row.get::<String, _>("locale"))
+            .collect())
+    }
+
+    /// EVERY locale bundle in this scope (no pagination), ordered by tag: the set the config
+    /// snapshot export (issue #43) projects, and the set the render path builds its resolved
+    /// bundle chain from. A locale bundle is promotable config, so its whole non-secret map
+    /// travels in the snapshot.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_all(&self) -> Result<Vec<LocaleBundleRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, locale, is_env_default, entries::text AS entries \
+             FROM locale_bundles \
+             WHERE tenant_id = $1 AND environment_id = $2 ORDER BY locale",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows.iter().map(locale_bundle_from_row).collect())
+    }
+}
+
+/// Build a [`LocaleBundleRecord`] from a `locale_bundles` row (the shared read projection).
+fn locale_bundle_from_row(row: &sqlx::postgres::PgRow) -> LocaleBundleRecord {
+    LocaleBundleRecord {
+        id: row.get("id"),
+        locale: row.get("locale"),
+        is_env_default: row.get("is_env_default"),
+        entries_json: row.get("entries"),
+    }
+}
+
+/// The mutating per-environment locale bundle repository for one scope and actor (issue #86,
+/// PR 2): set (create or overwrite) a locale, audited, and delete a locale, audited. The
+/// entries are stored verbatim as the caller's ALREADY-validated JSON string (the admin
+/// locales path validates the registered ids and the declared placeholders before the write).
+pub struct ActingLocaleBundleRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingLocaleBundleRepo<'_> {
+    /// Set a locale bundle (a first write or an overwrite) and audit `locale.set` in the same
+    /// transaction (issue #86). One row per (scope, tag): a repeat write to the same tag
+    /// overwrites in place and reuses the row's id (a stable audit target across overwrites),
+    /// so a set is idempotent on the tag. When `params.is_env_default` is set, any OTHER
+    /// default in the scope is first demoted, so the partial unique index (one default per
+    /// scope) is never violated and the new bundle becomes the sole default.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `id` is out of scope; [`StoreError::Database`] on a
+    /// persistence failure.
+    pub async fn set(
+        &self,
+        env: &Env,
+        id: &LocaleBundleId,
+        created_at_micros: i64,
+        params: NewLocaleBundle<'_>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        // Reuse the existing row id for this tag so an overwrite keeps a stable audit target; a
+        // first write uses the caller-minted id.
+        let target_id = match self.locale_id_for_tag(params.locale).await? {
+            Some(existing) => existing,
+            None => id.to_string(),
+        };
+        let target = LocaleBundleId::parse_in_scope(&target_id, &scope)?;
+        let created_micros = created_at_micros;
+        let locale = params.locale.to_owned();
+        let is_env_default = params.is_env_default;
+        let entries = params.entries_json.to_owned();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::LocaleSet,
+                target: &target,
+            },
+            async move |tx| {
+                // Demote any other default so the new default is the sole one (the partial
+                // unique index tolerates only one default per scope).
+                if is_env_default {
+                    sqlx::query(
+                        "UPDATE locale_bundles SET is_env_default = false, updated_at = \
+                         TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval \
+                         WHERE tenant_id = $1 AND environment_id = $2 AND is_env_default \
+                           AND locale <> $4",
+                    )
+                    .bind(scope.tenant().to_string())
+                    .bind(scope.environment().to_string())
+                    .bind(created_micros)
+                    .bind(&locale)
+                    .execute(&mut **tx)
+                    .await?;
+                }
+                sqlx::query(
+                    "INSERT INTO locale_bundles \
+                     (id, tenant_id, environment_id, locale, entries, is_env_default, \
+                      created_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5::jsonb, $6, \
+                             TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval) \
+                     ON CONFLICT (tenant_id, environment_id, locale) DO UPDATE \
+                     SET entries = EXCLUDED.entries, \
+                         is_env_default = EXCLUDED.is_env_default, \
+                         updated_at = EXCLUDED.updated_at",
+                )
+                .bind(target.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&locale)
+                .bind(&entries)
+                .bind(is_env_default)
+                .bind(created_micros)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Delete the locale bundle named `id` and audit `locale.delete` in the same transaction
+    /// (issue #86). A delete of an id out of scope, or of a tag with no row, is a uniform
+    /// [`StoreError::NotFound`], so a delete never discloses a foreign scope's locales.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `id` is out of scope or names no installed locale;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn delete(&self, env: &Env, id: &LocaleBundleId) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let target = *id;
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::LocaleDelete,
+                target: &target,
+            },
+            async move |tx| {
+                let affected = sqlx::query(
+                    "DELETE FROM locale_bundles \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND id = $3",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(target.to_string())
+                .execute(&mut **tx)
+                .await?
+                .rows_affected();
+                // A delete of a tag with no row rolls back the audit row too (the error is
+                // returned INSIDE the transaction), so a not-found delete records nothing.
+                if affected == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// The stored id of the locale named `tag`, or [`None`] for a first write.
+    async fn locale_id_for_tag(&self, tag: &str) -> Result<Option<String>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id FROM locale_bundles \
+             WHERE tenant_id = $1 AND environment_id = $2 AND locale = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(tag)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| row.get::<String, _>("id")))
+    }
+}
+
 /// The mutating federation connector repository (issue #75): create (seal the
 /// upstream client secret inline, audited), update (replace and reseal, audited),
 /// and delete (audited). Every write is scope-bound.
@@ -33550,6 +33856,9 @@ async fn read_promoted_snapshot(
             // transactional engine yet (a later slice), so the promoted target read omits
             // them exactly like `client`, keeping the promotion revision consistent.
             brand: Vec::new(),
+            // Locale bundles (issue #86, PR 2) are likewise exported and diffable but not
+            // applied by the transactional engine yet, so the promoted target read omits them.
+            locale_bundle: Vec::new(),
         },
     })
 }

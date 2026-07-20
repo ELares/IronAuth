@@ -29,11 +29,12 @@ use crate::views::{
     DcrPolicyView, EnvironmentList, EnvironmentView, ExtendSignupQuarantineRequest, GuardrailView,
     InitialAccessTokenCreated, InvitationCreatedView, InvitationCredentialTypeView, InvitationList,
     InvitationStateChangeView, InvitationStateView, InvitationView, LinkExternalIdRequest,
-    ManagementKeyCreated, ManagementKeyList, ManagementKeyView, OperatorList, OperatorView,
-    OrganizationList, OrganizationView, RecoveryApprovalCaseView, RecoveryApprovalDecisionView,
-    RecoveryApprovalList, RecoveryApprovalStateView, RefreshFamilyList, RefreshFamilyView,
-    ResourceTypeView, ResourceTypesList, RevokeSessionsRequest, SessionList, SessionRevocationView,
-    SessionView, SetUserStateRequest, SignupQuarantineCaseView, SignupQuarantineDecisionView,
+    LocaleBundleView, ManagementKeyCreated, ManagementKeyList, ManagementKeyView, OperatorList,
+    OperatorView, OrganizationList, OrganizationView, RecoveryApprovalCaseView,
+    RecoveryApprovalDecisionView, RecoveryApprovalList, RecoveryApprovalStateView,
+    RefreshFamilyList, RefreshFamilyView, ResourceTypeView, ResourceTypesList,
+    RevokeSessionsRequest, SessionList, SessionRevocationView, SessionView, SetLocaleRequest,
+    SetUserStateRequest, SignupQuarantineCaseView, SignupQuarantineDecisionView,
     SignupQuarantineList, SignupQuarantineReasonView, SignupQuarantineStateView, TenantCreated,
     TenantList, TenantStatusView, TenantView, UpdateUserRequest, UserExternalIdView, UserList,
     UserRevocationView, UserStateChangeView, UserStateView, UserView,
@@ -73,6 +74,9 @@ use crate::views::{
         (name = "connectors", description = "Declarative inbound-federation connectors: \
                                             strict-validated OIDC-shaped upstream definitions \
                                             (CRUD) and the machine-readable capability matrix"),
+        (name = "locales", description = "Per-environment localization bundles: set, get, and \
+                                         delete a bundle of numeric message id to plain-text \
+                                         render, strict-validated against the message registry"),
         (name = "sessions", description = "Session and refresh-family fleet operations: \
                                           search, inspect, revoke (single, bulk, and \
                                           everything-for-a-user with a token-family cascade)"),
@@ -141,6 +145,9 @@ use crate::views::{
         crate::connectors::get_connector_health,
         crate::connectors::update_connector,
         crate::connectors::delete_connector,
+        crate::locales::set_locale,
+        crate::locales::get_locale,
+        crate::locales::delete_locale,
         crate::sessions::list_sessions,
         crate::sessions::get_session,
         crate::sessions::revoke_session,
@@ -215,6 +222,8 @@ use crate::views::{
         ConnectorList,
         ConnectorCapabilitiesView,
         ConnectorHealthView,
+        SetLocaleRequest,
+        LocaleBundleView,
         SessionView,
         SessionList,
         RefreshFamilyView,

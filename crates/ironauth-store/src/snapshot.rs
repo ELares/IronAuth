@@ -82,7 +82,7 @@ pub const CONNECTOR_CLIENT_SECRET_REFERENCE: &str = "connector_client_secret";
 /// (and by the export), and an environment-identity or runtime type can never be
 /// added without failing it. This is the live binding between the snapshot and the
 /// single source of truth, not a hand-maintained parallel list.
-pub const SNAPSHOT_RESOURCE_TYPES: [ResourceType; 9] = [
+pub const SNAPSHOT_RESOURCE_TYPES: [ResourceType; 10] = [
     ResourceType::Client,
     ResourceType::ResourceServer,
     ResourceType::DcrPolicy,
@@ -92,6 +92,7 @@ pub const SNAPSHOT_RESOURCE_TYPES: [ResourceType; 9] = [
     ResourceType::RoutingRule,
     ResourceType::UpstreamTokenGrant,
     ResourceType::Brand,
+    ResourceType::LocaleBundle,
 ];
 
 /// A named reference to a secret in the environment-scoped secret store (issue
@@ -335,6 +336,22 @@ pub struct BrandSnapshot {
     pub slots: serde_json::Value,
 }
 
+/// The secret-free projection of one per-environment locale bundle (issue #86, PR 2). A locale
+/// bundle is NON-secret promotable localization config: the BCP47 tag, the env-default flag,
+/// and the entries map (numeric message id string to the plain-text render) travel as embedded
+/// parsed JSON so it canonicalizes recursively. No secret and no PII: a bundle string is a
+/// plain-text label, title, or error, escaped on render exactly like the compiled default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocaleBundleSnapshot {
+    /// The BCP47 language tag, unique per scope: the stable natural key the export orders by.
+    pub locale: String,
+    /// Whether this is the environment's default locale.
+    pub is_env_default: bool,
+    /// The bundle entries (a JSON object of numeric message id string to the plain-text
+    /// render), embedded as parsed JSON so it canonicalizes recursively.
+    pub entries: serde_json::Value,
+}
+
 /// The promotable resources a snapshot carries, keyed by resource-type wire name
 /// (issue #41 classification). Each array is ordered by its type's stable natural
 /// key, so the collection order is deterministic and documented.
@@ -376,6 +393,11 @@ pub struct SnapshotResources {
     /// branding is deferred to M10 and rides org export, never the snapshot (issue #86).
     #[serde(default)]
     pub brand: Vec<BrandSnapshot>,
+    /// The environment's per-environment locale bundles (`locale_bundle`). Each is secret-free
+    /// localization config (a BCP47 tag and its numeric-id to plain-text map); per-organization
+    /// localization is out of scope for #86 (issue #86, PR 2).
+    #[serde(default)]
+    pub locale_bundle: Vec<LocaleBundleSnapshot>,
 }
 
 /// A canonical, deterministic, secret-free snapshot of one environment's
@@ -716,6 +738,22 @@ pub async fn export(scoped: &ScopedStore<'_>) -> Result<Snapshot, StoreError> {
     }
     brand.sort_by(|a, b| a.slug.cmp(&b.slug));
 
+    // Per-environment locale bundles (issue #86, PR 2): non-secret promotable localization
+    // config. The entries map is embedded as PARSED JSON so it canonicalizes recursively (a
+    // decode fault here is a real persistence corruption, surfaced rather than swallowed). No
+    // secret and no PII travels. Ordered by the stable locale-tag natural key.
+    let mut locale_bundle = Vec::new();
+    for record in scoped.locale_bundles().list_all().await? {
+        let entries: serde_json::Value =
+            serde_json::from_str(&record.entries_json).map_err(serde_fault)?;
+        locale_bundle.push(LocaleBundleSnapshot {
+            locale: record.locale,
+            is_env_default: record.is_env_default,
+            entries,
+        });
+    }
+    locale_bundle.sort_by(|a, b| a.locale.cmp(&b.locale));
+
     Ok(Snapshot {
         schema_version: SNAPSHOT_SCHEMA_VERSION.to_string(),
         resources: SnapshotResources {
@@ -728,6 +766,7 @@ pub async fn export(scoped: &ScopedStore<'_>) -> Result<Snapshot, StoreError> {
             routing_rule,
             upstream_token_grant,
             brand,
+            locale_bundle,
         },
     })
 }
@@ -884,6 +923,11 @@ const BRAND_KEYS: [&str; 8] = [
     "tokens_dark",
     "slots",
 ];
+
+/// Every key a snapshot `locale_bundle` element may carry (issue #86, PR 2). No secret slot: a
+/// locale bundle holds no secret material. The published schema pins `additionalProperties:
+/// false`.
+const LOCALE_BUNDLE_KEYS: [&str; 3] = ["locale", "is_env_default", "entries"];
 
 /// Every key a snapshot `connector` element may carry, besides the secret REFERENCE
 /// slot (issue #75). The published schema pins `additionalProperties: false`.
@@ -1202,6 +1246,36 @@ fn validate_resource(
                 }
             }
         }
+        ResourceType::LocaleBundle => {
+            // A locale bundle is secret-free localization config (issue #86, PR 2): a BCP47
+            // tag and the entries map (numeric message id string to plain text) as a JSON
+            // object. The forbidden-secret-key scan above already blocks secret-shaped
+            // material; a bundle string is plain text, escaped on render, never markup.
+            reject_unknown_keys(object, &LOCALE_BUNDLE_KEYS, None, path, violations);
+            require_nonempty_string(object, "locale", path, violations);
+            // The default marker is a bool; a hand authored or future apply document that
+            // supplies a non bool here is a fault (export always emits a real bool, so a genuine
+            // round trip never trips this).
+            if let Some(value) = object.get("is_env_default") {
+                if !value.is_boolean() {
+                    violations.push(SnapshotViolation::new(
+                        format!("{path}/is_env_default"),
+                        "must be a boolean",
+                    ));
+                }
+            }
+            match object.get("entries") {
+                Some(serde_json::Value::Object(_)) => {}
+                Some(_) => violations.push(SnapshotViolation::new(
+                    format!("{path}/entries"),
+                    "must be a JSON object",
+                )),
+                None => violations.push(SnapshotViolation::new(
+                    format!("{path}/entries"),
+                    "missing required object field",
+                )),
+            }
+        }
         // Only the promotable set is ever passed here (the caller iterates
         // SNAPSHOT_RESOURCE_TYPES); a non-promotable type is a programmer error, not
         // a document fault, so it is reported at the element path.
@@ -1487,8 +1561,8 @@ mod tests {
         assert_eq!(
             text,
             "{\"resources\":{\"brand\":[],\"client\":[],\"connector\":[],\"dcr_policy\":[],\
-             \"org_connection\":[],\"resource_server\":[],\"routing_rule\":[],\
-             \"upstream_token_grant\":[],\"variable\":[]},\
+             \"locale_bundle\":[],\"org_connection\":[],\"resource_server\":[],\
+             \"routing_rule\":[],\"upstream_token_grant\":[],\"variable\":[]},\
              \"schema_version\":\"ironauth.config-snapshot/v1\"}"
         );
     }

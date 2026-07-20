@@ -3656,6 +3656,270 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/locales/{locale}": {
+      "get": {
+        "tags": [
+          "locales"
+        ],
+        "summary": "Get a per-environment locale bundle by tag.",
+        "operationId": "getLocale",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "locale",
+            "in": "path",
+            "description": "The BCP47 language tag (for example fr or fr-CA)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The locale bundle",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LocaleBundleView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (absent or in another scope)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "locales"
+        ],
+        "summary": "Set (create or overwrite) a per-environment locale bundle.",
+        "operationId": "setLocale",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "locale",
+            "in": "path",
+            "description": "The BCP47 language tag (for example fr or fr-CA)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetLocaleRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Set",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LocaleBundleView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Unregistered message id or undeclared placeholder",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found or malformed locale tag",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "locales"
+        ],
+        "summary": "Delete a per-environment locale bundle by tag.",
+        "operationId": "deleteLocale",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "locale",
+            "in": "path",
+            "description": "The BCP47 language tag (for example fr or fr-CA)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (absent or in another scope)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/migration-runs": {
       "get": {
         "tags": [
@@ -8540,6 +8804,35 @@
           }
         }
       },
+      "LocaleBundleView": {
+        "type": "object",
+        "description": "A per-environment locale bundle, as returned by the management API (issue #86, PR 2).",
+        "required": [
+          "locale",
+          "is_env_default",
+          "entries"
+        ],
+        "properties": {
+          "entries": {
+            "type": "object",
+            "description": "The bundle entries: a map of numeric message id (as a string) to the plain-text render.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "is_env_default": {
+            "type": "boolean",
+            "description": "Whether this is the environment's default locale."
+          },
+          "locale": {
+            "type": "string",
+            "description": "The BCP47 language tag (the per-environment natural key)."
+          }
+        }
+      },
       "ManagementKeyCreated": {
         "type": "object",
         "description": "The result of minting a management API key.\n\nOn the genuine first creation (HTTP 201) `secret` carries the full bearer\ntoken, shown exactly ONCE, and `secret_already_issued` is false. The secret\nis never stored, so an idempotent replay of the same POST (HTTP 200) returns\nthis same view with `secret` OMITTED and `secret_already_issued` true. Store\nthe secret on first receipt; it is never retrievable again.\n\n`Debug` is hand-written to redact the secret so a live token can never reach\na log line through `{value:?}`.",
@@ -9563,6 +9856,29 @@
           }
         }
       },
+      "SetLocaleRequest": {
+        "type": "object",
+        "description": "The body to set (create or overwrite) a per-environment locale bundle (issue #86, PR 2).\n\nThe entries map keys on the STABLE NUMERIC message id (as a string) and values are the\nPLAIN TEXT render. On write, every key must be a REGISTERED message id and every\n`{placeholder}` in a value must be one the id declares, so a translator cannot invent an\ninterpolation that leaks unintended context or reword a string to reference a variable the\nid does not carry; a violation is a loud 400 and nothing is stored. A bundle string is\nplain text, escaped on render exactly like the compiled default, never markup.",
+        "required": [
+          "entries"
+        ],
+        "properties": {
+          "entries": {
+            "type": "object",
+            "description": "The bundle entries: a map of numeric message id (as a string) to the plain-text render.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "is_env_default": {
+            "type": "boolean",
+            "description": "Whether this is the environment's DEFAULT locale (resolved when an end user requests no\n`ui_locales` the environment can render). At most one default per environment; setting a\nnew default demotes the previous one. Defaults to false."
+          }
+        }
+      },
       "SetUserStateRequest": {
         "type": "object",
         "description": "The body to transition a user's lifecycle state (issue #52).",
@@ -10145,6 +10461,10 @@
     {
       "name": "connectors",
       "description": "Declarative inbound-federation connectors: strict-validated OIDC-shaped upstream definitions (CRUD) and the machine-readable capability matrix"
+    },
+    {
+      "name": "locales",
+      "description": "Per-environment localization bundles: set, get, and delete a bundle of numeric message id to plain-text render, strict-validated against the message registry"
     },
     {
       "name": "sessions",

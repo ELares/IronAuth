@@ -113,6 +113,15 @@ name = "brands"
 path = "tests/brands.rs"
 required-features = ["testing"]
 
+# Per-environment locale bundles (issue #86, PR 2): the control-plane set / data-plane read
+# repo, the one-env-default-per-scope invariant, the installed-locales projection, the
+# promotable snapshot round-trip (export both-sides, byte-identical), delete, and cross-tenant
+# isolation, against a real database.
+[[test]]
+name = "locale_bundles"
+path = "tests/locale_bundles.rs"
+required-features = ["testing"]
+
 # Enterprise inbound routing (issue #77): org connections and routing rules over a real
 # database -- selector lookup on the data plane, the per-scope unique-index routing-
 # confusion defence, and the secret-free snapshot export (the user selector is an opaque

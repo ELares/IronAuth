@@ -494,8 +494,8 @@ async fn production_chain_is_only_the_sixty_eight_real_migrations_and_ships_no_d
     );
     assert_eq!(
         report.already_applied(),
-        68,
-        "the production chain is exactly sixty-eight migrations (isolation, audit log, management \
+        69,
+        "the production chain is exactly sixty-nine migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -512,17 +512,18 @@ async fn production_chain_is_only_the_sixty_eight_real_migrations_and_ships_no_d
          risk engine, account recovery, federation connectors, registration abuse defenses, \
          federation login state, enterprise inbound routing, upstream token vault, \
          guarded account links, account linking wiring, FedCM assertion nonces, third-party \
-         risk signals, signup fraud review, advanced recovery modes, headless flows, branding)"
+         risk signals, signup fraud review, advanced recovery modes, headless flows, branding, \
+         locale bundles)"
     );
 
-    // The ledger holds exactly versions 1 through 68.
+    // The ledger holds exactly versions 1 through 69.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
             46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67,
-            68
+            68, 69
         ]
     );
     let phase_of = |version: i64| async move {
@@ -1302,6 +1303,48 @@ async fn production_chain_is_only_the_sixty_eight_real_migrations_and_ships_no_d
     assert!(
         !role_has_table_privilege(pool, "ironauth_app", "brands", "INSERT").await,
         "the data-plane role must NOT hold INSERT on brands (the control plane owns writes)"
+    );
+
+    // The locale-bundles migration (issue #86, PR 2) is an EXPAND: one new tenant-scoped table
+    // (locale_bundles), no rewrite of existing state.
+    assert_eq!(phase_of(69).await, "expand");
+
+    // The locale_bundles store (issue #86) is a NEW tenant-scoped table, so it must ENABLE and
+    // FORCE row-level security, carry the (tenant, environment) isolation policy, and pin the
+    // nonempty-scope CHECK, exactly like every other scoped table.
+    assert!(
+        rls_enabled_and_forced(pool, "locale_bundles").await,
+        "locale_bundles must ENABLE and FORCE row-level security"
+    );
+    assert!(
+        policy_exists(pool, "locale_bundles", "locale_bundles_tenant_isolation").await,
+        "locale_bundles must carry the (tenant, environment) isolation policy"
+    );
+    assert!(
+        check_constraint_exists(pool, "locale_bundles", "locale_bundles_scope_nonempty").await,
+        "locale_bundles must carry the nonempty-scope CHECK"
+    );
+    // At most one ENV DEFAULT locale per scope: the partial unique index is the structural
+    // single-default invariant.
+    assert!(
+        partial_unique_index_exists(pool, "locale_bundles", "locale_bundles_default_idx").await,
+        "locale_bundles must carry the one-default-per-scope partial unique index"
+    );
+    // The bundle entries are jsonb, never a raw HTML/markup text column.
+    assert_eq!(
+        column_data_type(pool, "locale_bundles", "entries").await,
+        "jsonb",
+        "locale_bundles.entries must be jsonb (numeric-id to plain-text map, never markup)"
+    );
+    // The data plane READS the installed locales on the render / discovery path but never
+    // writes them: SELECT only, no INSERT/UPDATE/DELETE (the control plane owns the lifecycle).
+    assert!(
+        role_has_table_privilege(pool, "ironauth_app", "locale_bundles", "SELECT").await,
+        "the data-plane role must hold SELECT on locale_bundles (the render / discovery read)"
+    );
+    assert!(
+        !role_has_table_privilege(pool, "ironauth_app", "locale_bundles", "INSERT").await,
+        "the data-plane role must NOT hold INSERT on locale_bundles (control plane owns writes)"
     );
 
     // The demo object never reaches a production database.

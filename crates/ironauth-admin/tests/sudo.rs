@@ -51,6 +51,10 @@ fn dcr_policies_path(tenant: &str, environment: &str) -> String {
     format!("/v1/tenants/{tenant}/environments/{environment}/dcr/policies")
 }
 
+fn locale_path(tenant: &str, environment: &str, locale: &str) -> String {
+    format!("/v1/tenants/{tenant}/environments/{environment}/locales/{locale}")
+}
+
 async fn audit_actions(harness: &Harness, scope: Scope) -> Vec<String> {
     harness
         .control_store()
@@ -142,6 +146,47 @@ async fn sudo_lifecycle_elevate_act_expire_challenge_reelevate() {
         .await;
     assert_eq!(status, StatusCode::OK, "the re-elevated revoke succeeds");
     assert!(!harness.session_resolves(scope, &s2).await);
+}
+
+/// A locale bundle write rewrites the plain text of the auth pages (login, recovery, error
+/// copy), a social engineering surface, so it is sudo gated exactly like the other environment
+/// scoped management mutations (issue #86 PR 2): challenged without a fresh elevation, and it
+/// succeeds after one.
+#[tokio::test]
+async fn a_locale_write_is_sudo_gated() {
+    let (harness, _clock) = Harness::start_with_sudo(600).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k1").await;
+    let path = locale_path(&tenant, &env, "fr");
+    let body = format!(
+        "{{\"entries\":{{\"{}\":\"Se connecter\"}}}}",
+        ironauth_oidc::flow::message::LOGIN_TITLE.0
+    );
+
+    // Without a fresh elevation the write is challenged and nothing is stored.
+    let (status, _, challenge) = harness.put(&path, &body).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "the stale locale write is challenged: {challenge}"
+    );
+    assert!(
+        challenge.contains("insufficient_user_authentication"),
+        "the challenge body carries the RFC 9470 error: {challenge}"
+    );
+
+    // After elevation the same write succeeds.
+    let (status, _, elevated) = harness.post(&elevate_path(&tenant, &env), "e1", "{}").await;
+    assert_eq!(status, StatusCode::OK, "elevate: {elevated}");
+    let (status, _, stored) = harness.put(&path, &body).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the elevated locale write succeeds: {stored}"
+    );
+    assert!(
+        stored.contains("Se connecter"),
+        "the write persisted: {stored}"
+    );
 }
 
 /// The acceptance-critical adversarial case: a valid credential whose recorded elevation
