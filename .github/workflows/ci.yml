@@ -154,7 +154,7 @@ jobs:
       # install with --require-hashes, so this lane installs exactly the reviewed
       # bits or fails. Without this the deep matrix and plan-config checks would
       # silently take their degraded fallback path and enforce less than they say.
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: provision the conformance static-check python deps (hash pinned)
@@ -305,7 +305,7 @@ jobs:
       # Without this the runner's own dependencies would be absent and the lane
       # could never drive a plan; run-conformance.sh would then (correctly) go RED
       # rather than pass vacuously, which is why provisioning it here matters.
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         if: ${{ steps.status.outputs.enabled == 'true' }}
         with:
           python-version: "3.12"
