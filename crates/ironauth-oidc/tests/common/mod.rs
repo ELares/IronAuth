@@ -897,6 +897,29 @@ impl Harness {
         self.state = state;
     }
 
+    /// Arm the hosted-page cutover (issue #85) for the harness: BOTH the flow engine and the
+    /// hosted-pages toggle, so the `/authorize` login and registration interaction redirects
+    /// retarget onto the scope-routed flow browser page. Rebuilds the protocol router and
+    /// preserves any previously installed hashing pool.
+    pub fn enable_hosted_pages_cutover(&mut self) {
+        let state = self
+            .state
+            .clone()
+            .with_flows_enabled(true)
+            .with_hosted_pages_enabled(true);
+        self.router = oidc_router(state.clone());
+        self.state = state;
+    }
+
+    /// Arm ONLY the hosted-pages toggle (issue #85) WITHOUT the flow engine, to pin that the
+    /// cutover is INERT without `flows.enabled` (the pages render through the flow engine): the
+    /// `/authorize` interaction redirects keep targeting the bootstrap pages. Rebuilds the router.
+    pub fn arm_hosted_pages_without_flows(&mut self) {
+        let state = self.state.clone().with_hosted_pages_enabled(true);
+        self.router = oidc_router(state.clone());
+        self.state = state;
+    }
+
     /// Arm the experimental IdP-side FedCM surface (issue #83) for the harness scope and
     /// rebuild the protocol router. Builds a fresh state over the SAME master-key-wired
     /// store, env, and registry, with the harness scope designated as the single FedCM

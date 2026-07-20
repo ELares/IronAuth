@@ -1372,6 +1372,32 @@ enum StepUpOutcome {
     Fail(AuthzErrorCode, &'static str),
 }
 
+/// The login interaction redirect (issue #85, the cutover seam). When the hosted-pages cutover is
+/// active it retargets to the scope-routed flow browser LOGIN page; otherwise it is the bootstrap
+/// `/login` redirect, byte-identical to before the cutover. The `return_to` is the SAME validated
+/// local `/authorize` resume in both arms (only the landing PATH changes), and the flow GET
+/// handler re-validates it through `parse_resume`, so no open redirect is introduced.
+fn login_interaction(state: &OidcState, scope: Scope, return_to: &str) -> Response {
+    if state.hosted_pages_cutover() {
+        interaction::login_flow_redirect(scope, return_to)
+    } else {
+        interaction::login_redirect(return_to)
+    }
+}
+
+/// The registration interaction redirect (issue #85, the cutover seam). When the hosted-pages
+/// cutover is active it retargets to the scope-routed flow browser REGISTRATION page; otherwise it
+/// is the bootstrap `/register` redirect, byte-identical to before the cutover. The `return_to`
+/// stays `parse_resume`-validated (only the landing path changes), so no open redirect is
+/// introduced.
+fn register_interaction(state: &OidcState, scope: Scope, return_to: &str) -> Response {
+    if state.hosted_pages_cutover() {
+        interaction::register_flow_redirect(scope, return_to)
+    } else {
+        interaction::register_redirect(return_to)
+    }
+}
+
 /// Evaluate step-up authentication for a validated, authenticated request (RFC
 /// 9470, issue #72).
 ///
@@ -1593,25 +1619,37 @@ async fn evaluate_step_up(
 
     match remediation {
         // A full re-login: consume the request's re-auth forcing tokens so the
-        // resumed request does not loop, exactly like the max_age gate.
-        step_up::Remediation::FullReauth => StepUpOutcome::Interaction(
-            interaction::login_redirect(&login_resume_url(params, hints, prompt, pushed)),
-        ),
+        // resumed request does not loop, exactly like the max_age gate. Under the hosted-pages
+        // cutover (issue #85) this retargets to the flow browser LOGIN page, which drives the
+        // full first-factor (and any in-login MFA) through the flow engine.
+        step_up::Remediation::FullReauth => StepUpOutcome::Interaction(login_interaction(
+            state,
+            scope,
+            &login_resume_url(params, hints, prompt, pushed),
+        )),
         // A phishing-resistant floor (phr/phrh), or an mfa floor the subject can only
         // reach with a passkey: run the passkey ceremony SPECIFICALLY, never the generic
         // login (a password re-login yields pwd and would loop). Completing the passkey
         // ceremony yields phr, which satisfies the floor, so the resumed request proceeds
-        // and the flow TERMINATES.
+        // and the flow TERMINATES. This is NOT retargeted by the issue #85 cutover: there is
+        // no browser-creatable passkey-only flow journey, and a generic flow login would show
+        // a password form that yields pwd (looping the phr floor), so it stays on the bootstrap
+        // passkey-only surface (which remains mounted as the FORK-D fallback).
         step_up::Remediation::PasskeyReauth => StepUpOutcome::Interaction(
             interaction::passkey_reauth_redirect(&login_resume_url(params, hints, prompt, pushed)),
         ),
         // A second-factor challenge against the LIVE session: resume the request
-        // verbatim (the acr is elevated by the challenge, so it does not loop).
+        // verbatim (the acr is elevated by the challenge, so it does not loop). This is NOT
+        // retargeted by the issue #85 cutover: the flow `mfa` journey is an INTERNAL login-flow
+        // state, never a browser creation entry (see `creation_journey`), so a standalone
+        // second-factor step-up against an existing session has no flow browser page to land on.
+        // It stays on the bootstrap `/login/mfa` surface (the FORK-D fallback).
         step_up::Remediation::SecondFactor => StepUpOutcome::Interaction(
             interaction::mfa_challenge_redirect(&preserve_resume_url(params, hints, pushed), false),
         ),
         // No qualifying factor, but enrollment is allowed: the challenge page
-        // surfaces the enrollment prompt.
+        // surfaces the enrollment prompt. Not retargeted by the issue #85 cutover for the same
+        // reason as the second-factor challenge above (no standalone flow MFA browser page).
         step_up::Remediation::Enroll => StepUpOutcome::Interaction(
             interaction::mfa_challenge_redirect(&preserve_resume_url(params, hints, pushed), true),
         ),
@@ -1697,9 +1735,13 @@ async fn resolve_gate(
         // (login/select_account/max_age) so the fresh login does not re-force and
         // loop.
         let redirect = if prompt.contains(PromptValue::Create) {
-            interaction::register_redirect(&preserve_resume_url(params, hints, pushed))
+            register_interaction(state, scope, &preserve_resume_url(params, hints, pushed))
         } else {
-            interaction::login_redirect(&login_resume_url(params, hints, prompt, pushed))
+            login_interaction(
+                state,
+                scope,
+                &login_resume_url(params, hints, prompt, pushed),
+            )
         };
         return Ok(Gate::Interaction(redirect));
     };
@@ -1721,7 +1763,9 @@ async fn resolve_gate(
                 "re-authentication is required but prompt=none forbids interaction",
             ));
         }
-        return Ok(Gate::Interaction(interaction::login_redirect(
+        return Ok(Gate::Interaction(login_interaction(
+            state,
+            scope,
             &login_resume_url(params, hints, prompt, pushed),
         )));
     }
