@@ -43,7 +43,7 @@ jobs:
           - crate: ironauth-oidc
             target: branding_sanitize
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # cargo-fuzz needs a nightly toolchain for the sanitizer build. The
       # repository's rust-toolchain.toml pins a stable version, so the fuzz run
       # sets RUSTUP_TOOLCHAIN to override the file (the same technique the msrv
