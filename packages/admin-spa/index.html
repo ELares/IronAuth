@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>IronAuth admin console</title>
+
+    <!--
+      The deployment config surface. An embedded deploy leaves these empty (the
+      app calls its own origin); a standalone deploy points ironauth-issuer at
+      the IronAuth public plane and ironauth-management-base at the management
+      proxy origin. There are NO secrets here: the browser holds a bearer token
+      it obtains through the OIDC login it performs (that lands in PR2), never a
+      client secret.
+    -->
+    <meta name="ironauth-issuer" content="" />
+    <meta name="ironauth-management-base" content="" />
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

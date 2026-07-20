@@ -22,6 +22,10 @@ ironauth-admin.workspace = true
 # oidc.enabled is set; the store provides the data-plane connection. rustls/ring
 # only, so the musl static lane holds.
 ironauth-oidc.workspace = true
+# The admin console SPA (issue #90) is embedded and mounted on the PUBLIC plane
+# under /admin when admin_spa.enabled is set. It embeds its assets with
+# rust-embed and owns no store connection, so the musl static lane holds.
+ironauth-admin-ui.workspace = true
 ironauth-jose.workspace = true
 # The tenant/environment quota engine (issue #50): the boot path builds one
 # enforcer from the [quota] config and hands it to the OIDC data plane. Pure,

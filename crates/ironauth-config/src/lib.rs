@@ -89,6 +89,14 @@ pub struct Config {
     /// render app) is a later, deliberate change; this toggle default-off ships the seam.
     pub hosted_pages: HostedPagesConfig,
 
+    /// Admin console SPA settings (issue #90): the in-process serving of the
+    /// Preact admin console on the public plane under `/admin`. Off by default:
+    /// PR1 ships the serving skeleton (a static shell over the public management
+    /// API, no auth yet), so a default deployment mounts nothing and every
+    /// `/admin` path is a uniform 404. A later change flips the default on once
+    /// the console is functional.
+    pub admin_spa: AdminSpaConfig,
+
     /// Flexible-identifier settings (issue #54): the per-environment uniqueness
     /// policy for typed login identifiers. Safe default: environment-wide uniqueness.
     pub identifiers: IdentifiersConfig,
@@ -163,6 +171,26 @@ pub struct HostedPagesConfig {
     /// Whether the hosted flow render app is the live browser interaction surface. Off by
     /// default: the bootstrap login, consent, and register pages stay the live UI until an
     /// operator opts in. Enabling this is independent of `flows.enabled`.
+    pub enabled: bool,
+}
+
+/// Admin console SPA settings (issue #90).
+///
+/// The admin console is a Preact single page app served in process on the public
+/// plane under `/admin`, embedded in the binary and speaking the public
+/// management API through one generated typed client. This gate mirrors
+/// `flows.enabled` and `hosted_pages.enabled`: a plain operator toggle, off by
+/// default, that mounts nothing on the wire until it is turned on (every
+/// `/admin` path answers a uniform 404 while off, so a deployment that does not
+/// use the console discloses nothing). Off in PR1 because the console is a
+/// static shell with no auth yet; a later change flips the default on once it is
+/// functional.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct AdminSpaConfig {
+    /// Whether to serve the in-process admin console. Off by default so the
+    /// default boot mounts nothing under `/admin` and every such path is a
+    /// uniform 404. When on, the embedded console is served on the public plane.
     pub enabled: bool,
 }
 

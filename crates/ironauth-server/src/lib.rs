@@ -117,14 +117,22 @@ impl Server {
     /// Mount an additional router on the PUBLIC data plane.
     ///
     /// The public-facing protocol surfaces (the OIDC provider, `ironauth-oidc`,
-    /// issue #12) are built as self-contained `Router`s and mounted here, so the
-    /// server crate stays decoupled from them (it accepts any router, not a
-    /// specific type). The routes are merged into the PUBLIC plane only, never the
-    /// management plane, and inherit the plane's observability and panic-catching
-    /// layers. The caller owns the router's state, auth, and middleware.
+    /// issue #12; the admin console SPA, `ironauth-admin-ui`, issue #90) are built
+    /// as self-contained `Router`s and mounted here, so the server crate stays
+    /// decoupled from them (it accepts any router, not a specific type). The
+    /// routes are merged into the PUBLIC plane only, never the management plane,
+    /// and inherit the plane's observability and panic-catching layers. The caller
+    /// owns the router's state, auth, and middleware.
+    ///
+    /// Calling this more than once MERGES the routers (the OIDC provider and the
+    /// admin console each mount independently), rather than the later call
+    /// replacing the earlier one.
     #[must_use]
     pub fn mount_public(mut self, router: Router) -> Self {
-        self.public_extension = Some(router);
+        self.public_extension = Some(match self.public_extension.take() {
+            Some(existing) => existing.merge(router),
+            None => router,
+        });
         self
     }
 

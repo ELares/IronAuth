@@ -193,6 +193,12 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // the flow engine is surfaced as a load-time warning (see the config `collect_warnings`).
         let hosted_pages_enabled = config.hosted_pages.enabled;
 
+        // The admin console SPA (issue #90): a plain top-level operator toggle, off by
+        // default, resolved here before `config` is moved. When on, the embedded console is
+        // mounted on the PUBLIC plane under /admin; while off nothing is mounted there and
+        // every /admin path is a uniform 404.
+        let admin_spa_enabled = config.admin_spa.enabled;
+
         // When advanced-recovery is armed, an IDV callback's signature is verified against each
         // provider's REGISTERED JWKS through the JOSE core. The config layer can only prove the
         // JWKS is NON-EMPTY (it carries no jose dep); parse it HERE, where jose IS available, so
@@ -315,6 +321,17 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             }
         } else {
             tracing::info!("OIDC provider not mounted: oidc.enabled is false");
+        }
+        // Mount the admin console SPA on the PUBLIC plane under /admin when enabled
+        // (issue #90). mount_public MERGES with the OIDC router above, so both mount
+        // independently; while off nothing is mounted and every /admin path is a
+        // uniform 404. PR1 serves a static shell (no auth yet); PR2 wires the login
+        // and the same origin management proxy.
+        if admin_spa_enabled {
+            server = server.mount_public(ironauth_admin_ui::router());
+            tracing::info!("admin console mounted on the public plane under /admin");
+        } else {
+            tracing::info!("admin console not mounted: admin_spa.enabled is false");
         }
         // The OIDC Back-Channel Logout delivery worker (issue #34), spawned only when the
         // OIDC provider is mounted AND its posture switch is on. Off by default (the

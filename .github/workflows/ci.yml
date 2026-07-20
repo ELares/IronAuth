@@ -189,6 +189,17 @@ jobs:
         # call or names a server path or external URL. It is a static check (no
         # Node needed), so it lives in this python lane.
         run: scripts/route-audit.sh
+      - name: admin spa route audit (console calls only documented management endpoints)
+        # The admin console SPA (packages/admin-spa, issue #90) is a pure client
+        # of the PUBLIC management API. This audit is the structural guarantee
+        # that every network call it makes funnels through the one generated
+        # typed client and targets a path documented in
+        # docs/openapi/management.json (plus the allowlisted OIDC public
+        # endpoints the PR2 login module needs). It is a static check (no Node
+        # needed), so it lives in this python lane alongside the reference-app
+        # route audit. The Node driven codegen freshness and build for this app
+        # run in the admin-spa job below.
+        run: scripts/admin-spa-route-audit.sh
       - name: conformance harness static checks (results gate, matrix, digest pins, plan config, downgrade confinement)
         # THIS is the conformance enforcement that is real today. It is always-on,
         # runner-independent, gated by NO repository variable, and required on
@@ -289,6 +300,41 @@ jobs:
         working-directory: packages/reference-app
         # `tsc` typechecks and emits; noEmitOnError is on by default, so a type
         # error fails the build.
+        run: npm run build
+
+  # The admin console SPA (packages/admin-spa, issue #90): the repo's first npm
+  # prod dependency tree. This job installs from the committed lockfile with
+  # `npm ci`, checks the generated management client is fresh against
+  # docs/openapi/management.json, typechecks under the strict tsconfig, and runs
+  # the Vite build. The route audit for this app is a static python check and
+  # runs in the `invariants` job above. Like the reference app this is a SEPARATE
+  # deployable, built here and NEVER part of the Rust release pipeline (the
+  # in-process serving crate ironauth-admin-ui embeds a committed placeholder so
+  # the Rust build needs no Node).
+  admin-spa:
+    name: admin spa (codegen freshness, typecheck, vite build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: install (locked, from package-lock.json)
+        working-directory: packages/admin-spa
+        run: npm ci --no-audit --no-fund
+      - name: management client codegen freshness (generated vs committed)
+        # Regenerates management.gen.ts from docs/openapi/management.json and
+        # fails if the committed client drifts, so the console and the served
+        # management contract cannot diverge.
+        run: scripts/admin-spa-bindings.sh
+      - name: typecheck (strict)
+        working-directory: packages/admin-spa
+        run: npm run typecheck
+      - name: build (vite, content hashed external assets)
+        working-directory: packages/admin-spa
         run: npm run build
 
   # The LIVE OIDF suite drive. Read the name: this job is NOT a merge gate and
