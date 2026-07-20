@@ -994,6 +994,14 @@ async fn complete_primary_or_step_up(
 /// #84), exactly as the bootstrap `login_post`: relax THIS attempt's failure counters (so a
 /// user who fumbled before the correct password is not throttled for the rest of the window),
 /// then persist the audited risk decision (and, on a new device, notify). All best effort.
+///
+/// When the primary factor genuinely succeeded on an imported FOREIGN hash (issue #298 / #55),
+/// this ALSO lands the verify-then-rehash lazy migration through the SAME
+/// [`crate::login::rehash_foreign_credential`] primitive the bootstrap `login_post` uses,
+/// upgrading the credential to native Argon2id and retiring the foreign hash so the NEXT login
+/// is an ordinary native verify. Best effort (the login has already succeeded): a failure just
+/// leaves the foreign hash to upgrade on the next foreign login. This runs on the genuine
+/// primary success (before any in flow second factor), matching where `login_post` upgrades.
 async fn login_follow_through(
     state: &OidcState,
     scope: Scope,
@@ -1001,6 +1009,9 @@ async fn login_follow_through(
     headers: &axum::http::HeaderMap,
 ) {
     state.reset_after_success(&success.ctx).await;
+    if let Some(password) = &success.foreign_rehash {
+        crate::login::rehash_foreign_credential(state, scope, &success.user_id, password).await;
+    }
     let user_agent = login::user_agent_of(headers);
     let risk_ctx = crate::risk::RiskContext {
         ip: success.ctx.ip.as_deref(),

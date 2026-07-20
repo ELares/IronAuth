@@ -28,12 +28,15 @@
 //! to a wrong password), so it is never an enumeration oracle -- stronger than `/login`,
 //! which surfaces a distinguishable 429 onset.
 //!
-//! Deferred (issue #55): an account imported with only a FOREIGN password hash (not yet
-//! migrated) cannot log in through this flow yet -- [`spend_verify`] has no foreign verify
-//! arm and routes the sentinel native hash through the dummy spend, so such an account
-//! reads as a wrong password here. This is a journey completeness gap, not a security
-//! weakness (the bootstrap `/login` still migrates them, and the flow is flag off); the
-//! foreign verify arm lands with the journey follow up.
+//! The foreign hash arm (issue #298, closing the #55 gap): an account imported with only a
+//! FOREIGN password hash (not yet migrated) logs in through this flow too. [`spend_verify`]
+//! reuses the bootstrap login's EXACT primitives, never re-deriving them: the foreign verify
+//! goes through [`crate::login::verify_foreign`], and a genuine foreign success triggers the
+//! SAME verify-then-rehash lazy migration through [`crate::login::rehash_foreign_credential`]
+//! (driven off the post success follow through, exactly as `login_post` upgrades the
+//! credential on a first foreign login), so the NEXT login is an ordinary native verify. The
+//! response stays the SAME uniform anti enumeration render on a failure, so a foreign account
+//! is indistinguishable (body/status) from a native one and from an unknown identifier.
 
 use ironauth_store::{FlowRecord, Scope, UserId, UserRecord};
 
@@ -88,6 +91,13 @@ pub(super) struct LoginSuccess {
     pub risk_decision: RiskDecision,
     /// The submitted identifier, the recipient for a new device notice.
     pub identifier: String,
+    /// The plaintext to rehash to a native Argon2id verifier, present ONLY when this login
+    /// genuinely succeeded on an imported FOREIGN hash (issue #298 / #55). The post success
+    /// follow through hands it to [`crate::login::rehash_foreign_credential`] to complete the
+    /// lazy migration, so the next login is an ordinary native verify. This transient in
+    /// memory value is never persisted here and never logged (the struct has no `Debug`), and
+    /// it is [`None`] for an ordinary native login (no rehash).
+    pub foreign_rehash: Option<String>,
 }
 
 /// Build the identifier plus password nodes in the deterministic contract order (issue
@@ -214,30 +224,73 @@ pub(super) fn uniform_incorrect_render(transport: Transport, flow_id: &str) -> V
     uniform_incorrect_nodes(transport, flow_id)
 }
 
-/// Spend the ONE Argon2 op for a resolved account (issue #84), returning whether the
-/// native hash verified. When the account carries a usable native hash this is the real
-/// verify; otherwise it routes through the SAME dummy [`verify_absent`] spend the unknown
-/// branch uses, so a passkey only / not yet migrated account stays timing uniform with an
-/// absent account (issue #66 LOW-2) and never verifies. The flow has no foreign hash arm
-/// (issue #55, deferred), so a foreign only account reads as a wrong password here.
+/// The outcome of the one convergent credential verify (issue #84 / #298): whether the
+/// native Argon2id hash verified, and -- only when it did not -- whether the imported FOREIGN
+/// hash (issue #55) verified. Exactly one real hash verify is charged per resolved account,
+/// so an attempt is never a fast-fail timing oracle.
+struct VerifyOutcome {
+    /// The native Argon2id hash verified (a usable native hash and the correct password).
+    native_ok: bool,
+    /// The imported foreign hash verified (the account carries a not yet migrated foreign
+    /// hash and the correct password). Only ever `true` when `native_ok` is `false`.
+    foreign_ok: bool,
+}
+
+impl VerifyOutcome {
+    /// Whether the presented credential authenticated on either the native or the foreign
+    /// verifier.
+    fn verified(&self) -> bool {
+        self.native_ok || self.foreign_ok
+    }
+}
+
+/// Spend the ONE credential verify for a resolved account (issue #84 / #298), reproducing the
+/// bootstrap `login_post` verify EXACTLY (through the SAME primitives, never re-derived):
+///
+/// - a usable native hash is the real [`OidcState::verify_password`] (one Argon2 op);
+/// - a passkey only / credential less account (the sentinel native hash, no foreign hash)
+///   routes through the SAME dummy [`OidcState::verify_absent`] spend the unknown branch uses,
+///   so it stays timing uniform with an absent account (issue #66 LOW-2) and never verifies;
+/// - a not yet migrated FOREIGN account (the sentinel native hash WITH a foreign hash) skips
+///   the dummy Argon2 (the foreign verify below is its one real work spend) and verifies
+///   against the imported hash through [`crate::login::verify_foreign`], the SAME primitive
+///   `login_post` calls. This matches how the bootstrap login spends the foreign vs the native
+///   verify, so the flow adds no new timing distinguishability over `/login`.
+///
+/// The foreign verify is only consulted when the native hash did NOT verify, exactly as
+/// `login_post` orders it, so a native account never pays the foreign parse.
 async fn spend_verify(
     state: &OidcState,
     scope: &Scope,
     password: &str,
     user: &UserRecord,
-) -> Result<bool, FlowError> {
-    if user.has_usable_password_hash() {
+) -> Result<VerifyOutcome, FlowError> {
+    let native_ok = if user.has_usable_password_hash() {
         state
             .verify_password(scope, password, &user.password_hash)
             .await
-            .map_err(|_| FlowError::Store)
-    } else {
+            .map_err(|_| FlowError::Store)?
+    } else if user.foreign_password_hash.is_none() {
+        // Passkey only / credential less: the dummy Argon2 spend keeps timing uniform with an
+        // absent account; the sentinel never verifies.
         state
             .verify_absent(scope, password)
             .await
             .map_err(|_| FlowError::Store)?;
-        Ok(false)
-    }
+        false
+    } else {
+        // Foreign only, not yet migrated: the foreign verify below is the real work spend, so
+        // no dummy Argon2 is charged here (matching `login_post`'s `spend_native_verify`).
+        false
+    };
+    // Only reach for the foreign hash when the native hash did not verify, exactly as
+    // `login_post` does. `verify_foreign` is cheap and returns `false` for an account with no
+    // foreign hash, so a native or passkey only account never pays a foreign parse.
+    let foreign_ok = !native_ok && crate::login::verify_foreign(user, password);
+    Ok(VerifyOutcome {
+        native_ok,
+        foreign_ok,
+    })
 }
 
 /// The observed User-Agent for a risk evaluation (issue #79), or `"unknown"` when absent,
@@ -374,9 +427,13 @@ pub(super) async fn advance_login(
             })
         }
         Some(user) => {
-            // 3. The convergent verify spend.
-            let native_ok = spend_verify(state, &scope, password, &user).await?;
-            if !native_ok {
+            // 3. The convergent verify spend: the native Argon2id verify OR, for a not yet
+            //    migrated import, the foreign verify (issue #298), through the SAME primitives
+            //    `login_post` uses. A failure on BOTH is the SAME uniform render a native
+            //    wrong password produces (flow OPEN, no consume), so a foreign account is never
+            //    an existence or foreign vs native oracle.
+            let outcome = spend_verify(state, &scope, password, &user).await?;
+            if !outcome.verified() {
                 return Ok(LoginStep::Render {
                     nodes: uniform_incorrect_nodes(transport, flow_id),
                 });
@@ -405,6 +462,10 @@ pub(super) async fn advance_login(
                 ctx,
                 risk_decision,
                 identifier: identifier.to_owned(),
+                // A genuine FOREIGN success carries the plaintext so the post success follow
+                // through rehashes it to native (issue #298 / #55); a native success carries
+                // none (no migration due).
+                foreign_rehash: outcome.foreign_ok.then(|| password.to_owned()),
             })))
         }
         None => {

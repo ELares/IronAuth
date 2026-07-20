@@ -834,7 +834,11 @@ async fn spend_native_verify(
 /// one. Returns `false` when the user carries no foreign hash or the stored value
 /// cannot be parsed (fail closed). Dispatches on the hash scheme (bcrypt, scrypt,
 /// PBKDF2, Argon2, Firebase modified scrypt).
-fn verify_foreign(user: &UserRecord, password: &str) -> bool {
+///
+/// Exposed to the crate (issue #298) so the flow login (`crate::flow::login`) reuses
+/// this EXACT primitive for its foreign-hash arm rather than re-deriving the foreign
+/// verify, keeping the two login surfaces byte-for-byte identical on the foreign path.
+pub(crate) fn verify_foreign(user: &UserRecord, password: &str) -> bool {
     let Some(stored) = user.foreign_password_hash.as_deref() else {
         return false;
     };
@@ -851,7 +855,11 @@ fn verify_foreign(user: &UserRecord, password: &str) -> bool {
 /// persistence fault) is swallowed so the sign-in still succeeds; the foreign hash
 /// simply remains to be upgraded on the next login. The plaintext never leaves this
 /// function and the hash is never logged.
-async fn rehash_foreign_credential(
+///
+/// Exposed to the crate (issue #298) so the flow login's foreign-hash arm triggers the
+/// SAME verify-then-rehash lazy migration the bootstrap `login_post` performs, reusing
+/// this exact migration primitive rather than re-deriving the rehash crypto.
+pub(crate) async fn rehash_foreign_credential(
     state: &OidcState,
     scope: Scope,
     subject: &UserId,
