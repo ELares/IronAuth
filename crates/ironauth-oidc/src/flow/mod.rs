@@ -29,6 +29,7 @@
 //! the bootstrap `/login`, `/consent`, `/register` pages are untouched (their cutover onto
 //! this engine is deferred to issue #85).
 
+pub mod golden;
 pub mod message;
 pub mod model;
 pub mod schema;
@@ -40,6 +41,7 @@ mod recovery;
 mod registration;
 mod transport;
 
+pub use golden::{GoldenFlow, golden_corpus, golden_flows};
 pub use schema::{flow_messages_snapshot, flow_object_schema};
 pub use transport::{
     FLOW_API_SUBMIT_PATH, FLOW_BROWSER_PATH, FLOW_CREATE_API_PATH, flow_api_create,
@@ -250,19 +252,28 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 /// The submission target for a transport (issue #84). The browser posts back to its scoped
 /// GET/POST path; the API posts to the scoped submit endpoint.
 fn submit_action(scope: Scope, transport: Transport, journey: Journey) -> String {
+    submit_action_for(scope.tenant(), scope.environment(), transport, journey)
+}
+
+/// The submission target for a transport, from the raw scope parts (issue #84). The ONE
+/// source of truth for the `ui.action` shape, so the live engine and the golden corpus
+/// ([`golden`]) build it identically.
+pub(super) fn submit_action_for(
+    tenant: impl std::fmt::Display,
+    environment: impl std::fmt::Display,
+    transport: Transport,
+    journey: Journey,
+) -> String {
     match transport {
-        Transport::Browser => format!(
-            "/t/{}/e/{}/flow/{}",
-            scope.tenant(),
-            scope.environment(),
-            journey.as_str()
-        ),
-        Transport::Api => format!(
-            "/t/{}/e/{}/flow/api/{}/submit",
-            scope.tenant(),
-            scope.environment(),
-            journey.as_str()
-        ),
+        Transport::Browser => {
+            format!("/t/{tenant}/e/{environment}/flow/{}", journey.as_str())
+        }
+        Transport::Api => {
+            format!(
+                "/t/{tenant}/e/{environment}/flow/api/{}/submit",
+                journey.as_str()
+            )
+        }
     }
 }
 
@@ -287,6 +298,102 @@ fn normalize_transient_payload(
                 return Err(FlowError::MalformedTransientPayload);
             }
             Ok(Some(serialized))
+        }
+    }
+}
+
+/// Validate a submission's transient payload (issue #84, §8): it must be well formed JSON
+/// within the size cap, else [`FlowError::MalformedTransientPayload`] (400, never a 500).
+/// Returns the payload to carry, or [`None`] when absent or JSON null. Shared by every ingest
+/// edge, so the cap is enforced on submit as it is on create.
+fn validate_submission_transient_payload(
+    payload: Option<&serde_json::Value>,
+) -> Result<Option<serde_json::Value>, FlowError> {
+    match payload {
+        None => Ok(None),
+        Some(value) if value.is_null() => Ok(None),
+        Some(value) => {
+            // Reuse the create path validator: it enforces "well formed JSON within the cap".
+            normalize_transient_payload(Some(value))?;
+            Ok(Some(value.clone()))
+        }
+    }
+}
+
+/// The decoded API submission envelope (issue #84): the flow id, the presented submit token,
+/// and the transport neutral [`Submission`]. Produced by [`parse_api_submission`].
+pub struct ParsedApiSubmission {
+    /// The flow id to advance (validated against the scope downstream).
+    pub id: String,
+    /// The per flow submit token the client presented (the API CSRF handle).
+    pub submit_token: String,
+    /// The transport neutral decoded submission (node values plus the transient payload).
+    pub submission: Submission,
+}
+
+/// The raw JSON shape of an API submit body (issue #84). One decode struct, shared by the live
+/// API submit handler ([`transport::flow_api_submit`]) and the submission parse fuzz target, so
+/// the fuzzer exercises the REAL decode path, never a divergent copy.
+#[derive(serde::Deserialize)]
+struct ApiSubmitEnvelope {
+    /// The flow id to advance.
+    id: String,
+    /// The per flow submit token (the API CSRF handle).
+    submit_token: String,
+    /// The submitted node values keyed by node name.
+    #[serde(default)]
+    nodes: BTreeMap<String, serde_json::Value>,
+    /// Arbitrary client context (never persisted on the identity).
+    #[serde(default)]
+    transient_payload: Option<serde_json::Value>,
+}
+
+/// Parse a raw JSON API submission body into the transport neutral pieces (issue #84, the
+/// fuzz target's subject): the node values decode plus the transient payload validation, with
+/// NO IO and NO state. Arbitrary bytes NEVER panic; a malformed envelope is a typed
+/// [`FlowError::InvalidSubmission`] and an oversized or malformed transient payload is a typed
+/// [`FlowError::MalformedTransientPayload`] (both 400), never a 500. This is the pure core the
+/// live API submit handler routes through, so the parser has exactly one implementation.
+///
+/// # Errors
+///
+/// [`FlowError::InvalidSubmission`] when the body is not a well formed submit envelope;
+/// [`FlowError::MalformedTransientPayload`] when the transient payload is not well formed JSON
+/// or exceeds the size cap.
+pub fn parse_api_submission(raw: &[u8]) -> Result<ParsedApiSubmission, FlowError> {
+    let envelope: ApiSubmitEnvelope =
+        serde_json::from_slice(raw).map_err(|_| FlowError::InvalidSubmission)?;
+    let transient_payload =
+        validate_submission_transient_payload(envelope.transient_payload.as_ref())?;
+    Ok(ParsedApiSubmission {
+        id: envelope.id,
+        submit_token: envelope.submit_token,
+        submission: Submission {
+            node_values: envelope.nodes,
+            transient_payload,
+        },
+    })
+}
+
+/// Parse a browser transport transient payload field (issue #84): the raw form field is a JSON
+/// STRING the client set, decoded to a value and validated within the size cap. Arbitrary
+/// input NEVER panics; a non JSON or oversized value is a typed
+/// [`FlowError::MalformedTransientPayload`] (400, never a 500). Shared by the browser submit
+/// handler and the submission parse fuzz target.
+///
+/// # Errors
+///
+/// [`FlowError::MalformedTransientPayload`] when the field is not well formed JSON or exceeds
+/// the size cap.
+pub fn parse_form_transient_payload(
+    raw: Option<&str>,
+) -> Result<Option<serde_json::Value>, FlowError> {
+    match raw {
+        None => Ok(None),
+        Some(raw) => {
+            let value = serde_json::from_str::<serde_json::Value>(raw)
+                .map_err(|_| FlowError::MalformedTransientPayload)?;
+            validate_submission_transient_payload(Some(&value))
         }
     }
 }

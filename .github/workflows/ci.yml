@@ -206,6 +206,14 @@ jobs:
         run: |
           scripts/flow-schema.sh
           git diff --exit-code docs/flow-schema.json docs/flow-messages.json
+      - name: flow golden corpus freshness (rendered flow shape, all journeys x both transports)
+        # The golden corpus LOCKS the rendered flow shape (node set, deterministic order,
+        # groups, message ids) for every journey/state on both transports. A breaking change
+        # to any journey's rendered flow trips this diff, so it cannot land silently; new
+        # journeys or node groups are additive (they add goldens without changing existing ones).
+        run: |
+          scripts/flow-golden.sh
+          git diff --exit-code docs/flow-golden.json
       - name: openapi freshness (served management spec vs committed artifact)
         run: scripts/openapi-check.sh
       - name: governance files present
