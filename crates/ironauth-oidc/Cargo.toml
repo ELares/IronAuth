@@ -802,6 +802,16 @@ name = "flow_login_hardening"
 path = "tests/flow_login_hardening.rs"
 required-features = ["testing"]
 
+# The flow login foreign-hash arm (issue #298): a #55 imported account (foreign password hash,
+# not yet migrated) logs in through the flow API and browser transport and is rehashed to
+# native on success, reusing the bootstrap login's exact verify_foreign + lazy-migration
+# primitives, with the anti-enumeration uniform holding for foreign accounts. Over a real
+# database (DATABASE_URL).
+[[test]]
+name = "flow_foreign_login"
+path = "tests/flow_foreign_login.rs"
+required-features = ["testing"]
+
 # The headless flow API PR2 (issue #84): the REGISTRATION and MFA (challenge + enrollment)
 # journeys. A native JSON client completes registration and login+MFA end to end; the
 # registration duplicate-address anti-enumeration is uniform on both transports (body / status

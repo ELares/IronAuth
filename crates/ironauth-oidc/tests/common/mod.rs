@@ -31,8 +31,9 @@ use ironauth_quota::QuotaEnforcer;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
     AssertionMappingId, ClientId, CorrelationId, ExternalIssuerId, InitialAccessTokenId,
-    NewAssertionSubjectMapping, NewExternalAssertionIssuer, NewInitialAccessToken,
+    NewAdminUser, NewAssertionSubjectMapping, NewExternalAssertionIssuer, NewInitialAccessToken,
     NewJwtAuthClient, NewSigningKey, Scope, SessionId, SigningKeyId, SigningKeyMaterialKind, Store,
+    UserState,
 };
 use tower::ServiceExt;
 
@@ -1375,6 +1376,57 @@ impl Harness {
             .register(&self.env, identifier, "!")
             .await
             .expect("register passwordless user")
+            .to_string()
+    }
+
+    /// Seed a user imported with ONLY a FOREIGN password hash (issue #55): the native
+    /// `password_hash` is left as the unusable sentinel and the imported verifier lives in the
+    /// foreign column, exactly as the streaming import engine leaves a not yet migrated
+    /// account. Such a user authenticates against the foreign hash on its next login and is
+    /// then rehashed to native Argon2id. `foreign_hash` is the canonical algorithm tagged
+    /// verifier string and `algo` its non-secret tag (for example `bcrypt`). Returns the
+    /// subject (the `usr_` id string).
+    pub async fn seed_foreign_user(
+        &self,
+        identifier: &str,
+        foreign_hash: &str,
+        algo: &str,
+    ) -> String {
+        let (actor, corr) = self.seeding_actor();
+        let created_at = i64::try_from(
+            self.env
+                .clock()
+                .now_utc()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .expect("after epoch")
+                .as_micros(),
+        )
+        .expect("fits i64");
+        self.store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .users()
+            .admin_create(
+                &self.env,
+                NewAdminUser {
+                    id: None,
+                    identifier,
+                    // No native hash: the account is on the sentinel until the first foreign
+                    // login rehashes onto it (a not yet migrated import).
+                    password_hash: None,
+                    claims_json: None,
+                    external_id: None,
+                    state: UserState::Active,
+                    foreign_password_hash: Some(foreign_hash),
+                    foreign_password_algo: Some(algo),
+                    traits_json: None,
+                    traits_schema_version: None,
+                },
+                created_at,
+                None,
+            )
+            .await
+            .expect("seed foreign user")
             .to_string()
     }
 
