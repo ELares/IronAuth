@@ -33,6 +33,54 @@ configured issuer URL. Hosted vs custom is a fork, not a rewrite.
   the documented public session endpoints. A fork cannot point it at a private
   or management endpoint without failing that gate.
 
+## Security headers the operator MUST serve (issue #89)
+
+The in-process IronAuth pages set their own strict anti-clickjacking and
+Content-Security-Policy headers on every response, and a header-level page-walk in
+the Rust test suite fails the build if any page regresses. This standalone fork is
+served by YOU (the operator) as static assets, so IronAuth cannot set its headers.
+Enforcing the same posture on your static host is a REQUIRED operator step; the
+server-side gate covers only the in-process mode.
+
+Configure your static host (or the reverse proxy in front of it) to send these
+headers on the HTML document response:
+
+- `X-Frame-Options: DENY` and a CSP `frame-ancestors 'none'`. The sign in surface
+  must never be framable (clickjacking and consent-phishing defense). These are
+  mandatory.
+- A strict Content-Security-Policy with no `unsafe-inline` and no wildcard source.
+  A good baseline that matches the in-process pages, adjusted for this app loading
+  its renderer as a same-origin ES module and calling the flow API on the issuer
+  origin:
+
+  ```
+  Content-Security-Policy:
+    default-src 'none';
+    base-uri 'none';
+    object-src 'none';
+    frame-ancestors 'none';
+    form-action 'none';
+    script-src 'self';
+    connect-src 'self' https://auth.example.com;
+    style-src 'self';
+    img-src 'self'
+  ```
+
+  Replace `https://auth.example.com` with your configured `ironauth-issuer`
+  origin (omit it, leaving `connect-src 'self'`, for a same-origin first party
+  deploy). This app submits every flow step over `fetch` (`connect-src`), never an
+  HTML form post, so `form-action 'none'` is correct.
+
+- Move the styling out of an inline `<style>` block so `style-src` needs no
+  `unsafe-inline`: serve the styles from a same-origin stylesheet under `style-src
+  'self'`, or attach a per-response nonce or hash. Keep the safe rendering rule in
+  `src/render.ts` (server strings via `textContent` or attribute values, never
+  `innerHTML`), so no server data can become markup.
+
+- `X-Content-Type-Options: nosniff`, `Referrer-Policy: same-origin`, and
+  `Cache-Control: no-store` round out the same hardening set the in-process pages
+  carry.
+
 ## How it binds the contract
 
 The app does not hand maintain the flow object shape. `src/contract/flow.gen.ts`
