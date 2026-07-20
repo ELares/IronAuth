@@ -99,6 +99,23 @@ pub fn escape_html(value: &str) -> String {
     out
 }
 
+// ===========================================================================
+// The server-rendered HTML response builders (issue #89).
+//
+// INVARIANT: every server-rendered HTML page MUST be produced by one of the
+// builders in this section (`secure_html`, `login_html`, `flow_html`,
+// `flow_login_html`, `device_verify_html`, `form_post_response`, plus the two
+// flag-gated M4 carve-out builders `check_session_iframe_response` and
+// `frontchannel_logout_response`). They are the ONE place the strict CSP,
+// `frame-ancestors 'none'`, and `X-Frame-Options: DENY` are attached, so the
+// hardening is uniform and code-owned. Any NEW HTML response builder MUST be
+// added here AND to the `csp_enforcement_page_walk_covers_every_auth_page_and_
+// only_the_two_carveouts` walk test below -- a page that hand-rolls its own
+// headers via `Response::builder()` would NOT auto-fail that walk, so the
+// "all pages funnel through these builders" convention is what keeps the
+// strict-CSP invariant from silently regressing.
+// ===========================================================================
+
 /// Build an HTML response at `status` with the full hardening header set. This is
 /// the ONE place the security headers are attached, so every bootstrap page (and
 /// the authorization error page) carries them identically.
@@ -1316,14 +1333,37 @@ pub fn frontchannel_logout_page(iframe_urls: &[String]) -> String {
     notice_document("Signing out", &body)
 }
 
+/// Whether `origin` is a syntactically clean web origin safe to place verbatim in a
+/// `frame-src` source list: an `https`/`http` scheme followed by a `host[:port]`
+/// authority built ONLY from host and port characters (ASCII alphanumerics, `.`, `-`,
+/// `:`, and the `[` `]` of an IPv6 literal). A registered `frontchannel_logout_uri`
+/// whose authority carried whitespace, a `;`, a quote, or any other CSP delimiter would
+/// otherwise smuggle extra sources or directives into the header once its origin is
+/// joined into the source list; such an origin is dropped (fail closed) rather than
+/// emitted. This is the last line before the CSP header, so it holds even if a malformed
+/// value ever reaches here past registration-time validation.
+fn is_clean_frame_src_origin(origin: &str) -> bool {
+    let Some(authority) = ["https://", "http://"]
+        .iter()
+        .find_map(|scheme| origin.strip_prefix(scheme))
+    else {
+        return false;
+    };
+    !authority.is_empty()
+        && authority
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'[' | b']'))
+}
+
 /// The `frame-src` CSP source list for the front-channel logout page: EXACTLY the
 /// participating RPs' registered `frontchannel_logout_uri` origins, de-duplicated in
-/// first-seen order. With no participants the source is `'none'`, so the page can frame
-/// nothing.
+/// first-seen order and with any malformed origin dropped (see
+/// [`is_clean_frame_src_origin`]). With no clean participant the source is `'none'`, so
+/// the page can frame nothing.
 fn frontchannel_frame_src(origins: &[String]) -> String {
     let mut seen: Vec<&str> = Vec::new();
     for origin in origins {
-        if !seen.contains(&origin.as_str()) {
+        if is_clean_frame_src_origin(origin) && !seen.contains(&origin.as_str()) {
             seen.push(origin.as_str());
         }
     }
@@ -1932,6 +1972,44 @@ mod tests {
         assert!(empty.contains("frame-src 'none'"), "{empty}");
     }
 
+    #[test]
+    fn frontchannel_frame_src_drops_an_authority_that_would_smuggle_a_directive() {
+        // Security hardening (issue #89): the frame-src is the last line before the CSP
+        // header. If a registered frontchannel_logout_uri ever reached here with a
+        // whitespace or `;` in its authority, its origin would carry an extra CSP source
+        // or directive verbatim into the header. Such an origin is dropped (fail closed),
+        // never joined into the source list.
+        let smuggled = vec![
+            "https://a.test frame-src *".to_owned(),
+            "https://b.test;script-src 'unsafe-inline'".to_owned(),
+            "https://c.test'".to_owned(),
+        ];
+        let csp = frontchannel_logout_csp(&smuggled);
+        assert!(
+            csp.ends_with("frame-src 'none'"),
+            "every malformed origin is dropped, leaving no framing source: {csp}"
+        );
+        assert!(!csp.contains("script-src"), "no smuggled directive: {csp}");
+        assert!(!csp.contains('*'), "no smuggled wildcard source: {csp}");
+        // No smuggled host origin leaks into the source list; only the code-owned
+        // `'none'` keywords remain (the CSP's own `default-src 'none'` etc.).
+        assert!(!csp.contains(".test"), "no smuggled host origin: {csp}");
+
+        // A clean origin still contributes its EXACT origin, and a malformed sibling is
+        // dropped without taking the good one down with it.
+        let mixed = vec![
+            "https://good.test:8443".to_owned(),
+            "https://bad.test frame-src *".to_owned(),
+        ];
+        assert_eq!(
+            frontchannel_frame_src(&mixed),
+            "https://good.test:8443",
+            "the clean origin survives; only the malformed one is dropped"
+        );
+        // An IPv6 literal authority is clean and kept intact.
+        assert!(is_clean_frame_src_origin("https://[::1]:443"));
+    }
+
     // =======================================================================
     // Issue #89: the CI enforcement page-walk + the reflected-parameter
     // injection corpus. These are the permanent, header-level merge gate: any
@@ -1997,16 +2075,24 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)] // an exhaustive page-walk over every builder reads clearest inline
     fn csp_enforcement_page_walk_covers_every_auth_page_and_only_the_two_carveouts() {
-        // Every server-rendered auth page funnels through ONE of the response builders
-        // exercised below: `secure_html` (login/register/consent/recover/mfa/notice/error/
-        // logout-confirmation/logged-out/magic/risk/device-step pages), `login_html` and
-        // `flow_login_html` (the passkey ceremony), `flow_html` (the headless-render pages),
-        // `device_verify_html` (device confirmation), and `form_post_response` (the code
-        // carrier). This walk snapshots each builder's CSP and framing headers and asserts
-        // the strict baseline, so a page that regresses the policy fails the build. A new
-        // page MUST reuse one of these builders (or add a builder to this walk), which keeps
-        // the gate exhaustive. The ONLY exemptions are the two flag-gated M4 carve-outs
-        // asserted at the end; nothing else is ever exempt.
+        // INVARIANT (issue #89): EVERY server-rendered HTML page MUST be produced by one
+        // of the response builders walked here: `secure_html` (login/register/consent/
+        // recover/mfa/notice/error/logout-confirmation/logged-out/magic/risk/device-step
+        // pages), `login_html` and `flow_login_html` (the passkey ceremony), `flow_html`
+        // (the headless-render pages), `device_verify_html` (device confirmation), and
+        // `form_post_response` (the code carrier) -- plus the two flag-gated M4 carve-out
+        // builders asserted at the end. This walk snapshots each builder's CSP and framing
+        // headers and asserts the strict baseline, so a page that regresses the policy fails
+        // the build.
+        //
+        // The guarantee is by CONVENTION, not by the compiler: a future page that
+        // hand-rolls its own headers via `Response::builder()` instead of reusing a walked
+        // builder would NOT auto-fail this walk. So the rule is load-bearing: any NEW
+        // server-rendered HTML response builder MUST be added to this walk (and route it
+        // through the strict headers), or the strict-CSP invariant can silently regress. A
+        // compile-enforced version is not practical in Rust; funneling every page through
+        // these builders, plus this walk, is the guarantee. The ONLY exemptions are the two
+        // flag-gated M4 carve-outs asserted at the end; nothing else is ever exempt.
         let hints = InteractionHints::default();
 
         // The blanket-framed pages: frame-ancestors 'none' + X-Frame-Options: DENY.

@@ -6878,9 +6878,21 @@ enabled = true
         let value = serde_json::to_value(&schema).expect("schema serializes");
         let mut names = Vec::new();
         collect_property_names(&value, &mut names);
+        // Sanity anchor: the walker must reach a top-level field AND a DEEPLY NESTED one
+        // that lives only inside a `$defs` object schema (`background_color` is a branding
+        // sub-field, issue #83). If a `$defs`-recursion regression stopped the walk from
+        // descending into referenced definitions, `bind` would still be found but the
+        // nested coverage would silently vanish; anchoring on both keeps this gate
+        // non-vacuous, so the forbidden-substring sweep below always spans nested fields.
         assert!(
             names.iter().any(|n| n == "bind"),
-            "the walker must reach real config fields (sanity check)"
+            "the walker must reach top-level config fields (sanity check)"
+        );
+        assert!(
+            names.iter().any(|n| n == "background_color"),
+            "the walker must descend through $defs into nested object schemas: the branding \
+             sub-field `background_color` is unreachable, so a $defs-recursion regression would \
+             hide nested fields from the forbidden-substring sweep (sanity check)"
         );
         for name in &names {
             let lower = name.to_ascii_lowercase();

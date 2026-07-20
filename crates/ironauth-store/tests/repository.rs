@@ -444,6 +444,34 @@ async fn frontchannel_logout_register_read_and_validate() {
         "a rejected registration leaves the prior value untouched"
     );
 
+    // Security hardening (issue #89): the origin of a registered URI becomes a
+    // frame-src source on the front-channel logout page, so an authority carrying a
+    // space, a `;`, a control character, or userinfo (which could smuggle extra CSP
+    // sources or directives) is refused BEFORE it is stored. The prior value stands.
+    for smuggle in [
+        "https://rp.test frame-src *",
+        "https://rp.test;script-src 'unsafe-inline'",
+        "https://rp.test\u{0009}/fc",
+        "https://user:pass@rp.test/fc",
+        "https://",
+    ] {
+        assert!(
+            matches!(
+                writer()
+                    .register_frontchannel_logout(&env, &id, Some(smuggle), false)
+                    .await,
+                Err(StoreError::InvalidRedirectUri)
+            ),
+            "a malformed https authority is rejected: {smuggle:?}"
+        );
+    }
+    let record = reader.get(&id).await.expect("get");
+    assert_eq!(
+        record.frontchannel_logout_uri.as_deref(),
+        Some("https://rp.test/frontchannel"),
+        "a rejected malformed registration leaves the prior value untouched"
+    );
+
     // Passing None clears the registration wholesale.
     writer()
         .register_frontchannel_logout(&env, &id, None, false)

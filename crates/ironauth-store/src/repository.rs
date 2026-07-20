@@ -3762,11 +3762,14 @@ impl ActingClientRepo<'_> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
-        // A registered front-channel logout URI MUST be https (OIDC Front-Channel
-        // Logout 1.0 section 2): it is loaded cross-origin in the end user's browser,
-        // so a plaintext or non-http scheme is refused before anything is written.
+        // A registered front-channel logout URI MUST be a well-formed absolute https
+        // URL (OIDC Front-Channel Logout 1.0 section 2): it is loaded cross-origin in
+        // the end user's browser, AND its origin becomes a `frame-src` source on the
+        // front-channel logout page. A value with whitespace or a `;` in its authority
+        // would smuggle extra CSP sources or directives into that header, so a plaintext
+        // scheme or a malformed authority is refused before anything is written.
         if let Some(uri) = uri {
-            if !uri.starts_with("https://") {
+            if !is_well_formed_https_uri(uri) {
                 return Err(StoreError::InvalidRedirectUri);
             }
         }
@@ -10288,6 +10291,27 @@ fn sha256_hex(value: &str) -> String {
         let _ = write!(out, "{byte:02x}");
     }
     out
+}
+
+/// Whether `uri` is a well-formed absolute `https` URL with a clean `host[:port]`
+/// authority (issue #89). A registered `frontchannel_logout_uri` origin becomes a
+/// `frame-src` source on the front-channel logout page, so an authority carrying
+/// whitespace, a `;`, a quote, or any other CSP delimiter would smuggle extra sources
+/// or directives into the header. The URL must be `https`, carry a non-empty authority,
+/// hold no userinfo (`@`), and build its authority (everything up to the first path,
+/// query, or fragment delimiter) only from host and port characters (ASCII
+/// alphanumerics, `.`, `-`, `:`, and the `[` `]` of an IPv6 literal). The store owns no
+/// URL parser, so the check is by construction rather than a new dependency.
+fn is_well_formed_https_uri(uri: &str) -> bool {
+    let Some(rest) = uri.strip_prefix("https://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    !authority.is_empty()
+        && !authority.contains('@')
+        && authority
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'[' | b']'))
 }
 
 /// The live state of a presented refresh token, resolved from its digest (issue
