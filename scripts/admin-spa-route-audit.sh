@@ -88,7 +88,26 @@ def is_api_path(literal):
 # ---- 2. Scan the hand written sources --------------------------------------
 
 network_sinks = re.compile(
-    r"\b(fetch|XMLHttpRequest|WebSocket|EventSource|sendBeacon|createClient)\s*\("
+    r"\b(fetch|XMLHttpRequest|WebSocket|EventSource|sendBeacon|createClient|import)\s*\("
+)
+
+# URL bearing attribute / property / CSS sinks that fetch a resource without
+# going through the one typed client: a form "action", an "src"/"srcset"
+# assignment or JSX attribute, and a CSS "url(...)". A browser route "href" is
+# deliberately NOT here (client side navigation under the /admin mount is not a
+# server call). Any of these outside the single client is a funnel violation.
+url_bearing_sinks = re.compile(
+    r"(?:\b(?:form)?[Aa]ction\s*=)|(?:\.src\b)|(?:\bsrc(?:set)?\s*=)|(?:\burl\s*\()"
+)
+
+# The same shapes but as they appear INSIDE a string literal (a raw HTML string:
+# a "<form action=..." or "src=..." or a CSS "url(..." held in a template). The
+# "=" must be followed by a quote or a slash so an ordinary prose "action = 5"
+# does not match; a legitimate Preact app writes JSX, never HTML in a string.
+html_url_sinks = re.compile(
+    r"""(?:\b(?:form)?[Aa]ction\s*=\s*["'/])"""
+    r"""|(?:\bsrc(?:set)?\s*=\s*["'/])"""
+    r"""|(?:\burl\s*\()"""
 )
 
 
@@ -169,6 +188,12 @@ for path in sources:
                 f"{rel}: network call {match.group(1)!r} outside the single audited "
                 f"client (src/api/client.ts)"
             )
+        for match in url_bearing_sinks.finditer(code):
+            problem(
+                f"{rel}: URL bearing sink {match.group(0)!r} outside the single "
+                f"audited client (src/api/client.ts); a form action, src, or CSS "
+                f"url fetches outside the one typed client"
+            )
 
     for literal in strings:
         # Property 1: the openapi-fetch network library is imported only in the
@@ -178,11 +203,27 @@ for path in sources:
                 f"{rel}: imports the openapi-fetch network library outside the single "
                 f"audited client (src/api/client.ts)"
             )
-        # Property 3: no absolute URL literal anywhere.
-        if re.match(r"^https?://", literal):
+        # Property 3: no authority bearing URL literal anywhere. A "//" in a
+        # literal names a host authority: a scheme relative "//host", a full
+        # "scheme://host", or a "//host" buried in a "url(...)" or an attribute
+        # value. A legitimate server path is single slash ("/v1/..."); an app
+        # route is single slash ("/tenants"); the issuer and management bases are
+        # runtime <meta> config, never a literal. So any "//" is an external or
+        # protocol relative host and fails the audit (the "no external host"
+        # guarantee, airtight against protocol relative and embedded forms).
+        if "//" in literal:
             problem(
-                f"{rel}: absolute URL literal {literal!r} (the issuer and management "
-                f"bases are runtime <meta> config, never a literal; no external hosts)"
+                f"{rel}: authority bearing URL literal {literal!r} (a scheme or "
+                f"protocol relative host; the issuer and management bases are "
+                f"runtime <meta> config, never a literal; no external hosts)"
+            )
+        # A raw HTML string that carries a URL sink (a form action, an src, or a
+        # CSS url) is a network sink smuggled inside a string, outside the funnel.
+        if path != client_file and html_url_sinks.search(literal):
+            problem(
+                f"{rel}: URL bearing sink inside a string literal {literal!r} "
+                f"outside the single audited client (src/api/client.ts); raw HTML "
+                f"in a string fetches outside the one typed client"
             )
         # Property 2: collect API path literals for the documented check.
         if is_api_path(literal):

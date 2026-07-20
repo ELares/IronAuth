@@ -47,8 +47,10 @@ pub const MOUNT_PREFIX: &str = "/admin";
 /// `'self'` and calls the management API on `'self'`. It carries no
 /// `unsafe-inline` because the Vite build emits only external, content hashed
 /// assets. `img-src` allows `data:` for small inlined icons; everything else is
-/// locked to `'self'` or `'none'`.
-pub const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; object-src 'none'; frame-ancestors 'none'";
+/// locked to `'self'` or `'none'`. `form-action 'self'` is explicit because it
+/// does NOT fall back to `default-src`, so without it a form could POST to an
+/// external host; here it confines every form submission to the same origin.
+pub const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'";
 
 /// The built admin console assets, baked into the binary at compile time.
 #[derive(RustEmbed)]
@@ -122,6 +124,9 @@ fn asset_response(path: &str, body: Vec<u8>) -> Response {
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
     );
+    // Belt and suspenders with `frame-ancestors 'none'` for a legacy browser that
+    // ignores CSP, matching the auth pages (issue #89): the console is never framed.
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     response
 }
 
@@ -179,6 +184,13 @@ mod tests {
                 .get(header::CONTENT_SECURITY_POLICY)
                 .unwrap(),
             CONTENT_SECURITY_POLICY
+        );
+        // The CSP confines form submissions to the same origin (form-action does
+        // not fall back to default-src), and the console is never framed.
+        assert!(CONTENT_SECURITY_POLICY.contains("form-action 'self'"));
+        assert_eq!(
+            response.headers().get(header::X_FRAME_OPTIONS).unwrap(),
+            "DENY"
         );
         assert!(
             response
