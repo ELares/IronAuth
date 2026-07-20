@@ -125,10 +125,50 @@
       "additionalProperties": false,
       "description": "Admin console SPA settings (issue #90).\n\nThe admin console is a Preact single page app served in process on the public\nplane under `/admin`, embedded in the binary and speaking the public\nmanagement API through one generated typed client. This gate mirrors\n`flows.enabled` and `hosted_pages.enabled`: a plain operator toggle, off by\ndefault, that mounts nothing on the wire until it is turned on (every\n`/admin` path answers a uniform 404 while off, so a deployment that does not\nuse the console discloses nothing). Off in PR1 because the console is a\nstatic shell with no auth yet; a later change flips the default on once it is\nfunctional.",
       "properties": {
+        "admin_issuer_environment": {
+          "default": null,
+          "description": "The environment identifier of the ADMIN ISSUER (issue #90, PR 2), paired\nwith `admin_issuer_tenant`. Together they name the system environment the\nconsole signs in against. Unset leaves the bridge disarmed (fail closed).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "admin_issuer_tenant": {
+          "default": null,
+          "description": "The tenant identifier of the ADMIN ISSUER (issue #90, PR 2): the system\n`(tenant, environment)` whose OIDC provider the console signs in against.\nThe console obtains a short-lived `at+jwt` from this issuer and the\nmanagement API verifies it against exactly this issuer's published JWKS\n(never any issuer). Unset leaves the OIDC credential bridge disarmed\n(fail closed): no `at+jwt` is ever accepted by the management API and the\nconsole can authenticate only if a bootstrap operator token path is used\nout of band. This is a bounded identifier datum; it carries no secret.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "console_client_id": {
+          "default": null,
+          "description": "The PUBLIC OAuth client identifier the console uses for its Authorization\nCode + PKCE sign-in (issue #90, PR 2). A public client holds no secret, so\nthis is a bounded identifier the browser reads from served config; it is\nnever a credential. Unset leaves the console with no client to log in as.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "enabled": {
           "default": false,
           "description": "Whether to serve the in-process admin console. Off by default so the\ndefault boot mounts nothing under `/admin` and every such path is a\nuniform 404. When on, the embedded console is served on the public plane.",
           "type": "boolean"
+        },
+        "management_audience": {
+          "default": null,
+          "description": "The management API AUDIENCE the console's `at+jwt` must be bound to (issue\n#90, PR 2): an RFC 8707 resource-server audience registered under the admin\nissuer. The console requests `resource=<this>` at `/token`, and the\nmanagement API requires the presented token's `aud` to EQUAL this value\nexactly. That exact match is the cross-RP replay defense: a token minted\nfor any other client or resource, even by the same issuer, is rejected.\nUnset leaves the bridge disarmed (fail closed). A bounded URL datum, no\nsecret.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "operator_subjects": {
+          "default": [],
+          "description": "The OPERATOR-SUBJECT ALLOWLIST (issue #90, PR 2): the OIDC `sub` values, in\nthe admin issuer, that map to the management operator plane. A verified\n`at+jwt` whose `sub` is a member is resolved to `Principal::Operator`; ANY\nother subject is REJECTED (fail closed). This is the entire human-to-authz\nmapping in PR 2: operator or nothing, no scoped binding, no migration, no\nauto-provisioning. Empty (the default) authorizes nobody, so arming the\nbridge without listing a subject grants no one console access.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         }
       },
       "type": "object"
@@ -2271,7 +2311,12 @@
     "admin_spa": {
       "$ref": "#/$defs/AdminSpaConfig",
       "default": {
-        "enabled": false
+        "admin_issuer_environment": null,
+        "admin_issuer_tenant": null,
+        "console_client_id": null,
+        "enabled": false,
+        "management_audience": null,
+        "operator_subjects": []
       },
       "description": "Admin console SPA settings (issue #90): the in-process serving of the\nPreact admin console on the public plane under `/admin`. Off by default:\nPR1 ships the serving skeleton (a static shell over the public management\nAPI, no auth yet), so a default deployment mounts nothing and every\n`/admin` path is a uniform 404. A later change flips the default on once\nthe console is functional."
     },

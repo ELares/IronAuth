@@ -26,9 +26,12 @@
 #      fails the audit (the issuer and management bases are runtime <meta> config,
 #      never a literal), so the app cannot be hardcoded to call an external host.
 #
-# In PR1 the console is a static shell, so it reaches no endpoint yet; the SCRIPT
-# and its wiring are the deliverable, and the OIDC allowlist is declared now for
-# the PR2 login module to draw on.
+#   4. No backdoor credential (issue #90, PR 2). No source literal may carry an
+#      operator token or a management key: the SPA's ONLY credential is the in
+#      memory at+jwt from the OIDC login, attached from a variable, never a
+#      literal. A literal that names the operator/management-key credential class
+#      (a `mak_` id, an operator token key) fails the audit. This is the
+#      structural no-backdoor check: the browser can hold no service credential.
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
@@ -71,6 +74,18 @@ oidc_public_allowlist = {
 }
 
 allowed_paths = documented_paths | oidc_public_allowlist
+
+# Property 4: substrings that only ever appear in a service-credential literal.
+# A `mak_` is a management-key id prefix; the operator-token config key names the
+# operator credential. The console's only credential is the runtime at+jwt, so
+# none of these belongs in any source literal. Matched case-insensitively.
+FORBIDDEN_CREDENTIAL_SUBSTRINGS = (
+    "mak_",
+    "bootstrap_operator_token",
+    "bootstrap-operator-token",
+    "operator_token",
+    "operator-token",
+)
 
 # A literal is treated as a server API path (and therefore must be documented or
 # allowlisted) when it names the management API or an OIDC public endpoint. App
@@ -225,6 +240,18 @@ for path in sources:
                 f"outside the single audited client (src/api/client.ts); raw HTML "
                 f"in a string fetches outside the one typed client"
             )
+        # Property 4: no backdoor credential literal. A `mak_` names a management
+        # key; the operator-token config keys name the operator credential. The
+        # console holds NEITHER; its only credential is the runtime at+jwt.
+        lowered = literal.lower()
+        for forbidden in FORBIDDEN_CREDENTIAL_SUBSTRINGS:
+            if forbidden in lowered:
+                problem(
+                    f"{rel}: source literal {literal!r} names a service credential "
+                    f"(matched {forbidden!r}); the console holds NO operator token or "
+                    f"management key, only the in memory at+jwt from the OIDC login "
+                    f"(no backdoor)"
+                )
         # Property 2: collect API path literals for the documented check.
         if is_api_path(literal):
             declared_api_paths.add(literal)

@@ -25,6 +25,12 @@ ironauth-store.workspace = true
 # and canonicalize a policy at create time (one source of truth for the primitive
 # shape, no drift between what the admin stores and what the engine applies).
 ironauth-oidc.workspace = true
+# The OIDC credential bridge (issue #90, PR 2) verifies the console's `at+jwt`
+# through the ONE hardened JOSE verify path (VerificationPolicy + TrustedKey +
+# verify), the SAME core the OIDC data plane uses; the arm never hand-rolls JWT
+# parsing. Already in the tree (a transitive dep via ironauth-oidc); named here so
+# the arm can reach the verify entry point directly.
+ironauth-jose.workspace = true
 # The full identity export (issue #58) SERIALIZES the same line-delimited record
 # format the streaming bulk import consumes, so export-to-import round-trips by
 # construction; the outbound credential-verification endpoint reuses the same
@@ -73,10 +79,6 @@ http-body-util.workspace = true
 # credential and an imported foreign one. Both crates are already in the tree.
 argon2.workspace = true
 bcrypt = "0.16"
-# The exit-export MFA round-trip test (issue #58/#69) computes an RFC 6238 code from
-# the original seed to prove a re-imported TOTP factor still verifies, and Base32
-# encodes the seed to assert the export line carries it. Already in the tree.
-ironauth-jose.workspace = true
 # The per-connector health-read test (issue #76) builds a real FederationRuntime (which
 # needs an SSRF-hardened fetcher; no network is touched, only the in-memory health registry)
 # and installs it on the AdminState to prove the mgmt read reflects an induced outage.
@@ -249,6 +251,17 @@ required-features = ["testing"]
 [[test]]
 name = "connector_health"
 path = "tests/connector_health.rs"
+required-features = ["testing"]
+
+# The OIDC-session credential bridge (issue #90, PR 2): the console signs in via
+# IronAuth's own OIDC and receives an at+jwt bound to the management audience; the
+# third resolution arm verifies it (signature vs the admin issuer JWKS, iss, aud,
+# exp, typ=at+jwt, the ironauth.manage scope) and maps a listed subject to the
+# operator plane. Proves the no-backdoor, authz-cannot-exceed-session, and
+# sudo-via-OIDC properties. Needs a real database (DATABASE_URL).
+[[test]]
+name = "oidc_bridge"
+path = "tests/oidc_bridge.rs"
 required-features = ["testing"]
 
 [lints]

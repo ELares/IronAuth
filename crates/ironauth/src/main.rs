@@ -11,7 +11,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use axum::Router;
-use ironauth_admin::AdminState;
+use ironauth_admin::{AdminOidcBridge, AdminState};
 use ironauth_config::{
     ADVANCED_RECOVERY_FEATURE, Config, FEDCM_FEATURE, FeatureRegistry,
     GLOBAL_TOKEN_REVOCATION_FEATURE, Loaded, OidcConfig, PasswordHashingConfig,
@@ -27,7 +27,7 @@ use ironauth_oidc::{
     canonical_step_up_acr, discovery_router, issuer_router, oidc_router,
 };
 use ironauth_quota::QuotaEnforcer;
-use ironauth_server::Server;
+use ironauth_server::{Server, SiteContext};
 use ironauth_store::{
     AbuseBanId, AbuseSubject, AbuseSubjectKind, ActorRef, AuthPath, ClientId, CorrelationId,
     EnvironmentId, NewBan, Scope, ServiceId, Store, TenantId,
@@ -280,6 +280,11 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+        // Keep a clone of the management router (if any) for the admin console's
+        // same-origin proxy (issue #90, PR 2): the browser reaches the management
+        // API through /admin/api on the PUBLIC plane, which the proxy forwards to
+        // THIS in-process router. A Router is cheaply cloneable.
+        let management_for_proxy = management.clone();
         if let Some(router) = management {
             server = server.mount_management(router);
         }
@@ -328,8 +333,15 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // uniform 404. PR1 serves a static shell (no auth yet); PR2 wires the login
         // and the same origin management proxy.
         if admin_spa_enabled {
-            server = server.mount_public(ironauth_admin_ui::router());
-            tracing::info!("admin console mounted on the public plane under /admin");
+            // Wire the same-origin management proxy (issue #90, PR 2): /admin/api/*
+            // on the public plane forwards to the in-process management router. When
+            // the management plane is not mounted (no bootstrap operator token) the
+            // proxy target is None and every /admin/api/* path is a uniform 404.
+            server = server.mount_public(ironauth_admin_ui::router(management_for_proxy));
+            tracing::info!(
+                "admin console mounted on the public plane under /admin (management proxy at \
+                 /admin/api)"
+            );
         } else {
             tracing::info!("admin console not mounted: admin_spa.enabled is false");
         }
@@ -422,6 +434,11 @@ async fn build_management_router(
             // PR 3) only when the ladder resolved the feature enabled AND acked; otherwise
             // every recovery-approval endpoint stays a uniform 404.
             let state = state.with_advanced_recovery_enabled(advanced_recovery_enabled);
+            // Arm the OIDC-session credential bridge (issue #90, PR 2) when the operator has
+            // configured an admin issuer and a management audience AND the OIDC data plane is
+            // mounted (so signing keys exist to verify against). Absent config leaves the
+            // bridge disarmed: the management API then accepts no at+jwt at all (fail closed).
+            let state = install_admin_oidc_bridge(state, config).await;
             tracing::info!("management API mounted on the management plane");
             Some(ironauth_admin::management_router(state))
         }
@@ -430,6 +447,106 @@ async fn build_management_router(
             None
         }
     }
+}
+
+/// Arm the OIDC-session credential bridge on the management state (issue #90, PR 2).
+///
+/// The console dogfoods IronAuth's own OIDC: it signs in and presents a short-lived
+/// `at+jwt`, which the management API's third resolution arm verifies against the
+/// admin issuer's PUBLISHED signing keys and maps to the operator plane via the
+/// fail-closed operator-subject allowlist. This installs the bridge when the
+/// operator has named an admin issuer `(tenant, environment)` and a management
+/// audience in `[admin_spa]` AND the OIDC data plane is enabled (so signing keys
+/// exist to verify against). It reads those keys through a store-backed
+/// [`IssuerRegistry`] over the SAME data-plane store and issuer base the OIDC plane
+/// serves its JWKS from, so the verification keys are the identical RLS-scoped rows
+/// (the registry seam reused, not a new key store). Any missing or unparseable
+/// config leaves the bridge disarmed, and the management API then accepts no
+/// `at+jwt` at all (fail closed).
+async fn install_admin_oidc_bridge(state: AdminState, config: &Config) -> AdminState {
+    // The bridge needs the OIDC data plane (its signing keys) and the admin-issuer
+    // config. Absent either, leave it disarmed.
+    if !config.oidc.enabled {
+        return state;
+    }
+    let spa = &config.admin_spa;
+    let (Some(tenant_id), Some(environment_id), Some(audience)) = (
+        spa.admin_issuer_tenant
+            .as_deref()
+            .filter(|v| !v.trim().is_empty()),
+        spa.admin_issuer_environment
+            .as_deref()
+            .filter(|v| !v.trim().is_empty()),
+        spa.management_audience
+            .as_deref()
+            .filter(|v| !v.trim().is_empty()),
+    ) else {
+        return state;
+    };
+    let Some(admin_scope) = resolve_admin_scope(&state, tenant_id, environment_id) else {
+        tracing::error!(
+            "admin console OIDC bridge NOT armed: admin_spa.admin_issuer_tenant / \
+             admin_issuer_environment did not parse as identifiers"
+        );
+        return state;
+    };
+    // The issuer base the OIDC plane mints issuers under (server.public_url derived),
+    // so the enforced `iss` matches exactly what the shared registry publishes.
+    let issuer_base = match SiteContext::derive(&config.server) {
+        Ok(site) => site.base_url(),
+        Err(error) => {
+            tracing::error!(%error, "admin console OIDC bridge NOT armed: cannot derive the issuer base");
+            return state;
+        }
+    };
+    // A store-backed registry over the DATA-plane store (the app role reads signing
+    // keys under forced RLS), master-keyed so sealed key material opens.
+    let store = match Store::connect(config.database.url.expose()).await {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::error!(%error, "admin console OIDC bridge NOT armed: cannot connect the data-plane store");
+            return state;
+        }
+    };
+    let store = match resolve_master_key(config) {
+        Some(master) => store.with_master_key(master),
+        None => store,
+    };
+    let cache = JwksCacheWindow::clamped(config.oidc.jwks_cache_max_age_secs);
+    let registry = Arc::new(IssuerRegistry::store_backed(issuer_base, cache, store));
+    let subjects = spa.operator_subjects.clone();
+    if subjects.is_empty() {
+        tracing::warn!(
+            "admin console OIDC bridge armed with an EMPTY operator_subjects allowlist: no \
+             subject can reach the management plane until one is listed"
+        );
+    }
+    let bridge = AdminOidcBridge::new(registry, admin_scope, audience.to_owned(), subjects);
+    tracing::info!(
+        "admin console OIDC credential bridge armed (issue #90): the management API accepts an \
+         at+jwt from the configured admin issuer, bound to the management audience and carrying \
+         the ironauth.manage scope, mapped to an operator via the fail-closed allowlist"
+    );
+    state.with_admin_oidc_bridge(bridge)
+}
+
+/// Parse the admin-issuer `(tenant, environment)` from config through the canonical
+/// scoped-id parses (issue #90, PR 2). Returns `None` if either identifier is
+/// malformed, which leaves the bridge disarmed.
+fn resolve_admin_scope(state: &AdminState, tenant_id: &str, environment_id: &str) -> Option<Scope> {
+    let tenant = state
+        .store()
+        .management()
+        .tenants(state.bootstrap_operator_id())
+        .parse_id(tenant_id)
+        .ok()?;
+    let environment = state
+        .store()
+        .management()
+        .environments(tenant)
+        .parse_id(environment_id)
+        .ok()?;
+    Some(Scope::new(tenant, environment))
 }
 
 /// Build the OIDC provider router (issue #12), or `None` if it should not be

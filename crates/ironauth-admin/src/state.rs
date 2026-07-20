@@ -21,13 +21,29 @@ use std::time::SystemTime;
 
 use ironauth_config::{AdminConfig, SecretError, SecretString};
 use ironauth_env::Env;
+use ironauth_jose::{JwsAlgorithm, TrustedKey, VerificationPolicy, verify};
+use ironauth_oidc::IssuerRegistry;
 use ironauth_store::{
-    ActorRef, MANAGEMENT_LIST_HARD_CAP, ManagementKeyId, OperatorId, Scope, ServiceId, Store,
+    ActorRef, HumanId, MANAGEMENT_LIST_HARD_CAP, ManagementKeyId, OperatorId, Scope, ServiceId,
+    Store,
 };
+use serde_json::Value;
 
 use crate::auth::Principal;
 use crate::error::ApiError;
 use crate::hash::{constant_time_eq, sha256_hex};
+
+/// The OAuth scope value a console `at+jwt` must carry to reach the management
+/// plane (issue #90, PR 2). An ordinary end-user login token for the SAME admin
+/// issuer that lacks this scope is rejected, so a broad interactive login cannot
+/// be replayed against the management API.
+const MANAGEMENT_SCOPE: &str = "ironauth.manage";
+
+/// The RFC 9068 access-token media type the console bearer must declare in its
+/// protected header (issue #90, PR 2). Enforced AFTER signature verification (the
+/// header is integrity-protected by the signature), so an opaque bootstrap token
+/// or a `mak_` key, which are not compact JWSs at all, never reach this arm.
+const AT_JWT_TYP: &str = "at+jwt";
 
 /// The seed bytes of the well-known bootstrap identities. The bootstrap operator
 /// (operator plane) and its audit service-actor are fixed, well-known identities
@@ -37,6 +53,61 @@ const BOOTSTRAP_SEED: [u8; 16] = [0_u8; 16];
 
 /// The display name recorded for the bootstrap operator row.
 pub(crate) const BOOTSTRAP_OPERATOR_DISPLAY_NAME: &str = "IronAuth bootstrap operator";
+
+/// The OIDC-session to management-Principal credential bridge (issue #90, PR 2).
+///
+/// This is the identity-resolution half of dogfooding: the admin console signs in
+/// through IronAuth's OWN OIDC (Authorization Code + PKCE, a public client) against
+/// a designated ADMIN ISSUER and receives a short-lived `at+jwt` bound to the
+/// management audience. This value carries everything the third resolution arm
+/// needs to turn that bearer into a [`Principal`], and NOTHING else:
+///
+/// - `issuers` is the SAME store-backed [`IssuerRegistry`] the OIDC data plane
+///   serves its JWKS and discovery from (shared as an `Arc`, exactly like the
+///   federation runtime and the lazy-migration hook). The verification keys come
+///   from the admin issuer's published signing keys ONLY, never an ambient "any
+///   issuer" trust anchor.
+/// - `issuer_scope` is the admin issuer's `(tenant, environment)`, from which the
+///   registry derives BOTH the trusted keys and the exact `iss` string the token
+///   must carry (one source of truth: the enforced issuer is the value the
+///   registry itself would publish).
+/// - `management_audience` is the exact `aud` the token must carry (RFC 8707); it
+///   is the cross-RP replay defense.
+/// - `operator_subjects` is the fail-closed allowlist: a verified token whose `sub`
+///   is a member maps to [`Principal::Operator`]; any other subject is rejected.
+///
+/// It carries NO secret. Arming it is an operator choice (config-only); when it is
+/// absent the management API accepts no `at+jwt` at all (fail closed).
+#[derive(Clone)]
+pub struct AdminOidcBridge {
+    issuers: Arc<IssuerRegistry>,
+    issuer_scope: Scope,
+    management_audience: String,
+    operator_subjects: Vec<String>,
+}
+
+impl AdminOidcBridge {
+    /// Build the bridge from the shared issuer registry, the admin issuer scope,
+    /// the management audience, and the operator-subject allowlist.
+    ///
+    /// The registry is shared (an `Arc`) with the OIDC data plane so the keys the
+    /// arm verifies against are exactly the keys that issuer publishes; the scope,
+    /// audience, and allowlist come from the operator's `[admin_spa]` config.
+    #[must_use]
+    pub fn new(
+        issuers: Arc<IssuerRegistry>,
+        issuer_scope: Scope,
+        management_audience: impl Into<String>,
+        operator_subjects: Vec<String>,
+    ) -> Self {
+        Self {
+            issuers,
+            issuer_scope,
+            management_audience: management_audience.into(),
+            operator_subjects,
+        }
+    }
+}
 
 /// Cheaply cloneable state shared by every management handler.
 #[derive(Clone)]
@@ -115,6 +186,12 @@ struct Inner {
     // recovery-approval review-queue endpoints outside the experimental ack gate. Off by
     // default; when off every recovery-approval endpoint answers a uniform 404.
     advanced_recovery_enabled: bool,
+    // The OIDC-session credential bridge (issue #90, PR 2), shared with the OIDC data
+    // plane. `None` (the default) leaves the management API accepting only the two
+    // service credentials (the bootstrap operator token and `mak_` keys); NO `at+jwt` is
+    // ever accepted, so the console dogfooding surface is fully inert until an operator
+    // arms it in `[admin_spa]`.
+    admin_oidc_bridge: Option<AdminOidcBridge>,
 }
 
 impl AdminState {
@@ -202,8 +279,152 @@ impl AdminState {
                 sudo_mode_window_secs: config.sudo_mode_window_secs,
                 signup_quarantine_enabled: false,
                 advanced_recovery_enabled: false,
+                admin_oidc_bridge: None,
             }),
         })
+    }
+
+    /// Arm the OIDC-session credential bridge (issue #90, PR 2).
+    ///
+    /// The boot path installs this when `admin_spa` names an admin issuer and a
+    /// management audience AND the OIDC data plane is mounted (so a store-backed
+    /// [`IssuerRegistry`] exists to share). It is a builder rather than an
+    /// `AdminConfig` field precisely so the verification KEY SOURCE is the same
+    /// shared registry the data plane serves, not a second key store the admin
+    /// plane could drift from. With no bridge installed the third resolution arm
+    /// is inert and no `at+jwt` is ever accepted (fail closed).
+    #[must_use]
+    pub fn with_admin_oidc_bridge(mut self, bridge: AdminOidcBridge) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.admin_oidc_bridge = Some(bridge);
+        }
+        self
+    }
+
+    /// Resolve a console `at+jwt` (issue #90, PR 2) to a management [`Principal`].
+    ///
+    /// This is the THIRD resolution arm, after the bootstrap operator token and the
+    /// `mak_` key. It runs ONLY when the bridge is armed and the token is a compact
+    /// JWS (three dot-separated segments), so the opaque bootstrap token and the
+    /// `mak_` key can never reach it. It does IDENTITY RESOLUTION ONLY: it verifies
+    /// the token and maps the subject to an operator, and performs NO authorization
+    /// (the existing `require_*` methods do that, unchanged).
+    ///
+    /// Verification runs through the ONE hardened JOSE path
+    /// ([`ironauth_jose::verify`]), the SAME core the OIDC data plane uses (compare
+    /// `OidcState::verify_access_token`): the signature is checked against the admin
+    /// issuer's PUBLISHED signing keys ONLY, `iss` must equal the issuer the shared
+    /// registry derives for the admin scope, `aud` must EQUAL the configured
+    /// management audience (the cross-RP replay defense), and `exp`/`nbf`/`iat` and
+    /// the algorithm allowlist (which forbids `alg=none` and HMAC/RSA confusion) are
+    /// enforced by the policy. It then additionally requires `typ == at+jwt`, the
+    /// `ironauth.manage` scope, and a `sub` on the operator-subject allowlist.
+    ///
+    /// Returns `Ok(Some(Operator))` for a listed subject, and `Ok(None)` for EVERY
+    /// other outcome (bridge disarmed, not a JWS, no keys, any verification failure,
+    /// missing scope/typ, or an unlisted subject) so the extractor surfaces one
+    /// uniform `Unauthorized` with no oracle. This is fail-closed by construction:
+    /// there is no default-grant path.
+    ///
+    /// # Errors
+    ///
+    /// This arm never itself returns an `Err`: a store fault reading the shared
+    /// registry (the fence read) fails closed to `Ok(None)`. The signature keeps the
+    /// `Result` so the extractor can chain it uniformly with the `mak_` arm.
+    pub(crate) async fn authenticate_admin_oidc(
+        &self,
+        token: &str,
+    ) -> Result<Option<Principal>, ApiError> {
+        let Some(bridge) = self.inner.admin_oidc_bridge.as_ref() else {
+            return Ok(None);
+        };
+        // Shape gate: only a compact JWS (exactly three `.`-separated segments) is
+        // ours. The opaque bootstrap token and the `mak_<id>.<secret>` key are not,
+        // so they never reach the verify path. `verify` re-checks the structure, so
+        // this is a cheap pre-filter, not the trust boundary.
+        if token.split('.').count() != 3 {
+            return Ok(None);
+        }
+        // Resolve the admin issuer's registry entry (the SAME keys its JWKS serves).
+        // A store-backed registry re-reads the suspension fence here; an unprovisioned,
+        // cross-tenant, or fenced scope yields `None` and fails closed.
+        let Some(entry) = bridge.issuers.entry_for(&bridge.issuer_scope).await else {
+            return Ok(None);
+        };
+        let now = self.inner.env.clock().now_utc();
+        // The keys published at `now` are exactly those a currently-valid token could
+        // have been signed by; a token's `kid` only selects among them, never
+        // introduces one (the #9 verify path).
+        let keys = entry.keyset().published_signing_keys(now);
+        let trusted: Vec<TrustedKey> = keys
+            .iter()
+            .filter_map(|key| key.verifying_key().ok())
+            .collect();
+        if trusted.is_empty() {
+            return Ok(None);
+        }
+        // The allowlist is exactly the algorithms those published keys sign with, so a
+        // token's own `alg` header is only ever matched against them (never followed);
+        // `alg=none`, HMAC, and RSA/EC confusion are structurally inexpressible.
+        let mut algorithms: Vec<JwsAlgorithm> = Vec::new();
+        for key in &keys {
+            if !algorithms.contains(&key.algorithm()) {
+                algorithms.push(key.algorithm());
+            }
+        }
+        // One source of truth for the enforced issuer: the value the shared registry
+        // itself would publish for this scope. `aud` is the configured management
+        // audience, matched EXACTLY (the cross-RP replay defense).
+        let issuer = bridge.issuers.issuer_for(&bridge.issuer_scope);
+        let Ok(policy) = VerificationPolicy::new(
+            algorithms,
+            trusted,
+            issuer,
+            bridge.management_audience.clone(),
+        ) else {
+            return Ok(None);
+        };
+        let Ok(verified) = verify(token, &policy, self.inner.env.clock()) else {
+            return Ok(None);
+        };
+        // `typ == at+jwt` (RFC 9068). The header is integrity-protected by the now
+        // verified signature, so reading it here is trusted; a token minted for a
+        // different media type (an id token, a logout token) is rejected.
+        if compact_jws_typ(token).as_deref() != Some(AT_JWT_TYP) {
+            return Ok(None);
+        }
+        // The `ironauth.manage` scope must be present: an ordinary end-user login
+        // token for the same issuer, lacking it, is rejected here.
+        let has_manage_scope = verified
+            .claims()
+            .get("scope")
+            .and_then(Value::as_str)
+            .is_some_and(|scope| scope.split_whitespace().any(|s| s == MANAGEMENT_SCOPE));
+        if !has_manage_scope {
+            return Ok(None);
+        }
+        // Map the verified subject to an operator via the fail-closed allowlist. An
+        // unlisted (or absent) subject is rejected.
+        let Some(subject) = verified
+            .claims()
+            .subject()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return Ok(None);
+        };
+        if !bridge
+            .operator_subjects
+            .iter()
+            .any(|listed| listed == subject)
+        {
+            return Ok(None);
+        }
+        // Attribute the operator to a HUMAN actor derived deterministically from the
+        // verified subject (a public identifier), so audit and idempotency name the
+        // person, distinct from the SERVICE actor the token/`mak_` arms record.
+        let actor = ActorRef::human(human_id_for_subject(subject));
+        Ok(Some(Principal::Operator { actor }))
     }
 
     /// Arm the experimental signup fraud-review-queue admin surface (issue #82, PR 2).
@@ -504,6 +725,44 @@ impl AdminState {
             Ok(None)
         }
     }
+}
+
+/// Read the `typ` from a compact JWS's protected header (issue #90, PR 2).
+///
+/// The header is the FIRST segment; this decodes it and reads the `typ` string.
+/// It is only ever called AFTER [`ironauth_jose::verify`] has validated the
+/// signature over that exact header, so the value read here is integrity-protected
+/// (a tampered `typ` would have failed the signature). Returns `None` when the
+/// token is malformed, the header is not a JSON object, or no string `typ` is
+/// present, so a missing `typ` fails closed at the caller.
+fn compact_jws_typ(token: &str) -> Option<String> {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let header_b64 = token.split('.').next()?;
+    let bytes = URL_SAFE_NO_PAD.decode(header_b64.as_bytes()).ok()?;
+    let value: Value = serde_json::from_slice(&bytes).ok()?;
+    match value.get("typ") {
+        Some(Value::String(typ)) => Some(typ.clone()),
+        _ => None,
+    }
+}
+
+/// A stable [`HumanId`] derived deterministically from a verified OIDC subject
+/// (issue #90, PR 2).
+///
+/// The subject is a PUBLIC identifier recovered from a cryptographically verified
+/// token, so deriving the audit actor's id from it is the exact "derived from other
+/// PUBLIC identifier bytes" allowance [`HumanId::from_seed_bytes`] documents (the
+/// same shape a management key's service actor uses). It is stable across requests,
+/// so every action by one operator attributes to one human actor; and it is a
+/// one-way SHA-256 truncation, so the human id column carries no reversible copy of
+/// the subject.
+fn human_id_for_subject(subject: &str) -> HumanId {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(subject.as_bytes());
+    let mut seed = [0_u8; 16];
+    seed.copy_from_slice(&digest[..16]);
+    HumanId::from_seed_bytes(seed)
 }
 
 /// Why the management state could not be built.

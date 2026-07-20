@@ -89,7 +89,7 @@ pub use auth::Principal;
 pub use error::{ApiError, ErrorBody};
 pub use openapi::{management_openapi, openapi_json};
 pub use pagination::ListQuery;
-pub use state::{AdminState, StateError};
+pub use state::{AdminOidcBridge, AdminState, StateError};
 
 /// Build the management API router.
 ///

@@ -154,6 +154,17 @@ impl FromRequestParts<AdminState> for Principal {
         if let Some(principal) = state.authenticate_management_key(&token).await? {
             return Ok(principal);
         }
+        // The third arm (issue #90, PR 2): a console `at+jwt` from the admin issuer,
+        // verified through the hardened JOSE path and mapped to an operator via the
+        // fail-closed operator-subject allowlist. It runs after the two service
+        // credentials because an `at+jwt` is a compact JWS, unambiguous vs the opaque
+        // bootstrap token and the `mak_` key; a non-JWS, a disarmed bridge, or any
+        // verification failure returns `None` and falls through to the uniform
+        // `Unauthorized` below (no oracle). This resolves IDENTITY only; the
+        // per-endpoint `require_*` methods still enforce authorization unchanged.
+        if let Some(principal) = state.authenticate_admin_oidc(&token).await? {
+            return Ok(principal);
+        }
         Err(ApiError::Unauthorized(
             "invalid or unknown credential".to_owned(),
         ))
