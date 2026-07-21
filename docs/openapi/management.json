@@ -1188,6 +1188,270 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/signup-form": {
+      "get": {
+        "tags": [
+          "signup-forms"
+        ],
+        "summary": "Get a per-environment, per-client signup form.",
+        "operationId": "getSignupForm",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "client_id",
+            "in": "path",
+            "description": "The authorize client identifier the form governs",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The signup form",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SignupFormView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (absent or in another scope)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "signup-forms"
+        ],
+        "summary": "Set (create or overwrite) a per-environment, per-client signup form.",
+        "operationId": "setSignupForm",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "client_id",
+            "in": "path",
+            "description": "The authorize client identifier the form governs",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetSignupFormRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Set",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SignupFormView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A nonexistent or type-incompatible trait, a widening rule, or a duplicate field",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found or malformed client id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "signup-forms"
+        ],
+        "summary": "Delete a per-environment, per-client signup form.",
+        "operationId": "deleteSignupForm",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "client_id",
+            "in": "path",
+            "description": "The authorize client identifier the form governs",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (absent or in another scope)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}/favicon": {
       "put": {
         "tags": [
@@ -11372,6 +11636,22 @@
           }
         }
       },
+      "SetSignupFormRequest": {
+        "type": "object",
+        "description": "The body to set (create or overwrite) a per-environment, per-client signup form (issue #87).\n\nThe field list is validated FAIL FAST against the scope's active trait schema before the\nwrite: a field that names a nonexistent or type-incompatible trait, a rule that widens the\ntrait, a duplicate order, or a duplicate trait pointer is a loud 400 and nothing is stored.",
+        "required": [
+          "fields"
+        ],
+        "properties": {
+          "fields": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SignupFormFieldView"
+            },
+            "description": "The form's fields."
+          }
+        }
+      },
       "SetUserStateRequest": {
         "type": "object",
         "description": "The body to transition a user's lifecycle state (issue #52).",
@@ -11394,6 +11674,67 @@
           "state": {
             "$ref": "#/components/schemas/UserStateView",
             "description": "The target state."
+          }
+        }
+      },
+      "SignupFormFieldView": {
+        "type": "object",
+        "description": "One field of a signup form, in the management API request and response (issue #87). It\nreferences an identity trait PATH (an RFC 6901 JSON Pointer), whether it is required, its\nrender order, the step it is collected at (`signup` or `later_login`), a NARROWING-ONLY rule\nobject (a subset of the trait schema's closed keyword vocabulary that may only tighten the\ntrait's constraint), and the numeric message id of its label. It carries no secret and no PII.",
+        "required": [
+          "trait_pointer",
+          "required",
+          "order",
+          "step",
+          "label_message_id"
+        ],
+        "properties": {
+          "label_message_id": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The numeric message id of the field's label.",
+            "minimum": 0
+          },
+          "order": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The render order within the form (a total, deterministic order).",
+            "minimum": 0
+          },
+          "required": {
+            "type": "boolean",
+            "description": "Whether the field must be supplied."
+          },
+          "rules": {
+            "description": "The narrowing-only rule set: a JSON object over the trait schema's closed keyword\nvocabulary, each of which may only TIGHTEN the trait's constraint."
+          },
+          "step": {
+            "type": "string",
+            "description": "The step the field is collected at: `signup` or `later_login`."
+          },
+          "trait_pointer": {
+            "type": "string",
+            "description": "The RFC 6901 JSON Pointer naming the identity trait this field collects."
+          }
+        }
+      },
+      "SignupFormView": {
+        "type": "object",
+        "description": "A per-environment, per-client signup form, as returned by the management API (issue #87).",
+        "required": [
+          "client_id",
+          "fields"
+        ],
+        "properties": {
+          "client_id": {
+            "type": "string",
+            "description": "The authorize client id this form governs (the per-environment natural key)."
+          },
+          "fields": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SignupFormFieldView"
+            },
+            "description": "The form's fields."
           }
         }
       },
@@ -12016,6 +12357,10 @@
     {
       "name": "locales",
       "description": "Per-environment localization bundles: set, get, and delete a bundle of numeric message id to plain-text render, strict-validated against the message registry"
+    },
+    {
+      "name": "signup-forms",
+      "description": "Per-environment, per-client signup forms as data: set (fail-fast validated against the active trait schema, narrowing-only rules), get, and delete a form keyed on the authorize client id"
     },
     {
       "name": "brand-assets",

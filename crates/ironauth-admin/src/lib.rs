@@ -73,6 +73,7 @@ mod recovery_approvals;
 mod resource_types;
 mod response;
 mod sessions;
+mod signup_forms;
 mod signup_quarantine;
 mod state;
 mod sudo;
@@ -332,6 +333,15 @@ pub fn management_router(state: AdminState) -> Router {
             put(locales::set_locale)
                 .get(locales::get_locale)
                 .delete(locales::delete_locale),
+        )
+        // Per-environment, per-client signup forms as data (issue #87): set (fail-fast validated
+        // against the active trait schema), get, and delete a form keyed on the authorize client
+        // id.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/signup-form",
+            put(signup_forms::set_signup_form)
+                .get(signup_forms::get_signup_form)
+                .delete(signup_forms::delete_signup_form),
         )
         // Per-environment brand assets (issue #86, PR 3): upload (magic-byte sniffed, size capped,
         // sudo gated) or delete a brand's logo / favicon. The `/logo` and `/favicon` static

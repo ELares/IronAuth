@@ -1574,6 +1574,49 @@ pub struct LocaleBundleView {
     pub entries: std::collections::BTreeMap<String, String>,
 }
 
+/// One field of a signup form, in the management API request and response (issue #87). It
+/// references an identity trait PATH (an RFC 6901 JSON Pointer), whether it is required, its
+/// render order, the step it is collected at (`signup` or `later_login`), a NARROWING-ONLY rule
+/// object (a subset of the trait schema's closed keyword vocabulary that may only tighten the
+/// trait's constraint), and the numeric message id of its label. It carries no secret and no PII.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SignupFormFieldView {
+    /// The RFC 6901 JSON Pointer naming the identity trait this field collects.
+    pub trait_pointer: String,
+    /// Whether the field must be supplied.
+    pub required: bool,
+    /// The render order within the form (a total, deterministic order).
+    pub order: u16,
+    /// The step the field is collected at: `signup` or `later_login`.
+    pub step: String,
+    /// The narrowing-only rule set: a JSON object over the trait schema's closed keyword
+    /// vocabulary, each of which may only TIGHTEN the trait's constraint.
+    #[serde(default)]
+    pub rules: serde_json::Value,
+    /// The numeric message id of the field's label.
+    pub label_message_id: u32,
+}
+
+/// The body to set (create or overwrite) a per-environment, per-client signup form (issue #87).
+///
+/// The field list is validated FAIL FAST against the scope's active trait schema before the
+/// write: a field that names a nonexistent or type-incompatible trait, a rule that widens the
+/// trait, a duplicate order, or a duplicate trait pointer is a loud 400 and nothing is stored.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct SetSignupFormRequest {
+    /// The form's fields.
+    pub fields: Vec<SignupFormFieldView>,
+}
+
+/// A per-environment, per-client signup form, as returned by the management API (issue #87).
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct SignupFormView {
+    /// The authorize client id this form governs (the per-environment natural key).
+    pub client_id: String,
+    /// The form's fields.
+    pub fields: Vec<SignupFormFieldView>,
+}
+
 /// A stored brand asset's METADATA, as returned by the management API upload (issue #86, PR 3).
 /// The bytes are never echoed back; only the by-reference metadata is (the same shape the brand
 /// snapshot carries).

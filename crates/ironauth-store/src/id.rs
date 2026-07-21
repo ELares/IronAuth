@@ -541,6 +541,19 @@ impl ScopedKind for LocaleBundleKind {
     const PREFIX: &'static str = "lcb";
 }
 
+/// Marker for a per-environment, per-client signup form (`sgf_`), one declarative
+/// signup-form-as-data definition per (tenant, environment, client) (issue #87). A
+/// tenant-scoped resource: the id embeds its (tenant, environment), so a form minted in
+/// one scope parses as a uniform not-found under another. A signup form is PROMOTABLE
+/// (issue #41): its field list references identity trait paths as RFC 6901 pointers plus
+/// a narrowing-only rule set, all non-secret per-environment config a config snapshot
+/// carries and a promotion replays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SignupFormKind;
+impl ScopedKind for SignupFormKind {
+    const PREFIX: &'static str = "sgf";
+}
+
 /// Marker for a federation outbound-login correlation-state row (`fls_`), the
 /// short-lived single-use row that correlates an upstream authorize leg to its
 /// callback (issue #75, PR B). A tenant-scoped resource: the id embeds its (tenant,
@@ -1348,6 +1361,9 @@ pub type BrandId = ScopedId<BrandKind>;
 /// A per-environment locale bundle identifier (`lcb_...`), one installed localization per
 /// environment (issue #86, PR 2). Promotable.
 pub type LocaleBundleId = ScopedId<LocaleBundleKind>;
+/// A per-environment, per-client signup form identifier (`sgf_...`), one signup-form-as-data
+/// definition per (tenant, environment, client) (issue #87). Promotable.
+pub type SignupFormId = ScopedId<SignupFormKind>;
 /// A federation outbound-login correlation-state identifier (`fls_...`), the
 /// short-lived single-use row correlating an upstream authorize leg to its callback
 /// (issue #75, PR B).

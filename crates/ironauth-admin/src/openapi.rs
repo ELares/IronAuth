@@ -34,9 +34,10 @@ use crate::views::{
     RecoveryApprovalDecisionView, RecoveryApprovalList, RecoveryApprovalStateView,
     RefreshFamilyList, RefreshFamilyView, ResourceTypeView, ResourceTypesList,
     RevokeSessionsRequest, SessionList, SessionRevocationView, SessionView, SetLocaleRequest,
-    SetUserStateRequest, SignupQuarantineCaseView, SignupQuarantineDecisionView,
-    SignupQuarantineList, SignupQuarantineReasonView, SignupQuarantineStateView, TenantCreated,
-    TenantList, TenantStatusView, TenantView, UpdateUserRequest, UserExternalIdView, UserList,
+    SetSignupFormRequest, SetUserStateRequest, SignupFormFieldView, SignupFormView,
+    SignupQuarantineCaseView, SignupQuarantineDecisionView, SignupQuarantineList,
+    SignupQuarantineReasonView, SignupQuarantineStateView, TenantCreated, TenantList,
+    TenantStatusView, TenantView, UpdateUserRequest, UserExternalIdView, UserList,
     UserRevocationView, UserStateChangeView, UserStateView, UserView,
 };
 
@@ -77,6 +78,10 @@ use crate::views::{
         (name = "locales", description = "Per-environment localization bundles: set, get, and \
                                          delete a bundle of numeric message id to plain-text \
                                          render, strict-validated against the message registry"),
+        (name = "signup-forms", description = "Per-environment, per-client signup forms as data: \
+                                             set (fail-fast validated against the active trait \
+                                             schema, narrowing-only rules), get, and delete a \
+                                             form keyed on the authorize client id"),
         (name = "brand-assets", description = "Per-environment brand assets: upload (magic-byte \
                                               sniffed, size-capped, sudo-gated raster) or delete a \
                                               brand's logo and favicon; svg is refused"),
@@ -157,6 +162,9 @@ use crate::views::{
         crate::locales::set_locale,
         crate::locales::get_locale,
         crate::locales::delete_locale,
+        crate::signup_forms::set_signup_form,
+        crate::signup_forms::get_signup_form,
+        crate::signup_forms::delete_signup_form,
         crate::brand_assets::set_brand_logo,
         crate::brand_assets::delete_brand_logo,
         crate::brand_assets::set_brand_favicon,
@@ -242,6 +250,9 @@ use crate::views::{
         ConnectorHealthView,
         SetLocaleRequest,
         LocaleBundleView,
+        SetSignupFormRequest,
+        SignupFormFieldView,
+        SignupFormView,
         BrandAssetView,
         SessionView,
         SessionList,
