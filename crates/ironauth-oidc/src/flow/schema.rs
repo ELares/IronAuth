@@ -75,7 +75,10 @@ mod tests {
     #[test]
     fn the_messages_snapshot_carries_the_contract_version_and_every_id() {
         let snapshot = flow_messages_snapshot();
-        assert_eq!(snapshot["contract_version"], 1);
+        assert_eq!(
+            snapshot["contract_version"],
+            super::super::model::CONTRACT_VERSION
+        );
         let messages = snapshot["messages"].as_array().expect("messages array");
         assert!(!messages.is_empty(), "the registry is not empty");
         // Every entry carries a numeric id (never a copy string as the key).

@@ -14,13 +14,17 @@
 //! legible:
 //!
 //! - `10xxxxx` informational copy (labels, prompts, titles): `1010xxx` login, `1020xxx`
-//!   registration, `1030xxx` MFA (challenge and enrollment);
+//!   registration, `1030xxx` MFA (challenge and enrollment), `1070xxx` the generic signup
+//!   field label (issue #87, one id for every configured field, the field pointer riding
+//!   the context so the registry stays finite);
 //! - `15xxxxx` success copy;
 //! - `4000xxx` flow level errors (expiry, completion, malformed input);
 //! - `4100xxx` login journey errors (the uniform identifier or password failure, the
 //!   per node validation errors);
 //! - `4200xxx` registration journey errors (the per node validation errors, the uniform
-//!   abuse and policy failures, the open mode duplicate disclosure);
+//!   abuse and policy failures, the open mode duplicate disclosure); `4270xxx` the generic
+//!   signup field validation errors (issue #87, one fixed id per failure KIND, the field
+//!   pointer riding the context);
 //! - `4300xxx` MFA journey errors (the uniform second factor failure, the per node
 //!   validation errors).
 
@@ -192,6 +196,12 @@ pub const FEDERATION_TITLE: MessageId = MessageId(1_060_001);
 /// context, never the copy string, so i18n keys on the id and the context.
 pub const FEDERATION_CONTINUE_LABEL: MessageId = MessageId(1_060_002);
 
+/// The GENERIC signup field label (issue #87): ONE id for every configured signup field, the
+/// field's RFC 6901 trait pointer riding the `field` context so a locale bundle keys per
+/// field copy on the pointer while the numeric id registry stays finite. The default text is
+/// a neutral fallback for a client that does not localize.
+pub const SIGNUP_FIELD_LABEL: MessageId = MessageId(1_070_001);
+
 /// The login success note.
 pub const LOGIN_SUCCESS: MessageId = MessageId(1_500_001);
 /// The registration success note (a new account was created and signed in).
@@ -239,6 +249,25 @@ pub const REGISTER_THROTTLED: MessageId = MessageId(4_200_006);
 /// That identifier is already registered. Emitted ONLY under OPEN registration, where
 /// duplicate disclosure is the accepted posture; the closed/uniform path never emits it.
 pub const REGISTER_ALREADY_REGISTERED: MessageId = MessageId(4_200_007);
+
+/// A required signup field (issue #87) was left empty. GENERIC across every configured
+/// field, the field's RFC 6901 trait pointer riding the `field` context. Existence
+/// independent, so it is never an enumeration oracle.
+pub const SIGNUP_FIELD_REQUIRED: MessageId = MessageId(4_270_001);
+/// A signup field value is below its effective lower bound (issue #87): shorter than the
+/// minimum length, fewer than the minimum items, or less than the numeric minimum. The
+/// field pointer rides the `field` context.
+pub const SIGNUP_FIELD_TOO_SHORT: MessageId = MessageId(4_270_002);
+/// A signup field value is above its effective upper bound (issue #87): longer than the
+/// maximum length, more than the maximum items, or greater than the numeric maximum. The
+/// field pointer rides the `field` context.
+pub const SIGNUP_FIELD_TOO_LONG: MessageId = MessageId(4_270_003);
+/// A signup field value is not one of the enumerated permitted values (issue #87). The
+/// field pointer rides the `field` context.
+pub const SIGNUP_FIELD_NOT_ALLOWED: MessageId = MessageId(4_270_004);
+/// A signup field value is not the expected type or shape (issue #87): it does not match the
+/// field's effective type. The field pointer rides the `field` context.
+pub const SIGNUP_FIELD_INVALID_FORMAT: MessageId = MessageId(4_270_005);
 
 /// The uniform MFA failure: the code was incorrect or expired. The SAME id whether the
 /// code was a wrong TOTP, a replay, or a wrong recovery code (never an oracle).
@@ -429,6 +458,13 @@ pub const REGISTRY: &[MessageSpec] = &[
         context_keys: &["provider"],
     },
     MessageSpec {
+        id: SIGNUP_FIELD_LABEL,
+        name: "signup.field.label",
+        kind: MessageKind::Info,
+        text: "Additional information",
+        context_keys: &["field"],
+    },
+    MessageSpec {
         id: LOGIN_SUCCESS,
         name: "login.success",
         kind: MessageKind::Success,
@@ -560,6 +596,41 @@ pub const REGISTRY: &[MessageSpec] = &[
         kind: MessageKind::Error,
         text: "That identifier is already registered.",
         context_keys: &[],
+    },
+    MessageSpec {
+        id: SIGNUP_FIELD_REQUIRED,
+        name: "signup.field.required",
+        kind: MessageKind::Error,
+        text: "This field is required.",
+        context_keys: &["field"],
+    },
+    MessageSpec {
+        id: SIGNUP_FIELD_TOO_SHORT,
+        name: "signup.field.too_short",
+        kind: MessageKind::Error,
+        text: "This value is too short.",
+        context_keys: &["field"],
+    },
+    MessageSpec {
+        id: SIGNUP_FIELD_TOO_LONG,
+        name: "signup.field.too_long",
+        kind: MessageKind::Error,
+        text: "This value is too long.",
+        context_keys: &["field"],
+    },
+    MessageSpec {
+        id: SIGNUP_FIELD_NOT_ALLOWED,
+        name: "signup.field.not_allowed",
+        kind: MessageKind::Error,
+        text: "This value is not one of the permitted values.",
+        context_keys: &["field"],
+    },
+    MessageSpec {
+        id: SIGNUP_FIELD_INVALID_FORMAT,
+        name: "signup.field.invalid_format",
+        kind: MessageKind::Error,
+        text: "This value is not in the expected format.",
+        context_keys: &["field"],
     },
     MessageSpec {
         id: MFA_CODE_INCORRECT,

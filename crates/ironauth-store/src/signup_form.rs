@@ -152,6 +152,23 @@ pub enum SignupFormError {
         /// The duplicated RFC 6901 trait pointer.
         pointer: String,
     },
+    /// A field names an admin-only trait. The visibility split (issue #53) forbids a
+    /// self-service surface from collecting or writing an admin-only trait, so a signup form
+    /// may never configure one.
+    AdminOnlyTrait {
+        /// The offending RFC 6901 trait pointer.
+        pointer: String,
+    },
+    /// A field's node name (its pointer's leaf token) collides with a reserved built-in flow
+    /// field (the identifier, the password, the submit control, a hidden transport field, or a
+    /// proof-of-work field). Collecting it would read the built-in input's value into a trait,
+    /// so the write is rejected.
+    ReservedFieldName {
+        /// The offending RFC 6901 trait pointer.
+        pointer: String,
+        /// The reserved node name it resolves to.
+        name: String,
+    },
 }
 
 impl fmt::Display for SignupFormError {
@@ -175,8 +192,39 @@ impl fmt::Display for SignupFormError {
             SignupFormError::DuplicateTrait { pointer } => {
                 write!(f, "two fields name the same trait path {pointer}")
             }
+            SignupFormError::AdminOnlyTrait { pointer } => {
+                write!(
+                    f,
+                    "field trait path {pointer} is admin-only and cannot be collected"
+                )
+            }
+            SignupFormError::ReservedFieldName { pointer, name } => {
+                write!(
+                    f,
+                    "field trait path {pointer} resolves to the reserved field name {name}"
+                )
+            }
         }
     }
+}
+
+/// Node names reserved by the built-in flow fields (issue #87). A configured signup field whose
+/// pointer leaf equals one of these, or begins with the `pow_` prefix, would shadow a built-in
+/// input (the identifier, the password, the submit control, a hidden transport field, or a
+/// proof-of-work field) and read its value into a trait, so it is rejected at write time. This
+/// mirrors the reserved names the registration and transport paths read.
+const RESERVED_FIELD_NAMES: [&str; 5] = [
+    "identifier",
+    "password",
+    "method",
+    "flow",
+    "transient_payload",
+];
+
+/// Whether `name` shadows a reserved built-in flow field (issue #87): an exact reserved name or
+/// any `pow_`-prefixed proof-of-work field.
+fn is_reserved_field_name(name: &str) -> bool {
+    RESERVED_FIELD_NAMES.contains(&name) || name.starts_with("pow_")
 }
 
 impl std::error::Error for SignupFormError {}
@@ -190,6 +238,11 @@ impl std::error::Error for SignupFormError {}
 ///   ([`SignupFormError::NonexistentTrait`]);
 /// - a resolved sub-schema whose type is not renderable (not string / number / integer /
 ///   boolean) ([`SignupFormError::TypeIncompatible`]);
+/// - a `trait_pointer` whose top-level trait is admin-only, since the visibility split (issue
+///   #53) forbids a self-service surface from collecting it ([`SignupFormError::AdminOnlyTrait`]);
+/// - a `trait_pointer` whose leaf shadows a reserved built-in flow field (the identifier, the
+///   password, the submit control, a hidden field, or a proof-of-work field)
+///   ([`SignupFormError::ReservedFieldName`]);
 /// - a `rules` object that widens the trait via [`narrows`] ([`SignupFormError::WideningRule`]);
 /// - a duplicate `order` ([`SignupFormError::DuplicateOrder`]); and
 /// - a duplicate `trait_pointer` ([`SignupFormError::DuplicateTrait`]).
@@ -205,6 +258,7 @@ pub fn validate_against_schema(
 ) -> Result<(), SignupFormError> {
     let mut seen_orders: BTreeSet<u16> = BTreeSet::new();
     let mut seen_pointers: BTreeSet<&str> = BTreeSet::new();
+    let annotations = schema.annotations();
     for field in &config.fields {
         if !seen_orders.insert(field.order) {
             return Err(SignupFormError::DuplicateOrder { order: field.order });
@@ -212,6 +266,20 @@ pub fn validate_against_schema(
         if !seen_pointers.insert(field.trait_pointer.as_str()) {
             return Err(SignupFormError::DuplicateTrait {
                 pointer: field.trait_pointer.clone(),
+            });
+        }
+        if let Some(top) = top_level_field(&field.trait_pointer) {
+            if annotations.is_admin_only(&top) {
+                return Err(SignupFormError::AdminOnlyTrait {
+                    pointer: field.trait_pointer.clone(),
+                });
+            }
+        }
+        let name = leaf_field_name(&field.trait_pointer);
+        if is_reserved_field_name(&name) {
+            return Err(SignupFormError::ReservedFieldName {
+                pointer: field.trait_pointer.clone(),
+                name,
             });
         }
         let subschema = schema.subschema_at(&field.trait_pointer).ok_or_else(|| {
@@ -232,6 +300,29 @@ pub fn validate_against_schema(
         }
     }
     Ok(())
+}
+
+/// The top-level trait name a `trait_pointer` addresses (issue #87): the FIRST RFC 6901
+/// reference token, unescaped (`~1` to `/`, `~0` to `~`). Admin-only visibility is declared on
+/// top-level trait names, so `/risk_score` and `/address/zip` resolve to `risk_score` and
+/// `address` respectively. An empty pointer (the whole document) has no top-level field.
+fn top_level_field(pointer: &str) -> Option<String> {
+    pointer
+        .split('/')
+        .nth(1)
+        .map(|token| token.replace("~1", "/").replace("~0", "~"))
+}
+
+/// The node name a `trait_pointer` renders as (issue #87): its LAST RFC 6901 reference token,
+/// unescaped. This matches the flow's `field_name`, so the reserved-name check here rejects
+/// exactly the pointers that would shadow a built-in node.
+fn leaf_field_name(pointer: &str) -> String {
+    pointer
+        .rsplit('/')
+        .next()
+        .unwrap_or(pointer)
+        .replace("~1", "/")
+        .replace("~0", "~")
 }
 
 /// Whether a resolved trait sub-schema declares a RENDERABLE input type (issue #87): its `type`
@@ -341,6 +432,84 @@ mod tests {
             validate_against_schema(&config, &schema()),
             Err(SignupFormError::TypeIncompatible {
                 pointer: "/address".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn an_admin_only_trait_cannot_be_configured_as_a_signup_field() {
+        // The visibility split forbids a self-service form from collecting an admin-only trait,
+        // even when its type is renderable and its rule does not widen.
+        let schema = TraitSchema::compile(
+            &json!({
+                "type": "object",
+                "properties": {
+                    "email": {"type": "string", "minLength": 3},
+                    "risk_score": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "x-ironauth": {"visibility": "admin"}
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("schema compiles");
+        let config = SignupFormConfig {
+            fields: vec![field("/risk_score", 0, json!({}))],
+        };
+        assert_eq!(
+            validate_against_schema(&config, &schema),
+            Err(SignupFormError::AdminOnlyTrait {
+                pointer: "/risk_score".to_owned()
+            })
+        );
+        // A user-visible field on the same schema still validates.
+        let ok = SignupFormConfig {
+            fields: vec![field("/email", 0, json!({}))],
+        };
+        assert_eq!(validate_against_schema(&ok, &schema), Ok(()));
+    }
+
+    #[test]
+    fn a_field_shadowing_a_reserved_built_in_name_is_rejected() {
+        // A trait literally named `password` would render a node named `password`, colliding with
+        // the built-in password input; collecting it would capture the plaintext password as a
+        // trait, so the write is rejected before it can be stored.
+        let schema = TraitSchema::compile(
+            &json!({
+                "type": "object",
+                "properties": {
+                    "password": {"type": "string"},
+                    "pow_nonce": {"type": "string"}
+                }
+            })
+            .to_string(),
+        )
+        .expect("schema compiles");
+        assert_eq!(
+            validate_against_schema(
+                &SignupFormConfig {
+                    fields: vec![field("/password", 0, json!({}))],
+                },
+                &schema
+            ),
+            Err(SignupFormError::ReservedFieldName {
+                pointer: "/password".to_owned(),
+                name: "password".to_owned()
+            })
+        );
+        // The `pow_` prefix is reserved wholesale (proof-of-work fields).
+        assert_eq!(
+            validate_against_schema(
+                &SignupFormConfig {
+                    fields: vec![field("/pow_nonce", 0, json!({}))],
+                },
+                &schema
+            ),
+            Err(SignupFormError::ReservedFieldName {
+                pointer: "/pow_nonce".to_owned(),
+                name: "pow_nonce".to_owned()
             })
         );
     }

@@ -16,11 +16,11 @@
 //! Every route answers a uniform 404 when `flows.enabled` is off (FORK D), so a deployment
 //! that does not use the flow API discloses nothing and the bootstrap pages are untouched.
 
+use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::{Form, Json};
 use ironauth_store::{FlowId, Scope};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -71,10 +71,14 @@ pub const FLOW_API_SUBMIT_PATH: &str =
 
 /// Stamp the flow contract version response header (issue #84, FORK B) onto a response.
 fn with_contract_header(mut response: Response) -> Response {
-    response.headers_mut().insert(
-        header::HeaderName::from_static(FLOW_CONTRACT_HEADER),
-        HeaderValue::from_static("1"),
-    );
+    // The header mirrors the monotonic contract version (issue #84), so it moves with the
+    // constant rather than a hand kept literal (bumped to 2 for the issue #87 constraints
+    // carrier). The decimal render of a `u32` is always a valid header value.
+    let value = HeaderValue::from_str(&super::model::CONTRACT_VERSION.to_string())
+        .unwrap_or_else(|_| HeaderValue::from_static("1"));
+    response
+        .headers_mut()
+        .insert(header::HeaderName::from_static(FLOW_CONTRACT_HEADER), value);
     response
 }
 
@@ -136,39 +140,6 @@ pub struct BrowserCreateQuery {
     /// journeys.
     #[serde(default)]
     connector: Option<String>,
-}
-
-/// The browser POST form: the flow id (a hidden field), the node values, and the optional
-/// transient payload.
-#[derive(Debug, Deserialize)]
-pub struct BrowserSubmitForm {
-    /// The flow id carried back from the hidden field.
-    #[serde(default)]
-    flow: String,
-    /// The identifier field (login and registration).
-    #[serde(default)]
-    identifier: Option<String>,
-    /// The password field (login and registration).
-    #[serde(default)]
-    password: Option<String>,
-    /// The MFA code field (a TOTP or recovery code on the challenge/enroll states).
-    #[serde(default)]
-    code: Option<String>,
-    /// The proof of work challenge id (issue #80), when a registration challenge is required.
-    #[serde(default)]
-    pow_challenge_id: Option<String>,
-    /// The proof of work nonce (issue #80).
-    #[serde(default)]
-    pow_nonce: Option<String>,
-    /// The proof of work request context (issue #80).
-    #[serde(default)]
-    pow_context: Option<String>,
-    /// An external adapter response token (issue #80).
-    #[serde(default)]
-    pow_token: Option<String>,
-    /// The transient payload as a JSON string, or absent.
-    #[serde(default)]
-    transient_payload: Option<String>,
 }
 
 // -------------------------------------------------------------------------------------
@@ -344,7 +315,7 @@ pub async fn flow_browser_post(
     State(state): State<OidcState>,
     Path((tenant_id, environment_id, _journey)): Path<(String, String, String)>,
     headers: HeaderMap,
-    Form(form): Form<BrowserSubmitForm>,
+    body: Bytes,
 ) -> Response {
     if !state.flows_enabled() {
         return disabled_not_found();
@@ -357,26 +328,36 @@ pub async fn flow_browser_post(
     let Some(scope) = parse_scope(&tenant_id, &environment_id) else {
         return error_html(FlowError::NotFound);
     };
-    let Ok(flow_id) = FlowId::parse_in_scope(&form.flow, &scope) else {
+    // The urlencoded form is parsed as an ordered pair list (issue #87) so ARBITRARY named
+    // fields (a configured signup field, keyed on its node name) reach the engine, exactly as
+    // the API transport passes its whole `nodes` map through. The three control fields (the
+    // hidden flow id, the transient payload, and the submit button `method`) are pulled out;
+    // every other field becomes a node value, so browser and API ingest the same node set.
+    let pairs: Vec<(String, String)> = serde_urlencoded::from_bytes(&body).unwrap_or_default();
+    let mut flow = String::new();
+    let mut transient_raw: Option<String> = None;
+    let mut node_values = std::collections::BTreeMap::new();
+    for (name, value) in pairs {
+        match name.as_str() {
+            "flow" => flow = value,
+            "transient_payload" => transient_raw = Some(value),
+            // The submit control is not a node value (it names the chosen method, never a
+            // collected field), so it never enters the node set.
+            "method" => {}
+            _ => {
+                node_values
+                    .entry(name)
+                    .or_insert_with(|| Value::String(value));
+            }
+        }
+    }
+    let Ok(flow_id) = FlowId::parse_in_scope(&flow, &scope) else {
         return error_html(FlowError::NotFound);
     };
-    let transient_payload = match parse_form_transient_payload(form.transient_payload.as_deref()) {
+    let transient_payload = match parse_form_transient_payload(transient_raw.as_deref()) {
         Ok(payload) => payload,
         Err(error) => return error_html(error),
     };
-    let mut node_values = std::collections::BTreeMap::new();
-    let mut insert = |name: &str, value: Option<String>| {
-        if let Some(value) = value {
-            node_values.insert(name.to_owned(), Value::String(value));
-        }
-    };
-    insert("identifier", form.identifier);
-    insert("password", form.password);
-    insert("code", form.code);
-    insert("pow_challenge_id", form.pow_challenge_id);
-    insert("pow_nonce", form.pow_nonce);
-    insert("pow_context", form.pow_context);
-    insert("pow_token", form.pow_token);
     let submission = Submission {
         node_values,
         transient_payload,

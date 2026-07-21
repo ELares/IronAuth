@@ -25,17 +25,70 @@
 //!   session mint and lifecycle fence), called by the driver after the single use
 //!   completion latch trips, so a registration is consumed ONLY on a genuine account create.
 
-use ironauth_store::{ActorRef, AuthPath, CorrelationId, HumanId, Scope, SignupQuarantineReason};
+use ironauth_store::{
+    ActorRef, AuthPath, CorrelationId, HumanId, RegisteredTraits, Scope, SignupFormConfig,
+    SignupQuarantineReason, SignupStep, TraitSchema, UserState,
+};
 
 use super::message::{self, Message, MessageId};
 use super::model::{
     Autocomplete, FlowStateTag, InputType, Node, NodeAttributes, NodeGroup, Transport,
 };
+use super::signup_fields::{self, FieldFailure, SignupValidation};
 use super::{FlowError, Submission};
 use crate::authn::AuthenticationEvent;
 use crate::interaction;
 use crate::state::OidcState;
 use crate::util::epoch_micros;
+
+/// Load the environment's active signup form for a registration flow (issue #87): resolve the
+/// authorize client from the flow's `/authorize` resume target, read that client's active
+/// signup form, and compile the scope's active trait schema. Returns the config, the compiled
+/// schema, and the schema version (the version stamped on the created user's traits), or
+/// [`None`] when the flow has no client, the client has no form, there is no active schema, or
+/// any read faults (a form is a pure additive collection, never a hard block, so any absence
+/// degrades to collecting nothing).
+async fn load_signup_form(
+    state: &OidcState,
+    scope: Scope,
+    return_to: Option<&str>,
+) -> Option<(SignupFormConfig, TraitSchema, i32)> {
+    let client_id = interaction::parse_resume(return_to)?.client_id.to_string();
+    let record = state
+        .store()
+        .scoped(scope)
+        .signup_forms()
+        .get(&client_id)
+        .await
+        .ok()??;
+    let config = SignupFormConfig::from_fields_json(&record.fields_json).ok()?;
+    let active = state
+        .store()
+        .scoped(scope)
+        .trait_schemas()
+        .active()
+        .await
+        .ok()??;
+    let schema = TraitSchema::compile(&active.schema_json).ok()?;
+    Some((config, schema, active.version))
+}
+
+/// The signup field nodes for a freshly created registration flow (issue #87): the Signup-step
+/// fields of the client's active form, appended to the initial details form so the very NEXT
+/// flow created after a management write reflects the change (immediacy, no redeploy). Empty
+/// when the flow collects no fields.
+pub(super) async fn signup_start_nodes(
+    state: &OidcState,
+    scope: Scope,
+    return_to: Option<&str>,
+) -> Vec<Node> {
+    match load_signup_form(state, scope, return_to).await {
+        Some((config, schema, _)) => {
+            signup_fields::signup_field_nodes(&config, &schema, SignupStep::Signup)
+        }
+        None => Vec::new(),
+    }
+}
 
 /// The outcome of one registration transition (issue #84).
 pub(super) enum RegistrationStep {
@@ -77,9 +130,10 @@ pub(super) struct RegistrationSuccess {
 }
 
 /// Build the registration details nodes in the deterministic contract order (issue #84):
-/// the identifier field (Default group) and the new password field plus submit (Password
-/// group). On the browser transport a hidden `flow` node carries the flow id back on the
-/// form post. `id_error` / `pw_error` attach a node level message to the offending node.
+/// the identifier field (Default group), the new password field (Password group), and the
+/// submit control (Submit group, rank 90, so it renders after any collected profile fields).
+/// On the browser transport a hidden `flow` node carries the flow id back on the form post.
+/// `id_error` / `pw_error` attach a node level message to the offending node.
 fn details_nodes(
     transport: Transport,
     flow_id: &str,
@@ -103,6 +157,7 @@ fn details_nodes(
             required: true,
             autocomplete: Some(Autocomplete::Username),
             disabled: false,
+            constraints: None,
         },
         Some(Message::of(message::REGISTER_IDENTIFIER_LABEL)),
     );
@@ -121,6 +176,7 @@ fn details_nodes(
             required: true,
             autocomplete: Some(Autocomplete::NewPassword),
             disabled: false,
+            constraints: None,
         },
         Some(Message::of(message::REGISTER_PASSWORD_LABEL)),
     );
@@ -130,8 +186,8 @@ fn details_nodes(
     nodes.push(password);
 
     nodes.push(Node::input(
-        NodeGroup::Password,
-        10,
+        NodeGroup::Submit,
+        0,
         NodeAttributes::Input {
             name: "method".to_owned(),
             input_type: InputType::Submit,
@@ -139,6 +195,7 @@ fn details_nodes(
             required: false,
             autocomplete: None,
             disabled: false,
+            constraints: None,
         },
         Some(Message::of(message::REGISTER_SUBMIT_LABEL)),
     ));
@@ -154,6 +211,7 @@ fn details_nodes(
                 required: true,
                 autocomplete: None,
                 disabled: false,
+                constraints: None,
             },
             None,
         ));
@@ -228,6 +286,28 @@ pub(super) async fn advance_registration(
         .and_then(|value| value.as_str())
         .unwrap_or("");
 
+    // The client's active signup form (issue #87), loaded ONCE at the live scope so a
+    // management write reflects on the next transition (immediacy). Its Signup-step fields are
+    // appended to every details render and validated on the create attempt below.
+    let signup = load_signup_form(state, scope, record.return_to.as_deref()).await;
+    // Build the details form PLUS the configured signup field nodes, with optional per field
+    // validation messages attached. Ui ordering re-sorts by (group rank, sequence), so the
+    // Profile group signup nodes always render after the identifier and password regardless of
+    // append order.
+    let details_with_signup =
+        |id_err: Option<MessageId>, pw_err: Option<MessageId>, failures: &[FieldFailure]| {
+            let mut nodes = details_nodes(transport, flow_id, identifier, id_err, pw_err);
+            if let Some((config, schema, _)) = &signup {
+                nodes.extend(signup_fields::signup_field_nodes_with_messages(
+                    config,
+                    schema,
+                    SignupStep::Signup,
+                    failures,
+                ));
+            }
+            nodes
+        };
+
     // Credential abuse regulation for the REGISTER path (issue #64), keyed on the canonical
     // identifier and the resolved peer IP, INDEPENDENTLY of the password path. Every
     // processed attempt is counted, so registration spam is throttled per identifier and per
@@ -243,7 +323,7 @@ pub(super) async fn advance_registration(
     };
     if state.regulate_before(&ctx).await.is_throttled() {
         return Ok(RegistrationStep::Render {
-            nodes: details_nodes(transport, flow_id, identifier, None, None),
+            nodes: details_with_signup(None, None, &[]),
             messages: vec![Message::of(message::REGISTER_THROTTLED)],
         });
     }
@@ -255,13 +335,7 @@ pub(super) async fn advance_registration(
     if state.registration_closed() {
         if identifier.is_empty() {
             return Ok(RegistrationStep::Render {
-                nodes: details_nodes(
-                    transport,
-                    flow_id,
-                    identifier,
-                    Some(message::REGISTER_IDENTIFIER_REQUIRED),
-                    None,
-                ),
+                nodes: details_with_signup(Some(message::REGISTER_IDENTIFIER_REQUIRED), None, &[]),
                 messages: Vec::new(),
             });
         }
@@ -296,14 +370,46 @@ pub(super) async fn advance_registration(
         .then_some(message::REGISTER_PASSWORD_REQUIRED);
     if id_error.is_some() || pw_error.is_some() {
         return Ok(RegistrationStep::Render {
-            nodes: details_nodes(transport, flow_id, identifier, id_error, pw_error),
+            nodes: details_with_signup(id_error, pw_error, &[]),
             messages: Vec::new(),
         });
     }
 
+    // Validate the configured signup fields SERVER AUTHORITATIVELY (issue #87, the critical
+    // contract): each value is checked against the trait sub-schema AND the form's narrowing
+    // rule (both must pass, so an empty or partial rule still enforces the full trait). A
+    // failure re-renders the offending field nodes with the generic error id (the field
+    // pointer in context), the SAME node and id on the browser and the API transport. On
+    // success the assembled partial trait document is sealed atomically at the create below.
+    // Existence independent (a field error never depends on whether the identifier exists), so
+    // it is not an enumeration oracle.
+    let collected_traits: Option<(String, i32)> = match &signup {
+        Some((config, schema, version)) => {
+            match signup_fields::validate_signup_submission(
+                config,
+                schema,
+                SignupStep::Signup,
+                &submission.node_values,
+            ) {
+                SignupValidation::Valid(document) => document
+                    .as_object()
+                    .filter(|map| !map.is_empty())
+                    .and_then(|_| serde_json::to_string(&document).ok())
+                    .map(|json| (json, *version)),
+                SignupValidation::Invalid(failures) => {
+                    return Ok(RegistrationStep::Render {
+                        nodes: details_with_signup(None, None, &failures),
+                        messages: Vec::new(),
+                    });
+                }
+            }
+        }
+        None => None,
+    };
+
     let render_details =
         |id_err: Option<MessageId>, pw_err: Option<MessageId>| RegistrationStep::Render {
-            nodes: details_nodes(transport, flow_id, identifier, id_err, pw_err),
+            nodes: details_with_signup(id_err, pw_err, &[]),
             messages: Vec::new(),
         };
 
@@ -404,6 +510,16 @@ pub(super) async fn advance_registration(
     // uniform pending acknowledgment.
     let waitlisted = state.registration_abuse_config().waitlist.enabled;
 
+    // The validated signup traits (issue #87) seal atomically with the account insert, so a
+    // committed account carries its collected traits or neither exists (mirroring `login.rs`
+    // migration create). `None` when the flow collected no fields (an ordinary registration).
+    let registered_traits = collected_traits
+        .as_ref()
+        .map(|(traits_json, schema_version)| RegisteredTraits {
+            traits_json,
+            schema_version: *schema_version,
+        });
+
     let actor = ActorRef::human(HumanId::generate(state.env()));
     let scoped = state
         .store()
@@ -415,22 +531,29 @@ pub(super) async fn advance_registration(
         // review row, rather than parked unauthenticatable in the waitlist.
         scoped
             .users()
-            .register_quarantined(state.env(), identifier, &password_hash, reason)
+            .register_quarantined_with_traits(
+                state.env(),
+                identifier,
+                &password_hash,
+                reason,
+                registered_traits,
+            )
             .await
     } else if waitlisted {
         scoped
             .users()
-            .register_in_state(
+            .register_in_state_with_traits(
                 state.env(),
                 identifier,
                 &password_hash,
-                ironauth_store::UserState::Waitlisted,
+                UserState::Waitlisted,
+                registered_traits,
             )
             .await
     } else {
         scoped
             .users()
-            .register(state.env(), identifier, &password_hash)
+            .register_with_traits(state.env(), identifier, &password_hash, registered_traits)
             .await
     };
 

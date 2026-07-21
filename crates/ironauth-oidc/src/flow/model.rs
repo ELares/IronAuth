@@ -18,6 +18,7 @@
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::{Number, Value};
 
 use super::message::Message;
 
@@ -25,7 +26,12 @@ use super::message::Message;
 /// breaking change; additive changes (a new node group, a new message id) do NOT bump it
 /// and are covered by the golden snapshot gate. Mirrored on the wire as the
 /// `X-IronAuth-Flow-Contract` response header.
-pub const CONTRACT_VERSION: u32 = 1;
+///
+/// Bumped to 2 for issue #87 (signup forms as data): the [`NodeAttributes::Input`] node
+/// gains an optional `constraints` sub-object carrying the effective (trait narrowed by the
+/// form) validation keywords a configured signup field renders under, so a client can offer
+/// the SAME hints the server enforces from one source.
+pub const CONTRACT_VERSION: u32 = 2;
 
 /// The journey a flow drives (issue #84). One object renders every journey; there is no
 /// journey specific client logic.
@@ -184,6 +190,8 @@ pub enum NodeGroup {
     Oidc,
     /// Profile fields collected during registration.
     Profile,
+    /// The terminal submit action, rendered after every collected field.
+    Submit,
 }
 
 impl NodeGroup {
@@ -202,6 +210,7 @@ impl NodeGroup {
             NodeGroup::RecoveryCode => 60,
             NodeGroup::Oidc => 70,
             NodeGroup::Profile => 80,
+            NodeGroup::Submit => 90,
         }
     }
 }
@@ -242,6 +251,58 @@ pub enum Autocomplete {
     Webauthn,
 }
 
+/// The effective validation constraints a configured signup field carries on the wire
+/// (issue #87): the trait sub-schema's closed keyword vocabulary, TIGHTENED by the form's
+/// narrowing rule (the trait always applies, the form only ever narrows). This is a CLIENT
+/// HINT only: it is exactly what the server enforces authoritatively on submit, mirrored to
+/// the wire so a hosted page or a reference SPA validates from ONE source. It carries no
+/// secret and no value except the enumerated permitted values, which are the schema's own
+/// configured members, never user data. Every keyword is skip-if-none, so a field with no
+/// constraint of a given kind omits it.
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, Default, PartialEq, Eq)]
+pub struct FieldConstraints {
+    /// The effective primitive type name (`string` / `number` / `integer` / `boolean`).
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub value_type: Option<String>,
+    /// The permitted values, when the field is enumerated (the schema's configured members).
+    #[serde(rename = "enum", skip_serializing_if = "Option::is_none")]
+    pub allowed: Option<Vec<Value>>,
+    /// The minimum string length.
+    #[serde(rename = "minLength", skip_serializing_if = "Option::is_none")]
+    pub min_length: Option<u64>,
+    /// The maximum string length.
+    #[serde(rename = "maxLength", skip_serializing_if = "Option::is_none")]
+    pub max_length: Option<u64>,
+    /// The minimum array length.
+    #[serde(rename = "minItems", skip_serializing_if = "Option::is_none")]
+    pub min_items: Option<u64>,
+    /// The maximum array length.
+    #[serde(rename = "maxItems", skip_serializing_if = "Option::is_none")]
+    pub max_items: Option<u64>,
+    /// The inclusive numeric lower bound.
+    #[serde(rename = "minimum", skip_serializing_if = "Option::is_none")]
+    pub minimum: Option<Number>,
+    /// The inclusive numeric upper bound.
+    #[serde(rename = "maximum", skip_serializing_if = "Option::is_none")]
+    pub maximum: Option<Number>,
+}
+
+impl FieldConstraints {
+    /// Whether every keyword is absent (an unconstrained field), so the builder can omit the
+    /// sub-object entirely rather than emit an empty one.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.value_type.is_none()
+            && self.allowed.is_none()
+            && self.min_length.is_none()
+            && self.max_length.is_none()
+            && self.min_items.is_none()
+            && self.max_items.is_none()
+            && self.minimum.is_none()
+            && self.maximum.is_none()
+    }
+}
+
 /// The typed attributes of a node (issue #84): a tagged union over the renderable node
 /// kinds. Tagged by `node_type` so a client dispatches on one field.
 #[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
@@ -263,6 +324,11 @@ pub enum NodeAttributes {
         autocomplete: Option<Autocomplete>,
         /// Whether the control is disabled.
         disabled: bool,
+        /// The effective validation constraints (issue #87), for a configured signup field
+        /// only. [`None`] for every built in node (the identifier, the password, an OTP
+        /// code), so those nodes serialize byte identically to before the field was added.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        constraints: Option<FieldConstraints>,
     },
     /// A block of rendered copy (the copy IS a message, so it localizes).
     Text {

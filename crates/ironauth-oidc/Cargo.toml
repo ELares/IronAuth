@@ -216,6 +216,16 @@ name = "flow_inspect"
 path = "tests/flow_inspect.rs"
 required-features = ["testing"]
 
+# Signup forms as data, the flow contract half (issue #87, PR 2): a configured signup field
+# materializes on the next created registration flow (immediacy), a submitted value is validated
+# TRAIT AUTHORITATIVELY (an empty form rule still enforces the full trait), and each failure
+# attaches to the field node under the same generic message id on both transports. Over a real
+# database (DATABASE_URL).
+[[test]]
+name = "flow_signup_fields"
+path = "tests/flow_signup_fields.rs"
+required-features = ["testing"]
+
 # The refresh-token grant end to end (issue #21): the graduated rotation policy
 # (public rotate every refresh, confidential only past the TTL threshold), HTTP-layer
 # reuse detection and family revocation, the offline_access consent rule for web

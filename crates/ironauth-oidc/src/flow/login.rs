@@ -128,6 +128,7 @@ fn identifier_password_nodes(
             required: true,
             autocomplete: Some(Autocomplete::Username),
             disabled: false,
+            constraints: None,
         },
         Some(Message::of(message::LOGIN_IDENTIFIER_LABEL)),
     );
@@ -147,6 +148,7 @@ fn identifier_password_nodes(
             required: true,
             autocomplete: Some(Autocomplete::CurrentPassword),
             disabled: false,
+            constraints: None,
         },
         Some(Message::of(message::LOGIN_PASSWORD_LABEL)),
     );
@@ -165,6 +167,7 @@ fn identifier_password_nodes(
             required: false,
             autocomplete: None,
             disabled: false,
+            constraints: None,
         },
         Some(Message::of(message::LOGIN_SUBMIT_LABEL)),
     ));
@@ -183,6 +186,7 @@ fn identifier_password_nodes(
                 required: true,
                 autocomplete: None,
                 disabled: false,
+                constraints: None,
             },
             None,
         ));

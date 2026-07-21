@@ -119,10 +119,10 @@ async fn a_native_json_client_completes_login_with_no_html() {
         headers
             .get("x-ironauth-flow-contract")
             .and_then(|v| v.to_str().ok()),
-        Some("1"),
+        Some("2"),
         "the contract version header is present"
     );
-    assert_eq!(create["flow"]["contract_version"], 1);
+    assert_eq!(create["flow"]["contract_version"], 2);
     assert_eq!(create["flow"]["journey"], "login");
     assert_eq!(create["flow"]["transport"], "api");
     assert_eq!(create["flow"]["state"], "identifier_password");

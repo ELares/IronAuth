@@ -41,6 +41,10 @@ def prim(t):
         return "boolean"
     if t == "null":
         return "null"
+    # A nullable array member of a type union (the issue #87 signup field `enum` hint carries
+    # `type: ["array", "null"]` with unconstrained items), modelled as an array of unknown.
+    if t == "array":
+        return "Array<unknown>"
     raise SystemExit(f"gen-bindings: unmodeled primitive type {t!r}")
 
 
