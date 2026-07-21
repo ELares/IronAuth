@@ -534,6 +534,7 @@ async fn the_engine_renders_cross_transport_equivalent_start_states_for_every_jo
             return_to,
             None,
             connector,
+            &HeaderMap::new(),
         )
         .await
         .expect("api create");
@@ -545,6 +546,7 @@ async fn the_engine_renders_cross_transport_equivalent_start_states_for_every_jo
             return_to,
             None,
             connector,
+            &HeaderMap::new(),
         )
         .await
         .expect("browser create");

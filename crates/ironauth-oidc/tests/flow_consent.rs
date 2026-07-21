@@ -23,10 +23,39 @@ use axum::http::{HeaderMap, Request, StatusCode, header};
 use common::{Harness, PKCE_CHALLENGE, REDIRECT_URI, enc, form, location};
 use ironauth_config::{OidcConfig, RegulationConfig};
 use ironauth_oidc::{Argon2Params, HashingPool};
+use ironauth_store::CorrelationId;
 use serde_json::{Value, json};
 
 const IDENTIFIER: &str = "consent-user@example.test";
 const PASSWORD: &str = "correct-horse-battery-staple";
+/// A fixed revocation instant (microseconds since the Unix epoch) for the store seam.
+const REVOKE_AT_MICROS: i64 = 1_800_000_000_000_000;
+
+/// The authorization query for the harness client requesting an explicit `scope` value.
+fn authorize_query_with_scope(client_id: &str, scope_value: &str) -> String {
+    format!(
+        "response_type=code&client_id={client_id}&redirect_uri={}&scope={}&state=xyz&nonce=n-1&\
+         code_challenge={PKCE_CHALLENGE}&code_challenge_method=S256",
+        enc(REDIRECT_URI),
+        enc(scope_value),
+    )
+}
+
+/// Record a prior consent grant for (subject, client) directly through the store, the same
+/// audited path the gate uses, so a later authorization can exercise the scope diff.
+async fn pre_grant(harness: &Harness, subject: &str, client_id: &str, scope_value: &str) {
+    harness
+        .store()
+        .scoped(harness.scope())
+        .acting(
+            harness.db().test_actor(harness.env()),
+            CorrelationId::generate(harness.env()),
+        )
+        .consents()
+        .grant(harness.env(), subject, client_id, Some(scope_value))
+        .await
+        .expect("pre-grant");
+}
 
 /// A store-backed, flows-enabled harness with a cheap deterministic Argon2 pool.
 async fn setup() -> Harness {
@@ -436,5 +465,128 @@ async fn with_the_cutover_off_consent_stays_on_the_bootstrap_page() {
     assert!(
         consent_location.starts_with("/consent?return_to="),
         "with the cutover off consent stays on the bootstrap page: {consent_location}"
+    );
+}
+
+// ------------------------------------------------------------------------------------------
+// 6. Scope diff: a prior grant renders only the NEW scopes, and allow records the UNION.
+// ------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn scope_diff_prompts_only_for_new_scopes_and_allow_records_the_union() {
+    let mut harness = setup().await;
+    harness.enable_hosted_pages_cutover();
+    let client_id = harness.client_id().to_string();
+    let scope = harness.scope();
+    let subject = harness.seed_user(IDENTIFIER, PASSWORD).await;
+    let cookie = harness.session_cookie(&subject).await;
+
+    // A prior grant already covers `openid profile`; the new request ADDS `email`.
+    pre_grant(&harness, &subject, &client_id, "openid profile").await;
+    let (_s, headers, _b) = harness
+        .authorize_with_cookie(
+            &authorize_query_with_scope(&client_id, "openid profile email"),
+            &cookie,
+        )
+        .await;
+    let consent_location = location(&headers).expect("consent redirect");
+    assert!(
+        consent_location.starts_with(&consent_browser_path(&harness)),
+        "the added scope re-prompts: {consent_location}"
+    );
+
+    // The consent page renders ONLY the new `email` scope, not the already-granted ones.
+    let (status, _h, html) = harness
+        .get_with_cookie(&consent_location, Some(&cookie))
+        .await;
+    assert_eq!(status, StatusCode::OK, "consent renders: {html}");
+    assert!(
+        html.contains("Access your email address."),
+        "the new email scope is described: {html}"
+    );
+    assert!(
+        !html.contains("Confirm your identity"),
+        "the already-granted openid scope is NOT re-prompted: {html}"
+    );
+    assert!(
+        !html.contains("Access your basic profile information"),
+        "the already-granted profile scope is NOT re-prompted: {html}"
+    );
+
+    // Allow records the UNION (openid profile email), not just the new email scope, and does
+    // not shrink the existing grant.
+    let flow_id = hidden_flow_id(&html);
+    let (status, _headers, body) = post_flow(
+        &harness,
+        &consent_browser_path(&harness),
+        &form(&[("flow", &flow_id), ("decision", "allow")]),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "allow completes: {body}");
+    let recorded = harness
+        .store()
+        .scoped(scope)
+        .consents()
+        .granted_ref(&subject, &client_id)
+        .await
+        .expect("granted_ref read")
+        .expect("a grant is recorded");
+    assert_eq!(
+        recorded.granted_scope.as_deref(),
+        Some("openid profile email"),
+        "allow records the union of the prior grant and the new scope"
+    );
+}
+
+// ------------------------------------------------------------------------------------------
+// 7. A revoked grant re-prompts for the full scope (it does not satisfy the gate).
+// ------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_revoked_grant_re_prompts_for_the_full_scope() {
+    let mut harness = setup().await;
+    harness.enable_hosted_pages_cutover();
+    let client_id = harness.client_id().to_string();
+    let scope = harness.scope();
+    let subject = harness.seed_user(IDENTIFIER, PASSWORD).await;
+    let cookie = harness.session_cookie(&subject).await;
+
+    // Grant, then REVOKE the grant for the whole requested scope.
+    pre_grant(&harness, &subject, &client_id, "openid profile").await;
+    harness
+        .store()
+        .scoped(scope)
+        .acting(
+            harness.db().test_actor(harness.env()),
+            CorrelationId::generate(harness.env()),
+        )
+        .consents()
+        .revoke(harness.env(), &subject, &client_id, REVOKE_AT_MICROS)
+        .await
+        .expect("revoke");
+
+    // The revoked grant does NOT satisfy the gate: the same request re-prompts (rather than
+    // issuing a code), and it re-prompts for the FULL scope (the revoked grant is absent, so
+    // there is no diff to subtract).
+    let (_s, headers, _b) = harness
+        .authorize_with_cookie(&authorize_query(&client_id), &cookie)
+        .await;
+    let consent_location = location(&headers).expect("consent redirect");
+    assert!(
+        consent_location.starts_with(&consent_browser_path(&harness)),
+        "a revoked grant re-prompts: {consent_location}"
+    );
+    let (status, _h, html) = harness
+        .get_with_cookie(&consent_location, Some(&cookie))
+        .await;
+    assert_eq!(status, StatusCode::OK, "consent renders: {html}");
+    assert!(
+        html.contains("Confirm your identity"),
+        "the full scope re-prompts (openid): {html}"
+    );
+    assert!(
+        html.contains("Access your basic profile information"),
+        "the full scope re-prompts (profile): {html}"
     );
 }

@@ -508,11 +508,20 @@ fn start_state(
 /// transitions INTO the MFA states; recovery lands in a later PR), so they are a typed not
 /// found.
 ///
+/// `headers` carry the request's session cookie, read ONLY by the Consent journey (issue #88) to
+/// resolve the authenticated subject for its render-time scope diff (rendering only the scopes an
+/// active prior grant does not already cover). The other journeys ignore it.
+///
 /// # Errors
 ///
 /// [`FlowError::NotFound`] for a journey that is not a creation entry;
 /// [`FlowError::MalformedTransientPayload`] when the transient payload is not well formed
 /// JSON or exceeds the size cap; [`FlowError::Store`] on a persistence fault.
+// Each argument is an independent piece of the creation context (state, scope, transport,
+// journey, and the four per-request inputs: resume target, transient payload, connector, and
+// the headers the Consent journey reads); grouping them into a struct would only rename the same
+// fields the two transports already assemble inline.
+#[allow(clippy::too_many_arguments)]
 pub async fn create_flow(
     state: &OidcState,
     scope: Scope,
@@ -521,6 +530,7 @@ pub async fn create_flow(
     return_to: Option<&str>,
     transient_payload: Option<&serde_json::Value>,
     connector: Option<&str>,
+    headers: &axum::http::HeaderMap,
 ) -> Result<(FlowId, String, Flow), FlowError> {
     // The federation launcher REQUIRES a resume target: the whole point is to resume a pending
     // local `/authorize` after the federated login, and the existing authorize leg refuses an
@@ -567,8 +577,15 @@ pub async fn create_flow(
     // cross-scope, or an unreadable client) renders nothing.
     if journey == Journey::Consent {
         nodes.extend(
-            consent::consent_start_nodes(state, scope, transport, &flow_id.to_string(), return_to)
-                .await,
+            consent::consent_start_nodes(
+                state,
+                scope,
+                transport,
+                &flow_id.to_string(),
+                return_to,
+                headers,
+            )
+            .await,
         );
     }
     let start_step = persisted.step;

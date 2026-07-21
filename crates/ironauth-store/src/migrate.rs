@@ -722,6 +722,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0075_signup_forms.sql"),
         },
+        Migration {
+            version: 76,
+            name: "consent_lockdown",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0076_consent_lockdown.sql"),
+        },
     ]
 }
 

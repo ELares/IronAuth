@@ -92,6 +92,7 @@ async fn observe_and_dry_run_write_no_row_anywhere() {
         None,
         None,
         None,
+        &axum::http::HeaderMap::new(),
     )
     .await
     .expect("create a login flow");
@@ -141,6 +142,7 @@ async fn observe_renders_the_plan_context_and_current_node() {
         None,
         None,
         None,
+        &axum::http::HeaderMap::new(),
     )
     .await
     .expect("create a login flow");

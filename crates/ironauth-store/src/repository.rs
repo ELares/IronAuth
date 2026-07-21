@@ -1831,6 +1831,13 @@ pub struct ClientRecord {
     /// verification badge (a verified client shows a verified badge; an unverified one
     /// shows the unverified badge). Control-plane-write-only.
     pub verified_at_unix_micros: Option<i64>,
+    /// Whether the client is explicitly classified first-party (issue #88): an
+    /// identity property an admin sets on provisioning. The lockdown gate carves a
+    /// first-party client out of the third-party admin-consent requirement (enforced
+    /// in a later PR; stored and selected here). Defaults to false, so a client stays
+    /// third-party until deliberately classified. Control-plane-write-only, like
+    /// `verified_at`.
+    pub first_party: bool,
 }
 
 /// One relying party that participates in a front-channel logout for a given SSO
@@ -2157,7 +2164,7 @@ impl ClientRepo<'_> {
              consent_mode, skip_consent, \
              store_skipped_consent, \
              require_pushed_authorization_requests, quarantined, \
-             step_up_acr, step_up_max_age_secs, logo_uri, \
+             step_up_acr, step_up_max_age_secs, logo_uri, first_party, \
              (EXTRACT(EPOCH FROM verified_at) * 1000000)::bigint AS verified_at_us FROM clients \
              WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
         )
@@ -2185,7 +2192,7 @@ impl ClientRepo<'_> {
              consent_mode, skip_consent, \
              store_skipped_consent, \
              require_pushed_authorization_requests, quarantined, \
-             step_up_acr, step_up_max_age_secs, logo_uri, \
+             step_up_acr, step_up_max_age_secs, logo_uri, first_party, \
              (EXTRACT(EPOCH FROM verified_at) * 1000000)::bigint AS verified_at_us FROM clients \
              WHERE tenant_id = $1 AND environment_id = $2 ORDER BY created_at, id",
         )
@@ -2458,6 +2465,7 @@ impl ClientRepo<'_> {
                 .map(i64::from),
             logo_uri: row.get("logo_uri"),
             verified_at_unix_micros: row.get::<Option<i64>, _>("verified_at_us"),
+            first_party: row.get("first_party"),
         })
     }
 }
@@ -27586,6 +27594,30 @@ pub struct GrantedConsent {
     pub expires_at_unix_micros: Option<i64>,
 }
 
+/// One of a subject's ACTIVE (non-revoked) consent grants (issue #88): the client
+/// it authorizes, the scope it was granted against, its optional remembered expiry,
+/// and when it was granted. Assembled by [`ConsentRepo::list_for_subject`] for the
+/// self-service and admin consent surfaces (which enumerate a subject's grants so
+/// they can be reviewed and revoked). A revoked grant is excluded, so the surfaces
+/// only ever show live authorizations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveConsent {
+    /// The `con_` consent identifier.
+    pub id: String,
+    /// The client the grant authorizes.
+    pub client_id: String,
+    /// The space-separated `scope` the grant was recorded against, or [`None`] when
+    /// the consented request carried no scope.
+    pub granted_scope: Option<String>,
+    /// The remembered-consent expiry in microseconds since the Unix epoch (issue
+    /// #21), or [`None`] when the grant never expires.
+    pub expires_at_unix_micros: Option<i64>,
+    /// When the grant was recorded, in microseconds since the Unix epoch (the
+    /// consent row's `created_at`). A re-consent keeps the original row, so this is
+    /// the FIRST grant instant for the (subject, client) pair.
+    pub granted_at_unix_micros: i64,
+}
+
 /// The read-only consent repository (issue #20).
 pub struct ConsentRepo<'a> {
     store: &'a Store,
@@ -27603,6 +27635,12 @@ impl ConsentRepo<'_> {
     /// re-prompt when a later request's scope is not a subset of the granted scope
     /// rather than auto-granting the broader scope off the narrower recorded one.
     ///
+    /// A REVOKED grant (`revoked_at` set, issue #88) is treated as ABSENT: the
+    /// predicate `revoked_at IS NULL` filters it out, so a revoked grant never
+    /// satisfies the consent gate and the client re-prompts for the full scope. This
+    /// is the security-load-bearing read: the authorization gate's coverage decision
+    /// flows through it, so a revoked grant can never silently auto-authorize.
+    ///
     /// # Errors
     ///
     /// [`StoreError::Database`] on a persistence failure.
@@ -27616,7 +27654,8 @@ impl ConsentRepo<'_> {
             "SELECT id, granted_scope, \
              (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint AS expires_us FROM consents \
              WHERE subject = $1 AND client_id = $2 \
-             AND tenant_id = $3 AND environment_id = $4",
+             AND tenant_id = $3 AND environment_id = $4 \
+             AND revoked_at IS NULL",
         )
         .bind(subject)
         .bind(client_id)
@@ -27630,6 +27669,73 @@ impl ConsentRepo<'_> {
             granted_scope: row.get::<Option<String>, _>("granted_scope"),
             expires_at_unix_micros: row.get::<Option<i64>, _>("expires_us"),
         }))
+    }
+
+    /// Every ACTIVE (non-revoked) consent grant `subject` holds in this scope (issue
+    /// #88), oldest first, for the self-service and admin consent surfaces that let a
+    /// subject review and revoke the clients they have authorized. A REVOKED grant
+    /// (`revoked_at` set) is excluded, so the surfaces show only live authorizations;
+    /// an expired remembered grant is still returned (its expiry is surfaced so the
+    /// reader can present it), matching how [`granted_ref`](Self::granted_ref) leaves
+    /// the expiry check to the caller's clock.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_for_subject(&self, subject: &str) -> Result<Vec<ActiveConsent>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, client_id, granted_scope, \
+             (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint AS expires_us, \
+             (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS granted_us FROM consents \
+             WHERE subject = $1 AND tenant_id = $2 AND environment_id = $3 \
+             AND revoked_at IS NULL \
+             ORDER BY created_at, id",
+        )
+        .bind(subject)
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows
+            .iter()
+            .map(|row| ActiveConsent {
+                id: row.get::<String, _>("id"),
+                client_id: row.get::<String, _>("client_id"),
+                granted_scope: row.get::<Option<String>, _>("granted_scope"),
+                expires_at_unix_micros: row.get::<Option<i64>, _>("expires_us"),
+                granted_at_unix_micros: row.get::<i64, _>("granted_us"),
+            })
+            .collect())
+    }
+
+    /// The `con_` id of the consent row for (subject, client) in scope, if one
+    /// exists, REGARDLESS of whether it is revoked (issue #88). Used ONLY by the
+    /// grant upsert's pre-read so a re-grant of a previously revoked consent finds
+    /// and reactivates the same row (its audit target stays the real id). The gate's
+    /// coverage read is [`granted_ref`](Self::granted_ref), which hides a revoked
+    /// grant; this deliberately does not, so it is never used for a coverage
+    /// decision.
+    async fn existing_id_including_revoked(
+        &self,
+        subject: &str,
+        client_id: &str,
+    ) -> Result<Option<String>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id FROM consents \
+             WHERE subject = $1 AND client_id = $2 \
+             AND tenant_id = $3 AND environment_id = $4",
+        )
+        .bind(subject)
+        .bind(client_id)
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| row.get::<String, _>("id")))
     }
 }
 
@@ -28448,7 +28554,10 @@ impl ActingConsentRepo<'_> {
     /// row; a RE-consent for an already-consented (subject, client) UPDATEs the
     /// stored `granted_scope` in place (issue #196), so broadening a previously
     /// narrow consent is PERSISTED rather than dropped (the old `ON CONFLICT DO
-    /// NOTHING` silently kept the narrow scope, which then re-prompted forever).
+    /// NOTHING` silently kept the narrow scope, which then re-prompted forever). The
+    /// UPDATE branch also CLEARS `revoked_at` (issue #88): re-consenting a previously
+    /// REVOKED grant reactivates the same row, so a fresh grant after a revoke is
+    /// honored rather than staying revoked and re-prompting forever.
     ///
     /// A re-consent's UPDATE branch keeps the row's ORIGINAL id, so a freshly
     /// generated id would be a phantom audit target: it is never persisted, and an
@@ -28523,17 +28632,20 @@ impl ActingConsentRepo<'_> {
         // upsert's UPDATE branch would discard. This read is a separate scoped
         // transaction (the concurrency window is documented on this method); a
         // BROADENING re-consent always finds the row here, so its audit linkage never
-        // drifts.
+        // drifts. It reads the row REGARDLESS of `revoked_at` (unlike the gate's
+        // `granted_ref`, which hides a revoked grant): re-granting a previously REVOKED
+        // consent must find and REACTIVATE the same row, so its audit target stays the
+        // real id rather than drifting to a fresh, never-persisted candidate.
         let candidate = match (ConsentRepo {
             store: self.store,
             scope,
         })
-        .granted_ref(subject, client_id)
+        .existing_id_including_revoked(subject, client_id)
         .await?
         {
             // A row this scope already wrote parses back in scope by construction; it
             // is checked anyway for defense in depth (the anti-oracle boundary).
-            Some(existing) => ConsentId::parse_in_scope(&existing.id, &scope)?,
+            Some(existing) => ConsentId::parse_in_scope(&existing, &scope)?,
             None => ConsentId::generate(env, &scope),
         };
         // The upsert's RETURNING id is read out through this slot: the closure runs
@@ -28562,7 +28674,8 @@ impl ActingConsentRepo<'_> {
                                        + ($7::text || ' microseconds')::interval END) \
                      ON CONFLICT (tenant_id, environment_id, subject, client_id) \
                      DO UPDATE SET granted_scope = EXCLUDED.granted_scope, \
-                                   expires_at = EXCLUDED.expires_at \
+                                   expires_at = EXCLUDED.expires_at, \
+                                   revoked_at = NULL \
                      RETURNING id",
                 )
                 .bind(candidate.to_string())
@@ -28588,6 +28701,75 @@ impl ActingConsentRepo<'_> {
         let stored_id = stored_id.unwrap_or_else(|| candidate.to_string());
         let consent_id = ConsentId::parse_in_scope(&stored_id, &self.scope)?;
         Ok(consent_id)
+    }
+
+    /// REVOKE `subject`'s consent to `client_id` (issue #88): stamp `revoked_at` so
+    /// the authorization gate treats the grant as absent and re-prompts. The grant
+    /// row is never deleted, only marked revoked, so the revocation is auditable and
+    /// a later re-consent reactivates the SAME row (the grant upsert clears
+    /// `revoked_at`).
+    ///
+    /// Idempotent: the guarded UPDATE filters `revoked_at IS NULL`, so revoking an
+    /// ALREADY-revoked or ABSENT grant updates zero rows and is a no-op SUCCESS that
+    /// writes NO audit row (a revocation that did not happen records nothing). A real
+    /// revocation writes exactly one `consent.revoke` audit row in the SAME
+    /// transaction, targeting the revoked consent row, so a revocation without its
+    /// audit row cannot commit.
+    ///
+    /// `revoked_at_micros` is the revocation instant in microseconds since the Unix
+    /// epoch, taken from the CALLER's application clock seam (never `SystemTime`
+    /// here), so the write stays deterministic under a manual clock.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn revoke(
+        &self,
+        env: &Env,
+        subject: &str,
+        client_id: &str,
+        revoked_at_micros: i64,
+    ) -> Result<(), StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "UPDATE consents \
+             SET revoked_at = TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval \
+             WHERE subject = $1 AND client_id = $2 \
+             AND tenant_id = $3 AND environment_id = $4 \
+             AND revoked_at IS NULL \
+             RETURNING id",
+        )
+        .bind(subject)
+        .bind(client_id)
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(revoked_at_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            // Absent or already revoked: an idempotent no-op success. Commit the empty
+            // transaction and record no audit row for a revocation that did not happen.
+            tx.commit().await?;
+            return Ok(());
+        };
+        let id_text: String = row.get("id");
+        let consent_id = ConsentId::parse_in_scope(&id_text, &scope)?;
+        insert_audit_row(
+            &mut tx,
+            &AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ConsentRevoke,
+                target: &consent_id,
+            },
+            None,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
     }
 }
 

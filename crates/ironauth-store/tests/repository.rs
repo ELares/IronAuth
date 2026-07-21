@@ -294,6 +294,357 @@ async fn consent_grant_audit_target_joins_the_persisted_consent_row() {
     );
 }
 
+/// A fixed revocation instant (microseconds since the Unix epoch), passed to
+/// `revoke` from the caller's clock seam (never `SystemTime` inside the store).
+const REVOKE_AT_MICROS: i64 = 1_800_000_000_000_000;
+
+/// Revoke makes a grant ABSENT to the gate and is idempotent (issue #88): after a
+/// revoke, `granted_ref` returns `None` (the revoked grant no longer satisfies the
+/// consent gate) and `list_for_subject` excludes it; revoking an already-revoked or
+/// an absent grant is a no-op SUCCESS.
+#[tokio::test]
+async fn consent_revoke_makes_a_grant_absent_and_is_idempotent() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let subject = "usr_example-subject";
+    let client_id = "cli_example-client";
+
+    // Grant, then confirm it is visible to both the gate read and the list.
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .consents()
+        .grant(&env, subject, client_id, Some("openid profile"))
+        .await
+        .expect("grant");
+    assert!(
+        db.store()
+            .scoped(scope)
+            .consents()
+            .granted_ref(subject, client_id)
+            .await
+            .expect("granted_ref")
+            .is_some(),
+        "the active grant satisfies the gate read"
+    );
+    let active = db
+        .store()
+        .scoped(scope)
+        .consents()
+        .list_for_subject(subject)
+        .await
+        .expect("list_for_subject");
+    assert_eq!(active.len(), 1, "the active grant is listed");
+    assert_eq!(active[0].client_id, client_id);
+    assert_eq!(active[0].granted_scope.as_deref(), Some("openid profile"));
+
+    // Revoke: the grant becomes absent to the gate and drops out of the list.
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .consents()
+        .revoke(&env, subject, client_id, REVOKE_AT_MICROS)
+        .await
+        .expect("revoke");
+    assert!(
+        db.store()
+            .scoped(scope)
+            .consents()
+            .granted_ref(subject, client_id)
+            .await
+            .expect("granted_ref after revoke")
+            .is_none(),
+        "a revoked grant is treated as absent by the gate read"
+    );
+    assert!(
+        db.store()
+            .scoped(scope)
+            .consents()
+            .list_for_subject(subject)
+            .await
+            .expect("list after revoke")
+            .is_empty(),
+        "a revoked grant is excluded from the active list"
+    );
+
+    // Idempotent: revoking again (already revoked) and revoking an absent grant both
+    // succeed as no-ops.
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .consents()
+        .revoke(&env, subject, client_id, REVOKE_AT_MICROS)
+        .await
+        .expect("revoking an already-revoked grant is a no-op success");
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .consents()
+        .revoke(&env, subject, "cli_never-granted", REVOKE_AT_MICROS)
+        .await
+        .expect("revoking an absent grant is a no-op success");
+}
+
+/// A real revocation writes exactly one `consent.revoke` audit row targeting the
+/// revoked consent row; an idempotent no-op revoke writes NONE (issue #88).
+#[tokio::test]
+async fn consent_revoke_audits_only_a_real_revocation() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let subject = "usr_example-subject";
+    let client_id = "cli_example-client";
+
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .consents()
+        .grant(&env, subject, client_id, Some("openid"))
+        .await
+        .expect("grant");
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .consents()
+        .revoke(&env, subject, client_id, REVOKE_AT_MICROS)
+        .await
+        .expect("revoke");
+    // A second (already-revoked) revoke must NOT write another audit row.
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .consents()
+        .revoke(&env, subject, client_id, REVOKE_AT_MICROS)
+        .await
+        .expect("no-op revoke");
+
+    let audit = db
+        .store()
+        .scoped(scope)
+        .audit()
+        .list()
+        .await
+        .expect("audit");
+    let revokes: Vec<_> = audit
+        .iter()
+        .filter(|row| row.action == "consent.revoke")
+        .collect();
+    assert_eq!(
+        revokes.len(),
+        1,
+        "only the real revocation writes a consent.revoke audit row"
+    );
+    assert_eq!(
+        revokes[0].target_kind, "con",
+        "the revoke audit targets a consent id"
+    );
+    let joined: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM consents \
+         WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+    )
+    .bind(&revokes[0].target_id)
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("count consents by audit target id");
+    assert_eq!(
+        joined, 1,
+        "the revoke audit target joins to the consent row"
+    );
+}
+
+/// Re-granting a previously REVOKED consent REACTIVATES the same row (issue #88): the
+/// grant upsert clears `revoked_at`, so a fresh grant after a revoke is honored rather
+/// than staying revoked and re-prompting forever.
+#[tokio::test]
+async fn re_grant_after_revoke_reactivates_the_same_consent_row() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let subject = "usr_example-subject";
+    let client_id = "cli_example-client";
+
+    let first = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .consents()
+        .grant(&env, subject, client_id, Some("openid"))
+        .await
+        .expect("first grant");
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .consents()
+        .revoke(&env, subject, client_id, REVOKE_AT_MICROS)
+        .await
+        .expect("revoke");
+
+    // Re-grant: the same row is reactivated (revoked_at cleared) and keeps its id.
+    let second = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .consents()
+        .grant(&env, subject, client_id, Some("openid profile"))
+        .await
+        .expect("re-grant after revoke");
+    assert_eq!(
+        second, first,
+        "the re-grant reactivates the original consent row"
+    );
+    let recorded = db
+        .store()
+        .scoped(scope)
+        .consents()
+        .granted_ref(subject, client_id)
+        .await
+        .expect("granted_ref")
+        .expect("the reactivated grant is visible again");
+    assert_eq!(recorded.id, first.to_string(), "the row keeps its id");
+    assert_eq!(
+        recorded.granted_scope.as_deref(),
+        Some("openid profile"),
+        "the re-grant records the new scope on the reactivated row"
+    );
+    // Exactly one consents row: the re-grant updated in place rather than inserting.
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM consents")
+        .fetch_one(db.owner_pool())
+        .await
+        .expect("count consents");
+    assert_eq!(rows, 1, "the re-grant updated in place");
+}
+
+/// The `first_party` classification round-trips on `ClientRecord` (issue #88): it
+/// defaults to false on create and reads back true once the control plane sets it.
+#[tokio::test]
+async fn first_party_round_trips_on_the_client_record() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let id = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .clients()
+        .create(&env, "acme web")
+        .await
+        .expect("create");
+    let record = db
+        .store()
+        .scoped(scope)
+        .clients()
+        .get(&id)
+        .await
+        .expect("get");
+    assert!(
+        !record.first_party,
+        "a client is third-party (first_party = false) by default"
+    );
+
+    // The control plane classifies the client as first-party (PR2 only stores and
+    // selects the column; the admin surface lands later, so set it directly here).
+    sqlx::query("UPDATE clients SET first_party = true WHERE id = $1")
+        .bind(id.to_string())
+        .execute(db.owner_pool())
+        .await
+        .expect("classify first-party");
+    let record = db
+        .store()
+        .scoped(scope)
+        .clients()
+        .get(&id)
+        .await
+        .expect("get after classify");
+    assert!(
+        record.first_party,
+        "the first-party classification reads back on ClientRecord"
+    );
+    // It also round-trips through the list read.
+    let listed = db
+        .store()
+        .scoped(scope)
+        .clients()
+        .list()
+        .await
+        .expect("list");
+    assert!(
+        listed.iter().any(|c| c.id == id && c.first_party),
+        "the list read carries first_party too"
+    );
+}
+
+/// The revoke write and the active-list read are RLS-scope isolated (issue #88): a
+/// grant in one scope is invisible and unrevocable from another scope.
+#[tokio::test]
+async fn consent_revoke_and_list_are_cross_scope_isolated() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope_a = db.seed_scope(&env).await;
+    let scope_b = db.seed_scope(&env).await;
+
+    let subject = "usr_example-subject";
+    let client_id = "cli_example-client";
+
+    // Grant in scope A.
+    db.store()
+        .scoped(scope_a)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .consents()
+        .grant(&env, subject, client_id, Some("openid"))
+        .await
+        .expect("grant in scope A");
+
+    // Scope B cannot see it: the active list is empty and a revoke from scope B is a
+    // no-op that does NOT touch scope A's grant (row-level security hides the row).
+    assert!(
+        db.store()
+            .scoped(scope_b)
+            .consents()
+            .list_for_subject(subject)
+            .await
+            .expect("list in scope B")
+            .is_empty(),
+        "scope B does not see scope A's grant"
+    );
+    db.store()
+        .scoped(scope_b)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .consents()
+        .revoke(&env, subject, client_id, REVOKE_AT_MICROS)
+        .await
+        .expect("cross-scope revoke is a no-op success");
+
+    // Scope A's grant is untouched: still active and still listed.
+    assert!(
+        db.store()
+            .scoped(scope_a)
+            .consents()
+            .granted_ref(subject, client_id)
+            .await
+            .expect("granted_ref in scope A")
+            .is_some(),
+        "a cross-scope revoke does not revoke scope A's grant"
+    );
+    assert_eq!(
+        db.store()
+            .scoped(scope_a)
+            .consents()
+            .list_for_subject(subject)
+            .await
+            .expect("list in scope A")
+            .len(),
+        1,
+        "scope A still lists its active grant"
+    );
+}
+
 #[tokio::test]
 async fn post_logout_redirect_uris_register_read_and_validate() {
     // RP-Initiated Logout (issue #33): a client's post_logout_redirect_uris are an
