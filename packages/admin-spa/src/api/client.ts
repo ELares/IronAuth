@@ -104,6 +104,16 @@ export type CreateInitialAccessTokenRequest =
 export type InitialAccessTokenCreated =
   components["schemas"]["InitialAccessTokenCreated"];
 
+// The recorded client-authentication failure diagnostic the admin flow inspector
+// reads (issue #91). Re-exported from the generated schema so the diagnostics view
+// never hand maintains a shape the management contract already owns. It carries ONLY
+// the safe, non secret fields the server projects (the specific failure reason, the
+// assertion key id and algorithm, the derived clock skew, the expectation hint); the
+// token endpoint's wire response for every such failure stays the opaque
+// invalid_client.
+export type ClientAuthDiagnosticView =
+  components["schemas"]["ClientAuthDiagnosticView"];
+
 export type ManagementClient = ReturnType<typeof createClient<paths>>;
 
 // A management call that failed carries the verbatim ErrorBody the server
@@ -836,6 +846,83 @@ export async function createDcrInitialAccessToken(
     throw new ManagementError(toErrorBody(error), response.status);
   }
   return data;
+}
+
+// ---- The diagnostics read operations (issue #91, M9 flow inspector) ---------
+//
+// The diagnostics view (src/ui/DiagnosticsView.tsx) calls this named wrapper, never
+// a path, so the single funnel holds: the literal below is the path the committed
+// docs/openapi/management.json documents, the diagnostics live UNDER the active
+// {tenant, environment} scope, and the ids substitute into the documented path
+// parameters exactly as the connectors and users wrappers inject them. It throws a
+// ManagementError carrying the verbatim ErrorBody on a non 2xx (the same
+// bodyless-non-2xx guard as the reads above), which the ErrorView boundary renders
+// unchanged. The read is bounded server side (at most 500 rows, oldest first); the
+// optional filters narrow it by client id and time window.
+
+// The optional filters the diagnostics read narrows by. The two instants are unix
+// microseconds, matching the documented `since`/`until` query parameters.
+export interface ClientAuthDiagnosticsFilter {
+  clientId?: string;
+  sinceUnixMicros?: number;
+  untilUnixMicros?: number;
+  limit?: number;
+}
+
+// Read the environment's recorded client-authentication failure diagnostics
+// (operationId getClientAuthDiagnostics). Scope injection: the active tenant and
+// environment ids substitute into the documented path, targeting
+// `/v1/tenants/<t>/environments/<e>/diagnostics/client-auth`. Only the filters the
+// caller set are sent, so an empty filter reads the whole (bounded) scope window.
+// A page of client auth diagnostics: the newest first rows plus whether the result
+// hit the limit (older matching failures left out), so the view can tell the operator
+// to narrow the window rather than silently dropping the tail.
+export interface ClientAuthDiagnosticsPage {
+  readonly items: ClientAuthDiagnosticView[];
+  readonly truncated: boolean;
+}
+
+export async function fetchClientAuthDiagnostics(
+  tenantId: string,
+  environmentId: string,
+  filter: ClientAuthDiagnosticsFilter = {},
+): Promise<ClientAuthDiagnosticsPage> {
+  const client = createManagementClient();
+  const query: {
+    client_id?: string;
+    since?: number;
+    until?: number;
+    limit?: number;
+  } = {};
+  if (filter.clientId !== undefined && filter.clientId !== "") {
+    query.client_id = filter.clientId;
+  }
+  if (filter.sinceUnixMicros !== undefined) {
+    query.since = filter.sinceUnixMicros;
+  }
+  if (filter.untilUnixMicros !== undefined) {
+    query.until = filter.untilUnixMicros;
+  }
+  if (filter.limit !== undefined) {
+    query.limit = filter.limit;
+  }
+  const { data, error, response } = await client.GET(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/client-auth",
+    {
+      params: {
+        path: { tenant_id: tenantId, environment_id: environmentId },
+        query,
+      },
+    },
+  );
+  // A non 2xx is a failure even when openapi-fetch yields no error body (it
+  // returns `error: undefined` for a bodyless response, for example a 401 or 502
+  // with Content-Length 0 from a proxy or gateway). Checking `response.ok` too
+  // means such a response is never silently read as success (an empty list).
+  if (error !== undefined || !response.ok) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return { items: data?.items ?? [], truncated: data?.truncated ?? false };
 }
 
 // ---- The users CRUD operations (issue #90, PR 5) ----------------------------

@@ -3057,6 +3057,131 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/client-auth": {
+      "get": {
+        "tags": [
+          "diagnostics"
+        ],
+        "summary": "Read the environment's recorded client authentication failure diagnostics.",
+        "operationId": "getClientAuthDiagnostics",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "client_id",
+            "in": "query",
+            "description": "Restrict to one client identifier, or absent for every client in scope.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "since",
+            "in": "query",
+            "description": "Only failures at or after this instant, unix microseconds. Absent for no lower\nbound.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "until",
+            "in": "query",
+            "description": "Only failures strictly before this instant, unix microseconds. Absent for no\nupper bound.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "The maximum number of rows to return, a positive integer. Clamped to the\nrepository's hard ceiling ([`ClientAuthDiagnosticsRepo::MAX_QUERY_LIMIT`]), so\na caller can never request an unbounded scan. Defaults to that ceiling.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The environment's recorded client authentication failure diagnostics, oldest first, filtered by client and time window and bounded to at most 500 rows. Each carries only the safe, non secret fields the store record holds: the specific failure reason, the assertion key id and algorithm, the derived clock skew bucket, and the expectation hint. The token endpoint's wire response for every one of these failures stays the uniform, opaque invalid_client.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientAuthDiagnosticsList"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed filter value",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/export": {
       "get": {
         "tags": [
@@ -8123,6 +8248,85 @@
           }
         }
       },
+      "ClientAuthDiagnosticView": {
+        "type": "object",
+        "description": "One recorded client authentication failure diagnostic (issue #91).\n\nEvery field is a bounded, non secret datum the store record already holds: the\n`client_id`, `key_id`, and `signing_alg` are attacker influenced but non secret\nidentifiers the failed attempt itself presented, and `reason`, `skew_seconds`,\nand `expected` are derived, bounded cardinality values. There is deliberately NO\nfield for an assertion body, a secret, or a token: the wire response stayed the\nopaque `invalid_client`, and this record is the ONLY additional detail.",
+        "required": [
+          "client_id",
+          "auth_method",
+          "reason",
+          "occurred_at_unix_micros"
+        ],
+        "properties": {
+          "auth_method": {
+            "type": "string",
+            "description": "The token endpoint authentication method the attempt used."
+          },
+          "client_id": {
+            "type": "string",
+            "description": "The client identifier the failed attempt claimed."
+          },
+          "expected": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The derived, bounded expectation hint, if recorded (for example\n`kid_not_in_registered_jwks`). Never the JWKS and never a key."
+          },
+          "key_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The assertion header `kid`, if the attempt presented a JWT assertion."
+          },
+          "occurred_at_unix_micros": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When the failed attempt happened, unix microseconds from the application clock."
+          },
+          "reason": {
+            "type": "string",
+            "description": "The bounded cardinality failure reason (for example `assertion_bad_signature`,\n`assertion_expired`, `assertion_clock_skew`, `assertion_audience_mismatch`,\n`assertion_kid_unknown`, `assertion_algorithm_disallowed`, `bad_secret`)."
+          },
+          "signing_alg": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The assertion header `alg`, if the attempt presented a JWT assertion."
+          },
+          "skew_seconds": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The derived, bounded clock skew bucket in seconds, if recorded: how far the\npresented `exp`/`nbf` fell outside the tolerance window (positive = expired\npast the window, negative = not yet valid). Never the assertion."
+          }
+        }
+      },
+      "ClientAuthDiagnosticsList": {
+        "type": "object",
+        "description": "A page of recorded client authentication diagnostics (issue #91).",
+        "required": [
+          "items",
+          "truncated"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ClientAuthDiagnosticView"
+            },
+            "description": "The diagnostics matching the query, NEWEST first, bounded by the limit, so a\ncapped result keeps the most recent failures (what a live incident is about)."
+          },
+          "truncated": {
+            "type": "boolean",
+            "description": "True when the result hit the limit and older matching failures were left out;\nthe operator should narrow the client or time window (never a silent truncation)."
+          }
+        }
+      },
       "ClientVerificationView": {
         "type": "object",
         "description": "A dynamically registered client's verification state (issue #31), as returned by\nthe management API. `quarantined` is the live gate the authorization/consent path\nhonors; `verified_at_unix_ms` records when an admin lifted the quarantine.",
@@ -10905,6 +11109,10 @@
     {
       "name": "migration",
       "description": "Inbound lazy-migration progress (issue #56): how far an environment's lazy migration has come and the node's circuit-breaker state"
+    },
+    {
+      "name": "diagnostics",
+      "description": "Admin flow inspector diagnostics (issue #91): the rich, structured record of WHY a client authentication failed (the specific reason, the assertion key id and algorithm, the derived clock skew, the expectation hint), kept off the wire while the token endpoint's response stays the opaque invalid_client"
     },
     {
       "name": "sudo",

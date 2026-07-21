@@ -253,6 +253,16 @@ name = "connector_health"
 path = "tests/connector_health.rs"
 required-features = ["testing"]
 
+# The client authentication diagnostics read (issue #91, M9 flow inspector): the
+# endpoint returns the scope's recorded failures, filters by client and time window,
+# is IDOR safe (a cross-tenant read resolves to nothing and a wrong-scope key is
+# refused), and exposes only the safe, non-secret fields. Needs a real database
+# (DATABASE_URL).
+[[test]]
+name = "diagnostics"
+path = "tests/diagnostics.rs"
+required-features = ["testing"]
+
 # The OIDC-session credential bridge (issue #90, PR 2): the console signs in via
 # IronAuth's own OIDC and receives an at+jwt bound to the management audience; the
 # third resolution arm verifies it (signature vs the admin issuer JWKS, iss, aud,
