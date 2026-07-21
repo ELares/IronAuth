@@ -24,8 +24,8 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::Semaphore;
 
 use ironauth_config::{
-    AdvancedRecoveryConfig, ClientAssertionAudience, ClientCredentialsAudience, OidcConfig,
-    QuarantineConfig, RegistrationMode,
+    AdvancedRecoveryConfig, ClientAssertionAudience, ClientCredentialsAudience,
+    DiagnosticVerbosity, DiagnosticsConfig, OidcConfig, QuarantineConfig, RegistrationMode,
 };
 use ironauth_env::Env;
 use ironauth_jose::{JwsAlgorithm, TrustedKey, VerificationPolicy, VerifiedToken, verify};
@@ -263,6 +263,22 @@ pub struct OidcState {
     // cutover is gated on BOTH flags through `hosted_pages_cutover` so it is inert whenever the
     // flow engine that renders the pages is itself off.
     hosted_pages_enabled: bool,
+    // How much of a client-authentication failure the out-of-band diagnostics sink
+    // records (issue #91). Kept OUTSIDE `Inner` and set through the builder because it
+    // is sourced from the TOP-LEVEL `[diagnostics]` config section
+    // (`diagnostics.verbosity`), not from `OidcConfig`, exactly like `flows_enabled`.
+    // Verbosity NEVER widens what a diagnostic can REPRESENT (the structural redaction
+    // guarantee holds at every verbosity); it only chooses which safe fields populate.
+    // Default: `Standard` (the rich failure reason plus the assertion header, without
+    // the derived skew / hint), so the existing behavior is unchanged until an operator
+    // opts into `verbose` or silences the sink with `off`.
+    diagnostics_verbosity: DiagnosticVerbosity,
+    // How long a client-authentication diagnostic is retained before the on-insert
+    // prune reclaims it (issue #91), threaded from `diagnostics.retention_secs`
+    // (replacing the former hard-coded store constant), in epoch microseconds (the
+    // unit the store prune binds). Kept OUTSIDE `Inner` and set through the builder for
+    // the SAME top-level-config reason as the verbosity. Default: seven days.
+    diagnostic_retention_micros: i64,
     // The per-tenant/per-environment quota enforcer (issue #50), the data plane's
     // tenant-fairness layer. Kept OUTSIDE `Inner` and installed by the boot path
     // (built from the [quota] config, seeded with the SAME env clock), so a spend
@@ -822,6 +838,8 @@ impl OidcState {
             advanced_recovery_enabled: false,
             flows_enabled: false,
             hosted_pages_enabled: false,
+            diagnostics_verbosity: DiagnosticVerbosity::Standard,
+            diagnostic_retention_micros: default_diagnostic_retention_micros(),
             quota: None,
             migration_hook: None,
             hashing_pool: None,
@@ -1032,6 +1050,37 @@ impl OidcState {
     #[must_use]
     pub fn hosted_pages_enabled(&self) -> bool {
         self.hosted_pages_enabled
+    }
+
+    /// Install the admin diagnostics knobs (issue #91). The boot path resolves the
+    /// TOP-LEVEL `[diagnostics]` config section and passes it here: the verbosity
+    /// (default `standard`; `off` makes the client-auth diagnostics sink a no-op;
+    /// `verbose` adds the derived skew / hint) and the retention window (default seven
+    /// days, hard-capped at ninety days by config load), which replaces the former
+    /// hard-coded store constant and is threaded into the on-insert prune. Verbosity
+    /// never widens what a diagnostic can REPRESENT, only which safe fields populate,
+    /// so the wire response is unchanged at every verbosity.
+    #[must_use]
+    pub fn with_diagnostics(mut self, config: &DiagnosticsConfig) -> Self {
+        self.diagnostics_verbosity = config.verbosity;
+        self.diagnostic_retention_micros = retention_secs_to_micros(config.retention_secs);
+        self
+    }
+
+    /// How much of a client-authentication failure the diagnostics sink records
+    /// (issue #91). `off` suppresses recording entirely; the wire response is the
+    /// opaque `invalid_client` at every verbosity.
+    #[must_use]
+    pub fn diagnostics_verbosity(&self) -> DiagnosticVerbosity {
+        self.diagnostics_verbosity
+    }
+
+    /// The client-authentication diagnostic retention window in epoch microseconds
+    /// (issue #91), threaded into the store's on-insert prune. Sourced from
+    /// `diagnostics.retention_secs` (default seven days, hard-capped at ninety days).
+    #[must_use]
+    pub fn diagnostic_retention_micros(&self) -> i64 {
+        self.diagnostic_retention_micros
     }
 
     /// Whether the `/authorize` login and registration interaction redirects should retarget onto
@@ -3180,6 +3229,21 @@ fn map_token_format(format: ironauth_config::TokenFormat) -> TokenFormat {
         ironauth_config::TokenFormat::AtJwt => TokenFormat::AtJwt,
         ironauth_config::TokenFormat::Opaque => TokenFormat::Opaque,
     }
+}
+
+/// Convert a diagnostic retention in whole seconds to epoch microseconds (issue #91),
+/// saturating so an absurd value can never overflow `i64` (config load already caps it
+/// at ninety days, but this is total regardless of the caller).
+fn retention_secs_to_micros(secs: u64) -> i64 {
+    i64::try_from(secs)
+        .unwrap_or(i64::MAX)
+        .saturating_mul(1_000_000)
+}
+
+/// The default client-authentication diagnostic retention in epoch microseconds
+/// (issue #91), seven days, used until the boot path installs the configured value.
+fn default_diagnostic_retention_micros() -> i64 {
+    retention_secs_to_micros(ironauth_config::DIAGNOSTICS_DEFAULT_RETENTION_SECS)
 }
 
 /// Keep the escalation with the LARGER delay (issue #64): the binding layer is the one

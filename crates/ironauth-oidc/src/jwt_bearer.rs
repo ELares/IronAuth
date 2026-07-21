@@ -570,6 +570,12 @@ async fn record_diagnostic(
     assertion: &str,
     reason: ClientAuthDiagnosticReason,
 ) {
+    // Verbosity off makes recording a no-op (issue #91); the grant decision and its
+    // wire response are unchanged. The JWT bearer grant records only the base fields
+    // (no derived skew / hint), so nothing extra is gated by `standard` vs `verbose`.
+    if state.diagnostics_verbosity() == ironauth_config::DiagnosticVerbosity::Off {
+        return;
+    }
     let (alg, kid) = peek_assertion_header(assertion);
     if let Err(error) = state
         .store()
@@ -577,12 +583,15 @@ async fn record_diagnostic(
         .client_auth_diagnostics()
         .record(
             state.env(),
+            state.diagnostic_retention_micros(),
             NewClientAuthDiagnostic {
                 client_id,
                 auth_method: JWT_BEARER_METHOD_MARKER,
                 reason,
                 key_id: kid.as_deref(),
                 signing_alg: alg.as_deref(),
+                skew_seconds: None,
+                expected: None,
             },
         )
         .await

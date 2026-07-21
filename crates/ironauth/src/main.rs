@@ -13,7 +13,7 @@ use std::sync::Arc;
 use axum::Router;
 use ironauth_admin::{AdminOidcBridge, AdminState};
 use ironauth_config::{
-    ADVANCED_RECOVERY_FEATURE, Config, FEDCM_FEATURE, FeatureRegistry,
+    ADVANCED_RECOVERY_FEATURE, Config, DiagnosticsConfig, FEDCM_FEATURE, FeatureRegistry,
     GLOBAL_TOKEN_REVOCATION_FEATURE, Loaded, OidcConfig, PasswordHashingConfig,
     PasswordPolicyConfig, QuotaConfig, RISK_SIGNALS_FEATURE, SIGNUP_QUARANTINE_FEATURE,
     ScreeningFailurePolicy, ScreeningProvider,
@@ -312,6 +312,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
                 config.quota.clone(),
                 config.password_hashing.clone(),
                 config.password_policy.clone(),
+                config.diagnostics.clone(),
             ))
         } else {
             None
@@ -346,6 +347,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             quota_config,
             hashing_config,
             policy_config,
+            diagnostics_config,
         )) = oidc_inputs
         {
             let issuer_base = server.base_url();
@@ -365,6 +367,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
                 &quota_config,
                 &hashing_config,
                 &policy_config,
+                &diagnostics_config,
                 migration_hook,
                 federation_runtime,
             )
@@ -670,6 +673,7 @@ async fn build_oidc_router(
     quota_config: &QuotaConfig,
     hashing_config: &PasswordHashingConfig,
     policy_config: &PasswordPolicyConfig,
+    diagnostics_config: &DiagnosticsConfig,
     migration_hook: Option<Arc<LazyMigrationHook>>,
     federation_runtime: Option<Arc<FederationRuntime>>,
 ) -> Option<Router> {
@@ -780,6 +784,7 @@ async fn build_oidc_router(
         .with_advanced_recovery_enabled(advanced_recovery_enabled)
         .with_flows_enabled(flows_enabled)
         .with_hosted_pages_enabled(hosted_pages_enabled)
+        .with_diagnostics(diagnostics_config)
         .with_quota_enforcer(quota_enforcer)
         .with_hashing_pool(hashing_pool)
         .with_password_policy(password_policy, screening_failure, screen_on_login)

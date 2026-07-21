@@ -499,6 +499,16 @@ name = "client_assertion"
 path = "tests/client_assertion.rs"
 required-features = ["testing"]
 
+# The HARD wire-vs-diagnostic invariant for the widened client-authentication
+# diagnostics (issue #91): every widened failure reason (bad signature, expired, clock
+# skew, audience mismatch, unknown kid, disallowed algorithm, plus the coarse secret-path
+# reasons) yields a BYTE-IDENTICAL opaque invalid_client wire response, and only the
+# out-of-band diagnostic record carries the specific reason. Over a real database.
+[[test]]
+name = "diagnostics_wire_invariance"
+path = "tests/diagnostics_wire_invariance.rs"
+required-features = ["testing"]
+
 # The JWT bearer assertion grant (issue #26, RFC 7521 4.1 / RFC 7523): a simulated
 # external issuer (inline jwks and jwks_uri key sources) exchanges an assertion for a
 # mapped-identity access token; the full negative matrix (unregistered/disabled

@@ -7,10 +7,11 @@ use ironauth_env::Env;
 use ironauth_store::idor_harness::{IdorHarness, UPSTREAM_TOKEN_PROBE_CONNECTOR};
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
-    AuthorizationCodeId, ClientId, ConnectorCapabilities, ConnectorId, CorrelationId,
-    CredentialType, FederationLoginStateId, GrantId, IssueCode, NewConnector,
-    NewFederationLoginState, NewRefreshFamily, NewSession, NewUpstreamTokens, RefreshFamilyId,
-    RefreshTokenId, Scope, SessionId, StoreError, UpstreamTokenId, UserId, refresh_token_digest,
+    AuthorizationCodeId, ClientAuthDiagnosticReason, ClientId, ConnectorCapabilities, ConnectorId,
+    CorrelationId, CredentialType, FederationLoginStateId, GrantId, IssueCode,
+    NewClientAuthDiagnostic, NewConnector, NewFederationLoginState, NewRefreshFamily, NewSession,
+    NewUpstreamTokens, RefreshFamilyId, RefreshTokenId, Scope, SessionId, StoreError,
+    UpstreamTokenId, UserId, refresh_token_digest,
 };
 
 /// A timestamp far past any test's clock, so a planted fixture never expires mid-test.
@@ -606,6 +607,81 @@ async fn upstream_token_read_is_connector_filtered() {
         b"upstream-at",
         "the token round-trips when the read connector matches the capture connector"
     );
+}
+
+#[tokio::test]
+async fn client_auth_diagnostic_read_is_cross_scope_isolated() {
+    // A client's recorded authentication-failure diagnostics (issue #91) planted in another
+    // tenant or environment must never resolve under the caller's scope, or the M9 admin flow
+    // inspector would leak which foreign clients were failing to authenticate and how. The
+    // probe's foreign identifier is the CLIENT ID (the M9 view's read key). Run on the DATA
+    // store (ironauth_app), which holds the sink's SELECT grant.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+
+    let scope_a = db.seed_scope(&env).await;
+    let scope_b = db.seed_scope(&env).await;
+    let env_a2 = db.seed_environment(&env, scope_a.tenant()).await;
+    let scope_a2 = Scope::new(scope_a.tenant(), env_a2);
+
+    // The SAME client id string is used in each foreign scope, so a leak could only come from a
+    // scope boundary miss (not from the id being globally unique).
+    let victim_client = "cli_victim_diag";
+    plant_diagnostic(&db, &env, scope_b, victim_client).await;
+    plant_diagnostic(&db, &env, scope_a2, victim_client).await;
+
+    let mut harness = IdorHarness::new();
+    harness.register_diagnostic_probes();
+    assert_eq!(
+        harness.probe_names(),
+        vec!["client_auth_diagnostics.query"],
+        "the client-auth diagnostics read surface is registered with the harness"
+    );
+
+    let foreign = [victim_client.to_string()];
+    let refs: Vec<&str> = foreign.iter().map(String::as_str).collect();
+    let leaks = harness.run(db.store(), scope_a, &refs).await;
+    assert!(leaks.is_empty(), "cross-scope leak detected: {leaks:?}");
+
+    // Each victim's diagnostic is STILL readable in its OWN scope (the cross-scope probe never
+    // touched it), proving the isolation is a genuine scope boundary, not a global miss.
+    for scope in [scope_b, scope_a2] {
+        let rows = db
+            .store()
+            .scoped(scope)
+            .client_auth_diagnostics()
+            .for_client(victim_client)
+            .await
+            .expect("read in own scope");
+        assert_eq!(
+            rows.len(),
+            1,
+            "the diagnostic survives every cross-scope probe in its own scope"
+        );
+    }
+}
+
+/// Plant one client-authentication diagnostic for `client_id` in `scope` (a far-future
+/// retention, so the on-insert prune never reclaims it mid-test), for the read isolation probe.
+async fn plant_diagnostic(db: &TestDatabase, env: &Env, scope: Scope, client_id: &str) {
+    db.store()
+        .scoped(scope)
+        .client_auth_diagnostics()
+        .record(
+            env,
+            FAR_FUTURE_MICROS,
+            NewClientAuthDiagnostic {
+                client_id,
+                auth_method: "private_key_jwt",
+                reason: ClientAuthDiagnosticReason::AssertionBadSignature,
+                key_id: Some("kprobe"),
+                signing_alg: Some("ES256"),
+                skew_seconds: None,
+                expected: None,
+            },
+        )
+        .await
+        .expect("plant client-auth diagnostic");
 }
 
 /// Plant a captured upstream token keyed on a fresh session in `scope`, returning the

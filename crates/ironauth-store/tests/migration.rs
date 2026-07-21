@@ -494,8 +494,8 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
     );
     assert_eq!(
         report.already_applied(),
-        70,
-        "the production chain is exactly seventy migrations (isolation, audit log, management \
+        71,
+        "the production chain is exactly seventy one migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -513,17 +513,17 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
          federation login state, enterprise inbound routing, upstream token vault, \
          guarded account links, account linking wiring, FedCM assertion nonces, third-party \
          risk signals, signup fraud review, advanced recovery modes, headless flows, branding, \
-         locale bundles, brand assets)"
+         locale bundles, brand assets, diagnostic reason detail)"
     );
 
-    // The ledger holds exactly versions 1 through 70.
+    // The ledger holds exactly versions 1 through 71.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
             46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67,
-            68, 69, 70
+            68, 69, 70, 71
         ]
     );
     let phase_of = |version: i64| async move {
@@ -1432,6 +1432,56 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
     assert!(
         partial_unique_index_exists(pool, "brands", "brands_client_id_idx").await,
         "brands must carry the per-scope client_id partial unique index"
+    );
+
+    // The diagnostic-reason-detail migration (issue #91) is an EXPAND: two additive nullable
+    // columns (skew_seconds, expected) on the EXISTING client_auth_diagnostics table for the M9
+    // flow inspector's richer reasons, no rewrite of existing state.
+    assert_eq!(phase_of(71).await, "expand");
+
+    // The two derived, non-secret columns exist and are NULLABLE (NULL for every pre-#91 row and
+    // for a standard-verbosity capture; only a verbose capture of the relevant reason fills them).
+    for column in ["skew_seconds", "expected"] {
+        assert!(
+            column_exists(pool, "client_auth_diagnostics", column).await,
+            "client_auth_diagnostics.{column} exists after 0071"
+        );
+        assert!(
+            !column_is_not_null(pool, "client_auth_diagnostics", column).await,
+            "client_auth_diagnostics.{column} must be nullable (a derived field, absent by default)"
+        );
+    }
+    assert_eq!(
+        column_data_type(pool, "client_auth_diagnostics", "skew_seconds").await,
+        "bigint",
+        "client_auth_diagnostics.skew_seconds must be a bigint (a bounded integer bucket)"
+    );
+    // The ALTER preserves the sink's row level security: after adding the columns the table must
+    // STILL ENABLE and FORCE RLS and carry its (tenant, environment) isolation policy, exactly as
+    // migration 0013 declared, so the M9 read stays scope-confined.
+    assert!(
+        rls_enabled_and_forced(pool, "client_auth_diagnostics").await,
+        "client_auth_diagnostics must still ENABLE and FORCE row-level security after 0071"
+    );
+    assert!(
+        policy_exists(
+            pool,
+            "client_auth_diagnostics",
+            "client_auth_diagnostics_tenant_isolation"
+        )
+        .await,
+        "client_auth_diagnostics must still carry the (tenant, environment) isolation policy"
+    );
+    // The data-plane role reads the sink for the M9 view (a table-level SELECT that already covers
+    // the two new columns) but never mutates a diagnostic in place: no UPDATE grant exists.
+    assert!(
+        role_has_table_privilege(pool, "ironauth_app", "client_auth_diagnostics", "SELECT").await,
+        "the data-plane role must hold SELECT on client_auth_diagnostics (the M9 read)"
+    );
+    assert!(
+        !role_has_table_privilege(pool, "ironauth_app", "client_auth_diagnostics", "UPDATE").await,
+        "the data-plane role must NOT hold UPDATE on client_auth_diagnostics (a diagnostic is \
+         never mutated in place)"
     );
 
     // The demo object never reaches a production database.

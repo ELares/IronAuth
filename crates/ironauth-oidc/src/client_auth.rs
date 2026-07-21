@@ -61,11 +61,12 @@ use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE_NO_PAD};
+use ironauth_config::DiagnosticVerbosity;
 use ironauth_env::Env;
 use ironauth_jose::{JwsAlgorithm, RejectReason, TrustedKey, VerificationPolicy, verify};
 use ironauth_store::{
-    ClientAuthDiagnosticReason, ClientAuthRecord, ClientId, JtiOutcome, NewClientAuthDiagnostic,
-    Scope, StoreError,
+    ClientAuthDiagnosticReason, ClientAuthRecord, ClientId, DiagnosticExpectation, JtiOutcome,
+    NewClientAuthDiagnostic, Scope, StoreError,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -382,6 +383,8 @@ pub async fn authenticate_client(
                 ClientAuthDiagnosticReason::Unparsable,
                 kid.as_deref(),
                 alg.as_deref(),
+                None,
+                None,
             )
             .await;
             return Err(map_parse_error(error));
@@ -450,9 +453,14 @@ async fn authenticate_presented(
 
     // A helper that records the diagnostic and returns the opaque invalid_client.
     // Confining the borrow of `presented`/`client_id_str` to owned values here
-    // keeps this a plain async closure over Copy-ish data.
+    // keeps this a plain async closure over Copy-ish data. The wire outcome is
+    // ALWAYS the same opaque invalid_client; only the recorded reason (and, for the
+    // assertion arm, the derived skew / expected hint) differs between calls.
     macro_rules! fail {
-        ($method:expr, $reason:expr) => {{
+        ($method:expr, $reason:expr) => {
+            fail!($method, $reason, None, None)
+        };
+        ($method:expr, $reason:expr, $skew:expr, $expected:expr) => {{
             record_diagnostic(
                 state,
                 scope,
@@ -461,6 +469,8 @@ async fn authenticate_presented(
                 $reason,
                 assertion_kid.as_deref(),
                 assertion_alg.as_deref(),
+                $skew,
+                $expected,
             )
             .await;
             return Err(ClientAuthError::InvalidClient { via_basic });
@@ -521,8 +531,12 @@ async fn authenticate_presented(
                     client_id: client_id_str,
                     auth_method: registered,
                 }),
-                Err(AssertionAuthError::Invalid) => {
-                    fail!(&method_str, ClientAuthDiagnosticReason::AssertionInvalid)
+                // The assertion failed: the diagnostic carries the SPECIFIC reject
+                // reason (bad signature, expired, clock skew, audience mismatch,
+                // unknown kid, disallowed alg, or the coarse invalid) plus its
+                // derived skew / expected hint. The wire outcome is unchanged.
+                Err(AssertionAuthError::Invalid(diag)) => {
+                    fail!(&method_str, diag.reason, diag.skew_seconds, diag.expected)
                 }
                 Err(AssertionAuthError::Replayed) => {
                     fail!(&method_str, ClientAuthDiagnosticReason::ReplayedJti)
@@ -693,11 +707,75 @@ fn authenticate_secret(
 
 /// Why a `private_key_jwt` assertion failed (for the out-of-band diagnostic).
 enum AssertionAuthError {
-    /// The assertion did not verify (signature, `iss`/`sub`/`aud`, `exp`, algorithm,
-    /// keys, or a missing `jti`).
-    Invalid,
+    /// The assertion did not verify. Carries the widened diagnostic detail (the
+    /// specific reject reason plus any derived, non-secret skew / expected hint) so
+    /// the caller records WHICH check failed; the wire response is unchanged.
+    Invalid(AssertionDiagnostic),
     /// The assertion's `jti` was replayed (already used).
     Replayed,
+}
+
+/// The terminal reject an assertion verification produced (issue #91), the internal
+/// analogue of the JOSE [`RejectReason`] plus the two failures that arise OUTSIDE the
+/// verifier (no usable key, or a post-verify claim rule). Mapped to a
+/// [`ClientAuthDiagnosticReason`] for the record; never reaches the wire.
+enum AssertionReject {
+    /// The JOSE verifier rejected the assertion with this structural reason.
+    Jose(RejectReason),
+    /// No usable verification key was available (an empty JWKS, an unresolved
+    /// `jwks_uri`, an empty algorithm allowlist, or the per-client policy could not
+    /// be built), so no signature could even be checked.
+    NoUsableKey,
+    /// The assertion verified, but a post-verify RFC 7523 rule rejected it (the `sub`
+    /// did not equal the client id, or the required `exp` was absent).
+    ClaimRejected,
+}
+
+/// The widened, NON-SECRET diagnostic detail for a failed `private_key_jwt` assertion
+/// (issue #91): the specific reason, the derived clock-skew bucket, and the bounded
+/// expectation hint. Every field is safe to record; none can hold the assertion, a
+/// secret, or a key.
+struct AssertionDiagnostic {
+    /// The specific, bounded reason the M9 flow inspector surfaces.
+    reason: ClientAuthDiagnosticReason,
+    /// The derived clock-skew bucket in seconds (populated only for an expired /
+    /// clock-skew reason under `verbose`), or [`None`].
+    skew_seconds: Option<i64>,
+    /// The derived expectation hint (populated only for the relevant reason under
+    /// `verbose`), or [`None`].
+    expected: Option<DiagnosticExpectation>,
+}
+
+/// Map a terminal assertion reject to the bounded [`ClientAuthDiagnosticReason`] the
+/// M9 flow inspector records (issue #91). Every JOSE reason collapses to exactly one
+/// bounded diagnostic bucket; the reasons without a dedicated bucket (a malformed
+/// structure, a claims-shape problem, an `iss` mismatch, a missing claim, no usable
+/// key, or a post-verify claim rule) fall to the coarse `AssertionInvalid`, exactly
+/// as before. The wire response is byte-identical regardless of which reason this is.
+fn map_assertion_reject(reject: &AssertionReject) -> ClientAuthDiagnosticReason {
+    match reject {
+        AssertionReject::Jose(reason) => match reason {
+            RejectReason::SignatureInvalid | RejectReason::KeyTypeMismatch => {
+                ClientAuthDiagnosticReason::AssertionBadSignature
+            }
+            RejectReason::Expired => ClientAuthDiagnosticReason::AssertionExpired,
+            RejectReason::NotYetValid | RejectReason::IssuedInFuture => {
+                ClientAuthDiagnosticReason::AssertionClockSkew
+            }
+            RejectReason::AudienceMismatch => ClientAuthDiagnosticReason::AssertionAudienceMismatch,
+            RejectReason::UnknownKid => ClientAuthDiagnosticReason::AssertionKidUnknown,
+            RejectReason::AlgNone | RejectReason::UnsupportedAlg | RejectReason::AlgNotAllowed => {
+                ClientAuthDiagnosticReason::AssertionAlgorithmDisallowed
+            }
+            // Every other structural reason (malformed, claims shape, iss mismatch,
+            // missing claim, embedded key, crit, encryption, and the rest) is the
+            // coarse catch-all the inspector does not bucket separately.
+            _ => ClientAuthDiagnosticReason::AssertionInvalid,
+        },
+        AssertionReject::NoUsableKey | AssertionReject::ClaimRejected => {
+            ClientAuthDiagnosticReason::AssertionInvalid
+        }
+    }
 }
 
 /// Verify a `private_key_jwt` assertion for `client_id` and enforce single use.
@@ -714,7 +792,7 @@ async fn verify_private_key_assertion(
     let audiences = state.client_assertion_audiences(&scope);
     let skew = state.client_assertion_skew();
 
-    let verified = verify_assertion_claims(
+    let verified = match verify_assertion_claims(
         assertion,
         &keys,
         &algorithms,
@@ -722,12 +800,29 @@ async fn verify_private_key_assertion(
         &audiences,
         skew,
         state.env().clock(),
-    )
-    .ok_or(AssertionAuthError::Invalid)?;
+    ) {
+        Ok(verified) => verified,
+        // The assertion did not verify: build the widened, non-secret diagnostic
+        // (the specific reason plus, under `verbose`, the derived skew / expected
+        // hint) from the terminal reject and the unverified header/claim peek. The
+        // decision is still "any failure => opaque invalid_client, fail closed".
+        Err(reject) => {
+            return Err(AssertionAuthError::Invalid(build_assertion_diagnostic(
+                state, &reject, assertion, skew,
+            )));
+        }
+    };
 
     // A jti is REQUIRED for single use (OIDC Core 9): without it the assertion
-    // could be replayed, so an assertion that omits it is rejected.
-    let jti = verified.jti.ok_or(AssertionAuthError::Invalid)?;
+    // could be replayed, so an assertion that omits it is rejected. This is a
+    // post-verify claim rule, recorded as the coarse invalid (no skew / hint).
+    let Some(jti) = verified.jti else {
+        return Err(AssertionAuthError::Invalid(AssertionDiagnostic {
+            reason: ClientAuthDiagnosticReason::AssertionInvalid,
+            skew_seconds: None,
+            expected: None,
+        }));
+    };
     // Retain the jti until its assertion can no longer be accepted, PLUS one whole
     // second. Acceptance (enforce_exp) floors `now` to whole seconds and rejects only
     // once `now_secs > exp + skew`, so the assertion stays acceptable for the ENTIRE
@@ -749,9 +844,98 @@ async fn verify_private_key_assertion(
         Ok(JtiOutcome::Recorded) => Ok(()),
         Ok(JtiOutcome::Replayed) => Err(AssertionAuthError::Replayed),
         // A store fault recording the jti fails closed: we will not let an
-        // assertion through without recording its single use.
-        Err(_) => Err(AssertionAuthError::Invalid),
+        // assertion through without recording its single use. Not an assertion
+        // defect, so the coarse invalid (no skew / hint).
+        Err(_) => Err(AssertionAuthError::Invalid(AssertionDiagnostic {
+            reason: ClientAuthDiagnosticReason::AssertionInvalid,
+            skew_seconds: None,
+            expected: None,
+        })),
     }
+}
+
+/// Build the widened, NON-SECRET diagnostic detail for a failed assertion (issue #91).
+/// The specific reason comes from the terminal reject; the derived skew bucket and
+/// expectation hint are computed only for the relevant reasons AND only under
+/// `verbose` verbosity, so `standard` records the rich reason without the extras and
+/// `off` records nothing (the caller's `record_diagnostic` gates that). The skew is
+/// derived from the assertion's UNVERIFIED `exp`/`nbf` (a peek, exactly like the
+/// header peek), never captured material, and clamped to a bounded range.
+fn build_assertion_diagnostic(
+    state: &OidcState,
+    reject: &AssertionReject,
+    assertion: &str,
+    skew: Duration,
+) -> AssertionDiagnostic {
+    let reason = map_assertion_reject(reject);
+    let verbose = state.diagnostics_verbosity() == DiagnosticVerbosity::Verbose;
+    let (skew_seconds, expected) = if verbose {
+        let skew_seconds = match reason {
+            ClientAuthDiagnosticReason::AssertionExpired
+            | ClientAuthDiagnosticReason::AssertionClockSkew => {
+                assertion_skew_bucket(assertion, skew, state.env().clock())
+            }
+            _ => None,
+        };
+        let expected = match reason {
+            ClientAuthDiagnosticReason::AssertionKidUnknown => {
+                Some(DiagnosticExpectation::KidNotInRegisteredJwks)
+            }
+            _ => None,
+        };
+        (skew_seconds, expected)
+    } else {
+        (None, None)
+    };
+    AssertionDiagnostic {
+        reason,
+        skew_seconds,
+        expected,
+    }
+}
+
+/// The bounded, signed clock-skew bucket in seconds for a failed assertion (issue #91):
+/// how far the presented `exp`/`nbf` fell OUTSIDE the tolerance window, measured
+/// against the application clock. POSITIVE when the assertion's `exp` is in the past
+/// beyond the window (expired by that many seconds); NEGATIVE when its `nbf` is in the
+/// future beyond the window (not yet valid by that many seconds). Derived from the
+/// UNVERIFIED payload (a peek, never trusted and never the assertion itself) and
+/// clamped to a bounded magnitude so it stays a low-cardinality, non-secret datum.
+/// [`None`] when neither claim is present or parseable.
+fn assertion_skew_bucket(
+    assertion: &str,
+    skew: Duration,
+    clock: &dyn ironauth_env::Clock,
+) -> Option<i64> {
+    /// The clamp on the reported skew magnitude (about a year), so the bucket is a
+    /// bounded, low-cardinality value rather than an unbounded integer.
+    const MAX_SKEW_SECONDS: i64 = 366 * 24 * 60 * 60;
+    let now_secs = i64::try_from(epoch_secs(clock)).unwrap_or(i64::MAX);
+    let tolerance = i64::try_from(skew.as_secs()).unwrap_or(i64::MAX);
+    let (exp, nbf) = peek_assertion_times(assertion);
+    if let Some(exp) = exp {
+        // Expired: now is past exp + tolerance. Report how far past the window.
+        let overshoot = now_secs.saturating_sub(exp).saturating_sub(tolerance);
+        if overshoot > 0 {
+            return Some(overshoot.min(MAX_SKEW_SECONDS));
+        }
+    }
+    if let Some(nbf) = nbf {
+        // Not yet valid: nbf is beyond now + tolerance. Report as a NEGATIVE skew.
+        let ahead = nbf.saturating_sub(now_secs).saturating_sub(tolerance);
+        if ahead > 0 {
+            return Some(-ahead.min(MAX_SKEW_SECONDS));
+        }
+    }
+    None
+}
+
+/// The current time in whole seconds since the epoch, from the application clock seam.
+fn epoch_secs(clock: &dyn ironauth_env::Clock) -> u64 {
+    clock
+        .now_utc()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// A verified `private_key_jwt` assertion's replay-relevant fields.
@@ -767,10 +951,17 @@ struct VerifiedAssertion {
 ///
 /// The `iss` is enforced to equal `client_id` by the policy; the `sub` is checked
 /// to equal `client_id` here; `exp`/`nbf`/`iat` are enforced within `skew`; the
-/// algorithm must be in `algorithms` (which excludes ES512). Returns `None` on any
-/// failure (uniform), or the verified replay fields on success. Pure and
-/// synchronous: the key resolution and the jti recording are the caller's async
-/// concerns.
+/// algorithm must be in `algorithms` (which excludes ES512). Returns the verified
+/// replay fields on success, or the TERMINAL [`AssertionReject`] on failure so the
+/// caller can map it to a specific diagnostic reason (issue #91). The wire decision
+/// is unchanged: the caller collapses ANY `Err` into the opaque `invalid_client`.
+/// Pure and synchronous: the key resolution and the jti recording are the caller's
+/// async concerns.
+///
+/// The audience loop preserves the try-next-audience behavior: an `AudienceMismatch`
+/// under one acceptable audience just tries the next, and only the TERMINAL
+/// `AudienceMismatch` (every audience exhausted) is returned; any other reject is
+/// returned immediately.
 fn verify_assertion_claims(
     assertion: &str,
     keys: &[TrustedKey],
@@ -779,9 +970,9 @@ fn verify_assertion_claims(
     audiences: &[String],
     skew: Duration,
     clock: &dyn ironauth_env::Clock,
-) -> Option<VerifiedAssertion> {
+) -> Result<VerifiedAssertion, AssertionReject> {
     if keys.is_empty() || algorithms.is_empty() || audiences.is_empty() {
-        return None;
+        return Err(AssertionReject::NoUsableKey);
     }
     for audience in audiences {
         let Ok(policy) = VerificationPolicy::new(
@@ -790,7 +981,7 @@ fn verify_assertion_claims(
             client_id,
             audience.clone(),
         ) else {
-            return None;
+            return Err(AssertionReject::NoUsableKey);
         };
         let policy = policy.with_skew(skew);
         match verify(assertion, &policy, clock) {
@@ -798,9 +989,11 @@ fn verify_assertion_claims(
                 // RFC 7523: sub MUST equal the client id (iss already did, via the
                 // policy). An assertion whose sub is another value is rejected.
                 if verified.claims().subject() != Some(client_id) {
-                    return None;
+                    return Err(AssertionReject::ClaimRejected);
                 }
-                let exp = verified.claims().expiration()?;
+                let Some(exp) = verified.claims().expiration() else {
+                    return Err(AssertionReject::ClaimRejected);
+                };
                 // An empty or whitespace-only jti is no jti (RFC 7523 intends a real
                 // token identifier): treat it as absent so the single-use rule below
                 // rejects it, rather than recording a blank single-use key.
@@ -811,15 +1004,18 @@ fn verify_assertion_claims(
                     .map(str::trim)
                     .filter(|jti| !jti.is_empty())
                     .map(str::to_owned);
-                return Some(VerifiedAssertion { jti, exp });
+                return Ok(VerifiedAssertion { jti, exp });
             }
             // An audience mismatch under one acceptable audience just means try the
-            // next; any other failure is a hard, uniform rejection.
+            // next; any other failure is a hard, uniform rejection carrying its
+            // specific JOSE reason.
             Err(error) if error.reason() == RejectReason::AudienceMismatch => {}
-            Err(_) => return None,
+            Err(error) => return Err(AssertionReject::Jose(error.reason())),
         }
     }
-    None
+    // Every acceptable audience was tried and each was an audience mismatch: the
+    // TERMINAL audience mismatch (never a per-audience oracle).
+    Err(AssertionReject::Jose(RejectReason::AudienceMismatch))
 }
 
 /// The JWS algorithms a client's `private_key_jwt` assertion may be signed with:
@@ -857,6 +1053,16 @@ async fn resolve_client_keys(state: &OidcState, record: &ClientAuthRecord) -> Ve
 /// failure to record is logged and swallowed: the diagnostic is a side channel for
 /// operators, never a gate on the authentication decision, and must not turn a
 /// clean `invalid_client` into a `server_error`.
+///
+/// Verbosity (issue #91) gates recording WITHOUT ever widening the wire response: at
+/// `off` this is a no-op (nothing is recorded, the wire is unchanged); at `standard`
+/// the rich reason plus the header are recorded but the derived `skew`/`expected`
+/// extras are dropped; at `verbose` the extras are recorded too. The caller only ever
+/// computes `skew`/`expected` under `verbose`, but this drops them defensively at
+/// `standard` so the verbosity contract holds at the sink regardless of the caller.
+/// The retention window is threaded from `diagnostics.retention_secs` (config), not a
+/// hard-coded constant.
+#[allow(clippy::too_many_arguments)]
 async fn record_diagnostic(
     state: &OidcState,
     scope: Scope,
@@ -865,19 +1071,37 @@ async fn record_diagnostic(
     reason: ClientAuthDiagnosticReason,
     key_id: Option<&str>,
     signing_alg: Option<&str>,
+    skew_seconds: Option<i64>,
+    expected: Option<DiagnosticExpectation>,
 ) {
+    // Verbosity off makes recording a no-op: the wire response is already the opaque
+    // invalid_client; only the out-of-band record is suppressed.
+    let verbosity = state.diagnostics_verbosity();
+    if verbosity == DiagnosticVerbosity::Off {
+        return;
+    }
+    // The derived extras populate only under `verbose`; `standard` records the rich
+    // reason and the header without them (they never widen what is representable).
+    let (skew_seconds, expected) = if verbosity == DiagnosticVerbosity::Verbose {
+        (skew_seconds, expected)
+    } else {
+        (None, None)
+    };
     if let Err(error) = state
         .store()
         .scoped(scope)
         .client_auth_diagnostics()
         .record(
             state.env(),
+            state.diagnostic_retention_micros(),
             NewClientAuthDiagnostic {
                 client_id,
                 auth_method,
                 reason,
                 key_id,
                 signing_alg,
+                skew_seconds,
+                expected,
             },
         )
         .await
@@ -934,6 +1158,26 @@ fn assertion_subject(assertion: &str) -> Option<String> {
     let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
     let value: Value = serde_json::from_slice(&bytes).ok()?;
     value.get("sub").and_then(Value::as_str).map(str::to_owned)
+}
+
+/// The `(exp, nbf)` of a compact JWS assertion's (unverified) payload, in seconds,
+/// for deriving the NON-SECRET clock-skew bucket on a FAILED assertion only (issue
+/// #91). These are numeric timestamps, never captured material; the verification
+/// already rejected the assertion, so reading them introduces no trust. [`None`] for
+/// a claim that is absent or not an integer.
+fn peek_assertion_times(assertion: &str) -> (Option<i64>, Option<i64>) {
+    let Some(payload) = assertion.split('.').nth(1) else {
+        return (None, None);
+    };
+    let Ok(bytes) = URL_SAFE_NO_PAD.decode(payload) else {
+        return (None, None);
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+        return (None, None);
+    };
+    let exp = value.get("exp").and_then(Value::as_i64);
+    let nbf = value.get("nbf").and_then(Value::as_i64);
+    (exp, nbf)
 }
 
 /// The `(alg, kid)` of a compact JWS assertion's (unverified) protected header,
@@ -1347,6 +1591,130 @@ mod tests {
             Duration::from_secs(60),
             &clock,
         );
-        assert!(result.is_none(), "empty key set fails closed");
+        assert!(
+            matches!(result, Err(AssertionReject::NoUsableKey)),
+            "empty key set fails closed with no usable key"
+        );
+    }
+
+    /// The STRUCTURAL REDACTION CORPUS (issue #91): a HOSTILE corpus stuffs known
+    /// secret / token / assertion / JWKS-private sentinels into every SECRET-bearing
+    /// input, the safe-field extraction (the SAME peek the record path uses) builds a
+    /// diagnostic from each, and NO sentinel may appear in ANY serialization of the
+    /// resulting record (its `Debug`, its reason, its expected hint, or any field).
+    ///
+    /// The guarantee is structural first: `NewClientAuthDiagnostic` /
+    /// `ClientAuthDiagnosticRecord` have NO field capable of holding an assertion
+    /// body, a secret, or a token, so a secret is UNREPRESENTABLE, not scrubbed. This
+    /// corpus is the CI belt-and-suspenders that proves the extraction never lifts a
+    /// sentinel out of a secret position into a safe field. The shell wrapper is
+    /// `scripts/diagnostics-redaction-scan.sh`.
+    #[test]
+    fn diagnostics_redaction_corpus_leaks_no_secret_sentinel() {
+        use std::fmt::Write as _;
+
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
+        use ironauth_store::{ClientAuthDiagnosticRecord, DiagnosticExpectation};
+
+        // Distinct sentinels, one per class of secret material a hostile attempt could
+        // carry. None of these is a client id, a kid, or an alg (the safe fields).
+        const SENTINELS: &[&str] = &[
+            "SUPERSECRETASSERTIONBODYSENTINEL",
+            "WRONGCLIENTSECRETSENTINEL",
+            "OVERSIZEDBEARERTOKENSENTINEL",
+            "JWKSPRIVATEKEYDSENTINEL",
+        ];
+
+        // A hostile assertion: a VALID header (safe alg + kid, the only fields the peek
+        // reads from the header) over a payload that buries the assertion-body and
+        // JWKS-private sentinels in PRIVATE claims and whose signature segment is the
+        // secret sentinel. The peek reads only alg/kid/exp/nbf, never the signature or
+        // the private claims, so nothing secret can reach a field.
+        let header = B64.encode(br#"{"alg":"RS256","kid":"safe-kid"}"#);
+        let payload = B64.encode(
+            serde_json::to_vec(&serde_json::json!({
+                "iss": "cli_safe",
+                "sub": "cli_safe",
+                "aud": "https://issuer.test",
+                "exp": -1000,
+                "nbf": 5_000_000,
+                "iat": 0,
+                // Buried secret material an attacker might hope leaks into a diagnostic.
+                "assertion_secret": "SUPERSECRETASSERTIONBODYSENTINEL",
+                "jwks_private_d": "JWKSPRIVATEKEYDSENTINEL",
+            }))
+            .expect("claims"),
+        );
+        let hostile_assertion = format!("{header}.{payload}.OVERSIZEDBEARERTOKENSENTINEL");
+
+        // The safe-field extraction, exactly as the record path uses it.
+        let (alg, kid) = peek_assertion_header(&hostile_assertion);
+        let clock = ironauth_env::ManualClock::new(SystemTime::UNIX_EPOCH);
+        let skew_expired =
+            assertion_skew_bucket(&hostile_assertion, Duration::from_secs(60), &clock);
+
+        // Build a diagnostic per widened reason from the hostile inputs. The client id
+        // is the client's own (non-secret) identifier; the wrong-secret sentinel is a
+        // raw hostile input that has NOWHERE to go (there is no secret field), which is
+        // the structural point.
+        let reasons = [
+            ClientAuthDiagnosticReason::AssertionBadSignature,
+            ClientAuthDiagnosticReason::AssertionExpired,
+            ClientAuthDiagnosticReason::AssertionClockSkew,
+            ClientAuthDiagnosticReason::AssertionAudienceMismatch,
+            ClientAuthDiagnosticReason::AssertionKidUnknown,
+            ClientAuthDiagnosticReason::AssertionAlgorithmDisallowed,
+            ClientAuthDiagnosticReason::Unparsable,
+            ClientAuthDiagnosticReason::BadSecret,
+        ];
+
+        let mut serialized = String::new();
+        for reason in reasons {
+            let new = NewClientAuthDiagnostic {
+                client_id: "cli_safe",
+                auth_method: "private_key_jwt",
+                reason,
+                key_id: kid.as_deref(),
+                signing_alg: alg.as_deref(),
+                skew_seconds: skew_expired,
+                expected: Some(DiagnosticExpectation::KidNotInRegisteredJwks),
+            };
+            // The owned read-back shape as well, with the SAME safe fields.
+            let record = ClientAuthDiagnosticRecord {
+                id: "diag_safe".to_owned(),
+                client_id: new.client_id.to_owned(),
+                auth_method: new.auth_method.to_owned(),
+                failure_reason: reason.as_str().to_owned(),
+                key_id: new.key_id.map(str::to_owned),
+                signing_alg: new.signing_alg.map(str::to_owned),
+                skew_seconds: new.skew_seconds,
+                expected: new.expected.map(|e| e.as_str().to_owned()),
+                occurred_at_micros: 0,
+            };
+            // Serialize BOTH the builder and the record through Debug, plus every string
+            // field explicitly, so a leak anywhere is caught.
+            write!(serialized, "{new:?}{record:?}").expect("write to string");
+            serialized.push_str(reason.as_str());
+            serialized.push_str(record.expected.as_deref().unwrap_or(""));
+        }
+
+        // Positive control: the SAFE fields DID make it through (the extraction works).
+        assert!(
+            serialized.contains("safe-kid") && serialized.contains("RS256"),
+            "the safe header fields must be recorded (the extraction is real)"
+        );
+        // The expired assertion's derived skew bucket is a bounded integer, present.
+        assert!(
+            skew_expired.is_some(),
+            "the skew bucket is derived from the unverified exp, a non-secret integer"
+        );
+
+        // The GUARANTEE: no secret sentinel appears anywhere in any serialization.
+        for sentinel in SENTINELS {
+            assert!(
+                !serialized.contains(sentinel),
+                "a secret sentinel leaked into a diagnostic record: {sentinel}"
+            );
+        }
     }
 }
