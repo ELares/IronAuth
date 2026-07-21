@@ -1,10 +1,22 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //
-// The command palette (issue #90, PR 3): a keyboard-invoked (Cmd/Ctrl-K) palette
-// for cross-resource navigation and scope switches. It is hand built (no new
-// dependency) and driven ONLY by data the one typed client already loaded: the
-// nav sections plus the tenants and environments the scope store holds. It names
-// no new endpoint.
+// The command palette AND the global search surface (issue #90, PR 3 + PR 7):
+// ONE keyboard-invoked (Cmd/Ctrl-K) palette. PR3 built it as a synchronous
+// navigation palette driven only by data already in hand (the nav sections plus
+// the tenants and environments the scope store holds). PR7 extends THIS SAME
+// surface into cross-resource search rather than adding a second search box: as
+// the operator types, the palette also queries the documented LIST operations
+// (tenants, environments, users, connectors) through the one typed client and
+// folds the hits in as commands that navigate to the matching resource. So there
+// is a single coherent search experience: navigation commands and resource hits
+// live in one listbox, keyed and filtered the same way.
+//
+// The search is CLIENT SIDE aggregation over public list ops (src/ui/search.ts):
+// no server search endpoint exists or is invented. It is debounced and gated on a
+// minimum length so it never hammers the API on a keystroke, and it queries a
+// scoped resource ONLY when a scope is active. A list failure surfaces through the
+// verbatim ErrorView boundary inside the dialog, so a failed search is never
+// silently shown as an empty result set.
 //
 // Accessibility: it is an ARIA combobox over a listbox. Focus is trapped by
 // design because the only focusable control is the search input; the active
@@ -15,7 +27,16 @@
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { useLocation } from "preact-iso";
 import { type Command, filterCommands, wrapIndex } from "./commands";
+import {
+  type SearchResult,
+  SEARCH_DEBOUNCE_MS,
+  searchAll,
+  shouldSearch,
+  toCommand,
+} from "./search";
 import { SECTIONS } from "./sections";
+import { ErrorView } from "./ErrorView";
+import { type ErrorBody, errorBodyFrom } from "../api/client";
 import {
   activeScope,
   environments,
@@ -78,7 +99,59 @@ function useDefaultCommands(): Command[] {
   }, [location, tenantList, environmentList, scope]);
 }
 
+// Drive the debounced, scope-aware cross-resource search for the current query.
+// Returns the hits (already filtered by search.ts), a verbatim ErrorBody when a
+// list failed, and whether a query is in flight. A query below the minimum length
+// (or a closed palette) runs no call and clears any prior results; each new query
+// cancels the pending one, so a late response never lands on a newer query.
+function useSearch(
+  query: string,
+  open: boolean,
+): { results: SearchResult[]; error: ErrorBody | null; searching: boolean } {
+  const scope = activeScope.value;
+  const [results, setResults] = useState<SearchResult[]>([]);
+  const [error, setError] = useState<ErrorBody | null>(null);
+  const [searching, setSearching] = useState(false);
+
+  useEffect(() => {
+    if (!open || !shouldSearch(query)) {
+      setResults([]);
+      setError(null);
+      setSearching(false);
+      return;
+    }
+    let cancelled = false;
+    setSearching(true);
+    const timer = setTimeout(() => {
+      searchAll(query, scope)
+        .then((hits) => {
+          if (!cancelled) {
+            setResults(hits);
+            setError(null);
+            setSearching(false);
+          }
+        })
+        .catch((value: unknown) => {
+          if (!cancelled) {
+            setResults([]);
+            setError(errorBodyFrom(value));
+            setSearching(false);
+          }
+        });
+    }, SEARCH_DEBOUNCE_MS);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+    // The scope object identity is stable per selection; the query and open state
+    // drive the (re)search, and a change to either cancels the pending call.
+  }, [query, open, scope]);
+
+  return { results, error, searching };
+}
+
 export function CommandPalette({ commands }: CommandPaletteProps) {
+  const location = useLocation();
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [active, setActive] = useState(0);
@@ -87,7 +160,17 @@ export function CommandPalette({ commands }: CommandPaletteProps) {
 
   const defaults = useDefaultCommands();
   const source = commands ?? defaults;
-  const filtered = filterCommands(source, query);
+  const { results, error, searching } = useSearch(query, open);
+
+  // Fold the resource hits in as navigation commands, so the one listbox holds
+  // both the in-memory navigation commands and the cross-resource search hits.
+  const navigate = (path: string): void => {
+    if (typeof location.route === "function") {
+      location.route(path);
+    }
+  };
+  const resultCommands = results.map((result) => toCommand(result, navigate));
+  const filtered = [...filterCommands(source, query), ...resultCommands];
   const activeIndex = wrapIndex(active, filtered.length);
 
   // Cmd/Ctrl-K toggles the palette from anywhere.
@@ -170,7 +253,7 @@ export function CommandPalette({ commands }: CommandPaletteProps) {
         class="cmdk-dialog"
         role="dialog"
         aria-modal="true"
-        aria-label="Command palette"
+        aria-label="Command palette and search"
         onClick={(event) => event.stopPropagation()}
         onKeyDown={onKeyDown}
       >
@@ -184,18 +267,28 @@ export function CommandPalette({ commands }: CommandPaletteProps) {
           aria-activedescendant={
             filtered.length === 0 ? undefined : optionId(activeIndex)
           }
-          aria-label="Search commands"
-          placeholder="Search commands"
+          aria-label="Search resources and commands"
+          placeholder="Search resources and commands"
           value={query}
           onInput={(event) => {
             setQuery((event.target as HTMLInputElement).value);
             setActive(0);
           }}
         />
+        {error === null ? null : (
+          <div class="cmdk-error">
+            <ErrorView error={error} />
+          </div>
+        )}
+        {searching ? (
+          <p class="cmdk-searching" role="status" aria-live="polite">
+            Searching resources
+          </p>
+        ) : null}
         <ul class="cmdk-list" id={LISTBOX_ID} role="listbox">
           {filtered.length === 0 ? (
             <li class="cmdk-empty" role="option" aria-selected="false">
-              No matching commands
+              No matching commands or resources
             </li>
           ) : (
             filtered.map((command, index) => (
