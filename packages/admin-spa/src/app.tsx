@@ -23,6 +23,8 @@ import { SECTIONS } from "./ui/sections";
 import { Switcher } from "./ui/Switcher";
 import { CommandPalette } from "./ui/CommandPalette";
 import { ErrorView } from "./ui/ErrorView";
+import { TenantDetail, TenantsList } from "./ui/TenantsView";
+import { EnvironmentDetail, EnvironmentsList } from "./ui/EnvironmentsView";
 
 // UI state lives in signals (the locked state primitive). `signedIn` flips true
 // once a token is held; `authError` surfaces a failed login verbatim.
@@ -75,9 +77,10 @@ function SignIn() {
   );
 }
 
-// A placeholder resource view. PR4-6 replace each with the real, scope-injected
-// list and detail; PR3 renders the frame so the console reads whole. The active
-// scope is already resolved in the store, so a later PR only swaps this body.
+// A placeholder resource view for the sections not yet wired (Clients, Users,
+// Connectors land in PR5 and PR6). Tenants and Environments now render their real
+// CRUD surfaces below. The active scope is already resolved in the store, so each
+// remaining PR only swaps its body.
 function SectionView({ label }: { label: string }) {
   return (
     <section class="placeholder">
@@ -94,10 +97,12 @@ function Routes() {
   return (
     <Router>
       <Route path="/" component={() => <SectionView label="Overview" />} />
-      <Route path="/tenants" component={() => <SectionView label="Tenants" />} />
+      <Route path="/tenants" component={TenantsList} />
+      <Route path="/tenants/:tenantId" component={TenantDetail} />
+      <Route path="/environments" component={EnvironmentsList} />
       <Route
-        path="/environments"
-        component={() => <SectionView label="Environments" />}
+        path="/environments/:environmentId"
+        component={EnvironmentDetail}
       />
       <Route path="/clients" component={() => <SectionView label="Clients" />} />
       <Route path="/users" component={() => <SectionView label="Users" />} />

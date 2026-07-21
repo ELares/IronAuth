@@ -15,12 +15,41 @@ Progress on issue #90:
 - PR2 wired the real login: the Authorization Code + PKCE flow against the admin
   issuer, the short lived at+jwt held in memory, and the bearer attached to the
   typed client.
-- PR3 (this change) is the app SHELL: the real console frame (header, sidebar
-  nav of the resource sections, routed placeholder views), the persistent
-  tenant/environment CONTEXT SWITCHER that scopes every view, a keyboard COMMAND
-  PALETTE, and the verbatim management ErrorBody rendering boundary.
+- PR3 was the app SHELL: the real console frame (header, sidebar nav of the
+  resource sections, routed placeholder views), the persistent tenant/environment
+  CONTEXT SWITCHER that scopes every view, a keyboard COMMAND PALETTE, and the
+  verbatim management ErrorBody rendering boundary.
+- PR4 (this change) is the first CRUD content: the TENANTS and ENVIRONMENTS
+  surfaces (list, detail, create, delete, plus the tenant suspend, resume, and
+  restore lifecycle), built on a reusable resource pattern PR5 and PR6 follow.
 
-The CRUD content of each resource section lands in PR4 through PR6.
+The remaining CRUD content (Users, Connectors, Clients) lands in PR5 and PR6.
+
+## The reusable resource pattern (PR4)
+
+The CRUD surfaces share one shape so every later section reads the same way:
+
+- `src/ui/useResource.ts` holds the hooks. `useAsyncResource(load, deps)` drives a
+  read (a list or a detail) with an explicit loading, ready, or error state and a
+  `reload()`; `useMutation()` drives a write (create, delete, or a lifecycle
+  transition) with a pending, success, or error state, and remembers the last
+  write so the RFC 9470 sudo path can replay it after a re-authentication.
+- `src/ui/ResourceView.tsx` holds the presentational primitives. `AsyncBoundary`
+  renders a read's loading indicator, empty state, verbatim `ErrorView`, or ready
+  content; `MutationFeedback` renders a write's success or its verbatim
+  `ErrorView` (with the sudo recovery when the write can be replayed);
+  `ConfirmButton` gates a destructive action behind an explicit confirm step.
+- `src/ui/TenantsView.tsx` and `src/ui/EnvironmentsView.tsx` compose those into
+  the tenant and environment surfaces. Environments are scoped to the active
+  tenant from the switcher; creating or deleting one refreshes the switcher's
+  environment list through the store, so the single-environment collapse
+  recomputes.
+
+Every read and write goes through a named wrapper in `src/api/client.ts` (the
+single funnel), each mapped to a documented management operation. There is NO
+tenant or environment UPDATE operation in the management contract, so these
+surfaces have none: a tenant is create, read, list, delete, and the suspend,
+resume, and restore lifecycle; an environment is create, read, list, and delete.
 
 ## The context switcher and the single environment collapse
 
@@ -141,7 +170,7 @@ npm test          # vitest run (unit and component tests, jsdom)
 npm run build     # vite build -> dist/ (content hashed external assets)
 ```
 
-Dependencies are kept to a tight budget. Prod (unchanged in PR3): `preact`,
+Dependencies are kept to a tight budget. Prod (unchanged through PR4): `preact`,
 `@preact/signals` (UI state), `preact-iso` (routing), `openapi-fetch` (the one
 network client). Everything else is a dev dependency: `typescript`, `vite`,
 `@preact/preset-vite`, `openapi-typescript`, and the test runner `vitest` with
@@ -156,6 +185,10 @@ network client). Everything else is a dev dependency: `typescript`, `vite`,
 - `src/app.tsx`: the app shell (header, nav, routed views, error boundary wiring).
 - `src/scope/logic.ts`: the pure scope logic (collapse, scope injection).
 - `src/scope/store.ts`: the signal backed active scope (the single source).
+- `src/ui/useResource.ts`: the reusable read and write hooks (PR4).
+- `src/ui/ResourceView.tsx`: the reusable resource view primitives (PR4).
+- `src/ui/TenantsView.tsx`: the tenants CRUD surface (PR4).
+- `src/ui/EnvironmentsView.tsx`: the environments CRUD surface, tenant scoped (PR4).
 - `src/ui/Switcher.tsx`: the tenant/environment context switcher.
 - `src/ui/CommandPalette.tsx` and `src/ui/commands.ts`: the command palette.
 - `src/ui/ErrorView.tsx`: the verbatim management `ErrorBody` boundary.

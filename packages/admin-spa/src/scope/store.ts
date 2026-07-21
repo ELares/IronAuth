@@ -172,6 +172,21 @@ export function selectEnvironment(environmentId: string): void {
   persistScope(next);
 }
 
+// Reload just the reachable tenants (issue #90, PR 4). The tenants CRUD view
+// calls this after a create or delete so the switcher's tenant list stays in
+// step with what the console just changed; it leaves the active environment
+// selection untouched. A failure surfaces verbatim through scopeError, the same
+// channel the initial load uses. (An environment create or delete instead calls
+// selectTenant, which re-fetches the tenant's environments and recomputes the
+// single-environment collapse.)
+export async function reloadTenants(): Promise<void> {
+  try {
+    tenants.value = await fetchTenants();
+  } catch (value) {
+    recordError(value);
+  }
+}
+
 // Reset the store (used on sign out and by tests).
 export function resetScope(): void {
   tenants.value = [];
