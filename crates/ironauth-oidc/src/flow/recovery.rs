@@ -126,6 +126,7 @@ fn identifier_nodes(
             required: true,
             autocomplete: Some(Autocomplete::Username),
             disabled: false,
+            constraints: None,
         },
         Some(Message::of(message::RECOVERY_IDENTIFIER_LABEL)),
     );
@@ -143,6 +144,7 @@ fn identifier_nodes(
             required: false,
             autocomplete: None,
             disabled: false,
+            constraints: None,
         },
         Some(Message::of(message::RECOVERY_SUBMIT_LABEL)),
     ));
@@ -173,6 +175,7 @@ pub(super) fn ack_nodes(transport: Transport, flow_id: &str, code_error: bool) -
             required: true,
             autocomplete: Some(Autocomplete::OneTimeCode),
             disabled: false,
+            constraints: None,
         },
         Some(Message::of(message::RECOVERY_CODE_LABEL)),
     );
@@ -191,6 +194,7 @@ pub(super) fn ack_nodes(transport: Transport, flow_id: &str, code_error: bool) -
             required: false,
             autocomplete: None,
             disabled: false,
+            constraints: None,
         },
         Some(Message::of(message::RECOVERY_VERIFY_LABEL)),
     ));
@@ -221,6 +225,7 @@ fn push_flow_hidden(nodes: &mut Vec<Node>, transport: Transport, flow_id: &str) 
                 required: true,
                 autocomplete: None,
                 disabled: false,
+                constraints: None,
             },
             None,
         ));

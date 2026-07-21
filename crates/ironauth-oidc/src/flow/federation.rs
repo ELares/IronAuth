@@ -49,6 +49,7 @@ pub(super) fn start_nodes(transport: Transport, flow_id: &str, connector: &str) 
             required: false,
             autocomplete: None,
             disabled: false,
+            constraints: None,
         },
         Some(Message::with_context(
             message::FEDERATION_CONTINUE_LABEL,
@@ -66,6 +67,7 @@ pub(super) fn start_nodes(transport: Transport, flow_id: &str, connector: &str) 
                 required: true,
                 autocomplete: None,
                 disabled: false,
+                constraints: None,
             },
             None,
         ));

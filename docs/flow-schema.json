@@ -31,6 +31,77 @@
         }
       ]
     },
+    "FieldConstraints": {
+      "description": "The effective validation constraints a configured signup field carries on the wire\n(issue #87): the trait sub-schema's closed keyword vocabulary, TIGHTENED by the form's\nnarrowing rule (the trait always applies, the form only ever narrows). This is a CLIENT\nHINT only: it is exactly what the server enforces authoritatively on submit, mirrored to\nthe wire so a hosted page or a reference SPA validates from ONE source. It carries no\nsecret and no value except the enumerated permitted values, which are the schema's own\nconfigured members, never user data. Every keyword is skip-if-none, so a field with no\nconstraint of a given kind omits it.",
+      "properties": {
+        "enum": {
+          "description": "The permitted values, when the field is enumerated (the schema's configured members).",
+          "items": true,
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "maxItems": {
+          "description": "The maximum array length.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "maxLength": {
+          "description": "The maximum string length.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "maximum": {
+          "description": "The inclusive numeric upper bound.",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "minItems": {
+          "description": "The minimum array length.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "minLength": {
+          "description": "The minimum string length.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "minimum": {
+          "description": "The inclusive numeric lower bound.",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "type": {
+          "description": "The effective primitive type name (`string` / `number` / `integer` / `boolean`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "FlowStateTag": {
       "description": "The current state machine position of a flow (issue #84). A single flat tag across all\njourneys, so a client renders any state from the same field.",
       "oneOf": [
@@ -265,6 +336,17 @@
                 }
               ],
               "description": "The `autocomplete` hint, or [`None`]."
+            },
+            "constraints": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/FieldConstraints"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The effective validation constraints (issue #87), for a configured signup field\nonly. [`None`] for every built in node (the identifier, the password, an OTP\ncode), so those nodes serialize byte identically to before the field was added."
             },
             "disabled": {
               "description": "Whether the control is disabled.",

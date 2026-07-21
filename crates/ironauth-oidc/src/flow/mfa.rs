@@ -126,6 +126,7 @@ fn challenge_nodes(transport: Transport, flow_id: &str, code_error: bool) -> Vec
             required: true,
             autocomplete: Some(Autocomplete::OneTimeCode),
             disabled: false,
+            constraints: None,
         },
         Some(Message::of(message::MFA_CODE_LABEL)),
     );
@@ -143,6 +144,7 @@ fn challenge_nodes(transport: Transport, flow_id: &str, code_error: bool) -> Vec
             required: false,
             autocomplete: None,
             disabled: false,
+            constraints: None,
         },
         Some(Message::of(message::MFA_SUBMIT_LABEL)),
     ));
@@ -196,6 +198,7 @@ pub(super) fn enroll_nodes(
             required: false,
             autocomplete: None,
             disabled: true,
+            constraints: None,
         },
         None,
     ));
@@ -209,6 +212,7 @@ pub(super) fn enroll_nodes(
             required: false,
             autocomplete: None,
             disabled: true,
+            constraints: None,
         },
         None,
     ));
@@ -222,6 +226,7 @@ pub(super) fn enroll_nodes(
             required: true,
             autocomplete: Some(Autocomplete::OneTimeCode),
             disabled: false,
+            constraints: None,
         },
         Some(Message::of(message::MFA_CODE_LABEL)),
     );
@@ -239,6 +244,7 @@ pub(super) fn enroll_nodes(
             required: false,
             autocomplete: None,
             disabled: false,
+            constraints: None,
         },
         Some(Message::of(message::MFA_SUBMIT_LABEL)),
     ));
@@ -259,6 +265,7 @@ fn push_flow_hidden(nodes: &mut Vec<Node>, transport: Transport, flow_id: &str) 
                 required: true,
                 autocomplete: None,
                 disabled: false,
+                constraints: None,
             },
             None,
         ));

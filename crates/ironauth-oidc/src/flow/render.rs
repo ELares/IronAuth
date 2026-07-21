@@ -40,7 +40,9 @@
 
 use super::localize::{ResolvedLocale, localize};
 use super::message::{self, Message, MessageContext};
-use super::model::{Autocomplete, Flow, FlowStateTag, InputType, Node, NodeAttributes, NodeGroup};
+use super::model::{
+    Autocomplete, FieldConstraints, Flow, FlowStateTag, InputType, Node, NodeAttributes, NodeGroup,
+};
 use crate::hints::InteractionHints;
 use crate::pages;
 use crate::util::percent_encode_query;
@@ -329,6 +331,7 @@ fn render_node(body: &mut String, node: &Node, locale: &ResolvedLocale) {
             required,
             autocomplete,
             disabled,
+            constraints,
         } => {
             let labelled = node.label.is_some()
                 && !matches!(input_type, InputType::Hidden | InputType::Submit);
@@ -368,6 +371,13 @@ fn render_node(body: &mut String, node: &Node, locale: &ResolvedLocale) {
             if *disabled {
                 body.push_str(" disabled");
             }
+            // A configured signup field's effective constraints (issue #87) render as the
+            // inert HTML5 validation attributes the browser enforces natively. They are
+            // server known numbers (no user data, nothing script bearing), so the page stays
+            // CSP clean; the server still validates authoritatively on submit regardless.
+            if let Some(constraints) = constraints {
+                render_constraint_attrs(body, constraints);
+            }
             body.push('>');
             if labelled {
                 body.push_str("</label>");
@@ -405,6 +415,28 @@ fn input_type_attr(input_type: InputType) -> &'static str {
         InputType::Hidden => "hidden",
         InputType::Checkbox => "checkbox",
         InputType::Submit => "submit",
+    }
+}
+
+/// Render a configured signup field's effective constraints (issue #87) as inert HTML5
+/// validation attributes. Every value is a server known schema number, so the numeric
+/// bounds are written directly (there is nothing script bearing to escape) and the enum
+/// members are escaped as a data list attribute value. The client validation these enable
+/// is a convenience only; the server enforces the SAME constraints authoritatively on
+/// submit, so a bypassed attribute changes nothing.
+fn render_constraint_attrs(body: &mut String, constraints: &FieldConstraints) {
+    use std::fmt::Write as _;
+    if let Some(min) = constraints.min_length {
+        let _ = write!(body, " minlength=\"{min}\"");
+    }
+    if let Some(max) = constraints.max_length {
+        let _ = write!(body, " maxlength=\"{max}\"");
+    }
+    if let Some(min) = &constraints.minimum {
+        let _ = write!(body, " min=\"{}\"", pages::escape_html(&min.to_string()));
+    }
+    if let Some(max) = &constraints.maximum {
+        let _ = write!(body, " max=\"{}\"", pages::escape_html(&max.to_string()));
     }
 }
 
@@ -471,6 +503,7 @@ mod tests {
                 required: false,
                 autocomplete: None,
                 disabled: false,
+                constraints: None,
             },
             None,
         )
@@ -1010,6 +1043,7 @@ mod tests {
                     required: true,
                     autocomplete: Some(Autocomplete::Username),
                     disabled: false,
+                    constraints: None,
                 },
                 Some(error_message("Identifier")),
             )],

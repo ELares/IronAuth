@@ -13162,6 +13162,20 @@ impl UserRepo<'_> {
     }
 }
 
+/// The validated identity-traits document to persist atomically at registration (issue #87).
+/// The registration flow (issue #84) validated the collected signup fields against the
+/// environment's active trait schema BEFORE calling a `*_with_traits` register method, so the
+/// document is sealed VERBATIM in the same transaction as the account insert (exactly like the
+/// migration/import path, mirroring [`NewAdminUser::traits_json`]): a committed account carries
+/// its collected traits or neither exists. It is never re-validated here.
+#[derive(Debug, Clone, Copy)]
+pub struct RegisteredTraits<'a> {
+    /// The serialized (already schema-validated) partial trait document.
+    pub traits_json: &'a str,
+    /// The active trait schema version the document validated against.
+    pub schema_version: i32,
+}
+
 /// The mutating bootstrap user repository (issue #20).
 pub struct ActingUserRepo<'a> {
     store: &'a Store,
@@ -13195,6 +13209,7 @@ impl ActingUserRepo<'_> {
             "{}",
             false,
             UserState::Active,
+            None,
             None,
         )
         .await
@@ -13231,6 +13246,7 @@ impl ActingUserRepo<'_> {
             "{}",
             false,
             state,
+            None,
             None,
         )
         .await
@@ -13271,6 +13287,7 @@ impl ActingUserRepo<'_> {
             false,
             UserState::Active,
             Some(open),
+            None,
         )
         .await
     }
@@ -13309,6 +13326,7 @@ impl ActingUserRepo<'_> {
             true,
             UserState::Active,
             None,
+            None,
         )
         .await
     }
@@ -13344,6 +13362,108 @@ impl ActingUserRepo<'_> {
             false,
             UserState::Active,
             None,
+            None,
+        )
+        .await
+    }
+
+    /// Register a self-service signup that ALSO collected signup form traits (issue #87),
+    /// sealing the validated partial trait document atomically with the account insert. The
+    /// twin of [`Self::register`] for the registration flow's Active create path; a `None`
+    /// `traits` is exactly [`Self::register`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Conflict`] if the login handle is already registered in this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn register_with_traits(
+        &self,
+        env: &Env,
+        identifier: &str,
+        password_hash: &str,
+        traits: Option<RegisteredTraits<'_>>,
+    ) -> Result<UserId, StoreError> {
+        self.register_inner(
+            env,
+            None,
+            identifier,
+            password_hash,
+            "{}",
+            false,
+            UserState::Active,
+            None,
+            traits,
+        )
+        .await
+    }
+
+    /// Register a signup in an explicit initial lifecycle `state` that ALSO collected signup
+    /// form traits (issue #87), sealing the validated partial trait document atomically with
+    /// the account insert. The twin of [`Self::register_in_state`] for the registration
+    /// flow's waitlist create path (the traits persist even while the account is
+    /// [`UserState::Waitlisted`] and cannot yet authenticate).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Conflict`] if the login handle is already registered in this scope or if
+    /// `state` is not a valid initial state; [`StoreError::Database`] on a persistence failure.
+    pub async fn register_in_state_with_traits(
+        &self,
+        env: &Env,
+        identifier: &str,
+        password_hash: &str,
+        state: UserState,
+        traits: Option<RegisteredTraits<'_>>,
+    ) -> Result<UserId, StoreError> {
+        if !state.is_creatable() {
+            return Err(StoreError::Conflict);
+        }
+        self.register_inner(
+            env,
+            None,
+            identifier,
+            password_hash,
+            "{}",
+            false,
+            state,
+            None,
+            traits,
+        )
+        .await
+    }
+
+    /// Register a QUARANTINED signup that ALSO collected signup form traits (issue #87),
+    /// sealing the validated partial trait document atomically with the account insert and the
+    /// review-queue case. The twin of [`Self::register_quarantined`] for the registration
+    /// flow's quarantine create path.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Conflict`] if the login handle is already registered in this scope;
+    /// [`StoreError::Encryption`] if no platform master key is configured;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn register_quarantined_with_traits(
+        &self,
+        env: &Env,
+        identifier: &str,
+        password_hash: &str,
+        reason: SignupQuarantineReason,
+        traits: Option<RegisteredTraits<'_>>,
+    ) -> Result<UserId, StoreError> {
+        let open = SignupQuarantineOpen {
+            id: SignupQuarantineId::generate(env, &self.scope),
+            reason,
+        };
+        self.register_inner(
+            env,
+            None,
+            identifier,
+            password_hash,
+            "{}",
+            false,
+            UserState::Active,
+            Some(open),
+            traits,
         )
         .await
     }
@@ -13395,6 +13515,11 @@ impl ActingUserRepo<'_> {
         // (Active for a self-service signup, so it can authenticate) with the orthogonal
         // quarantine restriction the authorize path enforces.
         quarantine: Option<SignupQuarantineOpen>,
+        // The validated identity-traits document to seal at INSERT (issue #87), or [`None`]
+        // for a registration that collects no signup fields. Sealed under the same active DEK
+        // as the identifier and claims, exactly like `admin_create`, so the account and its
+        // collected traits are created together or neither is.
+        traits: Option<RegisteredTraits<'_>>,
     ) -> Result<UserId, StoreError> {
         let master = self.store.master().ok_or(StoreError::Encryption)?;
         // The scope needs a live KEK/DEK before the first PII seal; provision them
@@ -13440,12 +13565,26 @@ impl ActingUserRepo<'_> {
                     &user_pii_seal_aad(scope, USER_CLAIMS_PURPOSE, dek_version),
                     claims_json.as_bytes(),
                 );
+                // Seal the validated signup traits under the same active DEK when the
+                // registration collected any (issue #87); a traits-less registration leaves
+                // all three columns NULL, exactly like `admin_create`.
+                let traits_sealed = traits.map(|carried| {
+                    dek.seal(
+                        env.entropy(),
+                        &user_pii_seal_aad(scope, USER_TRAITS_PURPOSE, dek_version),
+                        carried.traits_json.as_bytes(),
+                    )
+                    .into_bytes()
+                });
+                let traits_dek_version = traits.map(|_| dek_version);
+                let traits_schema_version = traits.map(|carried| carried.schema_version);
                 let result = sqlx::query(
                     "INSERT INTO users \
                      (id, tenant_id, environment_id, identifier_bidx, identifier_sealed, \
                       password_hash, claims_sealed, pii_dek_version, passwordless, \
-                      webauthn_user_handle, state, quarantined) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                      webauthn_user_handle, state, quarantined, \
+                      traits_sealed, traits_dek_version, traits_schema_version) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
                 )
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
@@ -13459,6 +13598,9 @@ impl ActingUserRepo<'_> {
                 .bind(webauthn_user_handle.clone())
                 .bind(state.as_str())
                 .bind(quarantine.is_some())
+                .bind(traits_sealed)
+                .bind(traits_dek_version)
+                .bind(traits_schema_version)
                 .execute(&mut **tx)
                 .await;
                 match result {

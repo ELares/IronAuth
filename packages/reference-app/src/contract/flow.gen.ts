@@ -7,6 +7,16 @@
 
 /* eslint-disable */
 export type Autocomplete = "username" | "current-password" | "new-password" | "one-time-code" | "webauthn";
+export interface FieldConstraints {
+  enum?: Array<unknown> | null;
+  maxItems?: number | null;
+  maxLength?: number | null;
+  maximum?: number | null;
+  minItems?: number | null;
+  minLength?: number | null;
+  minimum?: number | null;
+  type?: string | null;
+}
 export type FlowStateTag = "identifier_password" | "registration_details" | "registration_ack" | "mfa_challenge" | "mfa_enroll" | "recovery_start" | "recovery_ack" | "federation_start" | "completed";
 export type InputType = "text" | "password" | "email" | "tel" | "hidden" | "checkbox" | "submit";
 export type Journey = "login" | "registration" | "mfa" | "recovery" | "federation";
@@ -25,7 +35,7 @@ export interface Node {
   label?: Message | null;
   messages: Array<Message>;
 }
-export type NodeAttributes = { autocomplete?: Autocomplete | null; disabled: boolean; input_type: InputType; name: string; node_type: "input"; required: boolean; value?: string | null; } | { message: Message; node_type: "text"; };
+export type NodeAttributes = { autocomplete?: Autocomplete | null; constraints?: FieldConstraints | null; disabled: boolean; input_type: InputType; name: string; node_type: "input"; required: boolean; value?: string | null; } | { message: Message; node_type: "text"; };
 export type NodeGroup = "default" | "password" | "passkey" | "totp" | "email_otp" | "sms_otp" | "recovery_code" | "oidc" | "profile";
 export type Transport = "browser" | "api";
 export interface Ui {
@@ -57,4 +67,4 @@ export const KNOWN_JOURNEYS = ["login", "registration", "mfa", "recovery", "fede
 
 export const KNOWN_INPUT_TYPES = ["text", "password", "email", "tel", "hidden", "checkbox", "submit"] as const;
 
-export const CONTRACT_VERSION = 1;
+export const CONTRACT_VERSION = 2;

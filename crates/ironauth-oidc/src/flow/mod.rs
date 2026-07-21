@@ -42,6 +42,7 @@ mod mfa;
 mod recovery;
 mod registration;
 mod render;
+mod signup_fields;
 mod transport;
 
 pub use golden::{GoldenFlow, golden_corpus, golden_flows};
@@ -525,8 +526,15 @@ pub async fn create_flow(
     }
     let transient = normalize_transient_payload(transient_payload)?;
     let flow_id = FlowId::generate(state.env(), &scope);
-    let (persisted, nodes) = start_state(journey, transport, &flow_id.to_string(), connector)
+    let (persisted, mut nodes) = start_state(journey, transport, &flow_id.to_string(), connector)
         .ok_or(FlowError::NotFound)?;
+    // A registration flow appends the client's configured signup field nodes (issue #87) to
+    // the initial details form, so the very NEXT flow created after a management write to the
+    // form reflects the change with no redeploy (the immediacy the flow contract diff test
+    // pins). Any absence (no client, no form, no active schema) collects nothing.
+    if journey == Journey::Registration {
+        nodes.extend(registration::signup_start_nodes(state, scope, return_to).await);
+    }
     let start_step = persisted.step;
     let submit_token = generate_submit_token(state);
     let now = state.now();
