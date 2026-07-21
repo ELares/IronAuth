@@ -70,6 +70,7 @@ mod redirect;
 mod repository;
 pub mod risk;
 mod scope;
+pub mod signup_form;
 pub mod sms_otp;
 pub mod snapshot;
 mod store;
@@ -140,13 +141,13 @@ pub use id::{
     RiskSignalId, RiskSignalKind, RoutingRuleId, RoutingRuleKind, ScopeStepUpPolicyId,
     ScopeStepUpPolicyKind, ScopedId, ScopedKind, ServiceAccountId, ServiceAccountKind, ServiceId,
     ServiceKind, SessionEventId, SessionEventKind, SessionId, SessionKind, SigningKeyId,
-    SigningKeyKind, SignupQuarantineId, SignupQuarantineKind, SmsOtpCodeId, SmsOtpCodeKind,
-    SmsRouteStatId, SmsRouteStatKind, TenantId, TenantKind, TotpCredentialId, TotpCredentialKind,
-    TraitMigrationJobId, TraitMigrationJobKind, TraitSchemaId, TraitSchemaKind, TrustedDeviceId,
-    TrustedDeviceKind, UpstreamTokenGrantId, UpstreamTokenGrantKind, UpstreamTokenId,
-    UpstreamTokenKind, UserId, UserIdentifierId, UserIdentifierKind, UserKind, VariableId,
-    VariableKind, WebauthnChallengeId, WebauthnChallengeKind, WebauthnCredentialId,
-    WebauthnCredentialKind,
+    SigningKeyKind, SignupFormId, SignupFormKind, SignupQuarantineId, SignupQuarantineKind,
+    SmsOtpCodeId, SmsOtpCodeKind, SmsRouteStatId, SmsRouteStatKind, TenantId, TenantKind,
+    TotpCredentialId, TotpCredentialKind, TraitMigrationJobId, TraitMigrationJobKind,
+    TraitSchemaId, TraitSchemaKind, TrustedDeviceId, TrustedDeviceKind, UpstreamTokenGrantId,
+    UpstreamTokenGrantKind, UpstreamTokenId, UpstreamTokenKind, UserId, UserIdentifierId,
+    UserIdentifierKind, UserKind, VariableId, VariableKind, WebauthnChallengeId,
+    WebauthnChallengeKind, WebauthnCredentialId, WebauthnCredentialKind,
 };
 pub use identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
@@ -252,6 +253,10 @@ pub use risk::{
     NewRiskSignal, RiskDecisionView, RiskSignalView,
 };
 pub use scope::Scope;
+pub use signup_form::{
+    NewSignupForm, SignupFormConfig, SignupFormError, SignupFormField, SignupFormRecord,
+    SignupStep, validate_against_schema as validate_signup_form,
+};
 pub use sms_otp::{ActiveSmsOtpCode, NewSmsOtpCode, SmsRouteStat, SmsTenantConfig};
 pub use snapshot::{
     CLIENT_SECRET_REFERENCE, ClientSnapshot, DcrPolicySnapshot, OrgConnectionSnapshot,
@@ -261,6 +266,7 @@ pub use snapshot::{
 };
 pub use store::Store;
 pub use trait_schema::{
-    MAX_DEPTH as TRAIT_SCHEMA_MAX_DEPTH, SchemaError, TraitAnnotations, TraitSchema, TransformOp,
-    ValidationFailure, Visibility, apply_transform, parse_transform,
+    MAX_DEPTH as TRAIT_SCHEMA_MAX_DEPTH, NarrowingViolation, SchemaError, TraitAnnotations,
+    TraitSchema, TransformOp, ValidationFailure, Visibility, apply_transform, narrows,
+    parse_transform,
 };

@@ -187,13 +187,18 @@ pub enum ResourceType {
     /// non-secret per-environment config a config snapshot carries and a promotion replays, so
     /// it is Promotable. Per-organization localization is out of scope for #86.
     LocaleBundle,
+    /// A per-environment, per-client signup form (issue #87): one declarative signup-form-as-data
+    /// definition per (tenant, environment, client). Its field list references identity trait
+    /// paths as RFC 6901 pointers plus a narrowing-only rule set: all non-secret per-environment
+    /// config a config snapshot carries and a promotion replays, so it is Promotable.
+    SignupForm,
 }
 
 impl ResourceType {
     /// Every resource type, in a stable order. The classification lint and the
     /// metadata endpoint both iterate this; a variant missing here is caught by
     /// the `all_lists_every_variant` test and by `scripts/classification-lint.sh`.
-    pub const ALL: [ResourceType; 26] = [
+    pub const ALL: [ResourceType; 27] = [
         ResourceType::Operator,
         ResourceType::Tenant,
         ResourceType::Environment,
@@ -220,6 +225,7 @@ impl ResourceType {
         ResourceType::Flow,
         ResourceType::Brand,
         ResourceType::LocaleBundle,
+        ResourceType::SignupForm,
     ];
 
     /// The stable wire name of this resource type (for example `organization`).
@@ -252,6 +258,7 @@ impl ResourceType {
             ResourceType::Flow => "flow",
             ResourceType::Brand => "brand",
             ResourceType::LocaleBundle => "locale_bundle",
+            ResourceType::SignupForm => "signup_form",
         }
     }
 
@@ -285,7 +292,8 @@ impl ResourceType {
             | ResourceType::UpstreamTokenGrant
             | ResourceType::Flow
             | ResourceType::Brand
-            | ResourceType::LocaleBundle => ResourceLevel::Environment,
+            | ResourceType::LocaleBundle
+            | ResourceType::SignupForm => ResourceLevel::Environment,
         }
     }
 
@@ -336,6 +344,10 @@ pub fn classify(resource: ResourceType) -> ResourceClassification {
         // config snapshot carries it and a promotion replays it, exactly the "static
         // configuration" the promotion story moves. Per-organization localization is out of
         // scope for #86.
+        // A per-environment, per-client signup form (issue #87) is non-secret
+        // per-environment config: its field list references trait paths as RFC 6901
+        // pointers plus a narrowing-only rule set, exactly the "static configuration" a
+        // config snapshot carries and a promotion replays.
         ResourceType::Client
         | ResourceType::ResourceServer
         | ResourceType::DcrPolicy
@@ -345,7 +357,8 @@ pub fn classify(resource: ResourceType) -> ResourceClassification {
         | ResourceType::RoutingRule
         | ResourceType::UpstreamTokenGrant
         | ResourceType::Brand
-        | ResourceType::LocaleBundle => Promotable,
+        | ResourceType::LocaleBundle
+        | ResourceType::SignupForm => Promotable,
 
         // Environment-intrinsic identity, excluded from every snapshot so a
         // promotion never copies one environment's identity onto another: the

@@ -82,7 +82,7 @@ pub const CONNECTOR_CLIENT_SECRET_REFERENCE: &str = "connector_client_secret";
 /// (and by the export), and an environment-identity or runtime type can never be
 /// added without failing it. This is the live binding between the snapshot and the
 /// single source of truth, not a hand-maintained parallel list.
-pub const SNAPSHOT_RESOURCE_TYPES: [ResourceType; 10] = [
+pub const SNAPSHOT_RESOURCE_TYPES: [ResourceType; 11] = [
     ResourceType::Client,
     ResourceType::ResourceServer,
     ResourceType::DcrPolicy,
@@ -93,6 +93,7 @@ pub const SNAPSHOT_RESOURCE_TYPES: [ResourceType; 10] = [
     ResourceType::UpstreamTokenGrant,
     ResourceType::Brand,
     ResourceType::LocaleBundle,
+    ResourceType::SignupForm,
 ];
 
 /// A named reference to a secret in the environment-scoped secret store (issue
@@ -385,6 +386,21 @@ pub struct LocaleBundleSnapshot {
     pub entries: serde_json::Value,
 }
 
+/// The secret-free projection of one per-environment, per-client signup form (issue #87). A
+/// signup form is NON-secret promotable config: the client id it governs and the field list
+/// (each field a trait pointer, a required flag, an order, a step, a narrowing-only rule object,
+/// and a label message id) travel as embedded parsed JSON so the field list canonicalizes
+/// recursively. No secret and no PII: only trait pointers, bounded rules, and numeric ids.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignupFormSnapshot {
+    /// The authorize client id this form governs, unique per scope: the stable natural key the
+    /// export orders by.
+    pub client_id: String,
+    /// The field list (a JSON array of field objects), embedded as parsed JSON so it
+    /// canonicalizes recursively.
+    pub fields: serde_json::Value,
+}
+
 /// The promotable resources a snapshot carries, keyed by resource-type wire name
 /// (issue #41 classification). Each array is ordered by its type's stable natural
 /// key, so the collection order is deterministic and documented.
@@ -431,6 +447,11 @@ pub struct SnapshotResources {
     /// localization is out of scope for #86 (issue #86, PR 2).
     #[serde(default)]
     pub locale_bundle: Vec<LocaleBundleSnapshot>,
+    /// The environment's per-environment, per-client signup forms (`signup_form`). Each is
+    /// secret-free config (a client id and a field list of trait pointers plus narrowing-only
+    /// rules); no secret and no PII travels (issue #87).
+    #[serde(default)]
+    pub signup_form: Vec<SignupFormSnapshot>,
 }
 
 /// A canonical, deterministic, secret-free snapshot of one environment's
@@ -809,6 +830,22 @@ pub async fn export(scoped: &ScopedStore<'_>) -> Result<Snapshot, StoreError> {
     }
     locale_bundle.sort_by(|a, b| a.locale.cmp(&b.locale));
 
+    // Per-environment, per-client signup forms (issue #87): non-secret promotable config. The
+    // field list is embedded as PARSED JSON so it canonicalizes recursively (a decode fault here
+    // is a real persistence corruption, surfaced rather than swallowed). No secret and no PII
+    // travels (only trait pointers, bounded rules, and numeric ids). Ordered by the stable
+    // client-id natural key.
+    let mut signup_form = Vec::new();
+    for record in scoped.signup_forms().list_all().await? {
+        let fields: serde_json::Value =
+            serde_json::from_str(&record.fields_json).map_err(serde_fault)?;
+        signup_form.push(SignupFormSnapshot {
+            client_id: record.client_id,
+            fields,
+        });
+    }
+    signup_form.sort_by(|a, b| a.client_id.cmp(&b.client_id));
+
     Ok(Snapshot {
         schema_version: SNAPSHOT_SCHEMA_VERSION.to_string(),
         resources: SnapshotResources {
@@ -822,6 +859,7 @@ pub async fn export(scoped: &ScopedStore<'_>) -> Result<Snapshot, StoreError> {
             upstream_token_grant,
             brand,
             locale_bundle,
+            signup_form,
         },
     })
 }
@@ -996,6 +1034,11 @@ const BRAND_ASSET_KINDS: [&str; 2] = ["logo", "favicon"];
 /// locale bundle holds no secret material. The published schema pins `additionalProperties:
 /// false`.
 const LOCALE_BUNDLE_KEYS: [&str; 3] = ["locale", "is_env_default", "entries"];
+
+/// Every key a snapshot `signup_form` element may carry (issue #87). No secret slot: a signup
+/// form holds no secret material and no PII (only trait pointers, bounded rules, and numeric
+/// ids). The published schema pins `additionalProperties: false`.
+const SIGNUP_FORM_KEYS: [&str; 2] = ["client_id", "fields"];
 
 /// Every key a snapshot `connector` element may carry, besides the secret REFERENCE
 /// slot (issue #75). The published schema pins `additionalProperties: false`.
@@ -1362,6 +1405,35 @@ fn validate_resource(
                 )),
             }
         }
+        ResourceType::SignupForm => {
+            // A signup form is secret-free config (issue #87): a client id and the field list (a
+            // JSON array of field objects, each a trait pointer plus a narrowing-only rule set).
+            // The forbidden-secret-key scan above already blocks secret-shaped material; a field
+            // carries only trait pointers, bounded rules, and numeric ids, never PII.
+            reject_unknown_keys(object, &SIGNUP_FORM_KEYS, None, path, violations);
+            require_nonempty_string(object, "client_id", path, violations);
+            match object.get("fields") {
+                // Every element of the field list must be a JSON object (a field descriptor).
+                Some(serde_json::Value::Array(items)) => {
+                    for (index, item) in items.iter().enumerate() {
+                        if !item.is_object() {
+                            violations.push(SnapshotViolation::new(
+                                format!("{path}/fields/{index}"),
+                                "must be a JSON object",
+                            ));
+                        }
+                    }
+                }
+                Some(_) => violations.push(SnapshotViolation::new(
+                    format!("{path}/fields"),
+                    "must be a JSON array",
+                )),
+                None => violations.push(SnapshotViolation::new(
+                    format!("{path}/fields"),
+                    "missing required array field",
+                )),
+            }
+        }
         // Only the promotable set is ever passed here (the caller iterates
         // SNAPSHOT_RESOURCE_TYPES); a non-promotable type is a programmer error, not
         // a document fault, so it is reported at the element path.
@@ -1630,8 +1702,9 @@ pub fn classification_coverage_gaps() -> (Vec<ResourceType>, Vec<ResourceType>) 
 #[cfg(test)]
 mod tests {
     use super::{
-        PRIVATE_JWK_PARAMS, SNAPSHOT_RESOURCE_TYPES, SNAPSHOT_SCHEMA_VERSION, Snapshot,
-        SnapshotResources, classification_coverage_gaps, project_jwks_public, validate_document,
+        PRIVATE_JWK_PARAMS, SNAPSHOT_RESOURCE_TYPES, SNAPSHOT_SCHEMA_VERSION, SignupFormSnapshot,
+        Snapshot, SnapshotResources, classification_coverage_gaps, project_jwks_public,
+        validate_document,
     };
     use crate::classification::{ResourceClassification, ResourceType, classify};
 
@@ -1686,8 +1759,57 @@ mod tests {
             text,
             "{\"resources\":{\"brand\":[],\"client\":[],\"connector\":[],\"dcr_policy\":[],\
              \"locale_bundle\":[],\"org_connection\":[],\"resource_server\":[],\
-             \"routing_rule\":[],\"upstream_token_grant\":[],\"variable\":[]},\
-             \"schema_version\":\"ironauth.config-snapshot/v1\"}"
+             \"routing_rule\":[],\"signup_form\":[],\"upstream_token_grant\":[],\
+             \"variable\":[]},\"schema_version\":\"ironauth.config-snapshot/v1\"}"
+        );
+    }
+
+    #[test]
+    fn a_signup_form_survives_export_validate_round_trip_byte_identically() {
+        // issue #87: a SignupForm in a snapshot validates and canonicalizes losslessly, so a
+        // promotion carries the field list byte-for-byte.
+        let mut resources = SnapshotResources::default();
+        resources.signup_form.push(SignupFormSnapshot {
+            client_id: "cli_example".to_string(),
+            fields: serde_json::json!([
+                {
+                    "trait_pointer": "/email",
+                    "required": true,
+                    "order": 0,
+                    "step": "signup",
+                    "rules": {"minLength": 5},
+                    "label_message_id": 1070
+                }
+            ]),
+        });
+        let snapshot = Snapshot {
+            schema_version: SNAPSHOT_SCHEMA_VERSION.to_string(),
+            resources,
+        };
+        let canonical = snapshot.to_canonical_string().expect("canonicalize");
+        // The document validates cleanly (secret-free, known keys, fields is an array of objects).
+        let parsed = validate_document(canonical.as_bytes()).expect("valid signup form");
+        // The parsed snapshot re-serializes byte-identically (the round-trip invariant).
+        assert_eq!(
+            canonical,
+            parsed.to_canonical_string().expect("reserialize"),
+            "a signup form must round-trip losslessly"
+        );
+        assert_eq!(parsed.resources.signup_form, snapshot.resources.signup_form);
+    }
+
+    #[test]
+    fn a_signup_form_with_non_object_fields_is_rejected() {
+        // A field list whose element is not an object is a document fault, caught at its path.
+        let doc = format!(
+            r#"{{"schema_version":"{SNAPSHOT_SCHEMA_VERSION}","resources":{{"signup_form":[{{"client_id":"cli_x","fields":[42]}}]}}}}"#
+        );
+        let violations = validate_document(doc.as_bytes()).expect_err("rejected");
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.path == "/resources/signup_form/0/fields/0"),
+            "{violations:?}"
         );
     }
 

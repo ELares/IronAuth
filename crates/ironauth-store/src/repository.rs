@@ -87,9 +87,9 @@ use crate::id::{
     RecoveryContactConfirmationId, RecoveryFlowId, RecoveryIdvSessionId, RecoveryTrustedContactId,
     RefreshFamilyId, RefreshTokenId, ResourceServerId, RiskDecisionId, RiskDisavowalId,
     RiskLoginGeoId, RiskSignalId, RoutingRuleId, ScopeStepUpPolicyId, ServiceAccountId,
-    SessionEventId, SessionId, SigningKeyId, SignupQuarantineId, SmsOtpCodeId, SmsRouteStatId,
-    TenantId, TotpCredentialId, TraitMigrationJobId, TraitSchemaId, TrustedDeviceId,
-    UpstreamTokenGrantId, UpstreamTokenId, UserId, UserIdentifierId, VariableId,
+    SessionEventId, SessionId, SigningKeyId, SignupFormId, SignupQuarantineId, SmsOtpCodeId,
+    SmsRouteStatId, TenantId, TotpCredentialId, TraitMigrationJobId, TraitSchemaId,
+    TrustedDeviceId, UpstreamTokenGrantId, UpstreamTokenId, UserId, UserIdentifierId, VariableId,
     WebauthnChallengeId, WebauthnCredentialId,
 };
 use crate::identifier::{
@@ -106,6 +106,7 @@ use crate::risk::{
     NewRiskSignal, RiskDecisionView, RiskSignalView,
 };
 use crate::scope::Scope;
+use crate::signup_form::{NewSignupForm, SignupFormRecord};
 use crate::sms_otp::{ActiveSmsOtpCode, NewSmsOtpCode, SmsRouteStat, SmsTenantConfig};
 use crate::store::Store;
 use crate::trait_schema::{TraitSchema, TransformOp, ValidationFailure};
@@ -510,6 +511,18 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn locale_bundles(&self) -> LocaleBundleRepo<'a> {
         LocaleBundleRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only per-environment, per-client signup form repository for this scope (issue
+    /// #87): read a client's signup form (for the flow-creation path PR 2 wires) and list the
+    /// scope's signup forms (for the config-snapshot export). The stored field list is already
+    /// fail-fast validated on write. The mutating set lives on [`ActingStore::signup_forms`].
+    #[must_use]
+    pub fn signup_forms(&self) -> SignupFormRepo<'a> {
+        SignupFormRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -1397,6 +1410,20 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn locale_bundles(&self) -> ActingLocaleBundleRepo<'a> {
         ActingLocaleBundleRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating per-environment, per-client signup form repository for this scope and actor
+    /// (issue #87): set (create or overwrite) a client's signup form, audited, and delete it,
+    /// audited. The field list is stored already fail-fast validated by the admin signup-forms
+    /// path (no nonexistent / type-incompatible trait, no widening rule). Every write carries the
+    /// actor and correlation id into its audit row.
+    #[must_use]
+    pub fn signup_forms(&self) -> ActingSignupFormRepo<'a> {
+        ActingSignupFormRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -22216,6 +22243,209 @@ impl ActingLocaleBundleRepo<'_> {
     }
 }
 
+/// The read-only per-environment, per-client signup form repository (issue #87): read a client's
+/// signup form for the flow-creation path, and list a scope's signup forms for the config-snapshot
+/// export. Every read is scope-forced under row-level security, so a form of another scope is a
+/// uniform not-found.
+pub struct SignupFormRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl SignupFormRepo<'_> {
+    /// A client's signup form within scope (issue #87), or [`None`] when the client has no form
+    /// installed in this scope.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn get(&self, client_id: &str) -> Result<Option<SignupFormRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, client_id, fields::text AS fields \
+             FROM signup_forms \
+             WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(client_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| signup_form_from_row(&row)))
+    }
+
+    /// EVERY signup form in this scope (no pagination), ordered by client id: the set the config
+    /// snapshot export (issue #43) projects. A signup form is promotable config, so its whole
+    /// non-secret field list travels in the snapshot.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_all(&self) -> Result<Vec<SignupFormRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, client_id, fields::text AS fields \
+             FROM signup_forms \
+             WHERE tenant_id = $1 AND environment_id = $2 ORDER BY client_id",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows.iter().map(signup_form_from_row).collect())
+    }
+}
+
+/// Build a [`SignupFormRecord`] from a `signup_forms` row (the shared read projection).
+fn signup_form_from_row(row: &sqlx::postgres::PgRow) -> SignupFormRecord {
+    SignupFormRecord {
+        id: row.get("id"),
+        client_id: row.get("client_id"),
+        fields_json: row.get("fields"),
+    }
+}
+
+/// The mutating per-environment, per-client signup form repository for one scope and actor (issue
+/// #87): set (create or overwrite) a client's form, audited, and delete it, audited. The field
+/// list is stored verbatim as the caller's ALREADY fail-fast validated JSON string (the admin
+/// signup-forms path validates it against the scope's active trait schema before the write).
+pub struct ActingSignupFormRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingSignupFormRepo<'_> {
+    /// Set a client's signup form (a first write or an overwrite) and audit `signup_form.set` in
+    /// the same transaction (issue #87). One row per (scope, client): a repeat write to the same
+    /// client overwrites in place and reuses the row's id (a stable audit target across
+    /// overwrites), so a set is idempotent on the client id.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `id` is out of scope; [`StoreError::Database`] on a
+    /// persistence failure.
+    pub async fn set(
+        &self,
+        env: &Env,
+        id: &SignupFormId,
+        created_at_micros: i64,
+        params: NewSignupForm<'_>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        // Reuse the existing row id for this client so an overwrite keeps a stable audit target; a
+        // first write uses the caller-minted id.
+        let target_id = match self.form_id_for_client(params.client_id).await? {
+            Some(existing) => existing,
+            None => id.to_string(),
+        };
+        let target = SignupFormId::parse_in_scope(&target_id, &scope)?;
+        let created_micros = created_at_micros;
+        let client_id = params.client_id.to_owned();
+        let fields = params.fields_json.to_owned();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::SignupFormSet,
+                target: &target,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "INSERT INTO signup_forms \
+                     (id, tenant_id, environment_id, client_id, fields, created_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5::jsonb, \
+                             TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval) \
+                     ON CONFLICT (tenant_id, environment_id, client_id) DO UPDATE \
+                     SET fields = EXCLUDED.fields, \
+                         updated_at = EXCLUDED.updated_at",
+                )
+                .bind(target.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&client_id)
+                .bind(&fields)
+                .bind(created_micros)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Delete the signup form named `id` and audit `signup_form.delete` in the same transaction
+    /// (issue #87). A delete of an id out of scope, or of a client with no form, is a uniform
+    /// [`StoreError::NotFound`], so a delete never discloses a foreign scope's forms.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `id` is out of scope or names no installed form;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn delete(&self, env: &Env, id: &SignupFormId) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let target = *id;
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::SignupFormDelete,
+                target: &target,
+            },
+            async move |tx| {
+                let affected = sqlx::query(
+                    "DELETE FROM signup_forms \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND id = $3",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(target.to_string())
+                .execute(&mut **tx)
+                .await?
+                .rows_affected();
+                // A delete of a client with no form rolls back the audit row too (the error is
+                // returned INSIDE the transaction), so a not-found delete records nothing.
+                if affected == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// The stored id of the signup form for `client_id`, or [`None`] for a first write.
+    async fn form_id_for_client(&self, client_id: &str) -> Result<Option<String>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id FROM signup_forms \
+             WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(client_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| row.get::<String, _>("id")))
+    }
+}
+
 /// The mutating federation connector repository (issue #75): create (seal the
 /// upstream client secret inline, audited), update (replace and reseal, audited),
 /// and delete (audited). Every write is scope-bound.
@@ -34874,6 +35104,9 @@ async fn read_promoted_snapshot(
             // Locale bundles (issue #86, PR 2) are likewise exported and diffable but not
             // applied by the transactional engine yet, so the promoted target read omits them.
             locale_bundle: Vec::new(),
+            // Signup forms (issue #87) are likewise exported and diffable but not applied by the
+            // transactional engine yet, so the promoted target read omits them.
+            signup_form: Vec::new(),
         },
     })
 }

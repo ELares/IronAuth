@@ -547,6 +547,13 @@ pub enum Action {
     /// A per-environment LOCALE BUNDLE was deleted through the management API (issue #86,
     /// PR 2). The audit row names the locale bundle id and scope.
     LocaleDelete,
+    /// A per-environment, per-client SIGNUP FORM was set through the management API (issue #87):
+    /// a first write or an overwrite of the fail-fast validated field list. The audit row names
+    /// the signup form id and scope; the field list itself is not recorded here.
+    SignupFormSet,
+    /// A per-environment, per-client SIGNUP FORM was deleted through the management API (issue
+    /// #87). The audit row names the signup form id and scope.
+    SignupFormDelete,
     /// An environment VARIABLE (a non-secret named config value) was set through
     /// the management API (issue #45): a first write or an overwrite. The audit row
     /// names the variable id and scope; the value itself is not recorded here.
@@ -1032,6 +1039,8 @@ impl Action {
             Action::BrandAssetDelete => "brand.asset.delete",
             Action::LocaleSet => "locale.set",
             Action::LocaleDelete => "locale.delete",
+            Action::SignupFormSet => "signup_form.set",
+            Action::SignupFormDelete => "signup_form.delete",
             Action::EnvironmentVariableSet => "environment_variable.set",
             Action::EnvironmentVariableDelete => "environment_variable.delete",
             Action::EnvironmentSecretPut => "environment_secret.put",

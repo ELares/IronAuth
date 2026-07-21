@@ -225,6 +225,273 @@ impl TraitSchema {
             Visibility::User
         }
     }
+
+    /// Resolve an RFC 6901 JSON Pointer into the compiled schema's `properties`
+    /// tree, returning the SUB-SCHEMA for that trait path (issue #87, landing on the
+    /// #53 trait-schema surface). The pointer is the SAME instance pointer a
+    /// [`ValidationFailure`] carries: each object-step token descends through
+    /// `properties`, each array-index token descends through `prefixItems` (by index)
+    /// or the single `items` schema, so a signup form field that names a trait path
+    /// resolves to exactly the sub-schema the validator applies at that location.
+    ///
+    /// Returns [`None`] when the pointer is empty (a field must name a real trait) or
+    /// names a path that does not exist in this schema, which is precisely the
+    /// "nonexistent trait path" a form write is rejected for. Pure and deterministic:
+    /// it only reads the compiled document.
+    #[must_use]
+    pub fn subschema_at(&self, pointer: &str) -> Option<&Value> {
+        // The empty pointer is the document root, not a trait path; a form field must
+        // name a real trait, so it does not resolve.
+        if pointer.is_empty() {
+            return None;
+        }
+        let mut current = &self.root;
+        // RFC 6901: a non-empty pointer is a run of `/`-prefixed reference tokens.
+        for raw_token in pointer.split('/').skip(1) {
+            let token = unescape_token(raw_token);
+            current = descend_subschema(current, &token)?;
+        }
+        Some(current)
+    }
+}
+
+/// Descend one RFC 6901 reference token into a schema node, returning the child
+/// sub-schema (issue #87). A property name resolves through `properties` (taking
+/// precedence, so a property literally named like a number is still found by name);
+/// an array index resolves through `prefixItems` at that index, else the single
+/// `items` schema. Any other token does not resolve.
+fn descend_subschema<'a>(schema: &'a Value, token: &str) -> Option<&'a Value> {
+    let object = schema.as_object()?;
+    if let Some(child) = object
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|props| props.get(token))
+    {
+        return Some(child);
+    }
+    if let Ok(index) = token.parse::<usize>() {
+        if let Some(child) = object
+            .get("prefixItems")
+            .and_then(Value::as_array)
+            .and_then(|prefix| prefix.get(index))
+        {
+            return Some(child);
+        }
+        // A single-schema `items` applies to every element past the prefix. A boolean
+        // `items` (accept / reject everything) is not a descendable sub-schema.
+        match object.get("items") {
+            Some(items) if !items.is_boolean() => return Some(items),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Reverse an RFC 6901 reference-token escape: `~1` decodes to `/` and `~0` to `~`.
+/// The `~1`-before-`~0` order is mandated by RFC 6901 so an escaped `~1` sequence is
+/// never mis-decoded.
+fn unescape_token(token: &str) -> String {
+    token.replace("~1", "/").replace("~0", "~")
+}
+
+/// Why a signup form rule WIDENS the trait sub-schema it must narrow (issue #87). It
+/// names the offending keyword (and a pointer to it within the rule), never a value,
+/// so a rejection is operator-safe and carries no trait data. The closed narrowing
+/// vocabulary is `type`, `enum`, `minLength`, `maxLength`, `minItems`, `maxItems`,
+/// `minimum`, `maximum` (plus `required`, which can only tighten); any other keyword
+/// on a form rule cannot be proven to narrow and is reported here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NarrowingViolation {
+    /// An RFC 6901 JSON Pointer to the offending keyword WITHIN the rule object (for
+    /// example `/minLength`). Combined by the caller with the field's trait pointer to
+    /// name the exact rule location.
+    pub pointer: String,
+    /// The offending keyword (for example `minLength`). Never a value.
+    pub keyword: String,
+}
+
+/// Whether a signup form `rule` is a STRUCTURAL SUBSET of a `trait_subschema` over
+/// the closed keyword vocabulary (issue #87, landing on the #53 surface): the form
+/// may only TIGHTEN the trait's constraint, never widen it.
+///
+/// A rule narrows when, for every keyword it carries:
+///
+/// - `type`: the form's type set is a subset of the trait's (a trait with no `type`
+///   permits any type, so any form type narrows it);
+/// - `enum`: every form enum member is in the trait's enum (introducing an enum where
+///   the trait has none is narrowing);
+/// - `minLength` / `minItems` / `minimum`: the form's lower bound is `>=` the trait's
+///   (a tighter floor; a trait with no such bound is widened by nothing);
+/// - `maxLength` / `maxItems` / `maximum`: the form's upper bound is `<=` the trait's
+///   (a tighter ceiling); and
+/// - `required`: always narrowing (a form may require a trait the schema does not).
+///
+/// A rule that RELAXES any bound, names an enum member the trait does not permit,
+/// broadens the type, or carries any keyword outside the closed vocabulary is a
+/// widening and returns [`NarrowingViolation`]. Pure and deterministic; a violation
+/// names the keyword, never a value.
+///
+/// # Errors
+///
+/// [`NarrowingViolation`] naming the first widening keyword (iterated in the rule's
+/// object key order, which serde keeps sorted, so the result is deterministic).
+pub fn narrows(form_rule: &Value, trait_subschema: &Value) -> Result<(), NarrowingViolation> {
+    // An absent rule (null) tightens nothing and narrows trivially. A rule that is
+    // neither null nor an object is malformed and cannot be proven to narrow, so it is
+    // refused, fail closed like every keyword handler below.
+    let rule = match form_rule {
+        Value::Null => return Ok(()),
+        Value::Object(map) => map,
+        _ => return Err(narrowing_violation("rules")),
+    };
+    for (keyword, value) in rule {
+        match keyword.as_str() {
+            "type" => check_type_narrows(value, trait_subschema, keyword)?,
+            "enum" => check_enum_narrows(value, trait_subschema, keyword)?,
+            "minLength" | "minItems" => {
+                check_integer_bound(keyword, value, trait_subschema, Bound::Lower)?;
+            }
+            "maxLength" | "maxItems" => {
+                check_integer_bound(keyword, value, trait_subschema, Bound::Upper)?;
+            }
+            "minimum" => check_number_bound(keyword, value, trait_subschema, Bound::Lower)?,
+            "maximum" => check_number_bound(keyword, value, trait_subschema, Bound::Upper)?,
+            // A form may REQUIRE a trait the schema does not; that only tightens.
+            "required" => {}
+            // Any other keyword cannot be proven to narrow the trait, so it is refused.
+            other => return Err(narrowing_violation(other)),
+        }
+    }
+    Ok(())
+}
+
+/// Which end of a bound a keyword tightens: a lower bound tightens by growing, an
+/// upper bound tightens by shrinking.
+#[derive(Clone, Copy)]
+enum Bound {
+    Lower,
+    Upper,
+}
+
+/// Build a [`NarrowingViolation`] for `keyword`, pointing at it within the rule.
+fn narrowing_violation(keyword: &str) -> NarrowingViolation {
+    NarrowingViolation {
+        pointer: format!("/{}", escape_token(keyword)),
+        keyword: keyword.to_string(),
+    }
+}
+
+/// The set of primitive type names a `type` keyword denotes (a single name or an
+/// array of names). A non-string, non-array value denotes the empty set.
+fn type_name_set(type_value: &Value) -> BTreeSet<&str> {
+    match type_value {
+        Value::String(name) => std::iter::once(name.as_str()).collect(),
+        Value::Array(names) => names.iter().filter_map(Value::as_str).collect(),
+        _ => BTreeSet::new(),
+    }
+}
+
+/// The `type` keyword narrows when the form's type set is a subset of the trait's. A
+/// trait with no `type` permits every type, so any form type narrows it.
+fn check_type_narrows(
+    form_type: &Value,
+    trait_subschema: &Value,
+    keyword: &str,
+) -> Result<(), NarrowingViolation> {
+    let form = type_name_set(form_type);
+    // A malformed form `type` (not a string, not an array of type names, or an array with
+    // no usable name) denotes the empty set, which would be a subset of anything. That
+    // cannot be proven to narrow, so it is refused, fail closed like the other keywords.
+    if form.is_empty() {
+        return Err(narrowing_violation(keyword));
+    }
+    let Some(trait_type) = trait_subschema.get("type") else {
+        // The trait permits every type, so a well formed form type narrows it.
+        return Ok(());
+    };
+    let trait_set = type_name_set(trait_type);
+    if form.is_subset(&trait_set) {
+        Ok(())
+    } else {
+        Err(narrowing_violation(keyword))
+    }
+}
+
+/// The `enum` keyword narrows when every form enum member is one the trait permits.
+/// A trait with no `enum` permits any value the type allows, so INTRODUCING an enum is
+/// narrowing.
+fn check_enum_narrows(
+    form_enum: &Value,
+    trait_subschema: &Value,
+    keyword: &str,
+) -> Result<(), NarrowingViolation> {
+    let Some(form_values) = form_enum.as_array() else {
+        // A malformed form enum cannot be proven to narrow.
+        return Err(narrowing_violation(keyword));
+    };
+    let Some(trait_values) = trait_subschema.get("enum").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for member in form_values {
+        if !trait_values.iter().any(|candidate| candidate == member) {
+            return Err(narrowing_violation(keyword));
+        }
+    }
+    Ok(())
+}
+
+/// An integer length / size bound (`minLength` / `maxLength` / `minItems` /
+/// `maxItems`) narrows when a LOWER bound is `>=` the trait's and an UPPER bound is
+/// `<=` the trait's. A trait without the bound is tightened by any form bound; a
+/// malformed (non-integer) form bound cannot be proven to narrow.
+fn check_integer_bound(
+    keyword: &str,
+    form_value: &Value,
+    trait_subschema: &Value,
+    bound: Bound,
+) -> Result<(), NarrowingViolation> {
+    let Some(form) = form_value.as_u64() else {
+        return Err(narrowing_violation(keyword));
+    };
+    let Some(trait_bound) = trait_subschema.get(keyword).and_then(Value::as_u64) else {
+        return Ok(());
+    };
+    let narrows = match bound {
+        Bound::Lower => form >= trait_bound,
+        Bound::Upper => form <= trait_bound,
+    };
+    if narrows {
+        Ok(())
+    } else {
+        Err(narrowing_violation(keyword))
+    }
+}
+
+/// A numeric range bound (`minimum` / `maximum`) narrows when a LOWER bound is `>=`
+/// the trait's and an UPPER bound is `<=` the trait's. A trait without the bound is
+/// tightened by any form bound; a malformed (non-numeric) form bound cannot be proven
+/// to narrow.
+fn check_number_bound(
+    keyword: &str,
+    form_value: &Value,
+    trait_subschema: &Value,
+    bound: Bound,
+) -> Result<(), NarrowingViolation> {
+    let Some(form) = form_value.as_f64() else {
+        return Err(narrowing_violation(keyword));
+    };
+    let Some(trait_bound) = trait_subschema.get(keyword).and_then(Value::as_f64) else {
+        return Ok(());
+    };
+    let narrows = match bound {
+        Bound::Lower => form >= trait_bound,
+        Bound::Upper => form <= trait_bound,
+    };
+    if narrows {
+        Ok(())
+    } else {
+        Err(narrowing_violation(keyword))
+    }
 }
 
 /// Escape a single reference token for an RFC 6901 JSON Pointer: `~` becomes `~0`
@@ -940,6 +1207,198 @@ mod tests {
         let redacted =
             a.redact_for_user(&json!({"email": "a@b.test", "risk_score": 90, "nickname": "z"}));
         assert_eq!(redacted, json!({"email": "a@b.test", "nickname": "z"}));
+    }
+
+    #[test]
+    fn subschema_at_resolves_object_and_array_trait_paths() {
+        // issue #87: a trait pointer resolves to the sub-schema the validator applies
+        // at that instance location, through nested objects and arrays.
+        let s = schema(&json!({
+            "type": "object",
+            "properties": {
+                "email": {"type": "string", "minLength": 3},
+                "address": {
+                    "type": "object",
+                    "properties": {"zip": {"type": "string", "maxLength": 10}}
+                },
+                "phones": {
+                    "type": "array",
+                    "items": {"type": "object", "properties": {"number": {"type": "string"}}}
+                }
+            }
+        }));
+        assert_eq!(
+            s.subschema_at("/email"),
+            Some(&json!({"type": "string", "minLength": 3}))
+        );
+        assert_eq!(
+            s.subschema_at("/address/zip"),
+            Some(&json!({"type": "string", "maxLength": 10}))
+        );
+        // An array element resolves through `items`, then its property.
+        assert_eq!(
+            s.subschema_at("/phones/0/number"),
+            Some(&json!({"type": "string"}))
+        );
+        // A nonexistent path (and the empty pointer) does not resolve.
+        assert_eq!(s.subschema_at("/nope"), None);
+        assert_eq!(s.subschema_at("/address/missing"), None);
+        assert_eq!(s.subschema_at(""), None);
+    }
+
+    #[test]
+    fn subschema_at_resolves_prefix_items_by_index_and_escaped_tokens() {
+        let s = schema(&json!({
+            "type": "object",
+            "properties": {
+                "pair": {
+                    "type": "array",
+                    "prefixItems": [{"type": "string"}, {"type": "integer"}]
+                },
+                "a/b": {"type": "boolean"}
+            }
+        }));
+        assert_eq!(s.subschema_at("/pair/0"), Some(&json!({"type": "string"})));
+        assert_eq!(s.subschema_at("/pair/1"), Some(&json!({"type": "integer"})));
+        // Past the prefix with no `items` schema does not resolve.
+        assert_eq!(s.subschema_at("/pair/2"), None);
+        // An RFC 6901 escaped `/` (`~1`) in a property name resolves by name.
+        assert_eq!(s.subschema_at("/a~1b"), Some(&json!({"type": "boolean"})));
+    }
+
+    #[test]
+    fn narrows_accepts_every_tightening() {
+        // A tighter type (subset), a tighter enum (subset of a value space), tighter
+        // lower and upper bounds, an INTRODUCED enum / bound where the trait has none,
+        // and a form-level `required` the trait lacks: each narrows.
+        let string_trait = json!({"type": "string", "minLength": 2, "maxLength": 20});
+        // Same bounds narrow (a subset is reflexive).
+        assert!(narrows(&json!({"minLength": 2, "maxLength": 20}), &string_trait).is_ok());
+        // Tighter bounds narrow.
+        assert!(narrows(&json!({"minLength": 5, "maxLength": 10}), &string_trait).is_ok());
+        // Introducing a bound the trait does not carry narrows.
+        assert!(narrows(&json!({"minLength": 1}), &json!({"type": "string"})).is_ok());
+        // A type subset narrows; a trait with no `type` permits any type.
+        assert!(
+            narrows(
+                &json!({"type": "string"}),
+                &json!({"type": ["string", "null"]})
+            )
+            .is_ok()
+        );
+        assert!(narrows(&json!({"type": "string"}), &json!({})).is_ok());
+        // Introducing an enum where the trait has none narrows.
+        assert!(narrows(&json!({"enum": ["a", "b"]}), &json!({"type": "string"})).is_ok());
+        // An enum subset of the trait's enum narrows.
+        assert!(
+            narrows(
+                &json!({"enum": ["a"]}),
+                &json!({"type": "string", "enum": ["a", "b", "c"]})
+            )
+            .is_ok()
+        );
+        // Numeric range tightening narrows; `required` always narrows.
+        let num_trait = json!({"type": "integer", "minimum": 0, "maximum": 100});
+        assert!(narrows(&json!({"minimum": 10, "maximum": 50}), &num_trait).is_ok());
+        assert!(narrows(&json!({"required": ["x"]}), &num_trait).is_ok());
+        // Item-count tightening narrows.
+        let arr_trait = json!({"type": "array", "minItems": 1, "maxItems": 9});
+        assert!(narrows(&json!({"minItems": 2, "maxItems": 5}), &arr_trait).is_ok());
+    }
+
+    #[test]
+    fn narrows_rejects_every_widening() {
+        let string_trait = json!({"type": "string", "minLength": 5, "maxLength": 10});
+        // A relaxed lower bound (allows shorter than the trait's floor) widens.
+        assert_eq!(
+            narrows(&json!({"minLength": 2}), &string_trait)
+                .unwrap_err()
+                .keyword,
+            "minLength"
+        );
+        // A relaxed upper bound (allows longer than the trait's ceiling) widens.
+        assert_eq!(
+            narrows(&json!({"maxLength": 50}), &string_trait)
+                .unwrap_err()
+                .keyword,
+            "maxLength"
+        );
+        // A broader type widens.
+        assert_eq!(
+            narrows(
+                &json!({"type": ["string", "integer"]}),
+                &json!({"type": "string"})
+            )
+            .unwrap_err()
+            .keyword,
+            "type"
+        );
+        // An enum member the trait does not permit widens.
+        assert_eq!(
+            narrows(
+                &json!({"enum": ["a", "z"]}),
+                &json!({"type": "string", "enum": ["a", "b"]})
+            )
+            .unwrap_err()
+            .keyword,
+            "enum"
+        );
+        // A relaxed numeric lower / upper bound widens.
+        let num_trait = json!({"type": "integer", "minimum": 0, "maximum": 100});
+        assert_eq!(
+            narrows(&json!({"minimum": -5}), &num_trait)
+                .unwrap_err()
+                .keyword,
+            "minimum"
+        );
+        assert_eq!(
+            narrows(&json!({"maximum": 200}), &num_trait)
+                .unwrap_err()
+                .keyword,
+            "maximum"
+        );
+        // A relaxed item-count bound widens.
+        let arr_trait = json!({"type": "array", "minItems": 2, "maxItems": 5});
+        assert_eq!(
+            narrows(&json!({"maxItems": 50}), &arr_trait)
+                .unwrap_err()
+                .keyword,
+            "maxItems"
+        );
+        // A keyword outside the closed narrowing vocabulary cannot be proven to narrow.
+        let violation = narrows(&json!({"pattern": "^x$"}), &string_trait).unwrap_err();
+        assert_eq!(violation.keyword, "pattern");
+        assert_eq!(violation.pointer, "/pattern");
+        // Fail closed on malformed input: a rule that is not an object, and a `type`
+        // keyword that is not a type name or an array of names, cannot be proven to narrow
+        // and so are refused (rather than accepted as the empty set, which would widen).
+        assert_eq!(
+            narrows(&json!("haxor"), &string_trait).unwrap_err().keyword,
+            "rules"
+        );
+        assert_eq!(
+            narrows(&json!(5), &string_trait).unwrap_err().keyword,
+            "rules"
+        );
+        assert_eq!(
+            narrows(&json!({"type": 5}), &string_trait)
+                .unwrap_err()
+                .keyword,
+            "type"
+        );
+        assert_eq!(
+            narrows(&json!({"type": {}}), &string_trait)
+                .unwrap_err()
+                .keyword,
+            "type"
+        );
+        // A malformed type is refused EVEN when the trait has no type (nothing to subset).
+        assert_eq!(
+            narrows(&json!({"type": 5}), &json!({"minLength": 1}))
+                .unwrap_err()
+                .keyword,
+            "type"
+        );
     }
 
     #[test]

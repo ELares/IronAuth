@@ -102,6 +102,14 @@ name = "pagination"
 path = "tests/pagination.rs"
 required-features = ["testing"]
 
+# Per-environment, per-client signup form management endpoint (issue #87): the operator
+# set / get / delete lifecycle, and the fail-fast write validation (an unknown step and a
+# field referencing a trait with no active schema are precise 400s). Needs a real database.
+[[test]]
+name = "signup_forms"
+path = "tests/signup_forms.rs"
+required-features = ["testing"]
+
 # Config snapshot export endpoint (issue #43): the operator and the environment's
 # own management key export a canonical secret-free snapshot; a cross-environment
 # key is refused. Needs a real database (DATABASE_URL).

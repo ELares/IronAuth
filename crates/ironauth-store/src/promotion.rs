@@ -361,6 +361,10 @@ fn promoted_projection(snapshot: &Snapshot) -> Snapshot {
             // transactional engine yet (a later slice), so the promoted projection empties them
             // exactly like `brand`.
             locale_bundle: Vec::new(),
+            // Signup forms (issue #87) are carried in the EXPORT but not applied by the
+            // transactional engine yet (a later slice), so the promoted projection empties them
+            // exactly like `brand` and `locale_bundle`.
+            signup_form: Vec::new(),
         },
     }
 }

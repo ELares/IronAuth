@@ -55,6 +55,10 @@ fn locale_path(tenant: &str, environment: &str, locale: &str) -> String {
     format!("/v1/tenants/{tenant}/environments/{environment}/locales/{locale}")
 }
 
+fn signup_form_path(tenant: &str, environment: &str, client: &str) -> String {
+    format!("/v1/tenants/{tenant}/environments/{environment}/applications/{client}/signup-form")
+}
+
 async fn audit_actions(harness: &Harness, scope: Scope) -> Vec<String> {
     harness
         .control_store()
@@ -187,6 +191,43 @@ async fn a_locale_write_is_sudo_gated() {
         stored.contains("Se connecter"),
         "the write persisted: {stored}"
     );
+}
+
+/// A signup form write is sudo-gated exactly like the other environment-scoped config writes
+/// (issue #87): a stale write is challenged and stored nothing; the same write succeeds after a
+/// fresh elevation.
+#[tokio::test]
+async fn a_signup_form_write_is_sudo_gated() {
+    let (harness, _clock) = Harness::start_with_sudo(600).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k1").await;
+    let scope = scope_of(&tenant, &env);
+    let client = Harness::fresh_client_id(scope);
+    let path = signup_form_path(&tenant, &env, &client);
+    // An empty form needs no active trait schema, so this isolates the sudo gate.
+    let body = "{\"fields\":[]}";
+
+    // Without a fresh elevation the write is challenged and nothing is stored.
+    let (status, _, challenge) = harness.put(&path, body).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "the stale signup form write is challenged: {challenge}"
+    );
+    assert!(
+        challenge.contains("insufficient_user_authentication"),
+        "the challenge body carries the RFC 9470 error: {challenge}"
+    );
+
+    // After elevation the same write succeeds.
+    let (status, _, elevated) = harness.post(&elevate_path(&tenant, &env), "e1", "{}").await;
+    assert_eq!(status, StatusCode::OK, "elevate: {elevated}");
+    let (status, _, stored) = harness.put(&path, body).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the elevated signup form write succeeds: {stored}"
+    );
+    assert!(stored.contains(&client), "the write persisted: {stored}");
 }
 
 /// The acceptance-critical adversarial case: a valid credential whose recorded elevation
