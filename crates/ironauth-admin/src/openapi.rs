@@ -106,6 +106,12 @@ use crate::views::{
         (name = "migration", description = "Inbound lazy-migration progress (issue #56): how \
                                           far an environment's lazy migration has come and the \
                                           node's circuit-breaker state"),
+        (name = "diagnostics", description = "Admin flow inspector diagnostics (issue #91): the \
+                                            rich, structured record of WHY a client authentication \
+                                            failed (the specific reason, the assertion key id and \
+                                            algorithm, the derived clock skew, the expectation \
+                                            hint), kept off the wire while the token endpoint's \
+                                            response stays the opaque invalid_client"),
         (name = "sudo", description = "Admin session privilege separation (issue #73): the \
                                      re-authentication endpoint that records a fresh elevation \
                                      so admin mutations pass the sudo freshness gate")
@@ -185,6 +191,7 @@ use crate::views::{
         crate::export::export_identities,
         crate::migration::verify_credential,
         crate::migration_status::get_migration_progress,
+        crate::diagnostics::get_client_auth_diagnostics,
         crate::mds3_health::get_mds3_health,
         crate::password_hashing::probe_password_hashing,
         crate::migration_runs::list_migration_runs,
@@ -271,6 +278,8 @@ use crate::views::{
         crate::migration::VerifyCredentialResponse,
         crate::migration::VerifyProfile,
         crate::migration_status::MigrationProgressView,
+        crate::diagnostics::ClientAuthDiagnosticView,
+        crate::diagnostics::ClientAuthDiagnosticsList,
         crate::mds3_health::Mds3HealthView,
         crate::password_hashing::PasswordHashingProbeRequest,
         crate::password_hashing::PasswordHashingProbeReport,

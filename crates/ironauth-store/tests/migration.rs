@@ -494,8 +494,8 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
     );
     assert_eq!(
         report.already_applied(),
-        71,
-        "the production chain is exactly seventy one migrations (isolation, audit log, management \
+        72,
+        "the production chain is exactly seventy two migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -513,17 +513,17 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
          federation login state, enterprise inbound routing, upstream token vault, \
          guarded account links, account linking wiring, FedCM assertion nonces, third-party \
          risk signals, signup fraud review, advanced recovery modes, headless flows, branding, \
-         locale bundles, brand assets, diagnostic reason detail)"
+         locale bundles, brand assets, diagnostic reason detail, diagnostics control read)"
     );
 
-    // The ledger holds exactly versions 1 through 71.
+    // The ledger holds exactly versions 1 through 72.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
             46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67,
-            68, 69, 70, 71
+            68, 69, 70, 71, 72
         ]
     );
     let phase_of = |version: i64| async move {
@@ -1483,6 +1483,31 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
         "the data-plane role must NOT hold UPDATE on client_auth_diagnostics (a diagnostic is \
          never mutated in place)"
     );
+
+    // The diagnostics-control-read migration (issue #91) is an EXPAND: a single table-level
+    // GRANT SELECT to the control-plane role, so the M9 admin flow inspector can READ the sink.
+    assert_eq!(phase_of(72).await, "expand");
+    // After 0072 the control-plane role holds SELECT on the sink (the M9 admin read), and ONLY
+    // SELECT: it never writes or prunes a diagnostic (the data-plane recorder owns that), so it
+    // holds neither INSERT nor DELETE. This is the grant the admin endpoint's read depends on.
+    assert!(
+        role_has_table_privilege(pool, "ironauth_control", "client_auth_diagnostics", "SELECT")
+            .await,
+        "the control-plane role must hold SELECT on client_auth_diagnostics after 0072 (the M9 read)"
+    );
+    for privilege in ["INSERT", "UPDATE", "DELETE"] {
+        assert!(
+            !role_has_table_privilege(
+                pool,
+                "ironauth_control",
+                "client_auth_diagnostics",
+                privilege
+            )
+            .await,
+            "the control-plane role must NOT hold {privilege} on client_auth_diagnostics (it only \
+             reads the sink)"
+        );
+    }
 
     // The demo object never reaches a production database.
     assert!(

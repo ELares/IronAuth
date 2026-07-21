@@ -1,0 +1,17 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+--
+-- Let the control plane READ the client authentication diagnostics sink (issue #91).
+--
+-- The out of band client_auth_diagnostics sink (migration 0013, widened by 0071) is written
+-- by the data plane role (ironauth_app) on the client authentication path: migration 0013
+-- granted SELECT, INSERT, DELETE to ironauth_app and nothing to the control plane, because
+-- until M9 there was no reader outside the recorder. The M9 admin flow inspector adds one:
+-- the management endpoint GET .../diagnostics/client-auth reads the sink as the least
+-- privilege control plane role (ironauth_control), exactly as the risk decision view reads
+-- risk_decisions (migration 0054 granted SELECT there for the same reason). So the control
+-- role needs SELECT, and ONLY SELECT: the admin surface reads these rows, it never writes or
+-- prunes them (the recorder on the data plane owns the write and the retention prune), so no
+-- INSERT or DELETE is granted here. The table keeps its row level security (ENABLE + FORCE)
+-- and its tenant isolation policy, so a control plane read still sees only the caller scope's
+-- rows: this grant widens WHO may read, never WHAT a read may cross.
+GRANT SELECT ON client_auth_diagnostics TO ironauth_control;

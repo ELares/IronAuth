@@ -47,6 +47,7 @@ mod brand_assets;
 mod config;
 mod connectors;
 mod dcr;
+mod diagnostics;
 mod environments;
 mod error;
 mod export;
@@ -195,6 +196,15 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/webauthn/mds3/health",
             get(mds3_health::get_mds3_health),
+        )
+        // The client authentication diagnostics read (issue #91, M9 flow inspector):
+        // the rich, structured record of WHY a client authentication failed, kept off
+        // the wire while the token endpoint's response stays the opaque invalid_client.
+        // Environment scoped, read only, filterable by client and time. Static
+        // `diagnostics/client-auth` suffix, matched before the parameterized routes.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/client-auth",
+            get(diagnostics::get_client_auth_diagnostics),
         )
         // The in-admin Argon2id tuning probe (issue #62): a host-measured parameter
         // recommendation, the same probe the CLI wraps. Environment-scoped, read-only.

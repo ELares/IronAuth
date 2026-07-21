@@ -425,6 +425,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/client-auth": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read the environment's recorded client authentication failure diagnostics. */
+        get: operations["getClientAuthDiagnostics"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/export": {
         parameters: {
             query?: never;
@@ -1207,6 +1224,54 @@ export interface components {
              *     its existence), so a batch can never reach across a scope boundary.
              */
             session_ids?: string[];
+        };
+        /**
+         * @description One recorded client authentication failure diagnostic (issue #91).
+         *
+         *     Every field is a bounded, non secret datum the store record already holds: the
+         *     `client_id`, `key_id`, and `signing_alg` are attacker influenced but non secret
+         *     identifiers the failed attempt itself presented, and `reason`, `skew_seconds`,
+         *     and `expected` are derived, bounded cardinality values. There is deliberately NO
+         *     field for an assertion body, a secret, or a token: the wire response stayed the
+         *     opaque `invalid_client`, and this record is the ONLY additional detail.
+         */
+        ClientAuthDiagnosticView: {
+            /** @description The token endpoint authentication method the attempt used. */
+            auth_method: string;
+            /** @description The client identifier the failed attempt claimed. */
+            client_id: string;
+            /**
+             * @description The derived, bounded expectation hint, if recorded (for example
+             *     `kid_not_in_registered_jwks`). Never the JWKS and never a key.
+             */
+            expected?: string | null;
+            /** @description The assertion header `kid`, if the attempt presented a JWT assertion. */
+            key_id?: string | null;
+            /**
+             * Format: int64
+             * @description When the failed attempt happened, unix microseconds from the application clock.
+             */
+            occurred_at_unix_micros: number;
+            /**
+             * @description The bounded cardinality failure reason (for example `assertion_bad_signature`,
+             *     `assertion_expired`, `assertion_clock_skew`, `assertion_audience_mismatch`,
+             *     `assertion_kid_unknown`, `assertion_algorithm_disallowed`, `bad_secret`).
+             */
+            reason: string;
+            /** @description The assertion header `alg`, if the attempt presented a JWT assertion. */
+            signing_alg?: string | null;
+            /**
+             * Format: int64
+             * @description The derived, bounded clock skew bucket in seconds, if recorded: how far the
+             *     presented `exp`/`nbf` fell outside the tolerance window (positive = expired
+             *     past the window, negative = not yet valid). Never the assertion.
+             */
+            skew_seconds?: number | null;
+        };
+        /** @description A page of recorded client authentication diagnostics (issue #91). */
+        ClientAuthDiagnosticsList: {
+            /** @description The diagnostics matching the query, oldest first, bounded by the limit. */
+            items: components["schemas"]["ClientAuthDiagnosticView"][];
         };
         /**
          * @description A dynamically registered client's verification state (issue #31), as returned by
@@ -4942,6 +5007,86 @@ export interface operations {
             };
             /** @description Idempotency-Key reused with a different request */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    getClientAuthDiagnostics: {
+        parameters: {
+            query?: {
+                /** @description Restrict to one client identifier, or absent for every client in scope. */
+                client_id?: string;
+                /**
+                 * @description Only failures at or after this instant, unix microseconds. Absent for no lower
+                 *     bound.
+                 */
+                since?: number;
+                /**
+                 * @description Only failures strictly before this instant, unix microseconds. Absent for no
+                 *     upper bound.
+                 */
+                until?: number;
+                /**
+                 * @description The maximum number of rows to return, a positive integer. Clamped to the
+                 *     repository's hard ceiling ([`ClientAuthDiagnosticsRepo::MAX_QUERY_LIMIT`]), so
+                 *     a caller can never request an unbounded scan. Defaults to that ceiling.
+                 */
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The environment's recorded client authentication failure diagnostics, oldest first, filtered by client and time window and bounded to at most 500 rows. Each carries only the safe, non secret fields the store record holds: the specific failure reason, the assertion key id and algorithm, the derived clock skew bucket, and the expectation hint. The token endpoint's wire response for every one of these failures stays the uniform, opaque invalid_client. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ClientAuthDiagnosticsList"];
+                };
+            };
+            /** @description A malformed filter value */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Environment not found */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
