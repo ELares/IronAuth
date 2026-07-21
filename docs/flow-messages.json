@@ -190,6 +190,123 @@
     },
     {
       "context_keys": [],
+      "id": 1080001,
+      "kind": "info",
+      "name": "consent.title",
+      "text": "Authorize access"
+    },
+    {
+      "context_keys": [
+        "client_name",
+        "logo_uri"
+      ],
+      "id": 1080002,
+      "kind": "info",
+      "name": "consent.client.name",
+      "text": "{client_name} is requesting access to your account."
+    },
+    {
+      "context_keys": [],
+      "id": 1080003,
+      "kind": "info",
+      "name": "consent.client.verified",
+      "text": "This application has been verified."
+    },
+    {
+      "context_keys": [],
+      "id": 1080004,
+      "kind": "info",
+      "name": "consent.client.unverified",
+      "text": "This application has not been verified."
+    },
+    {
+      "context_keys": [],
+      "id": 1080005,
+      "kind": "info",
+      "name": "consent.scopes.intro",
+      "text": "It is requesting the following access:"
+    },
+    {
+      "context_keys": [],
+      "id": 1080006,
+      "kind": "info",
+      "name": "consent.scope.openid.description",
+      "text": "Confirm your identity."
+    },
+    {
+      "context_keys": [],
+      "id": 1080007,
+      "kind": "info",
+      "name": "consent.scope.profile.description",
+      "text": "Access your basic profile information."
+    },
+    {
+      "context_keys": [],
+      "id": 1080008,
+      "kind": "info",
+      "name": "consent.scope.email.description",
+      "text": "Access your email address."
+    },
+    {
+      "context_keys": [],
+      "id": 1080009,
+      "kind": "info",
+      "name": "consent.scope.offline_access.description",
+      "text": "Maintain access when you are not using the application."
+    },
+    {
+      "context_keys": [],
+      "id": 1080010,
+      "kind": "info",
+      "name": "consent.scope.address.description",
+      "text": "Access your postal address."
+    },
+    {
+      "context_keys": [],
+      "id": 1080011,
+      "kind": "info",
+      "name": "consent.scope.phone.description",
+      "text": "Access your phone number."
+    },
+    {
+      "context_keys": [],
+      "id": 1080012,
+      "kind": "info",
+      "name": "consent.scope.admin.description",
+      "text": "Perform administrative actions on your behalf."
+    },
+    {
+      "context_keys": [],
+      "id": 1080013,
+      "kind": "info",
+      "name": "consent.scope.management.description",
+      "text": "Manage configuration on your behalf."
+    },
+    {
+      "context_keys": [
+        "scope"
+      ],
+      "id": 1080014,
+      "kind": "info",
+      "name": "consent.scope.generic.description",
+      "text": "Access an additional permission."
+    },
+    {
+      "context_keys": [],
+      "id": 1080015,
+      "kind": "info",
+      "name": "consent.allow.label",
+      "text": "Allow"
+    },
+    {
+      "context_keys": [],
+      "id": 1080016,
+      "kind": "info",
+      "name": "consent.deny.label",
+      "text": "Deny"
+    },
+    {
+      "context_keys": [],
       "id": 1500001,
       "kind": "success",
       "name": "login.success",

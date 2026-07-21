@@ -1820,6 +1820,17 @@ pub struct ClientRecord {
     /// window, folded with the request `max_age` and any per-scope policy (the
     /// smallest window wins). [`None`] means the client sets no age bound.
     pub step_up_max_age_secs: Option<i64>,
+    /// The client's registered logo URI (RFC 7591 metadata, issue #88): the image a
+    /// consent screen renders next to the client's display name. [`None`] when the
+    /// client registered no logo. The column is populated by DCR/management writes;
+    /// the consent flow reads it to render the client-identity node.
+    pub logo_uri: Option<String>,
+    /// The instant an admin lifted the client's quarantine (issue #31/#88), in
+    /// microseconds since the Unix epoch, or [`None`] when the client has never been
+    /// verified. Its PRESENCE is the "verified" signal the consent screen renders as a
+    /// verification badge (a verified client shows a verified badge; an unverified one
+    /// shows the unverified badge). Control-plane-write-only.
+    pub verified_at_unix_micros: Option<i64>,
 }
 
 /// One relying party that participates in a front-channel logout for a given SSO
@@ -2146,7 +2157,8 @@ impl ClientRepo<'_> {
              consent_mode, skip_consent, \
              store_skipped_consent, \
              require_pushed_authorization_requests, quarantined, \
-             step_up_acr, step_up_max_age_secs FROM clients \
+             step_up_acr, step_up_max_age_secs, logo_uri, \
+             (EXTRACT(EPOCH FROM verified_at) * 1000000)::bigint AS verified_at_us FROM clients \
              WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
         )
         .bind(id.to_string())
@@ -2173,7 +2185,8 @@ impl ClientRepo<'_> {
              consent_mode, skip_consent, \
              store_skipped_consent, \
              require_pushed_authorization_requests, quarantined, \
-             step_up_acr, step_up_max_age_secs FROM clients \
+             step_up_acr, step_up_max_age_secs, logo_uri, \
+             (EXTRACT(EPOCH FROM verified_at) * 1000000)::bigint AS verified_at_us FROM clients \
              WHERE tenant_id = $1 AND environment_id = $2 ORDER BY created_at, id",
         )
         .bind(self.scope.tenant().to_string())
@@ -2443,6 +2456,8 @@ impl ClientRepo<'_> {
             step_up_max_age_secs: row
                 .get::<Option<i32>, _>("step_up_max_age_secs")
                 .map(i64::from),
+            logo_uri: row.get("logo_uri"),
+            verified_at_unix_micros: row.get::<Option<i64>, _>("verified_at_us"),
         })
     }
 }

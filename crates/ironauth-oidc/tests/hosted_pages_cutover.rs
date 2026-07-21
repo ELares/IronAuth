@@ -17,8 +17,9 @@
 //! - end to end with the cutover on, a `/authorize` login lands on the flow page, completes the
 //!   login through the flow engine (minting the session with the SAME cookie/CSRF/CSP), and the
 //!   resumed request issues a code that exchanges for tokens;
-//! - consent stays SERVER-RENDERED (the bootstrap `/consent`) even with the cutover on, because it
-//!   has no flow journey.
+//! - consent (issue #88) ALSO retargets onto the scope-routed flow consent page with the cutover
+//!   on, rendering the consent screen as flow-contract nodes and recording the decision through
+//!   the flow engine (the bootstrap `/consent` remains the OFF fallback).
 
 mod common;
 
@@ -27,7 +28,7 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode, header};
 use common::{
-    Harness, PKCE_CHALLENGE, PKCE_VERIFIER, REDIRECT_URI, enc, form, form_field, json, location,
+    Harness, PKCE_CHALLENGE, PKCE_VERIFIER, REDIRECT_URI, enc, form, json, location,
     location_param, set_cookie_pair,
 };
 use ironauth_config::OidcConfig;
@@ -347,22 +348,39 @@ async fn end_to_end_authorize_flow_login_to_token_with_the_cutover_on() {
         "the flow login resumes the original /authorize: {resume}"
     );
 
-    // 4. Resume /authorize with the session -> consent is STILL server-rendered (bootstrap).
+    // 4. Resume /authorize with the session -> consent retargets to the scope-routed flow
+    //    consent page (issue #88), which renders the consent nodes and, on an allow, records the
+    //    grant and resumes the original /authorize.
     let (_s, headers, _b) = harness.get_with_cookie(&resume, Some(&cookie)).await;
     let consent_location = location(&headers).expect("consent redirect");
     assert!(
-        consent_location.starts_with("/consent?return_to="),
-        "consent stays SERVER-RENDERED (bootstrap /consent) with the cutover on: {consent_location}"
+        consent_location.starts_with(&flow_page_prefix(&harness, "consent")),
+        "consent retargets to the flow consent page with the cutover on: {consent_location}"
     );
     let (_s, _h, consent_html) = harness
         .get_with_cookie(&consent_location, Some(&cookie))
         .await;
-    let consent_return_to = form_field(&consent_html, "return_to").expect("consent return_to");
-    let consent_body = form(&[("decision", "allow"), ("return_to", &consent_return_to)]);
+    let consent_flow_id = hidden_flow_id(&consent_html);
+    let consent_body = form(&[("flow", &consent_flow_id), ("decision", "allow")]);
+    // The consent allow records the grant for the AUTHENTICATED subject, so the POST carries the
+    // session cookie (plus the same-origin CSRF signal), exactly as a real browser would.
     let (_s, headers, _b) = harness
-        .post_form("/consent", &consent_body, Some(&cookie))
+        .send(
+            Request::builder()
+                .method("POST")
+                .uri(flow_page_prefix(&harness, "consent"))
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header("Sec-Fetch-Site", "same-origin")
+                .header(header::COOKIE, &cookie)
+                .body(Body::from(consent_body))
+                .expect("request builds"),
+        )
         .await;
     let resume = location(&headers).expect("resume after consent");
+    assert!(
+        resume.starts_with("/authorize?"),
+        "the consent allow resumes the original /authorize: {resume}"
+    );
 
     // 5. The resumed request issues the code, which exchanges for tokens.
     let (_s, headers, _b) = harness.get_with_cookie(&resume, Some(&cookie)).await;

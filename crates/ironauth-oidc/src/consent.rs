@@ -173,7 +173,10 @@ pub async fn consent_post(
 /// (issue #21): a `remembered` client's consent expires after the configured TTL;
 /// an `explicit` or `implicit` client's consent never expires. An unreadable
 /// client (a race, or a deletion) degrades to a never-expiring consent.
-async fn remembered_expiry(
+///
+/// Shared with the issue #88 consent flow so the flow records the SAME remembered TTL as this
+/// bootstrap page.
+pub(crate) async fn remembered_expiry(
     state: &OidcState,
     scope: ironauth_store::Scope,
     client_id: &ironauth_store::ClientId,

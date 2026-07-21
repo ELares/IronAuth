@@ -251,9 +251,12 @@ fn canonical_nodes(
             .map(|slug| federation::start_nodes(transport, flow_id, slug))
             .unwrap_or_default(),
         // The terminal `Completed` state has no nodes, and the progressive profiling state (issue
-        // #87) renders DYNAMIC form nodes from the LIVE client form, which the pure inspector (no
-        // store handle) cannot synthesize, so it too projects an empty node set.
-        FlowStateTag::Completed | FlowStateTag::ProgressiveProfiling => Vec::new(),
+        // #87) plus the consent prompt (issue #88) render DYNAMIC nodes from the LIVE client form
+        // / client and requested scopes, which the pure inspector (no store handle) cannot
+        // synthesize, so they too project an empty node set.
+        FlowStateTag::Completed
+        | FlowStateTag::ProgressiveProfiling
+        | FlowStateTag::ConsentPrompt => Vec::new(),
     }
 }
 

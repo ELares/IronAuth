@@ -22,6 +22,7 @@
 
 use serde_json::{Value, json};
 
+use super::consent::{self, ConsentClient};
 use super::message::{self, Message};
 use super::model::{CONTRACT_VERSION, Flow, FlowStateTag, Journey, Node, Transport, Ui};
 use super::submit_action_for;
@@ -240,6 +241,36 @@ fn push_transport_goldens(
         Journey::Federation,
         FlowStateTag::FederationStart,
         federation::start_nodes(transport, id, GOLDEN_CONNECTOR),
+        Vec::new(),
+        Some(GOLDEN_RESUME),
+    ));
+
+    // Consent (issue #88): the prompt state (see [`push_consent_golden`]).
+    push_consent_golden(corpus, transport, id);
+}
+
+/// Push the consent prompt golden for one transport (issue #88): a fixed client identity and a
+/// representative requested scope set (well known scopes plus a custom scope that renders the
+/// generic id), carrying a resume target (a real consent flow always resumes an `/authorize`).
+fn push_consent_golden(corpus: &mut Vec<GoldenFlow>, transport: Transport, id: &str) {
+    let suffix = transport.as_str();
+    let consent_client = ConsentClient {
+        display_name: "Golden Client".to_owned(),
+        logo_uri: Some("https://client.example.test/logo.png".to_owned()),
+        verified: false,
+    };
+    let consent_scopes = [
+        "openid".to_owned(),
+        "profile".to_owned(),
+        "offline_access".to_owned(),
+        "urn:golden:widgets".to_owned(),
+    ];
+    corpus.push(golden(
+        leaked(format!("consent_prompt_{suffix}")),
+        transport,
+        Journey::Consent,
+        FlowStateTag::ConsentPrompt,
+        consent::consent_nodes(transport, id, &consent_client, &consent_scopes),
         Vec::new(),
         Some(GOLDEN_RESUME),
     ));

@@ -758,6 +758,19 @@ pub fn register_flow_redirect(scope: Scope, return_to: &str) -> Response {
     ))
 }
 
+/// A `303` redirect to the scope-routed flow browser CONSENT page carrying `return_to` (issue
+/// #88, the cutover). Used in place of [`consent_redirect`] when the hosted-pages cutover is
+/// active. The `return_to` stays [`parse_resume`]-validated at flow creation (the consent flow
+/// reads the client and requested scopes from it), so there is no open redirect via the
+/// retarget.
+#[must_use]
+pub fn consent_flow_redirect(scope: Scope, return_to: &str) -> Response {
+    redirect(&interaction_url(
+        &flow_browser_path(scope, "consent"),
+        return_to,
+    ))
+}
+
 /// A `303 See Other` to `location` with `Cache-Control: no-store` and
 /// `Referrer-Policy: no-referrer`.
 ///

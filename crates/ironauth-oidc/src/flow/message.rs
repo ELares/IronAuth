@@ -16,7 +16,10 @@
 //! - `10xxxxx` informational copy (labels, prompts, titles): `1010xxx` login, `1020xxx`
 //!   registration, `1030xxx` MFA (challenge and enrollment), `1070xxx` the generic signup
 //!   field label (issue #87, one id for every configured field, the field pointer riding
-//!   the context so the registry stays finite);
+//!   the context so the registry stays finite), `1080xxx` consent (issue #88, the title,
+//!   the client identity and verification badges, the well known scope descriptions plus a
+//!   generic id carrying an unregistered scope token in the context, and the allow/deny
+//!   labels);
 //! - `15xxxxx` success copy;
 //! - `4000xxx` flow level errors (expiry, completion, malformed input);
 //! - `4100xxx` login journey errors (the uniform identifier or password failure, the
@@ -207,6 +210,46 @@ pub const PROGRESSIVE_PROFILING_SUBMIT_LABEL: MessageId = MessageId(1_070_002);
 /// The progressive profiling prompt (issue #87): the leading copy that explains the optional
 /// later-login fields can be completed now or skipped. Informational only.
 pub const PROGRESSIVE_PROFILING_PROMPT: MessageId = MessageId(1_070_003);
+
+/// The consent page title (issue #88): the heading of the consent screen rendered as flow
+/// nodes.
+pub const CONSENT_TITLE: MessageId = MessageId(1_080_001);
+/// The consent client identity copy (issue #88): the client asking for access. The client's
+/// display name rides the `client_name` context and its optional logo the `logo_uri` context,
+/// never the copy string, so a locale bundle keys on the id and the context while the numeric
+/// id registry stays finite.
+pub const CONSENT_CLIENT_NAME: MessageId = MessageId(1_080_002);
+/// The consent verified badge (issue #88): the client has been verified by an administrator.
+pub const CONSENT_CLIENT_VERIFIED: MessageId = MessageId(1_080_003);
+/// The consent unverified badge (issue #88): the client has NOT been verified, shown so the
+/// end user weighs the request accordingly.
+pub const CONSENT_CLIENT_UNVERIFIED: MessageId = MessageId(1_080_004);
+/// The consent scopes intro (issue #88): the leading copy before the per scope descriptions.
+pub const CONSENT_SCOPES_INTRO: MessageId = MessageId(1_080_005);
+/// The `openid` scope description (issue #88).
+pub const CONSENT_SCOPE_OPENID: MessageId = MessageId(1_080_006);
+/// The `profile` scope description (issue #88).
+pub const CONSENT_SCOPE_PROFILE: MessageId = MessageId(1_080_007);
+/// The `email` scope description (issue #88).
+pub const CONSENT_SCOPE_EMAIL: MessageId = MessageId(1_080_008);
+/// The `offline_access` scope description (issue #88).
+pub const CONSENT_SCOPE_OFFLINE_ACCESS: MessageId = MessageId(1_080_009);
+/// The `address` scope description (issue #88).
+pub const CONSENT_SCOPE_ADDRESS: MessageId = MessageId(1_080_010);
+/// The `phone` scope description (issue #88).
+pub const CONSENT_SCOPE_PHONE: MessageId = MessageId(1_080_011);
+/// The `admin` (sensitive) scope description (issue #88).
+pub const CONSENT_SCOPE_ADMIN: MessageId = MessageId(1_080_012);
+/// The `management` (sensitive) scope description (issue #88).
+pub const CONSENT_SCOPE_MANAGEMENT: MessageId = MessageId(1_080_013);
+/// The GENERIC scope description (issue #88): ONE id for every scope with no well known
+/// description, the raw scope token riding the `scope` context (mirrors the issue #87 signup
+/// field pattern) so the numeric id registry stays finite for arbitrary custom scopes.
+pub const CONSENT_SCOPE_GENERIC: MessageId = MessageId(1_080_014);
+/// The consent allow button label (issue #88): grant the client access.
+pub const CONSENT_ALLOW_LABEL: MessageId = MessageId(1_080_015);
+/// The consent deny button label (issue #88): refuse the client access.
+pub const CONSENT_DENY_LABEL: MessageId = MessageId(1_080_016);
 
 /// The login success note.
 pub const LOGIN_SUCCESS: MessageId = MessageId(1_500_001);
@@ -483,6 +526,118 @@ pub const REGISTRY: &[MessageSpec] = &[
         kind: MessageKind::Info,
         text: "Help us complete your profile. You can fill in these details now or skip for \
                now.",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: CONSENT_TITLE,
+        name: "consent.title",
+        kind: MessageKind::Info,
+        text: "Authorize access",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: CONSENT_CLIENT_NAME,
+        name: "consent.client.name",
+        kind: MessageKind::Info,
+        text: "{client_name} is requesting access to your account.",
+        context_keys: &["client_name", "logo_uri"],
+    },
+    MessageSpec {
+        id: CONSENT_CLIENT_VERIFIED,
+        name: "consent.client.verified",
+        kind: MessageKind::Info,
+        text: "This application has been verified.",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: CONSENT_CLIENT_UNVERIFIED,
+        name: "consent.client.unverified",
+        kind: MessageKind::Info,
+        text: "This application has not been verified.",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: CONSENT_SCOPES_INTRO,
+        name: "consent.scopes.intro",
+        kind: MessageKind::Info,
+        text: "It is requesting the following access:",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: CONSENT_SCOPE_OPENID,
+        name: "consent.scope.openid.description",
+        kind: MessageKind::Info,
+        text: "Confirm your identity.",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: CONSENT_SCOPE_PROFILE,
+        name: "consent.scope.profile.description",
+        kind: MessageKind::Info,
+        text: "Access your basic profile information.",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: CONSENT_SCOPE_EMAIL,
+        name: "consent.scope.email.description",
+        kind: MessageKind::Info,
+        text: "Access your email address.",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: CONSENT_SCOPE_OFFLINE_ACCESS,
+        name: "consent.scope.offline_access.description",
+        kind: MessageKind::Info,
+        text: "Maintain access when you are not using the application.",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: CONSENT_SCOPE_ADDRESS,
+        name: "consent.scope.address.description",
+        kind: MessageKind::Info,
+        text: "Access your postal address.",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: CONSENT_SCOPE_PHONE,
+        name: "consent.scope.phone.description",
+        kind: MessageKind::Info,
+        text: "Access your phone number.",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: CONSENT_SCOPE_ADMIN,
+        name: "consent.scope.admin.description",
+        kind: MessageKind::Info,
+        text: "Perform administrative actions on your behalf.",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: CONSENT_SCOPE_MANAGEMENT,
+        name: "consent.scope.management.description",
+        kind: MessageKind::Info,
+        text: "Manage configuration on your behalf.",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: CONSENT_SCOPE_GENERIC,
+        name: "consent.scope.generic.description",
+        kind: MessageKind::Info,
+        text: "Access an additional permission.",
+        context_keys: &["scope"],
+    },
+    MessageSpec {
+        id: CONSENT_ALLOW_LABEL,
+        name: "consent.allow.label",
+        kind: MessageKind::Info,
+        text: "Allow",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: CONSENT_DENY_LABEL,
+        name: "consent.deny.label",
+        kind: MessageKind::Info,
+        text: "Deny",
         context_keys: &[],
     },
     MessageSpec {
