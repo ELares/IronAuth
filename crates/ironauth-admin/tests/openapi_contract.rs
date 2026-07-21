@@ -31,6 +31,7 @@ fn spec_is_openapi_3_1() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn operation_ids_are_the_stable_set() {
     let doc = spec();
     let mut ids: Vec<String> = doc["paths"]
@@ -77,6 +78,7 @@ fn operation_ids_are_the_stable_set() {
             "getConnectorCapabilities",
             "getConnectorHealth",
             "getDcrClient",
+            "getDiagnosticsWarnings",
             "getEnvironment",
             "getInvitation",
             "getLocale",
@@ -86,6 +88,7 @@ fn operation_ids_are_the_stable_set() {
             "getMigrationRun",
             "getOperator",
             "getOrganization",
+            "getPolicyDecisionTraces",
             "getRefreshFamily",
             "getSession",
             "getTenant",
@@ -274,6 +277,8 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/connectors/{connector_id}/health",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/dcr/policies",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/client-auth",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/policy-traces",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/warnings",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/export",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/invitations",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/invitations/{invitation_id}",
@@ -370,7 +375,7 @@ fn committed_artifact_matches_generated_spec() {
 async fn served_routes_match_documented_routes() {
     let router = db_free_router();
     let documented = documented_method_paths();
-    assert_eq!(documented.len(), 84, "the documented route count is pinned");
+    assert_eq!(documented.len(), 86, "the documented route count is pinned");
 
     // The OUTBOUND lazy-migration endpoint (issue #58) is the one documented route
     // that is NOT gated by the management `Principal` at 401. It is DISABLED BY

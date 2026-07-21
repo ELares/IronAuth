@@ -312,6 +312,18 @@ async fn authorization_code_grant(
     let extra_claims = id_token_extra_claims(state, scope, &bindings).await;
     let minted = mint_tokens(state, scope, &bindings, &extra_claims, &target).await?;
 
+    // Record a token size (claim bloat) event for the M9 warnings read, best effort and off
+    // the mint path (issue #91): only a token whose serialized size crosses the bloat
+    // threshold is recorded, and the token itself is never captured (only its byte size and
+    // claim count). The minted token below is returned unchanged regardless of this capture.
+    crate::policy_trace::record_token_size_event(
+        state,
+        scope,
+        &bindings.client_id,
+        &minted.id_token,
+    )
+    .await;
+
     // Build what the redeem transaction records for the minted tokens (issue #29).
     // The ID token is always an issued_tokens row; the access token is an
     // issued_tokens row when it is an at+jwt, or an opaque_access_tokens row (in

@@ -206,6 +206,21 @@ pub fn management_router(state: AdminState) -> Router {
             "/v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/client-auth",
             get(diagnostics::get_client_auth_diagnostics),
         )
+        // The policy decision traces read (issue #91, M9 flow inspector): the step up, risk,
+        // and claim mapping decisions recorded off the request path. Environment scoped, read
+        // only, filterable by policy and subject and time. Static suffix, matched before the
+        // parameterized routes.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/policy-traces",
+            get(diagnostics::get_policy_traces),
+        )
+        // The operational warnings read (issue #91, M9 flow inspector): the connector health
+        // and token size (claim bloat) warnings, COMPUTED LIVE from the existing seams.
+        // Environment scoped, read only. Static suffix, matched before the parameterized routes.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/warnings",
+            get(diagnostics::get_diagnostics_warnings),
+        )
         // The in-admin Argon2id tuning probe (issue #62): a host-measured parameter
         // recommendation, the same probe the CLI wraps. Environment-scoped, read-only.
         // Static `password-hashing` suffix, matched before the parameterized routes.

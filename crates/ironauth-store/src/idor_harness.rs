@@ -300,6 +300,19 @@ impl IdorHarness {
         self
     }
 
+    /// Register the policy decision trace read probe (issue #91): the M9 admin flow
+    /// inspector's read over the `policy_decision_traces` sink must never surface a trace
+    /// recorded under another tenant or environment, or the inspector would leak WHICH
+    /// subjects in a foreign tenant were being step up challenged, risk denied, or claim
+    /// mapping failed. The read is keyed on the SUBJECT (a plain usr_ handle filter), so
+    /// the probe's `foreign_id` is a subject whose traces were planted in another scope:
+    /// the scoped, forced RLS `query` must resolve to no rows under the caller's scope.
+    /// Run with the data plane store (`ironauth_app`), which holds the sink's SELECT grant.
+    pub fn register_policy_trace_probes(&mut self) -> &mut Self {
+        self.register(Box::new(PolicyDecisionTraceReadProbe));
+        self
+    }
+
     /// The names of the registered probes, in registration order.
     #[must_use]
     pub fn probe_names(&self) -> Vec<&'static str> {
@@ -1552,6 +1565,44 @@ impl IsolationProbe for ClientAuthDiagnosticReadProbe {
                 .await
             {
                 // Reading a foreign client's recorded diagnostics would be a leak.
+                Ok(rows) if !rows.is_empty() => ProbeOutcome::Leaked,
+                Ok(_) | Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built in probe for `PolicyDecisionTracesRepo::query` (issue #91). The M9 admin flow
+/// inspector reads recorded policy decision traces scoped to a (tenant, environment); a
+/// subject whose traces were planted in another scope must resolve to no rows under the
+/// caller's scope: the forced RLS and the scope predicates confine the read.
+struct PolicyDecisionTraceReadProbe;
+
+impl IsolationProbe for PolicyDecisionTraceReadProbe {
+    fn name(&self) -> &'static str {
+        "policy_decision_traces.query"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            // The subject is a plain string filter (no scoped id to parse): the forced RLS
+            // and the (tenant, environment) predicates confine the read to the caller's
+            // scope, so a foreign subject's traces resolve to no rows here.
+            match store
+                .scoped(caller)
+                .policy_decision_traces()
+                .query(crate::repository::PolicyDecisionTraceQuery {
+                    subject: Some(foreign_id),
+                    ..Default::default()
+                })
+                .await
+            {
+                // Reading a foreign subject's recorded traces would be a leak.
                 Ok(rows) if !rows.is_empty() => ProbeOutcome::Leaked,
                 Ok(_) | Err(_) => ProbeOutcome::Denied,
             }

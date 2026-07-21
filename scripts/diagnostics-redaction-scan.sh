@@ -22,4 +22,13 @@ echo "diagnostics-redaction: running the hostile sentinel corpus against the dia
 cargo test --quiet -p ironauth-oidc --lib \
   client_auth::tests::diagnostics_redaction_corpus_leaks_no_secret_sentinel -- --exact
 
+# The M9 policy decision trace and token size record types (issue #91) carry the SAME
+# structural redaction guarantee: their safe field builders accept only typed safe fields
+# (an acr, a signal name and level, a connector slug, a bounded failure kind, a byte size,
+# a client id), so a claim value, a token, or a secret is unrepresentable. This is the
+# sibling corpus that proves it for those record types.
+echo "diagnostics-redaction: running the hostile sentinel corpus against the policy trace record"
+cargo test --quiet -p ironauth-oidc --lib \
+  policy_trace::tests::redaction_corpus_leaks_no_secret_sentinel -- --exact
+
 echo "diagnostics-redaction: clean (no secret sentinel can reach a serialized diagnostic record)"

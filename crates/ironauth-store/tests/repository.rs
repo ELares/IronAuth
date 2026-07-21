@@ -6,7 +6,11 @@ use std::collections::HashSet;
 
 use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
-use ironauth_store::{CorrelationId, StoreError};
+use ironauth_store::{
+    CorrelationId, NewPolicyDecisionTrace, NewTokenSizeEvent, PolicyDecisionInputs,
+    PolicyDecisionTraceQuery, PolicyKind, PolicyOutcome, PolicyTraceSignal, StoreError,
+    TokenSizeKind,
+};
 
 #[tokio::test]
 async fn create_get_list_delete_round_trip() {
@@ -497,4 +501,156 @@ async fn frontchannel_logout_register_read_and_validate() {
             .await,
         Err(StoreError::NotFound)
     ));
+}
+
+const TRACE_RETENTION_MICROS: i64 = 7 * 24 * 60 * 60 * 1_000_000;
+
+#[tokio::test]
+async fn policy_decision_traces_round_trip_and_filter() {
+    // The M9 flow inspector sink (issue #91): record the three traced policy decisions and read
+    // them back, newest first, filtered by policy and subject, with the redacted safe field
+    // projection round-tripping through the jsonb column.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let traces = db.store().scoped(scope).policy_decision_traces();
+
+    // A step up trace for one subject.
+    traces
+        .record(
+            &env,
+            TRACE_RETENTION_MICROS,
+            &NewPolicyDecisionTrace {
+                policy: PolicyKind::StepUp,
+                subject: Some("usr_alice".to_owned()),
+                outcome: PolicyOutcome::StepUpRequired,
+                reason: Some("acr_unmet".to_owned()),
+                inputs: PolicyDecisionInputs::StepUp {
+                    required_acr: Some("urn:ironauth:acr:mfa".to_owned()),
+                    achieved_acr: "urn:ironauth:acr:pwd".to_owned(),
+                    max_auth_age_secs: Some(300),
+                    auth_age_secs: Some(9000),
+                    acr_unmet: true,
+                    age_lapsed: false,
+                },
+            },
+        )
+        .await
+        .expect("record step up trace");
+
+    // A risk trace for the SAME subject, with enumerated signals.
+    traces
+        .record(
+            &env,
+            TRACE_RETENTION_MICROS,
+            &NewPolicyDecisionTrace {
+                policy: PolicyKind::Risk,
+                subject: Some("usr_alice".to_owned()),
+                outcome: PolicyOutcome::Deny,
+                reason: Some("block".to_owned()),
+                inputs: PolicyDecisionInputs::Risk {
+                    level: "high".to_owned(),
+                    signals: vec![PolicyTraceSignal {
+                        name: "new_device".to_owned(),
+                        level: "med".to_owned(),
+                    }],
+                },
+            },
+        )
+        .await
+        .expect("record risk trace");
+
+    // A claim mapping trace for NO subject (evaluated before provisioning), another subject key.
+    traces
+        .record(
+            &env,
+            TRACE_RETENTION_MICROS,
+            &NewPolicyDecisionTrace {
+                policy: PolicyKind::ClaimMapping,
+                subject: None,
+                outcome: PolicyOutcome::Satisfied,
+                reason: None,
+                inputs: PolicyDecisionInputs::ClaimMapping {
+                    connector: "octa".to_owned(),
+                    mapped_trait_count: Some(3),
+                    failure_kind: None,
+                },
+            },
+        )
+        .await
+        .expect("record claim mapping trace");
+
+    // Newest first over the whole scope: three rows, most recent (the claim mapping) first.
+    let all = traces
+        .query(PolicyDecisionTraceQuery {
+            newest_first: true,
+            ..Default::default()
+        })
+        .await
+        .expect("query all");
+    assert_eq!(all.len(), 3, "all three traces are readable");
+    assert_eq!(all[0].policy, "claim_mapping", "newest first ordering");
+
+    // Filter by policy narrows to the one risk trace, with its signals in the jsonb.
+    let risk = traces
+        .query(PolicyDecisionTraceQuery {
+            policy: Some("risk"),
+            newest_first: true,
+            ..Default::default()
+        })
+        .await
+        .expect("query risk");
+    assert_eq!(risk.len(), 1, "the policy filter narrows to risk");
+    assert_eq!(risk[0].outcome, "deny");
+    assert!(
+        risk[0].decision_inputs_json.contains("new_device"),
+        "the redacted safe field projection round-trips through jsonb"
+    );
+
+    // Filter by subject narrows to the two traces bound to usr_alice (never the subjectless one).
+    let alice = traces
+        .query(PolicyDecisionTraceQuery {
+            subject: Some("usr_alice"),
+            ..Default::default()
+        })
+        .await
+        .expect("query alice");
+    assert_eq!(alice.len(), 2, "the subject filter narrows to alice's traces");
+}
+
+#[tokio::test]
+async fn token_size_events_round_trip() {
+    // The one materialized operational warning (issue #91): record two oversized token events and
+    // read them back newest first for the M9 warnings read.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let events = db.store().scoped(scope).token_size_events();
+
+    for byte_size in [4096_i64, 5120] {
+        events
+            .record(
+                &env,
+                TRACE_RETENTION_MICROS,
+                NewTokenSizeEvent {
+                    token_type: TokenSizeKind::IdToken,
+                    byte_size,
+                    claim_count: Some(40),
+                    client_id: "cli_bloat",
+                },
+            )
+            .await
+            .expect("record token size event");
+    }
+
+    let recent = events.recent(50).await.expect("read recent");
+    assert_eq!(recent.len(), 2, "both events are readable");
+    assert!(
+        recent.iter().all(|event| event.client_id == "cli_bloat"),
+        "the events carry the non secret client id"
+    );
+    assert!(
+        recent.iter().any(|event| event.byte_size == 5120),
+        "the byte size round-trips"
+    );
 }

@@ -40,9 +40,9 @@ use axum::response::Response;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ironauth_connector::{
-    ClaimSources, ClientAuth, ConnectorError, ConnectorRuntimeConfig, EmailVerifiedTrust,
-    Endpoints, PkceMode, ResolvedEndpoints, TraitDocument, TraitPointerFailure, TraitSchemaView,
-    discovery_url, evaluate, parse_discovery,
+    ClaimMappingError, ClaimSources, ClientAuth, ConnectorError, ConnectorRuntimeConfig,
+    EmailVerifiedTrust, Endpoints, PkceMode, ResolvedEndpoints, TraitDocument, TraitPointerFailure,
+    TraitSchemaView, discovery_url, evaluate, parse_discovery,
 };
 use ironauth_env::Clock;
 use ironauth_fetch::{FetchError, FetchPurpose, FetchRequest, Fetcher};
@@ -1266,6 +1266,20 @@ pub(crate) struct FinalizeLogin<'a> {
 /// no partial identity and no session.
 // One linear finalize sequence (schema -> prior-profile reuse -> relay -> map -> provision ->
 // session -> resume); splitting it would scatter the single quirk-handling flow a reviewer reads.
+/// The bounded, non secret failure kind of a claim mapping evaluation, for the M9 policy
+/// trace (issue #91). A closed set derived only from the error VARIANT, never its pointers
+/// or message (which are already operator safe, but the trace keeps to the variant so it is
+/// a metric like dimension). Never a claim value or a claim path.
+fn claim_mapping_failure_kind(error: &ClaimMappingError) -> &'static str {
+    match error {
+        ClaimMappingError::MappingInvalid { .. } => "mapping_invalid",
+        ClaimMappingError::UpstreamClaim { .. } => "upstream_claim",
+        // The error enum is non exhaustive: a future variant traces as a generic bounded
+        // kind rather than failing to compile or leaking anything.
+        _ => "mapping_failed",
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn finalize_federated_login(finalize: FinalizeLogin<'_>) -> Response {
     let FinalizeLogin {
@@ -1350,7 +1364,11 @@ pub(crate) async fn finalize_federated_login(finalize: FinalizeLogin<'_>) -> Res
     // future Send). Evaluation is fail-closed: on ANY failure (a missing required claim a first
     // login cannot backfill, a wrong type, an undeclared trait) it returns Err and the login
     // aborts BEFORE any user row is written.
-    let trait_doc = {
+    // Evaluate the claim mapping inside the synchronous block (the non-Send `&dyn
+    // TraitSchemaView` is confined here), mapping any failure to a bounded, non secret kind
+    // so nothing non-Send escapes. The trace is recorded AFTER the block (an await there is
+    // fine, since the trait-object reference is already dropped).
+    let trait_result: Result<TraitDocument, &'static str> = {
         let compiled = match active_schema
             .as_ref()
             .map(|version| TraitSchema::compile(&version.schema_json))
@@ -1375,9 +1393,24 @@ pub(crate) async fn finalize_federated_login(finalize: FinalizeLogin<'_>) -> Res
             schema_arg,
             prior_traits,
         ) {
-            Ok(trait_doc) => trait_doc,
-            Err(_) => return interaction::server_error_page(),
+            Ok(trait_doc) => Ok(trait_doc),
+            Err(error) => Err(claim_mapping_failure_kind(&error)),
         }
+    };
+    // Record the claim mapping evaluation as a policy trace for the M9 flow inspector, best
+    // effort and off the decision path (issue #91): the trace mirrors the SAME outcome the
+    // evaluation just reached, and its capture (verbosity gated, swallowed on error) never
+    // changes the fail closed below or any wire behavior.
+    let mapping_outcome = match &trait_result {
+        Ok(doc) => crate::policy_trace::ClaimMappingTraceOutcome::Resolved {
+            trait_count: u32::try_from(doc.traits.len()).unwrap_or(u32::MAX),
+        },
+        Err(kind) => crate::policy_trace::ClaimMappingTraceOutcome::Failed { kind },
+    };
+    crate::policy_trace::record_claim_mapping_trace(state, scope, connector_slug, mapping_outcome)
+        .await;
+    let Ok(trait_doc) = trait_result else {
+        return interaction::server_error_page();
     };
 
     // Guarded account linking (issue #78, PR 2): BEFORE provisioning a separate federated

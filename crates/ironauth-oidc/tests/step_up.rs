@@ -557,6 +557,71 @@ async fn a_session_already_at_the_floor_proceeds_without_a_challenge() {
     );
 }
 
+/// The step-up decision path is behavior-identical whether or not a trace is captured (issue
+/// #91): capturing a policy decision trace is best-effort, POST-decision, and swallowed, so it
+/// never changes the decision or the wire response. This drives a step-up authorization (a
+/// password-only session against an mfa scope floor) and asserts BOTH the documented step-up
+/// wire outcome the untraced path produces (the SAME `SEE_OTHER` interaction with NO code that
+/// the sibling untraced-expectation tests pin) AND that a faithful step-up trace (outcome
+/// `step_up_required`) was recorded alongside it, off the request path. The whole step-up and
+/// risk suite runs with tracing on by default, so its green byte-level assertions are the
+/// behavior-identity evidence; this test additionally proves the capture is faithful.
+#[tokio::test]
+async fn a_step_up_decision_is_traced_without_changing_the_decision() {
+    let harness = Harness::start().await;
+    let client_id = *harness.client_id();
+    let client = client_id.to_string();
+    harness
+        .configure_client_policy(&client_id, "explicit", true, false, None)
+        .await;
+    harness
+        .set_scope_step_up_policy("payments:write", Some(ACR_MFA), None)
+        .await;
+
+    let subject = harness.seed_unique_user().await;
+    // A password-only session does NOT meet the mfa floor, so the gate needs a step-up.
+    let cookie = harness
+        .session_cookie_at(&subject, "pwd", now_micros(&harness))
+        .await;
+
+    let query = authorize_query(&client, "openid payments:write", &[]);
+    let (status, headers, body) = harness.authorize_with_cookie(&query, &cookie).await;
+    // The untraced baseline: a step-up decision routes to an interaction (SEE_OTHER), never a
+    // code. Byte-identical to what every untraced step-up test in this file already pins.
+    assert_eq!(status, StatusCode::SEE_OTHER, "authorize: {body}");
+    assert!(
+        location_param(&headers, "code").is_none(),
+        "a step-up is required, so no code is issued (the decision is unchanged)"
+    );
+
+    // The trace was recorded alongside the UNCHANGED decision: exactly one step-up trace,
+    // outcome step_up_required, for this subject, carrying the redacted safe field projection.
+    let traces = harness
+        .store()
+        .scoped(harness.scope())
+        .policy_decision_traces()
+        .query(ironauth_store::PolicyDecisionTraceQuery {
+            policy: Some("step_up"),
+            subject: Some(&subject),
+            ..Default::default()
+        })
+        .await
+        .expect("read policy traces");
+    assert_eq!(
+        traces.len(),
+        1,
+        "one step-up trace was recorded for the decision"
+    );
+    assert_eq!(
+        traces[0].outcome, "step_up_required",
+        "the trace faithfully mirrors the decision it observed"
+    );
+    assert!(
+        traces[0].decision_inputs_json.contains("acr_unmet"),
+        "the redacted safe field projection carries the unmet dimension"
+    );
+}
+
 /// The sample resource server drives the FULL RFC 9470 round trip: it 401-challenges
 /// a password-only access token with `insufficient_user_authentication` and
 /// `acr_values`, the client re-authorizes (this time reaching the acr through a real

@@ -623,6 +623,18 @@ pub async fn login_post(
                 };
                 let risk_decision =
                     crate::risk::evaluate(&state, resume.scope, &user.id, &risk_ctx).await;
+                // Record the risk decision as a policy trace for the M9 flow inspector, best
+                // effort and off the decision path (issue #91): the decision is already
+                // persisted to risk_decisions; this ALSO surfaces it alongside the step up
+                // and claim mapping traces. Its capture never changes the block/allow branch
+                // below or any wire behavior.
+                crate::policy_trace::record_risk_trace(
+                    &state,
+                    resume.scope,
+                    &user.id,
+                    &risk_decision,
+                )
+                .await;
                 if matches!(risk_decision.action, crate::risk::RiskAction::Block) {
                     // Timing-uniformity (issue #79 MEDIUM-1): record the block decision OFF
                     // the synchronous response path (a detached spawn, like
