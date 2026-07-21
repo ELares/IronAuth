@@ -176,6 +176,20 @@
     },
     {
       "context_keys": [],
+      "id": 1070002,
+      "kind": "info",
+      "name": "progressive_profiling.submit.label",
+      "text": "Continue"
+    },
+    {
+      "context_keys": [],
+      "id": 1070003,
+      "kind": "info",
+      "name": "progressive_profiling.prompt",
+      "text": "Help us complete your profile. You can fill in these details now or skip for now."
+    },
+    {
+      "context_keys": [],
       "id": 1500001,
       "kind": "success",
       "name": "login.success",

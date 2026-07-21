@@ -33,6 +33,8 @@ export const MESSAGE_TEXT: Readonly<Record<number, string>> = {
   1060001: "Continue with a provider",
   1060002: "Continue with your identity provider",
   1070001: "Additional information",
+  1070002: "Continue",
+  1070003: "Help us complete your profile. You can fill in these details now or skip for now.",
   1500001: "You are signed in.",
   1520001: "Your account has been created.",
   1530001: "Your identity has been verified.",

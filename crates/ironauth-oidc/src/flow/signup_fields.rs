@@ -29,10 +29,47 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map, Number, Value};
 
-use ironauth_store::{SignupFormConfig, SignupFormField, SignupStep, TraitSchema};
+use ironauth_store::{Scope, SignupFormConfig, SignupFormField, SignupStep, TraitSchema};
 
 use super::message::{self, Message, MessageContext, MessageId};
 use super::model::{FieldConstraints, InputType, Node, NodeAttributes, NodeGroup};
+use crate::interaction;
+use crate::state::OidcState;
+
+/// Load the environment's active signup form for a flow (issue #87): resolve the authorize
+/// client from the flow's `/authorize` resume target, read that client's active signup form,
+/// and compile the scope's active trait schema. Returns the config, the compiled schema, and
+/// the schema version, or [`None`] when the flow has no client, the client has no form, there
+/// is no active schema, or any read faults (a form is a pure additive collection, never a hard
+/// block, so any absence degrades to collecting nothing).
+///
+/// This is the ONE loader both the registration path (the Signup-step fields) and the
+/// progressive profiling path (the LaterLogin-step fields) read the live form through, so a
+/// management write reflects on the very next flow transition on either path.
+pub(super) async fn load_active_signup_form(
+    state: &OidcState,
+    scope: Scope,
+    return_to: Option<&str>,
+) -> Option<(SignupFormConfig, TraitSchema, i32)> {
+    let client_id = interaction::parse_resume(return_to)?.client_id.to_string();
+    let record = state
+        .store()
+        .scoped(scope)
+        .signup_forms()
+        .get(&client_id)
+        .await
+        .ok()??;
+    let config = SignupFormConfig::from_fields_json(&record.fields_json).ok()?;
+    let active = state
+        .store()
+        .scoped(scope)
+        .trait_schemas()
+        .active()
+        .await
+        .ok()??;
+    let schema = TraitSchema::compile(&active.schema_json).ok()?;
+    Some((config, schema, active.version))
+}
 
 /// The message context key naming a field's RFC 6901 trait pointer (issue #87). Every generic
 /// field message (the label and each validation error) carries the pointer here, so a locale

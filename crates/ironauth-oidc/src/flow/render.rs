@@ -315,7 +315,9 @@ fn flow_title(flow: &Flow) -> message::MessageId {
         FlowStateTag::MfaEnroll => message::MFA_ENROLL_TITLE,
         FlowStateTag::RecoveryStart | FlowStateTag::RecoveryAck => message::RECOVERY_TITLE,
         FlowStateTag::FederationStart => message::FEDERATION_TITLE,
-        FlowStateTag::IdentifierPassword | FlowStateTag::Completed => message::LOGIN_TITLE,
+        FlowStateTag::IdentifierPassword
+        | FlowStateTag::ProgressiveProfiling
+        | FlowStateTag::Completed => message::LOGIN_TITLE,
     }
 }
 

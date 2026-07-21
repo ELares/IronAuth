@@ -98,11 +98,17 @@ impl Journey {
     #[must_use]
     pub fn plan(self) -> &'static [FlowStateTag] {
         use FlowStateTag::{
-            Completed, FederationStart, IdentifierPassword, MfaChallenge, MfaEnroll, RecoveryAck,
-            RecoveryStart, RegistrationAck, RegistrationDetails,
+            Completed, FederationStart, IdentifierPassword, MfaChallenge, MfaEnroll,
+            ProgressiveProfiling, RecoveryAck, RecoveryStart, RegistrationAck, RegistrationDetails,
         };
         match self {
-            Journey::Login => &[IdentifierPassword, MfaChallenge, MfaEnroll, Completed],
+            Journey::Login => &[
+                IdentifierPassword,
+                MfaChallenge,
+                MfaEnroll,
+                ProgressiveProfiling,
+                Completed,
+            ],
             Journey::Registration => &[RegistrationDetails, RegistrationAck, Completed],
             Journey::Recovery => &[RecoveryStart, RecoveryAck, Completed],
             Journey::Federation => &[FederationStart],
@@ -152,6 +158,12 @@ pub enum FlowStateTag {
     MfaChallenge,
     /// A second factor enrollment is required.
     MfaEnroll,
+    /// A progressive profiling step (issue #87): a subsequent login collects the client form's
+    /// later-login signup fields as a HELD login step, injected where a successful primary (plus
+    /// any second factor) login would otherwise mint the session. The step is always SKIPPABLE
+    /// (a missing required later-login field prompts but never blocks the mint), so the flow
+    /// stays OPEN on a re-render and mints on a skip or a valid submission.
+    ProgressiveProfiling,
     /// The recovery identifier entry (the recovery start state).
     RecoveryStart,
     /// The uniform recovery acknowledgment plus one-time-code entry: the #64 anti-enumeration

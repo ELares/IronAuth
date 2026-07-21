@@ -39,6 +39,7 @@ pub mod schema;
 mod federation;
 mod login;
 mod mfa;
+mod profiling;
 mod recovery;
 mod registration;
 mod render;
@@ -871,6 +872,13 @@ async fn drive_login(
             )
             .await
         }
+        FlowStateTag::ProgressiveProfiling => {
+            drive_profiling(
+                state, scope, flow_id, transport, record, persisted, submission, headers,
+                now_micros,
+            )
+            .await
+        }
         // A login row on a registration/recovery/federation/completed/ack state is corrupt; a
         // uniform not found.
         FlowStateTag::RegistrationDetails
@@ -904,6 +912,39 @@ async fn complete_primary_or_step_up(
         // No in flow second factor: complete now, running the PR1 post success follow through
         // AFTER a successful mint (exactly as the bootstrap `login_post` / the PR1 flow login).
         mfa::MfaPlan::Complete => {
+            // Progressive profiling (issue #87 PR3): when the client's active form has a missing
+            // required later-login field, HOLD the mint for a skippable profiling step (like the
+            // MFA challenge hold), running the PR1 follow through NOW (the primary genuinely
+            // verified) and transitioning WITHOUT minting or consuming. The single mint happens
+            // once, at the profiling completion, with the honest primary amr. When there is
+            // nothing to collect (`plan` is None), the path below stays BYTE IDENTICAL to before.
+            if let Some(plan) =
+                profiling::plan(state, scope, &success.user_id, record.return_to.as_deref()).await
+            {
+                login_follow_through(state, scope, success, headers).await;
+                let next = PersistedState {
+                    step: FlowStateTag::ProgressiveProfiling,
+                    subject: Some(success.subject.clone()),
+                    methods: method_tokens(&primary_methods),
+                    enroll_credential: None,
+                    identifier: None,
+                    connector: None,
+                };
+                let nodes = profiling::start_nodes(transport, &record.id, &plan);
+                return persist_and_render(
+                    state,
+                    scope,
+                    flow_id,
+                    transport,
+                    Journey::Login,
+                    record,
+                    &next,
+                    nodes,
+                    Vec::new(),
+                    now_micros,
+                )
+                .await;
+            }
             let consumed = state
                 .store()
                 .scoped(scope)
@@ -1197,6 +1238,37 @@ async fn complete_with_second_factor(
     if !methods.contains(&new_method) {
         methods.push(new_method);
     }
+    // Progressive profiling (issue #87 PR3): when the client's active form has a missing required
+    // later-login field, HOLD the mint for a skippable profiling step, carrying the HONEST
+    // combined method tokens (primary plus the just-proven second factor) on the state so the
+    // final mint's amr reflects everything that genuinely happened. The second factor was already
+    // genuinely proven (its abuse counters were relaxed on the proof), so a held profiling step
+    // never re-challenges. When there is nothing to collect, the mint below is UNCHANGED.
+    if let Some(plan) = profiling::plan(state, scope, subject_id, record.return_to.as_deref()).await
+    {
+        let next = PersistedState {
+            step: FlowStateTag::ProgressiveProfiling,
+            subject: Some(subject_id.to_string()),
+            methods: method_tokens(&methods),
+            enroll_credential: None,
+            identifier: None,
+            connector: None,
+        };
+        let nodes = profiling::start_nodes(transport, &record.id, &plan);
+        return persist_and_render(
+            state,
+            scope,
+            flow_id,
+            transport,
+            Journey::Login,
+            record,
+            &next,
+            nodes,
+            Vec::new(),
+            now_micros,
+        )
+        .await;
+    }
     let event = crate::authn::AuthenticationEvent::from_methods(&methods, now_micros);
     let actor = interaction::user_actor(subject_id);
     let subject = subject_id.to_string();
@@ -1217,6 +1289,73 @@ async fn complete_with_second_factor(
         now_micros,
     )
     .await
+}
+
+/// Drive the progressive profiling state (issue #87 PR3): collect the held later-login fields
+/// and, on completion (a skip, a valid collection, or nothing left to collect), mint the session
+/// with the HONEST amr the login already earned (the primary plus any genuinely proven second
+/// factor, carried on the state). A non-empty invalid value re-renders the profiling nodes with
+/// the flow OPEN, so the profiling step is never a completion oracle; the step is always
+/// SKIPPABLE, so a blank submit mints.
+#[allow(clippy::too_many_arguments)]
+async fn drive_profiling(
+    state: &OidcState,
+    scope: Scope,
+    flow_id: &FlowId,
+    transport: Transport,
+    record: &FlowRecord,
+    persisted: &PersistedState,
+    submission: &Submission,
+    headers: &axum::http::HeaderMap,
+    now_micros: i64,
+) -> Result<Continuation, FlowError> {
+    let (subject_id, methods) = mfa_context(scope, persisted)?;
+    match profiling::advance(state, scope, record, &subject_id, submission).await? {
+        profiling::ProfilingStep::Render { nodes, messages } => {
+            persist_and_render(
+                state,
+                scope,
+                flow_id,
+                transport,
+                Journey::Login,
+                record,
+                persisted,
+                nodes,
+                messages,
+                now_micros,
+            )
+            .await
+        }
+        profiling::ProfilingStep::Complete => {
+            let event = crate::authn::AuthenticationEvent::from_methods(&methods, now_micros);
+            let actor = interaction::user_actor(&subject_id);
+            let subject = subject_id.to_string();
+            // On the rare fence at the mint, re-render the profiling step uniformly (the flow is
+            // consumed). The plan may have emptied by now (nothing left to collect); an empty
+            // fenced node set is then correct.
+            let fenced =
+                match profiling::plan(state, scope, &subject_id, record.return_to.as_deref()).await
+                {
+                    Some(plan) => profiling::start_nodes(transport, &record.id, &plan),
+                    None => Vec::new(),
+                };
+            consume_and_complete(
+                state,
+                scope,
+                flow_id,
+                transport,
+                Journey::Login,
+                record,
+                &subject,
+                actor,
+                &event,
+                fenced,
+                headers,
+                now_micros,
+            )
+            .await
+        }
+    }
 }
 
 /// Drive the registration journey one step (issue #84): the details funnel through
@@ -1399,6 +1538,7 @@ async fn drive_recovery(
         | FlowStateTag::RegistrationAck
         | FlowStateTag::MfaChallenge
         | FlowStateTag::MfaEnroll
+        | FlowStateTag::ProgressiveProfiling
         | FlowStateTag::FederationStart
         | FlowStateTag::Completed => Err(FlowError::NotFound),
     }

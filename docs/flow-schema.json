@@ -131,6 +131,11 @@
           "type": "string"
         },
         {
+          "const": "progressive_profiling",
+          "description": "A progressive profiling step (issue #87): a subsequent login collects the client form's\nlater-login signup fields as a HELD login step, injected where a successful primary (plus\nany second factor) login would otherwise mint the session. The step is always SKIPPABLE\n(a missing required later-login field prompts but never blocks the mint), so the flow\nstays OPEN on a re-render and mints on a skip or a valid submission.",
+          "type": "string"
+        },
+        {
           "const": "recovery_start",
           "description": "The recovery identifier entry (the recovery start state).",
           "type": "string"
