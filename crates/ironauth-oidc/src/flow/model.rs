@@ -69,6 +69,40 @@ impl Journey {
             _ => None,
         }
     }
+
+    /// The ordered flow PLAN for this journey (issue #91, the M9 flow inspector): the
+    /// sequence of [`FlowStateTag`] positions the journey can occupy, from the start state
+    /// to its terminal.
+    ///
+    /// This is the ONE transition source of truth the live engine and the read only flow
+    /// inspector ([`crate::flow::inspect`]) share, MIRRORING how
+    /// [`submit_action_for`](super::submit_action_for) is the one `ui.action` source both
+    /// the engine and the golden corpus build from: the engine seeds its start state from
+    /// `plan()[0]` (see `start_state` in [`super`]), and the inspector projects the plan
+    /// from the SAME table, so the inspector's plan can never drift from the states the
+    /// engine actually drives. The `plan_matches_engine` test pins that agreement (every
+    /// golden corpus state is a member of its journey's plan, and each creatable journey's
+    /// `start_state` step equals `plan()[0]`).
+    ///
+    /// The MFA states live in the LOGIN plan (they are reached FROM a login flow after the
+    /// primary factor, never a creation entry), so the [`Journey::Mfa`] pseudo journey has
+    /// an EMPTY plan and is not a creation entry. The federation launcher hands off to an
+    /// EXTERNAL browser leg (a redirect, never a local completion), so its plan is the
+    /// single launcher state with no `Completed` terminal.
+    #[must_use]
+    pub fn plan(self) -> &'static [FlowStateTag] {
+        use FlowStateTag::{
+            Completed, FederationStart, IdentifierPassword, MfaChallenge, MfaEnroll, RecoveryAck,
+            RecoveryStart, RegistrationAck, RegistrationDetails,
+        };
+        match self {
+            Journey::Login => &[IdentifierPassword, MfaChallenge, MfaEnroll, Completed],
+            Journey::Registration => &[RegistrationDetails, RegistrationAck, Completed],
+            Journey::Recovery => &[RecoveryStart, RecoveryAck, Completed],
+            Journey::Federation => &[FederationStart],
+            Journey::Mfa => &[],
+        }
+    }
 }
 
 /// The transport a flow was created on (issue #84). Set at creation and immutable, so a

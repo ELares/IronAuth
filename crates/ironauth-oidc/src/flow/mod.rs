@@ -30,6 +30,7 @@
 //! this engine is deferred to issue #85).
 
 pub mod golden;
+pub mod inspect;
 pub mod localize;
 pub mod message;
 pub mod model;
@@ -446,22 +447,29 @@ fn start_state(
     flow_id: &str,
     connector: Option<&str>,
 ) -> Option<(PersistedState, Vec<Node>)> {
+    // The start state is the FIRST position in the journey's shared PLAN
+    // ([`Journey::plan`]), the ONE transition table the read only flow inspector also
+    // projects, so the engine's entry point and the inspector's plan can never diverge. A
+    // journey with no creation plan (the MFA states are reached FROM a login flow, never a
+    // creation entry) has an empty plan, so `first()` is [`None`] and the creation is a
+    // typed not found.
+    let start = *journey.plan().first()?;
     match journey {
         Journey::Login => Some((
-            PersistedState::step(FlowStateTag::IdentifierPassword),
+            PersistedState::step(start),
             login::start_nodes(transport, flow_id),
         )),
         Journey::Registration => Some((
-            PersistedState::step(FlowStateTag::RegistrationDetails),
+            PersistedState::step(start),
             registration::start_nodes(transport, flow_id),
         )),
         Journey::Recovery => Some((
-            PersistedState::step(recovery::start_state_tag()),
+            PersistedState::step(start),
             recovery::start_nodes(transport, flow_id),
         )),
         Journey::Federation => {
             let connector = connector?;
-            let mut persisted = PersistedState::step(FlowStateTag::FederationStart);
+            let mut persisted = PersistedState::step(start);
             persisted.connector = Some(connector.to_owned());
             Some((
                 persisted,

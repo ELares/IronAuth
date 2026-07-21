@@ -442,6 +442,49 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/flow/dry-run": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * DRY REPLAY a supplied context through a journey's plan (issue #91): evaluate the REAL step
+         *     up and risk evaluators with EVERY write disabled and project the reachable path. Despite
+         *     the POST verb this is READ ONLY / SIDE EFFECT FREE: it carries a context body but writes
+         *     NO row anywhere (no flow, session, risk, jti, or trace row). The `POST` is only because
+         *     the supplied context does not fit a URL.
+         */
+        post: operations["postFlowDryRun"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/flow/{flow_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * OBSERVE an existing flow read only (issue #91): the flow's current position, plan,
+         *     redacted context, node render, and recorded policy traces. NEVER mutates the flow.
+         */
+        get: operations["getFlowObservation"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/policy-traces": {
         parameters: {
             query?: never;
@@ -1816,6 +1859,128 @@ export interface components {
             extend_secs: number;
         };
         /**
+         * @description The redacted flow context projection surfaced by the inspector (issue #91): only safe
+         *     fields. The recovery identifier (a PII contact) is reduced to `has_identifier`, and the
+         *     flow submit token is not representable here at all.
+         */
+        FlowContextResponse: {
+            /** @description The federation connector slug (non secret), or absent. */
+            connector?: string | null;
+            /** @description Whether a second factor enrollment is pending (never its credential id or secret). */
+            enrolling: boolean;
+            /** @description Whether a recovery identifier is held server side (never its PII value). */
+            has_identifier: boolean;
+            /** @description The proven auth method tokens so far (for example `["pwd"]`), the honest amr source. */
+            methods: string[];
+            /** @description The current state machine step. */
+            step: string;
+            /** @description The blind internal `usr_` subject handle, or absent before a primary factor. */
+            subject?: string | null;
+        };
+        /**
+         * @description The flow dry run request (issue #91): a supplied context to replay through a journey's
+         *     plan. It is evaluated with EVERY write disabled and MUST write nothing.
+         */
+        FlowDryRunRequest: {
+            /** @description The achieved acr the supplied authentication reached. */
+            achieved_acr: string;
+            /** @description The acr order to compare under, or absent for the canonical deployment ladder. */
+            acr_order?: string[] | null;
+            /**
+             * Format: int64
+             * @description The recorded authentication instant in unix microseconds, or absent (which fails an
+             *     age bound closed).
+             */
+            auth_time_unix_micros?: number | null;
+            /** @description The journey whose plan to walk (`login`, `registration`, `recovery`, `federation`). */
+            journey: string;
+            /**
+             * Format: int64
+             * @description The maximum authentication age in seconds the requirement imposes, or absent.
+             */
+            max_auth_age_secs?: number | null;
+            /**
+             * Format: int64
+             * @description The clock instant to evaluate against, or absent for the current server clock.
+             */
+            now_unix_micros?: number | null;
+            /** @description The required acr floor (an alias like `mfa` or a full canonical acr), or absent. */
+            required_acr?: string | null;
+            risk?: null | components["schemas"]["RiskScenarioRequest"];
+            /** @description The subject the context carries (a blind `usr_` handle), or absent. */
+            subject?: string | null;
+        };
+        /**
+         * @description The flow dry run response (issue #91): the plan, the per step evaluations, and the
+         *     terminal state the supplied scenario reaches. ZERO rows were written to produce it.
+         */
+        FlowDryRunResponse: {
+            /** @description The journey walked. */
+            journey: string;
+            /** @description The journey plan (the ordered state sequence). */
+            plan: string[];
+            /** @description The per step evaluations. */
+            steps: components["schemas"]["FlowDryRunStep"][];
+            /** @description The terminal state the supplied scenario reaches. */
+            terminal: string;
+        };
+        /** @description One evaluated step of the dry replay (issue #91). */
+        FlowDryRunStep: {
+            /** @description The redacted context at this step. */
+            context: components["schemas"]["FlowContextResponse"];
+            /** @description The policy that governs the transition out of this step, or absent. */
+            policy?: string | null;
+            /** @description Whether the supplied scenario reaches this state. */
+            reached: boolean;
+            risk?: null | components["schemas"]["RiskDecisionResponse"];
+            /** @description The plan state this step is. */
+            step: string;
+            step_up?: null | components["schemas"]["StepUpDecisionResponse"];
+        };
+        /**
+         * @description One node of the current node render (issue #91): its group, its typed kind, and the form
+         *     field name for an input. A compact projection of the flow object's `ui.nodes`, never a
+         *     secret (no prefilled value is carried).
+         */
+        FlowNodeView: {
+            /** @description The node group (for example `default`, `password`, `totp`). */
+            group: string;
+            /** @description The node kind (`input` or `text`). */
+            kind: string;
+            /** @description The form field name, for an input node. */
+            name?: string | null;
+        };
+        /**
+         * @description The OBSERVE projection of an existing flow (issue #91): its current position, the plan it
+         *     sits within, the redacted context, the current node render, and any recorded policy
+         *     traces for its subject (from PR3).
+         */
+        FlowObserveResponse: {
+            /** @description Whether the single use completion latch has tripped. */
+            completed: boolean;
+            /** @description The redacted flow context. */
+            context: components["schemas"]["FlowContextResponse"];
+            /** @description The current state machine position. */
+            current: string;
+            /** @description Whether the flow has expired at the observation instant. */
+            expired: boolean;
+            /** @description The flow id (a scope embedded `flw_` id, non secret). */
+            flow_id: string;
+            /** @description The journey this flow drives. */
+            journey: string;
+            /** @description The current node render (a compact projection of the flow object's nodes). */
+            nodes: components["schemas"]["FlowNodeView"][];
+            /**
+             * @description The journey plan (the ordered state sequence, from the ONE transition table the
+             *     engine shares).
+             */
+            plan: string[];
+            /** @description The recorded policy decision traces for this flow's subject (from PR3), newest first. */
+            traces: components["schemas"]["PolicyTraceView"][];
+            /** @description The transport it was created on. */
+            transport: string;
+        };
+        /**
          * @description The typed guardrails an environment enforces (issue #42), derived purely from
          *     its kind so the production asymmetry can never drift.
          */
@@ -2572,6 +2737,56 @@ export interface components {
              */
             hard_kill?: boolean;
         };
+        /** @description The risk decision projection (issue #91), from the REAL compute core. */
+        RiskDecisionResponse: {
+            /** @description The dispatched action (`allow` / `block` / `challenge` / `notify`). */
+            action: string;
+            /** @description The combined level (`low` / `med` / `high`). */
+            level: string;
+            /** @description Whether the new device signal fired. */
+            new_device_fired: boolean;
+            /** @description The contributing signals, name and level only. */
+            signals: components["schemas"]["RiskSignalResponse"][];
+        };
+        /**
+         * @description The risk scenario a flow dry run evaluates (issue #91): the supplied signals plus the
+         *     deployment posture switches. Every field is optional; the defaults mirror the shipped
+         *     risk config (`block_on_high` on, `notify_on_new_device` on, no forced threshold).
+         */
+        RiskScenarioRequest: {
+            /** @description Whether a hard deny blocks (defaults to true). */
+            block_on_high?: boolean | null;
+            /** @description Whether a new device fired. */
+            new_device?: boolean;
+            /** @description Whether a new device notifies (defaults to true). */
+            notify_on_new_device?: boolean | null;
+            /**
+             * @description The step up threshold the score is compared against (`off` / `low` / `med` / `high`),
+             *     or absent for "never force".
+             */
+            require_mfa_at?: string | null;
+            /** @description The supplied signals (the what if scenario). */
+            signals?: components["schemas"]["RiskSignalRequest"][];
+        };
+        /** @description A supplied risk signal for a flow dry run (issue #91): the operator's what if scenario. */
+        RiskSignalRequest: {
+            /** @description Whether this signal alone justifies a block (a hard deny). Defaults to false. */
+            hard_deny?: boolean;
+            /** @description The signal's contribution level (`low` / `med` / `high`). */
+            level: string;
+            /**
+             * @description The signal name (mapped to the engine's bounded vocabulary; an unknown name folds to
+             *     `external_signal`).
+             */
+            name: string;
+        };
+        /** @description A contributing risk signal projection (issue #91): the name and level only (redacted). */
+        RiskSignalResponse: {
+            /** @description The signal's contribution level. */
+            level: string;
+            /** @description The signal name. */
+            name: string;
+        };
         /** @description A page of sessions. */
         SessionList: {
             /** @description The sessions in this page. */
@@ -2786,6 +3001,19 @@ export interface components {
          * @enum {string}
          */
         SignupQuarantineStateView: "pending" | "approved" | "rejected" | "extended";
+        /** @description The step up requirement evaluation projection (issue #91), from the REAL evaluator. */
+        StepUpDecisionResponse: {
+            /** @description The achieved acr the evaluation compared. */
+            achieved_acr: string;
+            /** @description Whether the achieved acr did not satisfy the floor. */
+            acr_unmet: boolean;
+            /** @description Whether the authentication age window lapsed. */
+            age_lapsed: boolean;
+            /** @description The bounded outcome (`satisfied` or `step_up_required`). */
+            outcome: string;
+            /** @description The required acr floor, or absent. */
+            required_acr?: string | null;
+        };
         /** @description The result of a successful admin sudo elevation (issue #73). */
         SudoElevationView: {
             /** @description The achieved authentication context recorded for the elevation. */
@@ -5195,6 +5423,125 @@ export interface operations {
                 };
             };
             /** @description Environment not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    postFlowDryRun: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FlowDryRunRequest"];
+            };
+        };
+        responses: {
+            /** @description The dry replay of the supplied context: the journey plan, the per step evaluations of the REAL step up and risk evaluators (with every write disabled), and the terminal state the scenario reaches. This is SIDE EFFECT FREE / read only despite the POST verb: it writes no flow, session, risk, jti, or trace row anywhere. The evaluators are the SAME ones the live path runs, so the decisions match the live path for the same inputs. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FlowDryRunResponse"];
+                };
+            };
+            /** @description A malformed request body or journey */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Environment not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    getFlowObservation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The flow identifier to observe */
+                flow_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The read only observation of the flow: its current state, the journey plan (the ordered state sequence from the one transition table the engine shares), a structurally redacted projection of its persisted context (the step, the proven method tokens, the blind subject handle; never a submit token or the recovery identifier PII), the current node render, and the recorded policy decision traces for its subject. This read never calls the mutating flow engine. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FlowObserveResponse"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Environment or flow not found */
             404: {
                 headers: {
                     [name: string]: unknown;

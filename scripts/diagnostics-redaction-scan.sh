@@ -31,4 +31,13 @@ echo "diagnostics-redaction: running the hostile sentinel corpus against the pol
 cargo test --quiet -p ironauth-oidc --lib \
   policy_trace::tests::redaction_corpus_leaks_no_secret_sentinel -- --exact
 
+# The M9 flow inspector projection (issue #91, PR4) carries the SAME structural redaction
+# guarantee: the flow context view has no field for the flow submit token (it is not even on
+# the persisted state) and no field for the recovery identifier PII (reduced to a boolean), and
+# a hostile risk signal name folds to the bounded vocabulary, so a secret is unrepresentable in
+# an observe or dry run projection. This is the sibling corpus that proves it for the inspector.
+echo "diagnostics-redaction: running the hostile sentinel corpus against the flow inspector projection"
+cargo test --quiet -p ironauth-oidc --lib \
+  flow::inspect::tests::redaction_corpus_leaks_no_secret_sentinel -- --exact
+
 echo "diagnostics-redaction: clean (no secret sentinel can reach a serialized diagnostic record)"

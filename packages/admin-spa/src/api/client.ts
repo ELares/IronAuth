@@ -127,6 +127,16 @@ export type PolicyTraceView = components["schemas"]["PolicyTraceView"];
 // from the connector health registry and the token size event sink.
 export type WarningItemView = components["schemas"]["WarningItemView"];
 
+// The flow inspector projections (issue #91, PR4). Re-exported from the generated schema so
+// the inspector view never hand maintains a shape the management contract already owns. The
+// OBSERVE response is the read only projection of an existing flow (its current state, the
+// journey plan, a redacted context, the node render, and the recorded policy traces); the
+// DRY RUN request and response carry a supplied context and the per step evaluations of the
+// real step up and risk evaluators, computed SIDE EFFECT FREE (the server writes no row).
+export type FlowObserveResponse = components["schemas"]["FlowObserveResponse"];
+export type FlowDryRunRequest = components["schemas"]["FlowDryRunRequest"];
+export type FlowDryRunResponse = components["schemas"]["FlowDryRunResponse"];
+
 export type ManagementClient = ReturnType<typeof createClient<paths>>;
 
 // A management call that failed carries the verbatim ErrorBody the server
@@ -1025,6 +1035,61 @@ export async function fetchDiagnosticsWarnings(
     throw new ManagementError(toErrorBody(error), response.status);
   }
   return data?.items ?? [];
+}
+
+// OBSERVE an existing flow read only (operationId getFlowObservation). Scope injection: the
+// active tenant and environment ids plus the flow id substitute into the documented path,
+// targeting `/v1/tenants/<t>/environments/<e>/diagnostics/flow/<flow>`. The server never
+// mutates the flow: this returns its current state, the journey plan, a redacted context,
+// the current node render, and the recorded policy traces. A foreign or malformed flow id is
+// a uniform 404 (ManagementError).
+export async function fetchFlowObservation(
+  tenantId: string,
+  environmentId: string,
+  flowId: string,
+): Promise<FlowObserveResponse> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.GET(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/flow/{flow_id}",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          flow_id: flowId,
+        },
+      },
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+// DRY REPLAY a supplied context through a journey's plan (operationId postFlowDryRun). Scope
+// injection: the active tenant and environment ids substitute into the documented path,
+// targeting `/v1/tenants/<t>/environments/<e>/diagnostics/flow/dry-run`. Despite the POST
+// verb this is READ ONLY / SIDE EFFECT FREE: the server writes no row. It returns the journey
+// plan, the per step evaluations of the real step up and risk evaluators, and the terminal
+// state the scenario reaches.
+export async function fetchFlowDryRun(
+  tenantId: string,
+  environmentId: string,
+  request: FlowDryRunRequest,
+): Promise<FlowDryRunResponse> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.POST(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/flow/dry-run",
+    {
+      params: { path: { tenant_id: tenantId, environment_id: environmentId } },
+      body: request,
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
 }
 
 // ---- The users CRUD operations (issue #90, PR 5) ----------------------------

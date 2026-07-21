@@ -207,6 +207,15 @@ name = "flow"
 path = "tests/flow.rs"
 required-features = ["testing"]
 
+# The read only flow inspector (issue #91, PR4): the OBSERVE projection of an existing
+# flow, and the ZERO SIDE EFFECT proof (a full database snapshot, byte identical before and
+# after a dry run) that neither observe nor a policy dry run writes any row. Over a real
+# database (DATABASE_URL).
+[[test]]
+name = "flow_inspect"
+path = "tests/flow_inspect.rs"
+required-features = ["testing"]
+
 # The refresh-token grant end to end (issue #21): the graduated rotation policy
 # (public rotate every refresh, confidential only past the TTL threshold), HTTP-layer
 # reuse detection and family revocation, the offline_access consent rule for web

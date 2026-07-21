@@ -14,8 +14,10 @@ use axum::http::StatusCode;
 use common::Harness;
 use ironauth_env::Env;
 use ironauth_store::{
-    ClientAuthDiagnosticReason, EnvironmentId, NewClientAuthDiagnostic, Scope, TenantId,
+    ClientAuthDiagnosticReason, EnvironmentId, FlowId, NewClientAuthDiagnostic, NewFlow, Scope,
+    TenantId,
 };
+use sqlx::PgPool;
 
 /// A retention long enough that no seeded row is ever pruned during a test (30 days).
 const RETENTION_MICROS: i64 = 30 * 24 * 60 * 60 * 1_000_000;
@@ -289,4 +291,212 @@ async fn an_unauthenticated_read_is_rejected() {
 fn list_items(body: &str) -> Vec<serde_json::Value> {
     let value: serde_json::Value = serde_json::from_str(body).expect("json list body");
     value["items"].as_array().expect("items array").clone()
+}
+
+// ===========================================================================
+// The flow inspector endpoints (issue #91, PR4): the OBSERVE read and the zero
+// side effect DRY REPLAY.
+// ===========================================================================
+
+/// Seed a login flow at its start state into `scope` through the data-plane store, exactly as
+/// the flow engine creates one. Returns the flow id string the observe path carries.
+async fn seed_login_flow(harness: &Harness, scope: Scope) -> String {
+    let env = Env::system();
+    let flow_id = FlowId::generate(&env, &scope);
+    harness
+        .store()
+        .scoped(scope)
+        .flows()
+        .create(
+            &flow_id,
+            NewFlow {
+                journey: "login",
+                transport: "browser",
+                // The serialized PersistedState at the login start state (opaque application
+                // JSON the inspector projects read only).
+                state: "{\"step\":\"identifier_password\"}",
+                submit_token: "seed-submit-token",
+                transient_payload: None,
+                return_to: None,
+                contract_version: 1,
+                expires_at_unix_micros: common::FAR_FUTURE_MICROS,
+            },
+        )
+        .await
+        .expect("seed a login flow");
+    flow_id.to_string()
+}
+
+/// Snapshot every public table's row count, read as the superuser owner (so forced row level
+/// security never hides a write).
+async fn snapshot(pool: &PgPool) -> std::collections::BTreeMap<String, i64> {
+    let tables: Vec<(String,)> =
+        sqlx::query_as("SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
+            .fetch_all(pool)
+            .await
+            .expect("list public tables");
+    let mut counts = std::collections::BTreeMap::new();
+    for (table,) in tables {
+        let (count,): (i64,) = sqlx::query_as(&format!("SELECT count(*) FROM \"{table}\""))
+            .fetch_one(pool)
+            .await
+            .expect("count table rows");
+        counts.insert(table, count);
+    }
+    counts
+}
+
+#[tokio::test]
+async fn the_flow_observe_read_projects_the_flow_read_only() {
+    let harness = Harness::start(50).await;
+    let (tenant, environment) = harness.create_tenant("Acme", "tenant-key").await;
+    let scope = scope_of(&tenant, &environment);
+    let flow_id = seed_login_flow(&harness, scope).await;
+
+    let path =
+        format!("/v1/tenants/{tenant}/environments/{environment}/diagnostics/flow/{flow_id}");
+    let (status, _, body) = harness.get(&path).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json body");
+    assert_eq!(value["flow_id"], flow_id);
+    assert_eq!(value["journey"], "login");
+    assert_eq!(value["current"], "identifier_password");
+    // The plan is the ordered login state sequence from the one transition table the engine
+    // shares; it starts at the current state.
+    let plan = value["plan"].as_array().expect("plan array");
+    assert_eq!(plan[0], "identifier_password");
+    assert!(
+        plan.iter().any(|s| s == "completed"),
+        "plan reaches completed"
+    );
+    // The redacted context never leaks an identifier value.
+    assert_eq!(value["context"]["step"], "identifier_password");
+    assert_eq!(value["context"]["has_identifier"], false);
+    // The current node render reuses the engine's node model.
+    assert!(
+        !value["nodes"].as_array().expect("nodes array").is_empty(),
+        "the node render is not empty: {body}"
+    );
+    // No policy traces recorded for this fresh flow's (absent) subject.
+    assert!(value["traces"].as_array().expect("traces array").is_empty());
+}
+
+#[tokio::test]
+async fn the_flow_observe_read_is_idor_safe() {
+    let harness = Harness::start(50).await;
+    let (tenant_a, env_a) = harness.create_tenant("Acme", "key-a").await;
+    let (tenant_b, env_b) = harness.create_tenant("Beta", "key-b").await;
+    let scope_b = scope_of(&tenant_b, &env_b);
+
+    // A flow that exists only in tenant B.
+    let flow_b = seed_login_flow(&harness, scope_b).await;
+
+    // Tenant A's observe path with tenant B's flow id: the id carries tenant B's scope, so
+    // parse_in_scope under tenant A rejects it as a UNIFORM not found (never an oracle).
+    let cross = format!("/v1/tenants/{tenant_a}/environments/{env_a}/diagnostics/flow/{flow_b}");
+    let (status, _, body) = harness.get(&cross).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "cross tenant is not found: {body}"
+    );
+    assert!(
+        !body.contains(&flow_b) || status == StatusCode::NOT_FOUND,
+        "tenant B's flow never leaks into tenant A"
+    );
+
+    // A wrong scope management key against tenant B's own path is rejected LOUD (403).
+    let key_a = harness
+        .create_key(&tenant_a, &env_a, "diag-reader", "mint-key-a")
+        .await;
+    let own_b = format!("/v1/tenants/{tenant_b}/environments/{env_b}/diagnostics/flow/{flow_b}");
+    let (status, _, body) = harness.get_as(&own_b, &key_a).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "wrong scope is loud: {body}");
+
+    // An unknown (well formed in scope) flow id is a uniform not found, not a 500.
+    let env = Env::system();
+    let unknown = FlowId::generate(&env, &scope_of(&tenant_a, &env_a)).to_string();
+    let missing = format!("/v1/tenants/{tenant_a}/environments/{env_a}/diagnostics/flow/{unknown}");
+    let (status, _, body) = harness.get(&missing).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "unknown flow is not found: {body}"
+    );
+}
+
+#[tokio::test]
+async fn the_flow_dry_run_evaluates_the_real_policies_and_writes_no_row() {
+    let harness = Harness::start(50).await;
+    let (tenant, environment) = harness.create_tenant("Acme", "tenant-key").await;
+    let base = format!("/v1/tenants/{tenant}/environments/{environment}/diagnostics/flow/dry-run");
+
+    // The BEFORE snapshot: every table's row count, superuser read (RLS never hides a write).
+    let before = snapshot(harness.db().owner_pool()).await;
+
+    // A dry run over the login journey: a pwd session against an mfa floor forces a step up,
+    // and two corroborating MED risk signals challenge. If this were the live path it would
+    // persist a risk decision and a step up trace; the dry run persists nothing.
+    let body = serde_json::json!({
+        "journey": "login",
+        "achieved_acr": "pwd",
+        "required_acr": "mfa",
+        "risk": {
+            "require_mfa_at": "med",
+            "new_device": true,
+            "signals": [
+                { "name": "velocity", "level": "med" },
+                { "name": "impossible_travel", "level": "med" }
+            ]
+        }
+    })
+    .to_string();
+    let (status, _, response) = harness.post(&base, "dry-run-1", &body).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let value: serde_json::Value = serde_json::from_str(&response).expect("json body");
+    assert_eq!(value["journey"], "login");
+    assert_eq!(
+        value["terminal"], "completed",
+        "the step up threads to completion"
+    );
+    let steps = value["steps"].as_array().expect("steps array");
+    let primary = &steps[0];
+    assert_eq!(primary["step"], "identifier_password");
+    // The REAL step up evaluator ran: a pwd session does not satisfy the mfa floor.
+    assert_eq!(primary["step_up"]["outcome"], "step_up_required");
+    // The REAL risk compute core ran: two MED signals corroborate to HIGH and challenge.
+    assert_eq!(primary["risk"]["action"], "challenge");
+    assert_eq!(primary["risk"]["level"], "high");
+
+    // The AFTER snapshot MUST be byte identical: the dry run wrote no risk decision, no step
+    // up trace, no flow, no session, no jti, no row anywhere.
+    let after = snapshot(harness.db().owner_pool()).await;
+    assert_eq!(
+        before, after,
+        "the dry run wrote a row: the store is not byte identical before and after"
+    );
+}
+
+#[tokio::test]
+async fn the_flow_dry_run_is_scope_gated() {
+    let harness = Harness::start(50).await;
+    let (tenant_a, env_a) = harness.create_tenant("Acme", "key-a").await;
+    let (tenant_b, env_b) = harness.create_tenant("Beta", "key-b").await;
+
+    let body = serde_json::json!({ "journey": "login", "achieved_acr": "pwd" }).to_string();
+
+    // A management key scoped to tenant A, presented against tenant B's dry run path, is
+    // rejected LOUD (wrong scope), never a silent cross tenant evaluation.
+    let key_a = harness
+        .create_key(&tenant_a, &env_a, "diag-reader", "mint-key-a")
+        .await;
+    let base_b = format!("/v1/tenants/{tenant_b}/environments/{env_b}/diagnostics/flow/dry-run");
+    let (status, _, resp) = harness.post_as(&base_b, &key_a, "dry-run-b", &body).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "wrong scope is loud: {resp}");
+
+    // An unauthenticated dry run is rejected.
+    let (status, _, _) = harness
+        .post_as(&base_b, "not-a-real-token", "dry-run-c", &body)
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }

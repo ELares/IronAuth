@@ -221,6 +221,21 @@ pub fn management_router(state: AdminState) -> Router {
             "/v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/warnings",
             get(diagnostics::get_diagnostics_warnings),
         )
+        // The flow inspector DRY REPLAY (issue #91, PR4): a zero side effect policy dry run
+        // over a supplied context. Despite the POST verb it is READ ONLY (it writes no row),
+        // and its static `diagnostics/flow/dry-run` suffix is registered before the
+        // parameterized `diagnostics/flow/{flow_id}` observe route so the literal wins.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/flow/dry-run",
+            post(diagnostics::post_flow_dry_run),
+        )
+        // The flow inspector OBSERVE read (issue #91, PR4): the read only projection of an
+        // existing flow's current position, plan, redacted context, node render, and recorded
+        // policy traces. Environment scoped, IDOR safe; never calls the mutating flow engine.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/flow/{flow_id}",
+            get(diagnostics::get_flow_observation),
+        )
         // The in-admin Argon2id tuning probe (issue #62): a host-measured parameter
         // recommendation, the same probe the CLI wraps. Environment-scoped, read-only.
         // Static `password-hashing` suffix, matched before the parameterized routes.

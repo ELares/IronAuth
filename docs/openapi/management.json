@@ -3182,6 +3182,187 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/flow/dry-run": {
+      "post": {
+        "tags": [
+          "diagnostics"
+        ],
+        "summary": "DRY REPLAY a supplied context through a journey's plan (issue #91): evaluate the REAL step\nup and risk evaluators with EVERY write disabled and project the reachable path. Despite\nthe POST verb this is READ ONLY / SIDE EFFECT FREE: it carries a context body but writes\nNO row anywhere (no flow, session, risk, jti, or trace row). The `POST` is only because\nthe supplied context does not fit a URL.",
+        "operationId": "postFlowDryRun",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FlowDryRunRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The dry replay of the supplied context: the journey plan, the per step evaluations of the REAL step up and risk evaluators (with every write disabled), and the terminal state the scenario reaches. This is SIDE EFFECT FREE / read only despite the POST verb: it writes no flow, session, risk, jti, or trace row anywhere. The evaluators are the SAME ones the live path runs, so the decisions match the live path for the same inputs.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FlowDryRunResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed request body or journey",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/flow/{flow_id}": {
+      "get": {
+        "tags": [
+          "diagnostics"
+        ],
+        "summary": "OBSERVE an existing flow read only (issue #91): the flow's current position, plan,\nredacted context, node render, and recorded policy traces. NEVER mutates the flow.",
+        "operationId": "getFlowObservation",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "The flow identifier to observe",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The read only observation of the flow: its current state, the journey plan (the ordered state sequence from the one transition table the engine shares), a structurally redacted projection of its persisted context (the step, the proven method tokens, the blind subject handle; never a submit token or the recovery identifier PII), the current node render, and the recorded policy decision traces for its subject. This read never calls the mutating flow engine.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FlowObserveResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment or flow not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/policy-traces": {
       "get": {
         "tags": [
@@ -9317,6 +9498,307 @@
           }
         }
       },
+      "FlowContextResponse": {
+        "type": "object",
+        "description": "The redacted flow context projection surfaced by the inspector (issue #91): only safe\nfields. The recovery identifier (a PII contact) is reduced to `has_identifier`, and the\nflow submit token is not representable here at all.",
+        "required": [
+          "step",
+          "methods",
+          "has_identifier",
+          "enrolling"
+        ],
+        "properties": {
+          "connector": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The federation connector slug (non secret), or absent."
+          },
+          "enrolling": {
+            "type": "boolean",
+            "description": "Whether a second factor enrollment is pending (never its credential id or secret)."
+          },
+          "has_identifier": {
+            "type": "boolean",
+            "description": "Whether a recovery identifier is held server side (never its PII value)."
+          },
+          "methods": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The proven auth method tokens so far (for example `[\"pwd\"]`), the honest amr source."
+          },
+          "step": {
+            "type": "string",
+            "description": "The current state machine step."
+          },
+          "subject": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The blind internal `usr_` subject handle, or absent before a primary factor."
+          }
+        }
+      },
+      "FlowDryRunRequest": {
+        "type": "object",
+        "description": "The flow dry run request (issue #91): a supplied context to replay through a journey's\nplan. It is evaluated with EVERY write disabled and MUST write nothing.",
+        "required": [
+          "journey",
+          "achieved_acr"
+        ],
+        "properties": {
+          "achieved_acr": {
+            "type": "string",
+            "description": "The achieved acr the supplied authentication reached."
+          },
+          "acr_order": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The acr order to compare under, or absent for the canonical deployment ladder."
+          },
+          "auth_time_unix_micros": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The recorded authentication instant in unix microseconds, or absent (which fails an\nage bound closed)."
+          },
+          "journey": {
+            "type": "string",
+            "description": "The journey whose plan to walk (`login`, `registration`, `recovery`, `federation`)."
+          },
+          "max_auth_age_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The maximum authentication age in seconds the requirement imposes, or absent.",
+            "minimum": 0
+          },
+          "now_unix_micros": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The clock instant to evaluate against, or absent for the current server clock."
+          },
+          "required_acr": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The required acr floor (an alias like `mfa` or a full canonical acr), or absent."
+          },
+          "risk": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RiskScenarioRequest",
+                "description": "The risk scenario, or absent to skip the risk evaluator."
+              }
+            ]
+          },
+          "subject": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The subject the context carries (a blind `usr_` handle), or absent."
+          }
+        }
+      },
+      "FlowDryRunResponse": {
+        "type": "object",
+        "description": "The flow dry run response (issue #91): the plan, the per step evaluations, and the\nterminal state the supplied scenario reaches. ZERO rows were written to produce it.",
+        "required": [
+          "journey",
+          "plan",
+          "terminal",
+          "steps"
+        ],
+        "properties": {
+          "journey": {
+            "type": "string",
+            "description": "The journey walked."
+          },
+          "plan": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The journey plan (the ordered state sequence)."
+          },
+          "steps": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FlowDryRunStep"
+            },
+            "description": "The per step evaluations."
+          },
+          "terminal": {
+            "type": "string",
+            "description": "The terminal state the supplied scenario reaches."
+          }
+        }
+      },
+      "FlowDryRunStep": {
+        "type": "object",
+        "description": "One evaluated step of the dry replay (issue #91).",
+        "required": [
+          "step",
+          "reached",
+          "context"
+        ],
+        "properties": {
+          "context": {
+            "$ref": "#/components/schemas/FlowContextResponse",
+            "description": "The redacted context at this step."
+          },
+          "policy": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The policy that governs the transition out of this step, or absent."
+          },
+          "reached": {
+            "type": "boolean",
+            "description": "Whether the supplied scenario reaches this state."
+          },
+          "risk": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RiskDecisionResponse",
+                "description": "The risk decision at this step, when it governs."
+              }
+            ]
+          },
+          "step": {
+            "type": "string",
+            "description": "The plan state this step is."
+          },
+          "step_up": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/StepUpDecisionResponse",
+                "description": "The step up requirement evaluation at this step, when it governs."
+              }
+            ]
+          }
+        }
+      },
+      "FlowNodeView": {
+        "type": "object",
+        "description": "One node of the current node render (issue #91): its group, its typed kind, and the form\nfield name for an input. A compact projection of the flow object's `ui.nodes`, never a\nsecret (no prefilled value is carried).",
+        "required": [
+          "group",
+          "kind"
+        ],
+        "properties": {
+          "group": {
+            "type": "string",
+            "description": "The node group (for example `default`, `password`, `totp`)."
+          },
+          "kind": {
+            "type": "string",
+            "description": "The node kind (`input` or `text`)."
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The form field name, for an input node."
+          }
+        }
+      },
+      "FlowObserveResponse": {
+        "type": "object",
+        "description": "The OBSERVE projection of an existing flow (issue #91): its current position, the plan it\nsits within, the redacted context, the current node render, and any recorded policy\ntraces for its subject (from PR3).",
+        "required": [
+          "flow_id",
+          "journey",
+          "transport",
+          "plan",
+          "current",
+          "completed",
+          "expired",
+          "context",
+          "nodes",
+          "traces"
+        ],
+        "properties": {
+          "completed": {
+            "type": "boolean",
+            "description": "Whether the single use completion latch has tripped."
+          },
+          "context": {
+            "$ref": "#/components/schemas/FlowContextResponse",
+            "description": "The redacted flow context."
+          },
+          "current": {
+            "type": "string",
+            "description": "The current state machine position."
+          },
+          "expired": {
+            "type": "boolean",
+            "description": "Whether the flow has expired at the observation instant."
+          },
+          "flow_id": {
+            "type": "string",
+            "description": "The flow id (a scope embedded `flw_` id, non secret)."
+          },
+          "journey": {
+            "type": "string",
+            "description": "The journey this flow drives."
+          },
+          "nodes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FlowNodeView"
+            },
+            "description": "The current node render (a compact projection of the flow object's nodes)."
+          },
+          "plan": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The journey plan (the ordered state sequence, from the ONE transition table the\nengine shares)."
+          },
+          "traces": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PolicyTraceView"
+            },
+            "description": "The recorded policy decision traces for this flow's subject (from PR3), newest first."
+          },
+          "transport": {
+            "type": "string",
+            "description": "The transport it was created on."
+          }
+        }
+      },
       "GuardrailView": {
         "type": "object",
         "description": "The typed guardrails an environment enforces (issue #42), derived purely from\nits kind so the production asymmetry can never drift.",
@@ -10615,6 +11097,115 @@
           }
         }
       },
+      "RiskDecisionResponse": {
+        "type": "object",
+        "description": "The risk decision projection (issue #91), from the REAL compute core.",
+        "required": [
+          "level",
+          "action",
+          "new_device_fired",
+          "signals"
+        ],
+        "properties": {
+          "action": {
+            "type": "string",
+            "description": "The dispatched action (`allow` / `block` / `challenge` / `notify`)."
+          },
+          "level": {
+            "type": "string",
+            "description": "The combined level (`low` / `med` / `high`)."
+          },
+          "new_device_fired": {
+            "type": "boolean",
+            "description": "Whether the new device signal fired."
+          },
+          "signals": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RiskSignalResponse"
+            },
+            "description": "The contributing signals, name and level only."
+          }
+        }
+      },
+      "RiskScenarioRequest": {
+        "type": "object",
+        "description": "The risk scenario a flow dry run evaluates (issue #91): the supplied signals plus the\ndeployment posture switches. Every field is optional; the defaults mirror the shipped\nrisk config (`block_on_high` on, `notify_on_new_device` on, no forced threshold).",
+        "properties": {
+          "block_on_high": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether a hard deny blocks (defaults to true)."
+          },
+          "new_device": {
+            "type": "boolean",
+            "description": "Whether a new device fired."
+          },
+          "notify_on_new_device": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether a new device notifies (defaults to true)."
+          },
+          "require_mfa_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The step up threshold the score is compared against (`off` / `low` / `med` / `high`),\nor absent for \"never force\"."
+          },
+          "signals": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RiskSignalRequest"
+            },
+            "description": "The supplied signals (the what if scenario)."
+          }
+        }
+      },
+      "RiskSignalRequest": {
+        "type": "object",
+        "description": "A supplied risk signal for a flow dry run (issue #91): the operator's what if scenario.",
+        "required": [
+          "name",
+          "level"
+        ],
+        "properties": {
+          "hard_deny": {
+            "type": "boolean",
+            "description": "Whether this signal alone justifies a block (a hard deny). Defaults to false."
+          },
+          "level": {
+            "type": "string",
+            "description": "The signal's contribution level (`low` / `med` / `high`)."
+          },
+          "name": {
+            "type": "string",
+            "description": "The signal name (mapped to the engine's bounded vocabulary; an unknown name folds to\n`external_signal`)."
+          }
+        }
+      },
+      "RiskSignalResponse": {
+        "type": "object",
+        "description": "A contributing risk signal projection (issue #91): the name and level only (redacted).",
+        "required": [
+          "name",
+          "level"
+        ],
+        "properties": {
+          "level": {
+            "type": "string",
+            "description": "The signal's contribution level."
+          },
+          "name": {
+            "type": "string",
+            "description": "The signal name."
+          }
+        }
+      },
       "SessionList": {
         "type": "object",
         "description": "A page of sessions.",
@@ -10953,6 +11544,41 @@
           "rejected",
           "extended"
         ]
+      },
+      "StepUpDecisionResponse": {
+        "type": "object",
+        "description": "The step up requirement evaluation projection (issue #91), from the REAL evaluator.",
+        "required": [
+          "outcome",
+          "acr_unmet",
+          "age_lapsed",
+          "achieved_acr"
+        ],
+        "properties": {
+          "achieved_acr": {
+            "type": "string",
+            "description": "The achieved acr the evaluation compared."
+          },
+          "acr_unmet": {
+            "type": "boolean",
+            "description": "Whether the achieved acr did not satisfy the floor."
+          },
+          "age_lapsed": {
+            "type": "boolean",
+            "description": "Whether the authentication age window lapsed."
+          },
+          "outcome": {
+            "type": "string",
+            "description": "The bounded outcome (`satisfied` or `step_up_required`)."
+          },
+          "required_acr": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The required acr floor, or absent."
+          }
+        }
       },
       "SudoElevationView": {
         "type": "object",

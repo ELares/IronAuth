@@ -944,16 +944,43 @@ pub(crate) async fn evaluate(
         append_external_signal_outcomes(state, scope, subject, &mut outcomes).await;
     }
 
+    let threshold = RiskLevel::parse_threshold(&cfg.require_mfa_at);
+    decide_from_signals(
+        outcomes,
+        new_device_fired,
+        threshold,
+        cfg.block_on_high,
+        cfg.notify_on_new_device,
+    )
+}
+
+/// The PURE risk decision core (issue #79, factored out for issue #91): combine the
+/// evaluated `outcomes` into a level and dispatch to an action, with NO store read and NO
+/// store write. This is the ONE compute seam BOTH the live [`evaluate`] path and the read
+/// only flow inspector dry run ([`crate::flow::inspect`]) route through, so a dry run over
+/// the SAME signals yields the SAME [`RiskDecision`] the live path would (the M9 fidelity
+/// guarantee) while writing nothing: the compute is separated from the persist (the
+/// `record_*`/`mint_*` writers), so a dry run calls the compute and skips every writer.
+// The boolean parameters model the deployment risk posture (the two policy switches plus
+// the new device flag); grouping them into a struct would only obscure this pure function.
+#[allow(clippy::fn_params_excessive_bools)]
+#[must_use]
+pub fn decide_from_signals(
+    outcomes: Vec<SignalOutcome>,
+    new_device_fired: bool,
+    threshold: Option<RiskLevel>,
+    block_on_high: bool,
+    notify_on_new_device: bool,
+) -> RiskDecision {
     let level = combine(&outcomes);
     let hard_deny = outcomes.iter().any(|outcome| outcome.hard_deny);
-    let threshold = RiskLevel::parse_threshold(&cfg.require_mfa_at);
     let action = dispatch(
         level,
         hard_deny,
         new_device_fired,
         threshold,
-        cfg.block_on_high,
-        cfg.notify_on_new_device,
+        block_on_high,
+        notify_on_new_device,
     );
     RiskDecision {
         level,
