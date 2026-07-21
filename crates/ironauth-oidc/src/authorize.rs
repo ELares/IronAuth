@@ -1914,7 +1914,10 @@ fn strip_sensitive_scopes(effective_scope: Option<&str>, cfg: &QuarantineConfig)
 /// principle (a per-environment switch with a safe default); the escapes -- verify the client
 /// (which lifts `quarantined`) or mark it `first_party` -- both already exist. The SENSITIVE
 /// set is REUSED from the quarantine denylist (`quarantine_config`), a single source of truth.
-fn unverified_sensitive_scope_blocked(
+///
+/// Shared by the redirect consent gate (`resolve_consent_gate`) and the device-authorization
+/// endpoint (`device::device_authorization`), so both consent surfaces enforce the same block.
+pub(crate) fn unverified_sensitive_scope_blocked(
     state: &OidcState,
     client: &ClientRecord,
     effective_scope: Option<&str>,

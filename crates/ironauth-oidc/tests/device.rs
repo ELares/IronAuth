@@ -1166,3 +1166,56 @@ async fn device_sign_in_emits_no_set_login_when_fedcm_is_off() {
         "with FedCM off a device-flow post-sign-in emits no Set-Login header"
     );
 }
+
+#[tokio::test]
+async fn device_authorization_blocks_an_unverified_client_requesting_a_sensitive_scope() {
+    // The consent-lockdown gate (issue #88) guards the device consent surface too: an
+    // unverified (quarantined), non-first-party client requesting a sensitive scope is refused
+    // before any device code is issued, so human approval on the verification page can never
+    // grant it. The escapes (first_party, or verifying the client) both let it through.
+    let harness = Harness::start().await;
+    let client = *harness.client_id();
+    harness
+        .enable_device_grant(&client, DEVICE_GRANTS, Some(TEST_LOGO))
+        .await;
+    let client_str = client.to_string();
+
+    harness.set_client_quarantined(&client, true).await;
+    let (status, _headers, body) = harness
+        .post_form(
+            "/device_authorization",
+            &form(&[
+                ("client_id", client_str.as_str()),
+                ("scope", "openid offline_access"),
+            ]),
+            None,
+        )
+        .await;
+    let blocked = json(&body);
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "unverified sensitive: {blocked}"
+    );
+    assert_eq!(blocked["error"], "access_denied");
+    assert!(
+        blocked.get("device_code").is_none(),
+        "no device code is issued for a blocked request"
+    );
+
+    // A non-sensitive request from the same unverified client still proceeds (the block is
+    // scope-specific, not a blanket refusal).
+    let proceeds = start_flow(&harness, &client_str, Some("openid profile")).await;
+    assert!(proceeds["device_code"].is_string());
+
+    // The first-party carve-out lets an unverified first-party client obtain the sensitive scope.
+    harness.set_client_first_party(&client, true).await;
+    let carved = start_flow(&harness, &client_str, Some("openid offline_access")).await;
+    assert!(carved["device_code"].is_string());
+
+    // Verifying the client (lifting quarantine) is the other escape.
+    harness.set_client_first_party(&client, false).await;
+    harness.set_client_quarantined(&client, false).await;
+    let verified = start_flow(&harness, &client_str, Some("openid offline_access")).await;
+    assert!(verified["device_code"].is_string());
+}

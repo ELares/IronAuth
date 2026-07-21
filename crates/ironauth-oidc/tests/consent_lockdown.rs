@@ -104,7 +104,9 @@ async fn unverified_third_party_sensitive_scope_is_blocked() {
     let harness = Harness::start_store_backed().await;
     let client_id = harness.client_id().to_string();
     // An unverified (quarantined), third-party (not first_party) client.
-    harness.set_client_quarantined(harness.client_id(), true).await;
+    harness
+        .set_client_quarantined(harness.client_id(), true)
+        .await;
 
     let subject = harness.seed_unique_user().await;
     let cookie = harness.session_cookie(&subject).await;
@@ -119,7 +121,9 @@ async fn unverified_third_party_sensitive_scope_is_blocked() {
 async fn unverified_third_party_non_sensitive_scope_is_not_blocked() {
     let harness = Harness::start_store_backed().await;
     let client_id = harness.client_id().to_string();
-    harness.set_client_quarantined(harness.client_id(), true).await;
+    harness
+        .set_client_quarantined(harness.client_id(), true)
+        .await;
 
     let subject = harness.seed_unique_user().await;
     let cookie = harness.session_cookie(&subject).await;
@@ -138,8 +142,12 @@ async fn unverified_first_party_sensitive_scope_is_not_blocked() {
     let client_id = harness.client_id().to_string();
     // Quarantined but explicitly classified FIRST-PARTY: the carve-out exempts it from the
     // gate even for a sensitive scope.
-    harness.set_client_quarantined(harness.client_id(), true).await;
-    harness.set_client_first_party(harness.client_id(), true).await;
+    harness
+        .set_client_quarantined(harness.client_id(), true)
+        .await;
+    harness
+        .set_client_first_party(harness.client_id(), true)
+        .await;
 
     let subject = harness.seed_unique_user().await;
     let cookie = harness.session_cookie(&subject).await;
@@ -151,12 +159,60 @@ async fn unverified_first_party_sensitive_scope_is_not_blocked() {
 }
 
 #[tokio::test]
+async fn the_block_fires_before_the_skip_consent_carve_out() {
+    // A quarantined, non-first-party client with skip_consent set must still be blocked for a
+    // sensitive scope: the lockdown gate sits ahead of the skip_consent carve-out, so a
+    // consent-skipping unverified client cannot silently obtain the sensitive scope.
+    let harness = Harness::start_store_backed().await;
+    let client_id = harness.client_id().to_string();
+    harness
+        .set_client_quarantined(harness.client_id(), true)
+        .await;
+    harness
+        .configure_client_policy(harness.client_id(), "explicit", true, false, None)
+        .await;
+
+    let subject = harness.seed_unique_user().await;
+    let cookie = harness.session_cookie(&subject).await;
+    let (status, headers, body) = harness
+        .authorize_with_cookie(&authorize_query(&client_id, SENSITIVE_SCOPE), &cookie)
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
+    assert_blocked(&headers);
+}
+
+#[tokio::test]
+async fn the_block_fires_before_the_implicit_consent_mode_carve_out() {
+    // Same ordering property for consent_mode=implicit (the auto-grant first-party UX): an
+    // unverified, non-first-party client cannot use implicit consent to skip the lockdown for a
+    // sensitive scope.
+    let harness = Harness::start_store_backed().await;
+    let client_id = harness.client_id().to_string();
+    harness
+        .set_client_quarantined(harness.client_id(), true)
+        .await;
+    harness
+        .configure_client_policy(harness.client_id(), "implicit", false, false, None)
+        .await;
+
+    let subject = harness.seed_unique_user().await;
+    let cookie = harness.session_cookie(&subject).await;
+    let (status, headers, body) = harness
+        .authorize_with_cookie(&authorize_query(&client_id, SENSITIVE_SCOPE), &cookie)
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
+    assert_blocked(&headers);
+}
+
+#[tokio::test]
 async fn verified_third_party_sensitive_scope_is_not_blocked() {
     let harness = Harness::start_store_backed().await;
     let client_id = harness.client_id().to_string();
     // A VERIFIED (non-quarantined) client is the escape: the gate keys off `quarantined`, so a
     // verified client requesting a sensitive scope proceeds normally.
-    harness.set_client_quarantined(harness.client_id(), false).await;
+    harness
+        .set_client_quarantined(harness.client_id(), false)
+        .await;
 
     let subject = harness.seed_unique_user().await;
     let cookie = harness.session_cookie(&subject).await;
@@ -173,7 +229,9 @@ async fn gate_off_restores_the_prior_proceed_behavior() {
     // scope is NOT blocked and proceeds to consent exactly as before the lockdown existed.
     let harness = Harness::start_store_backed_with(gate_off_config()).await;
     let client_id = harness.client_id().to_string();
-    harness.set_client_quarantined(harness.client_id(), true).await;
+    harness
+        .set_client_quarantined(harness.client_id(), true)
+        .await;
 
     let subject = harness.seed_unique_user().await;
     let cookie = harness.session_cookie(&subject).await;
@@ -194,17 +252,24 @@ async fn the_block_fires_before_the_recorded_consent_fast_path() {
     // 1. While the client is VERIFIED, the user grants consent covering the sensitive scope, so
     //    a covering recorded consent exists (the fast path would auto-authorize a later
     //    request).
-    harness.set_client_quarantined(harness.client_id(), false).await;
-    let code =
-        authorize_through_consent(&harness, &cookie, &authorize_query(&client_id, SENSITIVE_SCOPE))
-            .await;
+    harness
+        .set_client_quarantined(harness.client_id(), false)
+        .await;
+    let code = authorize_through_consent(
+        &harness,
+        &cookie,
+        &authorize_query(&client_id, SENSITIVE_SCOPE),
+    )
+    .await;
     assert!(!code.is_empty(), "a code is issued for the verified client");
 
     // 2. The client is now quarantined. Despite the prior covering grant, the lockdown BLOCKS a
     //    fresh authorization for the sensitive scope: the gate fires ahead of the
     //    recorded-consent fast path, so the recorded consent can never let a now-quarantined
     //    client through.
-    harness.set_client_quarantined(harness.client_id(), true).await;
+    harness
+        .set_client_quarantined(harness.client_id(), true)
+        .await;
     let (status, headers, body) = harness
         .authorize_with_cookie(&authorize_query(&client_id, SENSITIVE_SCOPE), &cookie)
         .await;
