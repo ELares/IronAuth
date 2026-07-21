@@ -7,6 +7,7 @@
 // shows is fetched by the one typed client in the resource views that land in the
 // later PRs. Overview, Tenants, and Environments read the console-wide and
 // tenant lists; Clients, Users, and Connectors read the active environment scope.
+// Diagnostics is the entry point PR7 wires; its content lands under issue #91.
 
 export interface Section {
   readonly href: string;
@@ -20,4 +21,5 @@ export const SECTIONS: ReadonlyArray<Section> = [
   { href: "/clients", label: "Clients" },
   { href: "/users", label: "Users" },
   { href: "/connectors", label: "Connectors" },
+  { href: "/diagnostics", label: "Diagnostics" },
 ];

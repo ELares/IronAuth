@@ -28,6 +28,7 @@ import { EnvironmentDetail, EnvironmentsList } from "./ui/EnvironmentsView";
 import { UserDetail, UsersList } from "./ui/UsersView";
 import { ConnectorDetail, ConnectorsList } from "./ui/ConnectorsView";
 import { ClientsList } from "./ui/ClientsView";
+import { DiagnosticsView } from "./ui/DiagnosticsView";
 
 // UI state lives in signals (the locked state primitive). `signedIn` flips true
 // once a token is held; `authError` surfaces a failed login verbatim.
@@ -112,6 +113,7 @@ function Routes() {
       <Route path="/users/:userId" component={UserDetail} />
       <Route path="/connectors" component={ConnectorsList} />
       <Route path="/connectors/:connectorId" component={ConnectorDetail} />
+      <Route path="/diagnostics" component={DiagnosticsView} />
       <Route default component={() => <SectionView label="Overview" />} />
     </Router>
   );

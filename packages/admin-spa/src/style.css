@@ -209,6 +209,19 @@ body {
   color: var(--muted);
 }
 
+/* The in flight search status and the verbatim error a failed list surfaces,
+ * both inside the palette dialog so a failed search is never a silent empty. */
+.cmdk-searching {
+  padding: 0.4rem 0.9rem;
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.cmdk-error {
+  padding: 0.5rem 0.6rem;
+}
+
 /* The verbatim management ErrorBody boundary. Every value is rendered as text. */
 .errorbody {
   border: 1px solid var(--line);
