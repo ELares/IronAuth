@@ -1588,6 +1588,45 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
         "the data-plane role must NOT hold INSERT on signup_forms (the control plane owns writes)"
     );
 
+    // Revocable consent and first-party classification (issue #88, migration 0076): the
+    // additive columns exist with the right types and the column-grant split holds.
+    assert!(
+        column_exists(pool, "consents", "revoked_at").await,
+        "consents.revoked_at exists after 0076"
+    );
+    assert!(
+        column_exists(pool, "clients", "first_party").await,
+        "clients.first_party exists after 0076"
+    );
+    assert_eq!(
+        column_data_type(pool, "clients", "first_party").await,
+        "boolean",
+        "clients.first_party is a boolean"
+    );
+    // consents.revoked_at is a self-service kill switch: the data-plane role flips exactly this
+    // column (through its existing table SELECT), and holds no wider write. A revoked grant is
+    // read as absent, so the app must be able to set revoked_at but nothing else new.
+    assert!(
+        role_has_column_privilege(pool, "ironauth_app", "consents", "revoked_at", "UPDATE").await,
+        "the data-plane role must hold column-scoped UPDATE on consents.revoked_at (self-service revoke)"
+    );
+    assert!(
+        !role_has_column_privilege(pool, "ironauth_app", "consents", "subject", "UPDATE").await,
+        "the data-plane role must NOT hold UPDATE on consents.subject (no widening past revoked_at)"
+    );
+    // clients.first_party is the lockdown carve-out flag: control-plane write-only, exactly like
+    // quarantined and verified_at, so a compromised data plane can never self-classify a client as
+    // first-party to defeat the PR3 lockdown gate.
+    assert!(
+        role_has_column_privilege(pool, "ironauth_control", "clients", "first_party", "UPDATE")
+            .await,
+        "the control role must hold column-scoped UPDATE on clients.first_party"
+    );
+    assert!(
+        !role_has_column_privilege(pool, "ironauth_app", "clients", "first_party", "UPDATE").await,
+        "the data-plane role must NOT hold UPDATE on clients.first_party (no self-classification)"
+    );
+
     // The demo object never reaches a production database.
     assert!(
         !table_exists(pool, "migration_demo").await,

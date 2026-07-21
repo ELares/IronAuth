@@ -7,11 +7,13 @@
 --
 --   1. consents.revoked_at: a nullable revocation instant. A non-null value means
 --      the recorded grant is revoked, so the authorization gate treats it as absent
---      and re-prompts. Self-service revocation (the data plane) and admin revocation
---      (the control plane) both flip exactly this column, so each role gains a
---      column-scoped UPDATE on it (never a table-wide UPDATE). The revocation
+--      and re-prompts. Self-service revocation (the data plane, which already holds
+--      table SELECT on consents) flips exactly this column, so the data-plane role
+--      gains a column-scoped UPDATE on it (never a table-wide UPDATE). The revocation
 --      SURFACES ship later (PR5); this migration only stores the column and grants
---      the writes.
+--      the data-plane write. Admin (control-plane) revocation lands in PR5 together
+--      with the SELECT the control plane needs to target a row, so its grants are
+--      deliberately deferred rather than shipped dead here.
 --   2. clients.first_party: an explicit first-party classification an admin sets on
 --      provisioning. The lockdown gate keys off it (PR3): a first-party client is
 --      carved out of the third-party admin-consent requirement. Control-plane
@@ -36,14 +38,17 @@ ALTER TABLE consents ADD COLUMN revoked_at timestamptz;
 -- The data-plane role already holds table-level SELECT and INSERT (0006) plus
 -- column-level UPDATE on granted_scope (0010) and expires_at (0016). Self-service
 -- revocation (PR5) flips revoked_at, so the role needs UPDATE on that column too.
--- Least privilege is preserved: still no table-wide UPDATE, only these enumerated
--- columns.
+-- The guarded revoke UPDATE reads the row (WHERE (subject, client) plus RETURNING
+-- id) under the data-plane's existing table SELECT. Least privilege is preserved:
+-- still no table-wide UPDATE, only these enumerated columns.
 GRANT UPDATE (revoked_at) ON consents TO ironauth_app;
 
--- The control plane performs admin revocation (PR5), which flips the SAME
--- revoked_at column. Grant it the column-scoped UPDATE here; the admin surface
--- that calls it lands in PR5.
-GRANT UPDATE (revoked_at) ON consents TO ironauth_control;
+-- Admin (control-plane) revocation is intentionally NOT granted here. The control
+-- plane holds no SELECT on consents, so a column-scoped UPDATE alone would be a
+-- dead grant (the revoke reads the row to target it). PR5, which adds the admin
+-- revocation surface, grants the control plane the SELECT it needs and the
+-- UPDATE (revoked_at) together, so the grant is coherent and testable when it
+-- first has a caller.
 
 -- ---------------------------------------------------------------------------
 -- 2. First-party client classification (issue #88).
