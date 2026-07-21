@@ -1644,11 +1644,13 @@ async fn drive_consent(
     if persisted.step != FlowStateTag::ConsentPrompt {
         return Err(FlowError::NotFound);
     }
+    // Decide the transition WITHOUT writing the grant, so a validation failure (a lapsed session,
+    // a bad decision) leaves the flow un-consumed and retryable.
     let step = consent::advance_consent(state, scope, record, submission, headers).await?;
-    // The decision is terminal: consume the single-use flow so a replayed submit is a uniform
-    // `AlreadyCompleted`, never a second grant or a second denial. The grant (on an allow) was
-    // already recorded through the audited store write; a lost consume race is a concurrent
-    // completion.
+    // The decision is terminal: consume the single-use flow FIRST so a replayed or concurrent
+    // submit is a uniform `AlreadyCompleted`, never a second grant or a second denial. Only the
+    // consume winner records the grant, so a lost consume race persists nothing. If the grant
+    // write then faults, the flow is already spent and the subject restarts (fail closed).
     let consumed = state
         .store()
         .scoped(scope)
@@ -1660,7 +1662,10 @@ async fn drive_consent(
         return Err(FlowError::AlreadyCompleted);
     }
     let (allow, redirect_to) = match step {
-        consent::ConsentStep::Allow { redirect_to } => (true, redirect_to),
+        consent::ConsentStep::Allow { redirect_to, grant } => {
+            consent::commit_grant(state, scope, grant).await?;
+            (true, redirect_to)
+        }
         consent::ConsentStep::Deny { redirect_to } => (false, redirect_to),
     };
     Ok(Continuation::ConsentDecision { allow, redirect_to })

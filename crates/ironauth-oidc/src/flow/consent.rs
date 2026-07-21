@@ -33,7 +33,7 @@
 
 use serde_json::Value;
 
-use ironauth_store::{CorrelationId, FlowRecord, Scope};
+use ironauth_store::{ActorRef, CorrelationId, FlowRecord, Scope};
 
 use super::message::{self, Message, MessageContext};
 use super::model::{InputType, Node, NodeAttributes, NodeGroup, Transport};
@@ -59,11 +59,15 @@ pub(super) struct ConsentClient {
 /// consumes the single-use flow and redirects the browser (or hands the native client the
 /// redirect affordance).
 pub(super) enum ConsentStep {
-    /// The subject allowed the request: the grant is recorded; resume `redirect_to` (the
-    /// `/authorize` resume) so the code is issued.
+    /// The subject allowed the request: `grant` carries the resolved grant to record ONLY after
+    /// the single-use flow is consumed, then resume `redirect_to` (the `/authorize` resume) so the
+    /// code is issued. The grant is deliberately NOT written here so a lost consume race cannot
+    /// leave a persisted grant behind a denied or replayed submit.
     Allow {
         /// The `/authorize` resume URL to redirect to.
         redirect_to: String,
+        /// The resolved, server authoritative grant to commit after the flow is consumed.
+        grant: PendingGrant,
     },
     /// The subject denied the request: no grant recorded; `redirect_to` routes back through
     /// `/authorize` with the internal deny marker so `access_denied` is returned to the client.
@@ -71,6 +75,23 @@ pub(super) enum ConsentStep {
         /// The `/authorize` deny URL to redirect to.
         redirect_to: String,
     },
+}
+
+/// A consent grant resolved from the persisted authorize context and the authenticated session,
+/// held so the driver can record it AFTER consuming the single-use flow (issue #88). Every field
+/// is server authoritative: the subject is the session cookie's, the client and scope come from
+/// the flow's validated `return_to`, never the submission.
+pub(super) struct PendingGrant {
+    /// The audit actor for the grant write (the authenticated subject).
+    actor: ActorRef,
+    /// The authenticated subject the grant is recorded for.
+    subject: String,
+    /// The authorize client the grant covers.
+    client_id: String,
+    /// The requested scope the grant covers (space delimited), or `None`.
+    oauth_scope: Option<String>,
+    /// The remembered-consent expiry (a `remembered`-mode client), or `None` for no expiry.
+    expires_at: Option<i64>,
 }
 
 /// The consent node set (issue #88): the client-identity nodes (name, optional logo, and the
@@ -258,15 +279,16 @@ fn requested_scopes(oauth_scope: Option<&str>) -> Vec<String> {
         .collect()
 }
 
-/// Advance the consent prompt one transition (issue #88): re-derive the client and scopes from
-/// the PERSISTED authorize context (never the submission), read the decision from the dedicated
-/// `decision` action node, and either record the grant and resume, or record nothing and route
-/// to `access_denied`.
+/// Decide the consent prompt transition (issue #88): re-derive the client and scopes from the
+/// PERSISTED authorize context (never the submission), read the decision from the dedicated
+/// `decision` action node, and RESOLVE (but do NOT write) the grant on an allow. The driver
+/// records the resolved grant only after consuming the single-use flow, so a lost consume race
+/// cannot leave a persisted grant. This function performs no persistence.
 ///
 /// # Errors
 ///
 /// [`FlowError::NotFound`] when the flow's resume context is missing, cross-scope, or (on an
-/// allow) the session no longer resolves; [`FlowError::Store`] on a genuine persistence fault.
+/// allow) the session no longer resolves.
 pub(super) async fn advance_consent(
     state: &OidcState,
     scope: Scope,
@@ -295,34 +317,57 @@ pub(super) async fn advance_consent(
             redirect_to: deny_redirect(return_to),
         });
     }
-    // Allow: record the grant for the AUTHENTICATED subject (from the session cookie), never a
-    // submitted value. A lapsed session fails closed (the flow is not consumed by this branch,
-    // so the driver returns a uniform not found rather than granting for an unknown subject).
+    // Allow: resolve the grant for the AUTHENTICATED subject (from the session cookie), never a
+    // submitted value. A lapsed session fails closed (the flow is not consumed by this branch, so
+    // the driver returns a uniform not found rather than granting for an unknown subject). The
+    // grant is committed by the driver AFTER the consume, not written here.
     let session = interaction::resolve_session(state, scope, headers)
         .await
         .ok_or(FlowError::NotFound)?;
     let actor = interaction::subject_actor(state, scope, &session.subject);
-    let client_id = resume.client_id.to_string();
     // Reuse the bootstrap page's remembered-consent TTL verbatim: a `remembered`-mode client's
     // consent lapses after the configured TTL; an `explicit`/`implicit` one never expires.
     let expires_at = crate::consent::remembered_expiry(state, scope, &resume.client_id).await;
+    Ok(ConsentStep::Allow {
+        redirect_to: return_to.to_owned(),
+        grant: PendingGrant {
+            actor,
+            subject: session.subject,
+            client_id: resume.client_id.to_string(),
+            oauth_scope: resume.oauth_scope.clone(),
+            expires_at,
+        },
+    })
+}
+
+/// Record a resolved consent grant (issue #88), called by the driver ONLY after the single-use
+/// flow is consumed so a lost consume race never persists a grant. The write is the same audited
+/// `grant_with_expiry` the bootstrap page uses (same TTL, same audit).
+///
+/// # Errors
+///
+/// [`FlowError::Store`] on a genuine persistence fault. Because the flow is already consumed when
+/// this runs, a fault fails closed: no grant is recorded and the subject restarts the flow.
+pub(super) async fn commit_grant(
+    state: &OidcState,
+    scope: Scope,
+    grant: PendingGrant,
+) -> Result<(), FlowError> {
     state
         .store()
         .scoped(scope)
-        .acting(actor, CorrelationId::generate(state.env()))
+        .acting(grant.actor, CorrelationId::generate(state.env()))
         .consents()
         .grant_with_expiry(
             state.env(),
-            &session.subject,
-            &client_id,
-            resume.oauth_scope.as_deref(),
-            expires_at,
+            &grant.subject,
+            &grant.client_id,
+            grant.oauth_scope.as_deref(),
+            grant.expires_at,
         )
         .await
         .map_err(|_| FlowError::Store)?;
-    Ok(ConsentStep::Allow {
-        redirect_to: return_to.to_owned(),
-    })
+    Ok(())
 }
 
 /// The deny redirect target (issue #88): the `/authorize` resume URL carrying the internal
