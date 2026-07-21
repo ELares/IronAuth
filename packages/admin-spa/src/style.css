@@ -505,3 +505,56 @@ body {
 .resource-status-waitlisted {
   color: #8a6d1f;
 }
+
+/* Connector health states (issue #90, PR 6). */
+.resource-status-healthy {
+  color: #1f6b3a;
+}
+
+.resource-status-config_error,
+.resource-status-unavailable {
+  color: #a3341f;
+}
+
+.resource-status-unknown {
+  color: var(--muted);
+}
+
+/* A short explanatory note above a resource surface (the DCR section). */
+.resource-note {
+  font-size: 0.85rem;
+  color: var(--muted);
+  max-width: 40rem;
+  margin: 0.5rem 0 1rem;
+}
+
+/* A freshly minted initial access token (issue #90, PR 6): the copy-once
+   credential block. The value is memory only, shown once, never persisted. */
+.resource-token {
+  margin: 1rem 0;
+  padding: 1rem;
+  border: 1px solid var(--accent);
+  border-radius: 0.5rem;
+  background: #fbfbfe;
+}
+
+.resource-token-secret {
+  margin-top: 0.5rem;
+}
+
+.resource-token-warning {
+  font-size: 0.85rem;
+  color: #8a6d1f;
+  margin: 0.3rem 0;
+}
+
+.resource-token-value {
+  display: block;
+  overflow-x: auto;
+  padding: 0.5rem;
+  border: 1px solid var(--line);
+  border-radius: 0.3rem;
+  background: #fff;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  word-break: break-all;
+}

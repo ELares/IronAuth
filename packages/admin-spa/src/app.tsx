@@ -26,6 +26,8 @@ import { ErrorView } from "./ui/ErrorView";
 import { TenantDetail, TenantsList } from "./ui/TenantsView";
 import { EnvironmentDetail, EnvironmentsList } from "./ui/EnvironmentsView";
 import { UserDetail, UsersList } from "./ui/UsersView";
+import { ConnectorDetail, ConnectorsList } from "./ui/ConnectorsView";
+import { ClientsList } from "./ui/ClientsView";
 
 // UI state lives in signals (the locked state primitive). `signedIn` flips true
 // once a token is held; `authError` surfaces a failed login verbatim.
@@ -78,10 +80,10 @@ function SignIn() {
   );
 }
 
-// A placeholder resource view for the sections not yet wired (Clients and
-// Connectors land in PR6). Tenants, Environments, and Users now render their real
-// CRUD surfaces below. The active scope is already resolved in the store, so each
-// remaining PR only swaps its body.
+// A placeholder resource view for the sections not yet wired. Every resource
+// section (Tenants, Environments, Users, Connectors, Clients) now renders its real
+// CRUD surface below; this remains for the Overview landing only. The active scope
+// is already resolved in the store.
 function SectionView({ label }: { label: string }) {
   return (
     <section class="placeholder">
@@ -105,13 +107,11 @@ function Routes() {
         path="/environments/:environmentId"
         component={EnvironmentDetail}
       />
-      <Route path="/clients" component={() => <SectionView label="Clients" />} />
+      <Route path="/clients" component={ClientsList} />
       <Route path="/users" component={UsersList} />
       <Route path="/users/:userId" component={UserDetail} />
-      <Route
-        path="/connectors"
-        component={() => <SectionView label="Connectors" />}
-      />
+      <Route path="/connectors" component={ConnectorsList} />
+      <Route path="/connectors/:connectorId" component={ConnectorDetail} />
       <Route default component={() => <SectionView label="Overview" />} />
     </Router>
   );

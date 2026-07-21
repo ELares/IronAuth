@@ -69,6 +69,41 @@ export type LinkExternalIdRequest =
 export type UserExternalIdView =
   components["schemas"]["UserExternalIdView"];
 
+// The request and result shapes the connectors and clients (DCR) surfaces read
+// (issue #90, PR 6). Both surfaces are ENVIRONMENT scoped, so every wrapper below
+// injects the active {tenant, environment} into the documented path, exactly as
+// the users wrappers do. Re-exported from the generated schema so the views never
+// hand maintain a shape the management contract already owns.
+//
+// Connectors are a real CRUD resource WITH a full-replace PUT update:
+// ConnectorView / ConnectorList for the reads, CreateConnectorRequest for BOTH
+// the create and the PUT replace (the contract reuses one request body), and the
+// ConnectorCapabilitiesView / ConnectorHealthView diagnostics reads.
+export type ConnectorView = components["schemas"]["ConnectorView"];
+export type CreateConnectorRequest =
+  components["schemas"]["CreateConnectorRequest"];
+export type ConnectorCapabilitiesView =
+  components["schemas"]["ConnectorCapabilitiesView"];
+export type ConnectorHealthView =
+  components["schemas"]["ConnectorHealthView"];
+
+// Clients are DCR (dynamic client registration) ONLY, never generic client CRUD:
+// ClientVerificationView for the get + verify of a registered client,
+// DcrPolicyView / CreateDcrPolicyRequest for the reusable registration policies,
+// and CreateInitialAccessTokenRequest / InitialAccessTokenCreated for the
+// copy-once initial access token. InitialAccessTokenCreated.token is the
+// plaintext bearer returned ONCE on the genuine create (HTTP 201) and never
+// stored; the UI surfaces it once and never persists or logs it.
+export type ClientVerificationView =
+  components["schemas"]["ClientVerificationView"];
+export type DcrPolicyView = components["schemas"]["DcrPolicyView"];
+export type CreateDcrPolicyRequest =
+  components["schemas"]["CreateDcrPolicyRequest"];
+export type CreateInitialAccessTokenRequest =
+  components["schemas"]["CreateInitialAccessTokenRequest"];
+export type InitialAccessTokenCreated =
+  components["schemas"]["InitialAccessTokenCreated"];
+
 export type ManagementClient = ReturnType<typeof createClient<paths>>;
 
 // A management call that failed carries the verbatim ErrorBody the server
@@ -464,6 +499,343 @@ export async function deleteEnvironment(
   if (error !== undefined || !response.ok) {
     throw new ManagementError(toErrorBody(error), response.status);
   }
+}
+
+// ---- The connectors CRUD operations (issue #90, PR 6) -----------------------
+//
+// The connectors resource view (src/ui/ConnectorsView.tsx) calls these named
+// wrappers, never a path, so the single funnel holds: every literal below is a
+// path the committed docs/openapi/management.json documents, connectors live
+// UNDER the active {tenant, environment} scope, and the ids substitute into the
+// documented path parameters exactly as the users wrappers inject them. Each
+// throws a ManagementError carrying the verbatim ErrorBody on a non 2xx (the same
+// bodyless-non-2xx guard as the reads above), which the ErrorView boundary
+// renders unchanged. Unlike tenants and environments, a connector HAS a real
+// update: updateConnector is a full-replace PUT whose body is the same
+// CreateConnectorRequest the create takes (the contract reuses it), plus the
+// capabilities and health reads for diagnostics.
+
+// List the connectors of one environment (operationId listConnectors). Scope
+// injection: the active tenant and environment ids substitute into the documented
+// path, targeting `/v1/tenants/<t>/environments/<e>/connectors`.
+export async function fetchConnectors(
+  tenantId: string,
+  environmentId: string,
+): Promise<ConnectorView[]> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.GET(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/connectors",
+    { params: { path: { tenant_id: tenantId, environment_id: environmentId } } },
+  );
+  // A non 2xx is a failure even when openapi-fetch yields no error body (it
+  // returns `error: undefined` for a bodyless response, for example a 401 or 502
+  // with Content-Length 0 from a proxy or gateway). Checking `response.ok` too
+  // means such a response is never silently read as success (an empty list).
+  if (error !== undefined || !response.ok) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data?.items ?? [];
+}
+
+// Read one connector (operationId getConnector). The detail view reads this.
+export async function getConnector(
+  tenantId: string,
+  environmentId: string,
+  connectorId: string,
+): Promise<ConnectorView> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.GET(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/connectors/{connector_id}",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          connector_id: connectorId,
+        },
+      },
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+// Create a connector under an environment (operationId createConnector).
+// Idempotency-Key guarded (same pattern the user create uses) so a retried submit
+// records the connector once. The request body is the declarative connector
+// definition; the returned ConnectorView is SECRET-FREE (no client_secret).
+export async function createConnector(
+  tenantId: string,
+  environmentId: string,
+  request: CreateConnectorRequest,
+): Promise<ConnectorView> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.POST(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/connectors",
+    {
+      params: {
+        path: { tenant_id: tenantId, environment_id: environmentId },
+        header: { "Idempotency-Key": idempotencyKey() },
+      },
+      body: request,
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+// Update a connector (operationId updateConnector): a full-replace PUT. The
+// contract reuses CreateConnectorRequest as the update body, so this REPLACES the
+// whole definition (not a merge), and an omitted field takes its documented
+// default (for example `enabled` defaults to true). A PUT replace is idempotent
+// by construction (the same body twice yields the same state), so no
+// Idempotency-Key is sent, mirroring the idempotent external-id PUT.
+export async function updateConnector(
+  tenantId: string,
+  environmentId: string,
+  connectorId: string,
+  request: CreateConnectorRequest,
+): Promise<ConnectorView> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.PUT(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/connectors/{connector_id}",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          connector_id: connectorId,
+        },
+      },
+      body: request,
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+// Delete a connector (operationId deleteConnector). A 204 carries no body, so the
+// guard reads the bodyless 2xx as success and any non 2xx as the verbatim failure.
+export async function deleteConnector(
+  tenantId: string,
+  environmentId: string,
+  connectorId: string,
+): Promise<void> {
+  const client = createManagementClient();
+  const { error, response } = await client.DELETE(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/connectors/{connector_id}",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          connector_id: connectorId,
+        },
+      },
+    },
+  );
+  if (error !== undefined || !response.ok) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+}
+
+// Read a connector's capability matrix (operationId getConnectorCapabilities):
+// the derived refresh / groups / logout_propagation / email_verified_trust view
+// the detail surface shows alongside the connector.
+export async function getConnectorCapabilities(
+  tenantId: string,
+  environmentId: string,
+  connectorId: string,
+): Promise<ConnectorCapabilitiesView> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.GET(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/connectors/{connector_id}/capabilities",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          connector_id: connectorId,
+        },
+      },
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+// Read a connector's live health (operationId getConnectorHealth): THIS node's
+// in-memory federation health for admin diagnostics. A connector never exercised
+// on this node reports `state = "unknown"` with no timestamps.
+export async function getConnectorHealth(
+  tenantId: string,
+  environmentId: string,
+  connectorId: string,
+): Promise<ConnectorHealthView> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.GET(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/connectors/{connector_id}/health",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          connector_id: connectorId,
+        },
+      },
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+// ---- The clients (DCR) operations (issue #90, PR 6) -------------------------
+//
+// The clients surface (src/ui/ClientsView.tsx) is DYNAMIC CLIENT REGISTRATION
+// (RFC 7591, issue #31), NOT generic client CRUD: the management contract has NO
+// listClients / createClient / updateClient / deleteClient, so none is invented.
+// The documented surface is: get + verify a registered client, list + create the
+// reusable DCR policies, and mint a copy-once initial access token. Every wrapper
+// calls a named function, never a path, so the single funnel holds; each literal
+// is a documented path and each throws a ManagementError carrying the verbatim
+// ErrorBody on a non 2xx (the same bodyless-non-2xx guard as above).
+
+// Read a registered DCR client's verification state (operationId getDcrClient):
+// its quarantine and verified flags. SECRET-FREE: no client secret is projected.
+export async function getDcrClient(
+  tenantId: string,
+  environmentId: string,
+  clientId: string,
+): Promise<ClientVerificationView> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.GET(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          client_id: clientId,
+        },
+      },
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+// Verify a registered DCR client (operationId verifyDcrClient): lift the
+// unverified-client quarantine the authorization / consent path honors. The
+// returned ClientVerificationView states the post-condition. Idempotency-Key
+// guarded (re-verifying an already-verified client stays a single recorded act).
+export async function verifyDcrClient(
+  tenantId: string,
+  environmentId: string,
+  clientId: string,
+): Promise<ClientVerificationView> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.POST(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/verify",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          client_id: clientId,
+        },
+        header: { "Idempotency-Key": idempotencyKey() },
+      },
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+// List an environment's DCR policies (operationId listDcrPolicies): the named,
+// reusable registration policies a minted token's chain references.
+export async function fetchDcrPolicies(
+  tenantId: string,
+  environmentId: string,
+): Promise<DcrPolicyView[]> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.GET(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/dcr/policies",
+    { params: { path: { tenant_id: tenantId, environment_id: environmentId } } },
+  );
+  // The same bodyless-non-2xx guard the other list reads use: a 401 with no body
+  // is a failure, never an empty policy list read as success.
+  if (error !== undefined || !response.ok) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data?.items ?? [];
+}
+
+// Create a named DCR policy (operationId createDcrPolicy). Idempotency-Key
+// guarded. The `primitives` are the ordered force / restrict / reject / default
+// objects the OIDC policy engine validates at create time.
+export async function createDcrPolicy(
+  tenantId: string,
+  environmentId: string,
+  request: CreateDcrPolicyRequest,
+): Promise<DcrPolicyView> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.POST(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/dcr/policies",
+    {
+      params: {
+        path: { tenant_id: tenantId, environment_id: environmentId },
+        header: { "Idempotency-Key": idempotencyKey() },
+      },
+      body: request,
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+// Mint a DCR initial access token (operationId createDcrInitialAccessToken, RFC
+// 7591). Idempotency-Key guarded. On the genuine first create the returned
+// InitialAccessTokenCreated.token carries the plaintext bearer ONCE (HTTP 201);
+// an idempotent replay omits it and sets token_already_issued (HTTP 200). This
+// wrapper RETURNS the body to the caller so the UI can surface the token value a
+// single time; it NEVER logs it and the UI NEVER persists it (memory-only,
+// copy-once), consistent with the token-safety posture.
+export async function createDcrInitialAccessToken(
+  tenantId: string,
+  environmentId: string,
+  request: CreateInitialAccessTokenRequest,
+): Promise<InitialAccessTokenCreated> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.POST(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/dcr/initial-access-tokens",
+    {
+      params: {
+        path: { tenant_id: tenantId, environment_id: environmentId },
+        header: { "Idempotency-Key": idempotencyKey() },
+      },
+      body: request,
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
 }
 
 // ---- The users CRUD operations (issue #90, PR 5) ----------------------------
