@@ -1180,9 +1180,17 @@ fn peek_assertion_times(assertion: &str) -> (Option<i64>, Option<i64>) {
     (exp, nbf)
 }
 
+/// The longest `alg`/`kid` the diagnostic keeps. These are attacker authored on a
+/// (pre grant reachable) failed attempt, so the recorded value is bounded to stop a
+/// hostile assertion from writing an oversized header field into the record, while
+/// staying well above any legitimate algorithm name or key id.
+const MAX_DIAGNOSTIC_HEADER_LEN: usize = 256;
+
 /// The `(alg, kid)` of a compact JWS assertion's (unverified) protected header,
 /// for the out-of-band diagnostic only (never for trust). Shared with the JWT
 /// bearer assertion grant (#26), which records the same header fields on a failure.
+/// Each value is length bounded (see [`MAX_DIAGNOSTIC_HEADER_LEN`]) since it is
+/// attacker authored.
 pub(crate) fn peek_assertion_header(assertion: &str) -> (Option<String>, Option<String>) {
     let Some(header_b64) = assertion.split('.').next() else {
         return (None, None);
@@ -1193,9 +1201,14 @@ pub(crate) fn peek_assertion_header(assertion: &str) -> (Option<String>, Option<
     let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
         return (None, None);
     };
-    let alg = value.get("alg").and_then(Value::as_str).map(str::to_owned);
-    let kid = value.get("kid").and_then(Value::as_str).map(str::to_owned);
-    (alg, kid)
+    let bounded = |field: &str| -> Option<String> {
+        value.get(field).and_then(Value::as_str).map(|raw| {
+            raw.chars()
+                .take(MAX_DIAGNOSTIC_HEADER_LEN)
+                .collect::<String>()
+        })
+    };
+    (bounded("alg"), bounded("kid"))
 }
 
 /// Trim an optional form value and drop it if empty.
@@ -1517,6 +1530,20 @@ mod tests {
         let (alg, kid) = peek_assertion_header(&assertion);
         assert_eq!(alg.as_deref(), Some("ES512"));
         assert_eq!(kid.as_deref(), Some("k9"));
+    }
+
+    #[test]
+    fn peek_header_bounds_an_oversized_attacker_kid() {
+        // A hostile assertion cannot amplify the diagnostic record with a giant header
+        // field: the recorded kid/alg are length bounded (they are attacker authored on a
+        // pre grant reachable failed attempt).
+        let big_kid = "K".repeat(MAX_DIAGNOSTIC_HEADER_LEN * 4);
+        let header =
+            URL_SAFE_NO_PAD.encode(format!(r#"{{"alg":"RS256","kid":"{big_kid}"}}"#).as_bytes());
+        let assertion = format!("{header}.cGF5.c2ln");
+        let (alg, kid) = peek_assertion_header(&assertion);
+        assert_eq!(alg.as_deref(), Some("RS256"));
+        assert_eq!(kid.map(|k| k.len()), Some(MAX_DIAGNOSTIC_HEADER_LEN));
     }
 
     #[test]

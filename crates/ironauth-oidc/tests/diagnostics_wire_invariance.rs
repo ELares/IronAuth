@@ -15,11 +15,12 @@
 mod common;
 
 use axum::http::{StatusCode, header};
+use base64::Engine;
 use common::{Harness, REDIRECT_URI, form, json};
 use ironauth_jose::{EmissionOptions, JwkSet, SigningKey, sign_jws};
 use ironauth_oidc::{ClientAuthMethod, JWT_BEARER_ASSERTION_TYPE};
 
-/// An EdDSA signing key from a fixed seed, tagged with `kid`.
+/// An `EdDSA` signing key from a fixed seed, tagged with `kid`.
 fn ed25519_key(kid: &str, seed: u8) -> SigningKey {
     SigningKey::ed25519_from_seed(Some(kid.to_owned()), &[seed; 32]).expect("ed25519")
 }
@@ -252,13 +253,18 @@ async fn secret_path_reasons_share_the_same_invalid_client_wire_response() {
         ("redirect_uri", REDIRECT_URI),
         ("client_id", &post_id),
     ]);
-    let (m_status, m_headers, m_body) = h.token(&mm_body).await;
+    let (mismatch_status, mismatch_headers, mismatch_body) = h.token(&mm_body).await;
 
     // All three are the byte-identical invalid_client (401, same body, no WWW-Authenticate).
     for (name, status, headers, body) in [
         ("unknown_client", u_status, &u_headers, &u_body),
         ("bad_secret", b_status, &b_headers, &b_body),
-        ("method_mismatch", m_status, &m_headers, &m_body),
+        (
+            "method_mismatch",
+            mismatch_status,
+            &mismatch_headers,
+            &mismatch_body,
+        ),
     ] {
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{name} status");
         assert_eq!(json(body)["error"], "invalid_client", "{name} error");
@@ -272,13 +278,12 @@ async fn secret_path_reasons_share_the_same_invalid_client_wire_response() {
         "unknown_client and bad_secret are byte-identical"
     );
     assert_eq!(
-        b_body, m_body,
+        b_body, mismatch_body,
         "bad_secret and method_mismatch are byte-identical"
     );
 
     // The wrong secret over BASIC is the SAME body and status; the ONLY difference is the
     // added WWW-Authenticate challenge (a transport property, never the reason).
-    use base64::Engine;
     let (basic_client, _s) = h.create_confidential_client(ClientAuthMethod::Basic).await;
     let basic_id = basic_client.to_string();
     let basic_code = h.issue_authenticated_code(&basic_id).await;
