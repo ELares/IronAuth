@@ -213,6 +213,40 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             .iter()
             .all(|v| v.is_some_and(|s| !s.trim().is_empty()));
 
+        // The per environment runtime config the served console document carries in
+        // its `<meta>` tags (issue #323), captured here before `config` moves into
+        // the server. Populated ONLY when the OIDC bridge is configured; the admin
+        // issuer is a SAME ORIGIN scoped path (`/t/{tenant}/e/{env}`) the SPA does
+        // discovery against, so the embedded deploy needs no cross origin exception
+        // (the issuer and management base stay empty, defaulting to this origin and
+        // the /admin/api proxy). These are bounded, NON-secret operator identifiers;
+        // the serving crate HTML escapes each before injecting it. When the bridge is
+        // not configured every value is empty, leaving sign in unavailable.
+        let admin_spa_runtime = if admin_bridge_configured {
+            let trimmed = |v: &Option<String>| v.as_deref().unwrap_or_default().trim().to_owned();
+            ironauth_admin_ui::RuntimeConfig {
+                admin_issuer_path: format!(
+                    "/t/{}/e/{}",
+                    config
+                        .admin_spa
+                        .admin_issuer_tenant
+                        .as_deref()
+                        .unwrap_or_default()
+                        .trim(),
+                    config
+                        .admin_spa
+                        .admin_issuer_environment
+                        .as_deref()
+                        .unwrap_or_default()
+                        .trim(),
+                ),
+                console_client_id: trimmed(&config.admin_spa.console_client_id),
+                management_audience: trimmed(&config.admin_spa.management_audience),
+            }
+        } else {
+            ironauth_admin_ui::RuntimeConfig::default()
+        };
+
         // When advanced-recovery is armed, an IDV callback's signature is verified against each
         // provider's REGISTERED JWKS through the JOSE core. The config layer can only prove the
         // JWKS is NON-EMPTY (it carries no jose dep); parse it HERE, where jose IS available, so
@@ -360,7 +394,8 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             } else {
                 None
             };
-            server = server.mount_public(ironauth_admin_ui::router(proxy_target));
+            server =
+                server.mount_public(ironauth_admin_ui::router(proxy_target, admin_spa_runtime));
             tracing::info!(
                 proxy = admin_bridge_configured,
                 "admin console mounted on the public plane under /admin"
