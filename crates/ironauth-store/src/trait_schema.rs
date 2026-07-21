@@ -336,10 +336,13 @@ pub struct NarrowingViolation {
 /// [`NarrowingViolation`] naming the first widening keyword (iterated in the rule's
 /// object key order, which serde keeps sorted, so the result is deterministic).
 pub fn narrows(form_rule: &Value, trait_subschema: &Value) -> Result<(), NarrowingViolation> {
-    // A rule with no constraints (absent, null, or an empty object) tightens nothing
-    // and therefore narrows trivially.
-    let Some(rule) = form_rule.as_object() else {
-        return Ok(());
+    // An absent rule (null) tightens nothing and narrows trivially. A rule that is
+    // neither null nor an object is malformed and cannot be proven to narrow, so it is
+    // refused, fail closed like every keyword handler below.
+    let rule = match form_rule {
+        Value::Null => return Ok(()),
+        Value::Object(map) => map,
+        _ => return Err(narrowing_violation("rules")),
     };
     for (keyword, value) in rule {
         match keyword.as_str() {
@@ -395,10 +398,17 @@ fn check_type_narrows(
     trait_subschema: &Value,
     keyword: &str,
 ) -> Result<(), NarrowingViolation> {
+    let form = type_name_set(form_type);
+    // A malformed form `type` (not a string, not an array of type names, or an array with
+    // no usable name) denotes the empty set, which would be a subset of anything. That
+    // cannot be proven to narrow, so it is refused, fail closed like the other keywords.
+    if form.is_empty() {
+        return Err(narrowing_violation(keyword));
+    }
     let Some(trait_type) = trait_subschema.get("type") else {
+        // The trait permits every type, so a well formed form type narrows it.
         return Ok(());
     };
-    let form = type_name_set(form_type);
     let trait_set = type_name_set(trait_type);
     if form.is_subset(&trait_set) {
         Ok(())
@@ -1359,6 +1369,36 @@ mod tests {
         let violation = narrows(&json!({"pattern": "^x$"}), &string_trait).unwrap_err();
         assert_eq!(violation.keyword, "pattern");
         assert_eq!(violation.pointer, "/pattern");
+        // Fail closed on malformed input: a rule that is not an object, and a `type`
+        // keyword that is not a type name or an array of names, cannot be proven to narrow
+        // and so are refused (rather than accepted as the empty set, which would widen).
+        assert_eq!(
+            narrows(&json!("haxor"), &string_trait).unwrap_err().keyword,
+            "rules"
+        );
+        assert_eq!(
+            narrows(&json!(5), &string_trait).unwrap_err().keyword,
+            "rules"
+        );
+        assert_eq!(
+            narrows(&json!({"type": 5}), &string_trait)
+                .unwrap_err()
+                .keyword,
+            "type"
+        );
+        assert_eq!(
+            narrows(&json!({"type": {}}), &string_trait)
+                .unwrap_err()
+                .keyword,
+            "type"
+        );
+        // A malformed type is refused EVEN when the trait has no type (nothing to subset).
+        assert_eq!(
+            narrows(&json!({"type": 5}), &json!({"minLength": 1}))
+                .unwrap_err()
+                .keyword,
+            "type"
+        );
     }
 
     #[test]
