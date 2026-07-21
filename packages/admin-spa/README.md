@@ -28,7 +28,8 @@ The tenant/environment switcher (`src/ui/Switcher.tsx`) is the SINGLE source of
 the active scope every resource view reads. It populates from `listTenants` and
 `listEnvironments` through the one typed client (`src/scope/store.ts`), and every
 scoped management call injects the selected `{tenant_id, environment_id}` into its
-path parameters (`src/scope/logic.ts`, `scopePathParams`). The selection persists
+path parameters inside the one typed client wrapper (`src/api/client.ts`), the
+only place a path is formed. The selection persists
 in `sessionStorage` for reload continuity; the bearer token never does (it stays
 in memory only).
 

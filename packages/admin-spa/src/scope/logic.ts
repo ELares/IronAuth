@@ -7,25 +7,12 @@
 // store (src/scope/store.ts) wires these to signals and the one typed client.
 
 // The active scope: the tenant and environment every scoped management call
-// substitutes into its path parameters. A view reads this and passes it to a
-// typed client wrapper, which is the ONLY place a path is formed.
+// substitutes into its path parameters. A view reads this and passes the ids to a
+// typed client wrapper in src/api/client.ts, which is the ONLY place a path is
+// formed (the wrapper hands the ids to the generated client's `params.path`).
 export interface Scope {
   tenantId: string;
   environmentId: string;
-}
-
-// The scope as path parameters for a scoped management operation. The typed
-// client substitutes these into `/v1/tenants/{tenant_id}/environments/{environment_id}/...`,
-// so this is the shape every scoped call injects. Kept pure and named so the
-// injection is one obvious, tested step rather than scattered literals.
-export interface ScopePathParams {
-  tenant_id: string;
-  environment_id: string;
-}
-
-// Inject a scope into the path parameters of a scoped management call.
-export function scopePathParams(scope: Scope): ScopePathParams {
-  return { tenant_id: scope.tenantId, environment_id: scope.environmentId };
 }
 
 // The inputs the collapse decision reads: the reachable tenants and the

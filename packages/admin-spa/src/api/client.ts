@@ -182,7 +182,12 @@ function idempotencyKey(): string {
 export async function fetchTenants(): Promise<TenantView[]> {
   const client = createManagementClient();
   const { data, error, response } = await client.GET("/v1/tenants", {});
-  if (error !== undefined) {
+  // A non 2xx is a failure even when openapi-fetch yields no error body (it
+  // returns `error: undefined` for a bodyless response, for example a 401 or 502
+  // with Content-Length 0 from a proxy or gateway). Checking `response.ok` too
+  // means such a response is never silently read as success (an empty list, or a
+  // failed sudo elevation treated as elevated).
+  if (error !== undefined || !response.ok) {
     throw new ManagementError(toErrorBody(error), response.status);
   }
   return data?.items ?? [];
@@ -199,7 +204,12 @@ export async function fetchEnvironments(
     "/v1/tenants/{tenant_id}/environments",
     { params: { path: { tenant_id: tenantId } } },
   );
-  if (error !== undefined) {
+  // A non 2xx is a failure even when openapi-fetch yields no error body (it
+  // returns `error: undefined` for a bodyless response, for example a 401 or 502
+  // with Content-Length 0 from a proxy or gateway). Checking `response.ok` too
+  // means such a response is never silently read as success (an empty list, or a
+  // failed sudo elevation treated as elevated).
+  if (error !== undefined || !response.ok) {
     throw new ManagementError(toErrorBody(error), response.status);
   }
   return data?.items ?? [];
@@ -223,7 +233,12 @@ export async function elevateAdminSudo(
       },
     },
   );
-  if (error !== undefined) {
+  // A non 2xx is a failure even when openapi-fetch yields no error body (it
+  // returns `error: undefined` for a bodyless response, for example a 401 or 502
+  // with Content-Length 0 from a proxy or gateway). Checking `response.ok` too
+  // means such a response is never silently read as success (an empty list, or a
+  // failed sudo elevation treated as elevated).
+  if (error !== undefined || !response.ok) {
     throw new ManagementError(toErrorBody(error), response.status);
   }
 }

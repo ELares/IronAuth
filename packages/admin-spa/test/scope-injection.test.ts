@@ -1,14 +1,19 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //
 // Scope injection: the active {tenant, environment} is substituted into the path
-// parameters of every scoped management call. This is tested two ways: the pure
-// helper, and faithfully through the ONE typed client (a stubbed fetch records the
-// concrete URL the wrapper forms), so a call under scope T/E provably targets
-// `/v1/tenants/T/environments/E/...`.
+// parameters of every scoped management call, tested faithfully through the ONE
+// typed client (a stubbed fetch records the concrete URL the wrapper forms), so a
+// call under scope T/E provably targets `/v1/tenants/T/environments/E/...`. The
+// wrappers also reject a bodyless non 2xx (a proxy or gateway error) rather than
+// reading it as success.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { scopePathParams } from "../src/scope/logic";
-import { elevateAdminSudo, fetchEnvironments } from "../src/api/client";
+import {
+  ManagementError,
+  elevateAdminSudo,
+  fetchEnvironments,
+  fetchTenants,
+} from "../src/api/client";
 
 const realFetch = globalThis.fetch;
 
@@ -56,12 +61,29 @@ afterEach(() => {
   globalThis.fetch = realFetch;
 });
 
-describe("scopePathParams", () => {
-  it("maps a scope to the management path parameter names", () => {
-    expect(scopePathParams({ tenantId: "T", environmentId: "E" })).toEqual({
-      tenant_id: "T",
-      environment_id: "E",
-    });
+describe("a bodyless non 2xx is a failure, never silent success", () => {
+  it("rejects a list with an empty bodied 401 instead of returning an empty list", async () => {
+    globalThis.fetch = vi.fn(
+      async () =>
+        new Response(null, {
+          status: 401,
+          headers: { "content-length": "0" },
+        }),
+    );
+    await expect(fetchTenants()).rejects.toBeInstanceOf(ManagementError);
+  });
+
+  it("rejects a sudo elevation with an empty bodied 403 instead of reporting success", async () => {
+    globalThis.fetch = vi.fn(
+      async () =>
+        new Response(null, {
+          status: 403,
+          headers: { "content-length": "0" },
+        }),
+    );
+    await expect(elevateAdminSudo("T", "E")).rejects.toBeInstanceOf(
+      ManagementError,
+    );
   });
 });
 

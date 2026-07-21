@@ -153,6 +153,14 @@ export function CommandPalette({ commands }: CommandPaletteProps) {
     if (event.key === "Enter") {
       event.preventDefault();
       runActive();
+      return;
+    }
+    if (event.key === "Tab") {
+      // The dialog holds exactly one focusable control (the search input); options
+      // are driven by aria-activedescendant, not focus. Swallow Tab so focus never
+      // escapes the modal to the page behind the overlay (a focus trap).
+      event.preventDefault();
+      inputRef.current?.focus();
     }
   }
 
