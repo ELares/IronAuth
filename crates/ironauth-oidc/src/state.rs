@@ -25,7 +25,8 @@ use tokio::sync::Semaphore;
 
 use ironauth_config::{
     AdvancedRecoveryConfig, ClientAssertionAudience, ClientCredentialsAudience,
-    DiagnosticVerbosity, DiagnosticsConfig, OidcConfig, QuarantineConfig, RegistrationMode,
+    ConsentLockdownConfig, DiagnosticVerbosity, DiagnosticsConfig, OidcConfig, QuarantineConfig,
+    RegistrationMode,
 };
 use ironauth_env::Env;
 use ironauth_jose::{JwsAlgorithm, TrustedKey, VerificationPolicy, VerifiedToken, verify};
@@ -576,6 +577,12 @@ struct Inner {
     // experimental feature is armed; the conservative default strips offline access and
     // admin/management scopes.
     quarantine: QuarantineConfig,
+    // The consent-lockdown policy (issue #88, PR 3): the tunable hardening the authorize
+    // consent gate applies to an UNVERIFIED (quarantined) client that requests a SENSITIVE
+    // scope, held verbatim from the validated config. On by default; the sensitive-scope set
+    // is REUSED from `quarantine` above (a single denylist), and the escapes (verify the
+    // client or mark it first-party) already exist.
+    consent_lockdown: ConsentLockdownConfig,
     // The advanced-recovery-modes policy (issue #82, PR 3): the three mode sub-toggles, the
     // trusted-contact confirmation threshold, and the registered IDV providers, held verbatim
     // from the validated config. Consulted only when the `advanced-recovery` experimental
@@ -778,6 +785,7 @@ impl OidcState {
                     .trusted_device_revoke_on_password_change,
                 risk: config.risk.clone(),
                 quarantine: config.quarantine.clone(),
+                consent_lockdown: config.consent_lockdown.clone(),
                 advanced_recovery: config.advanced_recovery.clone(),
                 registration_abuse: config.registration_abuse.clone(),
                 email_otp_enabled: config.email_otp_enabled,
@@ -991,6 +999,14 @@ impl OidcState {
     #[must_use]
     pub fn quarantine_config(&self) -> &QuarantineConfig {
         &self.inner.quarantine
+    }
+
+    /// The consent-lockdown policy (issue #88, PR 3): the tunable hardening the authorize
+    /// consent gate applies to an UNVERIFIED (quarantined) client that requests a SENSITIVE
+    /// scope. The sensitive-scope set itself is REUSED from [`Self::quarantine_config`].
+    #[must_use]
+    pub fn consent_lockdown_config(&self) -> &ConsentLockdownConfig {
+        &self.inner.consent_lockdown
     }
 
     /// Arm the experimental advanced-recovery-modes surface (issue #82, PR 3).

@@ -1908,7 +1908,37 @@ fn strip_sensitive_scopes(effective_scope: Option<&str>, cfg: &QuarantineConfig)
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Whether the consent-lockdown gate (issue #88, PR 3) BLOCKS this request: the switch is on
+/// (default), the client is UNVERIFIED (`quarantined`), it is NOT classified `first_party`,
+/// and its effective scope intersects the SENSITIVE denylist. On by default per the tunability
+/// principle (a per-environment switch with a safe default); the escapes -- verify the client
+/// (which lifts `quarantined`) or mark it `first_party` -- both already exist. The SENSITIVE
+/// set is REUSED from the quarantine denylist (`quarantine_config`), a single source of truth.
+///
+/// Shared by the redirect consent gate (`resolve_consent_gate`) and the device-authorization
+/// endpoint (`device::device_authorization`), so both consent surfaces enforce the same block.
+pub(crate) fn unverified_sensitive_scope_blocked(
+    state: &OidcState,
+    client: &ClientRecord,
+    effective_scope: Option<&str>,
+) -> bool {
+    state
+        .consent_lockdown_config()
+        .gate_unverified_sensitive_scopes
+        && client.quarantined
+        && !client.first_party
+        && effective_scope.is_some_and(|scope| {
+            scope
+                .split_whitespace()
+                .any(|token| state.quarantine_config().is_sensitive(token))
+        })
+}
+
+// The consent gate is a single cohesive decision procedure (quarantine read, first-party
+// carve-out, the consent-lockdown block, the recorded-consent fast path, and the prompt=none
+// surfaces); splitting it would scatter one security decision across helpers and hurt
+// readability, so the length lint is not meaningful here.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn resolve_consent_gate(
     state: &OidcState,
     client: &ClientRecord,
@@ -1934,6 +1964,18 @@ async fn resolve_consent_gate(
         mode,
     };
     let client_id_str = client_id.to_string();
+    // Consent lockdown (issue #88, PR 3): an UNVERIFIED (quarantined), non-first-party client
+    // requesting a SENSITIVE scope is BLOCKED with `access_denied` (the authorization SERVER
+    // refusing on policy grounds -- RFC 6749 section 4.1.2.1 -- not a malformed scope, so NOT
+    // `invalid_scope`), HARDENING the prior "proceed to consent and mint it" behavior. It fires
+    // FIRST, ahead of the carve-out AND the recorded-consent fast path below, so it is
+    // unbypassable; see `unverified_sensitive_scope_blocked` for the escapes and safe default.
+    if unverified_sensitive_scope_blocked(state, client, effective_scope) {
+        return Err(gate_error(
+            AuthzErrorCode::AccessDenied,
+            "an unverified client may not obtain the requested sensitive scope",
+        ));
+    }
     // A QUARANTINED USER (issue #82, PR 2) never gets a SILENT authorization: the
     // first-party/skip_consent carve-out is disabled below (its trust is ignored, so an
     // un-consented app always routes to the consent SCREEN), and every sensitive scope is

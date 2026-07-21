@@ -110,6 +110,11 @@ enum DeviceAuthError {
     /// The authenticated client is not permitted the device grant (its grant
     /// allowlist does not contain the `device_code` URN).
     UnauthorizedClient,
+    /// The consent-lockdown policy (issue #88) refuses the request: an unverified,
+    /// non-first-party client requested a sensitive scope. Fails fast here, before a device
+    /// code is issued, so the device consent surface enforces the same block the redirect flow
+    /// does.
+    AccessDenied,
     /// An unexpected server-side condition.
     ServerError,
 }
@@ -120,6 +125,7 @@ impl DeviceAuthError {
             DeviceAuthError::InvalidRequest(_) => "invalid_request",
             DeviceAuthError::InvalidClient { .. } => "invalid_client",
             DeviceAuthError::UnauthorizedClient => "unauthorized_client",
+            DeviceAuthError::AccessDenied => "access_denied",
             DeviceAuthError::ServerError => "server_error",
         }
     }
@@ -138,6 +144,9 @@ impl DeviceAuthError {
             DeviceAuthError::InvalidClient { .. } => "client authentication failed",
             DeviceAuthError::UnauthorizedClient => {
                 "the client is not permitted the device authorization grant"
+            }
+            DeviceAuthError::AccessDenied => {
+                "an unverified client may not obtain the requested sensitive scope"
             }
             DeviceAuthError::ServerError => "the request could not be processed",
         }
@@ -207,6 +216,33 @@ pub async fn device_authorization(
     }
 }
 
+/// Enforce the consent-lockdown gate (issue #88) on the device authorization request: an
+/// unverified, non-first-party client requesting a sensitive scope is refused BEFORE a device
+/// code is issued, so human approval on the verification page can never grant it. This is the
+/// same predicate the redirect flow's consent gate uses, keeping the two consent surfaces in
+/// agreement (no dangling device code for a request that can never grant). The authenticated
+/// client carries only its id, so the record (with quarantine and first-party status) is read
+/// here under the client's own scope.
+async fn enforce_consent_lockdown(
+    state: &OidcState,
+    scope: Scope,
+    client_id: &ClientId,
+    requested_scope: Option<&str>,
+) -> Result<(), DeviceAuthError> {
+    let client_record = state
+        .store()
+        .scoped(scope)
+        .clients()
+        .get(client_id)
+        .await
+        .map_err(|_| DeviceAuthError::ServerError)?;
+    if crate::authorize::unverified_sensitive_scope_blocked(state, &client_record, requested_scope)
+    {
+        return Err(DeviceAuthError::AccessDenied);
+    }
+    Ok(())
+}
+
 async fn device_authorization_inner(
     state: &OidcState,
     headers: &HeaderMap,
@@ -254,6 +290,7 @@ async fn device_authorization_inner(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
+    enforce_consent_lockdown(state, scope, &client_id, requested_scope).await?;
     let initiation_hint = request_source_hint(peer);
 
     // Issue the flow, retrying on the (astronomically unlikely) user-code collision.
