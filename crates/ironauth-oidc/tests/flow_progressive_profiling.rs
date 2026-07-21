@@ -115,8 +115,7 @@ async fn install_form(harness: &Harness, fields_json: &str) {
 
 /// A form with ONE required LATER-LOGIN field on `nickname` (an empty rule, so the trait's own
 /// minLength must still enforce).
-const NICKNAME_LATER_LOGIN_REQUIRED: &str =
-    r#"[{"trait_pointer":"/nickname","required":true,"order":0,"step":"later_login","rules":{},"label_message_id":1070001}]"#;
+const NICKNAME_LATER_LOGIN_REQUIRED: &str = r#"[{"trait_pointer":"/nickname","required":true,"order":0,"step":"later_login","rules":{},"label_message_id":1070001}]"#;
 
 /// A `/authorize` resume target for the harness client, so the login flow resolves the client
 /// whose signup form the progressive profiling path loads.
@@ -302,10 +301,67 @@ async fn a_valid_value_merges_into_the_traits_and_mints() {
     assert_eq!(status, StatusCode::OK, "profiling submit: {done}");
     assert_eq!(done["state"], "completed", "the valid value mints: {done}");
 
-    let traits = read_traits(&harness, &subject).await.expect("traits sealed");
+    let traits = read_traits(&harness, &subject)
+        .await
+        .expect("traits sealed");
     assert_eq!(
         traits["nickname"], "zeke",
         "the collected value is merged into the identity traits: {traits}"
+    );
+}
+
+/// Seal a trait document on an existing subject through the control-plane acting path (the same
+/// `set_traits` seam progressive profiling writes through), so a test can stage a pre-existing
+/// trait before a profiling login.
+async fn seed_traits(harness: &Harness, subject: &str, traits_json: &str) {
+    let env = harness.env().clone();
+    let scope = harness.scope();
+    let user_id = UserId::parse_in_scope(subject, &scope).expect("parse subject");
+    harness
+        .db()
+        .control_store()
+        .scoped(scope)
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+        .users()
+        .set_traits(&env, &user_id, traits_json)
+        .await
+        .expect("seed traits");
+}
+
+#[tokio::test]
+async fn the_merge_preserves_a_pre_existing_unrelated_trait() {
+    // AC 5b: the deep merge is additive through the full set_traits round-trip. A subject who
+    // already carries an unrelated trait (age) keeps it when progressive profiling collects a
+    // different one (nickname); the write never drops the pre-existing key.
+    let harness = setup().await;
+    install_schema(&harness).await;
+    install_form(&harness, NICKNAME_LATER_LOGIN_REQUIRED).await;
+    let subject = harness.seed_user("member@example.test", PASSWORD).await;
+    seed_traits(&harness, &subject, r#"{"age":42}"#).await;
+
+    let (flow_id, token) = api_login_create(&harness).await;
+    let (_s, held) = submit_primary(&harness, &flow_id, &token, "member@example.test").await;
+    let token = held["submit_token"].as_str().expect("token").to_owned();
+
+    let (status, _h, done) = post_json(
+        &harness,
+        &submit_path(&harness, "login"),
+        &json!({"id": flow_id, "submit_token": token, "nodes": {"nickname": "zeke"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "profiling submit: {done}");
+    assert_eq!(done["state"], "completed", "the valid value mints: {done}");
+
+    let traits = read_traits(&harness, &subject)
+        .await
+        .expect("traits sealed");
+    assert_eq!(
+        traits["nickname"], "zeke",
+        "the collected value is merged in: {traits}"
+    );
+    assert_eq!(
+        traits["age"], 42,
+        "the pre-existing unrelated trait survives the merge: {traits}"
     );
 }
 
@@ -356,7 +412,10 @@ async fn a_non_empty_invalid_value_re_renders_then_a_skip_mints() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_ne!(invalid["state"], "completed", "an invalid value does not mint: {invalid}");
+    assert_ne!(
+        invalid["state"], "completed",
+        "an invalid value does not mint: {invalid}"
+    );
     assert_eq!(invalid["flow"]["state"], "progressive_profiling");
     let nickname = node_named(&invalid["flow"], "nickname").expect("nickname node");
     assert!(
@@ -381,7 +440,10 @@ async fn a_non_empty_invalid_value_re_renders_then_a_skip_mints() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(done["state"], "completed", "clearing then submitting mints: {done}");
+    assert_eq!(
+        done["state"], "completed",
+        "clearing then submitting mints: {done}"
+    );
 }
 
 #[tokio::test]
@@ -404,7 +466,10 @@ async fn removing_a_field_from_the_form_does_not_delete_a_collected_trait() {
     )
     .await;
     assert_eq!(done["state"], "completed");
-    assert_eq!(read_traits(&harness, &subject).await.expect("traits")["nickname"], "zeke");
+    assert_eq!(
+        read_traits(&harness, &subject).await.expect("traits")["nickname"],
+        "zeke"
+    );
 
     // Remove the field from the form (an empty field list).
     install_form(&harness, "[]").await;
@@ -527,7 +592,10 @@ async fn mfa_then_profiling_mints_with_an_honest_combined_amr() {
         challenge["flow"]["state"], "mfa_challenge",
         "the primary factor steps up to MFA first: {challenge}"
     );
-    let token = challenge["submit_token"].as_str().expect("token").to_owned();
+    let token = challenge["submit_token"]
+        .as_str()
+        .expect("token")
+        .to_owned();
 
     // Advance to a fresh TOTP step, then submit a real current code: it HOLDS on progressive
     // profiling (it does NOT mint yet, since the later-login field is still missing).
@@ -549,7 +617,10 @@ async fn mfa_then_profiling_mints_with_an_honest_combined_amr() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "mfa submit: {held}");
-    assert_ne!(held["state"], "completed", "MFA success holds for profiling: {held}");
+    assert_ne!(
+        held["state"], "completed",
+        "MFA success holds for profiling: {held}"
+    );
     assert_eq!(held["flow"]["state"], "progressive_profiling");
     let token = held["submit_token"].as_str().expect("token").to_owned();
 
@@ -561,14 +632,20 @@ async fn mfa_then_profiling_mints_with_an_honest_combined_amr() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "profiling submit: {done}");
-    assert_eq!(done["state"], "completed", "the mint runs after profiling: {done}");
+    assert_eq!(
+        done["state"], "completed",
+        "the mint runs after profiling: {done}"
+    );
 
     let methods = latest_session_methods(&harness, &subject).await;
     assert!(
         methods.contains("pwd") && methods.contains("totp"),
         "the final mint records the honest combined amr: {methods}"
     );
-    assert_eq!(read_traits(&harness, &subject).await.expect("traits")["nickname"], "zeke");
+    assert_eq!(
+        read_traits(&harness, &subject).await.expect("traits")["nickname"],
+        "zeke"
+    );
 }
 
 /// The `auth_methods` recorded on the most recent session for `subject` (owner pool, so

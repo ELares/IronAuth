@@ -625,7 +625,11 @@ fn step_projection(
             reached: outcome.step_up_needed && !outcome.blocked,
             methods: vec![PRIMARY_METHOD.to_owned()],
         },
-        FlowStateTag::MfaEnroll => StepProjection {
+        // The enroll step depends on the subject's enrolled factors, and progressive profiling
+        // depends on the client's configured signup form and the subject's existing traits;
+        // a pure dry run reads none of these, so both are projected as not reached with only the
+        // primary factor proven.
+        FlowStateTag::MfaEnroll | FlowStateTag::ProgressiveProfiling => StepProjection {
             policy: None,
             step_up: None,
             risk: None,
