@@ -333,6 +333,13 @@ jobs:
       - name: typecheck (strict)
         working-directory: packages/admin-spa
         run: npm run typecheck
+      - name: unit and component tests (vitest, jsdom)
+        # The shell's pure logic (single-environment collapse, scope injection,
+        # ErrorBody mapping) and its components (the verbatim ErrorBody boundary,
+        # the command palette keyboard flow, the RFC 9470 sudo path) under the
+        # Node toolchain. Runtime end to end stays staged under issue #323.
+        working-directory: packages/admin-spa
+        run: npm test
       - name: build (vite, content hashed external assets)
         working-directory: packages/admin-spa
         run: npm run build
