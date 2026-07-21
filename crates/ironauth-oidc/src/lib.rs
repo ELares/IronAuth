@@ -119,6 +119,7 @@ mod par;
 mod password;
 mod phone;
 mod pkce;
+mod policy_trace;
 pub mod pow;
 mod pow_gate;
 mod probe;

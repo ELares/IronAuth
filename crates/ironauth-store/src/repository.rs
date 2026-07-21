@@ -772,6 +772,30 @@ impl<'a> ScopedStore<'a> {
         }
     }
 
+    /// The out of band policy decision trace sink for this scope (issue #91, M9 flow
+    /// inspector). Records WHY a traced policy decision (step up, risk, or claim
+    /// mapping) came out the way it did, off the request path; it is a diagnostic log,
+    /// not a business mutation, so (like `risk_decisions`) it is off the audited write
+    /// path and needs no acting context.
+    #[must_use]
+    pub fn policy_decision_traces(&self) -> PolicyDecisionTracesRepo<'a> {
+        PolicyDecisionTracesRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The out of band token size event sink for this scope (issue #91): the one
+    /// materialized operational warning the M9 warnings read surfaces. Off the audited
+    /// write path, like the other diagnostics sinks.
+    #[must_use]
+    pub fn token_size_events(&self) -> TokenSizeEventsRepo<'a> {
+        TokenSizeEventsRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
     /// The read-only registered external assertion issuer repository for this scope
     /// (issue #26). Resolves the trust anchor an inbound JWT bearer assertion's `iss`
     /// names, so the grant can verify the assertion against the issuer's keys;
@@ -9761,6 +9785,548 @@ impl ClientAuthDiagnosticsRepo<'_> {
                 signing_alg: row.get("signing_alg"),
                 skew_seconds: row.get("skew_seconds"),
                 expected: row.get("expected"),
+                occurred_at_micros: row.get("occurred_us"),
+            })
+            .collect())
+    }
+}
+
+// ===========================================================================
+// The policy decision trace sink (issue #91, M9 flow inspector).
+// ===========================================================================
+
+/// Which policy decision a trace records (issue #91). The closed set the M9 flow
+/// inspector traces: step up authentication, risk scoring, and connector claim
+/// mapping. Consent and scope decisions are deliberately NOT traced today (an owner
+/// resolved scope decision). No attacker controlled free text, so it is safe as a
+/// metric like dimension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyKind {
+    /// The step up authentication requirement evaluation (RFC 9470, issue #72).
+    StepUp,
+    /// The risk scoring decision (issue #79).
+    Risk,
+    /// The connector claim mapping evaluation for a federated login (issue #75).
+    ClaimMapping,
+}
+
+impl PolicyKind {
+    /// The stable wire string recorded in the trace row's `policy` column.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PolicyKind::StepUp => "step_up",
+            PolicyKind::Risk => "risk",
+            PolicyKind::ClaimMapping => "claim_mapping",
+        }
+    }
+}
+
+/// The bounded verdict a traced policy decision reached (issue #91). The closed set
+/// the `policy_decision_traces_outcome_known` CHECK pins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyOutcome {
+    /// The decision was satisfied: the requirement was met, the risk was allowed, or
+    /// the claim mapping resolved.
+    Satisfied,
+    /// The decision required a step up: the step up requirement was unmet, or the risk
+    /// score met the challenge threshold.
+    StepUpRequired,
+    /// The decision denied: the risk hard denied, or the claim mapping failed closed.
+    Deny,
+}
+
+impl PolicyOutcome {
+    /// The stable wire string recorded in the trace row's `outcome` column.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PolicyOutcome::Satisfied => "satisfied",
+            PolicyOutcome::StepUpRequired => "step_up_required",
+            PolicyOutcome::Deny => "deny",
+        }
+    }
+}
+
+/// One traced risk signal contribution (issue #91): the signal NAME and its level.
+/// Carries no raw IP, geo, or count, so it is operator safe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyTraceSignal {
+    /// The signal name (for example `new_device`, `velocity`).
+    pub name: String,
+    /// The signal's contributed level (for example `low`, `med`, `high`).
+    pub level: String,
+}
+
+/// The STRUCTURALLY REDACTED, allowlisted safe field projection of a traced policy
+/// decision's inputs (issue #91). Every variant carries only bounded, non secret
+/// fields; there is deliberately NO field capable of holding a claim value, a token,
+/// or a secret, so a secret is UNREPRESENTABLE here, not scrubbed after the fact. The
+/// recorder builds one of these from typed safe fields, and the repository serializes
+/// it into the trace row's `decision_inputs` jsonb.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyDecisionInputs {
+    /// The step up requirement evaluation inputs: the acr floor and achieved acr, the auth age
+    /// window and the derived auth age, and which dimensions were unmet. These are acr tokens and
+    /// bounded integers, never a claim value, a token, or a secret. The required acr may fold a
+    /// value the client itself sent in its own `acr_values` request parameter (its own request
+    /// input, readable only within its own tenant and environment, bounded by the request param
+    /// limit), so it is not strictly a fixed server vocabulary, but it can carry no PII or secret.
+    StepUp {
+        /// The required acr floor, if any: a server acr value, or an acr token the client sent in
+        /// its own `acr_values` request. Never a claim value, a token, or a secret.
+        required_acr: Option<String>,
+        /// The achieved acr the recorded authentication reached (a server acr value).
+        achieved_acr: String,
+        /// The maximum auth age window in seconds, if any.
+        max_auth_age_secs: Option<u64>,
+        /// The derived age of the authentication in seconds, if it could be established.
+        auth_age_secs: Option<i64>,
+        /// Whether the achieved acr failed the floor.
+        acr_unmet: bool,
+        /// Whether the authentication was older than the allowed window.
+        age_lapsed: bool,
+    },
+    /// The risk decision inputs: the combined level and the enumerated signal NAMES and
+    /// levels (never the raw IP, geo, or velocity counts).
+    Risk {
+        /// The combined risk level (`low` / `med` / `high`).
+        level: String,
+        /// The contributing signals, each a name and level.
+        signals: Vec<PolicyTraceSignal>,
+    },
+    /// The claim mapping inputs: the connector slug (an admin defined identifier, never
+    /// PII), the mapped trait count when the mapping resolved, and the bounded failure
+    /// kind when it failed (never a claim value or a claim path).
+    ClaimMapping {
+        /// The connector slug the login used (an admin defined identifier).
+        connector: String,
+        /// The number of traits the mapping resolved, when it resolved.
+        mapped_trait_count: Option<u32>,
+        /// The bounded failure kind, when the mapping failed closed (for example
+        /// `missing_required_claim`, `wrong_type`, `no_active_schema`).
+        failure_kind: Option<String>,
+    },
+}
+
+impl PolicyDecisionInputs {
+    /// The safe field projection as a JSON string for the trace row's `decision_inputs`
+    /// jsonb. Only the typed safe fields of the variant are emitted; no claim value,
+    /// token, or secret is representable, so none can appear.
+    #[must_use]
+    pub fn to_json(&self) -> String {
+        let value = match self {
+            PolicyDecisionInputs::StepUp {
+                required_acr,
+                achieved_acr,
+                max_auth_age_secs,
+                auth_age_secs,
+                acr_unmet,
+                age_lapsed,
+            } => serde_json::json!({
+                "kind": "step_up",
+                "required_acr": required_acr,
+                "achieved_acr": achieved_acr,
+                "max_auth_age_secs": max_auth_age_secs,
+                "auth_age_secs": auth_age_secs,
+                "acr_unmet": acr_unmet,
+                "age_lapsed": age_lapsed,
+            }),
+            PolicyDecisionInputs::Risk { level, signals } => {
+                let signals: Vec<serde_json::Value> = signals
+                    .iter()
+                    .map(|signal| serde_json::json!({ "name": signal.name, "level": signal.level }))
+                    .collect();
+                serde_json::json!({
+                    "kind": "risk",
+                    "level": level,
+                    "signals": signals,
+                })
+            }
+            PolicyDecisionInputs::ClaimMapping {
+                connector,
+                mapped_trait_count,
+                failure_kind,
+            } => serde_json::json!({
+                "kind": "claim_mapping",
+                "connector": connector,
+                "mapped_trait_count": mapped_trait_count,
+                "failure_kind": failure_kind,
+            }),
+        };
+        value.to_string()
+    }
+}
+
+/// A policy decision trace to record (issue #91). Carries the rich, structured detail
+/// of WHY a policy decision came out the way it did, kept OFF the request path.
+///
+/// STRUCTURAL REDACTION GUARANTEE (issue #91): every field is a bounded, non secret
+/// datum by construction. `subject` is the internal usr_ handle (a blind reference,
+/// never raw PII, exactly as `risk_decisions.subject`); `inputs` is the allowlisted
+/// safe field projection ([`PolicyDecisionInputs`]) with no field capable of holding a
+/// claim value, a token, or a secret. The redaction corpus CI gate
+/// (`scripts/diagnostics-redaction-scan.sh`) proves no secret sentinel can reach a
+/// serialized trace.
+#[derive(Debug, Clone)]
+pub struct NewPolicyDecisionTrace {
+    /// Which policy decision this trace records.
+    pub policy: PolicyKind,
+    /// The internal usr_ handle the decision was for, if any (a blind reference).
+    pub subject: Option<String>,
+    /// The bounded verdict the decision reached.
+    pub outcome: PolicyOutcome,
+    /// A bounded, non secret reason hint, if any.
+    pub reason: Option<String>,
+    /// The redacted, allowlisted safe field projection of the decision inputs.
+    pub inputs: PolicyDecisionInputs,
+}
+
+/// A read back policy decision trace row (issue #91), for the M9 admin flow inspector
+/// and for tests. Carries only the bounded, non secret fields the record can hold (the
+/// same structural redaction guarantee as [`NewPolicyDecisionTrace`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyDecisionTraceRecord {
+    /// The random per row identifier.
+    pub id: String,
+    /// The traced policy (the stable wire string, see [`PolicyKind`]).
+    pub policy: String,
+    /// The internal usr_ handle the decision was for, if any.
+    pub subject: Option<String>,
+    /// The bounded verdict (the stable wire string, see [`PolicyOutcome`]).
+    pub outcome: String,
+    /// The bounded, non secret reason hint, if any.
+    pub reason: Option<String>,
+    /// The safe field projection of the decision inputs, as a JSON string.
+    pub decision_inputs_json: String,
+    /// When the decision happened, in epoch microseconds from the application clock seam.
+    pub occurred_at_micros: i64,
+}
+
+/// A scoped query over the policy decision trace sink (issue #91), for the M9 admin
+/// flow inspector's read path. Every field NARROWS the result within the caller's
+/// forced RLS scope; the read can never widen past the scope.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PolicyDecisionTraceQuery<'a> {
+    /// Restrict to one policy (the stable wire string), or [`None`] for every policy.
+    pub policy: Option<&'a str>,
+    /// Restrict to one subject (a usr_ handle), or [`None`] for every subject in scope.
+    pub subject: Option<&'a str>,
+    /// Only rows at or after this epoch microseconds instant, or [`None`] for no bound.
+    pub occurred_at_or_after_micros: Option<i64>,
+    /// Only rows strictly before this epoch microseconds instant, or [`None`] for none.
+    pub occurred_before_micros: Option<i64>,
+    /// The maximum number of rows to return; the repository clamps it to a hard ceiling.
+    pub limit: Option<i64>,
+    /// Order newest first (the M9 view sets this so a capped result keeps the most
+    /// recent decisions). Default `false` is oldest first.
+    pub newest_first: bool,
+}
+
+/// The out of band policy decision trace sink (issue #91).
+///
+/// Records a traced policy decision's rich, structured detail (the safe field inputs,
+/// the bounded outcome, and the reason hint) for the M9 admin flow inspector, so the
+/// decision path stays byte identical while the trace is recorded off to the side.
+/// Append only and deliberately off the audited write path (a trace is a log entry,
+/// not a business mutation), mirroring `risk_decisions` and the client auth
+/// diagnostics sink.
+pub struct PolicyDecisionTracesRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl PolicyDecisionTracesRepo<'_> {
+    /// The hard ceiling on how many trace rows one [`query`] returns (issue #91), so
+    /// the M9 admin read can never request an unbounded scan.
+    ///
+    /// [`query`]: PolicyDecisionTracesRepo::query
+    pub const MAX_QUERY_LIMIT: i64 = 500;
+
+    /// Record a policy decision trace in this scope, first pruning any rows past their
+    /// retention window. The event time comes from the application clock seam (`env`),
+    /// so both the recorded time and the prune are deterministic under a manual clock
+    /// in tests. `retention_micros` is threaded from `diagnostics.retention_secs`
+    /// (config). This is a growth bound, NOT rate limiting.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn record(
+        &self,
+        env: &Env,
+        retention_micros: i64,
+        trace: &NewPolicyDecisionTrace,
+    ) -> Result<(), StoreError> {
+        let id = random_diagnostic_id(env);
+        let occurred_micros = epoch_micros(env.clock().now_utc());
+        let expires_micros = occurred_micros.saturating_add(retention_micros.max(0));
+        let inputs_json = trace.inputs.to_json();
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        // Prune rows past their retention window before inserting (prune then insert,
+        // exactly like the client auth diagnostics sink). Only already expired rows are
+        // removed.
+        sqlx::query(
+            "DELETE FROM policy_decision_traces \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+             AND expires_at <= TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(occurred_micros)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO policy_decision_traces \
+             (id, tenant_id, environment_id, policy, subject, outcome, reason, \
+              decision_inputs, occurred_at, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, \
+                     TIMESTAMPTZ 'epoch' + ($9::text || ' microseconds')::interval, \
+                     TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval)",
+        )
+        .bind(id)
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(trace.policy.as_str())
+        .bind(trace.subject.as_deref())
+        .bind(trace.outcome.as_str())
+        .bind(trace.reason.as_deref())
+        .bind(inputs_json)
+        .bind(occurred_micros)
+        .bind(expires_micros)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Read the traces matching `query` within this scope, for the M9 admin flow
+    /// inspector (issue #91). Every filter NARROWS within the caller's forced RLS scope:
+    /// the tenant and environment predicates plus the forced row level security make a
+    /// cross scope read impossible (proven by the IDOR probe). The result is bounded by
+    /// the query's `limit` clamped to [`PolicyDecisionTracesRepo::MAX_QUERY_LIMIT`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn query(
+        &self,
+        query: PolicyDecisionTraceQuery<'_>,
+    ) -> Result<Vec<PolicyDecisionTraceRecord>, StoreError> {
+        let limit = query
+            .limit
+            .unwrap_or(Self::MAX_QUERY_LIMIT)
+            .clamp(0, Self::MAX_QUERY_LIMIT);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        // The two statements differ ONLY in the ORDER direction, a compile time literal
+        // chosen by the flag (never interpolated data), so there is no dynamic SQL. The
+        // NULL guarded optional predicates keep the whole filter matrix in one statement.
+        let sql = if query.newest_first {
+            "SELECT id, policy, subject, outcome, reason, \
+                    decision_inputs::text AS decision_inputs, \
+                    (EXTRACT(EPOCH FROM occurred_at) * 1000000)::bigint AS occurred_us \
+             FROM policy_decision_traces \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+               AND ($3::text IS NULL OR policy = $3) \
+               AND ($4::text IS NULL OR subject = $4) \
+               AND ($5::bigint IS NULL OR occurred_at >= \
+                    TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval) \
+               AND ($6::bigint IS NULL OR occurred_at < \
+                    TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval) \
+             ORDER BY occurred_at DESC, id DESC \
+             LIMIT $7"
+        } else {
+            "SELECT id, policy, subject, outcome, reason, \
+                    decision_inputs::text AS decision_inputs, \
+                    (EXTRACT(EPOCH FROM occurred_at) * 1000000)::bigint AS occurred_us \
+             FROM policy_decision_traces \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+               AND ($3::text IS NULL OR policy = $3) \
+               AND ($4::text IS NULL OR subject = $4) \
+               AND ($5::bigint IS NULL OR occurred_at >= \
+                    TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval) \
+               AND ($6::bigint IS NULL OR occurred_at < \
+                    TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval) \
+             ORDER BY occurred_at, id \
+             LIMIT $7"
+        };
+        let rows = sqlx::query(sql)
+            .bind(self.scope.tenant().to_string())
+            .bind(self.scope.environment().to_string())
+            .bind(query.policy)
+            .bind(query.subject)
+            .bind(query.occurred_at_or_after_micros)
+            .bind(query.occurred_before_micros)
+            .bind(limit)
+            .fetch_all(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(rows
+            .iter()
+            .map(|row| PolicyDecisionTraceRecord {
+                id: row.get("id"),
+                policy: row.get("policy"),
+                subject: row.get("subject"),
+                outcome: row.get("outcome"),
+                reason: row.get("reason"),
+                decision_inputs_json: row.get("decision_inputs"),
+                occurred_at_micros: row.get("occurred_us"),
+            })
+            .collect())
+    }
+}
+
+// ===========================================================================
+// The token size event sink (issue #91): the one materialized operational warning.
+// ===========================================================================
+
+/// Which token a size event is about (issue #91). The closed set the
+/// `token_size_events_type_known` CHECK pins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenSizeKind {
+    /// The signed ID token.
+    IdToken,
+    /// The access token.
+    AccessToken,
+}
+
+impl TokenSizeKind {
+    /// The stable wire string recorded in the event row's `token_type` column.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TokenSizeKind::IdToken => "id_token",
+            TokenSizeKind::AccessToken => "access_token",
+        }
+    }
+}
+
+/// A token size (claim bloat) event to record (issue #91). Carries only the token
+/// TYPE, the byte SIZE, and the claim COUNT (bounded integers), plus the non secret
+/// client id; there is deliberately NO field capable of holding the token itself.
+#[derive(Debug, Clone)]
+pub struct NewTokenSizeEvent<'a> {
+    /// The token type the size event is about.
+    pub token_type: TokenSizeKind,
+    /// The serialized token byte size that tripped the bloat threshold.
+    pub byte_size: i64,
+    /// The token's claim count, when known.
+    pub claim_count: Option<i64>,
+    /// The client the token was minted for (a non secret identifier).
+    pub client_id: &'a str,
+}
+
+/// A read back token size event row (issue #91), for the M9 admin warnings read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenSizeEventRecord {
+    /// The token type (the stable wire string, see [`TokenSizeKind`]).
+    pub token_type: String,
+    /// The serialized token byte size.
+    pub byte_size: i64,
+    /// The token's claim count, if recorded.
+    pub claim_count: Option<i64>,
+    /// The client the token was minted for.
+    pub client_id: String,
+    /// When the mint happened, in epoch microseconds from the application clock seam.
+    pub occurred_at_micros: i64,
+}
+
+/// The out of band token size event sink (issue #91): the ONE materialized operational
+/// warning. Every other warning the M9 warnings read surfaces is computed live from
+/// existing seams. Append only, retention pruned, off the audited write path.
+pub struct TokenSizeEventsRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl TokenSizeEventsRepo<'_> {
+    /// The hard ceiling on how many event rows one [`recent`] returns (issue #91).
+    ///
+    /// [`recent`]: TokenSizeEventsRepo::recent
+    pub const MAX_QUERY_LIMIT: i64 = 200;
+
+    /// Record a token size event in this scope, first pruning any rows past their
+    /// retention window. The event time and prune come from the application clock seam
+    /// (`env`), so both are deterministic under a manual clock. `retention_micros` is
+    /// threaded from `diagnostics.retention_secs` (config).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn record(
+        &self,
+        env: &Env,
+        retention_micros: i64,
+        event: NewTokenSizeEvent<'_>,
+    ) -> Result<(), StoreError> {
+        let id = random_diagnostic_id(env);
+        let occurred_micros = epoch_micros(env.clock().now_utc());
+        let expires_micros = occurred_micros.saturating_add(retention_micros.max(0));
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        sqlx::query(
+            "DELETE FROM token_size_events \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+             AND expires_at <= TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(occurred_micros)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO token_size_events \
+             (id, tenant_id, environment_id, token_type, byte_size, claim_count, \
+              client_id, occurred_at, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, \
+                     TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval, \
+                     TIMESTAMPTZ 'epoch' + ($9::text || ' microseconds')::interval)",
+        )
+        .bind(id)
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(event.token_type.as_str())
+        .bind(event.byte_size)
+        .bind(event.claim_count)
+        .bind(event.client_id)
+        .bind(occurred_micros)
+        .bind(expires_micros)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Read the most recent token size events in this scope, newest first, bounded to
+    /// `limit` clamped to [`TokenSizeEventsRepo::MAX_QUERY_LIMIT`]. For the M9 warnings
+    /// read. The forced RLS and the scope predicates confine it to the caller's scope.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn recent(&self, limit: i64) -> Result<Vec<TokenSizeEventRecord>, StoreError> {
+        let limit = limit.clamp(0, Self::MAX_QUERY_LIMIT);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT token_type, byte_size, claim_count, client_id, \
+                    (EXTRACT(EPOCH FROM occurred_at) * 1000000)::bigint AS occurred_us \
+             FROM token_size_events \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+             ORDER BY occurred_at DESC, id DESC \
+             LIMIT $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows
+            .iter()
+            .map(|row| TokenSizeEventRecord {
+                token_type: row.get("token_type"),
+                byte_size: row.get("byte_size"),
+                claim_count: row.get("claim_count"),
+                client_id: row.get("client_id"),
                 occurred_at_micros: row.get("occurred_us"),
             })
             .collect())

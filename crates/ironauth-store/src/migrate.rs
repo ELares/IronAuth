@@ -704,6 +704,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0072_diagnostics_control_read.sql"),
         },
+        Migration {
+            version: 73,
+            name: "policy_decision_traces",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0073_policy_decision_traces.sql"),
+        },
     ]
 }
 

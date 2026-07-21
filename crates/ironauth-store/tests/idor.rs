@@ -9,9 +9,10 @@ use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
     AuthorizationCodeId, ClientAuthDiagnosticReason, ClientId, ConnectorCapabilities, ConnectorId,
     CorrelationId, CredentialType, FederationLoginStateId, GrantId, IssueCode,
-    NewClientAuthDiagnostic, NewConnector, NewFederationLoginState, NewRefreshFamily, NewSession,
-    NewUpstreamTokens, RefreshFamilyId, RefreshTokenId, Scope, SessionId, StoreError,
-    UpstreamTokenId, UserId, refresh_token_digest,
+    NewClientAuthDiagnostic, NewConnector, NewFederationLoginState, NewPolicyDecisionTrace,
+    NewRefreshFamily, NewSession, NewUpstreamTokens, PolicyDecisionInputs, PolicyKind,
+    PolicyOutcome, RefreshFamilyId, RefreshTokenId, Scope, SessionId, StoreError, UpstreamTokenId,
+    UserId, refresh_token_digest,
 };
 
 /// A timestamp far past any test's clock, so a planted fixture never expires mid-test.
@@ -682,6 +683,89 @@ async fn plant_diagnostic(db: &TestDatabase, env: &Env, scope: Scope, client_id:
         )
         .await
         .expect("plant client-auth diagnostic");
+}
+
+#[tokio::test]
+async fn policy_decision_trace_read_is_cross_scope_isolated() {
+    // A subject's recorded policy decision traces (issue #91) planted in another tenant or
+    // environment must never resolve under the caller's scope, or the M9 admin flow inspector
+    // would leak which foreign subjects were being step up challenged, risk denied, or claim
+    // mapping failed. The probe's foreign identifier is the SUBJECT (the M9 view's read key).
+    // Run on the DATA store (ironauth_app), which holds the sink's SELECT grant.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+
+    let scope_a = db.seed_scope(&env).await;
+    let scope_b = db.seed_scope(&env).await;
+    let env_a2 = db.seed_environment(&env, scope_a.tenant()).await;
+    let scope_a2 = Scope::new(scope_a.tenant(), env_a2);
+
+    // The SAME subject handle is used in each foreign scope, so a leak could only come from a
+    // scope boundary miss (not from the handle being globally unique).
+    let victim_subject = "usr_victim_trace";
+    plant_policy_trace(&db, &env, scope_b, victim_subject).await;
+    plant_policy_trace(&db, &env, scope_a2, victim_subject).await;
+
+    let mut harness = IdorHarness::new();
+    harness.register_policy_trace_probes();
+    assert_eq!(
+        harness.probe_names(),
+        vec!["policy_decision_traces.query"],
+        "the policy decision traces read surface is registered with the harness"
+    );
+
+    let foreign = [victim_subject.to_string()];
+    let refs: Vec<&str> = foreign.iter().map(String::as_str).collect();
+    let leaks = harness.run(db.store(), scope_a, &refs).await;
+    assert!(leaks.is_empty(), "cross-scope leak detected: {leaks:?}");
+
+    // Each victim's trace is STILL readable in its OWN scope, proving the isolation is a
+    // genuine scope boundary, not a global miss.
+    for scope in [scope_b, scope_a2] {
+        let rows = db
+            .store()
+            .scoped(scope)
+            .policy_decision_traces()
+            .query(ironauth_store::PolicyDecisionTraceQuery {
+                subject: Some(victim_subject),
+                ..Default::default()
+            })
+            .await
+            .expect("read in own scope");
+        assert_eq!(
+            rows.len(),
+            1,
+            "the trace survives every cross-scope probe in its own scope"
+        );
+    }
+}
+
+/// Plant one policy decision trace for `subject` in `scope` (a far-future retention, so the
+/// on-insert prune never reclaims it mid-test), for the read isolation probe.
+async fn plant_policy_trace(db: &TestDatabase, env: &Env, scope: Scope, subject: &str) {
+    db.store()
+        .scoped(scope)
+        .policy_decision_traces()
+        .record(
+            env,
+            FAR_FUTURE_MICROS,
+            &NewPolicyDecisionTrace {
+                policy: PolicyKind::StepUp,
+                subject: Some(subject.to_owned()),
+                outcome: PolicyOutcome::StepUpRequired,
+                reason: Some("acr_unmet".to_owned()),
+                inputs: PolicyDecisionInputs::StepUp {
+                    required_acr: Some("urn:ironauth:acr:mfa".to_owned()),
+                    achieved_acr: "urn:ironauth:acr:pwd".to_owned(),
+                    max_auth_age_secs: None,
+                    auth_age_secs: None,
+                    acr_unmet: true,
+                    age_lapsed: false,
+                },
+            },
+        )
+        .await
+        .expect("plant policy decision trace");
 }
 
 /// Plant a captured upstream token keyed on a fresh session in `scope`, returning the

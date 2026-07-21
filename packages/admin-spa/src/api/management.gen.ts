@@ -442,6 +442,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/policy-traces": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read the environment's recorded policy decision traces (issue #91). */
+        get: operations["getPolicyDecisionTraces"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/warnings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read the environment's operational warnings, computed live (issue #91). */
+        get: operations["getDiagnosticsWarnings"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/export": {
         parameters: {
             query?: never;
@@ -1681,6 +1715,16 @@ export interface components {
             /** @description The ordered primitive list (as stored). */
             primitives: unknown[];
         };
+        /**
+         * @description The environment's operational warnings (issue #91), COMPUTED LIVE from the existing
+         *     seams (the connector health registry and the token size event sink). Nothing here is a
+         *     stored, staleness prone materialization except the token size events, which are already
+         *     bounded and retention pruned.
+         */
+        DiagnosticsWarningsList: {
+            /** @description The computed warnings, connector warnings first, then token size warnings. */
+            items: components["schemas"]["WarningItemView"][];
+        };
         /** @description A page of environments. */
         EnvironmentList: {
             /** @description The environments on this page, oldest first. */
@@ -2347,6 +2391,44 @@ export interface components {
             target_latency_ms: number | null;
         };
         /**
+         * @description One recorded policy decision trace (issue #91).
+         *
+         *     Every field is a bounded, non secret datum the store record already holds: `policy`
+         *     and `outcome` are closed sets, `subject` is an internal usr_ handle (a blind
+         *     reference, never raw PII), `reason` is a bounded hint, and `decision_inputs` is the
+         *     STRUCTURALLY REDACTED safe field projection (the acr floor and achieved acr, the auth
+         *     age, the risk signal names and levels, the connector slug and the mapped trait count),
+         *     serialized as a JSON string. There is deliberately NO field capable of holding a claim
+         *     value, a token, or a secret: those are unrepresentable in the record this view carries.
+         */
+        PolicyTraceView: {
+            /**
+             * @description The redacted, allowlisted safe field projection of the decision inputs, as a JSON
+             *     string (rendered inertly by the console, never a claim value).
+             */
+            decision_inputs: string;
+            /**
+             * Format: int64
+             * @description When the decision happened, unix microseconds from the application clock.
+             */
+            occurred_at_unix_micros: number;
+            /** @description The bounded verdict (`satisfied`, `step_up_required`, or `deny`). */
+            outcome: string;
+            /** @description The traced policy (`step_up`, `risk`, or `claim_mapping`). */
+            policy: string;
+            /** @description The bounded, non secret reason hint, if any. */
+            reason?: string | null;
+            /** @description The internal usr_ handle the decision was for, if any (a blind reference). */
+            subject?: string | null;
+        };
+        /** @description A page of recorded policy decision traces (issue #91), newest first, truncation flagged. */
+        PolicyTracesList: {
+            /** @description The traces matching the query, NEWEST first, bounded by the limit. */
+            items: components["schemas"]["PolicyTraceView"][];
+            /** @description True when the result hit the limit and older matching traces were left out. */
+            truncated: boolean;
+        };
+        /**
          * @description An admin-approved recovery approval (issue #82, PR 3), as the management API returns it.
          *     Carries no secret and no raw PII: the subject is the opaque `usr_` id.
          */
@@ -2915,6 +2997,25 @@ export interface components {
             claims?: unknown;
             /** @description The user's identity-traits document, or null when the user has none. */
             traits?: unknown;
+        };
+        /**
+         * @description One operational warning item (issue #91): a bounded `kind`, the `subject` it is about
+         *     (a connector slug or a client id, non secret), and a safe `detail`. Every field is a
+         *     bounded, non secret datum; the detail never carries a claim value, a token, or a secret.
+         */
+        WarningItemView: {
+            /**
+             * @description A safe, bounded detail (a health counter, an error rate, a size summary). Never a
+             *     claim value, a token, or a secret.
+             */
+            detail: string;
+            /**
+             * @description The bounded warning kind (for example `connector_config_error`,
+             *     `connector_unavailable`, `connector_degraded`, `token_size`).
+             */
+            kind: string;
+            /** @description The subject the warning is about (a connector slug or a client id), non secret. */
+            subject: string;
         };
     };
     responses: never;
@@ -5073,6 +5174,130 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Environment not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    getPolicyDecisionTraces: {
+        parameters: {
+            query?: {
+                /** @description Restrict to one policy (`step_up`, `risk`, or `claim_mapping`), or absent for all. */
+                policy?: string;
+                /** @description Restrict to one subject (a usr_ handle), or absent for every subject in scope. */
+                subject?: string;
+                /** @description Only traces at or after this instant, unix microseconds. Absent for no lower bound. */
+                since?: number;
+                /** @description Only traces strictly before this instant, unix microseconds. Absent for no bound. */
+                until?: number;
+                /** @description The maximum number of rows to return, clamped to the repository ceiling. */
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The environment's recorded policy decision traces (the step up, risk, and claim mapping decisions), NEWEST first, filtered by policy and subject and time window and bounded to at most 500 rows. Each carries only the safe, non secret fields the store record holds: the closed policy and outcome, the blind subject handle, the bounded reason, and the redacted safe field projection of the decision inputs. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyTracesList"];
+                };
+            };
+            /** @description A malformed filter value */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Environment not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    getDiagnosticsWarnings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The environment's operational warnings, computed live from the connector health registry (a misconfigured, unreachable, or degraded upstream, which is how a stale or expired connector cert or metadata manifests through the live probe) and the token size (claim bloat) event sink. Each is a bounded kind, the non secret subject, and a safe detail. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DiagnosticsWarningsList"];
                 };
             };
             /** @description Missing or invalid credential */

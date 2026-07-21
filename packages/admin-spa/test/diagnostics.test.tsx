@@ -219,3 +219,127 @@ describe("the diagnostics client-auth panel", () => {
     );
   });
 });
+
+// Route the three diagnostics reads (client-auth, policy-traces, warnings) to their own
+// bodies so a test can assert one panel without the others' data bleeding in.
+function routeDiagnostics(bodies: {
+  clientAuth?: unknown;
+  policyTraces?: unknown;
+  warnings?: unknown;
+}): Call[] {
+  return stubFetch((call) => {
+    if (call.url.includes("/diagnostics/policy-traces")) {
+      return json(bodies.policyTraces ?? { items: [], truncated: false });
+    }
+    if (call.url.includes("/diagnostics/warnings")) {
+      return json(bodies.warnings ?? { items: [] });
+    }
+    return json(bodies.clientAuth ?? { items: [], truncated: false });
+  });
+}
+
+const trace = {
+  policy: "step_up",
+  outcome: "step_up_required",
+  subject: "usr_acme",
+  reason: "acr_unmet",
+  decision_inputs:
+    '{"kind":"step_up","required_acr":"urn:ironauth:acr:mfa","achieved_acr":"urn:ironauth:acr:pwd"}',
+  occurred_at_unix_micros: 1_700_000_000_000_000,
+};
+
+describe("the diagnostics policy traces panel", () => {
+  it("scopes the read to the active tenant and environment and renders the traces", async () => {
+    activeScope.value = { tenantId: "ten_a", environmentId: "env_a" };
+    const calls = routeDiagnostics({ policyTraces: { items: [trace] } });
+    const root = mount(<DiagnosticsView />);
+    await flush();
+
+    const get = calls.find((call) =>
+      call.url.includes("/diagnostics/policy-traces"),
+    );
+    expect(get?.url).toContain(
+      "/v1/tenants/ten_a/environments/env_a/diagnostics/policy-traces",
+    );
+    expect(root.textContent).toContain("step_up");
+    expect(root.textContent).toContain("step_up_required");
+    expect(root.textContent).toContain("usr_acme");
+    expect(root.textContent).toContain("urn:ironauth:acr:mfa");
+  });
+
+  it("adds the policy query param when a policy is selected", async () => {
+    activeScope.value = { tenantId: "ten_a", environmentId: "env_a" };
+    const calls = routeDiagnostics({ policyTraces: { items: [trace] } });
+    const root = mount(<DiagnosticsView />);
+    await flush();
+
+    const select = root.querySelector(
+      "#diagnostics-policy",
+    ) as HTMLSelectElement;
+    select.value = "risk";
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+    await flush();
+
+    const filtered = calls.find((call) => call.url.includes("policy=risk"));
+    expect(filtered).toBeDefined();
+    expect(filtered?.url).toContain(
+      "/v1/tenants/ten_a/environments/env_a/diagnostics/policy-traces",
+    );
+  });
+
+  it("renders an attacker influenced trace field as inert text", async () => {
+    activeScope.value = { tenantId: "ten_a", environmentId: "env_a" };
+    const hostile = {
+      ...trace,
+      subject: "<script>evil()</script>",
+    };
+    routeDiagnostics({ policyTraces: { items: [hostile] } });
+    const root = mount(<DiagnosticsView />);
+    await flush();
+
+    expect(root.textContent).toContain("<script>evil()</script>");
+    expect(root.querySelector("script")).toBeNull();
+  });
+});
+
+describe("the diagnostics warnings panel", () => {
+  it("scopes the read to the active tenant and environment and groups by kind", async () => {
+    activeScope.value = { tenantId: "ten_a", environmentId: "env_a" };
+    const calls = routeDiagnostics({
+      warnings: {
+        items: [
+          {
+            kind: "connector_unavailable",
+            subject: "octa",
+            detail: "the upstream is unreachable (3 consecutive failures)",
+          },
+          {
+            kind: "token_size",
+            subject: "cli_acme",
+            detail: "2 recent ID token(s) exceeded the claim bloat threshold",
+          },
+        ],
+      },
+    });
+    const root = mount(<DiagnosticsView />);
+    await flush();
+
+    const get = calls.find((call) => call.url.includes("/diagnostics/warnings"));
+    expect(get?.url).toContain(
+      "/v1/tenants/ten_a/environments/env_a/diagnostics/warnings",
+    );
+    expect(root.textContent).toContain("connector_unavailable");
+    expect(root.textContent).toContain("octa");
+    expect(root.textContent).toContain("token_size");
+    expect(root.textContent).toContain("cli_acme");
+  });
+
+  it("shows an empty state when there are no warnings", async () => {
+    activeScope.value = { tenantId: "ten_a", environmentId: "env_a" };
+    routeDiagnostics({ warnings: { items: [] } });
+    const root = mount(<DiagnosticsView />);
+    await flush();
+
+    expect(root.textContent).toContain("No operational warnings");
+  });
+});

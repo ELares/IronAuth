@@ -1533,13 +1533,29 @@ async fn evaluate_step_up(
     let explicit_step_up = if requirement.is_empty() {
         None
     } else {
-        match step_up::evaluate(
+        let satisfaction = step_up::evaluate(
             &requirement,
             achieved,
             Some(session.auth_time_unix_micros),
             now_micros,
             &order,
-        ) {
+        );
+        // Record the step up evaluation as a policy trace for the M9 flow inspector, best
+        // effort and off the decision path (issue #91): the trace mirrors the SAME inputs
+        // and outcome the gate just decided, and its capture (verbosity gated, swallowed on
+        // error) never changes the decision below or any wire behavior.
+        crate::policy_trace::record_step_up_trace(
+            state,
+            scope,
+            Some(&subject.to_string()),
+            &requirement,
+            achieved,
+            Some(session.auth_time_unix_micros),
+            now_micros,
+            satisfaction,
+        )
+        .await;
+        match satisfaction {
             step_up::Satisfaction::Satisfied => None,
             step_up::Satisfaction::NeedsStepUp {
                 acr_unmet,

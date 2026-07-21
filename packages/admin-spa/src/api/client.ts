@@ -114,6 +114,19 @@ export type InitialAccessTokenCreated =
 export type ClientAuthDiagnosticView =
   components["schemas"]["ClientAuthDiagnosticView"];
 
+// The recorded policy decision trace the admin flow inspector reads (issue #91): the
+// step up, risk, and claim mapping decisions recorded off the request path. Re-exported
+// from the generated schema so the diagnostics view never hand maintains a shape the
+// management contract already owns. It carries ONLY the safe, non secret fields the
+// server projects (the closed policy and outcome, the blind subject handle, the bounded
+// reason, and the redacted safe field projection of the decision inputs as a JSON string).
+export type PolicyTraceView = components["schemas"]["PolicyTraceView"];
+
+// One computed operational warning the admin flow inspector reads (issue #91): a bounded
+// kind, the non secret subject it is about, and a safe detail. Computed LIVE by the server
+// from the connector health registry and the token size event sink.
+export type WarningItemView = components["schemas"]["WarningItemView"];
+
 export type ManagementClient = ReturnType<typeof createClient<paths>>;
 
 // A management call that failed carries the verbatim ErrorBody the server
@@ -923,6 +936,95 @@ export async function fetchClientAuthDiagnostics(
     throw new ManagementError(toErrorBody(error), response.status);
   }
   return { items: data?.items ?? [], truncated: data?.truncated ?? false };
+}
+
+// The optional filters the policy traces read narrows by. The two instants are unix
+// microseconds, matching the documented `since`/`until` query parameters; `policy` is one
+// of `step_up` / `risk` / `claim_mapping`; `subject` is a usr_ handle.
+export interface PolicyTracesFilter {
+  policy?: string;
+  subject?: string;
+  sinceUnixMicros?: number;
+  untilUnixMicros?: number;
+  limit?: number;
+}
+
+// A page of policy decision traces: the newest first rows plus whether the result hit the
+// limit (older matching traces left out), so the view can tell the operator to narrow the
+// window rather than silently dropping the tail.
+export interface PolicyTracesPage {
+  readonly items: PolicyTraceView[];
+  readonly truncated: boolean;
+}
+
+// Read the environment's recorded policy decision traces (operationId
+// getPolicyDecisionTraces). Scope injection: the active tenant and environment ids
+// substitute into the documented path, targeting
+// `/v1/tenants/<t>/environments/<e>/diagnostics/policy-traces`. Only the filters the caller
+// set are sent, so an empty filter reads the whole (bounded) scope window.
+export async function fetchPolicyTraces(
+  tenantId: string,
+  environmentId: string,
+  filter: PolicyTracesFilter = {},
+): Promise<PolicyTracesPage> {
+  const client = createManagementClient();
+  const query: {
+    policy?: string;
+    subject?: string;
+    since?: number;
+    until?: number;
+    limit?: number;
+  } = {};
+  if (filter.policy !== undefined && filter.policy !== "") {
+    query.policy = filter.policy;
+  }
+  if (filter.subject !== undefined && filter.subject !== "") {
+    query.subject = filter.subject;
+  }
+  if (filter.sinceUnixMicros !== undefined) {
+    query.since = filter.sinceUnixMicros;
+  }
+  if (filter.untilUnixMicros !== undefined) {
+    query.until = filter.untilUnixMicros;
+  }
+  if (filter.limit !== undefined) {
+    query.limit = filter.limit;
+  }
+  const { data, error, response } = await client.GET(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/policy-traces",
+    {
+      params: {
+        path: { tenant_id: tenantId, environment_id: environmentId },
+        query,
+      },
+    },
+  );
+  // A non 2xx is a failure even when openapi-fetch yields no error body (the same
+  // bodyless-non-2xx guard as the reads above), so it is never silently read as success.
+  if (error !== undefined || !response.ok) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return { items: data?.items ?? [], truncated: data?.truncated ?? false };
+}
+
+// Read the environment's operational warnings, computed live (operationId
+// getDiagnosticsWarnings). Scope injection: the active tenant and environment ids
+// substitute into the documented path, targeting
+// `/v1/tenants/<t>/environments/<e>/diagnostics/warnings`. There are no filters: the server
+// computes the current warnings from the connector health registry and the token size sink.
+export async function fetchDiagnosticsWarnings(
+  tenantId: string,
+  environmentId: string,
+): Promise<WarningItemView[]> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.GET(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/warnings",
+    { params: { path: { tenant_id: tenantId, environment_id: environmentId } } },
+  );
+  if (error !== undefined || !response.ok) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data?.items ?? [];
 }
 
 // ---- The users CRUD operations (issue #90, PR 5) ----------------------------

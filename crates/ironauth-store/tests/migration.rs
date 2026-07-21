@@ -494,8 +494,8 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
     );
     assert_eq!(
         report.already_applied(),
-        72,
-        "the production chain is exactly seventy two migrations (isolation, audit log, management \
+        73,
+        "the production chain is exactly seventy three migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -513,17 +513,18 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
          federation login state, enterprise inbound routing, upstream token vault, \
          guarded account links, account linking wiring, FedCM assertion nonces, third-party \
          risk signals, signup fraud review, advanced recovery modes, headless flows, branding, \
-         locale bundles, brand assets, diagnostic reason detail, diagnostics control read)"
+         locale bundles, brand assets, diagnostic reason detail, diagnostics control read, \
+         policy decision traces)"
     );
 
-    // The ledger holds exactly versions 1 through 72.
+    // The ledger holds exactly versions 1 through 73.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
             46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67,
-            68, 69, 70, 71, 72
+            68, 69, 70, 71, 72, 73
         ]
     );
     let phase_of = |version: i64| async move {
@@ -1512,6 +1513,43 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
             "the control-plane role must NOT hold {privilege} on client_auth_diagnostics (it only \
              reads the sink)"
         );
+    }
+
+    // The policy-decision-traces migration (issue #91, PR 3) is an EXPAND that adds the two M9
+    // diagnostics sinks (the traces and the token-size events). Each MUST enforce scope isolation
+    // (ENABLE and FORCE row-level security plus its (tenant, environment) policy), be append-only
+    // for the data-plane recorder (SELECT, INSERT, and the retention DELETE, never UPDATE), and be
+    // read-only for the control-plane admin view (SELECT only, never a write).
+    assert_eq!(phase_of(73).await, "expand");
+    for table in ["policy_decision_traces", "token_size_events"] {
+        assert!(
+            rls_enabled_and_forced(pool, table).await,
+            "{table} must ENABLE and FORCE row-level security"
+        );
+        assert!(
+            policy_exists(pool, table, &format!("{table}_tenant_isolation")).await,
+            "{table} must carry the (tenant, environment) isolation policy"
+        );
+        for privilege in ["SELECT", "INSERT", "DELETE"] {
+            assert!(
+                role_has_table_privilege(pool, "ironauth_app", table, privilege).await,
+                "the data-plane role must hold {privilege} on {table} (record and prune)"
+            );
+        }
+        assert!(
+            !role_has_table_privilege(pool, "ironauth_app", table, "UPDATE").await,
+            "the data-plane role must NOT hold UPDATE on {table} (a trace is never mutated)"
+        );
+        assert!(
+            role_has_table_privilege(pool, "ironauth_control", table, "SELECT").await,
+            "the control-plane role must hold SELECT on {table} (the M9 admin read)"
+        );
+        for privilege in ["INSERT", "UPDATE", "DELETE"] {
+            assert!(
+                !role_has_table_privilege(pool, "ironauth_control", table, privilege).await,
+                "the control-plane role must NOT hold {privilege} on {table} (it only reads)"
+            );
+        }
     }
 
     // The demo object never reaches a production database.
