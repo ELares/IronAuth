@@ -540,8 +540,13 @@ pub fn dry_run(input: &DryRunInput) -> DryRunProjection {
     };
     let mut steps = Vec::with_capacity(plan.len());
     for (index, &state) in plan.iter().enumerate() {
-        let projected =
-            step_projection(state, index == 0, outcome, &step_up_view, risk_view.as_ref());
+        let projected = step_projection(
+            state,
+            index == 0,
+            outcome,
+            &step_up_view,
+            risk_view.as_ref(),
+        );
         steps.push(DryRunStep {
             step: state,
             reached: projected.reached,

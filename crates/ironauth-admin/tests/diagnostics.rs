@@ -315,9 +315,13 @@ async fn seed_login_flow(harness: &Harness, scope: Scope) -> String {
                 // The serialized PersistedState at the login start state (opaque application
                 // JSON the inspector projects read only).
                 state: "{\"step\":\"identifier_password\"}",
-                submit_token: "seed-submit-token",
+                submit_token: "SEEDSUBMITTOKENSENTINEL",
                 transient_payload: None,
-                return_to: None,
+                // A resume URL carrying the RP's state and nonce: sensitive, and the observe
+                // response must never surface it (the projection is the redaction).
+                return_to: Some(
+                    "/authorize?client_id=rp&state=RETURNTOSTATESENTINEL&nonce=RETURNTONONCESENTINEL",
+                ),
                 contract_version: 1,
                 expires_at_unix_micros: common::FAR_FUTURE_MICROS,
             },
@@ -379,6 +383,19 @@ async fn the_flow_observe_read_projects_the_flow_read_only() {
     );
     // No policy traces recorded for this fresh flow's (absent) subject.
     assert!(value["traces"].as_array().expect("traces array").is_empty());
+    // The wire response NEVER surfaces the flow's submit token (the API CSRF handle) nor its
+    // return_to resume URL (which embeds the RP's state and nonce): the observe projection is the
+    // redaction, so a future field addition that leaked either would fail this guard.
+    for sentinel in [
+        "SEEDSUBMITTOKENSENTINEL",
+        "RETURNTOSTATESENTINEL",
+        "RETURNTONONCESENTINEL",
+    ] {
+        assert!(
+            !body.contains(sentinel),
+            "the observe response leaked {sentinel}: {body}"
+        );
+    }
 }
 
 #[tokio::test]
