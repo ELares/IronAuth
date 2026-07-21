@@ -223,15 +223,14 @@ pub struct AdminSpaConfig {
     /// this is a bounded identifier the browser reads from served config; it is
     /// never a credential. Unset leaves the console with no client to log in as.
     ///
-    /// STAGING NOTE (issue #90): the browser reads this (and the admin issuer and
-    /// management audience) from `<meta>` tags in the served console document. PR 2
-    /// ships the server-side verifying arm, the proxy, and the complete client login
-    /// code, all tested; DELIVERING these values into the served document and
-    /// embedding the real Vite console (PR 1 embeds a placeholder shell so the Rust
-    /// build stays green without a Node toolchain) is the staged integration that
-    /// makes the login runtime reachable and flips `admin_spa.enabled` on by default.
-    /// Until then this field has no server-side reader by design; it is consumed only
-    /// by the browser once that integration lands.
+    /// The browser reads this (and the admin issuer and management audience) from
+    /// `<meta>` tags in the served console document. Issue #323 wired that delivery:
+    /// the server embeds the real Vite console and INJECTS this value, HTML escaped,
+    /// into the served `index.html` at serve time (`ironauth_admin_ui::router` +
+    /// `serve_index`), so `loadConfig()` returns it and the Authorization Code + PKCE
+    /// login can start. Injected only when the OIDC bridge is configured (an admin
+    /// issuer scope plus a management audience); otherwise the tag stays empty and
+    /// sign in is unavailable. `admin_spa.enabled` remains off by default (opt in).
     pub console_client_id: Option<String>,
 
     /// The OPERATOR-SUBJECT ALLOWLIST (issue #90, PR 2): the OIDC `sub` values, in

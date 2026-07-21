@@ -4,16 +4,32 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>IronAuth admin console</title>
+
+    <!--
+      The deployment config surface (issue #90, PR 2). An embedded deploy may
+      leave the bases empty (the app then calls its own origin and reaches the
+      management API through the same origin proxy under /admin/api); a standalone
+      deploy points ironauth-issuer at the IronAuth public plane and
+      ironauth-management-base at the management proxy origin.
+
+      The console signs in via IronAuth's own OIDC as a PUBLIC client: set
+      ironauth-admin-issuer to the system environment's OIDC issuer (a same origin
+      path such as /t/<tenant>/e/<env> for the embedded deploy, or an absolute
+      issuer URL for a standalone one), ironauth-console-client-id to the public
+      client id, and ironauth-management-audience to the management API audience
+      the token is bound to. There are NO secrets here: the browser holds only the
+      short lived at+jwt it obtains through the login, never a client secret,
+      operator token, or management key.
+    -->
     <meta name="ironauth-issuer" content="" />
     <meta name="ironauth-management-base" content="" />
+    <meta name="ironauth-admin-issuer" content="" />
+    <meta name="ironauth-console-client-id" content="" />
+    <meta name="ironauth-management-audience" content="" />
+    <script type="module" crossorigin src="/admin/assets/index-DTCJVll_.js"></script>
+    <link rel="stylesheet" crossorigin href="/admin/assets/style-Da_LDJog.css">
   </head>
   <body>
     <div id="app"></div>
-    <p>
-      This is the committed placeholder shell that rust-embed embeds so the Rust
-      build stays green without a Node toolchain. The real admin console assets
-      are produced by the packages/admin-spa Vite build and embedded by the CI
-      admin-spa job. See crates/ironauth-admin-ui and packages/admin-spa/README.
-    </p>
   </body>
 </html>

@@ -343,6 +343,12 @@ jobs:
       - name: build (vite, content hashed external assets)
         working-directory: packages/admin-spa
         run: npm run build
+      - name: embed freshness (committed embed vs a fresh vite build)
+        # Rebuilds the console and fails if the committed embed under
+        # crates/ironauth-admin-ui/embedded/ drifts, so a plain cargo build (no
+        # Node) always ships the real, current console. The Vite build is byte
+        # reproducible, so this diff is stable rather than flaky.
+        run: scripts/admin-spa-embed.sh
 
   # The LIVE OIDF suite drive. Read the name: this job is NOT a merge gate and
   # must NOT be added to branch protection while it is unprovisioned.
