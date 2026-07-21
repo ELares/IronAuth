@@ -189,6 +189,25 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/signup-form": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get a per-environment, per-client signup form. */
+        get: operations["getSignupForm"];
+        /** Set (create or overwrite) a per-environment, per-client signup form. */
+        put: operations["setSignupForm"];
+        post?: never;
+        /** Delete a per-environment, per-client signup form. */
+        delete: operations["deleteSignupForm"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}/favicon": {
         parameters: {
             query?: never;
@@ -2912,6 +2931,17 @@ export interface components {
              */
             is_env_default?: boolean;
         };
+        /**
+         * @description The body to set (create or overwrite) a per-environment, per-client signup form (issue #87).
+         *
+         *     The field list is validated FAIL FAST against the scope's active trait schema before the
+         *     write: a field that names a nonexistent or type-incompatible trait, a rule that widens the
+         *     trait, a duplicate order, or a duplicate trait pointer is a loud 400 and nothing is stored.
+         */
+        SetSignupFormRequest: {
+            /** @description The form's fields. */
+            fields: components["schemas"]["SignupFormFieldView"][];
+        };
         /** @description The body to transition a user's lifecycle state (issue #52). */
         SetUserStateRequest: {
             /**
@@ -2927,6 +2957,43 @@ export interface components {
             scheduled_offboarding_at_unix_ms?: number | null;
             /** @description The target state. */
             state: components["schemas"]["UserStateView"];
+        };
+        /**
+         * @description One field of a signup form, in the management API request and response (issue #87). It
+         *     references an identity trait PATH (an RFC 6901 JSON Pointer), whether it is required, its
+         *     render order, the step it is collected at (`signup` or `later_login`), a NARROWING-ONLY rule
+         *     object (a subset of the trait schema's closed keyword vocabulary that may only tighten the
+         *     trait's constraint), and the numeric message id of its label. It carries no secret and no PII.
+         */
+        SignupFormFieldView: {
+            /**
+             * Format: int32
+             * @description The numeric message id of the field's label.
+             */
+            label_message_id: number;
+            /**
+             * Format: int32
+             * @description The render order within the form (a total, deterministic order).
+             */
+            order: number;
+            /** @description Whether the field must be supplied. */
+            required: boolean;
+            /**
+             * @description The narrowing-only rule set: a JSON object over the trait schema's closed keyword
+             *     vocabulary, each of which may only TIGHTEN the trait's constraint.
+             */
+            rules?: unknown;
+            /** @description The step the field is collected at: `signup` or `later_login`. */
+            step: string;
+            /** @description The RFC 6901 JSON Pointer naming the identity trait this field collects. */
+            trait_pointer: string;
+        };
+        /** @description A per-environment, per-client signup form, as returned by the management API (issue #87). */
+        SignupFormView: {
+            /** @description The authorize client id this form governs (the per-environment natural key). */
+            client_id: string;
+            /** @description The form's fields. */
+            fields: components["schemas"]["SignupFormFieldView"][];
         };
         /**
          * @description A signup-quarantine review-queue case (issue #82, PR 2), as the management API returns
@@ -4093,6 +4160,179 @@ export interface operations {
                 };
             };
             /** @description Sudo mode is disabled, or the scope is not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    getSignupForm: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The authorize client identifier the form governs */
+                client_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The signup form */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SignupFormView"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found (absent or in another scope) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    setSignupForm: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The authorize client identifier the form governs */
+                client_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetSignupFormRequest"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SignupFormView"];
+                };
+            };
+            /** @description A nonexistent or type-incompatible trait, a widening rule, or a duplicate field */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Environment not found or malformed client id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    deleteSignupForm: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The authorize client identifier the form governs */
+                client_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found (absent or in another scope) */
             404: {
                 headers: {
                     [name: string]: unknown;
