@@ -25,6 +25,7 @@ import { CommandPalette } from "./ui/CommandPalette";
 import { ErrorView } from "./ui/ErrorView";
 import { TenantDetail, TenantsList } from "./ui/TenantsView";
 import { EnvironmentDetail, EnvironmentsList } from "./ui/EnvironmentsView";
+import { UserDetail, UsersList } from "./ui/UsersView";
 
 // UI state lives in signals (the locked state primitive). `signedIn` flips true
 // once a token is held; `authError` surfaces a failed login verbatim.
@@ -77,8 +78,8 @@ function SignIn() {
   );
 }
 
-// A placeholder resource view for the sections not yet wired (Clients, Users,
-// Connectors land in PR5 and PR6). Tenants and Environments now render their real
+// A placeholder resource view for the sections not yet wired (Clients and
+// Connectors land in PR6). Tenants, Environments, and Users now render their real
 // CRUD surfaces below. The active scope is already resolved in the store, so each
 // remaining PR only swaps its body.
 function SectionView({ label }: { label: string }) {
@@ -105,7 +106,8 @@ function Routes() {
         component={EnvironmentDetail}
       />
       <Route path="/clients" component={() => <SectionView label="Clients" />} />
-      <Route path="/users" component={() => <SectionView label="Users" />} />
+      <Route path="/users" component={UsersList} />
+      <Route path="/users/:userId" component={UserDetail} />
       <Route
         path="/connectors"
         component={() => <SectionView label="Connectors" />}
