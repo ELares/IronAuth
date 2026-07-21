@@ -268,3 +268,194 @@ body {
   color: #fff;
   cursor: pointer;
 }
+
+/* The reusable CRUD resource surfaces (issue #90, PR 4): the tenants and
+ * environments list, detail, create form, and lifecycle actions all draw from
+ * these shared classes, so PR5 and PR6 inherit the same look. */
+.resource h2 {
+  margin-top: 0;
+}
+
+.resource-empty {
+  color: var(--muted);
+}
+
+.resource-loading {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--muted);
+}
+
+.resource-spinner {
+  width: 0.9rem;
+  height: 0.9rem;
+  border: 2px solid var(--line);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: resource-spin 0.8s linear infinite;
+}
+
+@keyframes resource-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.resource-list {
+  list-style: none;
+  margin: 1rem 0 0;
+  padding: 0;
+}
+
+.resource-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid var(--line);
+  border-radius: 0.4rem;
+  margin-bottom: 0.4rem;
+}
+
+.resource-link {
+  color: var(--accent);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.resource-link:hover {
+  text-decoration: underline;
+}
+
+.resource-id {
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.resource-status,
+.resource-kind {
+  margin-left: auto;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--muted);
+}
+
+.resource-status-suspended {
+  color: #a3341f;
+}
+
+.resource-back {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.resource-detail {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.3rem 1rem;
+  margin: 0.5rem 0 1rem;
+}
+
+.resource-detail dt {
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.resource-detail dd {
+  margin: 0;
+}
+
+.resource-guardrail {
+  display: contents;
+}
+
+.resource-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  max-width: 26rem;
+  margin: 1rem 0;
+  padding: 1rem;
+  border: 1px solid var(--line);
+  border-radius: 0.5rem;
+  background: #fbfbfe;
+}
+
+.resource-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.resource-field label {
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.resource-field input,
+.resource-field select {
+  font: inherit;
+  padding: 0.35rem 0.5rem;
+  border: 1px solid var(--line);
+  border-radius: 0.3rem;
+  background: #fff;
+  color: var(--ink);
+}
+
+.resource-field input:focus,
+.resource-field select:focus,
+.resource-btn:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.resource-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin: 0.5rem 0;
+}
+
+.resource-btn {
+  font: inherit;
+  padding: 0.4rem 0.8rem;
+  border: 1px solid var(--line);
+  border-radius: 0.4rem;
+  background: #fff;
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.resource-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.resource-btn-primary {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #fff;
+}
+
+.resource-btn-danger {
+  border-color: #a3341f;
+  color: #a3341f;
+}
+
+.resource-confirm {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.resource-confirm-prompt {
+  font-size: 0.85rem;
+  color: var(--ink);
+}
+
+.resource-success {
+  color: #1f6b3a;
+  margin: 0.5rem 0;
+}
