@@ -17,7 +17,7 @@ export interface FieldConstraints {
   minimum?: number | null;
   type?: string | null;
 }
-export type FlowStateTag = "identifier_password" | "registration_details" | "registration_ack" | "mfa_challenge" | "mfa_enroll" | "recovery_start" | "recovery_ack" | "federation_start" | "completed";
+export type FlowStateTag = "identifier_password" | "registration_details" | "registration_ack" | "mfa_challenge" | "mfa_enroll" | "progressive_profiling" | "recovery_start" | "recovery_ack" | "federation_start" | "completed";
 export type InputType = "text" | "password" | "email" | "tel" | "hidden" | "checkbox" | "submit";
 export type Journey = "login" | "registration" | "mfa" | "recovery" | "federation";
 export interface Message {
@@ -61,7 +61,7 @@ export const KNOWN_NODE_TYPES = ["input", "text"] as const;
 
 export const KNOWN_NODE_GROUPS = ["default", "password", "passkey", "totp", "email_otp", "sms_otp", "recovery_code", "oidc", "profile", "submit"] as const;
 
-export const KNOWN_STATES = ["identifier_password", "registration_details", "registration_ack", "mfa_challenge", "mfa_enroll", "recovery_start", "recovery_ack", "federation_start", "completed"] as const;
+export const KNOWN_STATES = ["identifier_password", "registration_details", "registration_ack", "mfa_challenge", "mfa_enroll", "progressive_profiling", "recovery_start", "recovery_ack", "federation_start", "completed"] as const;
 
 export const KNOWN_JOURNEYS = ["login", "registration", "mfa", "recovery", "federation"] as const;
 

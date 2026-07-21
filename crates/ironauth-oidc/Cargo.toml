@@ -226,6 +226,11 @@ name = "flow_signup_fields"
 path = "tests/flow_signup_fields.rs"
 required-features = ["testing"]
 
+[[test]]
+name = "flow_progressive_profiling"
+path = "tests/flow_progressive_profiling.rs"
+required-features = ["testing"]
+
 # The refresh-token grant end to end (issue #21): the graduated rotation policy
 # (public rotate every refresh, confidential only past the TTL threshold), HTTP-layer
 # reuse detection and family revocation, the offline_access consent rule for web

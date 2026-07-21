@@ -26,8 +26,8 @@
 //!   completion latch trips, so a registration is consumed ONLY on a genuine account create.
 
 use ironauth_store::{
-    ActorRef, AuthPath, CorrelationId, HumanId, RegisteredTraits, Scope, SignupFormConfig,
-    SignupQuarantineReason, SignupStep, TraitSchema, UserState,
+    ActorRef, AuthPath, CorrelationId, HumanId, RegisteredTraits, Scope, SignupQuarantineReason,
+    SignupStep, UserState,
 };
 
 use super::message::{self, Message, MessageId};
@@ -41,38 +41,6 @@ use crate::interaction;
 use crate::state::OidcState;
 use crate::util::epoch_micros;
 
-/// Load the environment's active signup form for a registration flow (issue #87): resolve the
-/// authorize client from the flow's `/authorize` resume target, read that client's active
-/// signup form, and compile the scope's active trait schema. Returns the config, the compiled
-/// schema, and the schema version (the version stamped on the created user's traits), or
-/// [`None`] when the flow has no client, the client has no form, there is no active schema, or
-/// any read faults (a form is a pure additive collection, never a hard block, so any absence
-/// degrades to collecting nothing).
-async fn load_signup_form(
-    state: &OidcState,
-    scope: Scope,
-    return_to: Option<&str>,
-) -> Option<(SignupFormConfig, TraitSchema, i32)> {
-    let client_id = interaction::parse_resume(return_to)?.client_id.to_string();
-    let record = state
-        .store()
-        .scoped(scope)
-        .signup_forms()
-        .get(&client_id)
-        .await
-        .ok()??;
-    let config = SignupFormConfig::from_fields_json(&record.fields_json).ok()?;
-    let active = state
-        .store()
-        .scoped(scope)
-        .trait_schemas()
-        .active()
-        .await
-        .ok()??;
-    let schema = TraitSchema::compile(&active.schema_json).ok()?;
-    Some((config, schema, active.version))
-}
-
 /// The signup field nodes for a freshly created registration flow (issue #87): the Signup-step
 /// fields of the client's active form, appended to the initial details form so the very NEXT
 /// flow created after a management write reflects the change (immediacy, no redeploy). Empty
@@ -82,7 +50,7 @@ pub(super) async fn signup_start_nodes(
     scope: Scope,
     return_to: Option<&str>,
 ) -> Vec<Node> {
-    match load_signup_form(state, scope, return_to).await {
+    match signup_fields::load_active_signup_form(state, scope, return_to).await {
         Some((config, schema, _)) => {
             signup_fields::signup_field_nodes(&config, &schema, SignupStep::Signup)
         }
@@ -289,7 +257,8 @@ pub(super) async fn advance_registration(
     // The client's active signup form (issue #87), loaded ONCE at the live scope so a
     // management write reflects on the next transition (immediacy). Its Signup-step fields are
     // appended to every details render and validated on the create attempt below.
-    let signup = load_signup_form(state, scope, record.return_to.as_deref()).await;
+    let signup =
+        signup_fields::load_active_signup_form(state, scope, record.return_to.as_deref()).await;
     // Build the details form PLUS the configured signup field nodes, with optional per field
     // validation messages attached. Ui ordering re-sorts by (group rank, sequence), so the
     // Profile group signup nodes always render after the identifier and password regardless of

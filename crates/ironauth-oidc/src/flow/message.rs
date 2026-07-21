@@ -201,6 +201,12 @@ pub const FEDERATION_CONTINUE_LABEL: MessageId = MessageId(1_060_002);
 /// field copy on the pointer while the numeric id registry stays finite. The default text is
 /// a neutral fallback for a client that does not localize.
 pub const SIGNUP_FIELD_LABEL: MessageId = MessageId(1_070_001);
+/// The progressive profiling submit button label (issue #87): the control that skips or submits
+/// the held later-login profiling step. A skip (an empty submit) still mints the session.
+pub const PROGRESSIVE_PROFILING_SUBMIT_LABEL: MessageId = MessageId(1_070_002);
+/// The progressive profiling prompt (issue #87): the leading copy that explains the optional
+/// later-login fields can be completed now or skipped. Informational only.
+pub const PROGRESSIVE_PROFILING_PROMPT: MessageId = MessageId(1_070_003);
 
 /// The login success note.
 pub const LOGIN_SUCCESS: MessageId = MessageId(1_500_001);
@@ -463,6 +469,21 @@ pub const REGISTRY: &[MessageSpec] = &[
         kind: MessageKind::Info,
         text: "Additional information",
         context_keys: &["field"],
+    },
+    MessageSpec {
+        id: PROGRESSIVE_PROFILING_SUBMIT_LABEL,
+        name: "progressive_profiling.submit.label",
+        kind: MessageKind::Info,
+        text: "Continue",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: PROGRESSIVE_PROFILING_PROMPT,
+        name: "progressive_profiling.prompt",
+        kind: MessageKind::Info,
+        text: "Help us complete your profile. You can fill in these details now or skip for \
+               now.",
+        context_keys: &[],
     },
     MessageSpec {
         id: LOGIN_SUCCESS,
