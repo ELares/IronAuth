@@ -151,6 +151,7 @@ pub struct BrowserCreateQuery {
 pub async fn flow_api_create(
     State(state): State<OidcState>,
     Path((tenant_id, environment_id, journey)): Path<(String, String, String)>,
+    headers: HeaderMap,
     Json(body): Json<ApiCreateBody>,
 ) -> Response {
     if !state.flows_enabled() {
@@ -164,6 +165,8 @@ pub async fn flow_api_create(
     let Some(journey) = creation_journey(&journey) else {
         return error_json(FlowError::NotFound);
     };
+    // The headers carry the session cookie the Consent journey (issue #88) reads to resolve the
+    // subject for its render-time scope diff; the other journeys ignore them.
     match create_flow(
         &state,
         scope,
@@ -172,6 +175,7 @@ pub async fn flow_api_create(
         body.return_to.as_deref(),
         body.transient_payload.as_ref(),
         body.connector.as_deref(),
+        &headers,
     )
     .await
     {
@@ -309,6 +313,7 @@ pub async fn flow_browser_get(
         query.return_to.as_deref(),
         None,
         query.connector.as_deref(),
+        &headers,
     )
     .await
     {

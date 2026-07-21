@@ -494,8 +494,8 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
     );
     assert_eq!(
         report.already_applied(),
-        75,
-        "the production chain is exactly seventy five migrations (isolation, audit log, management \
+        76,
+        "the production chain is exactly seventy six migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -514,17 +514,17 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
          guarded account links, account linking wiring, FedCM assertion nonces, third-party \
          risk signals, signup fraud review, advanced recovery modes, headless flows, branding, \
          locale bundles, brand assets, diagnostic reason detail, diagnostics control read, \
-         policy decision traces, flows control read, signup forms)"
+         policy decision traces, flows control read, signup forms, consent lockdown)"
     );
 
-    // The ledger holds exactly versions 1 through 75.
+    // The ledger holds exactly versions 1 through 76.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
             46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67,
-            68, 69, 70, 71, 72, 73, 74, 75
+            68, 69, 70, 71, 72, 73, 74, 75, 76
         ]
     );
     let phase_of = |version: i64| async move {
@@ -1586,6 +1586,45 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
     assert!(
         !role_has_table_privilege(pool, "ironauth_app", "signup_forms", "INSERT").await,
         "the data-plane role must NOT hold INSERT on signup_forms (the control plane owns writes)"
+    );
+
+    // Revocable consent and first-party classification (issue #88, migration 0076): the
+    // additive columns exist with the right types and the column-grant split holds.
+    assert!(
+        column_exists(pool, "consents", "revoked_at").await,
+        "consents.revoked_at exists after 0076"
+    );
+    assert!(
+        column_exists(pool, "clients", "first_party").await,
+        "clients.first_party exists after 0076"
+    );
+    assert_eq!(
+        column_data_type(pool, "clients", "first_party").await,
+        "boolean",
+        "clients.first_party is a boolean"
+    );
+    // consents.revoked_at is a self-service kill switch: the data-plane role flips exactly this
+    // column (through its existing table SELECT), and holds no wider write. A revoked grant is
+    // read as absent, so the app must be able to set revoked_at but nothing else new.
+    assert!(
+        role_has_column_privilege(pool, "ironauth_app", "consents", "revoked_at", "UPDATE").await,
+        "the data-plane role must hold column-scoped UPDATE on consents.revoked_at (self-service revoke)"
+    );
+    assert!(
+        !role_has_column_privilege(pool, "ironauth_app", "consents", "subject", "UPDATE").await,
+        "the data-plane role must NOT hold UPDATE on consents.subject (no widening past revoked_at)"
+    );
+    // clients.first_party is the lockdown carve-out flag: control-plane write-only, exactly like
+    // quarantined and verified_at, so a compromised data plane can never self-classify a client as
+    // first-party to defeat the PR3 lockdown gate.
+    assert!(
+        role_has_column_privilege(pool, "ironauth_control", "clients", "first_party", "UPDATE")
+            .await,
+        "the control role must hold column-scoped UPDATE on clients.first_party"
+    );
+    assert!(
+        !role_has_column_privilege(pool, "ironauth_app", "clients", "first_party", "UPDATE").await,
+        "the data-plane role must NOT hold UPDATE on clients.first_party (no self-classification)"
     );
 
     // The demo object never reaches a production database.

@@ -31,15 +31,19 @@
 //! `redirect_uri` (RFC 6749), with no partial grant and no response-mode logic duplicated
 //! here.
 
+use axum::http::HeaderMap;
 use serde_json::Value;
 
-use ironauth_store::{ActorRef, CorrelationId, FlowRecord, Scope};
+use ironauth_store::{ActorRef, CorrelationId, FlowRecord, GrantedConsent, Scope};
 
 use super::message::{self, Message, MessageContext};
 use super::model::{InputType, Node, NodeAttributes, NodeGroup, Transport};
 use super::{FlowError, Submission};
+use crate::authorize::consent_expired;
 use crate::interaction;
+use crate::scope_claims::parse_scope_set;
 use crate::state::OidcState;
+use crate::util::epoch_micros;
 
 /// The requesting client's identity as the consent screen renders it (issue #88): the display
 /// name, the optional registered logo, and whether the client has been verified. Assembled from
@@ -238,12 +242,21 @@ fn scope_message(token: &str) -> Message {
 /// Returns an EMPTY node set on any absence (no resume, cross-scope, or an unreadable client),
 /// so a consent flow with no resolvable context renders nothing rather than faulting; the
 /// decision path re-derives the context server authoritatively.
+///
+/// Scope-diff (issue #88, PR 2): when the authenticated subject already holds an ACTIVE
+/// (non-revoked, non-expired) prior grant for this client that covers SOME of the requested
+/// scopes, only the NEW scopes (requested minus already-granted) are rendered, so a client that
+/// ADDS scopes prompts for the added ones alone. A revoked or expired prior grant is treated as
+/// absent (`granted_ref` hides the revoked; the expiry check drops the expired), so those
+/// re-prompt for the full requested scope. The subject is resolved from the session cookie in
+/// `headers`; with no session the full scope is rendered (a safe over-prompt).
 pub(super) async fn consent_start_nodes(
     state: &OidcState,
     scope: Scope,
     transport: Transport,
     flow_id: &str,
     return_to: Option<&str>,
+    headers: &HeaderMap,
 ) -> Vec<Node> {
     let Some(resume) = interaction::parse_resume(return_to) else {
         return Vec::new();
@@ -265,8 +278,86 @@ pub(super) async fn consent_start_nodes(
         logo_uri: record.logo_uri,
         verified: record.verified_at_unix_micros.is_some(),
     };
-    let scopes = requested_scopes(resume.oauth_scope.as_deref());
-    consent_nodes(transport, flow_id, &client, &scopes)
+    let requested = requested_scopes(resume.oauth_scope.as_deref());
+    // The scope diff: render only the scopes an active prior grant does not already cover. An
+    // absent session or prior grant leaves the full requested set (a safe over-prompt).
+    let render_scopes = match interaction::resolve_session(state, scope, headers).await {
+        Some(session) => {
+            let prior = active_prior_grant(
+                state,
+                scope,
+                &session.subject,
+                &resume.client_id.to_string(),
+            )
+            .await;
+            match prior {
+                Some(grant) => new_scopes(&requested, grant.granted_scope.as_deref()),
+                None => requested,
+            }
+        }
+        None => requested,
+    };
+    consent_nodes(transport, flow_id, &client, &render_scopes)
+}
+
+/// The subject's ACTIVE prior consent grant for the client (issue #88), or [`None`] when there
+/// is none to reuse. Returns the recorded grant only when it is present (a revoked grant is
+/// already hidden by [`granted_ref`](ironauth_store::ConsentRepo::granted_ref)'s revoked
+/// predicate) AND not expired at the current clock. Both the render-time scope diff and the
+/// allow-time granted-scope union read through this, so a re-prompt shows only the new scopes and
+/// an allow never shrinks or resurrects a lapsed or revoked grant.
+async fn active_prior_grant(
+    state: &OidcState,
+    scope: Scope,
+    subject: &str,
+    client_id: &str,
+) -> Option<GrantedConsent> {
+    let recorded = state
+        .store()
+        .scoped(scope)
+        .consents()
+        .granted_ref(subject, client_id)
+        .await
+        .ok()??;
+    if consent_expired(&recorded, epoch_micros(state.now())) {
+        return None;
+    }
+    Some(recorded)
+}
+
+/// The requested scopes MINUS those an active prior grant already covers (issue #88): the
+/// scope-diff a re-prompt renders. Preserves request order, so the new scopes appear in the
+/// order the client asked for them. With no prior granted scope, every requested scope is new.
+fn new_scopes(requested: &[String], prior_granted: Option<&str>) -> Vec<String> {
+    let granted = parse_scope_set(prior_granted);
+    requested
+        .iter()
+        .filter(|token| !granted.contains(*token))
+        .cloned()
+        .collect()
+}
+
+/// The granted scope to RECORD on an allow (issue #88): the requested scope UNIONED with an
+/// active prior grant, so a scope-diff allow records granted union new and NEVER shrinks an
+/// existing grant. Preserves request order, then appends any prior-granted token the request did
+/// not carry. [`None`] only when the union is empty. In the common case the request already
+/// contains the previously granted scopes, so the union equals the request verbatim.
+fn union_granted_scope(requested: Option<&str>, prior_granted: Option<&str>) -> Option<String> {
+    let mut tokens: Vec<String> = requested
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect();
+    for token in prior_granted.unwrap_or_default().split_whitespace() {
+        if !tokens.iter().any(|existing| existing == token) {
+            tokens.push(token.to_owned());
+        }
+    }
+    if tokens.is_empty() {
+        None
+    } else {
+        Some(tokens.join(" "))
+    }
 }
 
 /// The requested OAuth scope tokens from the resume's `scope` value, in request order (issue
@@ -328,13 +419,26 @@ pub(super) async fn advance_consent(
     // Reuse the bootstrap page's remembered-consent TTL verbatim: a `remembered`-mode client's
     // consent lapses after the configured TTL; an `explicit`/`implicit` one never expires.
     let expires_at = crate::consent::remembered_expiry(state, scope, &resume.client_id).await;
+    // Record the UNION of the requested scope and any active prior grant (issue #88), so a
+    // scope-diff allow (where only the new scopes were prompted) persists granted union new
+    // rather than shrinking the existing grant to just the request. In the common case the
+    // request already contains the previously granted scopes, so the union equals the request.
+    let prior = active_prior_grant(
+        state,
+        scope,
+        &session.subject,
+        &resume.client_id.to_string(),
+    )
+    .await
+    .and_then(|grant| grant.granted_scope);
+    let recorded_scope = union_granted_scope(resume.oauth_scope.as_deref(), prior.as_deref());
     Ok(ConsentStep::Allow {
         redirect_to: return_to.to_owned(),
         grant: PendingGrant {
             actor,
             subject: session.subject,
             client_id: resume.client_id.to_string(),
-            oauth_scope: resume.oauth_scope.clone(),
+            oauth_scope: recorded_scope,
             expires_at,
         },
     })
@@ -525,5 +629,46 @@ mod tests {
             deny_redirect("/authorize?client_id=cli_x&scope=openid"),
             "/authorize?client_id=cli_x&scope=openid&consent_denied=1"
         );
+    }
+
+    #[test]
+    fn new_scopes_subtracts_the_already_granted_and_keeps_request_order() {
+        let requested = vec![
+            "openid".to_owned(),
+            "profile".to_owned(),
+            "email".to_owned(),
+        ];
+        // A prior grant covering `openid profile` leaves only the new `email`.
+        assert_eq!(
+            new_scopes(&requested, Some("profile openid")),
+            vec!["email".to_owned()],
+            "only the scopes not already granted render, in request order"
+        );
+        // No prior grant: every requested scope is new.
+        assert_eq!(new_scopes(&requested, None), requested);
+        // A prior grant covering everything leaves nothing to prompt.
+        assert!(new_scopes(&requested, Some("openid profile email")).is_empty());
+    }
+
+    #[test]
+    fn union_granted_scope_never_shrinks_an_existing_grant() {
+        // The request already contains the prior grant: the union is the request verbatim.
+        assert_eq!(
+            union_granted_scope(Some("openid profile email"), Some("openid profile")).as_deref(),
+            Some("openid profile email")
+        );
+        // The request DROPS a previously granted scope: the union keeps it (no shrink), request
+        // order first then the appended prior scope.
+        assert_eq!(
+            union_granted_scope(Some("email"), Some("openid profile")).as_deref(),
+            Some("email openid profile")
+        );
+        // No prior grant: the union is the request.
+        assert_eq!(
+            union_granted_scope(Some("openid"), None).as_deref(),
+            Some("openid")
+        );
+        // Both empty: an empty union is None.
+        assert_eq!(union_granted_scope(None, None), None);
     }
 }

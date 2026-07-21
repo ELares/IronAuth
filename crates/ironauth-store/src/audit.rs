@@ -365,6 +365,11 @@ pub enum Action {
     UserSessionsRevokeAll,
     /// A subject granted consent to a client (issue #20).
     ConsentGrant,
+    /// A recorded consent grant was revoked (issue #88): its `revoked_at` was stamped
+    /// so the authorization gate treats it as absent and re-prompts. Written by the
+    /// self-service and admin revocation surfaces in the same transaction as the
+    /// revocation.
+    ConsentRevoke,
     /// A per-environment signing key was provisioned (issue #19). Covers both a
     /// day-one key and a manually rotated-in successor.
     SigningKeyProvision,
@@ -989,6 +994,7 @@ impl Action {
             Action::SessionsBulkRevoke => "sessions.bulk_revoke",
             Action::UserSessionsRevokeAll => "user.sessions.revoke_all",
             Action::ConsentGrant => "consent.grant",
+            Action::ConsentRevoke => "consent.revoke",
             Action::SigningKeyProvision => "signing_key.provision",
             Action::ResourceServerRegister => "resource_server.register",
             Action::RefreshTokenIssue => "refresh_token.issue",
