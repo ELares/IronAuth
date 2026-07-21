@@ -310,6 +310,18 @@
         }
       ]
     },
+    "ConsentLockdownConfig": {
+      "additionalProperties": false,
+      "description": "The consent-lockdown policy (issue #88, PR 3): the tunable hardening applied at the\nauthorization endpoint to an UNVERIFIED (quarantined) client that requests a SENSITIVE\nscope. Today such a client, once the user consents, can still receive a sensitive scope;\nthe lockdown BLOCKS that request instead unless the client is classified first-party or\nhas been verified. The sensitive-scope set is REUSED from\n[`QuarantineConfig::sensitive_scopes`] (a single source of truth), so an operator tunes\nONE denylist for both the quarantined-account strip and this gate. Secure by default (the\ngate is on); the escapes both already exist -- verify the client (which lifts\n`quarantined`) or mark it first-party -- so a default-on gate never traps a legitimate\nintegration, consistent with the tunability principle (env-dependent posture is a setting\nwith a safe default, never a baked-in one-way choice).",
+      "properties": {
+        "gate_unverified_sensitive_scopes": {
+          "default": true,
+          "description": "Whether an UNVERIFIED (quarantined) client that is NOT classified first-party is\nBLOCKED from an authorization request whose effective scope intersects the sensitive\ndenylist (`oidc.quarantine.sensitive_scopes`). Default `true`: such a request is\nrefused with `access_denied` at the validated `redirect_uri` rather than proceeding to\nconsent and minting a sensitive scope. The escapes both already exist -- verify the\nclient (which lifts `quarantined`) or set its `first_party` classification -- so the\nsafe default never strands a legitimate client. Set it to `false` to restore the prior\nbehavior (the request proceeds to the consent screen as before).",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "DatabaseConfig": {
       "additionalProperties": false,
       "description": "Primary database settings.",
@@ -817,6 +829,13 @@
           "default": false,
           "description": "Copy the scope-derived standard claims into the ID token (issue #15). The\nspec-conform default (`false`) places scope-derived claims (`profile`,\n`email`, `address`, `phone`) at the `UserInfo` endpoint and keeps the ID\ntoken lean, per OIDC Core 5.4. Setting this `true` additionally copies those\nclaims into the ID token for legacy relying parties that never call\n`UserInfo`; that placement is explicitly NON-conform (it is the\nnode-oidc-provider `conformIdTokenClaims = false` behavior) and is documented\nas such. This is a promotable per-environment setting: it appears in config\nsnapshots and rides the M5 promotion pipeline; the process value is the\ndeployment default until per-environment overrides land.",
           "type": "boolean"
+        },
+        "consent_lockdown": {
+          "$ref": "#/$defs/ConsentLockdownConfig",
+          "default": {
+            "gate_unverified_sensitive_scopes": true
+          },
+          "description": "The consent-lockdown policy (issue #88, PR 3): the tunable hardening applied to an\nUNVERIFIED (quarantined) client that requests a SENSITIVE scope at the authorization\nendpoint. On by default; the sensitive-scope set is REUSED from [`QuarantineConfig`]\n(a single source of truth), and the escapes (verify the client, which lifts\n`quarantined`, or mark it first-party) already exist, so the safe default never\nstrands a legitimate integration. See [`ConsentLockdownConfig`]."
         },
         "default_access_token_format": {
           "$ref": "#/$defs/TokenFormat",
@@ -2448,6 +2467,9 @@
         "client_assertion_max_skew_secs": 60,
         "client_credentials_default_audience": "client_id",
         "conform_id_token_claims": false,
+        "consent_lockdown": {
+          "gate_unverified_sensitive_scopes": true
+        },
         "default_access_token_format": "at_jwt",
         "device_code_ttl_secs": 600,
         "device_poll_interval_secs": 5,

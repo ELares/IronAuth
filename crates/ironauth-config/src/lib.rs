@@ -1486,6 +1486,14 @@ pub struct OidcConfig {
     /// admin/management scopes. See [`QuarantineConfig`].
     pub quarantine: QuarantineConfig,
 
+    /// The consent-lockdown policy (issue #88, PR 3): the tunable hardening applied to an
+    /// UNVERIFIED (quarantined) client that requests a SENSITIVE scope at the authorization
+    /// endpoint. On by default; the sensitive-scope set is REUSED from [`QuarantineConfig`]
+    /// (a single source of truth), and the escapes (verify the client, which lifts
+    /// `quarantined`, or mark it first-party) already exist, so the safe default never
+    /// strands a legitimate integration. See [`ConsentLockdownConfig`].
+    pub consent_lockdown: ConsentLockdownConfig,
+
     /// The advanced-recovery-modes policy (issue #82, PR 3): the three mode sub-toggles under
     /// the single `advanced-recovery` experimental ack, the trusted-contact confirmation
     /// threshold, and the registered IDV providers. Consulted only when the
@@ -1908,6 +1916,7 @@ impl Default for OidcConfig {
             regulation: RegulationConfig::default(),
             risk: RiskConfig::default(),
             quarantine: QuarantineConfig::default(),
+            consent_lockdown: ConsentLockdownConfig::default(),
             advanced_recovery: AdvancedRecoveryConfig::default(),
             registration_abuse: RegistrationAbuseConfig::default(),
             registration_max_clients: 100,
@@ -2593,6 +2602,39 @@ impl QuarantineConfig {
                         rest.starts_with(':') || rest.starts_with('.') || rest.starts_with('/')
                     }))
         })
+    }
+}
+
+/// The consent-lockdown policy (issue #88, PR 3): the tunable hardening applied at the
+/// authorization endpoint to an UNVERIFIED (quarantined) client that requests a SENSITIVE
+/// scope. Today such a client, once the user consents, can still receive a sensitive scope;
+/// the lockdown BLOCKS that request instead unless the client is classified first-party or
+/// has been verified. The sensitive-scope set is REUSED from
+/// [`QuarantineConfig::sensitive_scopes`] (a single source of truth), so an operator tunes
+/// ONE denylist for both the quarantined-account strip and this gate. Secure by default (the
+/// gate is on); the escapes both already exist -- verify the client (which lifts
+/// `quarantined`) or mark it first-party -- so a default-on gate never traps a legitimate
+/// integration, consistent with the tunability principle (env-dependent posture is a setting
+/// with a safe default, never a baked-in one-way choice).
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct ConsentLockdownConfig {
+    /// Whether an UNVERIFIED (quarantined) client that is NOT classified first-party is
+    /// BLOCKED from an authorization request whose effective scope intersects the sensitive
+    /// denylist (`oidc.quarantine.sensitive_scopes`). Default `true`: such a request is
+    /// refused with `access_denied` at the validated `redirect_uri` rather than proceeding to
+    /// consent and minting a sensitive scope. The escapes both already exist -- verify the
+    /// client (which lifts `quarantined`) or set its `first_party` classification -- so the
+    /// safe default never strands a legitimate client. Set it to `false` to restore the prior
+    /// behavior (the request proceeds to the consent screen as before).
+    pub gate_unverified_sensitive_scopes: bool,
+}
+
+impl Default for ConsentLockdownConfig {
+    fn default() -> Self {
+        Self {
+            gate_unverified_sensitive_scopes: true,
+        }
     }
 }
 
@@ -5506,6 +5548,50 @@ mod tests {
         assert_eq!(
             tuned.oidc.quarantine.sensitive_scopes,
             vec!["offline_access".to_owned(), "payments".to_owned()]
+        );
+    }
+
+    // The consent-lockdown gate (issue #88, PR 3) is ON by default, round-trips through the
+    // [oidc.consent_lockdown] table, and a config that omits the key inherits the safe default.
+    #[test]
+    fn consent_lockdown_config_defaults_and_parses() {
+        let default = Config::from_toml_str("", "<inline>")
+            .expect("empty config is valid")
+            .config;
+        assert!(
+            default
+                .oidc
+                .consent_lockdown
+                .gate_unverified_sensitive_scopes,
+            "the unverified-sensitive-scope gate defaults ON"
+        );
+
+        // A config that names [oidc.quarantine] but OMITS [oidc.consent_lockdown] still
+        // inherits the safe default (the gate stays on).
+        let other_section = Config::from_toml_str(
+            "[oidc.quarantine]\nsensitive_scopes = [\"admin\"]\n",
+            "<inline>",
+        )
+        .expect("config with an unrelated oidc section is valid")
+        .config;
+        assert!(
+            other_section
+                .oidc
+                .consent_lockdown
+                .gate_unverified_sensitive_scopes,
+            "omitting the section keeps the gate on"
+        );
+
+        // The gate is tunable OFF per environment and round-trips.
+        let tuned = Config::from_toml_str(
+            "[oidc.consent_lockdown]\ngate_unverified_sensitive_scopes = false\n",
+            "<inline>",
+        )
+        .expect("tuned config is valid")
+        .config;
+        assert!(
+            !tuned.oidc.consent_lockdown.gate_unverified_sensitive_scopes,
+            "the gate can be turned off"
         );
     }
 

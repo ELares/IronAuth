@@ -390,6 +390,16 @@ name = "signup_quarantine"
 path = "tests/signup_quarantine.rs"
 required-features = ["testing"]
 
+# Consent lockdown, unverified-sensitive-scope gate (issue #88, PR 3): an UNVERIFIED
+# (quarantined), non-first-party client requesting a SENSITIVE scope is BLOCKED with
+# access_denied at the validated redirect_uri (ahead of the recorded-consent fast path), while
+# a non-sensitive scope, a first-party client, a verified client, or the gate turned off all
+# proceed as before. Needs a real database.
+[[test]]
+name = "consent_lockdown"
+path = "tests/consent_lockdown.rs"
+required-features = ["testing"]
+
 # Advanced recovery modes (issue #82, PR 3): admin-approved, trusted-contact, and IDV-gated
 # recovery each complete THROUGH the #81 delay window and downgrade invariant; the IDV callback
 # is a single-use, case-bound, JOSE-verified signed callback driven by an in-repo fixture

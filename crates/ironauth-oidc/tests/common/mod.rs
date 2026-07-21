@@ -2283,6 +2283,26 @@ impl Harness {
         .expect("update client quarantine");
     }
 
+    /// Classify a client as first-party (or not) on the `clients.first_party` column (issue
+    /// #88), for tests that must exercise the consent-lockdown first-party carve-out. The
+    /// column is CONTROL-PLANE-only writable (issue #88 grants `UPDATE(first_party)` to
+    /// `ironauth_control`), so this runs through the owner pool (the migration/provisioning
+    /// connection), mirroring [`Self::set_client_quarantined`]. The value the consent
+    /// lockdown reads is the SAME `clients.first_party` column.
+    pub async fn set_client_first_party(&self, client_id: &ClientId, first_party: bool) {
+        sqlx::query(
+            "UPDATE clients SET first_party = $1 \
+             WHERE id = $2 AND tenant_id = $3 AND environment_id = $4",
+        )
+        .bind(first_party)
+        .bind(client_id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .execute(self.db.owner_pool())
+        .await
+        .expect("update client first_party");
+    }
+
     /// Additionally arm the signup fraud-review queue (issue #82, PR 2) on the CURRENT
     /// state and rebuild the protocol router, COMPOSING with an already-armed feature such
     /// as FedCM (unlike [`Self::enable_signup_quarantine`], which builds a fresh default
