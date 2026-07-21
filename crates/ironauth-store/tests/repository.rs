@@ -615,7 +615,11 @@ async fn policy_decision_traces_round_trip_and_filter() {
         })
         .await
         .expect("query alice");
-    assert_eq!(alice.len(), 2, "the subject filter narrows to alice's traces");
+    assert_eq!(
+        alice.len(),
+        2,
+        "the subject filter narrows to alice's traces"
+    );
 }
 
 #[tokio::test]

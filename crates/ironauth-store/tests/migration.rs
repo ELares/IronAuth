@@ -1515,6 +1515,43 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
         );
     }
 
+    // The policy-decision-traces migration (issue #91, PR 3) is an EXPAND that adds the two M9
+    // diagnostics sinks (the traces and the token-size events). Each MUST enforce scope isolation
+    // (ENABLE and FORCE row-level security plus its (tenant, environment) policy), be append-only
+    // for the data-plane recorder (SELECT, INSERT, and the retention DELETE, never UPDATE), and be
+    // read-only for the control-plane admin view (SELECT only, never a write).
+    assert_eq!(phase_of(73).await, "expand");
+    for table in ["policy_decision_traces", "token_size_events"] {
+        assert!(
+            rls_enabled_and_forced(pool, table).await,
+            "{table} must ENABLE and FORCE row-level security"
+        );
+        assert!(
+            policy_exists(pool, table, &format!("{table}_tenant_isolation")).await,
+            "{table} must carry the (tenant, environment) isolation policy"
+        );
+        for privilege in ["SELECT", "INSERT", "DELETE"] {
+            assert!(
+                role_has_table_privilege(pool, "ironauth_app", table, privilege).await,
+                "the data-plane role must hold {privilege} on {table} (record and prune)"
+            );
+        }
+        assert!(
+            !role_has_table_privilege(pool, "ironauth_app", table, "UPDATE").await,
+            "the data-plane role must NOT hold UPDATE on {table} (a trace is never mutated)"
+        );
+        assert!(
+            role_has_table_privilege(pool, "ironauth_control", table, "SELECT").await,
+            "the control-plane role must hold SELECT on {table} (the M9 admin read)"
+        );
+        for privilege in ["INSERT", "UPDATE", "DELETE"] {
+            assert!(
+                !role_has_table_privilege(pool, "ironauth_control", table, privilege).await,
+                "the control-plane role must NOT hold {privilege} on {table} (it only reads)"
+            );
+        }
+    }
+
     // The demo object never reaches a production database.
     assert!(
         !table_exists(pool, "migration_demo").await,

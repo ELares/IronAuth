@@ -9866,11 +9866,15 @@ pub struct PolicyTraceSignal {
 /// it into the trace row's `decision_inputs` jsonb.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyDecisionInputs {
-    /// The step up requirement evaluation inputs: the acr floor and achieved acr (server
-    /// vocabulary, never PII), the auth age window and the derived auth age, and which
-    /// dimensions were unmet.
+    /// The step up requirement evaluation inputs: the acr floor and achieved acr, the auth age
+    /// window and the derived auth age, and which dimensions were unmet. These are acr tokens and
+    /// bounded integers, never a claim value, a token, or a secret. The required acr may fold a
+    /// value the client itself sent in its own `acr_values` request parameter (its own request
+    /// input, readable only within its own tenant and environment, bounded by the request param
+    /// limit), so it is not strictly a fixed server vocabulary, but it can carry no PII or secret.
     StepUp {
-        /// The required acr floor, if any (a server acr value, never PII).
+        /// The required acr floor, if any: a server acr value, or an acr token the client sent in
+        /// its own `acr_values` request. Never a claim value, a token, or a secret.
         required_acr: Option<String>,
         /// The achieved acr the recorded authentication reached (a server acr value).
         achieved_acr: String,
