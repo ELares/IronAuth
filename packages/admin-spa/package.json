@@ -8,7 +8,8 @@
   "scripts": {
     "codegen": "openapi-typescript ../../docs/openapi/management.json -o src/api/management.gen.ts",
     "typecheck": "tsc --noEmit",
-    "build": "vite build"
+    "build": "vite build",
+    "test": "vitest run"
   },
   "dependencies": {
     "@preact/signals": "^2.0.1",
@@ -18,9 +19,11 @@
   },
   "devDependencies": {
     "@preact/preset-vite": "^2.9.4",
+    "jsdom": "^25.0.1",
     "openapi-typescript": "^7.5.0",
     "typescript": "5.6.3",
-    "vite": "^6.0.7"
+    "vite": "^6.0.7",
+    "vitest": "^2.1.9"
   },
   "engines": {
     "node": ">=20"

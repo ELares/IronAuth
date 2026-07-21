@@ -37,9 +37,23 @@ function redirectUri(): string {
   return `${window.location.origin}${REDIRECT_PATH}`;
 }
 
+// Options for a re-authentication (issue #90, PR 3). A sudo mutation that
+// returned an RFC 9470 `max_age` challenge (issue #73) needs a FRESH login: the
+// console re-runs the same Authorization Code + PKCE flow but adds `max_age` (the
+// server told us how fresh) and `prompt=login` (force a fresh credential
+// presentation rather than a silent single sign on reuse).
+export interface LoginOptions {
+  // Seconds: the maximum authentication age the mutation requires. Sent as the
+  // OIDC `max_age` request parameter.
+  maxAge?: number;
+  // The OIDC `prompt` value, for example `login` to force re-authentication.
+  prompt?: string;
+}
+
 // Start the login: redirect the browser to the admin issuer's authorization
-// endpoint with a fresh PKCE challenge and CSRF state.
-export async function beginLogin(): Promise<void> {
+// endpoint with a fresh PKCE challenge and CSRF state. With options, this is the
+// sudo re-authentication (a fresher credential no older than `maxAge`).
+export async function beginLogin(options: LoginOptions = {}): Promise<void> {
   const config = loadConfig();
   const pkce = await createPkce();
   const state = randomState();
@@ -58,6 +72,12 @@ export async function beginLogin(): Promise<void> {
   });
   if (config.managementAudience !== "") {
     params.set("resource", config.managementAudience);
+  }
+  if (options.maxAge !== undefined) {
+    params.set("max_age", String(options.maxAge));
+  }
+  if (options.prompt !== undefined && options.prompt !== "") {
+    params.set("prompt", options.prompt);
   }
   window.location.assign(`${discovery.authorization_endpoint}?${params.toString()}`);
 }

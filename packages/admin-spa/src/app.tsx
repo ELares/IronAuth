@@ -1,38 +1,33 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //
-// The admin console app shell. PR2 wires the real login: the sign in button
-// starts an Authorization Code + PKCE flow against the admin issuer, and on the
-// authorization callback the shell exchanges the code for a short lived at+jwt it
-// holds in memory (src/auth/session.ts). Nothing in this module performs a
-// network call or names a server API path directly (the route audit enforces
-// both): it delegates to src/auth/login.ts, which delegates to the one audited
-// client. The typed management client attaches the in memory bearer per request.
+// The admin console app shell (issue #90, PR 3). The PR2 login stays intact: the
+// sign in button starts an Authorization Code + PKCE flow against the admin
+// issuer and the callback exchange yields a short lived at+jwt held in memory
+// (src/auth/session.ts). PR3 builds the real console FRAME around it: a header
+// carrying the tenant/environment context switcher, a sidebar nav of the resource
+// sections, routed content (placeholder views until the CRUD lands in PR4-6), a
+// keyboard command palette, and the verbatim management ErrorBody boundary.
+//
+// This module performs NO network call and names NO server API path (the route
+// audit enforces both): it delegates to src/auth/login.ts and the scope store,
+// which reach the server only through the one audited client (src/api/client.ts).
 
 import { LocationProvider, Route, Router } from "preact-iso";
 import { signal } from "@preact/signals";
+import { useEffect } from "preact/hooks";
 import { loadConfig } from "./config";
 import { beginLogin, canSignIn, completeLoginFromRedirect } from "./auth/login";
 import { isSignedIn } from "./auth/session";
+import { loadScope, scopeError } from "./scope/store";
+import { SECTIONS } from "./ui/sections";
+import { Switcher } from "./ui/Switcher";
+import { CommandPalette } from "./ui/CommandPalette";
+import { ErrorView } from "./ui/ErrorView";
 
 // UI state lives in signals (the locked state primitive). `signedIn` flips true
 // once a token is held; `authError` surfaces a failed login verbatim.
 const signedIn = signal(isSignedIn());
 const authError = signal<string>("");
-
-const config = loadConfig();
-
-// On load, complete an authorization callback if the URL carries one, then
-// reflect whether a token is held. A failed exchange leaves the console signed
-// out with the error shown, never a half authenticated state.
-void completeLoginFromRedirect()
-  .then((ok) => {
-    if (ok) {
-      signedIn.value = true;
-    }
-  })
-  .catch((error: unknown) => {
-    authError.value = error instanceof Error ? error.message : "sign in failed";
-  });
 
 // Start the login. A failure (discovery or redirect) surfaces as an error rather
 // than a silent no op.
@@ -42,18 +37,6 @@ function onSignIn(): void {
     authError.value = error instanceof Error ? error.message : "sign in failed";
   });
 }
-
-// The nav placeholders. These are the future console sections; PR1 renders them
-// as inert labels so the frame reads as the real console without wiring any
-// data. The hrefs are in app route space (under the /admin mount), never server
-// API paths.
-const SECTIONS: ReadonlyArray<{ readonly href: string; readonly label: string }> = [
-  { href: "/", label: "Overview" },
-  { href: "/tenants", label: "Tenants" },
-  { href: "/environments", label: "Environments" },
-  { href: "/clients", label: "Clients" },
-  { href: "/users", label: "Users" },
-];
 
 function Nav() {
   return (
@@ -70,6 +53,7 @@ function Nav() {
 }
 
 function SignIn() {
+  const config = loadConfig();
   const ready = canSignIn();
   const target = config.adminIssuer || config.issuerBase || "this origin";
   return (
@@ -91,34 +75,90 @@ function SignIn() {
   );
 }
 
-function Placeholder() {
+// A placeholder resource view. PR4-6 replace each with the real, scope-injected
+// list and detail; PR3 renders the frame so the console reads whole. The active
+// scope is already resolved in the store, so a later PR only swaps this body.
+function SectionView({ label }: { label: string }) {
   return (
     <section class="placeholder">
-      <p>This section renders once the console is wired to the management API.</p>
+      <h2>{label}</h2>
+      <p>
+        This section lists {label.toLowerCase()} for the active scope once the
+        console is wired to the management API in a later change.
+      </p>
     </section>
   );
 }
 
+function Routes() {
+  return (
+    <Router>
+      <Route path="/" component={() => <SectionView label="Overview" />} />
+      <Route path="/tenants" component={() => <SectionView label="Tenants" />} />
+      <Route
+        path="/environments"
+        component={() => <SectionView label="Environments" />}
+      />
+      <Route path="/clients" component={() => <SectionView label="Clients" />} />
+      <Route path="/users" component={() => <SectionView label="Users" />} />
+      <Route
+        path="/connectors"
+        component={() => <SectionView label="Connectors" />}
+      />
+      <Route default component={() => <SectionView label="Overview" />} />
+    </Router>
+  );
+}
+
 function Shell() {
+  // Complete an authorization callback if the URL carries one, then reflect
+  // whether a token is held and, when signed in, load the scope. A failed
+  // exchange leaves the console signed out with the error shown, never a half
+  // authenticated state.
+  useEffect(() => {
+    void completeLoginFromRedirect()
+      .then((ok) => {
+        if (ok) {
+          signedIn.value = true;
+        }
+        if (signedIn.value) {
+          void loadScope();
+        }
+      })
+      .catch((error: unknown) => {
+        authError.value =
+          error instanceof Error ? error.message : "sign in failed";
+      });
+  }, []);
+
   return (
     <div class="app-frame">
       <header class="app-header">
         <span class="brand">IronAuth</span>
         <span class="subtitle">admin console</span>
+        {signedIn.value ? <Switcher /> : null}
+        {signedIn.value ? (
+          <span class="cmdk-hint" aria-hidden="true">
+            Ctrl or Cmd K
+          </span>
+        ) : null}
       </header>
       <div class="app-body">
-        <Nav />
+        {signedIn.value ? <Nav /> : null}
         <main class="app-main">
           {signedIn.value ? (
-            <Router>
-              <Route path="/" component={Placeholder} />
-              <Route default component={Placeholder} />
-            </Router>
+            <>
+              {scopeError.value === null ? null : (
+                <ErrorView error={scopeError.value} />
+              )}
+              <Routes />
+            </>
           ) : (
             <SignIn />
           )}
         </main>
       </div>
+      {signedIn.value ? <CommandPalette /> : null}
     </div>
   );
 }
