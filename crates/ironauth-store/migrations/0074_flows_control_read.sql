@@ -1,0 +1,21 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+--
+-- Let the control plane READ the headless flows table (issue #91, PR4 flow inspector).
+--
+-- The flows row (migration 0067) is written by the data plane role (ironauth_app) on the
+-- flow engine path: migration 0067 granted SELECT, INSERT, UPDATE to ironauth_app and
+-- nothing to the control plane, because until M9 there was no reader outside the engine.
+-- The M9 admin flow inspector adds one: the management endpoint
+-- GET .../diagnostics/flow/{flow_id} OBSERVES an existing flow read only as the least
+-- privilege control plane role (ironauth_control), exactly as migration 0072 let the
+-- control plane read the client authentication diagnostics sink for the same M9 reader. So
+-- the control role needs SELECT, and ONLY SELECT: the inspector reads a flow row, it never
+-- writes, advances, or consumes one (the engine on the data plane owns every write), so no
+-- INSERT or UPDATE is granted here. The read only OBSERVE never mutates a flow.
+--
+-- The table keeps its row level security (ENABLE + FORCE) and its tenant isolation policy,
+-- so a control plane read still sees only the caller scope's rows: this grant widens WHO may
+-- read, never WHAT a read may cross. The inspector's projection is redacted in code (it
+-- never surfaces the row's submit_token or transient payload), so a wider column grant here
+-- is safe: a secret is dropped by the projection, not carried onto the wire.
+GRANT SELECT ON flows TO ironauth_control;

@@ -80,6 +80,7 @@ fn operation_ids_are_the_stable_set() {
             "getDcrClient",
             "getDiagnosticsWarnings",
             "getEnvironment",
+            "getFlowObservation",
             "getInvitation",
             "getLocale",
             "getManagementKey",
@@ -113,6 +114,7 @@ fn operation_ids_are_the_stable_set() {
             "listTenants",
             "listUsers",
             "planConfigPromotion",
+            "postFlowDryRun",
             "probePasswordHashing",
             "rejectRecoveryApproval",
             "rejectSignupQuarantine",
@@ -277,6 +279,7 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/connectors/{connector_id}/health",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/dcr/policies",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/client-auth",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/flow/{flow_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/policy-traces",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/warnings",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/export",
@@ -312,6 +315,7 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/connectors",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/dcr/initial-access-tokens",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/dcr/policies",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/flow/dry-run",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/invitations",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/invitations/{invitation_id}/resend",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/invitations/{invitation_id}/revoke",
@@ -375,7 +379,7 @@ fn committed_artifact_matches_generated_spec() {
 async fn served_routes_match_documented_routes() {
     let router = db_free_router();
     let documented = documented_method_paths();
-    assert_eq!(documented.len(), 86, "the documented route count is pinned");
+    assert_eq!(documented.len(), 88, "the documented route count is pinned");
 
     // The OUTBOUND lazy-migration endpoint (issue #58) is the one documented route
     // that is NOT gated by the management `Principal` at 401. It is DISABLED BY

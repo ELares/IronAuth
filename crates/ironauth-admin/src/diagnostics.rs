@@ -26,11 +26,16 @@
 //! the way out, it is unrepresentable. This view carries the same bounded fields
 //! forward, never widening them.
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Json, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::Response;
+use ironauth_oidc::RiskLevel;
+use ironauth_oidc::flow::inspect::{
+    self, DryRunInput, DryRunProjection, ObserveProjection, RiskInput, RiskSignalInput,
+};
+use ironauth_oidc::flow::model::{Journey, NodeAttributes};
 use ironauth_store::{
-    ClientAuthDiagnosticQuery, ClientAuthDiagnosticRecord, ClientAuthDiagnosticsRepo,
+    ClientAuthDiagnosticQuery, ClientAuthDiagnosticRecord, ClientAuthDiagnosticsRepo, FlowId,
     PolicyDecisionTraceQuery, PolicyDecisionTraceRecord, PolicyDecisionTracesRepo, Scope, TenantId,
     TokenSizeEventsRepo,
 };
@@ -522,5 +527,486 @@ pub async fn get_diagnostics_warnings(
 
     let list = DiagnosticsWarningsList { items };
     let body = serde_json::to_string(&list).map_err(|_| ApiError::Internal)?;
+    Ok(json(StatusCode::OK, body))
+}
+
+// ===========================================================================
+// The flow inspector (issue #91, PR4): the read only OBSERVE projection over an
+// existing flow, and the zero side effect DRY REPLAY policy dry run.
+//
+// Neither endpoint mutates a flow: OBSERVE does ONE scoped, RLS forced read of the
+// flow row and projects it read only (never calling the mutating flow engine), and the
+// DRY REPLAY carries a supplied context, evaluates the REAL step up and risk evaluators
+// with every write disabled (the pure `ironauth_oidc::flow::inspect` module holds no
+// store handle), and writes NO row anywhere. Both are environment scoped and IDOR safe
+// exactly like the reads above: the scope comes from the path, `require_environment`
+// fails LOUD on a wrong scope key, and the store read runs under forced row level
+// security, so a foreign flow id resolves to a uniform not found.
+// ===========================================================================
+
+/// Serialize a bounded enum value (a journey, a transport, a state tag, a node group)
+/// to its stable wire string through serde, so the admin projection never re encodes the
+/// engine's vocabulary by hand (no drift from the flow contract).
+fn wire_str<T: Serialize>(value: T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+/// The redacted flow context projection surfaced by the inspector (issue #91): only safe
+/// fields. The recovery identifier (a PII contact) is reduced to `has_identifier`, and the
+/// flow submit token is not representable here at all.
+#[derive(Serialize, ToSchema)]
+pub struct FlowContextResponse {
+    /// The current state machine step.
+    pub step: String,
+    /// The proven auth method tokens so far (for example `["pwd"]`), the honest amr source.
+    pub methods: Vec<String>,
+    /// The blind internal `usr_` subject handle, or absent before a primary factor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    /// Whether a recovery identifier is held server side (never its PII value).
+    pub has_identifier: bool,
+    /// Whether a second factor enrollment is pending (never its credential id or secret).
+    pub enrolling: bool,
+    /// The federation connector slug (non secret), or absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connector: Option<String>,
+}
+
+impl From<inspect::FlowContextView> for FlowContextResponse {
+    fn from(context: inspect::FlowContextView) -> Self {
+        Self {
+            step: wire_str(context.step),
+            methods: context.methods,
+            subject: context.subject,
+            has_identifier: context.has_identifier,
+            enrolling: context.enrolling,
+            connector: context.connector,
+        }
+    }
+}
+
+/// One node of the current node render (issue #91): its group, its typed kind, and the form
+/// field name for an input. A compact projection of the flow object's `ui.nodes`, never a
+/// secret (no prefilled value is carried).
+#[derive(Serialize, ToSchema)]
+pub struct FlowNodeView {
+    /// The node group (for example `default`, `password`, `totp`).
+    pub group: String,
+    /// The node kind (`input` or `text`).
+    pub kind: String,
+    /// The form field name, for an input node.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// The OBSERVE projection of an existing flow (issue #91): its current position, the plan it
+/// sits within, the redacted context, the current node render, and any recorded policy
+/// traces for its subject (from PR3).
+#[derive(Serialize, ToSchema)]
+pub struct FlowObserveResponse {
+    /// The flow id (a scope embedded `flw_` id, non secret).
+    pub flow_id: String,
+    /// The journey this flow drives.
+    pub journey: String,
+    /// The transport it was created on.
+    pub transport: String,
+    /// The journey plan (the ordered state sequence, from the ONE transition table the
+    /// engine shares).
+    pub plan: Vec<String>,
+    /// The current state machine position.
+    pub current: String,
+    /// Whether the single use completion latch has tripped.
+    pub completed: bool,
+    /// Whether the flow has expired at the observation instant.
+    pub expired: bool,
+    /// The redacted flow context.
+    pub context: FlowContextResponse,
+    /// The current node render (a compact projection of the flow object's nodes).
+    pub nodes: Vec<FlowNodeView>,
+    /// The recorded policy decision traces for this flow's subject (from PR3), newest first.
+    pub traces: Vec<PolicyTraceView>,
+}
+
+impl FlowObserveResponse {
+    /// Build the response from the read only projection plus the subject's recorded traces.
+    fn build(projection: ObserveProjection, traces: Vec<PolicyTraceView>) -> Self {
+        let nodes = projection
+            .node_render
+            .ui
+            .nodes
+            .iter()
+            .map(|node| {
+                let (kind, name) = match &node.attributes {
+                    NodeAttributes::Input { name, .. } => ("input", Some(name.clone())),
+                    NodeAttributes::Text { .. } => ("text", None),
+                };
+                FlowNodeView {
+                    group: wire_str(node.group),
+                    kind: kind.to_owned(),
+                    name,
+                }
+            })
+            .collect();
+        Self {
+            flow_id: projection.flow_id,
+            journey: wire_str(projection.journey),
+            transport: wire_str(projection.transport),
+            plan: projection.plan.steps.iter().map(|s| wire_str(*s)).collect(),
+            current: wire_str(projection.current),
+            completed: projection.completed,
+            expired: projection.expired,
+            context: projection.context.into(),
+            nodes,
+            traces,
+        }
+    }
+}
+
+/// OBSERVE an existing flow read only (issue #91): the flow's current position, plan,
+/// redacted context, node render, and recorded policy traces. NEVER mutates the flow.
+#[utoipa::path(
+    get,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/flow/{flow_id}",
+    operation_id = "getFlowObservation",
+    tag = "diagnostics",
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("flow_id" = String, Path, description = "The flow identifier to observe")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "The read only observation of the flow: its current state, \
+         the journey plan (the ordered state sequence from the one transition table the engine \
+         shares), a structurally redacted projection of its persisted context (the step, the \
+         proven method tokens, the blind subject handle; never a submit token or the recovery \
+         identifier PII), the current node render, and the recorded policy decision traces for \
+         its subject. This read never calls the mutating flow engine.", body = FlowObserveResponse),
+        (status = 401, description = "Missing or invalid credential", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "Environment or flow not found", body = ErrorBody)
+    )
+)]
+pub async fn get_flow_observation(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, flow_id)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    let (tenant, scope) = scope_from_path(&state, &tenant_id, &environment_id)?;
+    // Environment scoped read: the operator plane, or the environment's own management key,
+    // may observe its flows. A wrong scope key fails LOUD here; the forced row level security
+    // on the store read is the IDOR backstop.
+    principal.require_environment(tenant, scope.environment())?;
+
+    // A malformed or cross scope flow id is the UNIFORM not found (never an oracle): the id
+    // carries its own scope, and `parse_in_scope` rejects one that does not match the path.
+    let parsed = FlowId::parse_in_scope(&flow_id, &scope).map_err(|_| ApiError::NotFound)?;
+    let record = state
+        .store()
+        .scoped(scope)
+        .flows()
+        .load(&parsed)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+
+    let now = state.now_unix_micros();
+    // A malformed stored row is a uniform not found too (never a 500, never an oracle).
+    let projection = inspect::observe(&record, scope, now).map_err(|_| ApiError::NotFound)?;
+
+    // The recorded policy decision traces for this flow's subject (from PR3), newest first,
+    // for the "why did the policy decide this" context alongside the plan. Absent a subject
+    // (a pre primary factor flow) there is nothing to key on, so the traces are empty.
+    let traces = match projection.context.subject.as_deref() {
+        Some(subject) => state
+            .store()
+            .scoped(scope)
+            .policy_decision_traces()
+            .query(PolicyDecisionTraceQuery {
+                policy: None,
+                subject: Some(subject),
+                occurred_at_or_after_micros: None,
+                occurred_before_micros: None,
+                limit: Some(PolicyDecisionTracesRepo::MAX_QUERY_LIMIT),
+                newest_first: true,
+            })
+            .await?
+            .into_iter()
+            .map(PolicyTraceView::from)
+            .collect(),
+        None => Vec::new(),
+    };
+
+    let response = FlowObserveResponse::build(projection, traces);
+    let body = serde_json::to_string(&response).map_err(|_| ApiError::Internal)?;
+    Ok(json(StatusCode::OK, body))
+}
+
+/// A supplied risk signal for a flow dry run (issue #91): the operator's what if scenario.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct RiskSignalRequest {
+    /// The signal name (mapped to the engine's bounded vocabulary; an unknown name folds to
+    /// `external_signal`).
+    pub name: String,
+    /// The signal's contribution level (`low` / `med` / `high`).
+    pub level: String,
+    /// Whether this signal alone justifies a block (a hard deny). Defaults to false.
+    #[serde(default)]
+    pub hard_deny: bool,
+}
+
+/// The risk scenario a flow dry run evaluates (issue #91): the supplied signals plus the
+/// deployment posture switches. Every field is optional; the defaults mirror the shipped
+/// risk config (`block_on_high` on, `notify_on_new_device` on, no forced threshold).
+#[derive(Debug, Clone, Default, Deserialize, ToSchema)]
+pub struct RiskScenarioRequest {
+    /// The supplied signals (the what if scenario).
+    #[serde(default)]
+    pub signals: Vec<RiskSignalRequest>,
+    /// Whether a new device fired.
+    #[serde(default)]
+    pub new_device: bool,
+    /// The step up threshold the score is compared against (`off` / `low` / `med` / `high`),
+    /// or absent for "never force".
+    #[serde(default)]
+    pub require_mfa_at: Option<String>,
+    /// Whether a hard deny blocks (defaults to true).
+    #[serde(default)]
+    pub block_on_high: Option<bool>,
+    /// Whether a new device notifies (defaults to true).
+    #[serde(default)]
+    pub notify_on_new_device: Option<bool>,
+}
+
+/// The flow dry run request (issue #91): a supplied context to replay through a journey's
+/// plan. It is evaluated with EVERY write disabled and MUST write nothing.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct FlowDryRunRequest {
+    /// The journey whose plan to walk (`login`, `registration`, `recovery`, `federation`).
+    pub journey: String,
+    /// The subject the context carries (a blind `usr_` handle), or absent.
+    #[serde(default)]
+    pub subject: Option<String>,
+    /// The required acr floor (an alias like `mfa` or a full canonical acr), or absent.
+    #[serde(default)]
+    pub required_acr: Option<String>,
+    /// The achieved acr the supplied authentication reached.
+    pub achieved_acr: String,
+    /// The maximum authentication age in seconds the requirement imposes, or absent.
+    #[serde(default)]
+    pub max_auth_age_secs: Option<u64>,
+    /// The recorded authentication instant in unix microseconds, or absent (which fails an
+    /// age bound closed).
+    #[serde(default)]
+    pub auth_time_unix_micros: Option<i64>,
+    /// The clock instant to evaluate against, or absent for the current server clock.
+    #[serde(default)]
+    pub now_unix_micros: Option<i64>,
+    /// The acr order to compare under, or absent for the canonical deployment ladder.
+    #[serde(default)]
+    pub acr_order: Option<Vec<String>>,
+    /// The risk scenario, or absent to skip the risk evaluator.
+    #[serde(default)]
+    pub risk: Option<RiskScenarioRequest>,
+}
+
+/// The step up requirement evaluation projection (issue #91), from the REAL evaluator.
+#[derive(Serialize, ToSchema)]
+pub struct StepUpDecisionResponse {
+    /// The bounded outcome (`satisfied` or `step_up_required`).
+    pub outcome: String,
+    /// Whether the achieved acr did not satisfy the floor.
+    pub acr_unmet: bool,
+    /// Whether the authentication age window lapsed.
+    pub age_lapsed: bool,
+    /// The required acr floor, or absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required_acr: Option<String>,
+    /// The achieved acr the evaluation compared.
+    pub achieved_acr: String,
+}
+
+/// A contributing risk signal projection (issue #91): the name and level only (redacted).
+#[derive(Serialize, ToSchema)]
+pub struct RiskSignalResponse {
+    /// The signal name.
+    pub name: String,
+    /// The signal's contribution level.
+    pub level: String,
+}
+
+/// The risk decision projection (issue #91), from the REAL compute core.
+#[derive(Serialize, ToSchema)]
+pub struct RiskDecisionResponse {
+    /// The combined level (`low` / `med` / `high`).
+    pub level: String,
+    /// The dispatched action (`allow` / `block` / `challenge` / `notify`).
+    pub action: String,
+    /// Whether the new device signal fired.
+    pub new_device_fired: bool,
+    /// The contributing signals, name and level only.
+    pub signals: Vec<RiskSignalResponse>,
+}
+
+/// One evaluated step of the dry replay (issue #91).
+#[derive(Serialize, ToSchema)]
+pub struct FlowDryRunStep {
+    /// The plan state this step is.
+    pub step: String,
+    /// Whether the supplied scenario reaches this state.
+    pub reached: bool,
+    /// The policy that governs the transition out of this step, or absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy: Option<String>,
+    /// The step up requirement evaluation at this step, when it governs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub step_up: Option<StepUpDecisionResponse>,
+    /// The risk decision at this step, when it governs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub risk: Option<RiskDecisionResponse>,
+    /// The redacted context at this step.
+    pub context: FlowContextResponse,
+}
+
+/// The flow dry run response (issue #91): the plan, the per step evaluations, and the
+/// terminal state the supplied scenario reaches. ZERO rows were written to produce it.
+#[derive(Serialize, ToSchema)]
+pub struct FlowDryRunResponse {
+    /// The journey walked.
+    pub journey: String,
+    /// The journey plan (the ordered state sequence).
+    pub plan: Vec<String>,
+    /// The terminal state the supplied scenario reaches.
+    pub terminal: String,
+    /// The per step evaluations.
+    pub steps: Vec<FlowDryRunStep>,
+}
+
+impl From<DryRunProjection> for FlowDryRunResponse {
+    fn from(projection: DryRunProjection) -> Self {
+        let steps = projection
+            .steps
+            .into_iter()
+            .map(|step| FlowDryRunStep {
+                step: wire_str(step.step),
+                reached: step.reached,
+                policy: step.policy,
+                step_up: step.step_up.map(|view| StepUpDecisionResponse {
+                    outcome: view.outcome,
+                    acr_unmet: view.acr_unmet,
+                    age_lapsed: view.age_lapsed,
+                    required_acr: view.required_acr,
+                    achieved_acr: view.achieved_acr,
+                }),
+                risk: step.risk.map(|view| RiskDecisionResponse {
+                    level: view.level,
+                    action: view.action,
+                    new_device_fired: view.new_device_fired,
+                    signals: view
+                        .signals
+                        .into_iter()
+                        .map(|signal| RiskSignalResponse {
+                            name: signal.name,
+                            level: signal.level,
+                        })
+                        .collect(),
+                }),
+                context: step.context.into(),
+            })
+            .collect();
+        Self {
+            journey: wire_str(projection.journey),
+            plan: projection.plan.steps.iter().map(|s| wire_str(*s)).collect(),
+            terminal: wire_str(projection.terminal),
+            steps,
+        }
+    }
+}
+
+/// DRY REPLAY a supplied context through a journey's plan (issue #91): evaluate the REAL step
+/// up and risk evaluators with EVERY write disabled and project the reachable path. Despite
+/// the POST verb this is READ ONLY / SIDE EFFECT FREE: it carries a context body but writes
+/// NO row anywhere (no flow, session, risk, jti, or trace row). The `POST` is only because
+/// the supplied context does not fit a URL.
+#[utoipa::path(
+    post,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/flow/dry-run",
+    operation_id = "postFlowDryRun",
+    tag = "diagnostics",
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier")
+    ),
+    request_body = FlowDryRunRequest,
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "The dry replay of the supplied context: the journey plan, \
+         the per step evaluations of the REAL step up and risk evaluators (with every write \
+         disabled), and the terminal state the scenario reaches. This is SIDE EFFECT FREE / read \
+         only despite the POST verb: it writes no flow, session, risk, jti, or trace row \
+         anywhere. The evaluators are the SAME ones the live path runs, so the decisions match \
+         the live path for the same inputs.", body = FlowDryRunResponse),
+        (status = 400, description = "A malformed request body or journey", body = ErrorBody),
+        (status = 401, description = "Missing or invalid credential", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "Environment not found", body = ErrorBody)
+    )
+)]
+pub async fn post_flow_dry_run(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+    Json(request): Json<FlowDryRunRequest>,
+) -> Result<Response, ApiError> {
+    let (tenant, scope) = scope_from_path(&state, &tenant_id, &environment_id)?;
+    principal.require_environment(tenant, scope.environment())?;
+
+    let journey = Journey::parse(&request.journey).ok_or_else(|| {
+        ApiError::BadRequest(
+            "journey must be one of login, registration, recovery, federation, mfa".to_owned(),
+        )
+    })?;
+    // The clock instant: the supplied value, or the current server clock.
+    let now = request
+        .now_unix_micros
+        .unwrap_or_else(|| state.now_unix_micros());
+
+    let risk = request.risk.map(|scenario| RiskInput {
+        signals: scenario
+            .signals
+            .into_iter()
+            .map(|signal| RiskSignalInput {
+                name: signal.name,
+                level: RiskLevel::parse_threshold(&signal.level).unwrap_or(RiskLevel::Low),
+                hard_deny: signal.hard_deny,
+            })
+            .collect(),
+        new_device_fired: scenario.new_device,
+        threshold: scenario
+            .require_mfa_at
+            .as_deref()
+            .and_then(RiskLevel::parse_threshold),
+        block_on_high: scenario.block_on_high.unwrap_or(true),
+        notify_on_new_device: scenario.notify_on_new_device.unwrap_or(true),
+    });
+
+    let input = DryRunInput {
+        journey,
+        subject: request.subject,
+        required_acr: request.required_acr,
+        achieved_acr: request.achieved_acr,
+        max_auth_age_secs: request.max_auth_age_secs,
+        auth_time_micros: request.auth_time_unix_micros,
+        now_micros: now,
+        order: request.acr_order,
+        risk,
+    };
+
+    // The dry replay is pure: it holds no store handle and writes nothing.
+    let projection = inspect::dry_run(&input);
+    let response = FlowDryRunResponse::from(projection);
+    let body = serde_json::to_string(&response).map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body))
 }

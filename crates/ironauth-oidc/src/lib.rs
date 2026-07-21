@@ -246,6 +246,7 @@ pub use revocation::{
 pub use risk::{
     GeoIpProvider, GeoLocation, IpReputation, IpReputationProvider, NullGeoIpProvider,
     NullIpReputationProvider, RiskAction, RiskDecision, RiskLevel, SignalOutcome,
+    decide_from_signals,
 };
 pub use routing::{RouteCandidates, normalize_email_domain, resolve_route};
 pub use sector::{

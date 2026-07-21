@@ -232,6 +232,13 @@ impl Harness {
         self.db.store()
     }
 
+    /// The underlying test database, for a full superuser store snapshot (the flow inspector
+    /// zero side effect proof snapshots every table's row count before and after a dry run).
+    #[must_use]
+    pub fn db(&self) -> &TestDatabase {
+        &self.db
+    }
+
     /// A stable test audit actor, for seeding rows through an acting repository.
     #[must_use]
     pub fn test_actor(&self, env: &Env) -> ironauth_store::ActorRef {
