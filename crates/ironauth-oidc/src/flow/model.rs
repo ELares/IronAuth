@@ -31,6 +31,14 @@ use super::message::Message;
 /// gains an optional `constraints` sub-object carrying the effective (trait narrowed by the
 /// form) validation keywords a configured signup field renders under, so a client can offer
 /// the SAME hints the server enforces from one source.
+///
+/// NOT bumped for issue #88 (consent as flow nodes): the change is purely ADDITIVE per the
+/// rule above. It adds a new [`Journey::Consent`], a new [`FlowStateTag::ConsentPrompt`], and
+/// two new node groups ([`NodeGroup::ClientIdentity`], [`NodeGroup::Scope`]) as enum variants,
+/// plus new message ids, and renders the client identity and requested scopes through the
+/// EXISTING [`NodeAttributes::Text`] and [`NodeAttributes::Input`] shapes with NO new field on
+/// any existing serialized struct (unlike the #87 `constraints` addition, which is what
+/// warranted the bump to 2). The golden snapshot gate covers the new journey's goldens.
 pub const CONTRACT_VERSION: u32 = 2;
 
 /// The journey a flow drives (issue #84). One object renders every journey; there is no
@@ -48,6 +56,10 @@ pub enum Journey {
     Recovery,
     /// A federated (OIDC upstream) login launcher.
     Federation,
+    /// A consent decision for an authenticated subject (issue #88): the client identity and
+    /// the requested scopes rendered as flow nodes, resolving to an allow (record the grant
+    /// and resume `/authorize`) or a deny (`access_denied` to the client).
+    Consent,
 }
 
 impl Journey {
@@ -60,6 +72,7 @@ impl Journey {
             Journey::Mfa => "mfa",
             Journey::Recovery => "recovery",
             Journey::Federation => "federation",
+            Journey::Consent => "consent",
         }
     }
 
@@ -72,6 +85,7 @@ impl Journey {
             "mfa" => Some(Journey::Mfa),
             "recovery" => Some(Journey::Recovery),
             "federation" => Some(Journey::Federation),
+            "consent" => Some(Journey::Consent),
             _ => None,
         }
     }
@@ -98,7 +112,7 @@ impl Journey {
     #[must_use]
     pub fn plan(self) -> &'static [FlowStateTag] {
         use FlowStateTag::{
-            Completed, FederationStart, IdentifierPassword, MfaChallenge, MfaEnroll,
+            Completed, ConsentPrompt, FederationStart, IdentifierPassword, MfaChallenge, MfaEnroll,
             ProgressiveProfiling, RecoveryAck, RecoveryStart, RegistrationAck, RegistrationDetails,
         };
         match self {
@@ -112,6 +126,11 @@ impl Journey {
             Journey::Registration => &[RegistrationDetails, RegistrationAck, Completed],
             Journey::Recovery => &[RecoveryStart, RecoveryAck, Completed],
             Journey::Federation => &[FederationStart],
+            // The consent decision resolves to a redirect (an allow resumes `/authorize` to
+            // issue the code; a deny returns `access_denied`), never a local session mint, so
+            // its plan is the single prompt state with no `Completed` terminal, exactly like
+            // the federation launcher.
+            Journey::Consent => &[ConsentPrompt],
             Journey::Mfa => &[],
         }
     }
@@ -174,6 +193,12 @@ pub enum FlowStateTag {
     /// The federated login launcher: the federation node group whose submission produces the
     /// redirect to the EXISTING outbound federation authorize leg.
     FederationStart,
+    /// The consent prompt (issue #88): the client identity and requested scopes rendered as
+    /// nodes for an authenticated subject, whose allow/deny submission records the grant and
+    /// resumes `/authorize`, or returns `access_denied` to the client. A held decision state,
+    /// never a session mint (the subject is already authenticated), so the flow leaves it only
+    /// by a redirect.
+    ConsentPrompt,
     /// The flow completed and a session was minted.
     Completed,
 }
@@ -202,6 +227,11 @@ pub enum NodeGroup {
     Oidc,
     /// Profile fields collected during registration.
     Profile,
+    /// The consent client identity (issue #88): the requesting client's name, logo, and
+    /// verification badge, rendered ahead of the requested scopes.
+    ClientIdentity,
+    /// The consent requested scopes (issue #88): one node per requested scope description.
+    Scope,
     /// The terminal submit action, rendered after every collected field.
     Submit,
 }
@@ -222,6 +252,8 @@ impl NodeGroup {
             NodeGroup::RecoveryCode => 60,
             NodeGroup::Oidc => 70,
             NodeGroup::Profile => 80,
+            NodeGroup::ClientIdentity => 82,
+            NodeGroup::Scope => 84,
             NodeGroup::Submit => 90,
         }
     }

@@ -164,6 +164,16 @@ pub struct AuthorizeParams {
     /// value is harmless. It is cleared before storage (a pushed request never
     /// carries it), so it is always [`None`] on a replayed request.
     pub par_resume: Option<String>,
+    /// An INTERNAL consent-denied marker (issue #88), NOT a client-facing parameter. When the
+    /// consent FLOW records a DENY, it routes the browser back to this exact `/authorize`
+    /// request carrying `consent_denied=1`, so the authorization endpoint returns
+    /// `access_denied` to the client through the negotiated response mode (RFC 6749) rather
+    /// than duplicating the response-mode error path in the flow engine. It only ever produces
+    /// `access_denied` to the request's OWN validated `redirect_uri` (it can never widen the
+    /// request or leak, and a client setting it on its own request merely denies itself), and
+    /// it is cleared before PAR storage (a pushed request never carries it). It is honored only
+    /// AFTER `redirect_uri` is validated, so it can never drive an open redirect.
+    pub consent_denied: Option<String>,
     /// The RFC 8707 `resource` indicators (issue #28): the resource server(s) the
     /// eventual access token is for. The wire parameter `resource` MAY appear
     /// multiple times, which a scalar serde field cannot capture, so it is NOT
@@ -360,6 +370,15 @@ async fn resolve_pushed_request(
         stored.max_age = params.max_age;
         stored.emit_auth_time = params.emit_auth_time;
     }
+    // The internal consent-denied marker (issue #88) is authoritative from the query
+    // INDEPENDENTLY of the PAR-resume marker: the consent flow's deny redirect re-presents the
+    // stored `request_uri` (whose stored parameters win) and appends `consent_denied=1`, so the
+    // denial survives PAR resolution and the endpoint returns `access_denied` to the STORED
+    // `redirect_uri`. It can only ever produce `access_denied` to the request's own validated
+    // redirect target, so honoring it from the query widens nothing.
+    if params.consent_denied.as_deref() == Some("1") {
+        stored.consent_denied = params.consent_denied;
+    }
 
     let context = PushedContext {
         par_id,
@@ -520,6 +539,20 @@ async fn issue_code(
         iss: iss.clone(),
         mode,
     };
+
+    // Consent-flow DENY (issue #88): the consent flow, on a deny, routes the browser back here
+    // carrying the internal `consent_denied` marker, so the client receives `access_denied`
+    // through the negotiated response mode (RFC 6749). This is honored only NOW, after
+    // `redirect_uri` and the response mode are validated, so it can never drive an open
+    // redirect, and it runs BEFORE the login/consent gate so a denial is final (never a
+    // re-prompt). It does NOT change the decision of WHEN consent is required; it only carries
+    // an already-made decision back to the client.
+    if params.consent_denied.as_deref() == Some("1") {
+        return Err(redirect_error(
+            AuthzErrorCode::AccessDenied,
+            "the user denied the authorization request",
+        ));
+    }
 
     // The effective granted scope (issue #21): offline_access is IGNORED on a flow
     // that does not return an authorization code (only the code flow reaches the
@@ -1398,6 +1431,22 @@ fn register_interaction(state: &OidcState, scope: Scope, return_to: &str) -> Res
     }
 }
 
+/// The consent interaction redirect (issue #88, the cutover seam). When the hosted-pages
+/// cutover is active it retargets to the scope-routed flow browser CONSENT page (which renders
+/// the consent screen as flow-contract nodes); otherwise it is the bootstrap `/consent`
+/// redirect, byte-identical to before the cutover, exactly as login/registration keep their
+/// bootstrap fallback. The `return_to` is the SAME validated local `/authorize` resume in both
+/// arms (only the landing PATH changes), and the flow GET handler re-validates it through
+/// `parse_resume`, so no open redirect is introduced. The DECISION of whether consent is
+/// required is UNCHANGED; only the redirect target changes.
+fn consent_interaction(state: &OidcState, scope: Scope, return_to: &str) -> Response {
+    if state.hosted_pages_cutover() {
+        interaction::consent_flow_redirect(scope, return_to)
+    } else {
+        interaction::consent_redirect(return_to)
+    }
+}
+
 /// Evaluate step-up authentication for a validated, authenticated request (RFC
 /// 9470, issue #72).
 ///
@@ -2012,7 +2061,9 @@ async fn resolve_consent_gate(
             "consent is required but prompt=none forbids interaction",
         ));
     }
-    Ok(Gate::Interaction(interaction::consent_redirect(
+    Ok(Gate::Interaction(consent_interaction(
+        state,
+        scope,
         &consent_resume_url(params, hints, prompt, pushed),
     )))
 }

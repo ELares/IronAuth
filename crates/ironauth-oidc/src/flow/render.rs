@@ -315,6 +315,7 @@ fn flow_title(flow: &Flow) -> message::MessageId {
         FlowStateTag::MfaEnroll => message::MFA_ENROLL_TITLE,
         FlowStateTag::RecoveryStart | FlowStateTag::RecoveryAck => message::RECOVERY_TITLE,
         FlowStateTag::FederationStart => message::FEDERATION_TITLE,
+        FlowStateTag::ConsentPrompt => message::CONSENT_TITLE,
         FlowStateTag::IdentifierPassword
         | FlowStateTag::ProgressiveProfiling
         | FlowStateTag::Completed => message::LOGIN_TITLE,
@@ -590,6 +591,7 @@ mod tests {
             (FlowStateTag::RecoveryStart, Journey::Recovery),
             (FlowStateTag::RecoveryAck, Journey::Recovery),
             (FlowStateTag::FederationStart, Journey::Federation),
+            (FlowStateTag::ConsentPrompt, Journey::Consent),
         ] {
             let flow = flow_with(
                 state,

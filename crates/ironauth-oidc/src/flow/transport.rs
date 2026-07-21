@@ -181,16 +181,17 @@ pub async fn flow_api_create(
 }
 
 /// Parse a creation journey (issue #84): [`Journey::Login`], [`Journey::Registration`],
-/// [`Journey::Recovery`], or [`Journey::Federation`], or [`None`] for an unknown journey or one
-/// that is not a creation entry (the MFA states are reached from a login flow, never created
-/// directly).
+/// [`Journey::Recovery`], [`Journey::Federation`], or [`Journey::Consent`] (issue #88), or
+/// [`None`] for an unknown journey or one that is not a creation entry (the MFA states are
+/// reached from a login flow, never created directly).
 fn creation_journey(raw: &str) -> Option<Journey> {
     match Journey::parse(raw) {
         Some(
             journey @ (Journey::Login
             | Journey::Registration
             | Journey::Recovery
-            | Journey::Federation),
+            | Journey::Federation
+            | Journey::Consent),
         ) => Some(journey),
         _ => None,
     }
@@ -255,6 +256,16 @@ pub async fn flow_api_submit(
             let body = json!({
                 "state": "redirect",
                 "continue_with": { "redirect_to": url },
+            });
+            with_contract_header((StatusCode::OK, Json(body)).into_response())
+        }
+        // The consent decision (issue #88): return the resolved `/authorize` redirect as an
+        // affordance. An allow recorded the grant and resumes to issue the code; a deny routes
+        // to `access_denied`. No session is minted here. The state names which decision resolved.
+        Ok(Continuation::ConsentDecision { allow, redirect_to }) => {
+            let body = json!({
+                "state": if allow { "consent_granted" } else { "consent_denied" },
+                "continue_with": { "redirect_to": redirect_to },
             });
             with_contract_header((StatusCode::OK, Json(body)).into_response())
         }
@@ -395,6 +406,12 @@ pub async fn flow_browser_post(
         // persists the correlation row and redirects to the upstream provider; the existing
         // callback finalizes the login). No session is minted here.
         Ok(Continuation::Redirect { url }) => with_contract_header(interaction::redirect(&url)),
+        // The consent decision (issue #88): 303 back to `/authorize` (an allow resumes to issue
+        // the code; a deny carries the deny marker for `access_denied`). No session is minted
+        // here (the subject is already authenticated), so no cookie is set.
+        Ok(Continuation::ConsentDecision { redirect_to, .. }) => {
+            with_contract_header(interaction::redirect(&redirect_to))
+        }
         Err(error) => error_html(error),
     }
 }

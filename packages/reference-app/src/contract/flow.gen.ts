@@ -17,9 +17,9 @@ export interface FieldConstraints {
   minimum?: number | null;
   type?: string | null;
 }
-export type FlowStateTag = "identifier_password" | "registration_details" | "registration_ack" | "mfa_challenge" | "mfa_enroll" | "progressive_profiling" | "recovery_start" | "recovery_ack" | "federation_start" | "completed";
+export type FlowStateTag = "identifier_password" | "registration_details" | "registration_ack" | "mfa_challenge" | "mfa_enroll" | "progressive_profiling" | "recovery_start" | "recovery_ack" | "federation_start" | "consent_prompt" | "completed";
 export type InputType = "text" | "password" | "email" | "tel" | "hidden" | "checkbox" | "submit";
-export type Journey = "login" | "registration" | "mfa" | "recovery" | "federation";
+export type Journey = "login" | "registration" | "mfa" | "recovery" | "federation" | "consent";
 export interface Message {
   context: MessageContext;
   id: MessageId;
@@ -36,7 +36,7 @@ export interface Node {
   messages: Array<Message>;
 }
 export type NodeAttributes = { autocomplete?: Autocomplete | null; constraints?: FieldConstraints | null; disabled: boolean; input_type: InputType; name: string; node_type: "input"; required: boolean; value?: string | null; } | { message: Message; node_type: "text"; };
-export type NodeGroup = "default" | "password" | "passkey" | "totp" | "email_otp" | "sms_otp" | "recovery_code" | "oidc" | "profile" | "submit";
+export type NodeGroup = "default" | "password" | "passkey" | "totp" | "email_otp" | "sms_otp" | "recovery_code" | "oidc" | "profile" | "client_identity" | "scope" | "submit";
 export type Transport = "browser" | "api";
 export interface Ui {
   action: string;
@@ -59,11 +59,11 @@ export const REQUIRED_FLOW_KEYS = ["contract_version", "id", "journey", "state",
 
 export const KNOWN_NODE_TYPES = ["input", "text"] as const;
 
-export const KNOWN_NODE_GROUPS = ["default", "password", "passkey", "totp", "email_otp", "sms_otp", "recovery_code", "oidc", "profile", "submit"] as const;
+export const KNOWN_NODE_GROUPS = ["default", "password", "passkey", "totp", "email_otp", "sms_otp", "recovery_code", "oidc", "profile", "client_identity", "scope", "submit"] as const;
 
-export const KNOWN_STATES = ["identifier_password", "registration_details", "registration_ack", "mfa_challenge", "mfa_enroll", "progressive_profiling", "recovery_start", "recovery_ack", "federation_start", "completed"] as const;
+export const KNOWN_STATES = ["identifier_password", "registration_details", "registration_ack", "mfa_challenge", "mfa_enroll", "progressive_profiling", "recovery_start", "recovery_ack", "federation_start", "consent_prompt", "completed"] as const;
 
-export const KNOWN_JOURNEYS = ["login", "registration", "mfa", "recovery", "federation"] as const;
+export const KNOWN_JOURNEYS = ["login", "registration", "mfa", "recovery", "federation", "consent"] as const;
 
 export const KNOWN_INPUT_TYPES = ["text", "password", "email", "tel", "hidden", "checkbox", "submit"] as const;
 

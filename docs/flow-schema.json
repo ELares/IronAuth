@@ -151,6 +151,11 @@
           "type": "string"
         },
         {
+          "const": "consent_prompt",
+          "description": "The consent prompt (issue #88): the client identity and requested scopes rendered as\nnodes for an authenticated subject, whose allow/deny submission records the grant and\nresumes `/authorize`, or returns `access_denied` to the client. A held decision state,\nnever a session mint (the subject is already authenticated), so the flow leaves it only\nby a redirect.",
+          "type": "string"
+        },
+        {
           "const": "completed",
           "description": "The flow completed and a session was minted.",
           "type": "string"
@@ -223,6 +228,11 @@
         {
           "const": "federation",
           "description": "A federated (OIDC upstream) login launcher.",
+          "type": "string"
+        },
+        {
+          "const": "consent",
+          "description": "A consent decision for an authenticated subject (issue #88): the client identity and\nthe requested scopes rendered as flow nodes, resolving to an allow (record the grant\nand resume `/authorize`) or a deny (`access_denied` to the client).",
           "type": "string"
         }
       ]
@@ -456,6 +466,16 @@
         {
           "const": "profile",
           "description": "Profile fields collected during registration.",
+          "type": "string"
+        },
+        {
+          "const": "client_identity",
+          "description": "The consent client identity (issue #88): the requesting client's name, logo, and\nverification badge, rendered ahead of the requested scopes.",
+          "type": "string"
+        },
+        {
+          "const": "scope",
+          "description": "The consent requested scopes (issue #88): one node per requested scope description.",
           "type": "string"
         },
         {

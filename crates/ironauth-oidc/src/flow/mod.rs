@@ -36,6 +36,7 @@ pub mod message;
 pub mod model;
 pub mod schema;
 
+mod consent;
 mod federation;
 mod login;
 mod mfa;
@@ -185,6 +186,19 @@ pub enum Continuation {
     Redirect {
         /// The URL to redirect to (a same origin path to the existing federation authorize leg).
         url: String,
+    },
+    /// A consent decision resolved (issue #88): the flow has been consumed and the browser is
+    /// redirected to `redirect_to`. On an ALLOW (`allow == true`) the grant was recorded and
+    /// `redirect_to` is the `/authorize` resume that issues the code; on a DENY it routes back
+    /// through `/authorize` carrying the internal deny marker so `access_denied` is returned to
+    /// the client. No session is minted here (the subject is already authenticated); the
+    /// browser transport issues a 303 to `redirect_to` and the API transport returns it as a
+    /// `continue_with.redirect_to` affordance.
+    ConsentDecision {
+        /// Whether the subject allowed the request (informational for the API envelope).
+        allow: bool,
+        /// The `/authorize` URL to redirect to (the resume, or the deny-marker URL).
+        redirect_to: String,
     },
 }
 
@@ -478,6 +492,11 @@ fn start_state(
                 federation::start_nodes(transport, flow_id, connector),
             ))
         }
+        // The consent prompt renders DYNAMIC client-identity and requested-scope nodes from the
+        // flow's persisted authorize context, which needs an async store read; `create_flow`
+        // appends them via [`consent::consent_start_nodes`] (like the registration signup
+        // fields), so the synchronous start state seeds only the position with no nodes.
+        Journey::Consent => Some((PersistedState::step(start), Vec::new())),
         Journey::Mfa => None,
     }
 }
@@ -509,6 +528,12 @@ pub async fn create_flow(
     if journey == Journey::Federation && return_to.is_none() {
         return Err(FlowError::InvalidSubmission);
     }
+    // A consent flow likewise REQUIRES a resume target: the whole point is to resume the pending
+    // `/authorize` after the decision, and the client and scopes are read from it. Reject an
+    // absent one at creation rather than mint a consent flow with no context.
+    if journey == Journey::Consent && return_to.is_none() {
+        return Err(FlowError::InvalidSubmission);
+    }
     // Open redirect fix (issue #84, inherited from PR 1): a PRESENT `return_to` is validated
     // at creation the SAME way the bootstrap `/login` and `/recover` validate theirs, via
     // [`interaction::parse_resume`]. It must be a LOCAL `/authorize?...` resume target whose
@@ -535,6 +560,16 @@ pub async fn create_flow(
     // pins). Any absence (no client, no form, no active schema) collects nothing.
     if journey == Journey::Registration {
         nodes.extend(registration::signup_start_nodes(state, scope, return_to).await);
+    }
+    // A consent flow appends the client-identity and requested-scope nodes (issue #88) built
+    // from its PERSISTED authorize context (`return_to`), so the render reflects the exact
+    // client and scopes the pending `/authorize` request named. Any absence (no resume,
+    // cross-scope, or an unreadable client) renders nothing.
+    if journey == Journey::Consent {
+        nodes.extend(
+            consent::consent_start_nodes(state, scope, transport, &flow_id.to_string(), return_to)
+                .await,
+        );
     }
     let start_step = persisted.step;
     let submit_token = generate_submit_token(state);
@@ -696,6 +731,20 @@ pub async fn drive(
             .await
         }
         Journey::Federation => drive_federation(scope, &record, &persisted),
+        Journey::Consent => {
+            drive_consent(
+                state,
+                scope,
+                flow_id,
+                transport,
+                &record,
+                &persisted,
+                &submission,
+                headers,
+                now_micros,
+            )
+            .await
+        }
         // The MFA states are reached FROM a login flow, never a creation entry. Typed not
         // found, never a 500.
         Journey::Mfa => Err(FlowError::NotFound),
@@ -879,13 +928,14 @@ async fn drive_login(
             )
             .await
         }
-        // A login row on a registration/recovery/federation/completed/ack state is corrupt; a
-        // uniform not found.
+        // A login row on a registration/recovery/federation/consent/completed/ack state is
+        // corrupt; a uniform not found.
         FlowStateTag::RegistrationDetails
         | FlowStateTag::RegistrationAck
         | FlowStateTag::RecoveryStart
         | FlowStateTag::RecoveryAck
         | FlowStateTag::FederationStart
+        | FlowStateTag::ConsentPrompt
         | FlowStateTag::Completed => Err(FlowError::NotFound),
     }
 }
@@ -1540,6 +1590,7 @@ async fn drive_recovery(
         | FlowStateTag::MfaEnroll
         | FlowStateTag::ProgressiveProfiling
         | FlowStateTag::FederationStart
+        | FlowStateTag::ConsentPrompt
         | FlowStateTag::Completed => Err(FlowError::NotFound),
     }
 }
@@ -1568,4 +1619,49 @@ fn drive_federation(
         .ok_or(FlowError::InvalidSubmission)?;
     let url = federation::authorize_url(scope, connector, return_to);
     Ok(Continuation::Redirect { url })
+}
+
+/// Drive the consent prompt one step (issue #88): record the subject's decision through
+/// [`consent::advance_consent`] (server authoritative, from the flow's persisted authorize
+/// context, never the submission), then CONSUME the single-use flow and hand back the redirect.
+/// An ALLOW recorded the grant and resumes `/authorize` (which then issues the code); a DENY
+/// recorded nothing and routes back through `/authorize` for `access_denied`. No session is
+/// minted here (the subject is already authenticated). A consent row on any other state, or one
+/// whose consume was raced, is a uniform typed error, never a 500.
+#[allow(clippy::too_many_arguments)]
+async fn drive_consent(
+    state: &OidcState,
+    scope: Scope,
+    flow_id: &FlowId,
+    _transport: Transport,
+    record: &FlowRecord,
+    persisted: &PersistedState,
+    submission: &Submission,
+    headers: &axum::http::HeaderMap,
+    now_micros: i64,
+) -> Result<Continuation, FlowError> {
+    // A consent row is only ever on the single consent prompt state; any other is corrupt.
+    if persisted.step != FlowStateTag::ConsentPrompt {
+        return Err(FlowError::NotFound);
+    }
+    let step = consent::advance_consent(state, scope, record, submission, headers).await?;
+    // The decision is terminal: consume the single-use flow so a replayed submit is a uniform
+    // `AlreadyCompleted`, never a second grant or a second denial. The grant (on an allow) was
+    // already recorded through the audited store write; a lost consume race is a concurrent
+    // completion.
+    let consumed = state
+        .store()
+        .scoped(scope)
+        .flows()
+        .consume(flow_id, now_micros)
+        .await
+        .map_err(|_| FlowError::Store)?;
+    if !consumed {
+        return Err(FlowError::AlreadyCompleted);
+    }
+    let (allow, redirect_to) = match step {
+        consent::ConsentStep::Allow { redirect_to } => (true, redirect_to),
+        consent::ConsentStep::Deny { redirect_to } => (false, redirect_to),
+    };
+    Ok(Continuation::ConsentDecision { allow, redirect_to })
 }

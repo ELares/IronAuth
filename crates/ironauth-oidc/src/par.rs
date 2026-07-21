@@ -152,6 +152,9 @@ impl ParParams {
             display: self.display,
             emit_auth_time: None,
             par_resume: None,
+            // The internal consent-denied marker (issue #88) is never stored: a pushed request
+            // never carries it (it is set only on the consent flow's deny redirect).
+            consent_denied: None,
             // The RFC 8707 `resource` indicators (issue #28) parsed from the pushed
             // form, carried through PAR storage so a replayed request approves the
             // same resources as an inline request.
