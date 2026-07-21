@@ -8310,7 +8310,8 @@
         "type": "object",
         "description": "A page of recorded client authentication diagnostics (issue #91).",
         "required": [
-          "items"
+          "items",
+          "truncated"
         ],
         "properties": {
           "items": {
@@ -8318,7 +8319,11 @@
             "items": {
               "$ref": "#/components/schemas/ClientAuthDiagnosticView"
             },
-            "description": "The diagnostics matching the query, oldest first, bounded by the limit."
+            "description": "The diagnostics matching the query, NEWEST first, bounded by the limit, so a\ncapped result keeps the most recent failures (what a live incident is about)."
+          },
+          "truncated": {
+            "type": "boolean",
+            "description": "True when the result hit the limit and older matching failures were left out;\nthe operator should narrow the client or time window (never a silent truncation)."
           }
         }
       },

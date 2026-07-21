@@ -1491,8 +1491,13 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
     // SELECT: it never writes or prunes a diagnostic (the data-plane recorder owns that), so it
     // holds neither INSERT nor DELETE. This is the grant the admin endpoint's read depends on.
     assert!(
-        role_has_table_privilege(pool, "ironauth_control", "client_auth_diagnostics", "SELECT")
-            .await,
+        role_has_table_privilege(
+            pool,
+            "ironauth_control",
+            "client_auth_diagnostics",
+            "SELECT"
+        )
+        .await,
         "the control-plane role must hold SELECT on client_auth_diagnostics after 0072 (the M9 read)"
     );
     for privilege in ["INSERT", "UPDATE", "DELETE"] {

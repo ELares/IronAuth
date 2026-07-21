@@ -127,6 +127,15 @@ describe("the diagnostics client-auth panel", () => {
     expect(root.textContent).toContain("2023-11-14T");
   });
 
+  it("flags a truncated result so the cap is never silent", async () => {
+    activeScope.value = { tenantId: "ten_a", environmentId: "env_a" };
+    stubFetch(() => json({ items: [record], truncated: true }));
+    const root = mount(<DiagnosticsView />);
+    await flush();
+
+    expect(root.textContent).toContain("Older matching failures were left out");
+  });
+
   it("prompts to select a scope and makes no call when none is active", async () => {
     activeScope.value = null;
     const calls = stubFetch(() => json({ items: [] }));

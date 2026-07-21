@@ -874,11 +874,19 @@ export interface ClientAuthDiagnosticsFilter {
 // environment ids substitute into the documented path, targeting
 // `/v1/tenants/<t>/environments/<e>/diagnostics/client-auth`. Only the filters the
 // caller set are sent, so an empty filter reads the whole (bounded) scope window.
+// A page of client auth diagnostics: the newest first rows plus whether the result
+// hit the limit (older matching failures left out), so the view can tell the operator
+// to narrow the window rather than silently dropping the tail.
+export interface ClientAuthDiagnosticsPage {
+  readonly items: ClientAuthDiagnosticView[];
+  readonly truncated: boolean;
+}
+
 export async function fetchClientAuthDiagnostics(
   tenantId: string,
   environmentId: string,
   filter: ClientAuthDiagnosticsFilter = {},
-): Promise<ClientAuthDiagnosticView[]> {
+): Promise<ClientAuthDiagnosticsPage> {
   const client = createManagementClient();
   const query: {
     client_id?: string;
@@ -914,7 +922,7 @@ export async function fetchClientAuthDiagnostics(
   if (error !== undefined || !response.ok) {
     throw new ManagementError(toErrorBody(error), response.status);
   }
-  return data?.items ?? [];
+  return { items: data?.items ?? [], truncated: data?.truncated ?? false };
 }
 
 // ---- The users CRUD operations (issue #90, PR 5) ----------------------------

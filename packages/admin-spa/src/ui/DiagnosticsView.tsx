@@ -24,8 +24,8 @@
 
 import { useState } from "preact/hooks";
 import {
-  type ClientAuthDiagnosticView,
   type ClientAuthDiagnosticsFilter,
+  type ClientAuthDiagnosticsPage,
   fetchClientAuthDiagnostics,
 } from "../api/client";
 import { activeScope } from "../scope/store";
@@ -80,7 +80,7 @@ function ClientAuthDiagnosticsPanel({
   // submit, so a keystroke does not refetch. The applied filter is part of the read's
   // dependency key, so applying a new one refetches.
   const [applied, setApplied] = useState<ClientAuthDiagnosticsFilter>({});
-  const { state } = useAsyncResource<ClientAuthDiagnosticView[]>(
+  const { state } = useAsyncResource<ClientAuthDiagnosticsPage>(
     () => fetchClientAuthDiagnostics(tenantId, environmentId, applied),
     [tenantId, environmentId, JSON.stringify(applied)],
   );
@@ -96,7 +96,7 @@ function ClientAuthDiagnosticsPanel({
         state={state}
         loadingLabel="Loading diagnostics"
         empty={{
-          when: (items) => items.length === 0,
+          when: (page) => page.items.length === 0,
           render: () => (
             <p class="resource-empty">
               No recorded client authentication failures for this filter.
@@ -104,9 +104,15 @@ function ClientAuthDiagnosticsPanel({
           ),
         }}
       >
-        {(items) => (
+        {(page) => (
           <ul class="resource-list">
-            {items.map((record, index) => (
+            {page.truncated ? (
+              <li class="resource-note">
+                Showing the most recent failures only. Older matching failures were
+                left out; narrow the client or time window to see more.
+              </li>
+            ) : null}
+            {page.items.map((record, index) => (
               // The records have no id field (append-only diagnostics), so the key is
               // the stable (instant, index) position within this page.
               <li

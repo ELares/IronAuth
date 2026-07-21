@@ -96,8 +96,12 @@ impl From<ClientAuthDiagnosticRecord> for ClientAuthDiagnosticView {
 /// A page of recorded client authentication diagnostics (issue #91).
 #[derive(Serialize, ToSchema)]
 pub struct ClientAuthDiagnosticsList {
-    /// The diagnostics matching the query, oldest first, bounded by the limit.
+    /// The diagnostics matching the query, NEWEST first, bounded by the limit, so a
+    /// capped result keeps the most recent failures (what a live incident is about).
     pub items: Vec<ClientAuthDiagnosticView>,
+    /// True when the result hit the limit and older matching failures were left out;
+    /// the operator should narrow the client or time window (never a silent truncation).
+    pub truncated: bool,
 }
 
 /// The filter parameters of the diagnostics read (issue #91).
@@ -201,6 +205,11 @@ pub async fn get_client_auth_diagnostics(
     let until = parse_optional_i64(query.until.as_deref(), "until")?;
     let limit = parse_optional_i64(query.limit.as_deref(), "limit")?;
 
+    // The effective limit the repository will apply (the request value clamped to the
+    // ceiling, or the ceiling by default). The result is truncated when it fills it.
+    let effective_limit = limit
+        .unwrap_or(ClientAuthDiagnosticsRepo::MAX_QUERY_LIMIT)
+        .clamp(0, ClientAuthDiagnosticsRepo::MAX_QUERY_LIMIT);
     let records = state
         .store()
         .scoped(scope)
@@ -209,17 +218,21 @@ pub async fn get_client_auth_diagnostics(
             client_id: query.client_id.as_deref(),
             occurred_at_or_after_micros: since,
             occurred_before_micros: until,
-            // The repository clamps this to MAX_QUERY_LIMIT (referenced so the ceiling
-            // stays a single source of truth), so even an out of range request is bounded.
-            limit: limit.or(Some(ClientAuthDiagnosticsRepo::MAX_QUERY_LIMIT)),
+            limit: Some(effective_limit),
+            // Newest first so a capped result keeps the most recent failures, not the
+            // oldest: an operator debugging a live failure wants what just happened.
+            newest_first: true,
         })
         .await?;
 
+    let truncated =
+        i64::try_from(records.len()).unwrap_or(i64::MAX) >= effective_limit && effective_limit > 0;
     let list = ClientAuthDiagnosticsList {
         items: records
             .into_iter()
             .map(ClientAuthDiagnosticView::from)
             .collect(),
+        truncated,
     };
     let body = serde_json::to_string(&list).map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body))

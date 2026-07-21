@@ -9571,6 +9571,12 @@ pub struct ClientAuthDiagnosticQuery<'a> {
     /// The maximum number of rows to return. The repository additionally clamps this
     /// to a hard ceiling so a caller can never request an unbounded scan.
     pub limit: Option<i64>,
+    /// Order newest first (most recent `occurred_at` first) rather than the default
+    /// oldest first. The admin diagnostics view sets this so that, when the result is
+    /// capped at the limit, the operator keeps the MOST RECENT failures (the ones a
+    /// live incident is about) rather than the oldest. Default `false` preserves the
+    /// oldest first contract every existing caller relies on.
+    pub newest_first: bool,
 }
 
 /// The out-of-band client-authentication diagnostics sink (issue #25).
@@ -9704,7 +9710,23 @@ impl ClientAuthDiagnosticsRepo<'_> {
         // A single parameterized statement with NULL-guarded optional predicates: a
         // NULL filter is inert ("$n IS NULL OR column <op> $n"), so the one query
         // serves the whole filter matrix without string concatenation.
-        let rows = sqlx::query(
+        // The two statements differ ONLY in the ORDER direction, a compile time literal
+        // chosen by the flag (never interpolated data), so there is no dynamic SQL. The
+        // NULL-guarded optional predicates keep the whole filter matrix in one statement.
+        let sql = if query.newest_first {
+            "SELECT id, client_id, auth_method, failure_reason, key_id, signing_alg, \
+                    skew_seconds, expected, \
+                    (EXTRACT(EPOCH FROM occurred_at) * 1000000)::bigint AS occurred_us \
+             FROM client_auth_diagnostics \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+               AND ($3::text IS NULL OR client_id = $3) \
+               AND ($4::bigint IS NULL OR occurred_at >= \
+                    TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval) \
+               AND ($5::bigint IS NULL OR occurred_at < \
+                    TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval) \
+             ORDER BY occurred_at DESC, id DESC \
+             LIMIT $6"
+        } else {
             "SELECT id, client_id, auth_method, failure_reason, key_id, signing_alg, \
                     skew_seconds, expected, \
                     (EXTRACT(EPOCH FROM occurred_at) * 1000000)::bigint AS occurred_us \
@@ -9716,16 +9738,17 @@ impl ClientAuthDiagnosticsRepo<'_> {
                AND ($5::bigint IS NULL OR occurred_at < \
                     TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval) \
              ORDER BY occurred_at, id \
-             LIMIT $6",
-        )
-        .bind(self.scope.tenant().to_string())
-        .bind(self.scope.environment().to_string())
-        .bind(query.client_id)
-        .bind(query.occurred_at_or_after_micros)
-        .bind(query.occurred_before_micros)
-        .bind(limit)
-        .fetch_all(&mut *tx)
-        .await?;
+             LIMIT $6"
+        };
+        let rows = sqlx::query(sql)
+            .bind(self.scope.tenant().to_string())
+            .bind(self.scope.environment().to_string())
+            .bind(query.client_id)
+            .bind(query.occurred_at_or_after_micros)
+            .bind(query.occurred_before_micros)
+            .bind(limit)
+            .fetch_all(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(rows
             .iter()

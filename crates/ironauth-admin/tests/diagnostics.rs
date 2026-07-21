@@ -31,12 +31,7 @@ fn scope_of(tenant: &str, environment: &str) -> Scope {
 /// Seed one client authentication diagnostic into `scope` through the data-plane
 /// store, exactly as the OIDC token endpoint records it, at the instant `env`'s clock
 /// reads. The management plane reads these rows; it never writes them.
-async fn seed(
-    harness: &Harness,
-    env: &Env,
-    scope: Scope,
-    diagnostic: NewClientAuthDiagnostic<'_>,
-) {
+async fn seed(harness: &Harness, env: &Env, scope: Scope, diagnostic: NewClientAuthDiagnostic<'_>) {
     harness
         .store()
         .scoped(scope)
@@ -95,18 +90,37 @@ async fn the_read_returns_the_scope_rows_and_filters_by_client_and_time() {
         .await;
     }
 
-    // No filter: every row in scope, oldest first.
+    // No filter: every row in scope, NEWEST first (so a capped result keeps the most
+    // recent failures), and not truncated (three rows are well under the limit).
     let (status, _, body) = harness.get(&base).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let items = list_items(&body);
     assert_eq!(items.len(), 3, "every row in scope: {body}");
-    assert_eq!(items[0]["reason"], "assertion_expired");
+    assert_eq!(items[0]["reason"], "bad_secret");
     assert_eq!(items[1]["reason"], "assertion_kid_unknown");
-    assert_eq!(items[2]["reason"], "bad_secret");
+    assert_eq!(items[2]["reason"], "assertion_expired");
     assert!(
         items[0]["occurred_at_unix_micros"].as_i64().unwrap()
-            <= items[1]["occurred_at_unix_micros"].as_i64().unwrap(),
-        "oldest first"
+            >= items[1]["occurred_at_unix_micros"].as_i64().unwrap(),
+        "newest first"
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["truncated"],
+        serde_json::Value::Bool(false),
+        "three rows under the limit are not truncated: {body}"
+    );
+
+    // A small limit caps the result and flags the truncation (never silent): the newest
+    // row is kept, and the operator is told to narrow the window.
+    let (status, _, body) = harness.get(&format!("{base}?limit=1")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let capped = list_items(&body);
+    assert_eq!(capped.len(), 1, "the limit caps the result: {body}");
+    assert_eq!(capped[0]["reason"], "bad_secret", "the newest row is kept");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["truncated"],
+        serde_json::Value::Bool(true),
+        "a capped result is flagged truncated: {body}"
     );
 
     // A client filter returns only that client's rows.
@@ -118,7 +132,9 @@ async fn the_read_returns_the_scope_rows_and_filters_by_client_and_time() {
 
     // A time window narrows further: only the cli_a row at 5s falls in [2s, 8s).
     let (status, _, body) = harness
-        .get(&format!("{base}?client_id=cli_a&since=2000000&until=8000000"))
+        .get(&format!(
+            "{base}?client_id=cli_a&since=2000000&until=8000000"
+        ))
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let items = list_items(&body);
@@ -188,8 +204,7 @@ async fn the_read_is_idor_safe_across_tenants_and_environments() {
     let env_a2 = harness
         .create_environment(&tenant_a, "Staging", "key-a2")
         .await;
-    let base_a2 =
-        format!("/v1/tenants/{tenant_a}/environments/{env_a2}/diagnostics/client-auth");
+    let base_a2 = format!("/v1/tenants/{tenant_a}/environments/{env_a2}/diagnostics/client-auth");
     let (status, _, body) = harness.get_as(&base_a2, &key_a).await;
     assert_eq!(
         status,
@@ -273,8 +288,5 @@ async fn an_unauthenticated_read_is_rejected() {
 /// The `items` array of a diagnostics list response body, parsed as JSON values.
 fn list_items(body: &str) -> Vec<serde_json::Value> {
     let value: serde_json::Value = serde_json::from_str(body).expect("json list body");
-    value["items"]
-        .as_array()
-        .expect("items array")
-        .clone()
+    value["items"].as_array().expect("items array").clone()
 }

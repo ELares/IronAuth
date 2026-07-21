@@ -1270,8 +1270,16 @@ export interface components {
         };
         /** @description A page of recorded client authentication diagnostics (issue #91). */
         ClientAuthDiagnosticsList: {
-            /** @description The diagnostics matching the query, oldest first, bounded by the limit. */
+            /**
+             * @description The diagnostics matching the query, NEWEST first, bounded by the limit, so a
+             *     capped result keeps the most recent failures (what a live incident is about).
+             */
             items: components["schemas"]["ClientAuthDiagnosticView"][];
+            /**
+             * @description True when the result hit the limit and older matching failures were left out;
+             *     the operator should narrow the client or time window (never a silent truncation).
+             */
+            truncated: boolean;
         };
         /**
          * @description A dynamically registered client's verification state (issue #31), as returned by
