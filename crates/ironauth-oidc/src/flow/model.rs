@@ -190,6 +190,8 @@ pub enum NodeGroup {
     Oidc,
     /// Profile fields collected during registration.
     Profile,
+    /// The terminal submit action, rendered after every collected field.
+    Submit,
 }
 
 impl NodeGroup {
@@ -208,6 +210,7 @@ impl NodeGroup {
             NodeGroup::RecoveryCode => 60,
             NodeGroup::Oidc => 70,
             NodeGroup::Profile => 80,
+            NodeGroup::Submit => 90,
         }
     }
 }

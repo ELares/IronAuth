@@ -1185,7 +1185,7 @@
               "required": false,
               "value": "register"
             },
-            "group": "password",
+            "group": "submit",
             "label": {
               "context": {},
               "id": 1020004,
@@ -1266,7 +1266,7 @@
               "required": false,
               "value": "register"
             },
-            "group": "password",
+            "group": "submit",
             "label": {
               "context": {},
               "id": 1020004,

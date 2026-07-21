@@ -36,7 +36,7 @@ export interface Node {
   messages: Array<Message>;
 }
 export type NodeAttributes = { autocomplete?: Autocomplete | null; constraints?: FieldConstraints | null; disabled: boolean; input_type: InputType; name: string; node_type: "input"; required: boolean; value?: string | null; } | { message: Message; node_type: "text"; };
-export type NodeGroup = "default" | "password" | "passkey" | "totp" | "email_otp" | "sms_otp" | "recovery_code" | "oidc" | "profile";
+export type NodeGroup = "default" | "password" | "passkey" | "totp" | "email_otp" | "sms_otp" | "recovery_code" | "oidc" | "profile" | "submit";
 export type Transport = "browser" | "api";
 export interface Ui {
   action: string;
@@ -59,7 +59,7 @@ export const REQUIRED_FLOW_KEYS = ["contract_version", "id", "journey", "state",
 
 export const KNOWN_NODE_TYPES = ["input", "text"] as const;
 
-export const KNOWN_NODE_GROUPS = ["default", "password", "passkey", "totp", "email_otp", "sms_otp", "recovery_code", "oidc", "profile"] as const;
+export const KNOWN_NODE_GROUPS = ["default", "password", "passkey", "totp", "email_otp", "sms_otp", "recovery_code", "oidc", "profile", "submit"] as const;
 
 export const KNOWN_STATES = ["identifier_password", "registration_details", "registration_ack", "mfa_challenge", "mfa_enroll", "recovery_start", "recovery_ack", "federation_start", "completed"] as const;
 

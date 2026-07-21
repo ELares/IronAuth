@@ -130,9 +130,10 @@ pub(super) struct RegistrationSuccess {
 }
 
 /// Build the registration details nodes in the deterministic contract order (issue #84):
-/// the identifier field (Default group) and the new password field plus submit (Password
-/// group). On the browser transport a hidden `flow` node carries the flow id back on the
-/// form post. `id_error` / `pw_error` attach a node level message to the offending node.
+/// the identifier field (Default group), the new password field (Password group), and the
+/// submit control (Submit group, rank 90, so it renders after any collected profile fields).
+/// On the browser transport a hidden `flow` node carries the flow id back on the form post.
+/// `id_error` / `pw_error` attach a node level message to the offending node.
 fn details_nodes(
     transport: Transport,
     flow_id: &str,
@@ -185,8 +186,8 @@ fn details_nodes(
     nodes.push(password);
 
     nodes.push(Node::input(
-        NodeGroup::Password,
-        10,
+        NodeGroup::Submit,
+        0,
         NodeAttributes::Input {
             name: "method".to_owned(),
             input_type: InputType::Submit,

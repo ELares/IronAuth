@@ -452,6 +452,11 @@
           "const": "profile",
           "description": "Profile fields collected during registration.",
           "type": "string"
+        },
+        {
+          "const": "submit",
+          "description": "The terminal submit action, rendered after every collected field.",
+          "type": "string"
         }
       ]
     },
