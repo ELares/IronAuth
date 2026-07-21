@@ -165,6 +165,8 @@ jobs:
         run: scripts/query-audit.sh
       - name: classification lint (every resource type is classified; all three classes used)
         run: scripts/classification-lint.sh
+      - name: diagnostics redaction corpus (no secret sentinel can reach a diagnostic record)
+        run: scripts/diagnostics-redaction-scan.sh
       - name: canonicalization seam (every identifier comparison routes through the one seam)
         run: scripts/canonicalization-seam.sh
       - name: hashing pool boundary (every request-path hash routes through the admission-controlled pool)

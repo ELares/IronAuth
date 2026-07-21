@@ -286,6 +286,20 @@ impl IdorHarness {
         self
     }
 
+    /// Register the client-authentication diagnostics read probe (issue #91): the M9
+    /// admin flow inspector's read path over the `client_auth_diagnostics` sink must
+    /// never surface a diagnostic recorded under another tenant or environment, or the
+    /// inspector would leak WHICH clients in a foreign tenant were failing to
+    /// authenticate and how. The read is keyed on the CLIENT ID (a plain string
+    /// filter, the M9 view's natural key), so the probe's `foreign_id` is a client id
+    /// whose diagnostics were planted in another scope: the scoped, forced-RLS
+    /// `query` must resolve to no rows under the caller's scope. Run with the
+    /// data-plane store (`ironauth_app`), which holds the sink's SELECT grant.
+    pub fn register_diagnostic_probes(&mut self) -> &mut Self {
+        self.register(Box::new(ClientAuthDiagnosticReadProbe));
+        self
+    }
+
     /// The names of the registered probes, in registration order.
     #[must_use]
     pub fn probe_names(&self) -> Vec<&'static str> {
@@ -1498,6 +1512,47 @@ impl IsolationProbe for RiskSignalReadProbe {
             {
                 // Reading a foreign subject's ingested signals would be a leak.
                 Ok(signals) if !signals.is_empty() => ProbeOutcome::Leaked,
+                Ok(_) | Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `ClientAuthDiagnosticsRepo::query` (issue #91): a client's recorded
+/// authentication-failure diagnostics must never be readable under another tenant or
+/// environment's scope, or the M9 admin flow inspector would leak which foreign clients were
+/// failing to authenticate. The read is keyed on the CLIENT ID (a plain string filter, not a
+/// scoped-parsed id), so the probe's `foreign_id` is a client id whose diagnostics were planted
+/// in another scope: the scoped, forced-RLS query must resolve to no rows under the caller's
+/// scope.
+struct ClientAuthDiagnosticReadProbe;
+
+impl IsolationProbe for ClientAuthDiagnosticReadProbe {
+    fn name(&self) -> &'static str {
+        "client_auth_diagnostics.query"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            // The client id is a plain string filter (no scoped id to parse): the forced RLS
+            // and the (tenant, environment) predicates confine the read to the caller's scope,
+            // so a foreign client's diagnostics resolve to no rows here.
+            match store
+                .scoped(caller)
+                .client_auth_diagnostics()
+                .query(crate::repository::ClientAuthDiagnosticQuery {
+                    client_id: Some(foreign_id),
+                    ..Default::default()
+                })
+                .await
+            {
+                // Reading a foreign client's recorded diagnostics would be a leak.
+                Ok(rows) if !rows.is_empty() => ProbeOutcome::Leaked,
                 Ok(_) | Err(_) => ProbeOutcome::Denied,
             }
         })

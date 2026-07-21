@@ -15,8 +15,8 @@ use std::time::Duration;
 use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
-    ClientAuthDiagnosticReason, CorrelationId, JtiOutcome, NewClientAuthDiagnostic,
-    NewJwtAuthClient, Scope, Store, StoreError,
+    ClientAuthDiagnosticReason, CorrelationId, DiagnosticExpectation, JtiOutcome,
+    NewClientAuthDiagnostic, NewJwtAuthClient, Scope, Store, StoreError,
 };
 
 /// A far-future expiry (year 2100) in epoch microseconds, so a recorded jti is
@@ -141,10 +141,15 @@ async fn the_prune_reclaims_a_jti_only_after_its_replayable_window_has_passed() 
     );
 }
 
+/// Seven days in microseconds, the default diagnostic retention the config seam now
+/// threads into the recorder (issue #91), used where a test does not exercise pruning.
+const DIAG_RETENTION_MICROS: i64 = 7 * 24 * 60 * 60 * 1_000_000;
+
 #[tokio::test]
 async fn a_client_auth_diagnostic_is_recorded_and_read_back_within_scope() {
     // The out-of-band diagnostics sink records a failure's rich detail (method,
-    // reason, key id, alg) and reads it back within scope; another scope sees none.
+    // reason, key id, alg, and the derived skew / expected hint) and reads it back
+    // within scope; another scope sees none.
     let db = TestDatabase::start().await;
     let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x28);
     let scope = db.seed_scope(&env).await;
@@ -155,12 +160,15 @@ async fn a_client_auth_diagnostic_is_recorded_and_read_back_within_scope() {
         .client_auth_diagnostics()
         .record(
             &env,
+            DIAG_RETENTION_MICROS,
             NewClientAuthDiagnostic {
                 client_id: "cli_diag",
                 auth_method: "private_key_jwt",
-                reason: ClientAuthDiagnosticReason::AssertionInvalid,
+                reason: ClientAuthDiagnosticReason::AssertionKidUnknown,
                 key_id: Some("k9"),
                 signing_alg: Some("ES256"),
+                skew_seconds: Some(-42),
+                expected: Some(DiagnosticExpectation::KidNotInRegisteredJwks),
             },
         )
         .await
@@ -175,10 +183,13 @@ async fn a_client_auth_diagnostic_is_recorded_and_read_back_within_scope() {
         .expect("read diagnostics");
     assert_eq!(rows.len(), 1, "one diagnostic recorded");
     let row = &rows[0];
+    assert!(!row.id.is_empty(), "the row carries its pagination id");
     assert_eq!(row.auth_method, "private_key_jwt");
-    assert_eq!(row.failure_reason, "assertion_invalid");
+    assert_eq!(row.failure_reason, "assertion_kid_unknown");
     assert_eq!(row.key_id.as_deref(), Some("k9"));
     assert_eq!(row.signing_alg.as_deref(), Some("ES256"));
+    assert_eq!(row.skew_seconds, Some(-42));
+    assert_eq!(row.expected.as_deref(), Some("kid_not_in_registered_jwks"));
 
     // Another scope sees nothing (RLS isolation).
     assert!(
@@ -191,6 +202,84 @@ async fn a_client_auth_diagnostic_is_recorded_and_read_back_within_scope() {
             .is_empty(),
         "a diagnostic is isolated to its own scope"
     );
+}
+
+#[tokio::test]
+async fn the_diagnostic_query_filters_by_client_and_time_window_within_scope() {
+    // The M9 read path (issue #91): query() narrows by client id and an occurred_at
+    // window within the forced-RLS scope, oldest first, and NEVER widens past scope.
+    let db = TestDatabase::start().await;
+    let (env, clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x71);
+    let scope = db.seed_scope(&env).await;
+
+    let diagnostics = db.store().scoped(scope).client_auth_diagnostics();
+    // Record three failures for two clients at distinct instants (the manual clock,
+    // frozen at the epoch, is advanced between records so occurred_at is deterministic
+    // at 0s, 5s, and 9s).
+    for (client, reason, advance_by) in [
+        ("cli_a", ClientAuthDiagnosticReason::AssertionExpired, 0),
+        (
+            "cli_a",
+            ClientAuthDiagnosticReason::AssertionBadSignature,
+            5_000_000,
+        ),
+        ("cli_b", ClientAuthDiagnosticReason::BadSecret, 4_000_000),
+    ] {
+        clock.advance(Duration::from_micros(advance_by));
+        diagnostics
+            .record(
+                &env,
+                DIAG_RETENTION_MICROS,
+                NewClientAuthDiagnostic {
+                    client_id: client,
+                    auth_method: "private_key_jwt",
+                    reason,
+                    key_id: None,
+                    signing_alg: None,
+                    skew_seconds: None,
+                    expected: None,
+                },
+            )
+            .await
+            .expect("record diagnostic");
+    }
+
+    // A client filter returns only that client's rows, oldest first.
+    let cli_a = diagnostics
+        .query(ironauth_store::ClientAuthDiagnosticQuery {
+            client_id: Some("cli_a"),
+            ..Default::default()
+        })
+        .await
+        .expect("query cli_a");
+    assert_eq!(cli_a.len(), 2, "two failures for cli_a");
+    assert_eq!(cli_a[0].failure_reason, "assertion_expired");
+    assert_eq!(cli_a[1].failure_reason, "assertion_bad_signature");
+    assert!(
+        cli_a[0].occurred_at_micros <= cli_a[1].occurred_at_micros,
+        "oldest first"
+    );
+
+    // A time window narrows further: only the second cli_a row (at 5_000_000) falls in
+    // [1_000_000, 9_000_000).
+    let windowed = diagnostics
+        .query(ironauth_store::ClientAuthDiagnosticQuery {
+            client_id: Some("cli_a"),
+            occurred_at_or_after_micros: Some(1_000_000),
+            occurred_before_micros: Some(9_000_000),
+            ..Default::default()
+        })
+        .await
+        .expect("windowed query");
+    assert_eq!(windowed.len(), 1, "one cli_a row in the window");
+    assert_eq!(windowed[0].failure_reason, "assertion_bad_signature");
+
+    // No client filter returns every row in scope (all three), still oldest first.
+    let all = diagnostics
+        .query(ironauth_store::ClientAuthDiagnosticQuery::default())
+        .await
+        .expect("query all");
+    assert_eq!(all.len(), 3, "every row in scope");
 }
 
 #[tokio::test]

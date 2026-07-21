@@ -346,6 +346,45 @@
       },
       "type": "object"
     },
+    "DiagnosticVerbosity": {
+      "description": "How much of a client-authentication failure a diagnostic captures (issue #91).\n\nVerbosity NEVER widens what a diagnostic can REPRESENT (the structural redaction\nguarantee: no diagnostic field can hold an assertion body, a secret, or a token,\nat any verbosity). It only chooses which SAFE, bounded fields populate.",
+      "oneOf": [
+        {
+          "const": "off",
+          "description": "Record nothing: the diagnostic sink is a no-op. The wire response is\nunchanged (still the opaque `invalid_client`); only the out-of-band record\nis suppressed.",
+          "type": "string"
+        },
+        {
+          "const": "standard",
+          "description": "Record the bounded failure reason, the attempted method, and the assertion\nheader key id and algorithm. The safe default: enough for the M9 view to\nname WHICH check failed, without the derived skew or key-mismatch hint.",
+          "type": "string"
+        },
+        {
+          "const": "verbose",
+          "description": "Additionally record the derived, NON-SECRET fields: the bounded clock-skew\nbucket (how far the presented `exp`/`nbf` fell outside the tolerance window)\nand the bounded kid-mismatch hint. Still never the assertion, a secret, or a\ntoken; these are computed values, not captured material.",
+          "type": "string"
+        }
+      ]
+    },
+    "DiagnosticsConfig": {
+      "additionalProperties": false,
+      "description": "Admin diagnostics settings (issue #91).\n\nThe out-of-band client-authentication diagnostics sink records WHY a client\nauthentication failed (the rich, bounded reason, off the wire) for the M9 admin\nflow inspector, while the wire response stays a uniform, opaque `invalid_client`.\nThese knobs bound how much is recorded and for how long. Safe defaults; the\nretention has a hard ninety day ceiling enforced at config load.",
+      "properties": {
+        "retention_secs": {
+          "default": 604800,
+          "description": "How long a client-authentication diagnostic is retained before the on-insert\nprune reclaims it, in seconds. Default seven days\n([`DIAGNOSTICS_DEFAULT_RETENTION_SECS`]); config load rejects a value above\nthe ninety day ceiling ([`DIAGNOSTICS_MAX_RETENTION_SECS`]). This replaces\nthe former hard-coded store constant and is threaded into the prune.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "verbosity": {
+          "$ref": "#/$defs/DiagnosticVerbosity",
+          "default": "standard",
+          "description": "How much of a failure a diagnostic captures. Default `standard`; `off`\nmakes recording a no-op. Verbosity never widens what is representable."
+        }
+      },
+      "type": "object"
+    },
     "DisposableEmailConfig": {
       "additionalProperties": false,
       "description": "The disposable / low-reputation email defense (issue #80). Evaluated at signup on the\nNFKC-normalized email domain. OFF by default. The lists are updateable per-environment\ndata (like the #79 IP allow/deny lists) that promote with the config snapshot: `denylist`\nnames domains treated as disposable, and `allowlist` is the override that always admits a\ndomain even if it matches a heuristic or the deny list.",
@@ -2342,6 +2381,14 @@
       "default": false,
       "description": "Development mode. Relaxes operational nagging (currently: the\nliteral-secret warning) but never relaxes parse strictness or the\nfeature acknowledgment gate. Never set this in production.",
       "type": "boolean"
+    },
+    "diagnostics": {
+      "$ref": "#/$defs/DiagnosticsConfig",
+      "default": {
+        "retention_secs": 604800,
+        "verbosity": "standard"
+      },
+      "description": "Admin diagnostics settings (issue #91): the verbosity and retention of the\nout-of-band client-authentication diagnostics sink the M9 admin flow\ninspector reads. Safe defaults: `standard` verbosity (the rich failure\nreason plus the assertion header, never a derived skew or hint) and a seven\nday retention (config load rejects a retention above the ninety day\nceiling). `off` makes recording a no-op; verbosity never widens what a\ndiagnostic can REPRESENT, only which safe fields populate."
     },
     "features": {
       "additionalProperties": {

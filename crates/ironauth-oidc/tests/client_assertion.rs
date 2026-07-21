@@ -268,12 +268,14 @@ async fn an_es512_assertion_is_rejected_and_diagnosed() {
         diags
             .iter()
             .any(|d| d.signing_alg.as_deref() == Some("ES512")
-                && d.failure_reason == "assertion_invalid"),
-        "the ES512 attempt is diagnosed out of band: {diags:?}"
+                && d.failure_reason == "assertion_algorithm_disallowed"),
+        "the ES512 attempt is diagnosed out of band with the specific disallowed-algorithm \
+         reason (issue #91): {diags:?}"
     );
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn the_rfc7523_claim_rules_are_enforced_with_opaque_errors_and_diagnostics() {
     let h = Harness::start().await;
     let key = signing_key_for(JwsAlgorithm::EdDsa);
@@ -375,15 +377,32 @@ async fn the_rfc7523_claim_rules_are_enforced_with_opaque_errors_and_diagnostics
     ));
 
     // Every failure recorded a diagnostic out of band (opaque on the wire, rich in
-    // the store): several assertion_invalid rows for this client.
+    // the store). Post-#91 the reasons are SPECIFIC: the bad audience is diagnosed as
+    // an audience mismatch and the expired assertion as expired, while the reasons
+    // without a dedicated bucket (a missing sub, a wrong iss, a missing jti) fall to
+    // the coarse assertion_invalid. The wire response was byte-identical for all of
+    // them (the dedicated wire-invariance test proves that); only the RECORD differs.
     let diags = h.client_auth_diagnostics(&cid).await;
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.failure_reason == "assertion_audience_mismatch"),
+        "the bad-audience failure is diagnosed as a terminal audience mismatch: {diags:?}"
+    );
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.failure_reason == "assertion_expired"),
+        "the expired assertion is diagnosed as expired: {diags:?}"
+    );
     assert!(
         diags
             .iter()
             .filter(|d| d.failure_reason == "assertion_invalid")
             .count()
-            >= 5,
-        "each failed claim rule is diagnosed: {diags:?}"
+            >= 3,
+        "the missing-sub, wrong-iss, and missing-jti failures fall to the coarse \
+         assertion_invalid: {diags:?}"
     );
 }
 
@@ -631,8 +650,8 @@ async fn a_client_pinned_to_eddsa_rejects_an_rs256_assertion() {
     assert!(
         diags
             .iter()
-            .any(|d| d.failure_reason == "assertion_invalid"),
-        "the disallowed algorithm is diagnosed: {diags:?}"
+            .any(|d| d.failure_reason == "assertion_algorithm_disallowed"),
+        "the disallowed algorithm is diagnosed with the specific reason (issue #91): {diags:?}"
     );
 }
 

@@ -80,6 +80,15 @@ pub struct Config {
     /// bootstrap login, consent, and register pages are the only interactive surface.
     pub flows: FlowsConfig,
 
+    /// Admin diagnostics settings (issue #91): the verbosity and retention of the
+    /// out-of-band client-authentication diagnostics sink the M9 admin flow
+    /// inspector reads. Safe defaults: `standard` verbosity (the rich failure
+    /// reason plus the assertion header, never a derived skew or hint) and a seven
+    /// day retention (config load rejects a retention above the ninety day
+    /// ceiling). `off` makes recording a no-op; verbosity never widens what a
+    /// diagnostic can REPRESENT, only which safe fields populate.
+    pub diagnostics: DiagnosticsConfig,
+
     /// Hosted-page render app settings (issue #85): the in-process, server-rendered pages
     /// that render from the headless flow contract (login, registration, MFA, recovery,
     /// federation), plus the theme seam and the served stylesheet. Off by default and
@@ -153,6 +162,77 @@ pub struct FlowsConfig {
     /// flow routes (the native JSON transport and the engine driven browser transport)
     /// answer, sharing one flow object and one state machine.
     pub enabled: bool,
+}
+
+/// The default client-authentication diagnostic retention, in seconds (seven days).
+///
+/// Long enough for the M9 admin flow inspector to surface a recent burst of
+/// client-authentication failures, while bounding the append-only sink so the #22
+/// introspection/revocation reuse of the `authenticate_client` seam PRE-grant (an
+/// unauthenticated caller reaches the sink there) cannot grow it without limit.
+/// This replaces the former hard-coded `DIAGNOSTIC_RETENTION_MICROS` constant in
+/// the store: retention is now a config value threaded into the on-insert prune.
+pub const DIAGNOSTICS_DEFAULT_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// The hard ceiling on the client-authentication diagnostic retention, in seconds
+/// (ninety days). Config load rejects a retention above it, so an operator cannot
+/// let the append-only, partially attacker-influenced sink grow unbounded by
+/// setting an unreasonable window.
+pub const DIAGNOSTICS_MAX_RETENTION_SECS: u64 = 90 * 24 * 60 * 60;
+
+/// How much of a client-authentication failure a diagnostic captures (issue #91).
+///
+/// Verbosity NEVER widens what a diagnostic can REPRESENT (the structural redaction
+/// guarantee: no diagnostic field can hold an assertion body, a secret, or a token,
+/// at any verbosity). It only chooses which SAFE, bounded fields populate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticVerbosity {
+    /// Record nothing: the diagnostic sink is a no-op. The wire response is
+    /// unchanged (still the opaque `invalid_client`); only the out-of-band record
+    /// is suppressed.
+    Off,
+    /// Record the bounded failure reason, the attempted method, and the assertion
+    /// header key id and algorithm. The safe default: enough for the M9 view to
+    /// name WHICH check failed, without the derived skew or key-mismatch hint.
+    #[default]
+    Standard,
+    /// Additionally record the derived, NON-SECRET fields: the bounded clock-skew
+    /// bucket (how far the presented `exp`/`nbf` fell outside the tolerance window)
+    /// and the bounded kid-mismatch hint. Still never the assertion, a secret, or a
+    /// token; these are computed values, not captured material.
+    Verbose,
+}
+
+/// Admin diagnostics settings (issue #91).
+///
+/// The out-of-band client-authentication diagnostics sink records WHY a client
+/// authentication failed (the rich, bounded reason, off the wire) for the M9 admin
+/// flow inspector, while the wire response stays a uniform, opaque `invalid_client`.
+/// These knobs bound how much is recorded and for how long. Safe defaults; the
+/// retention has a hard ninety day ceiling enforced at config load.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct DiagnosticsConfig {
+    /// How much of a failure a diagnostic captures. Default `standard`; `off`
+    /// makes recording a no-op. Verbosity never widens what is representable.
+    pub verbosity: DiagnosticVerbosity,
+
+    /// How long a client-authentication diagnostic is retained before the on-insert
+    /// prune reclaims it, in seconds. Default seven days
+    /// ([`DIAGNOSTICS_DEFAULT_RETENTION_SECS`]); config load rejects a value above
+    /// the ninety day ceiling ([`DIAGNOSTICS_MAX_RETENTION_SECS`]). This replaces
+    /// the former hard-coded store constant and is threaded into the prune.
+    pub retention_secs: u64,
+}
+
+impl Default for DiagnosticsConfig {
+    fn default() -> Self {
+        Self {
+            verbosity: DiagnosticVerbosity::default(),
+            retention_secs: DIAGNOSTICS_DEFAULT_RETENTION_SECS,
+        }
+    }
 }
 
 /// Hosted-page render app settings (issue #85).
@@ -3685,8 +3765,28 @@ impl Config {
         validate_quota(&self.quota)?;
         validate_password_hashing(&self.password_hashing)?;
         validate_password_policy(&self.password_policy)?;
+        validate_diagnostics(&self.diagnostics)?;
         Ok(())
     }
+}
+
+/// Validate the admin diagnostics retention (issue #91). The retention has a hard
+/// ninety day ceiling: a longer window would let the append-only, partially
+/// attacker-influenced client-authentication sink grow unbounded, so config load
+/// rejects it. There is no lower bound: a zero-second retention prunes every row on
+/// the next insert (an operator opting into an ephemeral, near-empty sink), which is
+/// a valid, safe posture.
+fn validate_diagnostics(diagnostics: &DiagnosticsConfig) -> Result<(), ConfigError> {
+    if diagnostics.retention_secs > DIAGNOSTICS_MAX_RETENTION_SECS {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "diagnostics.retention_secs ({}) must not exceed \
+                 {DIAGNOSTICS_MAX_RETENTION_SECS} seconds",
+                diagnostics.retention_secs
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Validate the account-recovery cooldown and delay windows (issue #81), kept out of
@@ -5474,6 +5574,48 @@ mod tests {
         assert_eq!(config.database.url.host(), "localhost");
         assert!(config.database.password.is_none());
         assert!(config.features.is_empty());
+    }
+
+    #[test]
+    fn diagnostics_section_defaults_and_enforces_the_retention_ceiling() {
+        // Defaults (issue #91): standard verbosity and a seven day retention.
+        let config = Config::from_toml_str("", "<inline>").expect("valid").config;
+        assert_eq!(config.diagnostics.verbosity, DiagnosticVerbosity::Standard);
+        assert_eq!(
+            config.diagnostics.retention_secs,
+            DIAGNOSTICS_DEFAULT_RETENTION_SECS
+        );
+
+        // A retention at the ninety day ceiling is accepted; verbose is a valid mode.
+        let at_ceiling = format!(
+            "[diagnostics]\nverbosity = \"verbose\"\nretention_secs = {DIAGNOSTICS_MAX_RETENTION_SECS}\n"
+        );
+        let config = Config::from_toml_str(&at_ceiling, "<inline>")
+            .expect("the ceiling is valid")
+            .config;
+        assert_eq!(config.diagnostics.verbosity, DiagnosticVerbosity::Verbose);
+        assert_eq!(
+            config.diagnostics.retention_secs,
+            DIAGNOSTICS_MAX_RETENTION_SECS
+        );
+
+        // A retention ABOVE the ceiling is a boot-time ConfigError::Invalid.
+        let over = format!(
+            "[diagnostics]\nretention_secs = {}\n",
+            DIAGNOSTICS_MAX_RETENTION_SECS + 1
+        );
+        let err = Config::from_toml_str(&over, "ironauth.toml")
+            .expect_err("a retention above the ceiling is rejected");
+        assert!(
+            matches!(err, ConfigError::Invalid { .. }),
+            "an over-ceiling retention is a boot-time Invalid: {err:?}"
+        );
+
+        // Off is a valid verbosity (the sink becomes a no-op).
+        let off = Config::from_toml_str("[diagnostics]\nverbosity = \"off\"\n", "<inline>")
+            .expect("off is valid")
+            .config;
+        assert_eq!(off.diagnostics.verbosity, DiagnosticVerbosity::Off);
     }
 
     #[test]

@@ -30,6 +30,8 @@ echo "==> classification lint (every resource type is classified; all three clas
 scripts/classification-lint.sh
 echo "==> pii encryption (every classified PII/secret column is envelope-encrypted)"
 scripts/pii-encryption-scan.sh
+echo "==> diagnostics redaction corpus (no secret sentinel can reach a diagnostic record)"
+scripts/diagnostics-redaction-scan.sh
 
 echo "==> canonicalization seam (every identifier comparison routes through the one seam)"
 scripts/canonicalization-seam.sh

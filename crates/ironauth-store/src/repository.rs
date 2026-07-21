@@ -9392,9 +9392,30 @@ pub enum ClientAuthDiagnosticReason {
     MethodMismatch,
     /// A presented secret did not match the client's stored hash.
     BadSecret,
-    /// A JWT assertion did not verify (bad signature, wrong iss/sub/aud, expired,
-    /// unsupported or disallowed algorithm, or unresolvable keys).
+    /// A JWT assertion did not verify for a reason that is not one of the specific
+    /// variants below (a malformed structure, a claims-shape problem, a wrong
+    /// `iss`, a missing required claim, or no usable verification key). The coarse
+    /// catch-all kept for every JOSE reject the M9 flow inspector does not surface
+    /// as its own bucket.
     AssertionInvalid,
+    /// A JWT assertion's signature did not verify against any eligible trusted key
+    /// (issue #91): the presented signature is wrong, or the key type did not match.
+    AssertionBadSignature,
+    /// A JWT assertion's `exp` is in the past beyond the allowed skew (issue #91):
+    /// the assertion is expired.
+    AssertionExpired,
+    /// A JWT assertion's `nbf`/`iat` is in the future beyond the allowed skew (issue
+    /// #91): the presenting clock is ahead of the application clock.
+    AssertionClockSkew,
+    /// A JWT assertion's `aud` matched none of the acceptable audiences after every
+    /// one was tried (issue #91): the terminal audience mismatch.
+    AssertionAudienceMismatch,
+    /// A JWT assertion's header `kid` names no trusted key in the client's
+    /// registered JWKS (issue #91).
+    AssertionKidUnknown,
+    /// A JWT assertion's `alg` was `none`, unsupported, or not in the client's
+    /// registered signing-algorithm allowlist (issue #91).
+    AssertionAlgorithmDisallowed,
     /// A JWT assertion's `jti` was replayed (already used).
     ReplayedJti,
     /// The `client_secret_jwt` method is registered but unsupported: IronAuth
@@ -9419,6 +9440,14 @@ impl ClientAuthDiagnosticReason {
             ClientAuthDiagnosticReason::MethodMismatch => "method_mismatch",
             ClientAuthDiagnosticReason::BadSecret => "bad_secret",
             ClientAuthDiagnosticReason::AssertionInvalid => "assertion_invalid",
+            ClientAuthDiagnosticReason::AssertionBadSignature => "assertion_bad_signature",
+            ClientAuthDiagnosticReason::AssertionExpired => "assertion_expired",
+            ClientAuthDiagnosticReason::AssertionClockSkew => "assertion_clock_skew",
+            ClientAuthDiagnosticReason::AssertionAudienceMismatch => "assertion_audience_mismatch",
+            ClientAuthDiagnosticReason::AssertionKidUnknown => "assertion_kid_unknown",
+            ClientAuthDiagnosticReason::AssertionAlgorithmDisallowed => {
+                "assertion_algorithm_disallowed"
+            }
             ClientAuthDiagnosticReason::ReplayedJti => "replayed_jti",
             ClientAuthDiagnosticReason::ClientSecretJwtUnsupported => {
                 "client_secret_jwt_unsupported"
@@ -9429,16 +9458,52 @@ impl ClientAuthDiagnosticReason {
     }
 }
 
-/// How long a client-authentication diagnostic is retained before the on-insert
-/// prune reclaims it (issue #25), in epoch microseconds (the unit the clock seam and
-/// the prune bind). Seven days is enough for the M9 admin view to surface a recent
-/// burst of failures, while bounding the table so the pre-grant reuse of the
-/// `authenticate_client` seam by #22 introspection/revocation cannot grow it without
-/// limit from unauthenticated requests. 7 days in microseconds is well within `i64`.
-const DIAGNOSTIC_RETENTION_MICROS: i64 = 7 * 24 * 60 * 60 * 1_000_000;
+/// A bounded, NON-SECRET hint about what a client-authentication failure EXPECTED
+/// versus what was presented (issue #91), recorded alongside the reason for the M9
+/// flow inspector. Every variant is a fixed shape with no attacker-controlled
+/// payload (never the JWKS, never a key, never the assertion), so it is safe as a
+/// metric-like dimension and can never carry captured material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosticExpectation {
+    /// The assertion header's `kid` named no key in the client's registered JWKS:
+    /// the presented kid is not among the registered verification keys (issue #91).
+    /// A structural hint only; it never names the registered kids or the JWKS.
+    KidNotInRegisteredJwks,
+}
 
-/// A client-authentication failure diagnostic to record (issue #25). Carries the
-/// rich, structured detail kept OFF the wire.
+impl DiagnosticExpectation {
+    /// The stable wire string recorded in the diagnostics row's `expected` column.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DiagnosticExpectation::KidNotInRegisteredJwks => "kid_not_in_registered_jwks",
+        }
+    }
+
+    /// Parse a stored `expected` string back to the bounded hint, or [`None`] for an
+    /// absent or unrecognized value (forward compatible: an unknown value reads as
+    /// no hint rather than a hard error).
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "kid_not_in_registered_jwks" => Some(DiagnosticExpectation::KidNotInRegisteredJwks),
+            _ => None,
+        }
+    }
+}
+
+/// A client-authentication failure diagnostic to record (issue #25, widened for the
+/// M9 flow inspector in #91). Carries the rich, structured detail kept OFF the wire.
+///
+/// STRUCTURAL REDACTION GUARANTEE (issue #91): every field is a bounded, non-secret
+/// datum by construction. There is deliberately NO field capable of holding an
+/// assertion body, a client secret, or a token value, so a secret is not scrubbed
+/// after the fact, it is UNREPRESENTABLE here. `client_id`, `key_id`, and
+/// `signing_alg` are attacker-INFLUENCED but non-secret identifiers the attempt
+/// itself presented; `reason`, `skew_seconds`, and `expected` are derived,
+/// bounded-cardinality values. The redaction corpus CI gate
+/// (`scripts/diagnostics-redaction-scan.sh`) proves no secret sentinel can reach a
+/// serialized record.
 #[derive(Debug, Clone, Copy)]
 pub struct NewClientAuthDiagnostic<'a> {
     /// The client identifier the attempt claimed (best effort on a failure).
@@ -9451,12 +9516,26 @@ pub struct NewClientAuthDiagnostic<'a> {
     pub key_id: Option<&'a str>,
     /// The assertion header's `alg`, if the attempt presented a JWT assertion.
     pub signing_alg: Option<&'a str>,
+    /// The derived, bounded clock-skew bucket in seconds (issue #91): how far the
+    /// presented `exp`/`nbf` fell outside the tolerance window, computed against the
+    /// application clock. Signed (positive = expired past the window, negative = not
+    /// yet valid), clamped to a bounded range. NEVER the assertion; only populated
+    /// for an expired / clock-skew reason under `verbose` verbosity, else [`None`].
+    pub skew_seconds: Option<i64>,
+    /// The derived, bounded expectation hint (issue #91), for example a kid that
+    /// names no registered key. NEVER the JWKS or a key; only populated for the
+    /// relevant reason under `verbose` verbosity, else [`None`].
+    pub expected: Option<DiagnosticExpectation>,
 }
 
-/// A read-back client-authentication diagnostic row (issue #25), for the future
-/// M9 admin view and for tests asserting a failure was recorded out of band.
+/// A read-back client-authentication diagnostic row (issue #25, widened in #91), for
+/// the M9 admin flow inspector and for tests asserting a failure was recorded out of
+/// band. Carries only the bounded, non-secret fields the record can hold (the same
+/// structural redaction guarantee as [`NewClientAuthDiagnostic`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientAuthDiagnosticRecord {
+    /// The random per-row identifier (the pagination cursor key for the M9 view).
+    pub id: String,
     /// The client identifier the attempt claimed.
     pub client_id: String,
     /// The authentication method the attempt used.
@@ -9467,6 +9546,31 @@ pub struct ClientAuthDiagnosticRecord {
     pub key_id: Option<String>,
     /// The assertion header `alg`, if any.
     pub signing_alg: Option<String>,
+    /// The derived, bounded clock-skew bucket in seconds, if recorded (issue #91).
+    pub skew_seconds: Option<i64>,
+    /// The derived, bounded expectation hint string, if recorded (issue #91).
+    pub expected: Option<String>,
+    /// When the attempt happened, in epoch microseconds from the application clock
+    /// seam (the pagination sort key for the M9 view, oldest first).
+    pub occurred_at_micros: i64,
+}
+
+/// A scoped query over the client-authentication diagnostics sink (issue #91), for
+/// the M9 admin flow inspector's read path. Every field NARROWS the result within
+/// the caller's forced-RLS scope; the read can never widen past the scope.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ClientAuthDiagnosticQuery<'a> {
+    /// Restrict to one client identifier, or [`None`] for every client in scope.
+    pub client_id: Option<&'a str>,
+    /// Only rows whose `occurred_at` is at or after this epoch-microseconds instant,
+    /// or [`None`] for no lower bound.
+    pub occurred_at_or_after_micros: Option<i64>,
+    /// Only rows whose `occurred_at` is strictly before this epoch-microseconds
+    /// instant, or [`None`] for no upper bound.
+    pub occurred_before_micros: Option<i64>,
+    /// The maximum number of rows to return. The repository additionally clamps this
+    /// to a hard ceiling so a caller can never request an unbounded scan.
+    pub limit: Option<i64>,
 }
 
 /// The out-of-band client-authentication diagnostics sink (issue #25).
@@ -9483,6 +9587,13 @@ pub struct ClientAuthDiagnosticsRepo<'a> {
 }
 
 impl ClientAuthDiagnosticsRepo<'_> {
+    /// The hard ceiling on how many diagnostic rows one [`query`] returns (issue
+    /// #91), so the M9 admin read can never request an unbounded scan. A caller's
+    /// larger `limit` is clamped to this; PR2's endpoint paginates under it.
+    ///
+    /// [`query`]: ClientAuthDiagnosticsRepo::query
+    pub const MAX_QUERY_LIMIT: i64 = 500;
+
     /// Record a client-authentication failure diagnostic in this scope, first
     /// pruning any rows past their retention window. The event time comes from the
     /// application clock seam (`env`), so both the recorded time and the prune are
@@ -9491,8 +9602,10 @@ impl ClientAuthDiagnosticsRepo<'_> {
     /// The prune bounds the table: issue #22 introspection/revocation reuses the
     /// `authenticate_client` seam PRE-grant, where an unauthenticated caller reaches
     /// this sink, so without retention it would grow one row per request. The window
-    /// is [`DIAGNOSTIC_RETENTION_MICROS`], long enough for the M9 admin view. This is
-    /// a growth bound, NOT rate limiting.
+    /// is `retention_micros`, threaded from the `diagnostics.retention_secs` config
+    /// (issue #91, replacing the former hard-coded constant), long enough for the M9
+    /// admin view and hard-capped at ninety days by config load. This is a growth
+    /// bound, NOT rate limiting.
     ///
     /// # Errors
     ///
@@ -9500,11 +9613,16 @@ impl ClientAuthDiagnosticsRepo<'_> {
     pub async fn record(
         &self,
         env: &Env,
+        retention_micros: i64,
         diagnostic: NewClientAuthDiagnostic<'_>,
     ) -> Result<(), StoreError> {
         let id = random_diagnostic_id(env);
         let occurred_micros = epoch_micros(env.clock().now_utc());
-        let expires_micros = occurred_micros.saturating_add(DIAGNOSTIC_RETENTION_MICROS);
+        // A negative or absurd retention (config guards the upper bound; guard the
+        // lower here) never yields an expiry BEFORE the event: clamp at zero, so a
+        // zero-retention posture prunes the row on the next insert rather than
+        // writing an already-past expiry that a clock quirk could misorder.
+        let expires_micros = occurred_micros.saturating_add(retention_micros.max(0));
         let mut tx = begin_scoped(self.store, self.scope).await?;
         // Prune rows past their retention window before inserting (prune-then-insert,
         // exactly like the jti cache). Bounds the table under the pre-grant reuse by
@@ -9522,10 +9640,10 @@ impl ClientAuthDiagnosticsRepo<'_> {
         sqlx::query(
             "INSERT INTO client_auth_diagnostics \
              (id, tenant_id, environment_id, client_id, auth_method, failure_reason, \
-              key_id, signing_alg, occurred_at, expires_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, \
-                     TIMESTAMPTZ 'epoch' + ($9::text || ' microseconds')::interval, \
-                     TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval)",
+              key_id, signing_alg, skew_seconds, expected, occurred_at, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
+                     TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval, \
+                     TIMESTAMPTZ 'epoch' + ($12::text || ' microseconds')::interval)",
         )
         .bind(id)
         .bind(self.scope.tenant().to_string())
@@ -9535,6 +9653,8 @@ impl ClientAuthDiagnosticsRepo<'_> {
         .bind(diagnostic.reason.as_str())
         .bind(diagnostic.key_id)
         .bind(diagnostic.signing_alg)
+        .bind(diagnostic.skew_seconds)
+        .bind(diagnostic.expected.map(DiagnosticExpectation::as_str))
         .bind(occurred_micros)
         .bind(expires_micros)
         .execute(&mut *tx)
@@ -9544,7 +9664,7 @@ impl ClientAuthDiagnosticsRepo<'_> {
     }
 
     /// Read every recorded diagnostic for `client_id` in this scope, oldest first.
-    /// For the future M9 admin view and for tests asserting a failure was recorded.
+    /// For the M9 admin view and for tests asserting a failure was recorded.
     ///
     /// # Errors
     ///
@@ -9553,27 +9673,72 @@ impl ClientAuthDiagnosticsRepo<'_> {
         &self,
         client_id: &str,
     ) -> Result<Vec<ClientAuthDiagnosticRecord>, StoreError> {
+        self.query(ClientAuthDiagnosticQuery {
+            client_id: Some(client_id),
+            ..ClientAuthDiagnosticQuery::default()
+        })
+        .await
+    }
+
+    /// Read the diagnostics matching `query` within this scope, oldest first, for the
+    /// M9 admin flow inspector's read path (issue #91). Every filter NARROWS within
+    /// the caller's forced-RLS scope: the tenant and environment predicates plus the
+    /// forced row-level security make a cross-scope read impossible (a cross-tenant
+    /// query for a foreign client id resolves to no rows, proven by the IDOR probe).
+    /// The result is bounded by the query's `limit` clamped to
+    /// [`ClientAuthDiagnosticsRepo::MAX_QUERY_LIMIT`], so a caller can never request
+    /// an unbounded scan.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn query(
+        &self,
+        query: ClientAuthDiagnosticQuery<'_>,
+    ) -> Result<Vec<ClientAuthDiagnosticRecord>, StoreError> {
+        let limit = query
+            .limit
+            .unwrap_or(Self::MAX_QUERY_LIMIT)
+            .clamp(0, Self::MAX_QUERY_LIMIT);
         let mut tx = begin_scoped(self.store, self.scope).await?;
+        // A single parameterized statement with NULL-guarded optional predicates: a
+        // NULL filter is inert ("$n IS NULL OR column <op> $n"), so the one query
+        // serves the whole filter matrix without string concatenation.
         let rows = sqlx::query(
-            "SELECT client_id, auth_method, failure_reason, key_id, signing_alg \
+            "SELECT id, client_id, auth_method, failure_reason, key_id, signing_alg, \
+                    skew_seconds, expected, \
+                    (EXTRACT(EPOCH FROM occurred_at) * 1000000)::bigint AS occurred_us \
              FROM client_auth_diagnostics \
-             WHERE client_id = $1 AND tenant_id = $2 AND environment_id = $3 \
-             ORDER BY occurred_at, id",
+             WHERE tenant_id = $1 AND environment_id = $2 \
+               AND ($3::text IS NULL OR client_id = $3) \
+               AND ($4::bigint IS NULL OR occurred_at >= \
+                    TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval) \
+               AND ($5::bigint IS NULL OR occurred_at < \
+                    TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval) \
+             ORDER BY occurred_at, id \
+             LIMIT $6",
         )
-        .bind(client_id)
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
+        .bind(query.client_id)
+        .bind(query.occurred_at_or_after_micros)
+        .bind(query.occurred_before_micros)
+        .bind(limit)
         .fetch_all(&mut *tx)
         .await?;
         tx.commit().await?;
         Ok(rows
             .iter()
             .map(|row| ClientAuthDiagnosticRecord {
+                id: row.get("id"),
                 client_id: row.get("client_id"),
                 auth_method: row.get("auth_method"),
                 failure_reason: row.get("failure_reason"),
                 key_id: row.get("key_id"),
                 signing_alg: row.get("signing_alg"),
+                skew_seconds: row.get("skew_seconds"),
+                expected: row.get("expected"),
+                occurred_at_micros: row.get("occurred_us"),
             })
             .collect())
     }
