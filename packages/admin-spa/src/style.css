@@ -395,7 +395,8 @@ body {
 }
 
 .resource-field input,
-.resource-field select {
+.resource-field select,
+.resource-field textarea {
   font: inherit;
   padding: 0.35rem 0.5rem;
   border: 1px solid var(--line);
@@ -404,8 +405,31 @@ body {
   color: var(--ink);
 }
 
+.resource-field textarea {
+  resize: vertical;
+  min-height: 4rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.resource-field-inline {
+  flex-direction: row;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.resource-field-inline input {
+  width: auto;
+}
+
+.resource-field-error {
+  color: #a3341f;
+  font-size: 0.8rem;
+  margin: 0.1rem 0 0;
+}
+
 .resource-field input:focus,
 .resource-field select:focus,
+.resource-field textarea:focus,
 .resource-btn:focus {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
@@ -458,4 +482,26 @@ body {
 .resource-success {
   color: #1f6b3a;
   margin: 0.5rem 0;
+}
+
+.resource-subsection {
+  margin: 1rem 0;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--line);
+}
+
+.resource-subsection h3 {
+  font-size: 0.95rem;
+  margin: 0.5rem 0;
+}
+
+.resource-status-blocked,
+.resource-status-disabled {
+  color: #a3341f;
+}
+
+.resource-status-scheduled_offboarding,
+.resource-status-pending_verification,
+.resource-status-waitlisted {
+  color: #8a6d1f;
 }

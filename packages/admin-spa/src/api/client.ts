@@ -43,6 +43,32 @@ export type TenantStatusView = components["schemas"]["TenantStatusView"];
 export type CreateEnvironmentRequest =
   components["schemas"]["CreateEnvironmentRequest"];
 
+// The request and result shapes the users CRUD surface reads (issue #90, PR 5).
+// Users are ENVIRONMENT scoped, so every wrapper below injects the active
+// {tenant, environment} into the documented path. Re-exported from the generated
+// schema so the users view never hand maintains a shape the management contract
+// already owns: UserView / UserList for the reads, CreateUserRequest for the
+// create, UpdateUserRequest for the RFC 7396 merge-patch update (claims only),
+// SetUserStateRequest / UserStateChangeView for the lifecycle transitions,
+// RevokeSessionsRequest / UserRevocationView for the session revoke, and
+// LinkExternalIdRequest / UserExternalIdView for the external id mapping.
+export type UserView = components["schemas"]["UserView"];
+export type UserStateView = components["schemas"]["UserStateView"];
+export type CreateUserRequest = components["schemas"]["CreateUserRequest"];
+export type UpdateUserRequest = components["schemas"]["UpdateUserRequest"];
+export type SetUserStateRequest =
+  components["schemas"]["SetUserStateRequest"];
+export type UserStateChangeView =
+  components["schemas"]["UserStateChangeView"];
+export type RevokeSessionsRequest =
+  components["schemas"]["RevokeSessionsRequest"];
+export type UserRevocationView =
+  components["schemas"]["UserRevocationView"];
+export type LinkExternalIdRequest =
+  components["schemas"]["LinkExternalIdRequest"];
+export type UserExternalIdView =
+  components["schemas"]["UserExternalIdView"];
+
 export type ManagementClient = ReturnType<typeof createClient<paths>>;
 
 // A management call that failed carries the verbatim ErrorBody the server
@@ -438,4 +464,263 @@ export async function deleteEnvironment(
   if (error !== undefined || !response.ok) {
     throw new ManagementError(toErrorBody(error), response.status);
   }
+}
+
+// ---- The users CRUD operations (issue #90, PR 5) ----------------------------
+//
+// The users resource view (src/ui/UsersView.tsx) calls these named wrappers,
+// never a path, so the single funnel holds: every literal below is a path the
+// committed docs/openapi/management.json documents, users live UNDER the active
+// {tenant, environment} scope, and the ids substitute into the documented path
+// parameters exactly as the environments wrappers inject the tenant. Each throws
+// a ManagementError carrying the verbatim ErrorBody on a non 2xx (the same
+// bodyless-non-2xx guard as the reads above), which the ErrorView boundary
+// renders unchanged. Unlike tenants and environments, a user HAS a real update:
+// updateUser is the PATCH (an RFC 7396 merge patch of the standard claims), and
+// the lifecycle state, external id, and sessions each have their own explicit
+// operation the contract documents.
+
+// List the users of one environment (operationId listUsers). Scope injection:
+// the active tenant and environment ids substitute into the documented path,
+// targeting `/v1/tenants/<t>/environments/<e>/users`.
+export async function fetchUsers(
+  tenantId: string,
+  environmentId: string,
+): Promise<UserView[]> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.GET(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/users",
+    { params: { path: { tenant_id: tenantId, environment_id: environmentId } } },
+  );
+  // A non 2xx is a failure even when openapi-fetch yields no error body (it
+  // returns `error: undefined` for a bodyless response, for example a 401 or 502
+  // with Content-Length 0 from a proxy or gateway). Checking `response.ok` too
+  // means such a response is never silently read as success (an empty list).
+  if (error !== undefined || !response.ok) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data?.items ?? [];
+}
+
+// Read one user (operationId getUser). The detail view reads this.
+export async function getUser(
+  tenantId: string,
+  environmentId: string,
+  userId: string,
+): Promise<UserView> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.GET(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          user_id: userId,
+        },
+      },
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+// Create a user under an environment (operationId createUser). Idempotency-Key
+// guarded (same pattern the sudo elevate and the tenant / environment creates
+// use) so a retried submit records the user once.
+export async function createUser(
+  tenantId: string,
+  environmentId: string,
+  request: CreateUserRequest,
+): Promise<UserView> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.POST(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/users",
+    {
+      params: {
+        path: { tenant_id: tenantId, environment_id: environmentId },
+        header: { "Idempotency-Key": idempotencyKey() },
+      },
+      body: request,
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+// Update a user (operationId updateUser): the PATCH, an RFC 7396 merge patch of
+// the mutable profile. The contract's UpdateUserRequest accepts ONLY `claims`
+// (the lifecycle state and external id have their own operations), so the caller
+// sends only that field, never a state or an external id smuggled in here.
+export async function updateUser(
+  tenantId: string,
+  environmentId: string,
+  userId: string,
+  request: UpdateUserRequest,
+): Promise<UserView> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.PATCH(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          user_id: userId,
+        },
+      },
+      body: request,
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+// Delete a user (operationId deleteUser): a soft-delete offboarding that
+// cascades the user's sessions. A 204 carries no body, so the guard reads the
+// bodyless 2xx as success and any non 2xx as the verbatim failure.
+export async function deleteUser(
+  tenantId: string,
+  environmentId: string,
+  userId: string,
+): Promise<void> {
+  const client = createManagementClient();
+  const { error, response } = await client.DELETE(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          user_id: userId,
+        },
+      },
+    },
+  );
+  if (error !== undefined || !response.ok) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+}
+
+// Transition a user's lifecycle state (operationId setUserState). The target
+// state (and, only for scheduled_offboarding, its instant) plus an optional
+// hard_kill ride in the body; the UserStateChangeView states the post-condition.
+// Idempotency-Key guarded.
+export async function setUserState(
+  tenantId: string,
+  environmentId: string,
+  userId: string,
+  request: SetUserStateRequest,
+): Promise<UserStateChangeView> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.POST(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/state",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          user_id: userId,
+        },
+        header: { "Idempotency-Key": idempotencyKey() },
+      },
+      body: request,
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+// Revoke EVERY session of one user (operationId revokeUserSessions). An empty
+// body is a plain revoke that PRESERVES the offline_access families; hard_kill
+// cuts a compromised principal off entirely. The UserRevocationView states the
+// post-condition. Idempotency-Key guarded.
+export async function revokeUserSessions(
+  tenantId: string,
+  environmentId: string,
+  userId: string,
+  request: RevokeSessionsRequest,
+): Promise<UserRevocationView> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.POST(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/sessions/revoke",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          user_id: userId,
+        },
+        header: { "Idempotency-Key": idempotencyKey() },
+      },
+      body: request,
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+// Link an external correlation id to a user (operationId linkUserExternalId): a
+// PUT that is idempotent by construction (a re-link of the same id is a no-op),
+// so no Idempotency-Key is needed. The UserExternalIdView states the mapping.
+export async function linkUserExternalId(
+  tenantId: string,
+  environmentId: string,
+  userId: string,
+  request: LinkExternalIdRequest,
+): Promise<UserExternalIdView> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.PUT(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/external-id",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          user_id: userId,
+        },
+      },
+      body: request,
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+// Unlink a user's external id (operationId unlinkUserExternalId). Returns a 200
+// with the (now null) mapping, not a 204, so the guard checks the body too.
+export async function unlinkUserExternalId(
+  tenantId: string,
+  environmentId: string,
+  userId: string,
+): Promise<UserExternalIdView> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.DELETE(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/external-id",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          user_id: userId,
+        },
+      },
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
 }
