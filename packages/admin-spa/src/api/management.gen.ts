@@ -8976,7 +8976,7 @@ export interface operations {
                     "application/json": components["schemas"]["ConsentRevocationView"];
                 };
             };
-            /** @description Missing or invalid credential */
+            /** @description Missing or invalid credential, or fresh privilege required */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -8985,7 +8985,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Wrong plane or scope, or fresh privilege required */
+            /** @description Wrong plane or scope */
             403: {
                 headers: {
                     [name: string]: unknown;

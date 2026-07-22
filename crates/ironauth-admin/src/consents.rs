@@ -148,8 +148,8 @@ pub async fn list_user_consents(
     security(("bearer" = [])),
     responses(
         (status = 200, description = "The consent was revoked", body = ConsentRevocationView),
-        (status = 401, description = "Missing or invalid credential", body = ErrorBody),
-        (status = 403, description = "Wrong plane or scope, or fresh privilege required", body = ErrorBody),
+        (status = 401, description = "Missing or invalid credential, or fresh privilege required", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
         (status = 404, description = "Not found (absent or in another scope)", body = ErrorBody)
     )
 )]
