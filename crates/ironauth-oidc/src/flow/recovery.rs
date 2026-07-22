@@ -36,20 +36,15 @@
 //! engine.
 
 use ironauth_store::{
-    ActorRef, AuthPath, EmailFactorPurpose, FlowRecord, RecoveryEntryPoint, RecoveryMethod, Scope,
+    AuthPath, EmailFactorPurpose, FlowRecord, RecoveryEntryPoint, RecoveryMethod, Scope,
 };
 
 use super::message::{self, Message};
-use super::model::{
-    Autocomplete, FlowStateTag, InputType, Node, NodeAttributes, NodeGroup, Transport,
-};
+use super::model::{Autocomplete, InputType, Node, NodeAttributes, NodeGroup, Transport};
 use super::{FlowError, Submission};
-use crate::authn::AuthenticationEvent;
 use crate::email_otp::{self, EmailCodeOutcome};
-use crate::interaction;
 use crate::recovery::{self, RecoveryFactor};
 use crate::state::OidcState;
-use crate::util::epoch_micros;
 
 /// The outcome of the recovery INITIATE transition (issue #84).
 pub(super) enum RecoveryStartStep {
@@ -90,10 +85,6 @@ pub(super) enum RecoveryVerifyStep {
 pub(super) struct RecoverySuccess {
     /// The recovered subject (a `usr_` id string).
     pub subject: String,
-    /// The audit actor for the session mint.
-    pub actor: ActorRef,
-    /// The recorded authentication event (an email one time code login at the current instant).
-    pub event: AuthenticationEvent,
     /// The recovery path abuse context, so a successful mint relaxes the SAME counters.
     pub ctx: crate::abuse::AttemptContext,
 }
@@ -230,12 +221,6 @@ fn push_flow_hidden(nodes: &mut Vec<Node>, transport: Transport, flow_id: &str) 
             None,
         ));
     }
-}
-
-/// The state tag a recovery identifier render stays on (issue #84).
-#[must_use]
-pub(super) fn start_state_tag() -> FlowStateTag {
-    FlowStateTag::RecoveryStart
 }
 
 /// Advance the recovery INITIATE one step (issue #84), mirroring the bootstrap `recover_post`
@@ -420,8 +405,6 @@ pub(super) async fn advance_verify(
         EmailCodeOutcome::Verified { subject, ctx } => {
             Ok(RecoveryVerifyStep::Complete(Box::new(RecoverySuccess {
                 subject: subject.to_string(),
-                actor: interaction::user_actor(&subject),
-                event: AuthenticationEvent::email_otp(epoch_micros(state.now())),
                 ctx,
             })))
         }

@@ -144,11 +144,11 @@ impl FlowPlanView {
 /// Each distinct wire state is kept once, in first-visit order, so the result is the ordered plan
 /// the flow inspector projects.
 ///
-/// This is the mechanism the per-journey convergence PRs (PR 8b onward) point each built-in's
-/// [`Journey::plan`] at, replacing the retired static arm once a one-time assertion pins that the
-/// projection equals the old list. In PR 8a the six built-ins still use their static [`Journey::plan`]
-/// (this helper is exercised only by its unit tests and the journey crate's compile tests), so no
-/// journey's plan changes.
+/// This is the mechanism the mint-family convergence PRs (PR 8b/8c/8d, closed by PR 8e) pin each
+/// mint-family journey's [`Journey::plan`] against: the login, registration, and recovery plans
+/// stay `&'static` lists but are held equal to this projection by the three projection pins below,
+/// and their imperative drivers are gone. Federation and Consent keep their purely static
+/// [`Journey::plan`] arms (they have no compiled artifact), so no journey's plan changes here.
 ///
 /// For a GENUINE [`Journey::Custom`] flow every step is the flat [`FlowStateTag::Custom`], so the
 /// projection folds to `[Custom, Completed]`; the custom half already drives from

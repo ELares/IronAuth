@@ -9,13 +9,17 @@
 //! re-derived here; the table only chooses which executor core runs and how routing threads
 //! between them.
 //!
-//! ## Why a parallel path (behavior preservation)
+//! ## The one engine for the mint family (convergence complete)
 //!
-//! The built-in `drive_*` functions in [`super`] are UNTOUCHED. The duplication is confined to
-//! the thin orchestration shell below (resolve the current step, run its executor, then either
-//! re-render or walk the compiled transitions), so the built-in default path stays byte-identical
-//! and a custom journey never perturbs it. A later PR converges the built-ins onto the table
-//! under a byte-equivalence gate.
+//! The mint family (login, registration, recovery) has CONVERGED onto this table engine (issue
+//! #92, PR 8b/8c/8d, closed by PR 8e): each is now driven through [`drive_via_table`], byte
+//! identically to the imperative `drive_*` drivers it replaced, which are DELETED. The
+//! orchestration shell below (resolve the current step, run its executor, then either re-render or
+//! walk the compiled transitions) reuses the SAME already-factored executor cores, so no security
+//! decision is re-derived. Federation and Consent stay imperative in [`super`]
+//! ([`super::drive_federation`] / [`super::drive_consent`]) as the two documented permanent
+//! residuals (an owner-scope decision): each is a redirect or grant step with no session mint, not
+//! a login state machine, so neither converges onto the table.
 //!
 //! ## The routing loop
 //!
