@@ -554,6 +554,30 @@ impl ScopedKind for SignupFormKind {
     const PREFIX: &'static str = "sgf";
 }
 
+/// Marker for a custom-journey version (`flv_`), one immutable version of a journey artifact in a
+/// (tenant, environment) registry (issue #92, PR 5). A tenant-scoped resource: the id embeds its
+/// (tenant, environment), so a version id minted in one scope parses as a uniform not-found under
+/// another. A custom flow stamps the resolved `flv_` id on its row so it re-resolves the SAME
+/// compiled table across submissions (the version it started under cannot change mid-flow). A flow
+/// version is PROMOTABLE (issue #41): its whole non-secret artifact travels in a config snapshot.
+/// The prefix is `flv` (distinct from the `flw` headless flow id and the `fvp` pin). Not a bearer
+/// secret, so its debug form stays legible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FlowVersionKind;
+impl ScopedKind for FlowVersionKind {
+    const PREFIX: &'static str = "flv";
+}
+
+/// Marker for a custom-journey active-version pin (`fvp_`), one row per (tenant, environment,
+/// `journey_id`) naming the version a fresh custom flow of that journey is created against (issue
+/// #92, PR 5). A tenant-scoped resource: the id embeds its (tenant, environment). The prefix is
+/// `fvp` (distinct from the `flv` version it points at). Not a bearer secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FlowVersionPinKind;
+impl ScopedKind for FlowVersionPinKind {
+    const PREFIX: &'static str = "fvp";
+}
+
 /// Marker for a per environment, per client admin consent pre authorization (`cag_`), one row per
 /// (tenant, environment, client) (issue #88, PR 4): the space separated scope set an admin
 /// pre authorized for a THIRD PARTY client, the escape from the third party admin consent gate. A
@@ -1380,6 +1404,13 @@ pub type LocaleBundleId = ScopedId<LocaleBundleKind>;
 /// A per-environment, per-client signup form identifier (`sgf_...`), one signup-form-as-data
 /// definition per (tenant, environment, client) (issue #87). Promotable.
 pub type SignupFormId = ScopedId<SignupFormKind>;
+/// A custom-journey version identifier (`flv_...`), one immutable version of a journey artifact in
+/// a (tenant, environment) registry (issue #92, PR 5). Promotable: the whole non-secret artifact
+/// travels in a config snapshot.
+pub type FlowVersionId = ScopedId<FlowVersionKind>;
+/// A custom-journey active-version pin identifier (`fvp_...`), one row per (tenant, environment,
+/// `journey_id`) naming the version a fresh custom flow is created against (issue #92, PR 5).
+pub type FlowVersionPinId = ScopedId<FlowVersionPinKind>;
 /// A per-environment, per-client admin consent pre-authorization identifier (`cag_...`), one row
 /// per (tenant, environment, client) (issue #88, PR 4): the scope set an admin pre-authorized for
 /// a third-party client. Runtime (never promoted).

@@ -566,6 +566,14 @@ pub enum Action {
     /// A per-environment, per-client SIGNUP FORM was deleted through the management API (issue
     /// #87). The audit row names the signup form id and scope.
     SignupFormDelete,
+    /// A new custom-journey VERSION was created in a (tenant, environment) registry (issue #92,
+    /// PR 5): an immutable, load-valid journey artifact (validated + compiled before the write).
+    /// The audit row names the flow version id and scope; the artifact itself is not recorded here.
+    FlowVersionCreate,
+    /// A custom-journey ACTIVE VERSION PIN was set or moved through the management API (issue #92,
+    /// PR 5): the version a fresh custom flow of the journey is created against. The audit row
+    /// names the pin id and scope; the pinned version is the operator-safe `detail`.
+    FlowVersionPin,
     /// A per-environment, per-client ADMIN CONSENT PRE-AUTHORIZATION was set through the
     /// management API (issue #88, PR 4): a first write or an overwrite of the scope set an admin
     /// pre-authorized for a third-party client. The audit row names the pre-authorization id and
@@ -1065,6 +1073,8 @@ impl Action {
             Action::LocaleDelete => "locale.delete",
             Action::SignupFormSet => "signup_form.set",
             Action::SignupFormDelete => "signup_form.delete",
+            Action::FlowVersionCreate => "flow_version.create",
+            Action::FlowVersionPin => "flow_version.pin",
             Action::AdminConsentGrant => "admin_consent.grant",
             Action::AdminConsentRevoke => "admin_consent.revoke",
             Action::EnvironmentVariableSet => "environment_variable.set",

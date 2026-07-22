@@ -1676,6 +1676,36 @@ pub struct SignupFormView {
     pub fields: Vec<SignupFormFieldView>,
 }
 
+/// The body to create a new version of a custom journey (issue #92, PR 5).
+///
+/// The `artifact` is the canonical journey document. It is validated LOAD-VALID before the write
+/// (it must parse and COMPILE: known step kinds and node groups, no dangling or ambiguous
+/// transition, no unreachable step or dead end, and a reachable completion); a load-invalid
+/// artifact is a loud 400 naming the offending location and nothing is stored. A journey artifact
+/// carries no secret and no PII (a predicate references trait pointers and group / scope names,
+/// never values).
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct CreateFlowVersionRequest {
+    /// The canonical journey artifact (a JSON document).
+    pub artifact: serde_json::Value,
+}
+
+/// A custom-journey version, as returned by the management API (issue #92, PR 5).
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct FlowVersionView {
+    /// The `flv_` version id (embeds its scope).
+    pub id: String,
+    /// The author-facing journey id this version belongs to.
+    pub journey_id: String,
+    /// The per-scope, per-journey monotonic version number.
+    pub version: i32,
+    /// The canonical journey artifact (a JSON document).
+    pub artifact: serde_json::Value,
+    /// Whether this version is the journey's active pin (the version a fresh custom flow is created
+    /// against).
+    pub pinned: bool,
+}
+
 /// The body to set (create or overwrite) a per-environment, per-client admin consent
 /// pre-authorization (issue #88, PR 4).
 ///

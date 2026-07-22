@@ -804,6 +804,16 @@ async fn build_oidc_router(
         // SMS gateway. A production deployment installs its own `SmsSender` here. SMS OTP
         // is off by default, so this stub is inert until a tenant explicitly enables SMS.
         .with_sms_sender(std::sync::Arc::new(ironauth_oidc::LoggingSmsSender));
+    // Wire the production custom-journey source (issue #92, PR 5): a store-backed
+    // CompiledJourneySource over the RLS-scoped flow_versions registry, with a compile cache
+    // keyed by version id. It replaces PR 4's test-only embedded source, so a custom flow created
+    // from a STORED, PINNED journey version executes end to end. It is inert until a journey
+    // version is authored and pinned (an unpinned or unknown journey is a uniform not-found), so
+    // installing it by default perturbs no built-in flow.
+    let custom_journey_source = std::sync::Arc::new(
+        ironauth_oidc::flow::FlowVersionJourneySource::new(state.store().clone()),
+    );
+    state = state.with_custom_journey_source(custom_journey_source);
     if let Some(provider) = build_breach_provider(policy_config) {
         state = state.with_breach_provider(provider);
     }

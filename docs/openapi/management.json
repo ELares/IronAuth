@@ -4694,6 +4694,387 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/journeys/{journey_id}/versions": {
+      "get": {
+        "tags": [
+          "flow-versions"
+        ],
+        "summary": "List every version of a custom journey (ascending by version).",
+        "operationId": "listFlowVersions",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "journey_id",
+            "in": "path",
+            "description": "The author-facing journey identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The journey's versions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/FlowVersionView"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Malformed journey id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "flow-versions"
+        ],
+        "summary": "Create a new version of a custom journey.",
+        "operationId": "createFlowVersion",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "journey_id",
+            "in": "path",
+            "description": "The author-facing journey identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateFlowVersionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The created version",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FlowVersionView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A load-invalid journey artifact",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found or malformed journey id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/journeys/{journey_id}/versions/{version}": {
+      "get": {
+        "tags": [
+          "flow-versions"
+        ],
+        "summary": "Get one version of a custom journey by its version number.",
+        "operationId": "getFlowVersion",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "journey_id",
+            "in": "path",
+            "description": "The author-facing journey identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "version",
+            "in": "path",
+            "description": "The version number",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The version",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FlowVersionView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (absent or in another scope)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/journeys/{journey_id}/versions/{version}/pin": {
+      "post": {
+        "tags": [
+          "flow-versions"
+        ],
+        "summary": "Pin a version of a custom journey as the active version (the version a fresh custom flow is\ncreated against).",
+        "operationId": "pinFlowVersion",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "journey_id",
+            "in": "path",
+            "description": "The author-facing journey identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "version",
+            "in": "path",
+            "description": "The version number to pin",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The now-pinned version",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FlowVersionView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The version does not exist in this scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/keys": {
       "get": {
         "tags": [
@@ -9834,6 +10215,18 @@
           }
         }
       },
+      "CreateFlowVersionRequest": {
+        "type": "object",
+        "description": "The body to create a new version of a custom journey (issue #92, PR 5).\n\nThe `artifact` is the canonical journey document. It is validated LOAD-VALID before the write\n(it must parse and COMPILE: known step kinds and node groups, no dangling or ambiguous\ntransition, no unreachable step or dead end, and a reachable completion); a load-invalid\nartifact is a loud 400 naming the offending location and nothing is stored. A journey artifact\ncarries no secret and no PII (a predicate references trait pointers and group / scope names,\nnever values).",
+        "required": [
+          "artifact"
+        ],
+        "properties": {
+          "artifact": {
+            "description": "The canonical journey artifact (a JSON document)."
+          }
+        }
+      },
       "CreateInitialAccessTokenRequest": {
         "type": "object",
         "description": "The body to mint a DCR initial access token (RFC 7591, issue #31).",
@@ -10546,6 +10939,39 @@
           "transport": {
             "type": "string",
             "description": "The transport it was created on."
+          }
+        }
+      },
+      "FlowVersionView": {
+        "type": "object",
+        "description": "A custom-journey version, as returned by the management API (issue #92, PR 5).",
+        "required": [
+          "id",
+          "journey_id",
+          "version",
+          "artifact",
+          "pinned"
+        ],
+        "properties": {
+          "artifact": {
+            "description": "The canonical journey artifact (a JSON document)."
+          },
+          "id": {
+            "type": "string",
+            "description": "The `flv_` version id (embeds its scope)."
+          },
+          "journey_id": {
+            "type": "string",
+            "description": "The author-facing journey id this version belongs to."
+          },
+          "pinned": {
+            "type": "boolean",
+            "description": "Whether this version is the journey's active pin (the version a fresh custom flow is created\nagainst)."
+          },
+          "version": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The per-scope, per-journey monotonic version number."
           }
         }
       },

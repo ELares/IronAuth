@@ -494,8 +494,8 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
     );
     assert_eq!(
         report.already_applied(),
-        79,
-        "the production chain is exactly seventy nine migrations (isolation, audit log, management \
+        80,
+        "the production chain is exactly eighty migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -515,17 +515,17 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
          risk signals, signup fraud review, advanced recovery modes, headless flows, branding, \
          locale bundles, brand assets, diagnostic reason detail, diagnostics control read, \
          policy decision traces, flows control read, signup forms, consent lockdown, client admin \
-         grants, consent control grants, flow version pin)"
+         grants, consent control grants, flow version pin, flow versions)"
     );
 
-    // The ledger holds exactly versions 1 through 79.
+    // The ledger holds exactly versions 1 through 80.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
             46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67,
-            68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79
+            68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80
         ]
     );
     let phase_of = |version: i64| async move {
@@ -1709,6 +1709,98 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
     assert!(
         role_has_column_privilege(pool, "ironauth_app", "consents", "revoked_at", "UPDATE").await,
         "the data-plane role must still hold column-scoped UPDATE on consents.revoked_at (0076)"
+    );
+
+    // The custom-journey version registry migration (issue #92, PR 5, migration 0080) is an
+    // EXPAND: two new tenant-scoped tables (flow_versions, flow_version_pins) plus the deferred
+    // flows foreign key, no rewrite of existing state.
+    assert_eq!(phase_of(80).await, "expand");
+
+    // Both new tables ENABLE and FORCE row-level security, carry the (tenant, environment)
+    // isolation policy, and pin the nonempty-scope CHECK, exactly like every other scoped table.
+    for table in ["flow_versions", "flow_version_pins"] {
+        assert!(
+            rls_enabled_and_forced(pool, table).await,
+            "{table} must ENABLE and FORCE row-level security"
+        );
+        assert!(
+            policy_exists(pool, table, &format!("{table}_tenant_isolation")).await,
+            "{table} must carry the (tenant, environment) isolation policy"
+        );
+        assert!(
+            check_constraint_exists(pool, table, &format!("{table}_scope_nonempty")).await,
+            "{table} must carry the nonempty-scope CHECK"
+        );
+    }
+    // The journey artifact is jsonb (a validated, canonicalizable document, never a raw text blob).
+    assert_eq!(
+        column_data_type(pool, "flow_versions", "artifact").await,
+        "jsonb",
+        "flow_versions.artifact must be jsonb"
+    );
+    // The CONTROL plane OWNS journey authoring (create a version, set a pin), and a version is
+    // immutable and never deleted (append-only): it holds SELECT and INSERT on flow_versions but
+    // never UPDATE or DELETE.
+    assert!(
+        role_has_table_privilege(pool, "ironauth_control", "flow_versions", "SELECT").await
+            && role_has_table_privilege(pool, "ironauth_control", "flow_versions", "INSERT").await,
+        "the control-plane role must hold SELECT and INSERT on flow_versions (journey authoring)"
+    );
+    for privilege in ["UPDATE", "DELETE"] {
+        assert!(
+            !role_has_table_privilege(pool, "ironauth_control", "flow_versions", privilege).await,
+            "the control-plane role must NOT hold {privilege} on flow_versions (append-only registry)"
+        );
+    }
+    // The DATA plane READS a pinned version's artifact on the custom-flow creation and drive path,
+    // so it holds SELECT only on both tables, never a write.
+    for table in ["flow_versions", "flow_version_pins"] {
+        assert!(
+            role_has_table_privilege(pool, "ironauth_app", table, "SELECT").await,
+            "the data-plane role must hold SELECT on {table} (the custom-flow read)"
+        );
+        assert!(
+            !role_has_table_privilege(pool, "ironauth_app", table, "INSERT").await,
+            "the data-plane role must NOT hold INSERT on {table} (the control plane owns writes)"
+        );
+    }
+    // Moving the active pin is the only mutation of flow_version_pins, so the control plane's
+    // UPDATE is COLUMN-scoped to flow_version_id (and updated_at), never a table-wide UPDATE: it
+    // can never rewrite a pin's journey_id or scope.
+    assert!(
+        role_has_column_privilege(
+            pool,
+            "ironauth_control",
+            "flow_version_pins",
+            "flow_version_id",
+            "UPDATE"
+        )
+        .await,
+        "the control-plane role must hold column-scoped UPDATE on flow_version_pins.flow_version_id"
+    );
+    assert!(
+        !role_has_column_privilege(
+            pool,
+            "ironauth_control",
+            "flow_version_pins",
+            "journey_id",
+            "UPDATE"
+        )
+        .await,
+        "the control-plane role must NOT hold UPDATE on flow_version_pins.journey_id (pin move only)"
+    );
+    // The deferred flows foreign key is now closed: flows.flow_version_id references flow_versions.
+    let flows_fk: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_constraint \
+         WHERE conrelid = 'flows'::regclass AND contype = 'f' \
+         AND conname = 'flows_flow_version_id_fkey')",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("query the flows foreign key");
+    assert!(
+        flows_fk,
+        "the flows.flow_version_id foreign key into flow_versions must exist after 0080"
     );
 
     // The demo object never reaches a production database.

@@ -29,18 +29,17 @@ use ironauth_env::Clock;
 use ironauth_jose::{TotpParams, code_at};
 use ironauth_journey::{
     CmpOp, FieldRef, FieldSource, JOURNEY_ENGINE_VERSION, JOURNEY_SCHEMA_VERSION, Journey, Literal,
-    Predicate, Step, StepKind, Transition, compile,
+    Predicate, Step, StepKind, Transition,
 };
-use ironauth_oidc::flow::EmbeddedJourneySource;
+use ironauth_oidc::flow::FlowVersionJourneySource;
 use ironauth_oidc::{Argon2Params, HashingPool, SESSION_COOKIE};
+use ironauth_store::{CorrelationId, NewFlowVersion};
 use serde_json::{Value, json};
 
 const PASSWORD: &str = "correct-horse-battery-staple";
 
 /// The author-facing custom journey id the AC1 fixture is registered under.
 const JOURNEY_ID: &str = "login_conditional_mfa";
-/// The synthetic pinned version id the embedded source keys the compiled table by.
-const VERSION_ID: &str = "flv_customtest00000000000000000";
 
 // ------------------------------------------------------------------------------------------
 // Fixtures: the declarative journeys, built from the ironauth-journey public artifact types.
@@ -151,10 +150,44 @@ fn decision_journey() -> Journey {
     }
 }
 
+/// A pwd-only journey: the primary factor completes in one submission, with no MFA. Used as the
+/// DIVERGENT v2 in the pinning-across-submissions test (a live flow stamped with the conditional
+/// v1 must keep stepping up even after the pin moves to this pwd-only v2).
+fn pwd_only_journey() -> Journey {
+    Journey {
+        schema_version: JOURNEY_SCHEMA_VERSION.to_owned(),
+        id: JOURNEY_ID.to_owned(),
+        engine_version: JOURNEY_ENGINE_VERSION,
+        entry: "primary".to_owned(),
+        comment: None,
+        steps: vec![
+            step("primary", StepKind::IdentifierPassword, Some("password")),
+            step("done", StepKind::Terminal, None),
+        ],
+        transitions: vec![Transition {
+            from: "primary".to_owned(),
+            to: "done".to_owned(),
+            guard: None,
+            comment: None,
+        }],
+        subflows: None,
+        subflow_definitions: None,
+    }
+}
+
 // ------------------------------------------------------------------------------------------
 // Harness setup with the custom journey source installed.
 // ------------------------------------------------------------------------------------------
 
+/// The custom-journey harness: the journey is STORED and PINNED in the RLS-scoped `flow_versions`
+/// registry (the production authoring path) and resolved through the production
+/// [`FlowVersionJourneySource`] (a compile cache over the store).
+///
+/// PR 5 moves the DB-backed integration tests off the PR 4 in-memory `EmbeddedJourneySource`:
+/// with the `flows.flow_version_id` foreign key now closed (migration 0080), a live flow can only
+/// be stamped with a version id that EXISTS in `flow_versions`, so a stamped flow must resolve to a
+/// real stored version. The `EmbeddedJourneySource` stays available (exported) for pure,
+/// non-database unit tests of the engine.
 async fn setup_custom(journey: Journey) -> (Harness, Arc<HashingPool>) {
     let mut harness = Harness::start_store_backed_with(OidcConfig {
         require_pkce_for_confidential_clients: false,
@@ -174,10 +207,45 @@ async fn setup_custom(journey: Journey) -> (Harness, Arc<HashingPool>) {
         None,
     ));
     harness.install_hashing_pool(Arc::clone(&pool));
-    let compiled = compile(&journey).expect("the fixture compiles");
-    let source = EmbeddedJourneySource::single(JOURNEY_ID, VERSION_ID, compiled);
+    store_and_pin(&harness, &journey, 1_000_000).await;
+    let source = FlowVersionJourneySource::new(harness.store().clone());
     harness.install_custom_journey_source(Arc::new(source));
     (harness, pool)
+}
+
+/// Store `journey` as a new version of `JOURNEY_ID` in the control-plane registry and PIN it,
+/// returning the created version number. This is the PRODUCTION authoring path (the same store
+/// repo the admin surface drives), exercising the write-time load-valid gate.
+async fn store_and_pin(harness: &Harness, journey: &Journey, now_micros: i64) -> i32 {
+    let env = harness.env().clone();
+    let scope = harness.scope();
+    let artifact_json = serde_json::to_string(journey).expect("serialize the journey artifact");
+    let record = harness
+        .db()
+        .control_store()
+        .scoped(scope)
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+        .flow_versions()
+        .create_version(
+            &env,
+            NewFlowVersion {
+                journey_id: JOURNEY_ID,
+                artifact_json: &artifact_json,
+            },
+            now_micros,
+        )
+        .await
+        .expect("store the journey version");
+    harness
+        .db()
+        .control_store()
+        .scoped(scope)
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+        .flow_versions()
+        .pin(&env, JOURNEY_ID, record.version, now_micros + 1)
+        .await
+        .expect("pin the version");
+    record.version
 }
 
 fn create_api_path(harness: &Harness) -> String {
@@ -681,4 +749,156 @@ fn the_contract_and_engine_versions_are_unchanged() {
     // PR 4 is additive: the flow contract stays 2 and the journey engine ABI stays 1.
     assert_eq!(ironauth_oidc::flow::model::CONTRACT_VERSION, 2);
     assert_eq!(JOURNEY_ENGINE_VERSION, 1);
+}
+
+// ------------------------------------------------------------------------------------------
+// PR 5: the production store-backed source. A journey STORED and PINNED in the RLS-scoped
+// flow_versions registry drives a custom flow end to end, version pinning is honored across a
+// mid-flight pin move, and an unpinned journey is a uniform not-found.
+// ------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_stored_and_pinned_custom_journey_executes_end_to_end() {
+    // The journey is resolved from the store (not the embedded fixture): create -> primary ->
+    // conditional MFA -> completion, with the honest pwd + totp amr.
+    let (harness, _pool) = setup_custom(conditional_mfa_journey()).await;
+    let subject = harness.seed_user("stored-mfa@example.test", PASSWORD).await;
+    harness.seed_active_totp(&subject).await;
+    harness.set_tenant_min_class("mfa").await;
+
+    let (flow_id, token, _create) = api_create(&harness).await;
+    let (status, _h, challenge) = post_json(
+        &harness,
+        &submit_api_path(&harness),
+        &json!({
+            "id": flow_id,
+            "submit_token": token,
+            "nodes": { "identifier": "stored-mfa@example.test", "password": PASSWORD },
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_ne!(
+        challenge["state"], "completed",
+        "pwd alone does not complete"
+    );
+    assert!(
+        has_node(&challenge["flow"], "code"),
+        "the MFA code node renders from the STORED journey: {challenge}"
+    );
+    let token = challenge["submit_token"]
+        .as_str()
+        .expect("rotated token")
+        .to_owned();
+
+    harness.clock().advance(std::time::Duration::from_secs(90));
+    let code = code_at(
+        &[0x0A; 20],
+        TotpParams::authenticator_default(),
+        now_secs(&harness),
+    );
+    let (status, headers, done) = post_json(
+        &harness,
+        &submit_api_path(&harness),
+        &json!({ "id": flow_id, "submit_token": token, "nodes": { "code": code } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "mfa submit: {done}");
+    assert_eq!(done["state"], "completed", "the stored journey completes");
+    let set_cookie = headers
+        .get(header::SET_COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert!(
+        set_cookie.contains(SESSION_COOKIE),
+        "sets the session cookie"
+    );
+    let auth_methods = latest_session_methods(&harness, &subject).await;
+    assert!(auth_methods.contains("pwd"), "records pwd: {auth_methods}");
+    assert!(
+        auth_methods.contains("totp"),
+        "records totp: {auth_methods}"
+    );
+}
+
+#[tokio::test]
+async fn a_live_flow_keeps_its_pinned_version_after_the_pin_moves() {
+    // A flow created against pinned v1 (conditional MFA) must keep running v1 even after the pin
+    // moves to a DIVERGENT v2 (pwd-only): the version is stamped on the flow row, so mid-flight the
+    // step-up still happens. This is the pinning-across-submissions guarantee.
+    let (harness, _pool) = setup_custom(conditional_mfa_journey()).await;
+    let subject = harness.seed_user("stored-pin@example.test", PASSWORD).await;
+    harness.seed_active_totp(&subject).await;
+    harness.set_tenant_min_class("mfa").await;
+
+    // Create a flow against v1 and submit the primary factor: v1 routes to the MFA step.
+    let (flow_id, token, _create) = api_create(&harness).await;
+    let (status, _h, challenge) = post_json(
+        &harness,
+        &submit_api_path(&harness),
+        &json!({
+            "id": flow_id,
+            "submit_token": token,
+            "nodes": { "identifier": "stored-pin@example.test", "password": PASSWORD },
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        has_node(&challenge["flow"], "code"),
+        "v1 steps up to MFA: {challenge}"
+    );
+    let token = challenge["submit_token"]
+        .as_str()
+        .expect("rotated token")
+        .to_owned();
+
+    // MOVE the pin to a DIVERGENT pwd-only v2. A fresh flow would now be pwd-only, but the live
+    // flow was stamped with v1 at creation.
+    let v2 = store_and_pin(&harness, &pwd_only_journey(), 5_000_000).await;
+    assert_eq!(v2, 2, "the divergent journey is stored as v2");
+
+    // The in-flight flow still expects the second factor (v1), so a real TOTP completes it with the
+    // honest pwd + totp amr: the pin move did NOT retarget the live flow onto pwd-only v2.
+    harness.clock().advance(std::time::Duration::from_secs(90));
+    let code = code_at(
+        &[0x0A; 20],
+        TotpParams::authenticator_default(),
+        now_secs(&harness),
+    );
+    let (status, _headers, done) = post_json(
+        &harness,
+        &submit_api_path(&harness),
+        &json!({ "id": flow_id, "submit_token": token, "nodes": { "code": code } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "mfa submit: {done}");
+    assert_eq!(
+        done["state"], "completed",
+        "the live flow completes on v1's MFA path after the pin moved: {done}"
+    );
+    let auth_methods = latest_session_methods(&harness, &subject).await;
+    assert!(
+        auth_methods.contains("pwd") && auth_methods.contains("totp"),
+        "the live flow ran the pinned v1 (pwd + totp), not the newly-pinned pwd-only v2: \
+         {auth_methods}"
+    );
+}
+
+#[tokio::test]
+async fn an_unpinned_journey_is_a_uniform_not_found_on_the_store_backed_source() {
+    // The store-backed source resolves a journey through its PIN. A journey with no pin (here, an
+    // id that was never authored) names no creatable custom flow: a uniform 404.
+    let (harness, _pool) = setup_custom(conditional_mfa_journey()).await;
+    let (status, _h, body) = post_json(
+        &harness,
+        &create_api_path(&harness),
+        &json!({ "journey_id": "never-authored" }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "an unpinned journey id is a uniform 404: {body}"
+    );
 }

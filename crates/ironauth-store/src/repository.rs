@@ -75,23 +75,25 @@ use crate::environment::{EnvironmentType, GuardrailSet};
 use crate::error::StoreError;
 use crate::federation_state::{ConsumedFederationLoginState, NewFederationLoginState};
 use crate::flow::{FlowRecord, NewFlow};
+use crate::flow_version::{FlowVersionRecord, NewFlowVersion};
 use crate::id::{
     AaguidRuleId, AbuseBanId, AccountLinkId, AcmeChallengeId, AdminSudoElevationId,
     AssertionMappingId, AttestationConfigId, AuditId, AuditTarget, AuthorizationCodeId,
     BackChannelDeliveryId, BrandId, ClientAdminGrantId, ClientId, ClientSessionId, ConnectorId,
     ConsentId, CorrelationId, CredentialClassPolicyId, CredentialId, CustomDomainId, DcrPolicyId,
     DekId, DeviceCodeId, EmailOtpCodeId, EncryptedSecretId, EnvironmentId, EnvironmentSecretId,
-    ExternalIssuerId, FedcmNonceId, FederationLoginStateId, FlowId, GrantId, InitialAccessTokenId,
-    InvitationId, IssuedTokenId, KekId, LocaleBundleId, MagicLinkTokenId, ManagementKeyId,
-    Mds3BlobCacheId, MigrationRunId, MigrationRunRecordId, OperatorId, OrgConnectionId,
-    OrganizationId, PowChallengeId, PushedRequestId, RecoveryApprovalId, RecoveryCodeId,
-    RecoveryContactConfirmationId, RecoveryFlowId, RecoveryIdvSessionId, RecoveryTrustedContactId,
-    RefreshFamilyId, RefreshTokenId, ResourceServerId, RiskDecisionId, RiskDisavowalId,
-    RiskLoginGeoId, RiskSignalId, RoutingRuleId, ScopeStepUpPolicyId, ServiceAccountId,
-    SessionEventId, SessionId, SigningKeyId, SignupFormId, SignupQuarantineId, SmsOtpCodeId,
-    SmsRouteStatId, TenantId, TotpCredentialId, TraitMigrationJobId, TraitSchemaId,
-    TrustedDeviceId, UpstreamTokenGrantId, UpstreamTokenId, UserId, UserIdentifierId, VariableId,
-    WebauthnChallengeId, WebauthnCredentialId,
+    ExternalIssuerId, FedcmNonceId, FederationLoginStateId, FlowId, FlowVersionId,
+    FlowVersionPinId, GrantId, InitialAccessTokenId, InvitationId, IssuedTokenId, KekId,
+    LocaleBundleId, MagicLinkTokenId, ManagementKeyId, Mds3BlobCacheId, MigrationRunId,
+    MigrationRunRecordId, OperatorId, OrgConnectionId, OrganizationId, PowChallengeId,
+    PushedRequestId, RecoveryApprovalId, RecoveryCodeId, RecoveryContactConfirmationId,
+    RecoveryFlowId, RecoveryIdvSessionId, RecoveryTrustedContactId, RefreshFamilyId,
+    RefreshTokenId, ResourceServerId, RiskDecisionId, RiskDisavowalId, RiskLoginGeoId,
+    RiskSignalId, RoutingRuleId, ScopeStepUpPolicyId, ServiceAccountId, SessionEventId, SessionId,
+    SigningKeyId, SignupFormId, SignupQuarantineId, SmsOtpCodeId, SmsRouteStatId, TenantId,
+    TotpCredentialId, TraitMigrationJobId, TraitSchemaId, TrustedDeviceId, UpstreamTokenGrantId,
+    UpstreamTokenId, UserId, UserIdentifierId, VariableId, WebauthnChallengeId,
+    WebauthnCredentialId,
 };
 use crate::identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
@@ -524,6 +526,19 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn signup_forms(&self) -> SignupFormRepo<'a> {
         SignupFormRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only custom-journey version registry for this scope (issue #92, PR 5): resolve a
+    /// version by its `flv_` id (the custom-flow drive path), resolve a journey's active PINNED
+    /// version (the custom-flow creation path), and list a scope's versions (the config-snapshot
+    /// export). Every read is scope-forced under row-level security, so a version of another scope
+    /// is a uniform not-found. The mutating create / pin live on [`ActingStore::flow_versions`].
+    #[must_use]
+    pub fn flow_versions(&self) -> FlowVersionRepo<'a> {
+        FlowVersionRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -1439,6 +1454,19 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn signup_forms(&self) -> ActingSignupFormRepo<'a> {
         ActingSignupFormRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating custom-journey version registry for this scope and actor (issue #92, PR 5):
+    /// create a new immutable version (fail-fast validated load-valid before the write, audited)
+    /// and set / move the journey's active PIN (audited). Every write carries the actor and
+    /// correlation id into its audit row.
+    #[must_use]
+    pub fn flow_versions(&self) -> ActingFlowVersionRepo<'a> {
+        ActingFlowVersionRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -22642,6 +22670,370 @@ impl ActingSignupFormRepo<'_> {
     }
 }
 
+/// The projection every custom-journey version read selects: the version columns plus a computed
+/// `pinned` flag (whether this version is its journey's active pin). One place so the by-id,
+/// by-pin, and list reads return the identical shape.
+const FLOW_VERSION_COLUMNS: &str = "v.id, v.journey_id, v.version, v.artifact::text AS artifact, \
+     (p.flow_version_id IS NOT NULL) AS pinned";
+
+/// The `flow_versions` table left-joined to `flow_version_pins`, so a version row carries whether
+/// it is its journey's active pin. The join is scope-local on both sides (RLS forces each to this
+/// scope), matched on the journey and the pinned version id.
+const FLOW_VERSION_FROM_JOIN: &str = "flow_versions v \
+     LEFT JOIN flow_version_pins p \
+       ON p.tenant_id = v.tenant_id AND p.environment_id = v.environment_id \
+       AND p.journey_id = v.journey_id AND p.flow_version_id = v.id";
+
+/// Build a [`FlowVersionRecord`] from a selected `flow_versions` row (the shared read projection).
+fn flow_version_from_row(row: &sqlx::postgres::PgRow) -> FlowVersionRecord {
+    FlowVersionRecord {
+        id: row.get("id"),
+        journey_id: row.get("journey_id"),
+        version: row.get("version"),
+        artifact_json: row.get("artifact"),
+        pinned: row.get("pinned"),
+    }
+}
+
+/// The read-only custom-journey version registry for a scope (issue #92, PR 5): resolve a version
+/// by its `flv_` id (the custom-flow DRIVE path re-resolves the SAME version a flow was stamped
+/// with), resolve a journey's active PINNED version (the custom-flow CREATION path stamps it), and
+/// list a scope's versions (the config-snapshot export). Every read is scope-forced under
+/// row-level security, so a version of another scope is a uniform not-found.
+pub struct FlowVersionRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl FlowVersionRepo<'_> {
+    /// A version by its `flv_` id within scope (issue #92, PR 5), or [`None`] when no such version
+    /// exists in this scope. The drive path resolves the version a live flow was stamped with, so
+    /// the journey it started under cannot change mid-flow even if the pin moves.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn get_by_id(&self, id: &str) -> Result<Option<FlowVersionRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(&format!(
+            "SELECT {FLOW_VERSION_COLUMNS} FROM {FLOW_VERSION_FROM_JOIN} \
+             WHERE v.tenant_id = $1 AND v.environment_id = $2 AND v.id = $3"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.as_ref().map(flow_version_from_row))
+    }
+
+    /// A journey's specific version by (`journey_id`, version) within scope (issue #92, PR 5), or
+    /// [`None`] when absent. The management GET reads a version by its stable natural key.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn get_version(
+        &self,
+        journey_id: &str,
+        version: i32,
+    ) -> Result<Option<FlowVersionRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(&format!(
+            "SELECT {FLOW_VERSION_COLUMNS} FROM {FLOW_VERSION_FROM_JOIN} \
+             WHERE v.tenant_id = $1 AND v.environment_id = $2 \
+             AND v.journey_id = $3 AND v.version = $4"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(journey_id)
+        .bind(version)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.as_ref().map(flow_version_from_row))
+    }
+
+    /// A journey's active PINNED version within scope (issue #92, PR 5), or [`None`] when the
+    /// journey has no pin (an unknown or unpinned journey names no creatable custom flow). The
+    /// creation path resolves this to STAMP the flow's version id.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn get_pinned(
+        &self,
+        journey_id: &str,
+    ) -> Result<Option<FlowVersionRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT v.id, v.journey_id, v.version, v.artifact::text AS artifact, true AS pinned \
+             FROM flow_version_pins p \
+             JOIN flow_versions v \
+               ON v.id = p.flow_version_id AND v.tenant_id = p.tenant_id \
+               AND v.environment_id = p.environment_id \
+             WHERE p.tenant_id = $1 AND p.environment_id = $2 AND p.journey_id = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(journey_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.as_ref().map(flow_version_from_row))
+    }
+
+    /// Every version of one `journey_id` in this scope, ascending by version, each carrying its
+    /// `pinned` flag (issue #92, PR 5): the management list surface. An unknown journey yields an
+    /// empty list.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_for_journey(
+        &self,
+        journey_id: &str,
+    ) -> Result<Vec<FlowVersionRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {FLOW_VERSION_COLUMNS} FROM {FLOW_VERSION_FROM_JOIN} \
+             WHERE v.tenant_id = $1 AND v.environment_id = $2 AND v.journey_id = $3 \
+             ORDER BY v.version"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(journey_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows.iter().map(flow_version_from_row).collect())
+    }
+
+    /// EVERY version in this scope (no pagination), ordered by journey id then version: the set the
+    /// config-snapshot export (issue #43) projects, each carrying its `pinned` flag. A flow version
+    /// is promotable config, so its whole non-secret artifact travels in the snapshot.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_all(&self) -> Result<Vec<FlowVersionRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {FLOW_VERSION_COLUMNS} FROM {FLOW_VERSION_FROM_JOIN} \
+             WHERE v.tenant_id = $1 AND v.environment_id = $2 \
+             ORDER BY v.journey_id, v.version"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows.iter().map(flow_version_from_row).collect())
+    }
+}
+
+/// The mutating custom-journey version registry for a scope and actor (issue #92, PR 5): create a
+/// new immutable version (fail-fast validated load-valid before the write, append-only, audited)
+/// and set / move the journey's active PIN (audited). A version's content is immutable once
+/// written (a change is a new version), so there is no update or delete: the registry is
+/// append-only.
+pub struct ActingFlowVersionRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingFlowVersionRepo<'_> {
+    /// Create a new immutable version of `journey_id`, returning the stored record (issue #92,
+    /// PR 5). The artifact is proved LOAD-VALID (parse + [`ironauth_journey::compile`]) BEFORE the
+    /// transaction, so a malformed or non-live journey never reaches the registry. The per-scope,
+    /// per-journey_id version number is `MAX(version) + 1`, computed under the audited
+    /// transaction's row lock. Writes a `flow_version.create` audit row in the same transaction.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::JourneyInvalid`] if the artifact is not a load-valid journey;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn create_version(
+        &self,
+        env: &Env,
+        params: NewFlowVersion<'_>,
+        created_at_micros: i64,
+    ) -> Result<FlowVersionRecord, StoreError> {
+        // Prove the artifact is a load-valid, compilable journey BEFORE the transaction: a bad
+        // artifact never reaches the registry, so the drive-path compile of a stored version never
+        // fails.
+        crate::flow_version::validate_artifact_json(params.artifact_json)
+            .map_err(StoreError::JourneyInvalid)?;
+        let scope = self.scope;
+        let id = FlowVersionId::generate(env, &scope);
+        let actor = self.acting.actor();
+        let created_by = format!("{}:{}", actor.kind_str(), actor.id_string());
+        let journey_id = params.journey_id.to_owned();
+        let artifact = params.artifact_json.to_owned();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::FlowVersionCreate,
+                target: &id,
+            },
+            async move |tx| {
+                // The next per-scope, per-journey_id version number under the row lock the audited
+                // transaction holds, so two concurrent creates cannot mint the same version (the
+                // unique index would also refuse it).
+                let next: i32 = sqlx::query(
+                    "SELECT COALESCE(MAX(version), 0) + 1 AS next FROM flow_versions \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND journey_id = $3",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&journey_id)
+                .fetch_one(&mut **tx)
+                .await?
+                .get("next");
+                sqlx::query(
+                    "INSERT INTO flow_versions \
+                     (id, tenant_id, environment_id, journey_id, version, artifact, created_by, \
+                      created_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, \
+                             TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&journey_id)
+                .bind(next)
+                .bind(&artifact)
+                .bind(&created_by)
+                .bind(created_at_micros)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await?;
+        // Read back the version the audited insert minted (its in-transaction MAX + 1), keyed by
+        // the id just created. A freshly created version is never pinned.
+        self.store
+            .scoped(scope)
+            .flow_versions()
+            .get_by_id(&id.to_string())
+            .await?
+            .ok_or(StoreError::NotFound)
+    }
+
+    /// Set or MOVE `journey_id`'s active version PIN to `version`, returning the pin id (issue #92,
+    /// PR 5). The version MUST already exist in this scope (a pin can only name a real version);
+    /// otherwise a uniform [`StoreError::NotFound`]. A repeat pin of the same journey upserts in
+    /// place and reuses the pin row's id (a stable audit target across moves). A live flow is
+    /// unaffected: it keeps the version stamped on its row regardless of where the pin moves.
+    /// Writes a `flow_version.pin` audit row (its operator-safe `detail` records the pinned
+    /// version) in the same transaction.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the version does not exist in this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn pin(
+        &self,
+        env: &Env,
+        journey_id: &str,
+        version: i32,
+        now_micros: i64,
+    ) -> Result<FlowVersionPinId, StoreError> {
+        let scope = self.scope;
+        // Resolve the version -> its flv_ id (a uniform not-found when the version is absent), and
+        // the existing pin id (reused as the stable audit target across moves). Versions are
+        // append-only (never deleted), so a resolved version cannot vanish before the upsert.
+        let version_id = self
+            .version_id_for(journey_id, version)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+        let target = match self.pin_id_for(journey_id).await? {
+            Some(existing) => FlowVersionPinId::parse_in_scope(&existing, &scope)?,
+            None => FlowVersionPinId::generate(env, &scope),
+        };
+        let detail = version.to_string();
+        let journey = journey_id.to_owned();
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::FlowVersionPin,
+                target: &target,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "INSERT INTO flow_version_pins \
+                     (id, tenant_id, environment_id, journey_id, flow_version_id, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5, \
+                             TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval) \
+                     ON CONFLICT (tenant_id, environment_id, journey_id) DO UPDATE \
+                     SET flow_version_id = EXCLUDED.flow_version_id, \
+                         updated_at = EXCLUDED.updated_at",
+                )
+                .bind(target.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&journey)
+                .bind(&version_id)
+                .bind(now_micros)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+            Some(&detail),
+        )
+        .await?;
+        Ok(target)
+    }
+
+    /// The `flv_` id of a specific (`journey_id`, version) in this scope, or [`None`] if absent.
+    async fn version_id_for(
+        &self,
+        journey_id: &str,
+        version: i32,
+    ) -> Result<Option<String>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id FROM flow_versions \
+             WHERE tenant_id = $1 AND environment_id = $2 AND journey_id = $3 AND version = $4",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(journey_id)
+        .bind(version)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| row.get::<String, _>("id")))
+    }
+
+    /// The stored pin id for `journey_id`, or [`None`] for a first pin.
+    async fn pin_id_for(&self, journey_id: &str) -> Result<Option<String>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id FROM flow_version_pins \
+             WHERE tenant_id = $1 AND environment_id = $2 AND journey_id = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(journey_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| row.get::<String, _>("id")))
+    }
+}
+
 /// The read-only per-environment, per-client admin consent pre-authorization repository (issue
 /// #88, PR 4): read a client's pre-authorization for the third-party admin-consent gate on the
 /// authorization path, and list a scope's pre-authorizations for the management surface. Every
@@ -35803,6 +36195,9 @@ async fn read_promoted_snapshot(
             // Signup forms (issue #87) are likewise exported and diffable but not applied by the
             // transactional engine yet, so the promoted target read omits them.
             signup_form: Vec::new(),
+            // Custom-journey versions (issue #92, PR 5) are likewise exported and diffable but not
+            // applied by the transactional engine yet, so the promoted target read omits them.
+            flow_version: Vec::new(),
         },
     })
 }

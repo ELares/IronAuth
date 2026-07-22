@@ -137,6 +137,14 @@ pub enum StoreError {
         /// The refused target state (wire string).
         to: &'static str,
     },
+    /// A custom-journey artifact submitted to the version registry is not a load-valid journey
+    /// (issue #92, PR 5): it does not parse as a journey document, or it fails
+    /// [`ironauth_journey::validate`] / compile (an unknown step kind or node group, a dangling
+    /// or ambiguous transition, an unreachable step, a dead end, or no reachable completion).
+    /// Carries every [`ironauth_journey::JourneyError`], each an operator-safe, value-free RFC
+    /// 6901 pointer and reason, so the management surface can report exactly what is invalid. The
+    /// write is refused before anything is persisted.
+    JourneyInvalid(Vec<ironauth_journey::JourneyError>),
 }
 
 impl fmt::Display for StoreError {
@@ -168,6 +176,13 @@ impl fmt::Display for StoreError {
             StoreError::IllegalMigrationTransition { from, to } => {
                 write!(f, "illegal migration-run transition from {from} to {to}")
             }
+            StoreError::JourneyInvalid(errors) => {
+                write!(
+                    f,
+                    "journey artifact failed validation ({} errors)",
+                    errors.len()
+                )
+            }
         }
     }
 }
@@ -188,7 +203,8 @@ impl std::error::Error for StoreError {
             | StoreError::TraitsInvalid(_)
             | StoreError::CutoverBlocked { .. }
             | StoreError::NoActiveTraitSchema
-            | StoreError::IllegalMigrationTransition { .. } => None,
+            | StoreError::IllegalMigrationTransition { .. }
+            | StoreError::JourneyInvalid(_) => None,
             StoreError::Database(source) => Some(source),
             StoreError::Migration(source) => Some(source),
             StoreError::SchemaMalformed(source) => Some(source),
