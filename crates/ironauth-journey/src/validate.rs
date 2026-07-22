@@ -233,6 +233,32 @@ pub enum JourneyError {
         /// The parameter name.
         param: String,
     },
+    /// An author-provided step id contains the reserved `::` sequence (issue #92, PR 3). The `::`
+    /// sequence is reserved as the composition namespace separator (`<call_id>::<step_id>`), so an
+    /// author step id may not use it, otherwise a hand-written id could collide with a namespaced
+    /// subflow step and produce a duplicate step id after composition.
+    ReservedStepIdSeparator {
+        /// The RFC 6901 pointer to the offending step `id`.
+        pointer: String,
+        /// The offending step id.
+        id: String,
+    },
+    /// Two entries in the `subflows` reference list declare the same alias id, so a
+    /// [`StepKind::SubflowCall`] step's reference cannot resolve unambiguously (issue #92, PR 3).
+    DuplicateSubflowRef {
+        /// The RFC 6901 pointer to the duplicate reference's `id`.
+        pointer: String,
+        /// The duplicated alias id.
+        id: String,
+    },
+    /// Composing the journey would splice more steps than the composed-size ceiling admits (issue
+    /// #92, PR 3). An acyclic fan-out of subflow references can expand exponentially, so the splice
+    /// fails LOAD at a generous bound rather than exhausting memory. Rejected during composition,
+    /// never at flow time.
+    ComposedTooLarge {
+        /// The composed step ceiling this build admits.
+        limit: usize,
+    },
 }
 
 impl fmt::Display for JourneyError {
@@ -348,6 +374,18 @@ impl fmt::Display for JourneyError {
                     "template parameter {param} at {pointer} has the wrong type"
                 )
             }
+            JourneyError::ReservedStepIdSeparator { pointer, id } => {
+                write!(
+                    f,
+                    "step id {id} at {pointer} uses the reserved namespace separator"
+                )
+            }
+            JourneyError::DuplicateSubflowRef { pointer, id } => {
+                write!(f, "duplicate subflow reference alias {id} at {pointer}")
+            }
+            JourneyError::ComposedTooLarge { limit } => {
+                write!(f, "composition exceeds the step ceiling of {limit}")
+            }
         }
     }
 }
@@ -371,6 +409,24 @@ impl std::error::Error for JourneyError {}
 ///
 /// A non-empty [`Vec`] of [`JourneyError`], one per structural failure, in document order.
 pub fn validate(doc: &Journey) -> Result<(), Vec<JourneyError>> {
+    validate_inner(doc, RESERVED_IDS_REJECTED)
+}
+
+/// Reject an author step id that uses the reserved namespace separator (the public [`validate`]
+/// entry point uses this).
+const RESERVED_IDS_REJECTED: bool = true;
+
+/// Admit the reserved namespace separator in step ids (the post-composition re-validation uses this,
+/// because composition itself mints the only legitimate `::` ids).
+pub(crate) const RESERVED_IDS_ADMITTED: bool = false;
+
+/// Validate a journey artifact (issue #92), with `reject_reserved` controlling whether an author
+/// step id that uses the reserved `::` namespace separator is refused. The public [`validate`]
+/// refuses it; the post-composition re-validation admits it, since composition mints those ids.
+pub(crate) fn validate_inner(
+    doc: &Journey,
+    reject_reserved: bool,
+) -> Result<(), Vec<JourneyError>> {
     // PR4: LIVENESS (a reachable completion exists and there is no exit-less cycle a journey can
     // never leave) is validated at COMPILE time in PR 4, not here, because judging whether a
     // journey can ever complete needs the executor's completion semantics: a step may complete
@@ -396,6 +452,12 @@ pub fn validate(doc: &Journey) -> Result<(), Vec<JourneyError>> {
     for (index, step) in doc.steps.iter().enumerate() {
         let step_ptr = format!("/steps/{index}");
         check_kind_and_node_group(step, &step_ptr, &mut errors);
+        if reject_reserved && step.id.contains(crate::subflow::NAMESPACE_SEPARATOR) {
+            errors.push(JourneyError::ReservedStepIdSeparator {
+                pointer: format!("/steps/{index}/id"),
+                id: step.id.clone(),
+            });
+        }
         match &step.subflow {
             Some(alias) if !declared.contains(alias.as_str()) => {
                 errors.push(JourneyError::DanglingSubflowRef {

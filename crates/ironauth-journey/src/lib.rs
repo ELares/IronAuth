@@ -48,7 +48,7 @@ pub use eval::{
     typecheck_predicate,
 };
 pub use schema::journey_object_schema;
-pub use subflow::{BUILTIN_MFA_STEP_UP, builtin_subflows, compose};
+pub use subflow::{BUILTIN_MFA_STEP_UP, MAX_COMPOSED_STEPS, builtin_subflows, compose};
 pub use template::{
     TEMPLATE_IDENTIFIER_FIRST_CONDITIONAL_MFA, TemplateInvocation, materialize, template_ids,
 };

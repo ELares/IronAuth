@@ -31,6 +31,19 @@ use crate::validate::{
 /// journey can reuse without re-authoring the challenge topology.
 pub const BUILTIN_MFA_STEP_UP: &str = "mfa_step_up";
 
+/// The reserved namespace separator [`compose`] mints spliced subflow step ids with
+/// (`<call_id>::<step_id>`). It is RESERVED: an author step id may not contain it (the load-time
+/// validator refuses one with [`JourneyError::ReservedStepIdSeparator`]), so a hand-written id can
+/// never collide with a namespaced subflow step and produce a duplicate step id after composition.
+pub(crate) const NAMESPACE_SEPARATOR: &str = "::";
+
+/// The ceiling on the number of steps a composed journey may reach (issue #92, PR 3). A journey
+/// whose subflow references fan out acyclically can expand exponentially; [`compose`] refuses to
+/// splice past this generous bound (far above any real journey) with
+/// [`JourneyError::ComposedTooLarge`], so a pathological fan-out fails LOAD instead of exhausting
+/// memory.
+pub const MAX_COMPOSED_STEPS: usize = 10_000;
+
 /// The built-in subflow registry (issue #92, PR 3): the reusable subflow fragments this crate
 /// provides as pure data, keyed by their built-in name. A [`SubflowSource::Builtin`] reference
 /// resolves against this map. The registry currently provides [`BUILTIN_MFA_STEP_UP`], a
@@ -99,9 +112,17 @@ pub(crate) fn validate_subflows(doc: &Journey, errors: &mut Vec<JourneyError>) {
     }
     let inline_ids: BTreeSet<&str> = inline.iter().map(|def| def.id.as_str()).collect();
 
-    // Resolve each journey subflow reference source.
+    // Resolve each journey subflow reference source, and reject a duplicate alias id (a
+    // `subflow_call` step could not resolve unambiguously between two same-named references).
+    let mut seen_aliases: BTreeSet<&str> = BTreeSet::new();
     if let Some(refs) = &doc.subflows {
         for (index, subflow_ref) in refs.iter().enumerate() {
+            if !seen_aliases.insert(subflow_ref.id.as_str()) {
+                errors.push(JourneyError::DuplicateSubflowRef {
+                    pointer: format!("/subflows/{index}/id"),
+                    id: subflow_ref.id.clone(),
+                });
+            }
             match &subflow_ref.source {
                 SubflowSource::Builtin { name } => {
                     if !builtins.contains_key(name.as_str()) {
@@ -150,6 +171,12 @@ fn validate_subflow_fragment(
     for (index, step) in def.steps.iter().enumerate() {
         let step_ptr = format!("{base}/steps/{index}");
         check_kind_and_node_group(step, &step_ptr, errors);
+        if step.id.contains(NAMESPACE_SEPARATOR) {
+            errors.push(JourneyError::ReservedStepIdSeparator {
+                pointer: format!("{step_ptr}/id"),
+                id: step.id.clone(),
+            });
+        }
         if step.kind.is_terminal() {
             errors.push(JourneyError::SubflowTerminalStep {
                 pointer: format!("{step_ptr}/kind"),
@@ -301,7 +328,10 @@ fn reaches(graph: &BTreeMap<String, Vec<String>>, from: &str, to: &str) -> bool 
 /// # Errors
 ///
 /// The journey's own load-time validation failures ([`crate::validate`]) when the journey does not
-/// validate; composition never introduces a new failure mode.
+/// validate; [`JourneyError::ComposedTooLarge`] when the splice would exceed [`MAX_COMPOSED_STEPS`]
+/// (a pathological acyclic fan-out); and, as an enforced invariant, the composed journey's own
+/// validation failures should the splice ever produce a malformed journey (a defense against a
+/// future splice bug, so a caller never receives an unchecked composed journey).
 pub fn compose(journey: &Journey) -> Result<Journey, Vec<JourneyError>> {
     crate::validate::validate(journey)?;
 
@@ -333,14 +363,30 @@ pub fn compose(journey: &Journey) -> Result<Journey, Vec<JourneyError>> {
         }
     }
 
-    // Inline until no subflow_call step remains. Acyclicity (checked above) guarantees termination.
+    // Inline until no subflow_call step remains. Acyclicity (checked above) guarantees termination,
+    // and the step ceiling guarantees an acyclic fan-out fails LOAD instead of exhausting memory.
     while let Some(index) = flat
         .steps
         .iter()
         .position(|step| matches!(step.kind, StepKind::SubflowCall))
     {
+        if flat.steps.len() > MAX_COMPOSED_STEPS {
+            return Err(vec![JourneyError::ComposedTooLarge {
+                limit: MAX_COMPOSED_STEPS,
+            }]);
+        }
         inline_one(&mut flat, index, &registry);
     }
+    if flat.steps.len() > MAX_COMPOSED_STEPS {
+        return Err(vec![JourneyError::ComposedTooLarge {
+            limit: MAX_COMPOSED_STEPS,
+        }]);
+    }
+
+    // Insurance: the composed journey is itself validated before it is returned, so the invariant
+    // "compose output is always validate-clean" is enforced, not merely documented. The reserved
+    // namespace separator is admitted here because composition mints the only legitimate `::` ids.
+    crate::validate::validate_inner(&flat, crate::validate::RESERVED_IDS_ADMITTED)?;
 
     Ok(flat)
 }
@@ -388,7 +434,7 @@ fn inline_one(flat: &mut Journey, index: usize, registry: &BTreeMap<String, Subf
         .expect("a validated subflow key resolves in the registry")
         .clone();
 
-    let prefix = format!("{call_id}::");
+    let prefix = format!("{call_id}{NAMESPACE_SEPARATOR}");
     let namespaced = |id: &str| format!("{prefix}{id}");
     let entry_ns = namespaced(&subflow.entry);
     let exits_ns: Vec<String> = subflow.exits.iter().map(|exit| namespaced(exit)).collect();
@@ -423,31 +469,21 @@ fn inline_one(flat: &mut Journey, index: usize, registry: &BTreeMap<String, Subf
         flat.entry.clone_from(&entry_ns);
     }
 
-    // Rebuild the step list with the call step replaced by the spliced subflow steps.
-    let mut steps: Vec<Step> = Vec::with_capacity(flat.steps.len() + spliced_steps.len());
-    for (position, step) in flat.steps.iter().enumerate() {
-        if position == index {
-            steps.extend(spliced_steps.iter().cloned());
-        } else {
-            steps.push(step.clone());
-        }
-    }
+    // Replace the call step in place with the spliced subflow steps (a move, so the untouched steps
+    // are neither cloned nor reallocated on each inline).
+    flat.steps.splice(index..=index, spliced_steps);
 
-    // Rebuild the transition list: drop the return edges (consumed), redirect incoming edges to the
-    // subflow entry, add the namespaced subflow transitions, and graft the return edges onto exits.
-    let mut transitions: Vec<Transition> = Vec::new();
-    for transition in &flat.transitions {
-        if transition.from == call_id {
-            continue;
+    // Edit the transition list in place: drop the return edges (consumed), redirect incoming edges
+    // to the subflow entry, then append the namespaced subflow transitions and the grafted returns.
+    flat.transitions
+        .retain(|transition| transition.from != call_id);
+    for transition in &mut flat.transitions {
+        if transition.to == call_id {
+            transition.to.clone_from(&entry_ns);
         }
-        let mut cloned = transition.clone();
-        if cloned.to == call_id {
-            cloned.to.clone_from(&entry_ns);
-        }
-        transitions.push(cloned);
     }
     for transition in &subflow.transitions {
-        transitions.push(Transition {
+        flat.transitions.push(Transition {
             from: namespaced(&transition.from),
             to: namespaced(&transition.to),
             guard: transition.guard.clone(),
@@ -456,7 +492,7 @@ fn inline_one(flat: &mut Journey, index: usize, registry: &BTreeMap<String, Subf
     }
     for exit in &exits_ns {
         for (to, guard, comment) in &return_edges {
-            transitions.push(Transition {
+            flat.transitions.push(Transition {
                 from: exit.clone(),
                 to: to.clone(),
                 guard: guard.clone(),
@@ -464,9 +500,6 @@ fn inline_one(flat: &mut Journey, index: usize, registry: &BTreeMap<String, Subf
             });
         }
     }
-
-    flat.steps = steps;
-    flat.transitions = transitions;
 }
 
 /// Combine the calling step's comment with the subflow entry step's comment so neither is lost: the
@@ -552,15 +585,22 @@ mod tests {
         let journey = journey_calling_builtin("login_with_step_up");
         assert_eq!(validate(&journey), Ok(()));
 
+        // compose() re-validates its output internally (admitting the reserved namespace
+        // separator it mints), so a successful compose already guarantees a validate-clean journey;
+        // the public validate() would refuse the legitimate `::` ids composition produces.
         let composed = compose(&journey).expect("composition succeeds");
-        // No subflow_call step remains, and the composed journey validates.
+        // No subflow_call step remains.
         assert!(
             composed
                 .steps
                 .iter()
                 .all(|step| !matches!(step.kind, StepKind::SubflowCall))
         );
-        assert_eq!(validate(&composed), Ok(()));
+        // The composed journey passes the structural validation with reserved ids admitted.
+        assert_eq!(
+            crate::validate::validate_inner(&composed, crate::validate::RESERVED_IDS_ADMITTED),
+            Ok(())
+        );
         // Control routes into the subflow entry and back to the caller's continuation.
         assert!(
             composed
@@ -825,5 +865,160 @@ mod tests {
                 .any(|error| matches!(error, JourneyError::PredicateType(_))),
             "expected a PredicateType error, got {errors:?}"
         );
+    }
+
+    #[test]
+    fn an_author_step_id_using_the_reserved_separator_is_rejected() {
+        // An author names a step exactly like a namespaced subflow step; without the reserved-id
+        // rule this would validate as input yet collide after composition. The rule refuses it at
+        // load with a precise pointer.
+        let journey = Journey {
+            schema_version: JOURNEY_SCHEMA_VERSION.to_owned(),
+            id: "collision".to_owned(),
+            engine_version: JOURNEY_ENGINE_VERSION,
+            entry: "primary".to_owned(),
+            comment: None,
+            steps: vec![
+                step("primary", StepKind::IdentifierPassword, Some("password")),
+                Step {
+                    subflow: Some("step_up".to_owned()),
+                    ..step("call", StepKind::SubflowCall, None)
+                },
+                step("call::challenge", StepKind::MfaChallenge, Some("totp")),
+                step("done", StepKind::Terminal, None),
+            ],
+            transitions: vec![
+                unguarded("primary", "call"),
+                unguarded("call", "call::challenge"),
+                unguarded("call::challenge", "done"),
+            ],
+            subflows: Some(vec![SubflowRef {
+                id: "step_up".to_owned(),
+                source: SubflowSource::Builtin {
+                    name: BUILTIN_MFA_STEP_UP.to_owned(),
+                },
+            }]),
+            subflow_definitions: None,
+        };
+        let errors = validate(&journey).expect_err("a reserved-separator step id is rejected");
+        assert!(
+            errors.iter().any(|error| matches!(
+                error,
+                JourneyError::ReservedStepIdSeparator { id, .. } if id == "call::challenge"
+            )),
+            "expected a ReservedStepIdSeparator, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_subflow_reference_alias_is_rejected() {
+        // Two references share the alias `dup`: a subflow_call could not resolve unambiguously.
+        let journey = Journey {
+            schema_version: JOURNEY_SCHEMA_VERSION.to_owned(),
+            id: "dup_alias".to_owned(),
+            engine_version: JOURNEY_ENGINE_VERSION,
+            entry: "primary".to_owned(),
+            comment: None,
+            steps: vec![
+                step("primary", StepKind::IdentifierPassword, Some("password")),
+                Step {
+                    subflow: Some("dup".to_owned()),
+                    ..step("call", StepKind::SubflowCall, None)
+                },
+                step("done", StepKind::Terminal, None),
+            ],
+            transitions: vec![unguarded("primary", "call"), unguarded("call", "done")],
+            subflows: Some(vec![
+                SubflowRef {
+                    id: "dup".to_owned(),
+                    source: SubflowSource::Builtin {
+                        name: BUILTIN_MFA_STEP_UP.to_owned(),
+                    },
+                },
+                SubflowRef {
+                    id: "dup".to_owned(),
+                    source: SubflowSource::Inline {
+                        subflow_id: "other".to_owned(),
+                    },
+                },
+            ]),
+            subflow_definitions: None,
+        };
+        let errors = validate(&journey).expect_err("a duplicate alias is rejected");
+        assert!(
+            errors.iter().any(|error| matches!(
+                error,
+                JourneyError::DuplicateSubflowRef { id, .. } if id == "dup"
+            )),
+            "expected a DuplicateSubflowRef, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn an_acyclic_fan_out_that_exceeds_the_ceiling_fails_load_without_hanging() {
+        // Each of N inline definitions calls the next TWICE, an acyclic DAG that would expand to
+        // 2^N steps. The step ceiling makes it FAIL LOAD rather than hang or exhaust memory.
+        let n = 20;
+        let mut definitions: Vec<Subflow> = Vec::new();
+        for i in 0..n {
+            let next = format!("level_{}", i + 1);
+            let (first, second) = if i + 1 < n {
+                (
+                    Step {
+                        subflow: Some(next.clone()),
+                        ..step("call_a", StepKind::SubflowCall, None)
+                    },
+                    Step {
+                        subflow: Some(next.clone()),
+                        ..step("call_b", StepKind::SubflowCall, None)
+                    },
+                )
+            } else {
+                // The deepest level is a plain leaf, so the graph is strictly acyclic.
+                (
+                    step("call_a", StepKind::MfaChallenge, Some("totp")),
+                    step("call_b", StepKind::MfaChallenge, Some("totp")),
+                )
+            };
+            definitions.push(Subflow {
+                id: format!("level_{i}"),
+                entry: "call_a".to_owned(),
+                exits: vec!["tail".to_owned()],
+                comment: None,
+                steps: vec![
+                    first,
+                    second,
+                    step("tail", StepKind::IdentifierPassword, Some("password")),
+                ],
+                transitions: vec![unguarded("call_a", "call_b"), unguarded("call_b", "tail")],
+            });
+        }
+        let journey = journey_referencing("level_0", definitions);
+        // The journey itself validates (the DAG is acyclic); composition refuses the blow-up.
+        assert_eq!(validate(&journey), Ok(()));
+        assert_eq!(
+            compose(&journey),
+            Err(vec![JourneyError::ComposedTooLarge {
+                limit: MAX_COMPOSED_STEPS,
+            }])
+        );
+    }
+
+    #[test]
+    fn a_normal_multi_subflow_journey_stays_under_the_ceiling() {
+        // A chain of three inline definitions composes well within the ceiling.
+        let leaf = Subflow {
+            id: "leaf".to_owned(),
+            entry: "work".to_owned(),
+            exits: vec!["work".to_owned()],
+            comment: None,
+            steps: vec![step("work", StepKind::MfaChallenge, Some("totp"))],
+            transitions: vec![],
+        };
+        let middle = calling_definition("middle", "leaf", "m_tail");
+        let outer = calling_definition("outer", "middle", "o_tail");
+        let journey = journey_referencing("outer", vec![outer, middle, leaf]);
+        let composed = compose(&journey).expect("a small chain composes");
+        assert!(composed.steps.len() < MAX_COMPOSED_STEPS);
     }
 }
