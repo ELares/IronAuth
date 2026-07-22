@@ -1874,7 +1874,7 @@ async fn resolve_gate(
 /// subject that may be quarantined. The caller gates this on the experimental flag, so it
 /// never runs when the feature is off (a quarantined-user flag can only ever be set behind
 /// the same flag).
-async fn user_is_quarantined(
+pub(crate) async fn user_is_quarantined(
     state: &OidcState,
     scope: Scope,
     subject_text: &str,
@@ -2841,6 +2841,12 @@ pub(crate) struct ChallengeCodeContext<'a> {
     pub session_ref: &'a str,
     /// The requested OAuth `scope`, or [`None`].
     pub oauth_scope: Option<&'a str>,
+    /// Whether the authenticated subject is a QUARANTINED account (issue #82). Belt-and-suspenders:
+    /// the challenge completion path escalates a quarantined user to the browser BEFORE minting, so
+    /// this is normally `false` here; when `true` the SENSITIVE scopes are stripped from the code's
+    /// bound scope regardless, so a future change to the escalation gate still cannot leak
+    /// `offline_access` onto a quarantined user's code.
+    pub user_quarantined: bool,
     /// The presented PKCE `code_challenge`, or [`None`].
     pub code_challenge: Option<&'a str>,
     /// The presented PKCE `code_challenge_method`, or [`None`].
@@ -2861,6 +2867,18 @@ pub(crate) async fn mint_challenge_code(
     client_id: &ClientId,
     context: &ChallengeCodeContext<'_>,
 ) -> Result<String, ()> {
+    // Belt-and-suspenders (issue #82): a QUARANTINED user's code can never carry a SENSITIVE scope
+    // (`offline_access`, an admin/management scope, a configured payment-class scope). The challenge
+    // completion path escalates a quarantined user to the browser BEFORE reaching here, so this is
+    // normally a no-op, but binding the strip to the mint means a future change to the escalation
+    // gate still cannot leak a sensitive scope onto a quarantined user's code. This MIRRORS the
+    // UNCONDITIONAL strip the browser path applies for a quarantined user (authorize.rs, step 6a).
+    let effective_scope: Option<String> = if context.user_quarantined {
+        strip_sensitive_scopes(context.oauth_scope, state.quarantine_config())
+    } else {
+        context.oauth_scope.map(str::to_owned)
+    };
+
     // FORK E: record the implicit grant exactly as the first-party carve-out (the block at the top
     // of `resolve_consent_gate`) does: persist a skipped-consent row when the client stores it, so
     // the grant stays enumerable and revocable per app; otherwise audit the skip so the silent
@@ -2874,7 +2892,7 @@ pub(crate) async fn mint_challenge_code(
                 scope,
                 context.subject,
                 &client_id_str,
-                context.oauth_scope,
+                effective_scope.as_deref(),
                 consent_mode,
             )
             .await?,
@@ -2893,7 +2911,7 @@ pub(crate) async fn mint_challenge_code(
 
     let resolved = Resolved {
         nonce: None,
-        oauth_scope: context.oauth_scope,
+        oauth_scope: effective_scope.as_deref(),
         code_challenge: context.code_challenge,
         code_challenge_method: context.code_challenge_method,
         state_echo: None,

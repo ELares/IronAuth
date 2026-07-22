@@ -31,7 +31,7 @@ use serde_json::Value;
 
 use ironauth_store::ClientId;
 
-use crate::authorize::{ChallengeCodeContext, mint_challenge_code};
+use crate::authorize::{ChallengeCodeContext, mint_challenge_code, user_is_quarantined};
 use crate::flow::model::{Journey, Transport};
 use crate::flow::{Continuation, Submission, TransportAuth, create_flow, drive};
 use crate::interaction;
@@ -271,6 +271,28 @@ pub async fn authorize_challenge(
                     "the request could not be processed",
                 );
             };
+            // Replicate the browser consent gate's quarantine checks (issue #31 / #82) that the
+            // first-party carve-out honors: the auto-grant applies ONLY to a NON-quarantined
+            // first-party client AND a NON-quarantined user. A quarantined client (#31, unverified)
+            // or a quarantined user (#82) cannot be silently auto-granted a code headlessly, because
+            // the browser path forces an interactive consent screen (client quarantine) and the
+            // UNCONDITIONAL sensitive-scope strip (user quarantine). The browserless endpoint cannot
+            // render a consent screen, so it ESCALATES to the browser with `redirect_to_web` instead
+            // of minting. `first_party` is already enforced at entry; a challenge request carries no
+            // `prompt`, so `force_consent` reduces to `client.quarantined`.
+            let user_quarantined = if state.signup_quarantine_enabled() {
+                match user_is_quarantined(&state, scope, &authenticated.subject).await {
+                    Ok(quarantined) => quarantined,
+                    // FAIL CLOSED: a store fault on the quarantine read must never silently mint a
+                    // code for a possibly-quarantined subject; escalate to the browser.
+                    Err(()) => return redirect_to_web(),
+                }
+            } else {
+                false
+            };
+            if client.quarantined || user_quarantined {
+                return redirect_to_web();
+            }
             let session_ref = authenticated.session_id.to_string();
             // auth_time is frozen onto the code only when the client registered require_auth_time
             // (issue #14), matching the browser path's honesty rule.
@@ -284,6 +306,7 @@ pub async fn authorize_challenge(
                 auth_time_micros,
                 session_ref: &session_ref,
                 oauth_scope: scope_param.as_deref(),
+                user_quarantined,
                 code_challenge,
                 code_challenge_method: code_challenge_method.as_deref(),
             };
@@ -314,6 +337,22 @@ pub async fn authorize_challenge(
 /// a deployment that has not enabled the experiment discloses nothing.
 fn not_found() -> Response {
     (StatusCode::NOT_FOUND, "not found").into_response()
+}
+
+/// The draft's `redirect_to_web` escalation (issue #93): when the interaction cannot be completed
+/// headlessly (here: a quarantined client or user, whose consent gate the browserless endpoint
+/// cannot satisfy), direct the native client to complete authorization in the browser (where the
+/// interactive consent screen and the sensitive-scope strip apply) instead of minting a code. PR1
+/// returns the MINIMAL form; PR3 generalizes it (risk-based escalation plus an optional PAR
+/// `request_uri`). A `400 application/json {"error": "redirect_to_web"}` with `no-store`.
+fn redirect_to_web() -> Response {
+    let body = serde_json::json!({ "error": "redirect_to_web" });
+    let mut response = (StatusCode::BAD_REQUEST, Json(body)).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    response
 }
 
 /// A `200 application/json` success response carrying the minted authorization code, with

@@ -260,3 +260,74 @@ async fn a_browserless_code_with_a_redirect_uri_is_rejected() {
     );
     assert_eq!(json(&response)["error"], "invalid_grant");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Consent-gate escalation: the browserless endpoint cannot render an interactive consent screen,
+// so a quarantined client (#31) or a quarantined user (#82) is escalated to the browser with
+// redirect_to_web rather than silently auto-granted a code (the security-lens HIGH).
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_quarantined_first_party_client_is_escalated_to_the_browser() {
+    // #31 consent-gate bypass regression: a first-party client that is ALSO quarantined (unverified)
+    // cannot be silently auto-granted a code. The browser path forces an interactive consent screen
+    // on EVERY authorization until an admin verifies the client; the browserless endpoint cannot
+    // render one, so it escalates with redirect_to_web and mints NOTHING.
+    let mut harness = Harness::start().await;
+    harness.enable_first_party_challenge();
+    let client_id = *harness.client_id();
+    harness.set_client_first_party(&client_id, true).await;
+    harness.set_client_quarantined(&client_id, true).await;
+    harness.seed_user(IDENTIFIER, PASSWORD).await;
+
+    let (status, body) = challenge(
+        &harness,
+        &challenge_form(&client_id.to_string(), IDENTIFIER, PASSWORD),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a quarantined client is escalated, not auto-granted: {body}"
+    );
+    assert_eq!(json(&body)["error"], "redirect_to_web");
+    assert!(
+        json(&body)["authorization_code"].is_null(),
+        "no code is minted for a quarantined client: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_quarantined_user_is_escalated_and_gets_no_offline_refresh() {
+    // #82 consent-gate bypass regression: a QUARANTINED user requesting offline_access cannot obtain
+    // a code (and therefore no long-lived offline refresh family) through the browserless endpoint.
+    // The browser path strips sensitive scopes UNCONDITIONALLY for a quarantined user; the
+    // browserless endpoint cannot render the consent/strip surface, so it escalates with
+    // redirect_to_web. No code is minted, so the offline refresh family is unreachable via this path.
+    let mut harness = Harness::start().await;
+    harness.enable_first_party_challenge();
+    harness.also_enable_signup_quarantine();
+    let client_id = *harness.client_id();
+    harness.set_client_first_party(&client_id, true).await;
+    let subject = harness.seed_user(IDENTIFIER, PASSWORD).await;
+    harness.set_user_quarantined(&subject, true).await;
+
+    let body = form(&[
+        ("client_id", &client_id.to_string()),
+        ("response_type", "code"),
+        ("scope", "openid offline_access"),
+        ("username", IDENTIFIER),
+        ("password", PASSWORD),
+    ]);
+    let (status, resp) = challenge(&harness, &body).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a quarantined user is escalated, not auto-granted: {resp}"
+    );
+    assert_eq!(json(&resp)["error"], "redirect_to_web");
+    assert!(
+        json(&resp)["authorization_code"].is_null(),
+        "no code is minted for a quarantined user, so no offline refresh family is reachable: {resp}"
+    );
+}
