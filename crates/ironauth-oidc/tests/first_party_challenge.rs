@@ -15,12 +15,16 @@ mod common;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
-use common::{Harness, REDIRECT_URI, form, json};
+use common::{Harness, PKCE_CHALLENGE, PKCE_VERIFIER, REDIRECT_URI, form, json};
+use ironauth_env::Clock;
+use ironauth_jose::{TotpParams, code_at};
 use ironauth_oidc::ClientAuthMethod;
 
 /// The identifier and password the suite's first-party user is seeded with.
 const IDENTIFIER: &str = "native@example.test";
 const PASSWORD: &str = "correct horse battery staple";
+/// The TOTP seed the harness `seed_active_totp` enrolls, so a real code is reproducible.
+const TOTP_SEED: [u8; 20] = [0x0A; 20];
 
 /// POST an `application/x-www-form-urlencoded` body to the scope-routed challenge endpoint.
 async fn challenge(harness: &Harness, body: &str) -> (StatusCode, String) {
@@ -59,6 +63,57 @@ async fn armed_harness() -> (Harness, String) {
     harness.set_client_first_party(&client_id, true).await;
     harness.seed_user(IDENTIFIER, PASSWORD).await;
     (harness, client_id.to_string())
+}
+
+/// Like [`armed_harness`] but the seeded user is enrolled in an ACTIVE TOTP factor and the tenant
+/// baseline demands MFA, so a correct primary factor HOLDS on the second-factor challenge (the PR2
+/// step-up loop) rather than completing in one request.
+async fn armed_mfa_harness() -> (Harness, String) {
+    let mut harness = Harness::start().await;
+    harness.enable_first_party_challenge();
+    let client_id = *harness.client_id();
+    harness.set_client_first_party(&client_id, true).await;
+    let subject = harness.seed_user(IDENTIFIER, PASSWORD).await;
+    harness.seed_active_totp(&subject).await;
+    harness.set_tenant_min_class("mfa").await;
+    (harness, client_id.to_string())
+}
+
+/// The current app-clock wall time in whole seconds (the TOTP step basis).
+fn now_secs(harness: &Harness) -> u64 {
+    harness
+        .clock()
+        .now_utc()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after epoch")
+        .as_secs()
+}
+
+/// A real TOTP code for the seeded factor at the current app-clock time.
+fn totp_code(harness: &Harness) -> String {
+    code_at(
+        &TOTP_SEED,
+        TotpParams::authenticator_default(),
+        now_secs(harness),
+    )
+}
+
+/// Drive the FRESH first hop (identifier + password) and return the `auth_session` continuity
+/// handle the step-up render carries. Asserts the hop is a `400 insufficient_authorization` with an
+/// `auth_session` and the `otp_required` hint.
+async fn first_hop_auth_session(harness: &Harness, client_id: &str) -> String {
+    let (status, body) = challenge(harness, &challenge_form(client_id, IDENTIFIER, PASSWORD)).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the primary factor holds on the second factor: {body}"
+    );
+    assert_eq!(json(&body)["error"], "insufficient_authorization");
+    assert_eq!(json(&body)["otp_required"], true, "the otp hint: {body}");
+    json(&body)["auth_session"]
+        .as_str()
+        .unwrap_or_else(|| panic!("an auth_session in the step-up render: {body}"))
+        .to_owned()
 }
 
 #[tokio::test]
@@ -330,4 +385,328 @@ async fn a_quarantined_user_is_escalated_and_gets_no_offline_refresh() {
         json(&resp)["authorization_code"].is_null(),
         "no code is minted for a quarantined user, so no offline refresh family is reachable: {resp}"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// PR2: MFA / step-up continuity. A held second factor returns a rotating opaque `auth_session`
+// plus hints; the native client resubmits with the handle and its one time code; the endpoint
+// resumes the SAME flow and loops or (on completion) mints the code. The OAuth params are sourced
+// from the flow's stashed, WRITE-ONCE `transient_payload`, so they are immutable across rounds.
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn step_up_completes_and_the_token_endpoint_redeems_the_resumed_code() {
+    let (harness, client_id) = armed_mfa_harness().await;
+
+    // First hop: the correct password holds on the second factor with a continuity handle.
+    let auth_session = first_hop_auth_session(&harness, &client_id).await;
+
+    // Resume with the handle and a REAL TOTP code (a fresh step, distinct from the seeded
+    // activation): the endpoint resumes the flow and mints the browserless code.
+    harness.clock().advance(std::time::Duration::from_secs(90));
+    let code = totp_code(&harness);
+    let (status, body) = challenge(
+        &harness,
+        &form(&[("auth_session", &auth_session), ("otp", &code)]),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the resumed step-up mints a code: {body}"
+    );
+    let authorization_code = json(&body)["authorization_code"]
+        .as_str()
+        .expect("authorization_code")
+        .to_owned();
+    assert!(
+        authorization_code.starts_with("ac_"),
+        "an authorization code: {authorization_code}"
+    );
+
+    // The ordinary token endpoint redeems it with NO redirect_uri (a browserless first-party code).
+    let redeem = form(&[
+        ("grant_type", "authorization_code"),
+        ("code", &authorization_code),
+        ("client_id", &client_id),
+    ]);
+    let (status, _headers, response) = harness.token(&redeem).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "token exchange should succeed: {response}"
+    );
+    assert!(
+        json(&response)["access_token"].is_string(),
+        "an access token: {response}"
+    );
+    assert!(
+        json(&response)["id_token"].is_string(),
+        "an id token: {response}"
+    );
+}
+
+#[tokio::test]
+async fn the_resume_hop_auth_session_rotates_away_from_the_first_hop() {
+    // Rotation: each render carries a freshly rotated submit token, so a wrong-code loop hop's
+    // handle differs from the first hop's.
+    let (harness, client_id) = armed_mfa_harness().await;
+    let first = first_hop_auth_session(&harness, &client_id).await;
+
+    let (status, body) = challenge(
+        &harness,
+        &form(&[("auth_session", &first), ("otp", "000000")]),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a wrong code loops: {body}"
+    );
+    let second = json(&body)["auth_session"]
+        .as_str()
+        .expect("a new auth_session on the loop")
+        .to_owned();
+    assert_ne!(
+        first, second,
+        "the resume-hop handle rotates away from the first hop"
+    );
+}
+
+#[tokio::test]
+async fn a_wrong_otp_loops_with_a_new_auth_session() {
+    // A wrong second factor re-renders the step-up loop with a NEW handle, never a code and never
+    // an oracle of whether the code was close.
+    let (harness, client_id) = armed_mfa_harness().await;
+    let auth_session = first_hop_auth_session(&harness, &client_id).await;
+
+    let (status, body) = challenge(
+        &harness,
+        &form(&[("auth_session", &auth_session), ("otp", "000000")]),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a wrong code does not complete: {body}"
+    );
+    assert_eq!(json(&body)["error"], "insufficient_authorization");
+    assert_eq!(
+        json(&body)["otp_required"],
+        true,
+        "still asking for the code: {body}"
+    );
+    assert!(
+        json(&body)["auth_session"].as_str().is_some(),
+        "a fresh handle to retry with: {body}"
+    );
+    assert!(
+        json(&body)["authorization_code"].is_null(),
+        "no code on a wrong code: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_replayed_first_hop_auth_session_is_rejected_after_a_successful_resume() {
+    // Stale rejection: once a handle's flow has completed (or its token rotated out), replaying the
+    // handle is the uniform invalid_grant, never a second code.
+    let (harness, client_id) = armed_mfa_harness().await;
+    let auth_session = first_hop_auth_session(&harness, &client_id).await;
+
+    harness.clock().advance(std::time::Duration::from_secs(90));
+    let code = totp_code(&harness);
+    let (status, body) = challenge(
+        &harness,
+        &form(&[("auth_session", &auth_session), ("otp", &code)]),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the first resume mints a code: {body}"
+    );
+
+    // Replaying the SAME handle now hits the completed flow: a uniform invalid_grant.
+    let (status, replay) = challenge(
+        &harness,
+        &form(&[("auth_session", &auth_session), ("otp", &code)]),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a replayed handle is rejected: {replay}"
+    );
+    assert_eq!(json(&replay)["error"], "invalid_grant");
+    assert!(
+        json(&replay)["authorization_code"].is_null(),
+        "no second code on replay: {replay}"
+    );
+}
+
+#[tokio::test]
+async fn a_resume_under_a_different_client_is_rejected() {
+    // Client binding (defense in depth): a resume presenting a DIFFERENT client_id than the one the
+    // flow was created for is a uniform invalid_client, so a stolen handle cannot be replayed under
+    // another client (and the code binds the ORIGINAL client regardless).
+    let (harness, client_id) = armed_mfa_harness().await;
+    // A second, distinct first-party client in the same scope.
+    let (other_client, _secret) = harness
+        .create_confidential_client(ClientAuthMethod::Post)
+        .await;
+    harness.set_client_first_party(&other_client, true).await;
+    let other_client_id = other_client.to_string();
+
+    let auth_session = first_hop_auth_session(&harness, &client_id).await;
+    harness.clock().advance(std::time::Duration::from_secs(90));
+    let code = totp_code(&harness);
+    let (status, body) = challenge(
+        &harness,
+        &form(&[
+            ("auth_session", &auth_session),
+            ("otp", &code),
+            ("client_id", &other_client_id),
+        ]),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a cross-client resume is rejected: {body}"
+    );
+    assert_eq!(json(&body)["error"], "invalid_client");
+    assert!(
+        json(&body)["authorization_code"].is_null(),
+        "no code for a cross-client resume: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_resume_cannot_escalate_the_bound_scope_or_pkce() {
+    // The invariant: the OAuth params are stashed WRITE-ONCE at flow creation, so a resume adding
+    // scopes and swapping the PKCE challenge has ZERO effect on the bound code. The minted code
+    // binds the ORIGINAL "openid" scope and the ORIGINAL code_challenge, proved via the token
+    // endpoint (the original verifier still validates, and no offline refresh family is bound).
+    let (harness, client_id) = armed_mfa_harness().await;
+
+    // First hop binds the ORIGINAL scope "openid" and a real PKCE challenge.
+    let (status, body) = challenge(
+        &harness,
+        &form(&[
+            ("client_id", &client_id),
+            ("response_type", "code"),
+            ("scope", "openid"),
+            ("code_challenge", PKCE_CHALLENGE),
+            ("code_challenge_method", "S256"),
+            ("username", IDENTIFIER),
+            ("password", PASSWORD),
+        ]),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the primary factor holds: {body}"
+    );
+    let auth_session = json(&body)["auth_session"]
+        .as_str()
+        .expect("an auth_session")
+        .to_owned();
+
+    // Resume tries to WIDEN the scope and SWAP the PKCE challenge. Both are ignored by the mint.
+    harness.clock().advance(std::time::Duration::from_secs(90));
+    let code = totp_code(&harness);
+    let (status, body) = challenge(
+        &harness,
+        &form(&[
+            ("auth_session", &auth_session),
+            ("otp", &code),
+            ("scope", "openid profile email offline_access"),
+            (
+                "code_challenge",
+                "tOtAlLyDiFfErEnTcHaLlEnGeVaLuE0000000000000",
+            ),
+            ("code_challenge_method", "S256"),
+        ]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the resume completes: {body}");
+    let authorization_code = json(&body)["authorization_code"]
+        .as_str()
+        .expect("authorization_code")
+        .to_owned();
+
+    // The ORIGINAL code_challenge is bound: the ORIGINAL verifier validates. Had the resume's
+    // swapped challenge been bound, this verifier would be rejected.
+    let redeem = form(&[
+        ("grant_type", "authorization_code"),
+        ("code", &authorization_code),
+        ("client_id", &client_id),
+        ("code_verifier", PKCE_VERIFIER),
+    ]);
+    let (status, _headers, response) = harness.token(&redeem).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the original PKCE verifier validates: {response}"
+    );
+    // The ORIGINAL scope "openid" is bound EXACTLY, never the resume's widened
+    // "openid profile email offline_access": the write-once params ignored the resume body, so the
+    // sensitive offline_access scope was never bound onto the code.
+    assert_eq!(
+        json(&response)["scope"],
+        "openid",
+        "the bound scope is the original: {response}"
+    );
+}
+
+#[tokio::test]
+async fn a_primary_failure_is_indistinguishable_from_an_unknown_user() {
+    // Anti-enumeration: a wrong password AND an unknown user both map to the SAME uniform
+    // insufficient_authorization with NO auth_session and NO hints, distinct from the MFA response
+    // (which carries the handle + otp_required only after a genuine primary success).
+    let (harness, client_id) = armed_mfa_harness().await;
+
+    let (wrong_status, wrong_body) = challenge(
+        &harness,
+        &challenge_form(&client_id, IDENTIFIER, "not-the-password"),
+    )
+    .await;
+    let (unknown_status, unknown_body) = challenge(
+        &harness,
+        &challenge_form(&client_id, "ghost@example.test", PASSWORD),
+    )
+    .await;
+
+    assert_eq!(wrong_status, StatusCode::BAD_REQUEST);
+    assert_eq!(unknown_status, StatusCode::BAD_REQUEST);
+    for body in [&wrong_body, &unknown_body] {
+        assert_eq!(json(body)["error"], "insufficient_authorization");
+        assert!(
+            json(body)["auth_session"].is_null(),
+            "no continuity handle on a primary failure: {body}"
+        );
+        assert!(
+            json(body)["otp_required"].is_null(),
+            "no otp hint on a primary failure: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_garbage_auth_session_is_a_uniform_invalid_grant() {
+    // A structurally invalid handle (bad base64 / no flow) is the SAME uniform stale rejection as a
+    // rotated-out one, so the handle is never an oracle.
+    let (harness, _client_id) = armed_mfa_harness().await;
+    let (status, body) = challenge(
+        &harness,
+        &form(&[("auth_session", "!!!not-a-handle!!!"), ("otp", "123456")]),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a garbage handle is rejected: {body}"
+    );
+    assert_eq!(json(&body)["error"], "invalid_grant");
 }
