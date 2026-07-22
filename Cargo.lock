@@ -1250,6 +1250,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironauth-journey"
+version = "0.1.0"
+dependencies = [
+ "schemars",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ironauth-kms"
 version = "0.1.0"
 dependencies = [
