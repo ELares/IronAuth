@@ -7,9 +7,10 @@ use std::collections::HashSet;
 use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
-    CorrelationId, NewPolicyDecisionTrace, NewTokenSizeEvent, PolicyDecisionInputs,
-    PolicyDecisionTraceQuery, PolicyKind, PolicyOutcome, PolicyTraceSignal, StoreError,
-    TokenSizeKind,
+    AuthorizationCodeId, ClientId, CorrelationId, GrantId, IssueCode, NewPolicyDecisionTrace,
+    NewRefreshFamily, NewSession, NewTokenSizeEvent, PolicyDecisionInputs,
+    PolicyDecisionTraceQuery, PolicyKind, PolicyOutcome, PolicyTraceSignal, RefreshFamilyId,
+    RefreshTokenId, Scope, SessionId, StoreError, TokenSizeKind, refresh_token_digest,
 };
 
 #[tokio::test]
@@ -642,6 +643,387 @@ async fn consent_revoke_and_list_are_cross_scope_isolated() {
             .len(),
         1,
         "scope A still lists its active grant"
+    );
+}
+
+// ===========================================================================
+// The consent-revoke refresh-family cascade (issue #88, PR 5).
+//
+// Revoking a consent stamps the grant revoked AND, in the SAME transaction,
+// revokes the (subject, client) refresh families (both session-bound AND offline,
+// the point-of-difference from a session logout). These pin the scope-tightness
+// (BOTH subject and client bound), the offline inclusion, the flip gating, and the
+// single-audit contract.
+// ===========================================================================
+
+/// A far-future family expiry (year 2100) in epoch microseconds: an absolute/idle cap
+/// far enough out that a seeded family stays live until a test revokes it.
+const FAMILY_FAR_FUTURE_MICROS: i64 = 4_102_444_800_000_000;
+
+/// Issue an authorization code and its grant in `scope` for `subject`, carrying an
+/// optional `session_ref`, and return the grant id. A family rooted at this grant reads
+/// the grant's `session_ref`, so a SESSION-BOUND family binds to the live session.
+async fn seed_grant(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    subject: &str,
+    session_ref: Option<&SessionId>,
+) -> GrantId {
+    let code_id = AuthorizationCodeId::generate(env, &scope);
+    let grant_id = GrantId::generate(env, &scope);
+    let client_id = ClientId::generate(env, &scope);
+    let session = session_ref.map(SessionId::to_string);
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .authorization()
+        .issue(
+            env,
+            IssueCode {
+                code_id: &code_id,
+                grant_id: &grant_id,
+                client_id: &client_id,
+                redirect_uri: "https://client.test/cb",
+                nonce: None,
+                code_challenge: None,
+                code_challenge_method: None,
+                subject,
+                oauth_scope: Some("openid"),
+                auth_methods: "pwd",
+                auth_time_micros: None,
+                session_ref: session.as_deref(),
+                consent_ref: None,
+                claims_request: None,
+                granted_resources: &[],
+                expires_at_micros: FAMILY_FAR_FUTURE_MICROS,
+                created_at_micros: 0,
+            },
+        )
+        .await
+        .expect("issue code");
+    grant_id
+}
+
+/// Create a LIVE session in `scope` for `subject`, so a session-bound family opened
+/// against it passes the live-session guard (issue #32).
+async fn create_live_session(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    subject: &str,
+) -> SessionId {
+    let id = SessionId::generate(env, &scope);
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .sessions()
+        .rotate(
+            env,
+            &id,
+            None,
+            NewSession {
+                subject,
+                auth_methods: "pwd",
+                auth_time_micros: 0,
+                idle_expires_micros: FAMILY_FAR_FUTURE_MICROS,
+                absolute_expires_micros: FAMILY_FAR_FUTURE_MICROS,
+                user_agent: None,
+                peer_ip: None,
+            },
+        )
+        .await
+        .expect("create session");
+    id
+}
+
+/// Open a refresh-token family (generation 0) rooted at `grant_id`, for the given
+/// `subject` and `client_id` string, session-bound or `offline_access`, and return its
+/// id. The family carries the (subject, client) the consent cascade keys on.
+async fn open_family(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    grant_id: &GrantId,
+    subject: &str,
+    client_id: &str,
+    offline: bool,
+) -> RefreshFamilyId {
+    let family_id = RefreshFamilyId::generate(env, &scope);
+    let jti = RefreshTokenId::generate(env, &scope);
+    let digest = refresh_token_digest(&format!("ira_rt_{jti}~seed"));
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .refresh()
+        .issue(
+            env,
+            NewRefreshFamily {
+                family_id: &family_id,
+                token_jti: &jti,
+                token_digest: &digest,
+                grant_id,
+                subject,
+                client_id,
+                scope: Some("openid"),
+                auth_methods: "pwd",
+                auth_time_unix_micros: None,
+                offline,
+                created_at_unix_micros: 0,
+                idle_expires_at_unix_micros: FAMILY_FAR_FUTURE_MICROS,
+                absolute_expires_at_unix_micros: FAMILY_FAR_FUTURE_MICROS,
+            },
+        )
+        .await
+        .expect("open family");
+    family_id
+}
+
+/// Whether the family `family` reads back revoked. Asserts the row EXISTS (the seeded
+/// family opened), so a session-bound family that failed the liveness guard is caught.
+async fn family_revoked(db: &TestDatabase, scope: Scope, family: &RefreshFamilyId) -> bool {
+    let revoked_at: Option<i64> = sqlx::query_scalar(
+        "SELECT (EXTRACT(EPOCH FROM revoked_at) * 1000000)::bigint FROM refresh_families \
+         WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+    )
+    .bind(family.to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("the seeded family exists");
+    revoked_at.is_some()
+}
+
+/// Revoking a consent cascades to the (subject, client) refresh families INCLUDING the
+/// `offline_access` ones (issue #88): a consent withdrawal kills the offline families
+/// too, the deliberate point-of-difference from a session logout (which spares them).
+#[tokio::test]
+async fn consent_revoke_cascades_to_subject_client_families_including_offline() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let subject = "usr_cascade-subject";
+    let client_id = "cli_cascade-client";
+
+    // The consent to revoke.
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .consents()
+        .grant(&env, subject, client_id, Some("openid"))
+        .await
+        .expect("grant");
+
+    // One session-bound and one offline_access family, both for (subject, client).
+    let session = create_live_session(&db, &env, scope, subject).await;
+    let bound_grant = seed_grant(&db, &env, scope, subject, Some(&session)).await;
+    let bound = open_family(&db, &env, scope, &bound_grant, subject, client_id, false).await;
+    let offline_grant = seed_grant(&db, &env, scope, subject, None).await;
+    let offline = open_family(&db, &env, scope, &offline_grant, subject, client_id, true).await;
+    assert!(
+        !family_revoked(&db, scope, &bound).await,
+        "bound family starts live"
+    );
+    assert!(
+        !family_revoked(&db, scope, &offline).await,
+        "offline family starts live"
+    );
+
+    let revocation = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .consents()
+        .revoke(&env, subject, client_id, REVOKE_AT_MICROS)
+        .await
+        .expect("revoke");
+    assert!(revocation.consent_revoked, "the consent flipped");
+    assert_eq!(
+        revocation.families_revoked, 2,
+        "both the session-bound AND the offline_access family were revoked"
+    );
+    assert!(
+        family_revoked(&db, scope, &bound).await,
+        "the session-bound family is revoked"
+    );
+    assert!(
+        family_revoked(&db, scope, &offline).await,
+        "the offline_access family is revoked too (no offline filter, unlike a logout)"
+    );
+}
+
+/// The cascade is SCOPE-TIGHT to the exact (subject, client) grant (issue #88, the
+/// crux): a family for the SAME subject under a DIFFERENT client, and one for a
+/// DIFFERENT subject under the SAME client, are BOTH left untouched. The WHERE binds
+/// BOTH subject AND client, so it is neither subject-only (too broad) nor session-bound
+/// (too narrow).
+#[tokio::test]
+async fn consent_revoke_cascade_is_scope_tight_to_subject_and_client() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let subject_a = "usr_subject-a";
+    let subject_b = "usr_subject-b";
+    let client_a = "cli_client-a";
+    let client_b = "cli_client-b";
+
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .consents()
+        .grant(&env, subject_a, client_a, Some("openid"))
+        .await
+        .expect("grant");
+
+    // The target family, plus two decoys that must survive.
+    let g_target = seed_grant(&db, &env, scope, subject_a, None).await;
+    let target = open_family(&db, &env, scope, &g_target, subject_a, client_a, true).await;
+    let g_other_client = seed_grant(&db, &env, scope, subject_a, None).await;
+    let other_client =
+        open_family(&db, &env, scope, &g_other_client, subject_a, client_b, true).await;
+    let g_other_subject = seed_grant(&db, &env, scope, subject_b, None).await;
+    let other_subject = open_family(
+        &db,
+        &env,
+        scope,
+        &g_other_subject,
+        subject_b,
+        client_a,
+        true,
+    )
+    .await;
+
+    let revocation = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .consents()
+        .revoke(&env, subject_a, client_a, REVOKE_AT_MICROS)
+        .await
+        .expect("revoke");
+    assert_eq!(
+        revocation.families_revoked, 1,
+        "exactly the (subject_a, client_a) family is revoked"
+    );
+    assert!(
+        family_revoked(&db, scope, &target).await,
+        "the (subject_a, client_a) family is revoked"
+    );
+    assert!(
+        !family_revoked(&db, scope, &other_client).await,
+        "a family for the same subject under a DIFFERENT client is NOT revoked"
+    );
+    assert!(
+        !family_revoked(&db, scope, &other_subject).await,
+        "a family for a DIFFERENT subject under the same client is NOT revoked"
+    );
+}
+
+/// An idempotent no-op revoke (an absent or already-revoked grant) runs NO cascade
+/// (issue #88): the cascade is gated on the consent ACTUALLY flipping, so a family for
+/// the (subject, client) is left untouched and no audit row is written.
+#[tokio::test]
+async fn consent_revoke_no_op_runs_no_cascade_and_writes_no_audit() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let subject = "usr_noop-subject";
+    let client_id = "cli_noop-client";
+
+    // A live family for (subject, client), but NO consent granted, so a revoke does not
+    // flip anything and must not cascade.
+    let grant = seed_grant(&db, &env, scope, subject, None).await;
+    let family = open_family(&db, &env, scope, &grant, subject, client_id, true).await;
+
+    let revocation = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .consents()
+        .revoke(&env, subject, client_id, REVOKE_AT_MICROS)
+        .await
+        .expect("no-op revoke");
+    assert!(
+        !revocation.consent_revoked,
+        "an absent grant does not flip (consent_revoked = false)"
+    );
+    assert_eq!(
+        revocation.families_revoked, 0,
+        "the gated cascade did not run for a revocation that did not happen"
+    );
+    assert!(
+        !family_revoked(&db, scope, &family).await,
+        "the family is untouched: the cascade is gated on the consent flip"
+    );
+    let audit = db
+        .store()
+        .scoped(scope)
+        .audit()
+        .list()
+        .await
+        .expect("audit");
+    assert!(
+        !audit.iter().any(|row| row.action == "consent.revoke"),
+        "a no-op revoke writes no consent.revoke audit row"
+    );
+}
+
+/// A real revocation with a family cascade writes EXACTLY ONE `consent.revoke` audit
+/// row and NO per-family audit row (issue #88): the single consent event is the record,
+/// matching the `refresh_family.revoke` precedent (no per-generation audit).
+#[tokio::test]
+async fn consent_revoke_cascade_writes_one_consent_audit_and_no_per_family_audit() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let subject = "usr_audit-subject";
+    let client_id = "cli_audit-client";
+
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .consents()
+        .grant(&env, subject, client_id, Some("openid"))
+        .await
+        .expect("grant");
+    let grant = seed_grant(&db, &env, scope, subject, None).await;
+    let _family = open_family(&db, &env, scope, &grant, subject, client_id, true).await;
+
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .consents()
+        .revoke(&env, subject, client_id, REVOKE_AT_MICROS)
+        .await
+        .expect("revoke");
+
+    let audit = db
+        .store()
+        .scoped(scope)
+        .audit()
+        .list()
+        .await
+        .expect("audit");
+    assert_eq!(
+        audit
+            .iter()
+            .filter(|row| row.action == "consent.revoke")
+            .count(),
+        1,
+        "exactly one consent.revoke audit row for a real revocation"
+    );
+    assert_eq!(
+        audit
+            .iter()
+            .filter(|row| row.action == "refresh_family.revoke")
+            .count(),
+        0,
+        "the cascade writes NO per-family audit row"
     );
 }
 

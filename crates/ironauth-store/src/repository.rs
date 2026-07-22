@@ -27857,6 +27857,30 @@ pub struct ActiveConsent {
     pub granted_at_unix_micros: i64,
 }
 
+/// The outcome of an [`ActingConsentRepo::revoke`] (issue #88): whether the consent
+/// grant actually flipped, and how many refresh-token families the same-transaction
+/// cascade revoked with it.
+///
+/// A consent revoke is not just a flag flip: it also revokes the (subject, client)
+/// refresh families in the SAME transaction (a revoked consent must not leave a live
+/// long-lived credential behind), so the surfaces report the cascade's extent. Both
+/// fields are zero/false on an idempotent no-op (an already-revoked or absent grant),
+/// which is why `consent_revoked` is distinct from `families_revoked`: a real flip
+/// that happened to own no live family still reports `consent_revoked = true` with
+/// `families_revoked = 0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConsentRevocation {
+    /// Whether the guarded consent UPDATE flipped a live grant to revoked. `false`
+    /// for the idempotent no-op (an already-revoked or absent grant), in which case
+    /// no audit row was written and no cascade ran.
+    pub consent_revoked: bool,
+    /// How many previously-live refresh-token families the same-transaction cascade
+    /// revoked (both session-bound AND `offline_access` families of the (subject,
+    /// client) pair). Zero when the consent did not flip, and zero when the flip
+    /// owned no live family.
+    pub families_revoked: u64,
+}
+
 /// The read-only consent repository (issue #20).
 pub struct ConsentRepo<'a> {
     store: &'a Store,
@@ -28980,21 +29004,47 @@ impl ActingConsentRepo<'_> {
     }
 
     /// REVOKE `subject`'s consent to `client_id` (issue #88): stamp `revoked_at` so
-    /// the authorization gate treats the grant as absent and re-prompts. The grant
-    /// row is never deleted, only marked revoked, so the revocation is auditable and
-    /// a later re-consent reactivates the SAME row (the grant upsert clears
-    /// `revoked_at`).
+    /// the authorization gate treats the grant as absent and re-prompts, AND cascade
+    /// in the SAME transaction to the (subject, client) refresh-token families so the
+    /// revocation kills the live long-lived credentials too. The grant row is never
+    /// deleted, only marked revoked, so the revocation is auditable and a later
+    /// re-consent reactivates the SAME row (the grant upsert clears `revoked_at`).
     ///
-    /// Idempotent: the guarded UPDATE filters `revoked_at IS NULL`, so revoking an
-    /// ALREADY-revoked or ABSENT grant updates zero rows and is a no-op SUCCESS that
-    /// writes NO audit row (a revocation that did not happen records nothing). A real
-    /// revocation writes exactly one `consent.revoke` audit row in the SAME
-    /// transaction, targeting the revoked consent row, so a revocation without its
-    /// audit row cannot commit.
+    /// # The cascade (the point-of-difference from a session logout)
+    ///
+    /// A consent revoke is a withdrawal of authorization, so it must not leave a live
+    /// refresh token behind. Gated on the consent ACTUALLY flipping, the same
+    /// transaction revokes every LIVE refresh family of the (subject, client) pair:
+    ///
+    /// ```text
+    /// WHERE subject = $1 AND client_id = $2 ... AND revoked_at IS NULL
+    /// ```
+    ///
+    /// The WHERE binds BOTH subject AND client, so the cascade is scope-tight to the
+    /// exact grant being withdrawn: a family for the same subject under a DIFFERENT
+    /// client, and one for a DIFFERENT subject under the same client, are BOTH left
+    /// untouched. Unlike a session logout ([`ActingRefreshRepo::revoke_session_bound`],
+    /// which filters `offline = false` to spare an `offline_access` family), this
+    /// carries NO offline filter: withdrawing consent kills the offline families too,
+    /// because their authorization is exactly what was revoked. Short-lived access
+    /// tokens are left to expire on their TTL (owner F5: families-only cascade, no
+    /// grant revoke), so no `grants.revoked_at` is touched here.
+    ///
+    /// Idempotent: the guarded consent UPDATE filters `revoked_at IS NULL`, so
+    /// revoking an ALREADY-revoked or ABSENT grant updates zero rows and is a no-op
+    /// SUCCESS ([`ConsentRevocation::consent_revoked`] `= false`) that writes NO audit
+    /// row and runs NO cascade (a revocation that did not happen records nothing and
+    /// touches nothing). A real revocation writes exactly one `consent.revoke` audit
+    /// row in the SAME transaction, targeting the revoked consent row, so a revocation
+    /// without its audit row cannot commit; the cascade rides that same transaction,
+    /// so the consent flip and its family revocations are atomic (both or neither).
+    /// There is no per-family audit row: the single `consent.revoke` event is the
+    /// record, matching the [`ActingRefreshRepo::revoke_family`] precedent.
     ///
     /// `revoked_at_micros` is the revocation instant in microseconds since the Unix
     /// epoch, taken from the CALLER's application clock seam (never `SystemTime`
-    /// here), so the write stays deterministic under a manual clock.
+    /// here), so both the consent flip and the cascade stay deterministic under a
+    /// manual clock.
     ///
     /// # Errors
     ///
@@ -29005,7 +29055,7 @@ impl ActingConsentRepo<'_> {
         subject: &str,
         client_id: &str,
         revoked_at_micros: i64,
-    ) -> Result<(), StoreError> {
+    ) -> Result<ConsentRevocation, StoreError> {
         let scope = self.scope;
         let mut tx = begin_scoped(self.store, scope).await?;
         let row = sqlx::query(
@@ -29025,12 +29075,37 @@ impl ActingConsentRepo<'_> {
         .await?;
         let Some(row) = row else {
             // Absent or already revoked: an idempotent no-op success. Commit the empty
-            // transaction and record no audit row for a revocation that did not happen.
+            // transaction and record no audit row and run no cascade for a revocation
+            // that did not happen.
             tx.commit().await?;
-            return Ok(());
+            return Ok(ConsentRevocation {
+                consent_revoked: false,
+                families_revoked: 0,
+            });
         };
         let id_text: String = row.get("id");
         let consent_id = ConsentId::parse_in_scope(&id_text, &scope)?;
+        // The refresh-family cascade, in the SAME transaction as the consent flip.
+        // BOTH subject AND client_id in the WHERE keep it scope-tight to the exact
+        // grant being withdrawn, and there is deliberately NO `offline = false` filter:
+        // withdrawing consent revokes the offline families too (the point-of-difference
+        // from a session logout). A grant that owned no live family flips zero rows here
+        // and is still a real revocation.
+        let cascade = sqlx::query(
+            "UPDATE refresh_families \
+             SET revoked_at = TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval \
+             WHERE subject = $1 AND client_id = $2 \
+             AND tenant_id = $3 AND environment_id = $4 \
+             AND revoked_at IS NULL",
+        )
+        .bind(subject)
+        .bind(client_id)
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(revoked_at_micros)
+        .execute(&mut *tx)
+        .await?;
+        let families_revoked = cascade.rows_affected();
         insert_audit_row(
             &mut tx,
             &AuditedWrite {
@@ -29045,7 +29120,10 @@ impl ActingConsentRepo<'_> {
         )
         .await?;
         tx.commit().await?;
-        Ok(())
+        Ok(ConsentRevocation {
+            consent_revoked: true,
+            families_revoked,
+        })
     }
 }
 

@@ -309,6 +309,16 @@ name = "account"
 path = "tests/account.rs"
 required-features = ["testing"]
 
+# The self-service connected-apps (remembered-consent) surface (issue #88): a user lists
+# their own active grants (auto-grant clients excluded, display metadata enriched),
+# revokes one subject-bound (never touching another user's grant to the same client),
+# the revoke cascades to the (subject, client) refresh families and is CSRF-guarded and
+# audited, and revoked_at is stamped from the manual clock. Needs a real database.
+[[test]]
+name = "account_consents"
+path = "tests/account_consents.rs"
+required-features = ["testing"]
+
 # Breached-password screening and 800-63B-4 policy on the set/change surfaces (issue #63):
 # a known-breached password is refused on register and change through an injected STUB
 # provider (never the real HIBP API), the fail-open/closed provider-failure policy behaves

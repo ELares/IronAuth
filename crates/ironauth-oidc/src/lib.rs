@@ -418,6 +418,19 @@ pub fn oidc_router(state: OidcState) -> Router {
             "/t/{tenant_id}/e/{environment_id}/account/sessions/revoke-others",
             post(account::revoke_other_sessions),
         )
+        // The connected-apps (remembered-consent) surface (issue #88): list the clients
+        // the caller granted a remembered consent to and revoke one. The subject is the
+        // authenticated caller (never a body field), so a user only ever manages their
+        // OWN grants; the revoke POST carries the #196 same-origin CSRF check and
+        // cascades to the client's refresh families in the store transaction.
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/account/consents",
+            get(account::list_consents),
+        )
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/account/consents/revoke",
+            post(account::revoke_consent),
+        )
         // The remembered-device (trusted-device) surface (issue #71): list the caller's
         // OWN remembered devices with their metadata, and revoke one or all. Revocation
         // takes effect server-side IMMEDIATELY (a replayed device cookie fails). Every

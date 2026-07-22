@@ -189,6 +189,15 @@ name = "sessions"
 path = "tests/sessions.rs"
 required-features = ["testing"]
 
+# User consent (connected apps) management over HTTP (#88): list a user's remembered
+# consents by subject (auto-grant clients excluded), revoke one with a same-transaction
+# refresh-family cascade that is scope-tight and audited, a cross-scope id is the uniform
+# not-found, and the revoke is sudo-gated.
+[[test]]
+name = "consents"
+path = "tests/consents.rs"
+required-features = ["testing"]
+
 # The tenant lifecycle API and residency attributes over HTTP (#46).
 [[test]]
 name = "tenant_lifecycle"
