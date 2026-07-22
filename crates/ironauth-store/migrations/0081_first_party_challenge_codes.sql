@@ -1,0 +1,28 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+--
+-- Browserless authorization codes for the OAuth 2.0 Authorization Challenge Endpoint
+-- (issue #93, Bet 3, draft-ietf-oauth-first-party-apps-03).
+--
+-- A first-party native client completes login THROUGH the challenge endpoint (no browser, no
+-- redirect_uri) and receives an authorization code it redeems at the ordinary token endpoint
+-- with grant_type=authorization_code and NO redirect_uri. Such a code carries no redirect_uri
+-- binding, so the token endpoint needs a way to tell a browserless code (which accepts an absent
+-- presented redirect_uri and rejects a present one, symmetric with the two-direction PKCE rule)
+-- apart from an ordinary browser code (which requires the exact bound redirect_uri). This is that
+-- discriminator: an explicit boolean, so no other reader has to infer intent from an empty-string
+-- redirect_uri special case.
+--
+-- The column is purely additive and DEFAULT FALSE, so every existing row and the browser
+-- authorization-code path stay byte-identical: an ordinary code is browserless = false and its
+-- redirect_uri re-check is unchanged. Row level security is INHERITED from the authorization_codes
+-- table (0004_oidc_authorization.sql): the column lives on the already-RLS-forced,
+-- (tenant, environment)-scoped table, whose isolation policy and scope CHECK apply unchanged. No
+-- new table, no new policy, no new grant. Every statement is additive, so this migration is an
+-- EXPAND.
+
+-- ---------------------------------------------------------------------------
+-- Whether this authorization code was minted for a browserless first-party challenge (issue #93):
+-- true means the code is bound with NO redirect_uri and is redeemed at the token endpoint without
+-- one. FALSE for every browser authorization code (the default), so the browser redirect_uri
+-- re-check is unchanged.
+ALTER TABLE authorization_codes ADD COLUMN browserless boolean NOT NULL DEFAULT FALSE;

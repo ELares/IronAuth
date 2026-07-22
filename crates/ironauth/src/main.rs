@@ -13,10 +13,10 @@ use std::sync::Arc;
 use axum::Router;
 use ironauth_admin::{AdminOidcBridge, AdminState};
 use ironauth_config::{
-    ADVANCED_RECOVERY_FEATURE, Config, DiagnosticsConfig, FEDCM_FEATURE, FeatureRegistry,
-    GLOBAL_TOKEN_REVOCATION_FEATURE, Loaded, OidcConfig, PasswordHashingConfig,
-    PasswordPolicyConfig, QuotaConfig, RISK_SIGNALS_FEATURE, SIGNUP_QUARANTINE_FEATURE,
-    ScreeningFailurePolicy, ScreeningProvider,
+    ADVANCED_RECOVERY_FEATURE, Config, DiagnosticsConfig, FEDCM_FEATURE,
+    FIRST_PARTY_CHALLENGE_FEATURE, FeatureRegistry, GLOBAL_TOKEN_REVOCATION_FEATURE, Loaded,
+    OidcConfig, PasswordHashingConfig, PasswordPolicyConfig, QuotaConfig, RISK_SIGNALS_FEATURE,
+    SIGNUP_QUARANTINE_FEATURE, ScreeningFailurePolicy, ScreeningProvider,
 };
 use ironauth_env::Env;
 use ironauth_jose::MasterKey;
@@ -179,6 +179,14 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // recovery-approval review queue), so every advanced-recovery path stays a 404 and
         // standard recovery is unchanged until an operator opts in.
         let advanced_recovery_enabled = features.is_enabled(&config, ADVANCED_RECOVERY_FEATURE);
+        // The experimental OAuth 2.0 Authorization Challenge Endpoint (issue #93, Bet 3) is served
+        // only when its feature is enabled AND acknowledged at the exact draft revision; the gate is
+        // the ladder, never a plain [oidc] toggle, so the ack can never be bypassed. Resolved to a
+        // bool here and injected through the OIDC state builder (never OidcConfig), so the
+        // challenge endpoint stays a 404 and no browserless code can be minted until an operator
+        // opts in AND acknowledges the draft.
+        let first_party_challenge_enabled =
+            features.is_enabled(&config, FIRST_PARTY_CHALLENGE_FEATURE);
 
         // The headless flow API (issue #84): a plain top-level operator toggle (like
         // `oidc.enabled`), off by default, resolved here before `config` is moved so the flow
@@ -361,6 +369,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
                 risk_signals_enabled,
                 signup_quarantine_enabled,
                 advanced_recovery_enabled,
+                first_party_challenge_enabled,
                 flows_enabled,
                 hosted_pages_enabled,
                 master_key,
@@ -667,6 +676,7 @@ async fn build_oidc_router(
     risk_signals_enabled: bool,
     signup_quarantine_enabled: bool,
     advanced_recovery_enabled: bool,
+    first_party_challenge_enabled: bool,
     flows_enabled: bool,
     hosted_pages_enabled: bool,
     master_key: Option<Arc<MasterKey>>,
@@ -782,6 +792,7 @@ async fn build_oidc_router(
         .with_risk_signals_enabled(risk_signals_enabled)
         .with_signup_quarantine_enabled(signup_quarantine_enabled)
         .with_advanced_recovery_enabled(advanced_recovery_enabled)
+        .with_first_party_challenge_enabled(first_party_challenge_enabled)
         .with_flows_enabled(flows_enabled)
         .with_hosted_pages_enabled(hosted_pages_enabled)
         .with_diagnostics(diagnostics_config)
@@ -860,6 +871,15 @@ async fn build_oidc_router(
              window and downgrade invariant; IDV consumes a signed provider callback and \
              IronAuth never verifies documents in house; the wire contract may change between \
              releases"
+        );
+    }
+    if first_party_challenge_enabled {
+        tracing::info!(
+            "experimental OAuth 2.0 Authorization Challenge Endpoint mounted (issue #93, \
+             draft-ietf-oauth-first-party-apps): the browserless first-party native login surface; \
+             a first-party native client completes login in one request and receives an \
+             authorization code redeemed at the token endpoint with no redirect_uri; the wire shape \
+             may change between releases"
         );
     }
     tracing::info!(

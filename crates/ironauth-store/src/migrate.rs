@@ -752,6 +752,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0080_flow_versions.sql"),
         },
+        Migration {
+            version: 81,
+            name: "first_party_challenge_codes",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0081_first_party_challenge_codes.sql"),
+        },
     ]
 }
 

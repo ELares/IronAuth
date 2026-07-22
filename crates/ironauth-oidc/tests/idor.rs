@@ -52,6 +52,7 @@ async fn oidc_probes_deny_cross_scope_redeem_and_token_status() {
                 grant_id: &grant_b,
                 client_id: &client_b,
                 redirect_uri: REDIRECT_URI,
+                browserless: false,
                 nonce: None,
                 code_challenge: None,
                 code_challenge_method: None,

@@ -7240,8 +7240,16 @@ pub struct IssueCode<'a> {
     pub grant_id: &'a GrantId,
     /// The OAuth client the code is bound to.
     pub client_id: &'a ClientId,
-    /// The redirect URI the code is bound to (re-checked at redemption).
+    /// The redirect URI the code is bound to (re-checked at redemption). Empty for a
+    /// browserless first-party challenge code (issue #93), which is bound to no redirect URI.
     pub redirect_uri: &'a str,
+    /// Whether this code was minted for a BROWSERLESS first-party challenge (issue #93, Bet 3,
+    /// draft-ietf-oauth-first-party-apps-03): true means the code carries no `redirect_uri` and is
+    /// redeemed at the token endpoint without one (the token endpoint's `redirect_uri` re-check
+    /// accepts an absent presented value and rejects a present one, symmetric with the PKCE
+    /// two-direction rule). `false` for every browser authorization code, whose `redirect_uri`
+    /// re-check is unchanged.
+    pub browserless: bool,
     /// The bound OIDC `nonce`, if the authorization request carried one.
     pub nonce: Option<&'a str>,
     /// The bound PKCE `code_challenge`, if present.
@@ -7308,8 +7316,15 @@ pub struct CodeBindings {
     pub grant_id: GrantId,
     /// The client the code was bound to at authorization time.
     pub client_id: String,
-    /// The redirect URI the code was bound to.
+    /// The redirect URI the code was bound to. Empty for a browserless first-party challenge
+    /// code (issue #93), which is bound to no redirect URI.
     pub redirect_uri: String,
+    /// Whether the code was minted for a BROWSERLESS first-party challenge (issue #93, Bet 3):
+    /// true means it carries no `redirect_uri`, so the token endpoint's `redirect_uri` re-check
+    /// accepts an absent presented value and rejects a present one (symmetric with the PKCE
+    /// two-direction rule). `false` for every browser code, whose `redirect_uri` re-check requires
+    /// the exact bound value.
+    pub browserless: bool,
     /// The bound OIDC `nonce`, if any.
     pub nonce: Option<String>,
     /// The bound PKCE `code_challenge`, if any.
@@ -7431,7 +7446,8 @@ impl AuthorizationRepo<'_> {
         // scope-filtered and RLS-forced, and the composite JOIN keeps a code and its
         // grant in the SAME (tenant, environment).
         let row = sqlx::query(
-            "SELECT ac.grant_id, ac.client_id, ac.redirect_uri, ac.nonce, ac.code_challenge, \
+            "SELECT ac.grant_id, ac.client_id, ac.redirect_uri, ac.browserless, ac.nonce, \
+             ac.code_challenge, \
              ac.code_challenge_method, ac.subject, ac.oauth_scope, ac.auth_methods, \
              ac.claims_request, ac.granted_resources, \
              (EXTRACT(EPOCH FROM ac.auth_time) * 1000000)::bigint AS auth_time_us, \
@@ -7773,15 +7789,16 @@ impl ActingAuthorizationRepo<'_> {
                 .await?;
                 sqlx::query(
                     "INSERT INTO authorization_codes \
-                     (id, tenant_id, environment_id, grant_id, client_id, redirect_uri, nonce, \
+                     (id, tenant_id, environment_id, grant_id, client_id, redirect_uri, \
+                      browserless, nonce, \
                       code_challenge, code_challenge_method, subject, oauth_scope, auth_methods, \
                       claims_request, granted_resources, auth_time, expires_at, created_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
-                             CASE WHEN $15::bigint IS NULL THEN NULL \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
+                             CASE WHEN $16::bigint IS NULL THEN NULL \
                                   ELSE TIMESTAMPTZ 'epoch' \
-                                       + ($15::text || ' microseconds')::interval END, \
-                             TIMESTAMPTZ 'epoch' + ($16::text || ' microseconds')::interval, \
-                             TIMESTAMPTZ 'epoch' + ($17::text || ' microseconds')::interval)",
+                                       + ($16::text || ' microseconds')::interval END, \
+                             TIMESTAMPTZ 'epoch' + ($17::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($18::text || ' microseconds')::interval)",
                 )
                 .bind(code.code_id.to_string())
                 .bind(scope.tenant().to_string())
@@ -7789,6 +7806,7 @@ impl ActingAuthorizationRepo<'_> {
                 .bind(code.grant_id.to_string())
                 .bind(code.client_id.to_string())
                 .bind(code.redirect_uri)
+                .bind(code.browserless)
                 .bind(code.nonce)
                 .bind(code.code_challenge)
                 .bind(code.code_challenge_method)
@@ -11093,6 +11111,7 @@ fn bindings_from_row(row: &PgRow, scope: &Scope) -> Result<CodeBindings, StoreEr
         grant_id,
         client_id: row.get("client_id"),
         redirect_uri: row.get("redirect_uri"),
+        browserless: row.get("browserless"),
         nonce: row.get("nonce"),
         code_challenge: row.get("code_challenge"),
         code_challenge_method: row.get("code_challenge_method"),

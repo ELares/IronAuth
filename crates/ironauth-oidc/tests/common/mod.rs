@@ -899,6 +899,18 @@ impl Harness {
         self.state = state;
     }
 
+    /// Arm the experimental OAuth 2.0 Authorization Challenge Endpoint (issue #93, Bet 3) for the
+    /// harness and rebuild the protocol router, so the `.../authorize-challenge` route answers
+    /// instead of the flag-off uniform 404. Sets `with_first_party_challenge_enabled(true)` (the
+    /// arming bool the boot path resolves from the strict feature ladder). Preserves the existing
+    /// state (the seeded public client, the relaxed confidential-PKCE config, and the admin-consent
+    /// gate off), so the completed challenge login and code redemption drive as usual.
+    pub fn enable_first_party_challenge(&mut self) {
+        let state = self.state.clone().with_first_party_challenge_enabled(true);
+        self.router = oidc_router(state.clone());
+        self.state = state;
+    }
+
     /// Install the custom (declarative) journey source (issue #92, PR 4) and rebuild the protocol
     /// router, so a `custom` flow resolves its compiled transition table. Preserves any previously
     /// installed hashing pool and the flows toggle.

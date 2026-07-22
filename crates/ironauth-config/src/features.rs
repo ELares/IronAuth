@@ -93,6 +93,23 @@ pub const ADVANCED_RECOVERY_FEATURE: &str = "advanced-recovery";
 /// bumps it and invalidates the old ack.
 pub const ADVANCED_RECOVERY_VERSION: &str = "0.1.0-exp.1";
 
+/// The registry name of the OAuth 2.0 Authorization Challenge Endpoint experimental feature
+/// (issue #93, Bet 3): the browserless first-party native login surface of
+/// draft-ietf-oauth-first-party-apps. One plain umbrella flag so the whole challenge surface
+/// (the endpoint and the browserless authorization-code path) toggles under one ack, mirroring
+/// the one-flag-per-surface precedent.
+pub const FIRST_PARTY_CHALLENGE_FEATURE: &str = "first-party-challenge";
+
+/// The exact draft revision of `draft-ietf-oauth-first-party-apps` this build implements (issue
+/// #93). It doubles as the experimental `ack` version for the `first-party-challenge` feature: an
+/// operator enabling the feature acknowledges this exact draft revision, and a future draft that
+/// changes the wire shape bumps this string and invalidates the old ack, refusing to boot with the
+/// changelog pointer. The ack string IS the draft id (the global-token-revocation precedent). It is
+/// EXPLORATORY: the draft was in WG Last Call at implementation time and the wire shape may break
+/// between releases. Surfaced in `docs/CONFIG.md` (the feature ladder table) so an interop mismatch
+/// with another implementer is diagnosable.
+pub const SUPPORTED_FIRST_PARTY_DRAFT: &str = "draft-ietf-oauth-first-party-apps-03";
+
 /// How mature a feature is, and therefore what enabling it requires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Maturity {
@@ -226,6 +243,7 @@ impl FeatureRegistry {
         registry.register_risk_signals();
         registry.register_signup_quarantine();
         registry.register_advanced_recovery();
+        registry.register_first_party_challenge();
         registry
     }
 
@@ -397,6 +415,29 @@ impl FeatureRegistry {
              this one ack, and every mode completes THROUGH the recovery delay window and the \
              downgrade invariant. EXPLORATORY: the seam is early and may break between releases.",
             ADVANCED_RECOVERY_VERSION,
+            "crates/ironauth-oidc/CHANGELOG.md",
+        ));
+    }
+
+    /// Registers the OAuth 2.0 Authorization Challenge Endpoint feature (issue #93, Bet 3), the
+    /// browserless first-party native login surface of `draft-ietf-oauth-first-party-apps`: a
+    /// first-party native client submits credentials to a POST endpoint and drives the login flow
+    /// to completion in one request, receiving an authorization code it redeems at the ordinary
+    /// token endpoint (with no `redirect_uri`). It is EXPERIMENTAL and EXPLORATORY: the draft was in
+    /// WG Last Call at implementation time and the wire shape may break between releases, so
+    /// enabling it must acknowledge the exact implemented draft revision. Off by default; when
+    /// enabled AND acked, the OIDC provider serves `POST .../authorize-challenge`. With the flag
+    /// off the endpoint answers a uniform 404 and no browserless code can be minted.
+    pub fn register_first_party_challenge(&mut self) {
+        self.register(Feature::experimental(
+            FIRST_PARTY_CHALLENGE_FEATURE,
+            "OAuth 2.0 Authorization Challenge Endpoint (issue #93, \
+             draft-ietf-oauth-first-party-apps): a browserless first-party native login surface. A \
+             first-party native client POSTs credentials, the endpoint drives the login flow to \
+             completion in one request and mints an authorization code the ordinary token endpoint \
+             redeems (no redirect_uri). EXPLORATORY: the draft was in WG Last Call at \
+             implementation time and the wire shape may break between releases.",
+            SUPPORTED_FIRST_PARTY_DRAFT,
             "crates/ironauth-oidc/CHANGELOG.md",
         ));
     }
@@ -916,5 +957,49 @@ mod tests {
         ));
         registry.validate(&acked).expect("the exact ack boots");
         assert!(registry.is_enabled(&acked, ADVANCED_RECOVERY_FEATURE));
+    }
+
+    #[test]
+    fn first_party_challenge_is_experimental_and_off_by_default() {
+        // Issue #93 (Bet 3) ships the OAuth 2.0 Authorization Challenge Endpoint behind a
+        // default-off experimental flag: absent from [features] it resolves disabled, and enabling
+        // it without the EXACT draft ack refuses to boot (so the challenge endpoint stays a uniform
+        // 404 and no browserless code can be minted until an operator explicitly enables AND
+        // acknowledges the experiment). A future draft bump invalidates every deployed ack.
+        let registry = FeatureRegistry::builtin();
+        let feature = registry
+            .get(FIRST_PARTY_CHALLENGE_FEATURE)
+            .expect("first-party-challenge is registered");
+        assert!(matches!(feature.maturity(), Maturity::Experimental { .. }));
+        assert!(!feature.default_enabled());
+
+        let absent = config_with_features("");
+        registry.validate(&absent).expect("absent is fine");
+        assert!(
+            !registry.is_enabled(&absent, FIRST_PARTY_CHALLENGE_FEATURE),
+            "first-party-challenge is off when absent from [features]"
+        );
+
+        // Enabled without an ack refuses to boot (the negative-startup acceptance criterion).
+        let no_ack = config_with_features("\"first-party-challenge\" = { enabled = true }");
+        registry
+            .validate(&no_ack)
+            .expect_err("an experimental feature enabled without an ack must refuse to boot");
+
+        // Enabled WITH a WRONG ack still refuses to boot: the acked draft version must match the
+        // shipped implementation EXACTLY (the "startup fails loudly on a mismatched ack" criterion).
+        let wrong_ack = config_with_features(
+            "\"first-party-challenge\" = { enabled = true, ack = \"draft-ietf-oauth-first-party-apps-99\" }",
+        );
+        registry
+            .validate(&wrong_ack)
+            .expect_err("a mismatched draft ack must refuse to boot");
+
+        // Enabled WITH the exact draft ack boots and reports enabled.
+        let acked = config_with_features(&format!(
+            "\"first-party-challenge\" = {{ enabled = true, ack = \"{SUPPORTED_FIRST_PARTY_DRAFT}\" }}"
+        ));
+        registry.validate(&acked).expect("the exact ack boots");
+        assert!(registry.is_enabled(&acked, FIRST_PARTY_CHALLENGE_FEATURE));
     }
 }

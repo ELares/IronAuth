@@ -58,6 +58,7 @@ async fn issue_code(
                 grant_id: &grant_id,
                 client_id: &client_id,
                 redirect_uri: "https://client.test/cb",
+                browserless: false,
                 nonce: None,
                 code_challenge: None,
                 code_challenge_method: None,
