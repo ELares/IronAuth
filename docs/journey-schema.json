@@ -363,7 +363,7 @@
               "type": "null"
             }
           ],
-          "description": "The decision this step evaluates, for a [`StepKind::Decision`] step."
+          "description": "The decision predicate carried by a [`StepKind::Decision`] step. It is validated and type\nchecked at load, but the built-in engine routes a decision step through its guarded\ntransitions, not this attachment, which is reserved for a future outcome-based routing mode."
         },
         "id": {
           "description": "The document-local step id (unique across the journey's steps).",
