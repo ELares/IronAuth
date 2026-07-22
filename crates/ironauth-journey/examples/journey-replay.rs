@@ -82,6 +82,13 @@ fn run_corpus(corpus: &Path, regenerate: bool) -> Result<bool, String> {
             transcript_count += 1;
             let transcript = load_transcript(path)?;
             check_pairing(path, &journey, &transcript)?;
+            // Refuse a transcript that routes on a subject-context field the engine does not yet
+            // populate (empty groups and scopes, lowest risk, pending issue #355): it would replay
+            // against those ignored values today yet drift from real behavior once the engine wires
+            // them, so a committed corpus must never carry one.
+            transcript
+                .check_engine_faithful()
+                .map_err(|error| format!("{}: {error}", path.display()))?;
             if regenerate {
                 regenerate_one(path, &compiled, &transcript)?;
             } else if !check_one(path, &compiled, &transcript) {

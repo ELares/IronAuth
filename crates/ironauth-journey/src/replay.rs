@@ -24,6 +24,23 @@
 //! no clock, no entropy, and no database: the evaluation context is pinned by the transcript, and
 //! the evaluator ([`evaluate`]) is pure.
 //!
+//! ## The engine-faithful context set
+//!
+//! A replay is only trustworthy if the context it assembles matches what the LIVE engine
+//! assembles, so a passing replay can never mask a routing the engine would take differently. The
+//! engine's `assemble_eval_context` today populates exactly four subject-derived inputs: the step
+//! outcome `signals`, the proven `method_tokens`, the blind `subject_handle`, and the sealed
+//! `subject_traits` document. It HARDCODES the remaining three, pending the wiring tracked in
+//! issue #355: `subject_groups` and `subject_scopes` are empty and `risk` is the lowest
+//! (`RiskView { level: Low, score: 0 }`). This module assembles the context the SAME way
+//! ([`base_context`]): it honors a transcript's signals, method tokens, subject handle, and traits
+//! (all engine-faithful), and it assembles empty groups and scopes and the lowest risk regardless
+//! of the transcript, exactly as the engine does. To keep a golden corpus from ever RELYING on the
+//! unpopulated fields (which would read faithfully today yet route differently once #355 wires
+//! them), [`JourneyTranscript::check_engine_faithful`] REJECTS a transcript step that sets
+//! `groups`, `scopes`, or `risk`; the CI harness enforces it, so an unfaithful transcript can never
+//! land. Those transcript fields are RESERVED for when the engine populates them.
+//!
 //! ## Purity discipline
 //!
 //! This module is a PURE value function, like the rest of the crate: no clock, no entropy, no
@@ -506,7 +523,95 @@ impl fmt::Display for RegenerateError {
 
 impl std::error::Error for RegenerateError {}
 
+/// A subject-context field the transcript set that the engine does not yet populate (issue #92,
+/// PR 7): the reason [`JourneyTranscript::check_engine_faithful`] rejects a transcript. Naming the
+/// field keeps the error precise and operator-safe (it names a context field, never a value).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnfaithfulField {
+    /// The subject's group memberships (the engine assembles these empty pending issue #355).
+    Groups,
+    /// The subject's granted scopes (the engine assembles these empty pending issue #355).
+    Scopes,
+    /// The risk decision (the engine assembles the lowest risk pending issue #355).
+    Risk,
+}
+
+impl UnfaithfulField {
+    /// The transcript field name this reason names.
+    #[must_use]
+    fn as_str(self) -> &'static str {
+        match self {
+            UnfaithfulField::Groups => "groups",
+            UnfaithfulField::Scopes => "scopes",
+            UnfaithfulField::Risk => "risk",
+        }
+    }
+}
+
+/// Why a transcript is not faithful to the current engine (issue #92, PR 7): a hop's subject
+/// context sets a field ([`UnfaithfulField`]) the engine's `assemble_eval_context` does not yet
+/// populate (empty groups and scopes, lowest risk, pending issue #355). Replaying such a transcript
+/// would read faithfully TODAY (the replay ignores the field, exactly as the engine does), yet the
+/// recorded expectation would silently stop reflecting real behavior once #355 wires the field, so
+/// the harness refuses it up front. Carries the hop index and the offending field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnfaithfulTranscript {
+    /// The zero-based index of the hop whose subject context set an unpopulated field.
+    pub step_index: usize,
+    /// The unpopulated field the hop set.
+    pub field: UnfaithfulField,
+}
+
+impl fmt::Display for UnfaithfulTranscript {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "hop {}: subject {} is not yet populated by the engine (see issue #355); a transcript \
+             routing on it would not reflect real behavior",
+            self.step_index,
+            self.field.as_str()
+        )
+    }
+}
+
+impl std::error::Error for UnfaithfulTranscript {}
+
 impl JourneyTranscript {
+    /// Refuse a transcript that routes on a subject-context field the engine does not yet populate
+    /// (issue #92, PR 7): a load-time fidelity lint. The engine's `assemble_eval_context` hardcodes
+    /// empty `subject_groups` and `subject_scopes` and the lowest `risk` pending issue #355, so a
+    /// transcript that sets any of them would replay against those ignored values TODAY yet drift
+    /// from real behavior the moment the engine wires them. The CI harness runs this before
+    /// replaying, so a committed golden corpus can never carry an unfaithful transcript. The
+    /// engine-faithful subject inputs (`method_tokens`, `subject_handle`, `traits`) are always
+    /// allowed.
+    ///
+    /// # Errors
+    ///
+    /// An [`UnfaithfulTranscript`] naming the first hop that sets `groups`, `scopes`, or `risk`.
+    pub fn check_engine_faithful(&self) -> Result<(), UnfaithfulTranscript> {
+        for (index, step) in self.steps.iter().enumerate() {
+            if let Some(subject) = &step.subject {
+                let unfaithful = if !subject.groups.is_empty() {
+                    Some(UnfaithfulField::Groups)
+                } else if !subject.scopes.is_empty() {
+                    Some(UnfaithfulField::Scopes)
+                } else if subject.risk.is_some() {
+                    Some(UnfaithfulField::Risk)
+                } else {
+                    None
+                };
+                if let Some(field) = unfaithful {
+                    return Err(UnfaithfulTranscript {
+                        step_index: index,
+                        field,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Return a copy of this transcript with each hop's `expect` replaced by the outcome the
     /// compiled routing actually produces for that hop's recorded signals and subject context
     /// (issue #92, PR 7): the REGENERATION the CI gate offers so an author who changes routing
@@ -577,7 +682,13 @@ impl JourneyTranscript {
 }
 
 /// Assemble the base evaluation context for a hop from its recorded signals and subject context
-/// (issue #92, PR 7). The `step_id` is set per cursor by [`route_hop`], so it is left empty here.
+/// (issue #92, PR 7), the SAME way the engine's `assemble_eval_context` does. The engine-faithful
+/// inputs are honored from the transcript: the `signals`, the `method_tokens`, the
+/// `subject_handle`, and the `subject_traits`. The three the engine still hardcodes pending issue
+/// #355 are assembled the engine's way REGARDLESS of the transcript: empty `subject_groups` and
+/// `subject_scopes`, and the lowest `risk`. [`JourneyTranscript::check_engine_faithful`] rejects a
+/// transcript that sets those three, so a valid corpus never carries a value the engine would
+/// ignore. The `step_id` is set per cursor by [`route_hop`], so it is left empty here.
 fn base_context(step: &TranscriptStep) -> EvalContext {
     let signals = step.signals.to_signal_set();
     let subject = step.subject.clone().unwrap_or_default();
@@ -589,12 +700,11 @@ fn base_context(step: &TranscriptStep) -> EvalContext {
             signals,
         },
         subject_traits: subject.traits,
-        subject_groups: subject.groups,
-        subject_scopes: subject.scopes,
-        risk: subject
-            .risk
-            .map(TranscriptRisk::to_view)
-            .unwrap_or_default(),
+        // The engine hardcodes these three pending #355, so the replay assembles them the same way
+        // to stay faithful; the load lint guarantees the transcript never set them.
+        subject_groups: BTreeSet::new(),
+        subject_scopes: BTreeSet::new(),
+        risk: RiskView::default(),
     }
 }
 
@@ -1085,11 +1195,82 @@ mod tests {
     }
 
     #[test]
-    fn a_subject_context_hop_assembles_and_routes() {
-        // A journey that routes on a subject group: staff go to a review step, others complete.
+    fn a_transcript_that_sets_an_unpopulated_field_is_rejected_as_unfaithful() {
+        // The engine's assemble_eval_context hardcodes empty groups and scopes and the lowest risk
+        // pending issue #355, so a transcript that sets any of them would replay against those
+        // ignored values yet drift from real behavior once the engine wires them. The fidelity lint
+        // refuses each, naming the exact hop and field, and never panics.
+        let with_subject = |subject: TranscriptSubject| JourneyTranscript {
+            journey_id: "login_conditional_mfa".to_owned(),
+            engine_version: JOURNEY_ENGINE_VERSION,
+            description: None,
+            steps: vec![TranscriptStep {
+                comment: None,
+                signals: TranscriptSignals::of([SignalName::PrimaryVerified]),
+                subject: Some(subject),
+                expect: ExpectedHop::Terminal("done".to_owned()),
+            }],
+        };
+        // Groups set.
+        assert_eq!(
+            with_subject(TranscriptSubject {
+                groups: BTreeSet::from(["staff".to_owned()]),
+                ..TranscriptSubject::default()
+            })
+            .check_engine_faithful(),
+            Err(UnfaithfulTranscript {
+                step_index: 0,
+                field: UnfaithfulField::Groups,
+            })
+        );
+        // Scopes set.
+        assert_eq!(
+            with_subject(TranscriptSubject {
+                scopes: BTreeSet::from(["read".to_owned()]),
+                ..TranscriptSubject::default()
+            })
+            .check_engine_faithful(),
+            Err(UnfaithfulTranscript {
+                step_index: 0,
+                field: UnfaithfulField::Scopes,
+            })
+        );
+        // Risk set.
+        assert_eq!(
+            with_subject(TranscriptSubject {
+                risk: Some(TranscriptRisk {
+                    level: TranscriptRiskLevel::High,
+                    score: 90,
+                }),
+                ..TranscriptSubject::default()
+            })
+            .check_engine_faithful(),
+            Err(UnfaithfulTranscript {
+                step_index: 0,
+                field: UnfaithfulField::Risk,
+            })
+        );
+        // The engine-faithful subject fields (traits, method tokens, subject handle) are allowed.
+        assert_eq!(
+            with_subject(TranscriptSubject {
+                traits: serde_json::json!({ "email_verified": true }),
+                method_tokens: BTreeSet::from(["password".to_owned()]),
+                subject_handle: "usr_abc".to_owned(),
+                ..TranscriptSubject::default()
+            })
+            .check_engine_faithful(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_traits_routed_transcript_replays_faithfully() {
+        // Traits ARE engine-faithful (assemble_eval_context reads the sealed trait document), so a
+        // journey that routes on a subject_traits pointer replays truly. Verified staff go to a
+        // review step; everyone else completes straight through.
         let journey = Journey {
             schema_version: JOURNEY_SCHEMA_VERSION.to_owned(),
-            id: "group_routed".to_owned(),
+            id: "traits_routed".to_owned(),
             engine_version: JOURNEY_ENGINE_VERSION,
             entry: "primary".to_owned(),
             comment: None,
@@ -1102,14 +1283,13 @@ mod tests {
                 Transition {
                     from: "primary".to_owned(),
                     to: "review".to_owned(),
-                    guard: Some(Predicate::Member {
+                    guard: Some(Predicate::Cmp {
                         field: FieldRef {
-                            source: FieldSource::SubjectGroups,
-                            pointer: String::new(),
+                            source: FieldSource::SubjectTraits,
+                            pointer: "/is_staff".to_owned(),
                         },
-                        set: crate::artifact::MemberSet::Group {
-                            name: "staff".to_owned(),
-                        },
+                        op: CmpOp::Eq,
+                        value: Literal::Bool(true),
                     }),
                     comment: None,
                 },
@@ -1130,29 +1310,43 @@ mod tests {
             subflow_definitions: None,
         };
         let compiled = compile(&journey).expect("compiles");
-        // A staff subject threads the review step.
+        // A staff subject (the trait is true) threads the review step, then completes.
         let staff = JourneyTranscript {
-            journey_id: "group_routed".to_owned(),
+            journey_id: "traits_routed".to_owned(),
             engine_version: JOURNEY_ENGINE_VERSION,
             description: None,
             steps: vec![
                 TranscriptStep {
                     comment: None,
-                    signals: TranscriptSignals::default(),
+                    signals: TranscriptSignals::of([SignalName::PrimaryVerified]),
                     subject: Some(TranscriptSubject {
-                        groups: BTreeSet::from(["staff".to_owned()]),
+                        traits: serde_json::json!({ "is_staff": true }),
                         ..TranscriptSubject::default()
                     }),
                     expect: ExpectedHop::Step("review".to_owned()),
                 },
                 TranscriptStep {
                     comment: None,
-                    signals: TranscriptSignals::default(),
+                    signals: TranscriptSignals::of([SignalName::PrimaryVerified]),
                     subject: None,
                     expect: ExpectedHop::Terminal("done".to_owned()),
                 },
             ],
         };
+        assert!(staff.check_engine_faithful().is_ok());
         assert_eq!(run(&compiled, &staff), ReplayReport::Match);
+        // A non-staff subject (the trait is absent) completes straight from the primary step.
+        let other = JourneyTranscript {
+            journey_id: "traits_routed".to_owned(),
+            engine_version: JOURNEY_ENGINE_VERSION,
+            description: None,
+            steps: vec![TranscriptStep {
+                comment: None,
+                signals: TranscriptSignals::of([SignalName::PrimaryVerified]),
+                subject: None,
+                expect: ExpectedHop::Terminal("done".to_owned()),
+            }],
+        };
+        assert_eq!(run(&compiled, &other), ReplayReport::Match);
     }
 }
