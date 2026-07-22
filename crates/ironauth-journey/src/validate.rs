@@ -9,14 +9,16 @@
 //!
 //! PR 1 validates the artifact STRUCTURE: the step id set, the closed step-kind and node-group
 //! vocabularies, transition and subflow reference targets, routing determinism, reachability,
-//! and engine compatibility. It validates the predicate SHAPE (guaranteed by the serde AST)
-//! but does NOT evaluate predicates and does NOT unify their types: the evaluator and the
-//! load-time type check are PR 2, and the compile-to-table executor is PR 4.
+//! and engine compatibility. PR 2 extends the same pass with predicate TYPE checking (see
+//! [`crate::eval::typecheck_predicate`]): a guard or decision predicate whose comparison cannot
+//! type-unify is a load-time [`JourneyError::PredicateType`], so the evaluator only ever runs
+//! type-safe predicates. The compile-to-table executor is PR 4.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use crate::artifact::{JOURNEY_ENGINE_VERSION, Journey, Step, StepKind};
+use crate::artifact::{DecisionSpec, JOURNEY_ENGINE_VERSION, Journey, Step, StepKind};
+use crate::eval::{PredicateTypeError, typecheck_predicate};
 
 /// The node-group vocabulary a journey step may render under (issue #92, fork F6): custom
 /// journeys are constrained to the EXISTING node-group set, so the rendered flow contract
@@ -143,6 +145,10 @@ pub enum JourneyError {
         /// The RFC 6901 pointer to `entry`.
         pointer: String,
     },
+    /// A guard or decision predicate is not type-safe: a comparison whose field source or type
+    /// cannot unify, so the evaluator only ever runs type-checked predicates (issue #92, PR 2).
+    /// The wrapped [`PredicateTypeError`] carries the precise RFC 6901 pointer into the artifact.
+    PredicateType(PredicateTypeError),
 }
 
 impl fmt::Display for JourneyError {
@@ -206,6 +212,7 @@ impl fmt::Display for JourneyError {
             JourneyError::UnknownEntry { pointer } => {
                 write!(f, "entry at {pointer} names no declared step")
             }
+            JourneyError::PredicateType(error) => write!(f, "{error}"),
         }
     }
 }
@@ -220,8 +227,8 @@ impl std::error::Error for JourneyError {}
 /// The checks, in order, are: engine compatibility; duplicate step ids; per-step unknown kind,
 /// unknown node group, dangling subflow reference, and kind-attachment coherence; an unknown
 /// entry; dangling transition endpoints; ambiguous unguarded routing; a transition leaving a
-/// terminal step; unreachable steps; and reachable non-terminal dead ends. Pure and
-/// deterministic: it only reads the document.
+/// terminal step; unreachable steps; reachable non-terminal dead ends; and guard and decision
+/// predicate type safety (PR 2). Pure and deterministic: it only reads the document.
 ///
 /// # Errors
 ///
@@ -257,6 +264,7 @@ pub fn validate(doc: &Journey) -> Result<(), Vec<JourneyError>> {
     if entry_known {
         check_reachability(doc, &ids, &mut errors);
     }
+    check_predicates(doc, &mut errors);
 
     if errors.is_empty() {
         Ok(())
@@ -380,6 +388,39 @@ fn check_reachability(doc: &Journey, ids: &BTreeSet<&str>, errors: &mut Vec<Jour
     }
 }
 
+/// Type-check every guard and decision predicate in the artifact (issue #92, PR 2), appending a
+/// [`JourneyError::PredicateType`] per failure in document order (all transition guards, then all
+/// step decisions). A statically-decidable type mismatch (an ordering operator on a boolean
+/// signal, a literal that cannot unify with its field, a membership over a mismatched set, a set
+/// used in a comparison) is a LOAD-TIME error, so the evaluator only ever runs type-safe
+/// predicates. Each error carries the precise RFC 6901 pointer into the predicate.
+fn check_predicates(doc: &Journey, errors: &mut Vec<JourneyError>) {
+    for (index, transition) in doc.transitions.iter().enumerate() {
+        if let Some(guard) = &transition.guard {
+            let base = format!("/transitions/{index}/guard");
+            collect_predicate_errors(guard, &base, errors);
+        }
+    }
+    for (index, step) in doc.steps.iter().enumerate() {
+        if let Some(DecisionSpec::Predicate { predicate }) = &step.decision {
+            let base = format!("/steps/{index}/decision/predicate");
+            collect_predicate_errors(predicate, &base, errors);
+        }
+    }
+}
+
+/// Type-check one predicate rooted at `base`, wrapping each [`PredicateTypeError`] as a
+/// [`JourneyError`].
+fn collect_predicate_errors(
+    predicate: &crate::artifact::Predicate,
+    base: &str,
+    errors: &mut Vec<JourneyError>,
+) {
+    let mut type_errors: Vec<PredicateTypeError> = Vec::new();
+    typecheck_predicate(predicate, base, &mut type_errors);
+    errors.extend(type_errors.into_iter().map(JourneyError::PredicateType));
+}
+
 /// The set of subflow ids the journey declares in its `subflows` list.
 fn declared_subflow_ids(doc: &Journey) -> BTreeSet<&str> {
     doc.subflows
@@ -470,6 +511,7 @@ mod tests {
         CmpOp, DecisionSpec, FieldRef, FieldSource, JOURNEY_SCHEMA_VERSION, Literal, Predicate,
         Step, StepKind, SubflowRef, SubflowSource, Transition,
     };
+    use crate::eval::PredicateTypeError;
 
     fn step(id: &str, kind: StepKind, node_group: Option<&str>) -> Step {
         Step {
@@ -893,6 +935,77 @@ mod tests {
             Err(vec![JourneyError::UnknownEntry {
                 pointer: "/entry".to_owned(),
             }])
+        );
+    }
+
+    #[test]
+    fn a_well_typed_guard_predicate_passes_validation() {
+        // The realistic conditional-MFA journey's guards are all well typed (boolean signal
+        // equalities), so predicate type checking adds no error.
+        assert_eq!(validate(&valid_journey()), Ok(()));
+    }
+
+    #[test]
+    fn an_ill_typed_guard_predicate_fails_validation_with_a_pointer() {
+        // An ordering operator on a boolean signal is a statically-decidable type error at the
+        // guard's precise pointer; the journey is otherwise valid.
+        let mut doc = valid_journey();
+        doc.transitions[0].guard = Some(Predicate::Cmp {
+            field: FieldRef {
+                source: FieldSource::Signals,
+                pointer: "/mfa_required".to_owned(),
+            },
+            op: CmpOp::Lt,
+            value: Literal::Bool(true),
+        });
+        assert_eq!(
+            validate(&doc),
+            Err(vec![JourneyError::PredicateType(
+                PredicateTypeError::OrderingUndefined {
+                    pointer: "/transitions/0/guard/op".to_owned(),
+                }
+            )])
+        );
+    }
+
+    #[test]
+    fn an_ill_typed_decision_predicate_fails_validation_with_a_pointer() {
+        // A Member over a numeric field (not a string set) is a static mismatch, located at the
+        // decision predicate's pointer.
+        let doc = Journey {
+            schema_version: JOURNEY_SCHEMA_VERSION.to_owned(),
+            id: "j".to_owned(),
+            engine_version: JOURNEY_ENGINE_VERSION,
+            entry: "primary".to_owned(),
+            comment: None,
+            steps: vec![
+                step("primary", StepKind::IdentifierPassword, Some("password")),
+                Step {
+                    decision: Some(DecisionSpec::Predicate {
+                        predicate: Predicate::Member {
+                            field: FieldRef {
+                                source: FieldSource::Risk,
+                                pointer: "/score".to_owned(),
+                            },
+                            set: crate::artifact::MemberSet::Group {
+                                name: "staff".to_owned(),
+                            },
+                        },
+                    }),
+                    ..step("branch", StepKind::Decision, None)
+                },
+                step("done", StepKind::Terminal, None),
+            ],
+            transitions: vec![unguarded("primary", "branch"), unguarded("branch", "done")],
+            subflows: None,
+        };
+        assert_eq!(
+            validate(&doc),
+            Err(vec![JourneyError::PredicateType(
+                PredicateTypeError::MemberSetMismatch {
+                    pointer: "/steps/1/decision/predicate/field".to_owned(),
+                }
+            )])
         );
     }
 }

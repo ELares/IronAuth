@@ -19,10 +19,13 @@
 //! management surface consume these types; none of that lands here.
 //!
 //! PR 1 is the pure library only, with no engine change. It defines the predicate AST as DATA
-//! and validates the artifact STRUCTURE; the predicate EVALUATOR and its type unification are
-//! PR 2, and the compile-to-table executor is PR 4.
+//! and validates the artifact STRUCTURE. PR 2 adds the pure predicate EVALUATOR
+//! ([`evaluate`]) over a typed [`EvalContext`], the load-time predicate type check that
+//! guarantees the evaluator only runs type-safe predicates, and the [`DecisionEvaluator`] seam a
+//! later milestone extends with a sandbox. The compile-to-table executor is PR 4.
 
 mod artifact;
+mod eval;
 mod schema;
 mod validate;
 
@@ -30,6 +33,11 @@ pub use artifact::{
     CmpOp, DecisionSpec, FieldRef, FieldSource, JOURNEY_ENGINE_VERSION, JOURNEY_SCHEMA_VERSION,
     Journey, Literal, MemberSet, Predicate, Step, StepId, StepKind, SubflowId, SubflowRef,
     SubflowSource, Transition,
+};
+pub use eval::{
+    DecisionEvaluator, EvalContext, FlowContext, MAX_PREDICATE_DEPTH, OutcomeSignal,
+    PredicateError, PredicateTypeError, RiskLevel, RiskView, SignalSet, evaluate,
+    typecheck_predicate,
 };
 pub use schema::journey_object_schema;
 pub use validate::{JourneyError, NODE_GROUPS, validate};
