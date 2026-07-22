@@ -755,16 +755,25 @@ pub async fn drive(
             )
             .await
         }
+        // The built-in registration journey (issue #92, PR 8c): re-expressed as the embedded
+        // registration artifact (a two-step guard-free machine: details form, then a terminal mint)
+        // and driven through the SAME compiled-table engine, byte-identically to the retired
+        // imperative `drive_registration`. The uniform acknowledgment is a render-override the
+        // register executor emits while the flow stays OPEN, not a routed step. The imperative
+        // `drive_registration` stays in the tree (unused, `#[allow(dead_code)]`, retired in PR 8e)
+        // so a revert is this one dispatch line.
         Journey::Registration => {
-            drive_registration(
+            orchestration::drive_via_table(
                 state,
                 scope,
                 flow_id,
                 transport,
                 &record,
+                &persisted,
                 &submission,
                 headers,
                 now_micros,
+                Journey::Registration,
             )
             .await
         }
@@ -1501,6 +1510,10 @@ async fn drive_profiling(
 /// first session; the uniform acknowledgment (closed mode anti enum, or waitlist pending)
 /// re-renders the ack state with the flow OPEN, so it is never a completion or enumeration
 /// oracle.
+// PR8e: retire. Dead after the PR 8c table flip (the `Journey::Registration` arm now drives through
+// `orchestration::drive_via_table`). Kept in the tree so a revert is one dispatch line; deleted in
+// PR 8e once every mint-family journey has converged.
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 async fn drive_registration(
     state: &OidcState,

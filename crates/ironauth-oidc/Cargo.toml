@@ -242,6 +242,16 @@ name = "flow_login_flip_adversarial"
 path = "tests/flow_login_flip_adversarial.rs"
 required-features = ["testing"]
 
+# The byte-equivalence gate for the REGISTRATION journey flip (issue #92, PR 8c): the flipped table
+# engine reproduces the imperative registration render byte-for-byte (the details create render and
+# the closed-mode uniform acknowledgment via the render-override seam), completes with the honest pwd
+# amr, folds a resubmit after the ack, and fails closed on a forged custom tag. Over a real database
+# (DATABASE_URL); see scripts/with-test-db.sh.
+[[test]]
+name = "flow_register_flip"
+path = "tests/flow_register_flip.rs"
+required-features = ["testing"]
+
 # The read only flow inspector (issue #91, PR4): the OBSERVE projection of an existing
 # flow, and the ZERO SIDE EFFECT proof (a full database snapshot, byte identical before and
 # after a dry run) that neither observe nor a policy dry run writes any row. Over a real
