@@ -61,6 +61,7 @@ use crate::brand::{
     BrandAssetKind, BrandAssetMeta, BrandAssetRecord, BrandRecord, NewBrand, NewBrandAsset,
 };
 use crate::classification::ResourceType;
+use crate::client_admin_grant::{ClientAdminGrantRecord, NewClientAdminGrant};
 use crate::connector::{ConnectorCapabilities, ConnectorRecord, NewConnector, StoredCapabilities};
 use crate::custom_domain::{
     AcmeChallengeRecord, ChallengeOutcome, ChallengeStatus, ChallengeType, CustomDomainRecord,
@@ -77,9 +78,9 @@ use crate::flow::{FlowRecord, NewFlow};
 use crate::id::{
     AaguidRuleId, AbuseBanId, AccountLinkId, AcmeChallengeId, AdminSudoElevationId,
     AssertionMappingId, AttestationConfigId, AuditId, AuditTarget, AuthorizationCodeId,
-    BackChannelDeliveryId, BrandId, ClientId, ClientSessionId, ConnectorId, ConsentId,
-    CorrelationId, CredentialClassPolicyId, CredentialId, CustomDomainId, DcrPolicyId, DekId,
-    DeviceCodeId, EmailOtpCodeId, EncryptedSecretId, EnvironmentId, EnvironmentSecretId,
+    BackChannelDeliveryId, BrandId, ClientAdminGrantId, ClientId, ClientSessionId, ConnectorId,
+    ConsentId, CorrelationId, CredentialClassPolicyId, CredentialId, CustomDomainId, DcrPolicyId,
+    DekId, DeviceCodeId, EmailOtpCodeId, EncryptedSecretId, EnvironmentId, EnvironmentSecretId,
     ExternalIssuerId, FedcmNonceId, FederationLoginStateId, FlowId, GrantId, InitialAccessTokenId,
     InvitationId, IssuedTokenId, KekId, LocaleBundleId, MagicLinkTokenId, ManagementKeyId,
     Mds3BlobCacheId, MigrationRunId, MigrationRunRecordId, OperatorId, OrgConnectionId,
@@ -523,6 +524,20 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn signup_forms(&self) -> SignupFormRepo<'a> {
         SignupFormRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only per-environment, per-client admin consent pre-authorization repository for
+    /// this scope (issue #88, PR 4): read a client's pre-authorization (for the third-party
+    /// admin-consent gate on the authorization path) and list the scope's pre-authorizations. The
+    /// mutating set and delete live on [`ActingStore::client_admin_grants`]. Every read is
+    /// scope-forced under row-level security, so a pre-authorization of another scope is a uniform
+    /// not-found.
+    #[must_use]
+    pub fn client_admin_grants(&self) -> ClientAdminGrantRepo<'a> {
+        ClientAdminGrantRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -1424,6 +1439,19 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn signup_forms(&self) -> ActingSignupFormRepo<'a> {
         ActingSignupFormRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating per-environment, per-client admin consent pre-authorization repository for this
+    /// scope and actor (issue #88, PR 4): set (create or overwrite) a client's pre-authorization,
+    /// audited, and delete it, audited. Every write carries the actor and correlation id into its
+    /// audit row.
+    #[must_use]
+    pub fn client_admin_grants(&self) -> ActingClientAdminGrantRepo<'a> {
+        ActingClientAdminGrantRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -22611,6 +22639,217 @@ impl ActingSignupFormRepo<'_> {
     }
 }
 
+/// The read-only per-environment, per-client admin consent pre-authorization repository (issue
+/// #88, PR 4): read a client's pre-authorization for the third-party admin-consent gate on the
+/// authorization path, and list a scope's pre-authorizations for the management surface. Every
+/// read is scope-forced under row-level security, so a pre-authorization of another scope is a
+/// uniform not-found.
+pub struct ClientAdminGrantRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl ClientAdminGrantRepo<'_> {
+    /// A client's admin consent pre-authorization within scope (issue #88, PR 4), or [`None`]
+    /// when the client has no pre-authorization installed in this scope (the third-party gate then
+    /// refuses the client with the administrator-approval terminal).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn get(&self, client_id: &str) -> Result<Option<ClientAdminGrantRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, client_id, granted_scope \
+             FROM client_admin_grants \
+             WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(client_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| client_admin_grant_from_row(&row)))
+    }
+
+    /// EVERY admin consent pre-authorization in this scope (no pagination), ordered by client id:
+    /// the set the management surface lists.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_all(&self) -> Result<Vec<ClientAdminGrantRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, client_id, granted_scope \
+             FROM client_admin_grants \
+             WHERE tenant_id = $1 AND environment_id = $2 ORDER BY client_id",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows.iter().map(client_admin_grant_from_row).collect())
+    }
+}
+
+/// Build a [`ClientAdminGrantRecord`] from a `client_admin_grants` row (the shared read
+/// projection).
+fn client_admin_grant_from_row(row: &sqlx::postgres::PgRow) -> ClientAdminGrantRecord {
+    ClientAdminGrantRecord {
+        id: row.get("id"),
+        client_id: row.get("client_id"),
+        granted_scope: row.get("granted_scope"),
+    }
+}
+
+/// The mutating per-environment, per-client admin consent pre-authorization repository for one
+/// scope and actor (issue #88, PR 4): set (create or overwrite) a client's pre-authorization,
+/// audited, and delete it, audited. One row per (scope, client): a repeat write overwrites in
+/// place and reuses the row's id (a stable audit target across overwrites).
+pub struct ActingClientAdminGrantRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingClientAdminGrantRepo<'_> {
+    /// Set a client's admin consent pre-authorization (a first write or an overwrite) and audit
+    /// `admin_consent.grant` in the same transaction (issue #88, PR 4). A repeat write to the same
+    /// client overwrites the pre-authorized scope in place and reuses the row's id, so a set is
+    /// idempotent on the client id and the audit target stays stable across overwrites.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `id` is out of scope; [`StoreError::Database`] on a
+    /// persistence failure.
+    pub async fn set(
+        &self,
+        env: &Env,
+        id: &ClientAdminGrantId,
+        created_at_micros: i64,
+        params: NewClientAdminGrant<'_>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        // Reuse the existing row id for this client so an overwrite keeps a stable audit target; a
+        // first write uses the caller-minted id.
+        let target_id = match self.grant_id_for_client(params.client_id).await? {
+            Some(existing) => existing,
+            None => id.to_string(),
+        };
+        let target = ClientAdminGrantId::parse_in_scope(&target_id, &scope)?;
+        let created_micros = created_at_micros;
+        let client_id = params.client_id.to_owned();
+        let granted_scope = params.granted_scope.map(ToOwned::to_owned);
+        let granted_by = params.granted_by.to_owned();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::AdminConsentGrant,
+                target: &target,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "INSERT INTO client_admin_grants \
+                     (id, tenant_id, environment_id, client_id, granted_scope, granted_by, \
+                      created_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, \
+                             TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval) \
+                     ON CONFLICT (tenant_id, environment_id, client_id) DO UPDATE \
+                     SET granted_scope = EXCLUDED.granted_scope, \
+                         granted_by = EXCLUDED.granted_by, \
+                         updated_at = EXCLUDED.updated_at",
+                )
+                .bind(target.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&client_id)
+                .bind(granted_scope.as_deref())
+                .bind(&granted_by)
+                .bind(created_micros)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Delete (revoke) the admin consent pre-authorization named `id` and audit
+    /// `admin_consent.revoke` in the same transaction (issue #88, PR 4). A delete of an id out of
+    /// scope, or of a client with no pre-authorization, is a uniform [`StoreError::NotFound`], so a
+    /// delete never discloses a foreign scope's pre-authorizations.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `id` is out of scope or names no installed pre-authorization;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn delete(&self, env: &Env, id: &ClientAdminGrantId) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let target = *id;
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::AdminConsentRevoke,
+                target: &target,
+            },
+            async move |tx| {
+                let affected = sqlx::query(
+                    "DELETE FROM client_admin_grants \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND id = $3",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(target.to_string())
+                .execute(&mut **tx)
+                .await?
+                .rows_affected();
+                // A delete of a client with no pre-authorization rolls back the audit row too (the
+                // error is returned INSIDE the transaction), so a not-found delete records nothing.
+                if affected == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// The stored id of the admin consent pre-authorization for `client_id`, or [`None`] for a
+    /// first write.
+    async fn grant_id_for_client(&self, client_id: &str) -> Result<Option<String>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id FROM client_admin_grants \
+             WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(client_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| row.get::<String, _>("id")))
+    }
+}
+
 /// The mutating federation connector repository (issue #75): create (seal the
 /// upstream client secret inline, audited), update (replace and reseal, audited),
 /// and delete (audited). Every write is scope-bound.
@@ -28701,6 +28940,43 @@ impl ActingConsentRepo<'_> {
         let stored_id = stored_id.unwrap_or_else(|| candidate.to_string());
         let consent_id = ConsentId::parse_in_scope(&stored_id, &self.scope)?;
         Ok(consent_id)
+    }
+
+    /// Audit that a user consent screen was SKIPPED for `client_id` (issue #88, PR 4), TARGETING
+    /// the client, with an operator-safe `detail` naming the reason. This is an AUDIT-ONLY inline
+    /// transaction: it makes NO data change (no consent row is written), appending exactly one
+    /// `consent.skip` audit row, so a silent auto-grant that persists no consent row still leaves
+    /// an audit trail. Two callers on the authorization consent gate: the first-party carve-out
+    /// with the no-store knob OFF (`first_party_carveout`), and a third-party client covered by an
+    /// admin consent pre-authorization (`admin_preauthorized`). The `detail` is a fixed,
+    /// operator-safe reason string, never attacker-controlled free text.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn audit_skipped_consent(
+        &self,
+        env: &Env,
+        client_id: &ClientId,
+        detail: &str,
+    ) -> Result<(), StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        insert_audit_row(
+            &mut tx,
+            &AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ConsentSkipped,
+                target: client_id,
+            },
+            Some(detail),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// REVOKE `subject`'s consent to `client_id` (issue #88): stamp `revoked_at` so

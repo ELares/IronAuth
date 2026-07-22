@@ -471,7 +471,7 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
     );
 }
 
-/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the sixty-eight
+/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the seventy-seven
 /// real migrations and leaves no throwaway demo object in a real database.
 // A long but linear ledger-and-table assertion sweep (one line per migration and
 // per real table); splitting it would not make it clearer.
@@ -494,8 +494,8 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
     );
     assert_eq!(
         report.already_applied(),
-        76,
-        "the production chain is exactly seventy six migrations (isolation, audit log, management \
+        77,
+        "the production chain is exactly seventy seven migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -514,17 +514,18 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
          guarded account links, account linking wiring, FedCM assertion nonces, third-party \
          risk signals, signup fraud review, advanced recovery modes, headless flows, branding, \
          locale bundles, brand assets, diagnostic reason detail, diagnostics control read, \
-         policy decision traces, flows control read, signup forms, consent lockdown)"
+         policy decision traces, flows control read, signup forms, consent lockdown, client admin \
+         grants)"
     );
 
-    // The ledger holds exactly versions 1 through 76.
+    // The ledger holds exactly versions 1 through 77.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
             46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67,
-            68, 69, 70, 71, 72, 73, 74, 75, 76
+            68, 69, 70, 71, 72, 73, 74, 75, 76, 77
         ]
     );
     let phase_of = |version: i64| async move {
@@ -1625,6 +1626,50 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
     assert!(
         !role_has_column_privilege(pool, "ironauth_app", "clients", "first_party", "UPDATE").await,
         "the data-plane role must NOT hold UPDATE on clients.first_party (no self-classification)"
+    );
+
+    // The client-admin-grants migration (issue #88, PR 4, migration 0077) is an EXPAND: one new
+    // tenant-scoped table (client_admin_grants), no rewrite of existing state.
+    assert_eq!(phase_of(77).await, "expand");
+
+    // The client_admin_grants store is a NEW tenant-scoped table, so it must ENABLE and FORCE
+    // row-level security, carry the (tenant, environment) isolation policy, and pin the
+    // nonempty-scope CHECK, exactly like every other scoped table.
+    assert!(
+        rls_enabled_and_forced(pool, "client_admin_grants").await,
+        "client_admin_grants must ENABLE and FORCE row-level security"
+    );
+    assert!(
+        policy_exists(
+            pool,
+            "client_admin_grants",
+            "client_admin_grants_tenant_isolation"
+        )
+        .await,
+        "client_admin_grants must carry the (tenant, environment) isolation policy"
+    );
+    assert!(
+        check_constraint_exists(
+            pool,
+            "client_admin_grants",
+            "client_admin_grants_scope_nonempty"
+        )
+        .await,
+        "client_admin_grants must carry the nonempty-scope CHECK"
+    );
+    // The CONTROL plane owns the pre-authorization lifecycle (set, get, delete); the DATA plane
+    // READS the active pre-authorization on the consent gate path but never writes it: SELECT only.
+    assert!(
+        role_has_table_privilege(pool, "ironauth_app", "client_admin_grants", "SELECT").await,
+        "the data-plane role must hold SELECT on client_admin_grants (the consent gate read)"
+    );
+    assert!(
+        !role_has_table_privilege(pool, "ironauth_app", "client_admin_grants", "INSERT").await,
+        "the data-plane role must NOT hold INSERT on client_admin_grants (the control plane owns writes)"
+    );
+    assert!(
+        role_has_table_privilege(pool, "ironauth_control", "client_admin_grants", "INSERT").await,
+        "the control-plane role must hold INSERT on client_admin_grants (it owns the lifecycle)"
     );
 
     // The demo object never reaches a production database.

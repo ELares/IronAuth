@@ -44,6 +44,7 @@
 mod auth;
 mod bans;
 mod brand_assets;
+mod client_admin_grants;
 mod config;
 mod connectors;
 mod dcr;
@@ -342,6 +343,15 @@ pub fn management_router(state: AdminState) -> Router {
             put(signup_forms::set_signup_form)
                 .get(signup_forms::get_signup_form)
                 .delete(signup_forms::delete_signup_form),
+        )
+        // Per-environment, per-client admin consent pre-authorizations (issue #88, PR 4): set
+        // (create or overwrite), get, and delete (revoke) the scope an admin pre-authorized for a
+        // third-party client, keyed on the authorize client id.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/admin-consent",
+            put(client_admin_grants::set_client_admin_consent)
+                .get(client_admin_grants::get_client_admin_consent)
+                .delete(client_admin_grants::delete_client_admin_consent),
         )
         // Per-environment brand assets (issue #86, PR 3): upload (magic-byte sniffed, size capped,
         // sudo gated) or delete a brand's logo / favicon. The `/logo` and `/favicon` static

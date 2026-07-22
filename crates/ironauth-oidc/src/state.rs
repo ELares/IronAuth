@@ -236,6 +236,14 @@ pub struct OidcState {
     // endpoints answer a uniform 404. The sensitive-scope denylist that SHAPES the strip
     // lives in `Inner` (config data cannot arm the surface).
     signup_quarantine_enabled: bool,
+    // An optional OVERRIDE of the third-party admin-consent gate knob (issue #88, PR 4). Kept
+    // OUTSIDE `Inner` and set through a cheap builder so a caller can flip just this one gate
+    // without rebuilding the immutable config `Inner`. `None` (the default) reads the knob from
+    // the validated `consent_lockdown` config (default ON in production); `Some(required)` forces
+    // it, which the test harness uses to keep the gate OFF for the general third-party fixture and
+    // ON for the dedicated PR 4 tests. It never weakens production: production boot never sets it,
+    // so the config value governs.
+    third_party_admin_consent_required_override: Option<bool>,
     // Whether the experimental advanced-recovery-modes surface is armed (issue #82, PR 3).
     // Kept OUTSIDE `Inner` and set through the builder for the SAME anti-bypass reason: it is
     // NOT a plain `OidcConfig` toggle. The ONLY writer is the boot path, which resolves it
@@ -843,6 +851,7 @@ impl OidcState {
             fedcm_enabled: false,
             risk_signals_enabled: false,
             signup_quarantine_enabled: false,
+            third_party_admin_consent_required_override: None,
             advanced_recovery_enabled: false,
             flows_enabled: false,
             hosted_pages_enabled: false,
@@ -1007,6 +1016,32 @@ impl OidcState {
     #[must_use]
     pub fn consent_lockdown_config(&self) -> &ConsentLockdownConfig {
         &self.inner.consent_lockdown
+    }
+
+    /// Whether a THIRD-PARTY (not `first_party`) client must be ADMIN PRE-AUTHORIZED for its
+    /// requested scope before it can obtain user consent (issue #88, PR 4). Reads the
+    /// `consent_lockdown.third_party_requires_admin_consent` knob, unless a caller installed an
+    /// override through [`Self::with_third_party_admin_consent_required`] (which forces the knob
+    /// without rebuilding the immutable config). The authorization and device consent gates read
+    /// this one accessor, so both surfaces agree.
+    #[must_use]
+    pub fn third_party_admin_consent_required(&self) -> bool {
+        self.third_party_admin_consent_required_override.unwrap_or(
+            self.inner
+                .consent_lockdown
+                .third_party_requires_admin_consent,
+        )
+    }
+
+    /// Force the third-party admin-consent gate knob (issue #88, PR 4) ON or OFF, overriding the
+    /// config value, and return the updated state. A cheap builder (the override lives OUTSIDE the
+    /// immutable `Inner`), so a caller can flip just this one gate without rebuilding the config.
+    /// The test harness uses it to keep the gate OFF for the general third-party fixture and ON
+    /// for the dedicated PR 4 tests; production boot never calls it, so the config value governs.
+    #[must_use]
+    pub fn with_third_party_admin_consent_required(mut self, required: bool) -> Self {
+        self.third_party_admin_consent_required_override = Some(required);
+        self
     }
 
     /// Arm the experimental advanced-recovery-modes surface (issue #82, PR 3).

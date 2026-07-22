@@ -554,6 +554,22 @@ impl ScopedKind for SignupFormKind {
     const PREFIX: &'static str = "sgf";
 }
 
+/// Marker for a per environment, per client admin consent pre authorization (`cag_`), one row per
+/// (tenant, environment, client) (issue #88, PR 4): the space separated scope set an admin
+/// pre authorized for a THIRD PARTY client, the escape from the third party admin consent gate. A
+/// tenant scoped resource: the id embeds its (tenant, environment), so a pre authorization minted
+/// in one scope parses as a uniform not found under another. It is RUNTIME per environment state
+/// (NOT promotable, issue #41): it is never carried in a config snapshot, so a promoted third
+/// party client stays locked in the target environment until a target environment admin
+/// pre authorizes it. The prefix is `cag` (distinct from the `con` consent decision, the `cnr`
+/// connector, the `cli` client, and the `ccp` credential class policy). Not a bearer secret, so
+/// its debug form stays legible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ClientAdminGrantKind;
+impl ScopedKind for ClientAdminGrantKind {
+    const PREFIX: &'static str = "cag";
+}
+
 /// Marker for a federation outbound-login correlation-state row (`fls_`), the
 /// short-lived single-use row that correlates an upstream authorize leg to its
 /// callback (issue #75, PR B). A tenant-scoped resource: the id embeds its (tenant,
@@ -1364,6 +1380,10 @@ pub type LocaleBundleId = ScopedId<LocaleBundleKind>;
 /// A per-environment, per-client signup form identifier (`sgf_...`), one signup-form-as-data
 /// definition per (tenant, environment, client) (issue #87). Promotable.
 pub type SignupFormId = ScopedId<SignupFormKind>;
+/// A per-environment, per-client admin consent pre-authorization identifier (`cag_...`), one row
+/// per (tenant, environment, client) (issue #88, PR 4): the scope set an admin pre-authorized for
+/// a third-party client. Runtime (never promoted).
+pub type ClientAdminGrantId = ScopedId<ClientAdminGrantKind>;
 /// A federation outbound-login correlation-state identifier (`fls_...`), the
 /// short-lived single-use row correlating an upstream authorize leg to its callback
 /// (issue #75, PR B).

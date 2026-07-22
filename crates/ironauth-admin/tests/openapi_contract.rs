@@ -62,6 +62,7 @@ fn operation_ids_are_the_stable_set() {
             "createUser",
             "deleteBrandFavicon",
             "deleteBrandLogo",
+            "deleteClientAdminConsent",
             "deleteConnector",
             "deleteEnvironment",
             "deleteLocale",
@@ -74,6 +75,7 @@ fn operation_ids_are_the_stable_set() {
             "exportConfigSnapshot",
             "exportIdentities",
             "extendSignupQuarantine",
+            "getClientAdminConsent",
             "getClientAuthDiagnostics",
             "getConnector",
             "getConnectorCapabilities",
@@ -128,6 +130,7 @@ fn operation_ids_are_the_stable_set() {
             "revokeUserSessions",
             "setBrandFavicon",
             "setBrandLogo",
+            "setClientAdminConsent",
             "setLocale",
             "setSignupForm",
             "setUserState",
@@ -258,6 +261,7 @@ fn documented_paths_are_the_expected_set() {
         vec![
             "DELETE /v1/tenants/{tenant_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}",
+            "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/admin-consent",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/signup-form",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}/favicon",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}/logo",
@@ -275,6 +279,7 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/abuse/bans",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/admin-consent",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/signup-form",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/config/snapshot",
@@ -341,6 +346,7 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/restore",
             "POST /v1/tenants/{tenant_id}/resume",
             "POST /v1/tenants/{tenant_id}/suspend",
+            "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/admin-consent",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/signup-form",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}/favicon",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}/logo",
@@ -385,7 +391,7 @@ fn committed_artifact_matches_generated_spec() {
 async fn served_routes_match_documented_routes() {
     let router = db_free_router();
     let documented = documented_method_paths();
-    assert_eq!(documented.len(), 91, "the documented route count is pinned");
+    assert_eq!(documented.len(), 94, "the documented route count is pinned");
 
     // The OUTBOUND lazy-migration endpoint (issue #58) is the one documented route
     // that is NOT gated by the management `Principal` at 401. It is DISABLED BY
