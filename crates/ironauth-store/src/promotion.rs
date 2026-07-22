@@ -31,8 +31,9 @@
 //! The promotion engine operates on the promotable resource types that carry a
 //! SCOPE-INDEPENDENT natural key and whose full promotable state travels in the
 //! snapshot: resource servers (keyed by `audience`), DCR policies (keyed by
-//! `name`), and environment variables (keyed by `name`). See
-//! [`PROMOTED_RESOURCE_TYPES`]. Environment-IDENTITY (the environment itself, its
+//! `name`), environment variables (keyed by `name`), and custom-journey versions
+//! (keyed by `journey_id@version`). See [`PROMOTED_RESOURCE_TYPES`].
+//! Environment-IDENTITY (the environment itself, its
 //! signing keys, its issuer, its custom domains, its secrets' VALUES) is NEVER
 //! diffed, planned, or applied: it is excluded from the snapshot by construction
 //! (issue #41 classification, issue #43 export), so a promotion cannot copy one
@@ -46,6 +47,28 @@
 //! scope-independent public client identity, a snapshot-format question owned by a
 //! follow-up; this engine leaves the target's clients untouched rather than
 //! silently minting divergent copies.
+//!
+//! # Custom-journey versions and the per-environment activation gate (issue #92)
+//!
+//! A custom-journey version (issue #92) is an APPEND-ONLY, immutable artifact keyed
+//! by `journey_id@version`: promotion carries the version DEFINITIONS, importing into
+//! the target every `(journey_id, version)` the source has that the target lacks. A
+//! version's artifact never changes, so a version already present with the SAME
+//! artifact is a no-op and a version present with a DIFFERENT artifact for the same
+//! key is an append-only CONFLICT the apply refuses (it never overwrites). A
+//! target-only version is left untouched: promotion is additive, never a delete of a
+//! target's own local history.
+//!
+//! Crucially, promotion carries the version definitions but NEVER moves the target's
+//! ACTIVE PIN. A custom journey IS auth logic, so auto-activating a promoted pin would
+//! silently change which journey authenticates users in the target environment. The
+//! `pinned` flag in a [`crate::FlowVersionSnapshot`] is INFORMATIONAL (it records which
+//! version was active in the SOURCE), never an apply instruction: the promoted
+//! projection normalizes it away so it never enters the revision or the diff, and the
+//! apply imports the definitions inert. The target keeps its own active pin until a
+//! target-environment admin explicitly pins a version (the PR5 admin pin endpoint).
+//! This mirrors the resolved #88 F7 posture: a promoted resource is secure-by-default
+//! inert in the target until a target-env admin deliberately activates it.
 
 use std::collections::BTreeMap;
 
@@ -54,7 +77,7 @@ use sha2::{Digest, Sha256};
 use crate::classification::ResourceType;
 use crate::error::StoreError;
 use crate::esv::Reference;
-use crate::snapshot::{Snapshot, SnapshotResources};
+use crate::snapshot::{FlowVersionSnapshot, Snapshot, SnapshotResources};
 
 /// The promotable resource types this engine diffs, plans, and applies.
 ///
@@ -64,10 +87,11 @@ use crate::snapshot::{Snapshot, SnapshotResources};
 /// re-diffing the source against the target yields an empty diff. This is a SUBSET
 /// of [`crate::snapshot::SNAPSHOT_RESOURCE_TYPES`] (which additionally carries
 /// `client`, excluded here per the module docs).
-pub const PROMOTED_RESOURCE_TYPES: [ResourceType; 3] = [
+pub const PROMOTED_RESOURCE_TYPES: [ResourceType; 4] = [
     ResourceType::ResourceServer,
     ResourceType::DcrPolicy,
     ResourceType::Variable,
+    ResourceType::FlowVersion,
 ];
 
 /// Whether a resource change creates, updates, or deletes a target resource.
@@ -214,6 +238,11 @@ pub fn diff(source: &Snapshot, target: &Snapshot) -> ConfigDiff {
         &keyed_variables(&target.resources),
         &mut changes,
     );
+    diff_flow_versions(
+        &keyed_flow_versions(&source.resources),
+        &keyed_flow_versions(&target.resources),
+        &mut changes,
+    );
     ConfigDiff { changes }
 }
 
@@ -257,6 +286,84 @@ fn diff_keyed(
             _ => {}
         }
     }
+}
+
+/// Diff a snapshot's custom-journey versions (issue #92), ADDITIVELY: a version is
+/// APPEND-ONLY and immutable, so this only ever emits creates and (artifact-mismatch)
+/// updates, NEVER a delete.
+///
+/// Each map is keyed by `journey_id@version` with the version's ARTIFACT as its value
+/// (the pin is deliberately excluded, per the activation gate). A key present in the
+/// source but not the target is a [`ChangeKind::Create`] (import the version); a key
+/// present in both whose artifact DIFFERS is a [`ChangeKind::Update`], which the apply
+/// refuses as an append-only conflict (a version's artifact never changes, so this is
+/// never an overwrite). A key present in both with an identical artifact produces no
+/// change. A key present only in the TARGET is IGNORED (never a delete): promotion
+/// never destroys a target's own local version history. Source keys are drawn from a
+/// [`BTreeMap`] so the emitted order is deterministic.
+fn diff_flow_versions(
+    source: &BTreeMap<String, serde_json::Value>,
+    target: &BTreeMap<String, serde_json::Value>,
+    changes: &mut Vec<ResourceChange>,
+) {
+    for (key, after) in source {
+        match target.get(key) {
+            None => changes.push(ResourceChange {
+                resource_type: ResourceType::FlowVersion,
+                key: key.clone(),
+                kind: ChangeKind::Create,
+                before: None,
+                after: Some(after.clone()),
+            }),
+            Some(before) if before != after => changes.push(ResourceChange {
+                resource_type: ResourceType::FlowVersion,
+                key: key.clone(),
+                kind: ChangeKind::Update,
+                before: Some(before.clone()),
+                after: Some(after.clone()),
+            }),
+            // Present in both with an identical artifact: append-only no-op.
+            _ => {}
+        }
+    }
+}
+
+/// The custom-journey versions of a snapshot, keyed by `journey_id@version`, with the
+/// version's ARTIFACT as the value (issue #92).
+///
+/// The pin is NOT part of the value: the activation gate keeps a promoted pin out of
+/// the diff and the revision, so promotion carries the version definitions but never
+/// moves the target's active pin. The natural key joins the journey id and the version
+/// with `@`; the version is numeric, so `rsplit_once('@')` recovers the pair even were
+/// a journey id itself to carry `@`.
+fn keyed_flow_versions(resources: &SnapshotResources) -> BTreeMap<String, serde_json::Value> {
+    resources
+        .flow_version
+        .iter()
+        .map(|version| {
+            (
+                flow_version_key(&version.journey_id, version.version),
+                version.artifact.clone(),
+            )
+        })
+        .collect()
+}
+
+/// The `journey_id@version` natural key of a custom-journey version (issue #92).
+#[must_use]
+pub(crate) fn flow_version_key(journey_id: &str, version: i32) -> String {
+    format!("{journey_id}@{version}")
+}
+
+/// Recover the `(journey_id, version)` pair from a [`flow_version_key`] (issue #92):
+/// the version is the numeric tail after the LAST `@`, so a journey id carrying `@`
+/// still round-trips. Returns [`None`] for a key whose tail is not an integer (never
+/// produced by [`flow_version_key`]).
+#[must_use]
+pub(crate) fn parse_flow_version_key(key: &str) -> Option<(String, i32)> {
+    let (journey_id, version) = key.rsplit_once('@')?;
+    let version: i32 = version.parse().ok()?;
+    Some((journey_id.to_owned(), version))
 }
 
 /// The resource servers of a snapshot, keyed by `audience`.
@@ -365,12 +472,26 @@ fn promoted_projection(snapshot: &Snapshot) -> Snapshot {
             // transactional engine yet (a later slice), so the promoted projection empties them
             // exactly like `brand` and `locale_bundle`.
             signup_form: Vec::new(),
-            // Custom-journey versions (issue #92, PR 5) are carried in the EXPORT (a promotable,
-            // diffable journey artifact and its pin) but not applied by the transactional engine
-            // yet: promoting an append-only, per-journey versioned resource with an active pin is
-            // its own slice, so the promoted projection empties it exactly like `signup_form`,
-            // keeping the revision consistent between the source projection and the target read.
-            flow_version: Vec::new(),
+            // Custom-journey versions (issue #92) ARE promoted by the transactional engine: the
+            // append-only version DEFINITIONS travel and are reconstructed in the target. The
+            // projection carries each version's `(journey_id, version, artifact)` but NORMALIZES
+            // its `pinned` flag to `false` (the per-environment activation gate): the pin records
+            // which version was active in the SOURCE and must never enter the promotable revision
+            // or the diff, so a promoted pin can never silently swap the target's active auth
+            // journey. Activation stays a deliberate target-env admin action. Normalizing here (and
+            // in the target read, which reports every version unpinned) keeps the revision
+            // pin-independent on both sides.
+            flow_version: snapshot
+                .resources
+                .flow_version
+                .iter()
+                .map(|version| FlowVersionSnapshot {
+                    journey_id: version.journey_id.clone(),
+                    version: version.version,
+                    artifact: version.artifact.clone(),
+                    pinned: false,
+                })
+                .collect(),
         },
     }
 }
@@ -578,6 +699,17 @@ pub enum PromotionApplyError {
     /// secret can vanish between plan and apply WITHOUT changing the revision, so
     /// apply re-checks and fails closed rather than half-completing.
     UnresolvedReference(Reference),
+    /// The source carries a custom-journey version whose `(journey_id, version)` already
+    /// exists in the TARGET with a DIFFERENT artifact (issue #92): a custom-journey version
+    /// is APPEND-ONLY and immutable, so its artifact never changes. Apply refuses the
+    /// conflict and changes nothing rather than overwriting the target's existing version.
+    /// The operator re-authors the divergent version under a NEW version number instead.
+    FlowVersionArtifactConflict {
+        /// The author-facing journey id whose version conflicts.
+        journey_id: String,
+        /// The version number that exists in the target with a different artifact.
+        version: i32,
+    },
     /// A persistence fault while applying (the transaction rolled back).
     Store(StoreError),
 }
@@ -606,6 +738,15 @@ impl core::fmt::Display for PromotionApplyError {
                 f,
                 "reference {} does not resolve in the target environment at apply time",
                 reference.render()
+            ),
+            PromotionApplyError::FlowVersionArtifactConflict {
+                journey_id,
+                version,
+            } => write!(
+                f,
+                "custom-journey version {journey_id}@{version} already exists in the target with a \
+                 different artifact; a version is append-only and its artifact never changes \
+                 (re-author the change under a new version number)"
             ),
             PromotionApplyError::Store(source) => write!(f, "promotion apply failed: {source}"),
         }
@@ -733,8 +874,8 @@ mod tests {
     use crate::classification::{ResourceClassification, ResourceType, classify};
     use crate::esv::{Reference, ReferenceKind};
     use crate::snapshot::{
-        DcrPolicySnapshot, ResourceServerSnapshot, SNAPSHOT_SCHEMA_VERSION, Snapshot,
-        SnapshotResources, VariableSnapshot,
+        DcrPolicySnapshot, FlowVersionSnapshot, ResourceServerSnapshot, SNAPSHOT_SCHEMA_VERSION,
+        Snapshot, SnapshotResources, VariableSnapshot,
     };
 
     fn snapshot(resources: SnapshotResources) -> Snapshot {
@@ -764,6 +905,119 @@ mod tests {
             name: name.to_owned(),
             primitives,
         }
+    }
+
+    fn flow_version(
+        journey_id: &str,
+        version: i32,
+        step: &str,
+        pinned: bool,
+    ) -> FlowVersionSnapshot {
+        FlowVersionSnapshot {
+            journey_id: journey_id.to_owned(),
+            version,
+            artifact: serde_json::json!({ "entry": step }),
+            pinned,
+        }
+    }
+
+    #[test]
+    fn flow_version_diff_is_additive_and_pin_independent() {
+        // The source carries v1 and v2 of a journey (v2 pinned); the target already has v1
+        // (same artifact) plus its OWN local v9. The diff must import ONLY the missing v2,
+        // leave the target's v9 alone (never a delete), and ignore the pin difference.
+        let source = snapshot(SnapshotResources {
+            flow_version: vec![
+                flow_version("login", 1, "a", false),
+                flow_version("login", 2, "b", true),
+            ],
+            ..SnapshotResources::default()
+        });
+        let target = snapshot(SnapshotResources {
+            flow_version: vec![
+                flow_version("login", 1, "a", true),
+                flow_version("login", 9, "z", false),
+            ],
+            ..SnapshotResources::default()
+        });
+        let changes = diff(&source, &target);
+        assert_eq!(changes.len(), 1, "only the missing version is a change");
+        assert_eq!(
+            changes.changes()[0].resource_type,
+            ResourceType::FlowVersion
+        );
+        assert_eq!(changes.changes()[0].key, "login@2");
+        assert_eq!(changes.changes()[0].kind, ChangeKind::Create);
+    }
+
+    #[test]
+    fn flow_version_diff_flags_a_differing_artifact_as_an_update_conflict() {
+        // The same (journey_id, version) with a DIFFERENT artifact is an append-only conflict,
+        // surfaced as an Update the apply refuses (never an overwrite).
+        let source = snapshot(SnapshotResources {
+            flow_version: vec![flow_version("login", 1, "source", false)],
+            ..SnapshotResources::default()
+        });
+        let target = snapshot(SnapshotResources {
+            flow_version: vec![flow_version("login", 1, "target", false)],
+            ..SnapshotResources::default()
+        });
+        let changes = diff(&source, &target);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes.changes()[0].kind, ChangeKind::Update);
+        assert_eq!(changes.changes()[0].key, "login@1");
+    }
+
+    #[test]
+    fn revision_ignores_the_flow_version_pin_but_tracks_the_artifact() {
+        // Two snapshots with the SAME versions but a different active pin hash to the SAME
+        // revision: the pin is not part of the promotable configuration (the activation gate).
+        let pinned_v1 = snapshot(SnapshotResources {
+            flow_version: vec![
+                flow_version("login", 1, "a", true),
+                flow_version("login", 2, "b", false),
+            ],
+            ..SnapshotResources::default()
+        });
+        let pinned_v2 = snapshot(SnapshotResources {
+            flow_version: vec![
+                flow_version("login", 1, "a", false),
+                flow_version("login", 2, "b", true),
+            ],
+            ..SnapshotResources::default()
+        });
+        assert_eq!(
+            revision(&pinned_v1).expect("rev"),
+            revision(&pinned_v2).expect("rev"),
+            "the active pin must not perturb the promotable revision"
+        );
+        // A differing artifact DOES change the revision.
+        let changed = snapshot(SnapshotResources {
+            flow_version: vec![
+                flow_version("login", 1, "a", true),
+                flow_version("login", 2, "CHANGED", false),
+            ],
+            ..SnapshotResources::default()
+        });
+        assert_ne!(
+            revision(&pinned_v1).expect("rev"),
+            revision(&changed).expect("rev")
+        );
+    }
+
+    #[test]
+    fn flow_version_key_round_trips_even_with_an_at_in_the_journey_id() {
+        assert_eq!(super::flow_version_key("login", 3), "login@3");
+        assert_eq!(
+            super::parse_flow_version_key("login@3"),
+            Some(("login".to_owned(), 3))
+        );
+        // A journey id carrying '@' still round-trips (the version is the numeric tail).
+        assert_eq!(
+            super::parse_flow_version_key("weird@id@12"),
+            Some(("weird@id".to_owned(), 12))
+        );
+        assert_eq!(super::parse_flow_version_key("no-version"), None);
     }
 
     #[test]

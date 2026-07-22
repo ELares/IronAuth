@@ -420,7 +420,15 @@ pub struct FlowVersionSnapshot {
     /// must parse and compile, so a promotion never carries a broken journey.
     pub artifact: serde_json::Value,
     /// Whether this version is its journey's active pin in the environment. At most one version per
-    /// journey carries `true`; a promotion replays the pin as authored.
+    /// journey carries `true`.
+    ///
+    /// This flag is INFORMATIONAL: it records which version was active in the SOURCE environment
+    /// for operator visibility. It is NOT an apply instruction. Promotion carries the version
+    /// DEFINITIONS; ACTIVATION (the pin) is a deliberate per-environment admin action and never
+    /// auto-promotes. The transactional promotion engine normalizes this flag out of the diff and
+    /// the revision (the per-environment activation gate) and imports every version inert, so a
+    /// promoted pin can never silently swap the target environment's active auth journey. The
+    /// target keeps its own active pin until a target-env admin explicitly pins a version.
     pub pinned: bool,
 }
 

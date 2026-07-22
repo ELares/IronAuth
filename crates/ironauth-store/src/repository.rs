@@ -36144,15 +36144,34 @@ impl ActingStore<'_> {
         // the plan's diff (the drift check proved current == base).
         let plan_diff = crate::promotion::diff(source, &current);
         let now_micros = epoch_micros(env.clock().now_utc());
+        // The actor provenance a promoted custom-journey version records in `created_by`,
+        // computed once (every version this apply imports is authored by this apply's actor).
+        let actor = self.acting.actor();
+        let created_by = format!("{}:{}", actor.kind_str(), actor.id_string());
         let (mut creates, mut updates, mut deletes) = (0_u32, 0_u32, 0_u32);
 
         for change in plan_diff.changes() {
+            // Append-only immutability (issue #92): a custom-journey version whose
+            // `(journey_id, version)` already exists in the target with a DIFFERENT artifact is
+            // surfaced by the diff as an Update. A version's artifact never changes, so this is a
+            // CONFLICT, never an overwrite: refuse it with a precise error BEFORE any write, so
+            // the whole apply rolls back and the target's existing version is left intact.
+            if change.resource_type == ResourceType::FlowVersion
+                && change.kind == ChangeKind::Update
+            {
+                let (journey_id, version) = crate::promotion::parse_flow_version_key(&change.key)
+                    .ok_or(StoreError::NotFound)?;
+                return Err(PromotionApplyError::FlowVersionArtifactConflict {
+                    journey_id,
+                    version,
+                });
+            }
             match change.kind {
                 ChangeKind::Create => creates += 1,
                 ChangeKind::Update => updates += 1,
                 ChangeKind::Delete => deletes += 1,
             }
-            apply_change(&mut tx, scope, env, source, change, now_micros).await?;
+            apply_change(&mut tx, scope, env, source, change, &created_by, now_micros).await?;
         }
 
         // One audit row, naming the environment and the change counts (operator-safe;
@@ -36244,6 +36263,36 @@ async fn read_promoted_snapshot(
     .collect();
     variable.sort_by(|a, b| a.name.cmp(&b.name));
 
+    // Custom-journey versions (issue #92): the append-only version DEFINITIONS ARE promoted.
+    // Read each version's `(journey_id, version, artifact)` WITHOUT joining the pin table and
+    // report every version UNPINNED (`pinned = false`): the promoted projection normalizes the
+    // pin away (the activation gate), so the target read must match, keeping the revision
+    // pin-independent on both sides. The `artifact::text` render is Postgres-canonical jsonb, so
+    // it structurally matches the source snapshot's parsed artifact under the diff.
+    let mut flow_version = Vec::new();
+    for row in sqlx::query(
+        "SELECT journey_id, version, artifact::text AS artifact FROM flow_versions \
+         WHERE tenant_id = $1 AND environment_id = $2",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_all(&mut **tx)
+    .await?
+    {
+        let artifact_text: String = row.get("artifact");
+        let artifact: serde_json::Value = serde_json::from_str(&artifact_text)
+            .map_err(|error| StoreError::Database(sqlx::Error::Decode(Box::new(error))))?;
+        flow_version.push(crate::snapshot::FlowVersionSnapshot {
+            journey_id: row.get("journey_id"),
+            version: row.get("version"),
+            artifact,
+            pinned: false,
+        });
+    }
+    flow_version.sort_by(|a, b| {
+        (a.journey_id.as_str(), a.version).cmp(&(b.journey_id.as_str(), b.version))
+    });
+
     Ok(crate::snapshot::Snapshot {
         schema_version: crate::snapshot::SNAPSHOT_SCHEMA_VERSION.to_owned(),
         resources: crate::snapshot::SnapshotResources {
@@ -36272,9 +36321,10 @@ async fn read_promoted_snapshot(
             // Signup forms (issue #87) are likewise exported and diffable but not applied by the
             // transactional engine yet, so the promoted target read omits them.
             signup_form: Vec::new(),
-            // Custom-journey versions (issue #92, PR 5) are likewise exported and diffable but not
-            // applied by the transactional engine yet, so the promoted target read omits them.
-            flow_version: Vec::new(),
+            // Custom-journey versions (issue #92) ARE promoted: their append-only definitions are
+            // read above (pin-normalized), so the target read carries them and the revision tracks
+            // them.
+            flow_version,
         },
     })
 }
@@ -36307,6 +36357,7 @@ async fn apply_change(
     env: &Env,
     source: &crate::snapshot::Snapshot,
     change: &crate::promotion::ResourceChange,
+    created_by: &str,
     now_micros: i64,
 ) -> Result<(), StoreError> {
     match change.resource_type {
@@ -36318,6 +36369,9 @@ async fn apply_change(
         }
         ResourceType::Variable => {
             apply_variable_change(tx, scope, env, source, change, now_micros).await
+        }
+        ResourceType::FlowVersion => {
+            apply_flow_version_change(tx, scope, env, source, change, created_by, now_micros).await
         }
         // The promotion engine only ever emits changes for the promoted resource
         // types; any other type is a programmer error, surfaced as a not-found
@@ -36538,6 +36592,84 @@ async fn apply_variable_change(
             .await?;
             Ok(())
         }
+    }
+}
+
+/// Apply a custom-journey version CREATE, matched by `journey_id@version` (issue #92).
+///
+/// A custom-journey version is APPEND-ONLY and immutable, so the only apply action is a
+/// CREATE: reconstruct the missing `(journey_id, version)` in the target from the source
+/// snapshot, at the EXPLICIT version number the source carried (never `MAX + 1`, because
+/// promotion reproduces the source's version numbers). The artifact is proved LOAD-VALID
+/// (parse + [`ironauth_journey::compile`]) BEFORE the insert, exactly as `create_version`
+/// does, so a load-invalid promoted artifact is refused and rolls the WHOLE apply back.
+/// The append-only `UNIQUE (tenant, environment, journey_id, version)` index makes a
+/// racing duplicate a [`StoreError::Conflict`], never an overwrite.
+///
+/// The version's `pinned` flag is NOT consulted here (the activation gate): apply imports
+/// the version DEFINITION inert and never touches `flow_version_pins`, so the target keeps
+/// its own active pin. Activation stays a deliberate target-env admin action.
+///
+/// An Update (a differing artifact for an existing version) is refused precisely in
+/// `apply_promotion` BEFORE this is reached, and the additive flow-version diff never emits
+/// a Delete, so both are unreachable append-only conflicts here.
+async fn apply_flow_version_change(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    env: &Env,
+    source: &crate::snapshot::Snapshot,
+    change: &crate::promotion::ResourceChange,
+    created_by: &str,
+    now_micros: i64,
+) -> Result<(), StoreError> {
+    use crate::promotion::ChangeKind;
+    match change.kind {
+        ChangeKind::Create => {
+            let (journey_id, version) = crate::promotion::parse_flow_version_key(&change.key)
+                .ok_or(StoreError::NotFound)?;
+            let snapshot = source
+                .resources
+                .flow_version
+                .iter()
+                .find(|candidate| {
+                    candidate.journey_id == journey_id && candidate.version == version
+                })
+                .ok_or(StoreError::NotFound)?;
+            let artifact_json = serde_json::to_string(&snapshot.artifact)
+                .map_err(|error| StoreError::Database(sqlx::Error::Decode(Box::new(error))))?;
+            // Prove the promoted artifact is a load-valid, compilable journey BEFORE the insert:
+            // a broken artifact never lands, and a rejection rolls the whole apply back.
+            crate::flow_version::validate_artifact_json(&artifact_json)
+                .map_err(StoreError::JourneyInvalid)?;
+            let id = FlowVersionId::generate(env, &scope);
+            let result = sqlx::query(
+                "INSERT INTO flow_versions \
+                 (id, tenant_id, environment_id, journey_id, version, artifact, created_by, \
+                  created_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, \
+                         TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval)",
+            )
+            .bind(id.to_string())
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .bind(&journey_id)
+            .bind(version)
+            .bind(&artifact_json)
+            .bind(created_by)
+            .bind(now_micros)
+            .execute(&mut **tx)
+            .await;
+            match result {
+                Ok(_) => Ok(()),
+                // The append-only unique index refused a concurrently-taken version.
+                Err(error) if is_unique_violation(&error) => Err(StoreError::Conflict),
+                Err(error) => Err(error.into()),
+            }
+        }
+        // Unreachable: an Update is refused as a precise conflict in apply_promotion before any
+        // write, and the additive flow-version diff never emits a Delete. Surface either as a
+        // conflict rather than silently overwriting or deleting an append-only version.
+        ChangeKind::Update | ChangeKind::Delete => Err(StoreError::Conflict),
     }
 }
 

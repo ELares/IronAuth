@@ -243,6 +243,23 @@ pub async fn apply_config_promotion(
             let body = serde_json::to_string(&payload).map_err(|_| ApiError::Internal)?;
             Ok(json(StatusCode::UNPROCESSABLE_ENTITY, body))
         }
+        Err(PromotionApplyError::FlowVersionArtifactConflict {
+            journey_id,
+            version,
+        }) => {
+            // A custom-journey version is append-only and immutable: the target already has this
+            // (journey_id, version) with a different artifact. Apply changed nothing; the operator
+            // re-authors the divergent version under a new version number.
+            let payload = serde_json::json!({
+                "error": "flow_version_conflict",
+                "message": "a custom-journey version already exists in the target with a \
+                            different artifact; a version is append-only and nothing was changed",
+                "journey_id": journey_id,
+                "version": version,
+            });
+            let body = serde_json::to_string(&payload).map_err(|_| ApiError::Internal)?;
+            Ok(json(StatusCode::CONFLICT, body))
+        }
         Err(PromotionApplyError::Store(error)) => Err(error.into()),
     }
 }
