@@ -36,7 +36,12 @@ pub type SubflowId = String;
 /// It carries the format tag, the authored engine version, the entry step, the step list,
 /// the transitions between steps, and any subflow references. Comments are FIRST-CLASS data
 /// fields, preserved through a serde round-trip, never lexical trivia.
+///
+/// An unknown or misspelled property is a HARD parse error (`deny_unknown_fields`), so a typo
+/// like `gaurd` cannot silently drop a guard and change routing; the published schema mirrors
+/// this with `additionalProperties: false`.
 #[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Journey {
     /// The artifact format tag; the canonical value is [`JOURNEY_SCHEMA_VERSION`].
     pub schema_version: String,
@@ -61,8 +66,10 @@ pub struct Journey {
 
 /// One step of a journey (issue #92): a document-local id, the built-in kind that executes
 /// it, and the kind-specific attachments (the node group it renders under, the subflow it
-/// calls, or the decision it evaluates). Comments are data fields.
+/// calls, or the decision it evaluates). Comments are data fields. An unknown property is a
+/// hard parse error (`deny_unknown_fields`).
 #[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Step {
     /// The document-local step id (unique across the journey's steps).
     pub id: StepId,
@@ -210,8 +217,11 @@ impl JsonSchema for StepKind {
 /// optional guard predicate that must hold for the transition to be taken. An UNGUARDED
 /// transition (a `guard` of [`None`]) always applies; two or more unguarded transitions from
 /// the same step are ambiguous and the validator rejects them
-/// ([`crate::JourneyError::NonDeterministicTransition`]).
+/// ([`crate::JourneyError::NonDeterministicTransition`]). An unknown property (a misspelled
+/// `guard`, for example) is a hard parse error (`deny_unknown_fields`), so it can never
+/// silently drop the guard and change routing.
 #[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Transition {
     /// The source step id.
     pub from: StepId,
@@ -226,8 +236,10 @@ pub struct Transition {
 }
 
 /// A subflow reference a journey can call (issue #92): a document-local id and its source. PR
-/// 1 parses and validates the SHAPE only; full subflow composition is PR 3.
+/// 1 parses and validates the SHAPE only; full subflow composition is PR 3. An unknown
+/// property is a hard parse error (`deny_unknown_fields`).
 #[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct SubflowRef {
     /// The document-local subflow id a [`StepKind::SubflowCall`] step references.
     pub id: SubflowId,
@@ -338,8 +350,10 @@ pub enum CmpOp {
 
 /// A typed reference to a field of the evaluation context (issue #92): the source it is read
 /// from and an RFC 6901 JSON Pointer into that source. The evaluation context is assembled by
-/// the engine before the predicate is evaluated (PR 2); PR 1 defines the reference as data.
+/// the engine before the predicate is evaluated (PR 2); PR 1 defines the reference as data. An
+/// unknown property is a hard parse error (`deny_unknown_fields`).
 #[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct FieldRef {
     /// The context source this field is read from.
     pub source: FieldSource,
@@ -576,5 +590,42 @@ mod tests {
             let parsed: Literal = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(parsed, literal);
         }
+    }
+
+    #[test]
+    fn an_unknown_field_on_the_journey_is_a_hard_parse_error() {
+        // deny_unknown_fields: an extra top-level property is refused rather than dropped.
+        let json = serde_json::to_string(&conditional_mfa_journey()).expect("serialize");
+        let mut document: serde_json::Value = serde_json::from_str(&json).expect("value");
+        document
+            .as_object_mut()
+            .expect("object")
+            .insert("bogus".to_owned(), serde_json::json!(1));
+        let parsed: Result<Journey, _> = serde_json::from_value(document);
+        assert!(parsed.is_err(), "an unknown journey field must be refused");
+    }
+
+    #[test]
+    fn a_misspelled_guard_on_a_transition_is_a_hard_parse_error() {
+        // A typo like `gaurd` would otherwise parse, drop the guard, and silently make the
+        // transition unguarded (changing routing). deny_unknown_fields refuses it instead.
+        let json = r#"{
+            "schema_version": "ironauth.journey/v1",
+            "id": "j",
+            "engine_version": 1,
+            "entry": "primary",
+            "steps": [
+                {"id": "primary", "kind": "identifier_password"},
+                {"id": "done", "kind": "terminal"}
+            ],
+            "transitions": [
+                {"from": "primary", "to": "done", "gaurd": {"type": "always"}}
+            ]
+        }"#;
+        let parsed: Result<Journey, _> = serde_json::from_str(json);
+        assert!(
+            parsed.is_err(),
+            "a misspelled guard field must be refused, never silently dropped"
+        );
     }
 }

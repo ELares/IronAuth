@@ -56,6 +56,22 @@ mod tests {
                 "missing required field {field}"
             );
         }
+        // deny_unknown_fields on the artifact structs is mirrored in the schema, so a document
+        // with an extra or misspelled property is rejected at the schema level too.
+        assert_eq!(
+            schema.get("additionalProperties"),
+            Some(&Value::Bool(false)),
+            "the Journey schema must forbid additional properties"
+        );
+        let step = schema
+            .get("$defs")
+            .and_then(|defs| defs.get("Step"))
+            .expect("the Step definition is published");
+        assert_eq!(
+            step.get("additionalProperties"),
+            Some(&Value::Bool(false)),
+            "the Step schema must forbid additional properties"
+        );
     }
 
     #[test]

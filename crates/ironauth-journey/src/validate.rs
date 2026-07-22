@@ -16,7 +16,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use crate::artifact::{JOURNEY_ENGINE_VERSION, Journey};
+use crate::artifact::{JOURNEY_ENGINE_VERSION, Journey, Step, StepKind};
 
 /// The node-group vocabulary a journey step may render under (issue #92, fork F6): custom
 /// journeys are constrained to the EXISTING node-group set, so the rendered flow contract
@@ -82,9 +82,41 @@ pub enum JourneyError {
         /// The unreachable step id.
         step: String,
     },
-    /// The entry step is non-terminal yet has no outgoing transition, so the journey cannot
-    /// advance from its start.
-    NoEntryTransition,
+    /// A reachable, non-terminal step has no outgoing transition, so the engine routes into it
+    /// and can neither advance nor complete (a dead end). Covers the entry step too, with a
+    /// proper `/steps/<index>` pointer.
+    DeadEndStep {
+        /// The RFC 6901 pointer to the dead-end step.
+        pointer: String,
+        /// The dead-end step id.
+        step: String,
+    },
+    /// A step requires an attachment its kind depends on but does not carry it: a `subflow_call`
+    /// with no `subflow` to call, or a `decision` with no `decision` to route on.
+    MissingStepAttachment {
+        /// The RFC 6901 pointer to the step missing the attachment.
+        pointer: String,
+        /// The step id.
+        step: String,
+        /// The kind that requires the missing attachment (`subflow_call` or `decision`).
+        kind: String,
+    },
+    /// A step carries an attachment its kind does not use: a `subflow` on a step that is not a
+    /// `subflow_call`, or a `decision` on a step that is not a `decision`.
+    UnexpectedStepAttachment {
+        /// The RFC 6901 pointer to the offending attachment.
+        pointer: String,
+        /// The step id.
+        step: String,
+    },
+    /// A terminal step has an outgoing transition, but a terminal completes and never routes
+    /// onward. The pointer names the offending transition.
+    TerminalHasTransition {
+        /// The RFC 6901 pointer to the offending transition.
+        pointer: String,
+        /// The terminal step id the transition leaves.
+        step: String,
+    },
     /// The artifact declares an engine version newer than this build supports.
     EngineIncompatible {
         /// The RFC 6901 pointer to `engine_version`.
@@ -131,8 +163,31 @@ impl fmt::Display for JourneyError {
             JourneyError::UnreachableStep { pointer, step } => {
                 write!(f, "step {step} at {pointer} is unreachable from the entry")
             }
-            JourneyError::NoEntryTransition => {
-                write!(f, "the entry step has no outgoing transition")
+            JourneyError::DeadEndStep { pointer, step } => {
+                write!(
+                    f,
+                    "step {step} at {pointer} is a non-terminal dead end with no outgoing transition"
+                )
+            }
+            JourneyError::MissingStepAttachment {
+                pointer,
+                step,
+                kind,
+            } => write!(
+                f,
+                "step {step} at {pointer} of kind {kind} is missing its required attachment"
+            ),
+            JourneyError::UnexpectedStepAttachment { pointer, step } => {
+                write!(
+                    f,
+                    "step {step} carries an attachment its kind does not use at {pointer}"
+                )
+            }
+            JourneyError::TerminalHasTransition { pointer, step } => {
+                write!(
+                    f,
+                    "terminal step {step} has an outgoing transition at {pointer}"
+                )
             }
             JourneyError::EngineIncompatible {
                 pointer,
@@ -163,14 +218,21 @@ impl std::error::Error for JourneyError {}
 /// 2) and the compiled transition table (PR 4).
 ///
 /// The checks, in order, are: engine compatibility; duplicate step ids; per-step unknown kind,
-/// unknown node group, and dangling subflow reference; an unknown entry; dangling transition
-/// endpoints; ambiguous unguarded routing; unreachable steps; and a dead entry with no
-/// outgoing transition. Pure and deterministic: it only reads the document.
+/// unknown node group, dangling subflow reference, and kind-attachment coherence; an unknown
+/// entry; dangling transition endpoints; ambiguous unguarded routing; a transition leaving a
+/// terminal step; unreachable steps; and reachable non-terminal dead ends. Pure and
+/// deterministic: it only reads the document.
 ///
 /// # Errors
 ///
 /// A non-empty [`Vec`] of [`JourneyError`], one per structural failure, in document order.
 pub fn validate(doc: &Journey) -> Result<(), Vec<JourneyError>> {
+    // PR4: LIVENESS (a reachable completion exists and there is no exit-less cycle a journey can
+    // never leave) is validated at COMPILE time in PR 4, not here, because judging whether a
+    // journey can ever complete needs the executor's completion semantics: a step may complete
+    // internally (mint a session) rather than only by reaching a kind=terminal step. PR 1
+    // validates topology structure; the compile pass adds liveness. This is a documented
+    // deferral, not a lost check.
     let mut errors = Vec::new();
 
     if doc.engine_version > JOURNEY_ENGINE_VERSION {
@@ -181,7 +243,31 @@ pub fn validate(doc: &Journey) -> Result<(), Vec<JourneyError>> {
         });
     }
 
-    // The declared step id set, flagging a duplicate at its document position.
+    let ids = collect_step_ids(doc, &mut errors);
+    check_steps(doc, &mut errors);
+
+    let entry_known = ids.contains(doc.entry.as_str());
+    if !entry_known {
+        errors.push(JourneyError::UnknownEntry {
+            pointer: "/entry".to_owned(),
+        });
+    }
+
+    check_transitions(doc, &ids, &mut errors);
+    if entry_known {
+        check_reachability(doc, &ids, &mut errors);
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+/// The declared step id set, flagging a [`JourneyError::DuplicateStepId`] at each repeat's
+/// document position.
+fn collect_step_ids<'a>(doc: &'a Journey, errors: &mut Vec<JourneyError>) -> BTreeSet<&'a str> {
     let mut ids: BTreeSet<&str> = BTreeSet::new();
     for (index, step) in doc.steps.iter().enumerate() {
         if !ids.insert(step.id.as_str()) {
@@ -191,7 +277,12 @@ pub fn validate(doc: &Journey) -> Result<(), Vec<JourneyError>> {
             });
         }
     }
+    ids
+}
 
+/// The per-step structural checks: an unknown kind, an unknown node group, a dangling subflow
+/// reference, and kind-attachment coherence, in document order.
+fn check_steps(doc: &Journey, errors: &mut Vec<JourneyError>) {
     let declared_subflows = declared_subflow_ids(doc);
     for (index, step) in doc.steps.iter().enumerate() {
         if !step.kind.is_known() {
@@ -220,15 +311,17 @@ pub fn validate(doc: &Journey) -> Result<(), Vec<JourneyError>> {
             }
             _ => {}
         }
+        check_attachment_coherence(step, index, errors);
     }
+}
 
-    let entry_known = ids.contains(doc.entry.as_str());
-    if !entry_known {
-        errors.push(JourneyError::UnknownEntry {
-            pointer: "/entry".to_owned(),
-        });
-    }
-
+/// The per-transition structural checks: a dangling endpoint, ambiguous unguarded routing, and a
+/// transition leaving a terminal step, in document order.
+fn check_transitions(doc: &Journey, ids: &BTreeSet<&str>, errors: &mut Vec<JourneyError>) {
+    let terminal_ids = terminal_step_ids(doc);
+    // A second (or later) unguarded transition from a step already left by an unguarded one:
+    // `insert` returns false once the source has been seen unguarded.
+    let mut seen_unguarded: BTreeSet<&str> = BTreeSet::new();
     for (index, transition) in doc.transitions.iter().enumerate() {
         if !ids.contains(transition.from.as_str()) {
             errors.push(JourneyError::DanglingTransition {
@@ -242,39 +335,48 @@ pub fn validate(doc: &Journey) -> Result<(), Vec<JourneyError>> {
                 to: transition.to.clone(),
             });
         }
-    }
-
-    // Ambiguous routing: a second (or later) unguarded transition from a step already left by an
-    // unguarded transition. `insert` returns false once the source has been seen unguarded.
-    let mut seen_unguarded: BTreeSet<&str> = BTreeSet::new();
-    for (index, transition) in doc.transitions.iter().enumerate() {
         if transition.guard.is_none() && !seen_unguarded.insert(transition.from.as_str()) {
             errors.push(JourneyError::NonDeterministicTransition {
                 pointer: format!("/transitions/{index}"),
             });
         }
-    }
-
-    // Reachability needs a known entry to walk from.
-    if entry_known {
-        let reachable = reachable_steps(doc, &ids);
-        for (index, step) in doc.steps.iter().enumerate() {
-            if !reachable.contains(step.id.as_str()) {
-                errors.push(JourneyError::UnreachableStep {
-                    pointer: format!("/steps/{index}"),
-                    step: step.id.clone(),
-                });
-            }
-        }
-        if entry_is_dead(doc) {
-            errors.push(JourneyError::NoEntryTransition);
+        if terminal_ids.contains(transition.from.as_str()) {
+            errors.push(JourneyError::TerminalHasTransition {
+                pointer: format!("/transitions/{index}"),
+                step: transition.from.clone(),
+            });
         }
     }
+}
 
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors)
+/// The reachability checks (a known entry is required to walk from): an unreachable step, and a
+/// reachable non-terminal dead end with no outgoing transition (which covers the entry step,
+/// reported with its own `/steps/<index>` pointer).
+fn check_reachability(doc: &Journey, ids: &BTreeSet<&str>, errors: &mut Vec<JourneyError>) {
+    let reachable = reachable_steps(doc, ids);
+    let sources: BTreeSet<&str> = doc
+        .transitions
+        .iter()
+        .map(|transition| transition.from.as_str())
+        .collect();
+    for (index, step) in doc.steps.iter().enumerate() {
+        if !reachable.contains(step.id.as_str()) {
+            errors.push(JourneyError::UnreachableStep {
+                pointer: format!("/steps/{index}"),
+                step: step.id.clone(),
+            });
+        }
+    }
+    for (index, step) in doc.steps.iter().enumerate() {
+        let dead = reachable.contains(step.id.as_str())
+            && !step.kind.is_terminal()
+            && !sources.contains(step.id.as_str());
+        if dead {
+            errors.push(JourneyError::DeadEndStep {
+                pointer: format!("/steps/{index}"),
+                step: step.id.clone(),
+            });
+        }
     }
 }
 
@@ -313,27 +415,60 @@ fn reachable_steps<'a>(doc: &'a Journey, ids: &BTreeSet<&'a str>) -> BTreeSet<&'
     reached
 }
 
-/// Whether the entry step is non-terminal yet has no outgoing transition, so the journey cannot
-/// advance from its start. A terminal entry (a single-step journey) is well formed.
-fn entry_is_dead(doc: &Journey) -> bool {
-    let entry_terminal = doc
-        .steps
+/// The set of step ids whose kind is terminal.
+fn terminal_step_ids(doc: &Journey) -> BTreeSet<&str> {
+    doc.steps
         .iter()
-        .find(|step| step.id == doc.entry)
-        .is_some_and(|step| step.kind.is_terminal());
-    let has_outgoing = doc
-        .transitions
-        .iter()
-        .any(|transition| transition.from == doc.entry);
-    !entry_terminal && !has_outgoing
+        .filter(|step| step.kind.is_terminal())
+        .map(|step| step.id.as_str())
+        .collect()
+}
+
+/// Check that a step carries exactly the attachments its kind uses: a `subflow_call` names a
+/// subflow to call, a `decision` carries a decision to route on, and neither attachment appears
+/// on a kind that does not use it. Only known kinds are checked; an unknown kind is already
+/// flagged by [`JourneyError::UnknownStepKind`].
+fn check_attachment_coherence(step: &Step, index: usize, errors: &mut Vec<JourneyError>) {
+    match &step.kind {
+        StepKind::SubflowCall if step.subflow.is_none() => {
+            errors.push(JourneyError::MissingStepAttachment {
+                pointer: format!("/steps/{index}"),
+                step: step.id.clone(),
+                kind: "subflow_call".to_owned(),
+            });
+        }
+        StepKind::Decision if step.decision.is_none() => {
+            errors.push(JourneyError::MissingStepAttachment {
+                pointer: format!("/steps/{index}"),
+                step: step.id.clone(),
+                kind: "decision".to_owned(),
+            });
+        }
+        _ => {}
+    }
+    // A stray `subflow` on a step that is not a `subflow_call`.
+    if step.subflow.is_some() && !matches!(step.kind, StepKind::SubflowCall) && step.kind.is_known()
+    {
+        errors.push(JourneyError::UnexpectedStepAttachment {
+            pointer: format!("/steps/{index}/subflow"),
+            step: step.id.clone(),
+        });
+    }
+    // A stray `decision` on a step that is not a `decision`.
+    if step.decision.is_some() && !matches!(step.kind, StepKind::Decision) && step.kind.is_known() {
+        errors.push(JourneyError::UnexpectedStepAttachment {
+            pointer: format!("/steps/{index}/decision"),
+            step: step.id.clone(),
+        });
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::artifact::{
-        CmpOp, FieldRef, FieldSource, JOURNEY_SCHEMA_VERSION, Literal, Predicate, Step, StepKind,
-        SubflowRef, SubflowSource, Transition,
+        CmpOp, DecisionSpec, FieldRef, FieldSource, JOURNEY_SCHEMA_VERSION, Literal, Predicate,
+        Step, StepKind, SubflowRef, SubflowSource, Transition,
     };
 
     fn step(id: &str, kind: StepKind, node_group: Option<&str>) -> Step {
@@ -497,7 +632,7 @@ mod tests {
     }
 
     #[test]
-    fn an_entry_with_no_outgoing_transition_is_rejected() {
+    fn an_entry_with_no_outgoing_transition_is_a_dead_end() {
         let doc = Journey {
             schema_version: JOURNEY_SCHEMA_VERSION.to_owned(),
             id: "j".to_owned(),
@@ -512,7 +647,178 @@ mod tests {
             transitions: vec![],
             subflows: None,
         };
-        assert_eq!(validate(&doc), Err(vec![JourneyError::NoEntryTransition]));
+        assert_eq!(
+            validate(&doc),
+            Err(vec![JourneyError::DeadEndStep {
+                pointer: "/steps/0".to_owned(),
+                step: "primary".to_owned(),
+            }])
+        );
+    }
+
+    #[test]
+    fn an_interior_non_terminal_dead_end_is_rejected() {
+        // The entry advances into `trap`, but `trap` is non-terminal with no outgoing transition,
+        // so the engine can neither advance from it nor complete: a dead end.
+        let doc = Journey {
+            schema_version: JOURNEY_SCHEMA_VERSION.to_owned(),
+            id: "j".to_owned(),
+            engine_version: JOURNEY_ENGINE_VERSION,
+            entry: "primary".to_owned(),
+            comment: None,
+            steps: vec![
+                step("primary", StepKind::IdentifierPassword, Some("password")),
+                step("trap", StepKind::MfaChallenge, Some("totp")),
+            ],
+            transitions: vec![unguarded("primary", "trap")],
+            subflows: None,
+        };
+        assert_eq!(
+            validate(&doc),
+            Err(vec![JourneyError::DeadEndStep {
+                pointer: "/steps/1".to_owned(),
+                step: "trap".to_owned(),
+            }])
+        );
+    }
+
+    #[test]
+    fn a_subflow_call_with_no_subflow_is_rejected() {
+        let doc = Journey {
+            schema_version: JOURNEY_SCHEMA_VERSION.to_owned(),
+            id: "j".to_owned(),
+            engine_version: JOURNEY_ENGINE_VERSION,
+            entry: "primary".to_owned(),
+            comment: None,
+            steps: vec![
+                step("primary", StepKind::IdentifierPassword, Some("password")),
+                step("call", StepKind::SubflowCall, None),
+                step("done", StepKind::Terminal, None),
+            ],
+            transitions: vec![unguarded("primary", "call"), unguarded("call", "done")],
+            subflows: None,
+        };
+        assert_eq!(
+            validate(&doc),
+            Err(vec![JourneyError::MissingStepAttachment {
+                pointer: "/steps/1".to_owned(),
+                step: "call".to_owned(),
+                kind: "subflow_call".to_owned(),
+            }])
+        );
+    }
+
+    #[test]
+    fn a_decision_step_with_no_decision_is_rejected() {
+        let doc = Journey {
+            schema_version: JOURNEY_SCHEMA_VERSION.to_owned(),
+            id: "j".to_owned(),
+            engine_version: JOURNEY_ENGINE_VERSION,
+            entry: "primary".to_owned(),
+            comment: None,
+            steps: vec![
+                step("primary", StepKind::IdentifierPassword, Some("password")),
+                step("branch", StepKind::Decision, None),
+                step("done", StepKind::Terminal, None),
+            ],
+            transitions: vec![unguarded("primary", "branch"), unguarded("branch", "done")],
+            subflows: None,
+        };
+        assert_eq!(
+            validate(&doc),
+            Err(vec![JourneyError::MissingStepAttachment {
+                pointer: "/steps/1".to_owned(),
+                step: "branch".to_owned(),
+                kind: "decision".to_owned(),
+            }])
+        );
+    }
+
+    #[test]
+    fn a_subflow_attachment_on_a_non_subflow_call_step_is_rejected() {
+        let doc = Journey {
+            schema_version: JOURNEY_SCHEMA_VERSION.to_owned(),
+            id: "j".to_owned(),
+            engine_version: JOURNEY_ENGINE_VERSION,
+            entry: "primary".to_owned(),
+            comment: None,
+            steps: vec![
+                Step {
+                    // A stray subflow on an identifier_password step; the subflow id is declared,
+                    // so this is the coherence rejection, not a dangling reference.
+                    subflow: Some("mfa_step_up".to_owned()),
+                    ..step("primary", StepKind::IdentifierPassword, Some("password"))
+                },
+                step("done", StepKind::Terminal, None),
+            ],
+            transitions: vec![unguarded("primary", "done")],
+            subflows: Some(vec![SubflowRef {
+                id: "mfa_step_up".to_owned(),
+                source: SubflowSource::Builtin {
+                    name: "mfa_step_up".to_owned(),
+                },
+            }]),
+        };
+        assert_eq!(
+            validate(&doc),
+            Err(vec![JourneyError::UnexpectedStepAttachment {
+                pointer: "/steps/0/subflow".to_owned(),
+                step: "primary".to_owned(),
+            }])
+        );
+    }
+
+    #[test]
+    fn a_decision_attachment_on_a_non_decision_step_is_rejected() {
+        let doc = Journey {
+            schema_version: JOURNEY_SCHEMA_VERSION.to_owned(),
+            id: "j".to_owned(),
+            engine_version: JOURNEY_ENGINE_VERSION,
+            entry: "primary".to_owned(),
+            comment: None,
+            steps: vec![
+                Step {
+                    decision: Some(DecisionSpec::Predicate {
+                        predicate: Predicate::Always,
+                    }),
+                    ..step("primary", StepKind::IdentifierPassword, Some("password"))
+                },
+                step("done", StepKind::Terminal, None),
+            ],
+            transitions: vec![unguarded("primary", "done")],
+            subflows: None,
+        };
+        assert_eq!(
+            validate(&doc),
+            Err(vec![JourneyError::UnexpectedStepAttachment {
+                pointer: "/steps/0/decision".to_owned(),
+                step: "primary".to_owned(),
+            }])
+        );
+    }
+
+    #[test]
+    fn a_terminal_step_with_an_outgoing_transition_is_rejected() {
+        let doc = Journey {
+            schema_version: JOURNEY_SCHEMA_VERSION.to_owned(),
+            id: "j".to_owned(),
+            engine_version: JOURNEY_ENGINE_VERSION,
+            entry: "primary".to_owned(),
+            comment: None,
+            steps: vec![
+                step("primary", StepKind::IdentifierPassword, Some("password")),
+                step("done", StepKind::Terminal, None),
+            ],
+            transitions: vec![unguarded("primary", "done"), unguarded("done", "primary")],
+            subflows: None,
+        };
+        assert_eq!(
+            validate(&doc),
+            Err(vec![JourneyError::TerminalHasTransition {
+                pointer: "/transitions/1".to_owned(),
+                step: "done".to_owned(),
+            }])
+        );
     }
 
     #[test]

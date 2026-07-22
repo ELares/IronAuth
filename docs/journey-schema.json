@@ -60,7 +60,8 @@
       ]
     },
     "FieldRef": {
-      "description": "A typed reference to a field of the evaluation context (issue #92): the source it is read\nfrom and an RFC 6901 JSON Pointer into that source. The evaluation context is assembled by\nthe engine before the predicate is evaluated (PR 2); PR 1 defines the reference as data.",
+      "additionalProperties": false,
+      "description": "A typed reference to a field of the evaluation context (issue #92): the source it is read\nfrom and an RFC 6901 JSON Pointer into that source. The evaluation context is assembled by\nthe engine before the predicate is evaluated (PR 2); PR 1 defines the reference as data. An\nunknown property is a hard parse error (`deny_unknown_fields`).",
       "properties": {
         "pointer": {
           "description": "The RFC 6901 JSON Pointer into the source.",
@@ -343,7 +344,8 @@
       ]
     },
     "Step": {
-      "description": "One step of a journey (issue #92): a document-local id, the built-in kind that executes\nit, and the kind-specific attachments (the node group it renders under, the subflow it\ncalls, or the decision it evaluates). Comments are data fields.",
+      "additionalProperties": false,
+      "description": "One step of a journey (issue #92): a document-local id, the built-in kind that executes\nit, and the kind-specific attachments (the node group it renders under, the subflow it\ncalls, or the decision it evaluates). Comments are data fields. An unknown property is a\nhard parse error (`deny_unknown_fields`).",
       "properties": {
         "comment": {
           "description": "An optional human-readable comment about the step (data, round-trip-safe).",
@@ -406,7 +408,8 @@
       "type": "string"
     },
     "SubflowRef": {
-      "description": "A subflow reference a journey can call (issue #92): a document-local id and its source. PR\n1 parses and validates the SHAPE only; full subflow composition is PR 3.",
+      "additionalProperties": false,
+      "description": "A subflow reference a journey can call (issue #92): a document-local id and its source. PR\n1 parses and validates the SHAPE only; full subflow composition is PR 3. An unknown\nproperty is a hard parse error (`deny_unknown_fields`).",
       "properties": {
         "id": {
           "description": "The document-local subflow id a [`StepKind::SubflowCall`] step references.",
@@ -465,7 +468,8 @@
       ]
     },
     "Transition": {
-      "description": "A transition between two steps (issue #92): the source step, the target step, and an\noptional guard predicate that must hold for the transition to be taken. An UNGUARDED\ntransition (a `guard` of [`None`]) always applies; two or more unguarded transitions from\nthe same step are ambiguous and the validator rejects them\n([`crate::JourneyError::NonDeterministicTransition`]).",
+      "additionalProperties": false,
+      "description": "A transition between two steps (issue #92): the source step, the target step, and an\noptional guard predicate that must hold for the transition to be taken. An UNGUARDED\ntransition (a `guard` of [`None`]) always applies; two or more unguarded transitions from\nthe same step are ambiguous and the validator rejects them\n([`crate::JourneyError::NonDeterministicTransition`]). An unknown property (a misspelled\n`guard`, for example) is a hard parse error (`deny_unknown_fields`), so it can never\nsilently drop the guard and change routing.",
       "properties": {
         "comment": {
           "description": "An optional human-readable comment about the transition (data, round-trip-safe).",
@@ -502,7 +506,8 @@
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "A whole journey artifact (issue #92): the declarative topology and routing a flow runs.\nIt carries the format tag, the authored engine version, the entry step, the step list,\nthe transitions between steps, and any subflow references. Comments are FIRST-CLASS data\nfields, preserved through a serde round-trip, never lexical trivia.",
+  "additionalProperties": false,
+  "description": "A whole journey artifact (issue #92): the declarative topology and routing a flow runs.\nIt carries the format tag, the authored engine version, the entry step, the step list,\nthe transitions between steps, and any subflow references. Comments are FIRST-CLASS data\nfields, preserved through a serde round-trip, never lexical trivia.\n\nAn unknown or misspelled property is a HARD parse error (`deny_unknown_fields`), so a typo\nlike `gaurd` cannot silently drop a guard and change routing; the published schema mirrors\nthis with `additionalProperties: false`.",
   "properties": {
     "comment": {
       "description": "An optional human-readable comment about the journey (data, round-trip-safe).",
