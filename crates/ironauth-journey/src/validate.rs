@@ -17,7 +17,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use crate::artifact::{DecisionSpec, JOURNEY_ENGINE_VERSION, Journey, Step, StepKind};
+use crate::artifact::{DecisionSpec, JOURNEY_ENGINE_VERSION, Journey, Step, StepKind, Transition};
 use crate::eval::{PredicateTypeError, typecheck_predicate};
 
 /// The node-group vocabulary a journey step may render under (issue #92, fork F6): custom
@@ -149,9 +149,96 @@ pub enum JourneyError {
     /// cannot unify, so the evaluator only ever runs type-checked predicates (issue #92, PR 2).
     /// The wrapped [`PredicateTypeError`] carries the precise RFC 6901 pointer into the artifact.
     PredicateType(PredicateTypeError),
+    /// A [`SubflowSource::Builtin`] reference names a built-in subflow this build does not provide
+    /// (issue #92, PR 3).
+    UnknownBuiltinSubflow {
+        /// The RFC 6901 pointer to the offending subflow reference `source`.
+        pointer: String,
+        /// The unrecognized built-in subflow name.
+        name: String,
+    },
+    /// A [`SubflowSource::Inline`] reference names an inline subflow definition the artifact's
+    /// `subflow_definitions` does not carry (issue #92, PR 3).
+    UnknownSubflowDefinition {
+        /// The RFC 6901 pointer to the offending subflow reference `source`.
+        pointer: String,
+        /// The unresolved inline subflow definition id.
+        subflow: String,
+    },
+    /// Two inline subflow definitions declare the same id, or a definition collides with a
+    /// built-in subflow name, so a reference cannot resolve unambiguously (issue #92, PR 3).
+    DuplicateSubflowDefinition {
+        /// The RFC 6901 pointer to the offending definition's `id`.
+        pointer: String,
+        /// The duplicated subflow definition id.
+        id: String,
+    },
+    /// A subflow references itself directly or transitively, so composition would never terminate
+    /// (issue #92, PR 3). Rejected at LOAD, never at flow time.
+    SubflowCycle {
+        /// The RFC 6901 pointer to the subflow definition that closes the cycle.
+        pointer: String,
+        /// The subflow definition id that closes the cycle.
+        subflow: String,
+    },
+    /// A subflow declares a [`StepKind::Terminal`] step. A subflow never mints a session; it
+    /// returns to its caller, so it declares return `exits`, never a terminal (issue #92, PR 3).
+    SubflowTerminalStep {
+        /// The RFC 6901 pointer to the offending terminal step.
+        pointer: String,
+        /// The offending step id.
+        step: String,
+    },
+    /// A subflow declares no return `exits`, so composition has no point to return to the caller
+    /// from (issue #92, PR 3).
+    SubflowNoExit {
+        /// The RFC 6901 pointer to the subflow definition's `exits`.
+        pointer: String,
+        /// The subflow definition id.
+        subflow: String,
+    },
+    /// A subflow's `exits` list names a step id the subflow does not declare (issue #92, PR 3).
+    UnknownSubflowExit {
+        /// The RFC 6901 pointer to the offending `exits` entry.
+        pointer: String,
+        /// The unknown exit step id.
+        exit: String,
+    },
+    /// A subflow exit has an outgoing transition, but an exit is a return leaf: it returns to the
+    /// caller, it does not route onward within the subflow (issue #92, PR 3).
+    SubflowExitNotLeaf {
+        /// The RFC 6901 pointer to the offending transition that leaves the exit.
+        pointer: String,
+        /// The exit step id the transition leaves.
+        exit: String,
+    },
+    /// A template invocation names a template id this build does not provide (issue #92, PR 3).
+    UnknownTemplate {
+        /// The RFC 6901 pointer to the offending `template`.
+        pointer: String,
+        /// The unrecognized template id.
+        template: String,
+    },
+    /// A template invocation omits a required parameter (issue #92, PR 3).
+    MissingTemplateParam {
+        /// The RFC 6901 pointer to the invocation's `params`.
+        pointer: String,
+        /// The missing parameter name.
+        param: String,
+    },
+    /// A template invocation supplies a parameter of the wrong type (issue #92, PR 3).
+    TemplateParamType {
+        /// The RFC 6901 pointer to the offending parameter.
+        pointer: String,
+        /// The parameter name.
+        param: String,
+    },
 }
 
 impl fmt::Display for JourneyError {
+    // One arm per error variant: a flat match is the clearest form and the line count only reflects
+    // the number of variants, not any real complexity.
+    #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             JourneyError::UnknownStepKind { pointer, kind } => {
@@ -213,6 +300,54 @@ impl fmt::Display for JourneyError {
                 write!(f, "entry at {pointer} names no declared step")
             }
             JourneyError::PredicateType(error) => write!(f, "{error}"),
+            JourneyError::UnknownBuiltinSubflow { pointer, name } => {
+                write!(f, "unknown built-in subflow {name} at {pointer}")
+            }
+            JourneyError::UnknownSubflowDefinition { pointer, subflow } => {
+                write!(
+                    f,
+                    "reference at {pointer} names no inline subflow definition {subflow}"
+                )
+            }
+            JourneyError::DuplicateSubflowDefinition { pointer, id } => {
+                write!(f, "duplicate subflow definition id {id} at {pointer}")
+            }
+            JourneyError::SubflowCycle { pointer, subflow } => {
+                write!(f, "subflow {subflow} at {pointer} references itself")
+            }
+            JourneyError::SubflowTerminalStep { pointer, step } => {
+                write!(
+                    f,
+                    "subflow step {step} at {pointer} is a terminal, but a subflow returns via its exits"
+                )
+            }
+            JourneyError::SubflowNoExit { pointer, subflow } => {
+                write!(f, "subflow {subflow} at {pointer} declares no return exits")
+            }
+            JourneyError::UnknownSubflowExit { pointer, exit } => {
+                write!(f, "exit at {pointer} names no declared step {exit}")
+            }
+            JourneyError::SubflowExitNotLeaf { pointer, exit } => {
+                write!(
+                    f,
+                    "subflow exit {exit} has an outgoing transition at {pointer}"
+                )
+            }
+            JourneyError::UnknownTemplate { pointer, template } => {
+                write!(f, "unknown template {template} at {pointer}")
+            }
+            JourneyError::MissingTemplateParam { pointer, param } => {
+                write!(
+                    f,
+                    "missing required template parameter {param} at {pointer}"
+                )
+            }
+            JourneyError::TemplateParamType { pointer, param } => {
+                write!(
+                    f,
+                    "template parameter {param} at {pointer} has the wrong type"
+                )
+            }
         }
     }
 }
@@ -227,8 +362,10 @@ impl std::error::Error for JourneyError {}
 /// The checks, in order, are: engine compatibility; duplicate step ids; per-step unknown kind,
 /// unknown node group, dangling subflow reference, and kind-attachment coherence; an unknown
 /// entry; dangling transition endpoints; ambiguous unguarded routing; a transition leaving a
-/// terminal step; unreachable steps; reachable non-terminal dead ends; and guard and decision
-/// predicate type safety (PR 2). Pure and deterministic: it only reads the document.
+/// terminal step; unreachable steps; reachable non-terminal dead ends; guard and decision
+/// predicate type safety (PR 2); and, for PR 3, subflow reference resolution, inline subflow
+/// definition well-formedness, and subflow reference acyclicity. Pure and deterministic: it only
+/// reads the document.
 ///
 /// # Errors
 ///
@@ -250,8 +387,26 @@ pub fn validate(doc: &Journey) -> Result<(), Vec<JourneyError>> {
         });
     }
 
-    let ids = collect_step_ids(doc, &mut errors);
-    check_steps(doc, &mut errors);
+    let ids = collect_step_ids(&doc.steps, "", &mut errors);
+
+    // A journey `subflow_call` step names a subflow ALIAS declared in the `subflows` reference
+    // list; a dangling alias is rejected here (the alias-to-source resolution is checked by
+    // `crate::subflow::validate_subflows`).
+    let declared = declared_subflow_ids(doc);
+    for (index, step) in doc.steps.iter().enumerate() {
+        let step_ptr = format!("/steps/{index}");
+        check_kind_and_node_group(step, &step_ptr, &mut errors);
+        match &step.subflow {
+            Some(alias) if !declared.contains(alias.as_str()) => {
+                errors.push(JourneyError::DanglingSubflowRef {
+                    pointer: format!("/steps/{index}/subflow"),
+                    subflow: alias.clone(),
+                });
+            }
+            _ => {}
+        }
+        check_attachment_coherence(step, &step_ptr, &mut errors);
+    }
 
     let entry_known = ids.contains(doc.entry.as_str());
     if !entry_known {
@@ -260,11 +415,39 @@ pub fn validate(doc: &Journey) -> Result<(), Vec<JourneyError>> {
         });
     }
 
-    check_transitions(doc, &ids, &mut errors);
-    if entry_known {
-        check_reachability(doc, &ids, &mut errors);
+    check_transition_endpoints(&ids, &doc.transitions, "", &mut errors);
+    // A journey's completion role is played by its `terminal`-kind steps: a transition may not
+    // leave one.
+    let terminals: BTreeSet<&str> = doc
+        .steps
+        .iter()
+        .filter(|step| step.kind.is_terminal())
+        .map(|step| step.id.as_str())
+        .collect();
+    for (index, transition) in doc.transitions.iter().enumerate() {
+        if terminals.contains(transition.from.as_str()) {
+            errors.push(JourneyError::TerminalHasTransition {
+                pointer: format!("/transitions/{index}"),
+                step: transition.from.clone(),
+            });
+        }
     }
-    check_predicates(doc, &mut errors);
+    if entry_known {
+        check_reachability_and_dead_ends(
+            &doc.entry,
+            &doc.steps,
+            &doc.transitions,
+            &ids,
+            &terminals,
+            "",
+            &mut errors,
+        );
+    }
+    check_predicates(&doc.steps, &doc.transitions, "", &mut errors);
+
+    // PR 3: resolve subflow references, validate inline subflow definitions as fragments, and
+    // reject reference cycles. All load-time, never at flow time.
+    crate::subflow::validate_subflows(doc, &mut errors);
 
     if errors.is_empty() {
         Ok(())
@@ -273,14 +456,20 @@ pub fn validate(doc: &Journey) -> Result<(), Vec<JourneyError>> {
     }
 }
 
-/// The declared step id set, flagging a [`JourneyError::DuplicateStepId`] at each repeat's
-/// document position.
-fn collect_step_ids<'a>(doc: &'a Journey, errors: &mut Vec<JourneyError>) -> BTreeSet<&'a str> {
+/// The declared step id set for a step slice, flagging a [`JourneyError::DuplicateStepId`] at each
+/// repeat's document position. `base` is the RFC 6901 pointer prefix (empty for a journey, the
+/// definition pointer for a subflow), so the error locates the step in whichever document carries
+/// it.
+pub(crate) fn collect_step_ids<'a>(
+    steps: &'a [Step],
+    base: &str,
+    errors: &mut Vec<JourneyError>,
+) -> BTreeSet<&'a str> {
     let mut ids: BTreeSet<&str> = BTreeSet::new();
-    for (index, step) in doc.steps.iter().enumerate() {
+    for (index, step) in steps.iter().enumerate() {
         if !ids.insert(step.id.as_str()) {
             errors.push(JourneyError::DuplicateStepId {
-                pointer: format!("/steps/{index}/id"),
+                pointer: format!("{base}/steps/{index}/id"),
                 id: step.id.clone(),
             });
         }
@@ -288,123 +477,127 @@ fn collect_step_ids<'a>(doc: &'a Journey, errors: &mut Vec<JourneyError>) -> BTr
     ids
 }
 
-/// The per-step structural checks: an unknown kind, an unknown node group, a dangling subflow
-/// reference, and kind-attachment coherence, in document order.
-fn check_steps(doc: &Journey, errors: &mut Vec<JourneyError>) {
-    let declared_subflows = declared_subflow_ids(doc);
-    for (index, step) in doc.steps.iter().enumerate() {
-        if !step.kind.is_known() {
-            errors.push(JourneyError::UnknownStepKind {
-                pointer: format!("/steps/{index}/kind"),
-                kind: step.kind.as_wire().to_owned(),
+/// The per-step vocabulary checks shared by a journey and a subflow: an unknown step kind and an
+/// unknown node group. `step_ptr` is the RFC 6901 pointer to the step (for example `/steps/2` or
+/// `/subflow_definitions/1/steps/2`).
+pub(crate) fn check_kind_and_node_group(
+    step: &Step,
+    step_ptr: &str,
+    errors: &mut Vec<JourneyError>,
+) {
+    if !step.kind.is_known() {
+        errors.push(JourneyError::UnknownStepKind {
+            pointer: format!("{step_ptr}/kind"),
+            kind: step.kind.as_wire().to_owned(),
+        });
+    }
+    // A match guard rather than a nested `if let ... { if ... }`, so no let chain is needed
+    // (MSRV 1.85), mirroring the trait-schema validator's structural checks.
+    match &step.node_group {
+        Some(group) if !NODE_GROUPS.contains(&group.as_str()) => {
+            errors.push(JourneyError::UnknownNodeGroup {
+                pointer: format!("{step_ptr}/node_group"),
+                group: group.clone(),
             });
         }
-        // A match guard rather than a nested `if let ... { if ... }`, so no let chain is needed
-        // (MSRV 1.85), mirroring the trait-schema validator's structural checks.
-        match &step.node_group {
-            Some(group) if !NODE_GROUPS.contains(&group.as_str()) => {
-                errors.push(JourneyError::UnknownNodeGroup {
-                    pointer: format!("/steps/{index}/node_group"),
-                    group: group.clone(),
-                });
-            }
-            _ => {}
-        }
-        match &step.subflow {
-            Some(subflow) if !declared_subflows.contains(subflow.as_str()) => {
-                errors.push(JourneyError::DanglingSubflowRef {
-                    pointer: format!("/steps/{index}/subflow"),
-                    subflow: subflow.clone(),
-                });
-            }
-            _ => {}
-        }
-        check_attachment_coherence(step, index, errors);
+        _ => {}
     }
 }
 
-/// The per-transition structural checks: a dangling endpoint, ambiguous unguarded routing, and a
-/// transition leaving a terminal step, in document order.
-fn check_transitions(doc: &Journey, ids: &BTreeSet<&str>, errors: &mut Vec<JourneyError>) {
-    let terminal_ids = terminal_step_ids(doc);
+/// The per-transition endpoint checks shared by a journey and a subflow: a dangling endpoint and
+/// ambiguous unguarded routing, in document order. `base` is the RFC 6901 pointer prefix.
+pub(crate) fn check_transition_endpoints(
+    ids: &BTreeSet<&str>,
+    transitions: &[Transition],
+    base: &str,
+    errors: &mut Vec<JourneyError>,
+) {
     // A second (or later) unguarded transition from a step already left by an unguarded one:
     // `insert` returns false once the source has been seen unguarded.
     let mut seen_unguarded: BTreeSet<&str> = BTreeSet::new();
-    for (index, transition) in doc.transitions.iter().enumerate() {
+    for (index, transition) in transitions.iter().enumerate() {
         if !ids.contains(transition.from.as_str()) {
             errors.push(JourneyError::DanglingTransition {
-                pointer: format!("/transitions/{index}/from"),
+                pointer: format!("{base}/transitions/{index}/from"),
                 to: transition.from.clone(),
             });
         }
         if !ids.contains(transition.to.as_str()) {
             errors.push(JourneyError::DanglingTransition {
-                pointer: format!("/transitions/{index}/to"),
+                pointer: format!("{base}/transitions/{index}/to"),
                 to: transition.to.clone(),
             });
         }
         if transition.guard.is_none() && !seen_unguarded.insert(transition.from.as_str()) {
             errors.push(JourneyError::NonDeterministicTransition {
-                pointer: format!("/transitions/{index}"),
-            });
-        }
-        if terminal_ids.contains(transition.from.as_str()) {
-            errors.push(JourneyError::TerminalHasTransition {
-                pointer: format!("/transitions/{index}"),
-                step: transition.from.clone(),
+                pointer: format!("{base}/transitions/{index}"),
             });
         }
     }
 }
 
-/// The reachability checks (a known entry is required to walk from): an unreachable step, and a
-/// reachable non-terminal dead end with no outgoing transition (which covers the entry step,
-/// reported with its own `/steps/<index>` pointer).
-fn check_reachability(doc: &Journey, ids: &BTreeSet<&str>, errors: &mut Vec<JourneyError>) {
-    let reachable = reachable_steps(doc, ids);
-    let sources: BTreeSet<&str> = doc
-        .transitions
+/// The reachability checks shared by a journey and a subflow (a known entry is required to walk
+/// from): an unreachable step, and a reachable dead end with no outgoing transition that does not
+/// play the completion role (a journey terminal, or a subflow exit). `role_terminals` names the
+/// steps that legitimately have no successor; `base` is the RFC 6901 pointer prefix.
+pub(crate) fn check_reachability_and_dead_ends(
+    entry: &str,
+    steps: &[Step],
+    transitions: &[Transition],
+    ids: &BTreeSet<&str>,
+    role_terminals: &BTreeSet<&str>,
+    base: &str,
+    errors: &mut Vec<JourneyError>,
+) {
+    let reachable = reachable_steps(entry, transitions, ids);
+    let sources: BTreeSet<&str> = transitions
         .iter()
         .map(|transition| transition.from.as_str())
         .collect();
-    for (index, step) in doc.steps.iter().enumerate() {
+    for (index, step) in steps.iter().enumerate() {
         if !reachable.contains(step.id.as_str()) {
             errors.push(JourneyError::UnreachableStep {
-                pointer: format!("/steps/{index}"),
+                pointer: format!("{base}/steps/{index}"),
                 step: step.id.clone(),
             });
         }
     }
-    for (index, step) in doc.steps.iter().enumerate() {
+    for (index, step) in steps.iter().enumerate() {
         let dead = reachable.contains(step.id.as_str())
-            && !step.kind.is_terminal()
+            && !role_terminals.contains(step.id.as_str())
             && !sources.contains(step.id.as_str());
         if dead {
             errors.push(JourneyError::DeadEndStep {
-                pointer: format!("/steps/{index}"),
+                pointer: format!("{base}/steps/{index}"),
                 step: step.id.clone(),
             });
         }
     }
 }
 
-/// Type-check every guard and decision predicate in the artifact (issue #92, PR 2), appending a
-/// [`JourneyError::PredicateType`] per failure in document order (all transition guards, then all
-/// step decisions). A statically-decidable type mismatch (an ordering operator on a boolean
-/// signal, a literal that cannot unify with its field, a membership over a mismatched set, a set
-/// used in a comparison) is a LOAD-TIME error, so the evaluator only ever runs type-safe
-/// predicates. Each error carries the precise RFC 6901 pointer into the predicate.
-fn check_predicates(doc: &Journey, errors: &mut Vec<JourneyError>) {
-    for (index, transition) in doc.transitions.iter().enumerate() {
+/// Type-check every guard and decision predicate in a step and transition slice (issue #92, PR 2),
+/// appending a [`JourneyError::PredicateType`] per failure in document order (all transition
+/// guards, then all step decisions). A statically-decidable type mismatch (an ordering operator on
+/// a boolean signal, a literal that cannot unify with its field, a membership over a mismatched
+/// set, a set used in a comparison) is a LOAD-TIME error, so the evaluator only ever runs type-safe
+/// predicates. Each error carries the precise RFC 6901 pointer into the predicate, prefixed by
+/// `base`.
+pub(crate) fn check_predicates(
+    steps: &[Step],
+    transitions: &[Transition],
+    base: &str,
+    errors: &mut Vec<JourneyError>,
+) {
+    for (index, transition) in transitions.iter().enumerate() {
         if let Some(guard) = &transition.guard {
-            let base = format!("/transitions/{index}/guard");
-            collect_predicate_errors(guard, &base, errors);
+            let predicate_base = format!("{base}/transitions/{index}/guard");
+            collect_predicate_errors(guard, &predicate_base, errors);
         }
     }
-    for (index, step) in doc.steps.iter().enumerate() {
+    for (index, step) in steps.iter().enumerate() {
         if let Some(DecisionSpec::Predicate { predicate }) = &step.decision {
-            let base = format!("/steps/{index}/decision/predicate");
-            collect_predicate_errors(predicate, &base, errors);
+            let predicate_base = format!("{base}/steps/{index}/decision/predicate");
+            collect_predicate_errors(predicate, &predicate_base, errors);
         }
     }
 }
@@ -421,7 +614,7 @@ fn collect_predicate_errors(
     errors.extend(type_errors.into_iter().map(JourneyError::PredicateType));
 }
 
-/// The set of subflow ids the journey declares in its `subflows` list.
+/// The set of subflow aliases the journey declares in its `subflows` reference list.
 fn declared_subflow_ids(doc: &Journey) -> BTreeSet<&str> {
     doc.subflows
         .as_deref()
@@ -433,9 +626,13 @@ fn declared_subflow_ids(doc: &Journey) -> BTreeSet<&str> {
 
 /// The set of step ids reachable from the entry by following transitions whose endpoints both
 /// name a declared step. An iterative walk, so a cyclic or deep graph cannot exhaust the stack.
-fn reachable_steps<'a>(doc: &'a Journey, ids: &BTreeSet<&'a str>) -> BTreeSet<&'a str> {
+pub(crate) fn reachable_steps<'a>(
+    entry: &'a str,
+    transitions: &'a [Transition],
+    ids: &BTreeSet<&'a str>,
+) -> BTreeSet<&'a str> {
     let mut adjacency: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-    for transition in &doc.transitions {
+    for transition in transitions {
         if ids.contains(transition.from.as_str()) && ids.contains(transition.to.as_str()) {
             adjacency
                 .entry(transition.from.as_str())
@@ -444,7 +641,7 @@ fn reachable_steps<'a>(doc: &'a Journey, ids: &BTreeSet<&'a str>) -> BTreeSet<&'
         }
     }
     let mut reached: BTreeSet<&str> = BTreeSet::new();
-    let mut stack = vec![doc.entry.as_str()];
+    let mut stack = vec![entry];
     while let Some(node) = stack.pop() {
         if !reached.insert(node) {
             continue;
@@ -456,31 +653,26 @@ fn reachable_steps<'a>(doc: &'a Journey, ids: &BTreeSet<&'a str>) -> BTreeSet<&'
     reached
 }
 
-/// The set of step ids whose kind is terminal.
-fn terminal_step_ids(doc: &Journey) -> BTreeSet<&str> {
-    doc.steps
-        .iter()
-        .filter(|step| step.kind.is_terminal())
-        .map(|step| step.id.as_str())
-        .collect()
-}
-
 /// Check that a step carries exactly the attachments its kind uses: a `subflow_call` names a
 /// subflow to call, a `decision` carries a decision to route on, and neither attachment appears
 /// on a kind that does not use it. Only known kinds are checked; an unknown kind is already
-/// flagged by [`JourneyError::UnknownStepKind`].
-fn check_attachment_coherence(step: &Step, index: usize, errors: &mut Vec<JourneyError>) {
+/// flagged by [`JourneyError::UnknownStepKind`]. `step_ptr` is the RFC 6901 pointer to the step.
+pub(crate) fn check_attachment_coherence(
+    step: &Step,
+    step_ptr: &str,
+    errors: &mut Vec<JourneyError>,
+) {
     match &step.kind {
         StepKind::SubflowCall if step.subflow.is_none() => {
             errors.push(JourneyError::MissingStepAttachment {
-                pointer: format!("/steps/{index}"),
+                pointer: step_ptr.to_owned(),
                 step: step.id.clone(),
                 kind: "subflow_call".to_owned(),
             });
         }
         StepKind::Decision if step.decision.is_none() => {
             errors.push(JourneyError::MissingStepAttachment {
-                pointer: format!("/steps/{index}"),
+                pointer: step_ptr.to_owned(),
                 step: step.id.clone(),
                 kind: "decision".to_owned(),
             });
@@ -491,14 +683,14 @@ fn check_attachment_coherence(step: &Step, index: usize, errors: &mut Vec<Journe
     if step.subflow.is_some() && !matches!(step.kind, StepKind::SubflowCall) && step.kind.is_known()
     {
         errors.push(JourneyError::UnexpectedStepAttachment {
-            pointer: format!("/steps/{index}/subflow"),
+            pointer: format!("{step_ptr}/subflow"),
             step: step.id.clone(),
         });
     }
     // A stray `decision` on a step that is not a `decision`.
     if step.decision.is_some() && !matches!(step.kind, StepKind::Decision) && step.kind.is_known() {
         errors.push(JourneyError::UnexpectedStepAttachment {
-            pointer: format!("/steps/{index}/decision"),
+            pointer: format!("{step_ptr}/decision"),
             step: step.id.clone(),
         });
     }
@@ -580,6 +772,7 @@ mod tests {
                 unguarded("mfa", "done"),
             ],
             subflows: None,
+            subflow_definitions: None,
         }
     }
 
@@ -650,6 +843,7 @@ mod tests {
                     name: "mfa_step_up".to_owned(),
                 },
             }]),
+            subflow_definitions: None,
         };
         assert_eq!(
             validate(&doc),
@@ -688,6 +882,7 @@ mod tests {
             )],
             transitions: vec![],
             subflows: None,
+            subflow_definitions: None,
         };
         assert_eq!(
             validate(&doc),
@@ -714,6 +909,7 @@ mod tests {
             ],
             transitions: vec![unguarded("primary", "trap")],
             subflows: None,
+            subflow_definitions: None,
         };
         assert_eq!(
             validate(&doc),
@@ -739,6 +935,7 @@ mod tests {
             ],
             transitions: vec![unguarded("primary", "call"), unguarded("call", "done")],
             subflows: None,
+            subflow_definitions: None,
         };
         assert_eq!(
             validate(&doc),
@@ -765,6 +962,7 @@ mod tests {
             ],
             transitions: vec![unguarded("primary", "branch"), unguarded("branch", "done")],
             subflows: None,
+            subflow_definitions: None,
         };
         assert_eq!(
             validate(&doc),
@@ -800,6 +998,7 @@ mod tests {
                     name: "mfa_step_up".to_owned(),
                 },
             }]),
+            subflow_definitions: None,
         };
         assert_eq!(
             validate(&doc),
@@ -829,6 +1028,7 @@ mod tests {
             ],
             transitions: vec![unguarded("primary", "done")],
             subflows: None,
+            subflow_definitions: None,
         };
         assert_eq!(
             validate(&doc),
@@ -853,6 +1053,7 @@ mod tests {
             ],
             transitions: vec![unguarded("primary", "done"), unguarded("done", "primary")],
             subflows: None,
+            subflow_definitions: None,
         };
         assert_eq!(
             validate(&doc),
@@ -892,6 +1093,7 @@ mod tests {
             ],
             transitions: vec![unguarded("primary", "a"), unguarded("primary", "b")],
             subflows: None,
+            subflow_definitions: None,
         };
         assert_eq!(
             validate(&doc),
@@ -916,6 +1118,7 @@ mod tests {
             ],
             transitions: vec![unguarded("a", "done")],
             subflows: None,
+            subflow_definitions: None,
         };
         assert_eq!(
             validate(&doc),
@@ -998,6 +1201,7 @@ mod tests {
             ],
             transitions: vec![unguarded("primary", "branch"), unguarded("branch", "done")],
             subflows: None,
+            subflow_definitions: None,
         };
         assert_eq!(
             validate(&doc),

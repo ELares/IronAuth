@@ -407,6 +407,56 @@
       ],
       "type": "string"
     },
+    "Subflow": {
+      "additionalProperties": false,
+      "description": "A reusable sub-flow fragment (issue #92, PR 3): a mini-journey the composition step splices\ninto a calling journey (the inner-tree analog). It mirrors the [`Journey`] shape but is NOT a\nstandalone flow: it has an entry, a set of steps and transitions, and one or more RETURN\npoints (its `exits`). A subflow never mints a session; it always RETURNS to its caller, so a\nsubflow declares no terminal step (a [`StepKind::Terminal`] inside a subflow is a load-time\nerror). Its steps and transitions are validated with the SAME structural rules as a journey's\n(vocabulary, reachability, dead-end, kind and attachment coherence, predicate type-check),\nexcept that the `exits` play the completion role a journey's terminal steps play.\n\n## Composition and return semantics\n\nA [`StepKind::SubflowCall`] step names a subflow. On composition the subflow's fragment is\nspliced into the journey: the transitions that targeted the call step are redirected to the\nsubflow's `entry`, and each of the call step's OUTGOING transitions (the RETURN edges) is\ngrafted onto every one of the subflow's `exits`, so control flows into the subflow at its\nentry and returns to the caller from its exits. Each exit is a leaf step (no outgoing\ntransition within the subflow); its own kind executor runs, and on completion routing follows\nthe caller's return edges. Composition is a pure, load-time splice: it never runs at flow time.\n\nAn unknown property is a hard parse error (`deny_unknown_fields`).",
+      "properties": {
+        "comment": {
+          "description": "An optional human-readable comment about the subflow (data, round-trip-safe).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "entry": {
+          "description": "The entry step: the step id control enters the subflow at.",
+          "type": "string"
+        },
+        "exits": {
+          "description": "The return points: the step ids control returns to the caller from. Each must name a\ndeclared step that is a leaf (no outgoing transition within the subflow) and is not a\nterminal. A subflow declares at least one exit.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "id": {
+          "description": "The subflow definition id (the key an inline [`SubflowSource::Inline`] reference and a\nnested [`StepKind::SubflowCall`] resolve against). Unique across the artifact's inline\ndefinitions and distinct from every built-in subflow name.",
+          "type": "string"
+        },
+        "steps": {
+          "description": "The steps this subflow can occupy, in document order (the same shape as a journey's steps).",
+          "items": {
+            "$ref": "#/$defs/Step"
+          },
+          "type": "array"
+        },
+        "transitions": {
+          "description": "The transitions between the subflow's steps, in document order.",
+          "items": {
+            "$ref": "#/$defs/Transition"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "entry",
+        "exits",
+        "steps",
+        "transitions"
+      ],
+      "type": "object"
+    },
     "SubflowRef": {
       "additionalProperties": false,
       "description": "A subflow reference a journey can call (issue #92): a document-local id and its source. PR\n1 parses and validates the SHAPE only; full subflow composition is PR 3. An unknown\nproperty is a hard parse error (`deny_unknown_fields`).",
@@ -541,8 +591,18 @@
       },
       "type": "array"
     },
+    "subflow_definitions": {
+      "description": "The inline subflow DEFINITIONS this artifact carries (issue #92, PR 3), or [`None`] when it\ncarries none. A [`SubflowRef`] with an [`SubflowSource::Inline`] source resolves to the\ndefinition here whose `id` matches its `subflow_id`. Distinct from the `subflows` REFERENCE\nlist: `subflows` declares which subflows a journey uses (alias plus source), while\n`subflow_definitions` carries the reusable fragment bodies themselves. A single definition\nis a shared, id-resolved fragment: two journeys that reference the same definition compile\nagainst the same body (edit-once-both-change), with version pinning layered on in a later PR.",
+      "items": {
+        "$ref": "#/$defs/Subflow"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
     "subflows": {
-      "description": "The subflow references this journey can call, or [`None`] when it calls none.",
+      "description": "The subflow references this journey can call, or [`None`] when it calls none. Each\nreference maps a document-local alias id to its source (a built-in subflow or an inline\ndefinition), and a [`StepKind::SubflowCall`] step names the alias.",
       "items": {
         "$ref": "#/$defs/SubflowRef"
       },
