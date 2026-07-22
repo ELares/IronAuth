@@ -44,8 +44,8 @@ use super::model::Journey;
 pub(super) fn builtin_compiled(journey: Journey) -> Option<&'static CompiledJourney> {
     match journey {
         Journey::Login => Some(login_compiled()),
-        Journey::Registration
-        | Journey::Recovery
+        Journey::Registration => Some(registration_compiled()),
+        Journey::Recovery
         | Journey::Mfa
         | Journey::Federation
         | Journey::Consent
@@ -154,6 +154,57 @@ fn login_artifact() -> JourneyDoc {
     }
 }
 
+/// The compiled registration artifact, compiled once and shared (issue #92, PR 8c).
+///
+/// # Panics
+///
+/// Never in practice: the fixed registration artifact is load-valid by construction (a
+/// compile-time verified fixture, pinned by `registration_artifact_compiles_and_pins_its_shape`
+/// and the projection tests), so the `expect` is a programming-error guard, not a runtime path.
+fn registration_compiled() -> &'static CompiledJourney {
+    static COMPILED: OnceLock<CompiledJourney> = OnceLock::new();
+    COMPILED.get_or_init(|| {
+        compile_builtin(&registration_artifact())
+            .expect("the embedded built-in registration journey compiles")
+    })
+}
+
+/// The embedded built-in REGISTRATION artifact (issue #92, PR 8c): the SIMPLEST mint-family
+/// journey, a two-step guard-free machine (details form, then a terminal mint).
+///
+/// Registration does not step up to MFA or profiling: the account is created inside the
+/// [`StepKind::Registration`] executor and the session mints immediately on a genuine create, so
+/// the artifact needs no MFA / profiling steps and no guards (contrast the login artifact's five
+/// guarded steps). The uniform acknowledgment ([`FlowStateTag::RegistrationAck`](super::model::FlowStateTag))
+/// is NOT a routed step: it is a render-override the SAME `register` executor emits while the flow
+/// stays OPEN (see [`super::wire_identity::render_override_states`]), so it needs no edge or step of
+/// its own. The single unconditional `register -> done` edge is the one forward path a genuine
+/// account create takes to the terminal. The `node_group` is validation metadata only
+/// (`enter_step_nodes` renders through fixed builders and never routes into the entry step).
+///
+/// [`StepKind::Registration`] is built-in-only ([`StepKind::is_builtin_only`]), so this artifact
+/// compiles ONLY through [`compile_builtin`], never the stricter [`ironauth_journey::compile`] a
+/// custom-authored journey uses.
+fn registration_artifact() -> JourneyDoc {
+    JourneyDoc {
+        schema_version: JOURNEY_SCHEMA_VERSION.to_owned(),
+        id: "builtin_registration".to_owned(),
+        engine_version: JOURNEY_ENGINE_VERSION,
+        entry: "register".to_owned(),
+        comment: None,
+        steps: vec![
+            step("register", StepKind::Registration, Some("password")),
+            step("done", StepKind::Terminal, None),
+        ],
+        // One unconditional forward edge: a genuine account create advances the register step, and
+        // the walk takes this fallback edge to the terminal mint. The Ack and details re-renders
+        // stay on the register step (a render-override / a plain render), never advancing.
+        transitions: vec![edge("register", "done")],
+        subflows: None,
+        subflow_definitions: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,6 +229,27 @@ mod tests {
             "the direct-mint fallback edge is unguarded"
         );
         // Every step is reachable and a completion is reachable (liveness).
+        assert!(compiled.reachable().contains("done"));
+    }
+
+    #[test]
+    fn registration_artifact_compiles_and_pins_its_shape() {
+        // The embedded registration artifact is load-valid and compiles cleanly, and its topology
+        // is the two-step guard-free machine PR 8c flips the imperative registration journey onto.
+        let compiled = registration_compiled();
+        assert_eq!(compiled.entry, "register");
+        assert_eq!(compiled.steps.len(), 2);
+        // The register step has exactly one forward edge, and it is the unguarded direct-mint
+        // fallback to the terminal (registration is guard-free, the whole reason it is the simplest
+        // mint-family journey).
+        let register_edges = compiled.edges("register");
+        assert_eq!(register_edges.len(), 1);
+        assert_eq!(register_edges[0].to, "done");
+        assert!(
+            register_edges[0].guard.is_none(),
+            "the direct-mint edge is unguarded"
+        );
+        // The terminal is reachable (liveness).
         assert!(compiled.reachable().contains("done"));
     }
 }

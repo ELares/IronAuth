@@ -88,6 +88,34 @@ pub(super) fn wire_state_for(journey: Journey, step_kind: &StepKind) -> FlowStat
     }
 }
 
+/// The render-override wire states a step can emit BEFORE routing (issue #92, PR 8c): the
+/// non-terminal acknowledgments an executor renders via
+/// [`StepOutcome::Render.state_override`](super::orchestration) while the flow stays OPEN, WITHOUT
+/// advancing the compiled walk.
+///
+/// Registration's uniform [`FlowStateTag::RegistrationAck`] is the only one: the `register`
+/// executor renders it (the closed-mode anti-enumeration ack, or the waitlist pending notice) on a
+/// DIFFERENT wire state than its own [`FlowStateTag::RegistrationDetails`], but it does NOT route to
+/// a distinct step (no edge, no executor of its own), so it is a render-override rather than a
+/// [`wire_state_for`] step kind. Teaching [`super::inspect::project_plan`] and the
+/// [`super::orchestration::builtin_step_for`] reverse-map about it keeps the projected plan and the
+/// resubmit-after-ack fold faithful to the imperative driver without a phantom step or a
+/// [`JOURNEY_ENGINE_VERSION`](ironauth_journey::JOURNEY_ENGINE_VERSION) bump.
+///
+/// Every other `(journey, kind)` has none. Recovery's ack is a REAL routed step
+/// ([`StepKind::RecoveryVerify`] mapping to [`FlowStateTag::RecoveryAck`] via [`wire_state_for`]),
+/// so it returns `&[]` here and keeps projecting naturally; the two are fully independent.
+#[must_use]
+pub(super) fn render_override_states(
+    journey: Journey,
+    step_kind: &StepKind,
+) -> &'static [FlowStateTag] {
+    match (journey, step_kind) {
+        (Journey::Registration, StepKind::Registration) => &[FlowStateTag::RegistrationAck],
+        _ => &[],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,6 +175,34 @@ mod tests {
             wire_state_for(Journey::Recovery, &StepKind::RecoveryVerify),
             FlowStateTag::RecoveryAck
         );
+    }
+
+    #[test]
+    fn registration_emits_the_ack_as_a_render_override_and_nothing_else_does() {
+        // Registration's uniform Ack is a render-override on the register step, not a routed step.
+        assert_eq!(
+            render_override_states(Journey::Registration, &StepKind::Registration),
+            &[FlowStateTag::RegistrationAck]
+        );
+        // Every other (journey, kind) has no render-override; recovery's ack is a REAL routed step
+        // (RecoveryVerify -> RecoveryAck via wire_state_for), so it is empty here.
+        for kind in [
+            StepKind::IdentifierPassword,
+            StepKind::Terminal,
+            StepKind::RecoveryStart,
+            StepKind::RecoveryVerify,
+        ] {
+            assert!(
+                render_override_states(Journey::Registration, &kind).is_empty(),
+                "no override for {kind:?} under registration"
+            );
+        }
+        for journey in [Journey::Login, Journey::Recovery, Journey::Custom] {
+            assert!(
+                render_override_states(journey, &StepKind::Registration).is_empty(),
+                "no override for {journey:?}"
+            );
+        }
     }
 
     #[test]

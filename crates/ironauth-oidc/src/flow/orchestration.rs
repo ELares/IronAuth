@@ -48,11 +48,11 @@ use super::builtin_artifacts::builtin_compiled;
 use super::eval_ctx::assemble_eval_context;
 use super::message::Message;
 use super::model::{CONTRACT_VERSION, Flow, FlowStateTag, Journey, Node, Transport};
-use super::wire_identity::wire_state_for;
+use super::wire_identity::{render_override_states, wire_state_for};
 use super::{
     Continuation, FlowError, PersistedState, Submission, build_flow, consume_and_complete,
     generate_submit_token, login, login_follow_through, method_tokens, mfa,
-    normalize_transient_payload, persist_and_render, profiling,
+    normalize_transient_payload, persist_and_render, profiling, registration,
 };
 use crate::authn::{AuthMethod, AuthenticationEvent};
 use crate::interaction;
@@ -853,14 +853,55 @@ async fn run_step_executor(
                 }
             }
         }
+        // The REGISTRATION journey (issue #92, PR 8c): the SAME `advance_registration` executor the
+        // imperative `drive_registration` runs, reusing every #64/#80/#82 defense unchanged. Its
+        // three outcomes map onto the table engine's vocabulary:
+        //
+        // - `Render` (a validation error / throttle / open-mode duplicate) stays on the details
+        //   state with NO override, byte-identical to the imperative re-render;
+        // - `Ack` (the closed-mode anti-enumeration acknowledgment, or the waitlist pending notice)
+        //   renders EMPTY nodes plus the one flow-level ack message and OVERRIDES the wire state to
+        //   the interstitial RegistrationAck, so the flow advances its wire position while staying
+        //   OPEN (no consume);
+        // - `Complete` (a genuine account create) records the subject and the honest `pwd` primary
+        //   method token and ADVANCES: the single unguarded `register -> done` edge routes to the
+        //   terminal, where `complete_via_table` mints the first session. `success.event` and
+        //   `success.actor` are DROPPED (as login drops `LoginStep::Complete`'s event):
+        //   `complete_via_table` rebuilds `AuthenticationEvent::from_methods(&[Password], ...)` and
+        //   `interaction::user_actor`, identical in every rendered field.
+        StepKind::Registration => {
+            match registration::advance_registration(state, scope, record, submission, headers)
+                .await?
+            {
+                registration::RegistrationStep::Render { nodes, messages } => {
+                    Ok(StepOutcome::Render {
+                        nodes,
+                        messages,
+                        state_override: None,
+                    })
+                }
+                registration::RegistrationStep::Ack { message_id } => Ok(StepOutcome::Render {
+                    nodes: registration::ack_nodes(),
+                    messages: vec![Message::of(message_id)],
+                    state_override: Some(FlowStateTag::RegistrationAck),
+                }),
+                registration::RegistrationStep::Complete(success) => {
+                    scratch.subject = Some(success.subject.clone());
+                    scratch.methods = method_tokens(&[AuthMethod::Password]);
+                    scratch.enroll_credential = None;
+                    Ok(StepOutcome::Advance {
+                        signals: SignalSet::new(),
+                    })
+                }
+            }
+        }
         // A decision, terminal, or subflow_call step is never a client-submittable render: the
-        // engine routes THROUGH it, it does not advance it by a submission. The mint-family kinds
-        // (issue #92, PR 8a) are built-in-only and not wired to their executors until the
-        // per-journey convergence PRs (8c registration, 8d recovery); a custom artifact cannot name
-        // them and no built-in is table-driven yet, so they are unreachable on a live flow too. A
-        // uniform not found, never an oracle.
-        StepKind::Registration
-        | StepKind::RecoveryStart
+        // engine routes THROUGH it, it does not advance it by a submission. The remaining
+        // mint-family kinds (issue #92, PR 8a) are built-in-only and not wired to their executors
+        // until the recovery convergence PR (8d); a custom artifact cannot name them and no built-in
+        // routes into one yet, so they are unreachable on a live flow too. A uniform not found,
+        // never an oracle.
+        StepKind::RecoveryStart
         | StepKind::RecoveryVerify
         | StepKind::Decision
         | StepKind::Terminal
@@ -1064,6 +1105,13 @@ fn table_state(
 /// a uniform not found, never an oracle). A genuine custom journey never uses this (it holds the
 /// concrete step in `custom_step`).
 ///
+/// A step also reverse-maps from any RENDER-OVERRIDE wire state it can emit (issue #92, PR 8c):
+/// registration persists on [`FlowStateTag::RegistrationAck`] after an Ack render while the flow
+/// stays OPEN, so a resubmit re-enters with `persisted.step == RegistrationAck` and must fold back
+/// to the `register` step, re-running `advance_registration` exactly as the imperative
+/// `drive_registration` (which ignores the persisted step) does. [`render_override_states`] supplies
+/// those states, so the fold is single-sourced with the projection.
+///
 /// Sharp edge that stays fail closed: [`wire_state_for`] folds a built-in Terminal to the flat
 /// `FlowStateTag::Custom`, so a tampered login row carrying `step = custom` reverse-maps to the
 /// Terminal step rather than an immediate not found. The Terminal step has no runnable executor, so
@@ -1077,7 +1125,10 @@ fn builtin_step_for(
     compiled
         .steps
         .iter()
-        .find(|(_, step)| wire_state_for(journey, &step.kind) == tag)
+        .find(|(_, step)| {
+            wire_state_for(journey, &step.kind) == tag
+                || render_override_states(journey, &step.kind).contains(&tag)
+        })
         .map(|(id, _)| id.as_str())
 }
 
@@ -1120,6 +1171,12 @@ async fn builtin_fenced_nodes(
                 },
                 Err(_) => Vec::new(),
             }
+        }
+        // Registration's pre-terminal step is the `register` details step (issue #92, PR 8c): the
+        // imperative `drive_registration` fences the details form on the rare central-fence TOCTOU,
+        // so reproduce it exactly. Registration runs NO post-mint reset (`post_reset` stays None).
+        (Journey::Registration, StepKind::Registration) => {
+            registration::start_nodes(transport, flow_id)
         }
         // A genuine custom journey (and any not-yet-converged built-in) carries no built-in
         // fallback form: its wire state renders from its own nodes, so the fence is empty.

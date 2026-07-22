@@ -39,7 +39,7 @@ use ironauth_journey::{CompiledJourney, StepKind};
 use ironauth_store::{FlowRecord, Scope};
 
 use super::model::{Flow, FlowStateTag, Journey, Node, Transport};
-use super::wire_identity::wire_state_for;
+use super::wire_identity::{render_override_states, wire_state_for};
 use super::{PersistedState, build_flow, federation, login, mfa, recovery, registration};
 use crate::risk::{RiskAction, RiskDecision, RiskLevel, SignalOutcome, decide_from_signals};
 use crate::step_up::{self, AuthnRequirement, Satisfaction};
@@ -166,6 +166,16 @@ pub fn project_plan(journey: Journey, compiled: &CompiledJourney) -> Vec<FlowSta
             if let Some(tag) = projected_state(journey, &step.kind) {
                 if !plan.contains(&tag) {
                     plan.push(tag);
+                }
+            }
+            // A step may also emit a render-override wire state BEFORE routing (issue #92, PR 8c):
+            // a non-terminal acknowledgment the executor renders while the flow stays OPEN
+            // (registration's uniform RegistrationAck). It has no edge or step of its own, so the
+            // BFS would miss it; project it right after the step's own state, in order, deduped by
+            // the same `plan.contains` guard.
+            for tag in render_override_states(journey, &step.kind) {
+                if !plan.contains(tag) {
+                    plan.push(*tag);
                 }
             }
         }
@@ -948,7 +958,8 @@ mod tests {
 
     #[test]
     fn project_plan_maps_the_registration_mint_family_kind() {
-        // A built-in-only mint-family kind projects to its real wire state, and the terminal to the
+        // A built-in-only mint-family kind projects to its real wire state, then its render-override
+        // (registration's uniform RegistrationAck, issue #92 PR 8c), and the terminal to the
         // Completed plan terminal.
         let compiled = linear_builtin_journey(
             "registration_like",
@@ -956,7 +967,28 @@ mod tests {
         );
         assert_eq!(
             project_plan(Journey::Registration, &compiled),
-            vec![FlowStateTag::RegistrationDetails, FlowStateTag::Completed]
+            vec![
+                FlowStateTag::RegistrationDetails,
+                FlowStateTag::RegistrationAck,
+                FlowStateTag::Completed
+            ]
+        );
+    }
+
+    #[test]
+    fn registration_plan_projection_pins_the_static_list() {
+        // The projection pin (issue #92, PR 8c): the EMBEDDED registration artifact, driven through
+        // the table engine, projects to the SAME ordered plan the static
+        // `Journey::Registration.plan()` lists, `[RegistrationDetails, RegistrationAck, Completed]`.
+        // The RegistrationAck is contributed by the render-override projection (registration's ack
+        // is not a routed step); this locks that the projected plan equals the old static list. PR
+        // 8e retires the static arm once every mint-family journey is pinned.
+        let compiled = super::super::builtin_artifacts::builtin_compiled(Journey::Registration)
+            .expect("the registration journey has an embedded artifact");
+        assert_eq!(
+            project_plan(Journey::Registration, compiled),
+            Journey::Registration.plan().to_vec(),
+            "the projected registration plan equals the static Journey::Registration.plan()"
         );
     }
 
