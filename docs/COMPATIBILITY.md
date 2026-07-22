@@ -17,6 +17,7 @@ table is the authoritative list of artifacts and their versions at HEAD.
 | ironauth-import | 0.1.0 | library | 1.85 |
 | ironauth-importers | 0.1.0 | library | 1.85 |
 | ironauth-jose | 0.1.0 | library | 1.85 |
+| ironauth-journey | 0.1.0 | library | 1.85 |
 | ironauth-kms | 0.1.0 | library | 1.85 |
 | ironauth-oidc | 0.1.0 | library | 1.85 |
 | ironauth-quota | 0.1.0 | library | 1.85 |
