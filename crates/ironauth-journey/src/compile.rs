@@ -111,10 +111,33 @@ impl CompiledJourney {
 /// failures, an unresolved or cyclic subflow reference, or [`JourneyError::ComposedTooLarge`]),
 /// plus [`JourneyError::NoReachableCompletion`] when no terminal step is reachable from the entry.
 pub fn compile(doc: &Journey) -> Result<CompiledJourney, Vec<JourneyError>> {
+    compile_inner(doc, crate::validate::BUILTIN_ONLY_REJECTED)
+}
+
+/// Compile an EMBEDDED BUILT-IN journey artifact into the engine's transition table (issue #92,
+/// PR 8a): identical to [`compile`] except that the BUILT-IN-ONLY mint-family step kinds
+/// ([`StepKind::is_builtin_only`]) are ADMITTED, so the built-in login/registration/recovery
+/// journeys that converge onto the compiled table lower cleanly. A custom-authored artifact still
+/// uses [`compile`], which refuses those kinds with [`JourneyError::BuiltinOnlyStepKind`].
+///
+/// # Errors
+///
+/// The same failures [`compile`] reports, minus the built-in-only rejection.
+pub fn compile_builtin(doc: &Journey) -> Result<CompiledJourney, Vec<JourneyError>> {
+    compile_inner(doc, crate::validate::BUILTIN_ONLY_ADMITTED)
+}
+
+/// Compile a journey into the engine's transition table (issue #92), with `admit_builtin_only`
+/// selecting the custom ([`compile`]) or embedded built-in ([`compile_builtin`]) validation
+/// context.
+fn compile_inner(
+    doc: &Journey,
+    admit_builtin_only: bool,
+) -> Result<CompiledJourney, Vec<JourneyError>> {
     // Compose validates the source (structure, references, acyclicity), inlines every subflow,
     // and re-validates the flattened result, so the table is built from a validate-clean journey
     // with no remaining subflow_call step. This subsumes a standalone validate pass.
-    let flat = crate::subflow::compose(doc)?;
+    let flat = crate::subflow::compose_inner(doc, admit_builtin_only)?;
 
     let mut steps: BTreeMap<StepId, CompiledStep> = BTreeMap::new();
     for step in &flat.steps {
@@ -359,6 +382,47 @@ mod tests {
             compile(&doc),
             Err(vec![JourneyError::NoReachableCompletion])
         );
+    }
+
+    #[test]
+    fn compile_rejects_a_builtin_only_kind_but_compile_builtin_admits_it() {
+        // A journey whose entry is a mint-family kind: the custom `compile` refuses it (a custom
+        // author cannot mint accounts / sessions), while `compile_builtin` lowers it for the
+        // embedded built-in journeys.
+        let doc = Journey {
+            schema_version: JOURNEY_SCHEMA_VERSION.to_owned(),
+            id: "registration".to_owned(),
+            engine_version: JOURNEY_ENGINE_VERSION,
+            entry: "details".to_owned(),
+            comment: None,
+            steps: vec![
+                step("details", StepKind::Registration, Some("password")),
+                step("done", StepKind::Terminal, None),
+            ],
+            transitions: vec![Transition {
+                from: "details".to_owned(),
+                to: "done".to_owned(),
+                guard: None,
+                comment: None,
+            }],
+            subflows: None,
+            subflow_definitions: None,
+        };
+        let errors = compile(&doc).expect_err("the custom compile refuses a built-in-only kind");
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                JourneyError::BuiltinOnlyStepKind { kind, .. } if kind == "registration"
+            )),
+            "expected a BuiltinOnlyStepKind, got {errors:?}"
+        );
+        // The embedded built-in compile lowers it, and the mint-family step survives to the table.
+        let compiled = compile_builtin(&doc).expect("compile_builtin admits the mint-family kind");
+        assert_eq!(
+            compiled.step("details").map(|s| s.kind.clone()),
+            Some(StepKind::Registration)
+        );
+        assert!(compiled.reachable().contains("done"));
     }
 
     #[test]

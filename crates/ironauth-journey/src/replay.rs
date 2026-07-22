@@ -737,10 +737,17 @@ fn route_hop(compiled: &CompiledJourney, start: &str, base: &EvalContext) -> Hop
             StepKind::Decision => {
                 cursor = next_id;
             }
+            // Every renderable executor kind (the login/MFA/profiling kinds and, from PR 8a, the
+            // mint-family registration and recovery kinds) settles the walk: control lands there and
+            // awaits the next submission. The mint itself happens on that step's own submission, not
+            // on this routing hop, so a landed mint-family step is non-terminal here.
             StepKind::IdentifierPassword
             | StepKind::MfaChallenge
             | StepKind::MfaEnroll
-            | StepKind::ProgressiveProfiling => {
+            | StepKind::ProgressiveProfiling
+            | StepKind::Registration
+            | StepKind::RecoveryStart
+            | StepKind::RecoveryVerify => {
                 return HopOutcome::Landed {
                     to: next_id,
                     terminal: false,

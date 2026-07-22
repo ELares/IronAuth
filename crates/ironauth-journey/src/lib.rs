@@ -47,15 +47,17 @@ pub use artifact::{
     Journey, Literal, MemberSet, Predicate, Step, StepId, StepKind, Subflow, SubflowId, SubflowRef,
     SubflowSource, Transition,
 };
-pub use compile::{CompiledJourney, CompiledStep, GuardedEdge, compile};
+pub use compile::{CompiledJourney, CompiledStep, GuardedEdge, compile, compile_builtin};
 pub use eval::{
     DecisionEvaluator, EvalContext, FlowContext, MAX_PREDICATE_DEPTH, OutcomeSignal,
     PredicateError, PredicateTypeError, RiskLevel, RiskView, SignalSet, evaluate,
     typecheck_predicate,
 };
 pub use schema::journey_object_schema;
-pub use subflow::{BUILTIN_MFA_STEP_UP, MAX_COMPOSED_STEPS, builtin_subflows, compose};
+pub use subflow::{
+    BUILTIN_MFA_STEP_UP, MAX_COMPOSED_STEPS, builtin_subflows, compose, compose_builtin,
+};
 pub use template::{
     TEMPLATE_IDENTIFIER_FIRST_CONDITIONAL_MFA, TemplateInvocation, materialize, template_ids,
 };
-pub use validate::{JourneyError, NODE_GROUPS, validate};
+pub use validate::{JourneyError, NODE_GROUPS, validate, validate_builtin};

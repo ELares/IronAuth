@@ -18,7 +18,15 @@ use serde::{Deserialize, Serialize};
 /// (see [`crate::JourneyError::EngineIncompatible`]). It is DISTINCT from the rendered flow
 /// contract version: the artifact compiles down to the engine's table, it never renders as a
 /// flow object directly.
-pub const JOURNEY_ENGINE_VERSION: u32 = 1;
+///
+/// Bumped to 2 for issue #92 (PR 8a, engine convergence): the [`StepKind`] vocabulary gains the
+/// three BUILT-IN-ONLY mint-family kinds ([`StepKind::Registration`],
+/// [`StepKind::RecoveryStart`], [`StepKind::RecoveryVerify`]) the embedded built-in journeys
+/// converge onto. The addition is purely ADDITIVE: the compatibility check refuses only an
+/// artifact declaring a version GREATER than this, so a version-1 artifact (which cannot name any
+/// of the new kinds) still loads unchanged. The rendered flow contract version is independent and
+/// unaffected.
+pub const JOURNEY_ENGINE_VERSION: u32 = 2;
 
 /// The stable artifact format tag every journey document carries in its `schema_version`
 /// field. It names the on-the-wire shape (the JSON canonical form), independent of the
@@ -176,15 +184,33 @@ pub enum StepKind {
     SubflowCall,
     /// A terminal step: the journey leaves it only by completing.
     Terminal,
+    /// The registration details (identifier plus password) first factor that CREATES an account
+    /// and mints the first session (issue #92, PR 8a). A BUILT-IN-ONLY kind: it may appear only in
+    /// an embedded built-in artifact, never a custom-authored one (see [`StepKind::is_builtin_only`]),
+    /// because it creates accounts and mints sessions. It wraps the existing
+    /// `registration::advance_registration` primitive.
+    Registration,
+    /// The recovery identifier entry that initiates account recovery (issue #92, PR 8a): the
+    /// anti-enumeration start step that delivers the one-time code uniformly. A BUILT-IN-ONLY kind
+    /// (it drives a session-minting recovery), it routes to [`StepKind::RecoveryVerify`] by an
+    /// UNCONDITIONAL edge, so it introduces no new outcome signal. It wraps
+    /// `recovery::advance_start`.
+    RecoveryStart,
+    /// The recovery one-time-code verification that mints the session on a genuine proof (issue
+    /// #92, PR 8a): the uniform acknowledgment plus code entry. A BUILT-IN-ONLY kind (it mints a
+    /// session and runs the post-mint counter reset), it wraps `recovery::advance_verify`.
+    RecoveryVerify,
     /// Not a built-in kind: an unrecognized wire value, preserved so the load-time validator
     /// can reject it cleanly. Carries the offending kind string.
     Unknown(String),
 }
 
 impl StepKind {
-    /// The seven built-in kind wire strings, in declaration order. This is the closed set the
-    /// published JSON Schema enumerates and the load-time validator accepts.
-    pub const BUILT_IN: [&'static str; 7] = [
+    /// The ten built-in kind wire strings, in declaration order. This is the closed set the
+    /// published JSON Schema enumerates and the load-time validator accepts. The three
+    /// mint-family kinds ([`StepKind::Registration`], [`StepKind::RecoveryStart`],
+    /// [`StepKind::RecoveryVerify`]) are BUILT-IN-ONLY (see [`StepKind::is_builtin_only`]).
+    pub const BUILT_IN: [&'static str; 10] = [
         "identifier_password",
         "mfa_challenge",
         "mfa_enroll",
@@ -192,6 +218,9 @@ impl StepKind {
         "decision",
         "subflow_call",
         "terminal",
+        "registration",
+        "recovery_start",
+        "recovery_verify",
     ];
 
     /// The wire string for this kind. For [`StepKind::Unknown`] it is the offending value the
@@ -206,6 +235,9 @@ impl StepKind {
             StepKind::Decision => "decision",
             StepKind::SubflowCall => "subflow_call",
             StepKind::Terminal => "terminal",
+            StepKind::Registration => "registration",
+            StepKind::RecoveryStart => "recovery_start",
+            StepKind::RecoveryVerify => "recovery_verify",
             StepKind::Unknown(raw) => raw.as_str(),
         }
     }
@@ -222,6 +254,9 @@ impl StepKind {
             "decision" => StepKind::Decision,
             "subflow_call" => StepKind::SubflowCall,
             "terminal" => StepKind::Terminal,
+            "registration" => StepKind::Registration,
+            "recovery_start" => StepKind::RecoveryStart,
+            "recovery_verify" => StepKind::RecoveryVerify,
             other => StepKind::Unknown(other.to_owned()),
         }
     }
@@ -230,6 +265,29 @@ impl StepKind {
     #[must_use]
     pub fn is_known(&self) -> bool {
         !matches!(self, StepKind::Unknown(_))
+    }
+
+    /// Whether this kind may appear ONLY in an EMBEDDED built-in artifact, never a custom-authored
+    /// one (issue #92, PR 8a). The three mint-family kinds ([`StepKind::Registration`],
+    /// [`StepKind::RecoveryStart`], [`StepKind::RecoveryVerify`]) CREATE accounts or MINT sessions
+    /// through fixed built-in ceremonies, so a custom author must not be able to name them (a
+    /// custom journey cannot mint an arbitrary account or session): the load-time validator refuses
+    /// one in a custom artifact with [`crate::JourneyError::BuiltinOnlyStepKind`], while
+    /// [`crate::compile_builtin`] admits them for the embedded built-in journeys that converge onto
+    /// the compiled table.
+    ///
+    /// The pre-existing kinds ([`StepKind::IdentifierPassword`], the MFA kinds, and
+    /// [`StepKind::ProgressiveProfiling`]) STAY custom-usable exactly as before: although
+    /// `identifier_password` and the MFA kinds also prove factors, they authenticate an EXISTING
+    /// subject the primary factor established and never create an account, and the AC1 custom
+    /// fixture composes them, so they are not built-in-only. Only the account-creating and
+    /// recovery-minting kinds are gated.
+    #[must_use]
+    pub fn is_builtin_only(&self) -> bool {
+        matches!(
+            self,
+            StepKind::Registration | StepKind::RecoveryStart | StepKind::RecoveryVerify
+        )
     }
 
     /// Whether this is the terminal kind (a step the journey leaves only by completing).
@@ -590,6 +648,38 @@ mod tests {
         let unknown: StepKind = serde_json::from_str("\"teleport\"").expect("deserialize");
         assert_eq!(unknown, StepKind::Unknown("teleport".to_owned()));
         assert!(!unknown.is_known());
+    }
+
+    #[test]
+    fn the_three_mint_family_kinds_are_built_in_only() {
+        // The new PR 8a kinds are BUILT-IN-ONLY: they create accounts or mint recovery sessions.
+        for wire in ["registration", "recovery_start", "recovery_verify"] {
+            let kind = StepKind::from_wire(wire);
+            assert!(kind.is_known(), "{wire} is a known built-in kind");
+            assert!(kind.is_builtin_only(), "{wire} is built-in-only");
+            assert!(
+                StepKind::BUILT_IN.contains(&wire),
+                "{wire} is in the closed built-in set"
+            );
+        }
+        // The pre-existing kinds stay custom-usable (not built-in-only), including the ones that
+        // prove factors for an already-established subject.
+        for wire in [
+            "identifier_password",
+            "mfa_challenge",
+            "mfa_enroll",
+            "progressive_profiling",
+            "decision",
+            "subflow_call",
+            "terminal",
+        ] {
+            assert!(
+                !StepKind::from_wire(wire).is_builtin_only(),
+                "{wire} stays custom-usable"
+            );
+        }
+        // The closed built-in set grew from seven to ten.
+        assert_eq!(StepKind::BUILT_IN.len(), 10);
     }
 
     #[test]

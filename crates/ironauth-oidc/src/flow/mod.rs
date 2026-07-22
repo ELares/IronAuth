@@ -48,6 +48,7 @@ mod registration;
 mod render;
 mod signup_fields;
 mod transport;
+mod wire_identity;
 
 pub use golden::{GoldenFlow, golden_corpus, golden_flows};
 pub use localize::{

@@ -54,6 +54,18 @@ pub enum JourneyError {
         /// The unrecognized kind name.
         kind: String,
     },
+    /// A CUSTOM-authored artifact declares a BUILT-IN-ONLY step kind (issue #92, PR 8a): one of the
+    /// mint-family kinds ([`StepKind::Registration`], [`StepKind::RecoveryStart`],
+    /// [`StepKind::RecoveryVerify`]) that CREATE accounts or MINT sessions through fixed built-in
+    /// ceremonies. A custom author must not be able to name these (see [`StepKind::is_builtin_only`]),
+    /// so [`validate`] refuses one here while [`crate::compile_builtin`] admits them for the embedded
+    /// built-in journeys.
+    BuiltinOnlyStepKind {
+        /// The RFC 6901 pointer to the offending `kind`.
+        pointer: String,
+        /// The built-in-only kind name a custom artifact may not use.
+        kind: String,
+    },
     /// A step names a node group outside the existing node-group vocabulary
     /// ([`NODE_GROUPS`], fork F6).
     UnknownNodeGroup {
@@ -276,6 +288,12 @@ impl fmt::Display for JourneyError {
             JourneyError::UnknownStepKind { pointer, kind } => {
                 write!(f, "unknown step kind {kind} at {pointer}")
             }
+            JourneyError::BuiltinOnlyStepKind { pointer, kind } => {
+                write!(
+                    f,
+                    "built-in-only step kind {kind} at {pointer} is not allowed in a custom journey"
+                )
+            }
             JourneyError::UnknownNodeGroup { pointer, group } => {
                 write!(f, "unknown node group {group} at {pointer}")
             }
@@ -418,23 +436,49 @@ impl std::error::Error for JourneyError {}
 ///
 /// A non-empty [`Vec`] of [`JourneyError`], one per structural failure, in document order.
 pub fn validate(doc: &Journey) -> Result<(), Vec<JourneyError>> {
-    validate_inner(doc, RESERVED_IDS_REJECTED)
+    validate_inner(doc, RESERVED_IDS_REJECTED, BUILTIN_ONLY_REJECTED)
+}
+
+/// Validate a journey artifact in the EMBEDDED BUILT-IN context (issue #92, PR 8a): identical to
+/// [`validate`] except that the BUILT-IN-ONLY mint-family step kinds
+/// ([`StepKind::is_builtin_only`]) are ADMITTED. The embedded built-in journeys that converge onto
+/// the compiled table (login/mfa/profiling/registration/recovery) declare these kinds; a
+/// custom-authored artifact must not, so the public [`validate`] refuses them.
+///
+/// # Errors
+///
+/// A non-empty [`Vec`] of [`JourneyError`], one per structural failure, in document order (the same
+/// checks [`validate`] runs, minus the built-in-only rejection).
+pub fn validate_builtin(doc: &Journey) -> Result<(), Vec<JourneyError>> {
+    validate_inner(doc, RESERVED_IDS_REJECTED, BUILTIN_ONLY_ADMITTED)
 }
 
 /// Reject an author step id that uses the reserved namespace separator (the public [`validate`]
 /// entry point uses this).
-const RESERVED_IDS_REJECTED: bool = true;
+pub(crate) const RESERVED_IDS_REJECTED: bool = true;
 
 /// Admit the reserved namespace separator in step ids (the post-composition re-validation uses this,
 /// because composition itself mints the only legitimate `::` ids).
 pub(crate) const RESERVED_IDS_ADMITTED: bool = false;
 
+/// Reject a BUILT-IN-ONLY step kind (issue #92, PR 8a): the CUSTOM validation context (the public
+/// [`validate`]) refuses the mint-family kinds a custom author must not name.
+pub(crate) const BUILTIN_ONLY_REJECTED: bool = false;
+
+/// Admit a BUILT-IN-ONLY step kind (issue #92, PR 8a): the EMBEDDED built-in context
+/// ([`validate_builtin`] / [`crate::compile_builtin`]) permits the mint-family kinds.
+pub(crate) const BUILTIN_ONLY_ADMITTED: bool = true;
+
 /// Validate a journey artifact (issue #92), with `reject_reserved` controlling whether an author
-/// step id that uses the reserved `::` namespace separator is refused. The public [`validate`]
-/// refuses it; the post-composition re-validation admits it, since composition mints those ids.
+/// step id that uses the reserved `::` namespace separator is refused, and `admit_builtin_only`
+/// controlling whether the BUILT-IN-ONLY mint-family step kinds ([`StepKind::is_builtin_only`]) are
+/// permitted. The public [`validate`] refuses the reserved separator and the built-in-only kinds;
+/// the post-composition re-validation admits the reserved separator (composition mints those ids);
+/// [`validate_builtin`] admits the built-in-only kinds.
 pub(crate) fn validate_inner(
     doc: &Journey,
     reject_reserved: bool,
+    admit_builtin_only: bool,
 ) -> Result<(), Vec<JourneyError>> {
     // PR4: LIVENESS (a reachable completion exists and there is no exit-less cycle a journey can
     // never leave) is validated at COMPILE time in PR 4, not here, because judging whether a
@@ -460,7 +504,7 @@ pub(crate) fn validate_inner(
     let declared = declared_subflow_ids(doc);
     for (index, step) in doc.steps.iter().enumerate() {
         let step_ptr = format!("/steps/{index}");
-        check_kind_and_node_group(step, &step_ptr, &mut errors);
+        check_kind_and_node_group(step, &step_ptr, admit_builtin_only, &mut errors);
         if reject_reserved && step.id.contains(crate::subflow::NAMESPACE_SEPARATOR) {
             errors.push(JourneyError::ReservedStepIdSeparator {
                 pointer: format!("/steps/{index}/id"),
@@ -517,8 +561,10 @@ pub(crate) fn validate_inner(
     check_predicates(&doc.steps, &doc.transitions, "", &mut errors);
 
     // PR 3: resolve subflow references, validate inline subflow definitions as fragments, and
-    // reject reference cycles. All load-time, never at flow time.
-    crate::subflow::validate_subflows(doc, &mut errors);
+    // reject reference cycles. All load-time, never at flow time. The built-in-only gate threads
+    // through so a mint-family kind smuggled into an inline subflow definition is refused in a
+    // custom artifact just as it is at journey level.
+    crate::subflow::validate_subflows(doc, admit_builtin_only, &mut errors);
 
     if errors.is_empty() {
         Ok(())
@@ -548,16 +594,25 @@ pub(crate) fn collect_step_ids<'a>(
     ids
 }
 
-/// The per-step vocabulary checks shared by a journey and a subflow: an unknown step kind and an
-/// unknown node group. `step_ptr` is the RFC 6901 pointer to the step (for example `/steps/2` or
-/// `/subflow_definitions/1/steps/2`).
+/// The per-step vocabulary checks shared by a journey and a subflow: an unknown step kind, a
+/// BUILT-IN-ONLY step kind used in a custom context (issue #92, PR 8a), and an unknown node group.
+/// `step_ptr` is the RFC 6901 pointer to the step (for example `/steps/2` or
+/// `/subflow_definitions/1/steps/2`). When `admit_builtin_only` is set (the embedded built-in
+/// context), a mint-family kind is permitted; otherwise a custom artifact naming one is refused
+/// with [`JourneyError::BuiltinOnlyStepKind`].
 pub(crate) fn check_kind_and_node_group(
     step: &Step,
     step_ptr: &str,
+    admit_builtin_only: bool,
     errors: &mut Vec<JourneyError>,
 ) {
     if !step.kind.is_known() {
         errors.push(JourneyError::UnknownStepKind {
+            pointer: format!("{step_ptr}/kind"),
+            kind: step.kind.as_wire().to_owned(),
+        });
+    } else if step.kind.is_builtin_only() && !admit_builtin_only {
+        errors.push(JourneyError::BuiltinOnlyStepKind {
             pointer: format!("{step_ptr}/kind"),
             kind: step.kind.as_wire().to_owned(),
         });
@@ -1239,6 +1294,107 @@ mod tests {
                     pointer: "/transitions/0/guard/op".to_owned(),
                 }
             )])
+        );
+    }
+
+    /// A structurally valid journey whose entry is a BUILT-IN-ONLY mint-family step (issue #92,
+    /// PR 8a): `registration` details routing to a terminal. Well formed in every respect except
+    /// the custom-context built-in-only gate.
+    fn registration_journey() -> Journey {
+        Journey {
+            schema_version: JOURNEY_SCHEMA_VERSION.to_owned(),
+            id: "registration".to_owned(),
+            engine_version: JOURNEY_ENGINE_VERSION,
+            entry: "details".to_owned(),
+            comment: None,
+            steps: vec![
+                step("details", StepKind::Registration, Some("password")),
+                step("done", StepKind::Terminal, None),
+            ],
+            transitions: vec![unguarded("details", "done")],
+            subflows: None,
+            subflow_definitions: None,
+        }
+    }
+
+    #[test]
+    fn a_custom_artifact_using_a_builtin_only_kind_is_rejected() {
+        // The public `validate` is the CUSTOM context: a mint-family kind an author must not name
+        // is refused with a precise pointer, never silently admitted.
+        assert_eq!(
+            validate(&registration_journey()),
+            Err(vec![JourneyError::BuiltinOnlyStepKind {
+                pointer: "/steps/0/kind".to_owned(),
+                kind: "registration".to_owned(),
+            }])
+        );
+        // Each of the three mint-family kinds is gated the same way at the entry position.
+        for kind in [
+            StepKind::Registration,
+            StepKind::RecoveryStart,
+            StepKind::RecoveryVerify,
+        ] {
+            let mut doc = registration_journey();
+            doc.steps[0].kind = kind.clone();
+            assert_eq!(
+                validate(&doc),
+                Err(vec![JourneyError::BuiltinOnlyStepKind {
+                    pointer: "/steps/0/kind".to_owned(),
+                    kind: kind.as_wire().to_owned(),
+                }])
+            );
+        }
+    }
+
+    #[test]
+    fn an_embedded_builtin_artifact_admits_builtin_only_kinds() {
+        // The embedded built-in context admits the mint-family kinds, so a built-in journey that
+        // uses `registration` validates clean.
+        assert_eq!(validate_builtin(&registration_journey()), Ok(()));
+    }
+
+    #[test]
+    fn a_builtin_only_kind_smuggled_into_an_inline_subflow_is_rejected_in_a_custom_artifact() {
+        // The gate threads into inline subflow definitions too, so a custom author cannot bypass
+        // it by hiding a mint-family kind in a called fragment.
+        let definition = crate::artifact::Subflow {
+            id: "smuggle".to_owned(),
+            entry: "mint".to_owned(),
+            exits: vec!["mint".to_owned()],
+            comment: None,
+            steps: vec![step("mint", StepKind::Registration, Some("password"))],
+            transitions: vec![],
+        };
+        let doc = Journey {
+            schema_version: JOURNEY_SCHEMA_VERSION.to_owned(),
+            id: "custom".to_owned(),
+            engine_version: JOURNEY_ENGINE_VERSION,
+            entry: "primary".to_owned(),
+            comment: None,
+            steps: vec![
+                step("primary", StepKind::IdentifierPassword, Some("password")),
+                Step {
+                    subflow: Some("smuggle".to_owned()),
+                    ..step("call", StepKind::SubflowCall, None)
+                },
+                step("done", StepKind::Terminal, None),
+            ],
+            transitions: vec![unguarded("primary", "call"), unguarded("call", "done")],
+            subflows: Some(vec![SubflowRef {
+                id: "smuggle".to_owned(),
+                source: SubflowSource::Inline {
+                    subflow_id: "smuggle".to_owned(),
+                },
+            }]),
+            subflow_definitions: Some(vec![definition]),
+        };
+        let errors = validate(&doc).expect_err("a smuggled built-in-only kind is rejected");
+        assert!(
+            errors.iter().any(|error| matches!(
+                error,
+                JourneyError::BuiltinOnlyStepKind { kind, .. } if kind == "registration"
+            )),
+            "expected a BuiltinOnlyStepKind, got {errors:?}"
         );
     }
 
