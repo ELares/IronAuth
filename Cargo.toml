@@ -30,6 +30,7 @@ members = [
     "crates/ironauth-import",
     "crates/ironauth-importers",
     "crates/ironauth-connector",
+    "crates/ironauth-journey",
     "crates/ironauth",
 ]
 
@@ -57,6 +58,7 @@ ironauth-screening = { path = "crates/ironauth-screening", version = "0.1.0" }
 ironauth-apply = { path = "crates/ironauth-apply", version = "0.1.0" }
 ironauth-import = { path = "crates/ironauth-import", version = "0.1.0" }
 ironauth-importers = { path = "crates/ironauth-importers", version = "0.1.0" }
+ironauth-journey = { path = "crates/ironauth-journey", version = "0.1.0" }
 getrandom = "0.3"
 
 # OpenAPI 3.1 source of truth for the management API (crates/ironauth-admin,

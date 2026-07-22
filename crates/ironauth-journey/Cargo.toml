@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "ironauth-journey"
+version = "0.1.0"
+description = "IronAuth declarative journey artifact (issue #92): the pure format, the published JSON Schema, and the load-time validator for code-first flow orchestration"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The artifact is a serde value model: the typed structs (de)serialize to and from
+# the canonical JSON document. serde is already the workspace floor, so this is a
+# direct path edge and no new crate enters the graph.
+serde = { workspace = true }
+# Literal values, the deterministic schema document, and the example generator. Already
+# in the tree, so no new crate; keeps MSRV 1.85 and the musl static lane clean.
+serde_json = { workspace = true }
+# Derive the published JSON Schema (draft 2020-12) straight from the artifact structs,
+# exactly like the ironauth-oidc flow contract does, so the committed
+# docs/journey-schema.json can never drift from the code. schemars is already a workspace
+# dependency (ironauth-oidc uses it) and cargo-deny already allows it, so no new crate and
+# no license change enters the graph. This is a schema GENERATOR, never a runtime validator:
+# the load-time validator is the hand-rolled pure logic in this crate.
+schemars = { workspace = true }
+
+[lints]
+workspace = true
