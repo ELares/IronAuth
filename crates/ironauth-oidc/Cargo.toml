@@ -233,6 +233,15 @@ name = "flow_login_flip"
 path = "tests/flow_login_flip.rs"
 required-features = ["testing"]
 
+# Adversarial probes for the login flip (issue #92, PR 8b): proves the flipped table engine
+# fails closed on a wrong second factor, a spoofed routing signal, a tampered post-primary step
+# with no subject, and a forged custom tag on a login row (no session minted in any case). Over a
+# real database (DATABASE_URL); see scripts/with-test-db.sh.
+[[test]]
+name = "flow_login_flip_adversarial"
+path = "tests/flow_login_flip_adversarial.rs"
+required-features = ["testing"]
+
 # The read only flow inspector (issue #91, PR4): the OBSERVE projection of an existing
 # flow, and the ZERO SIDE EFFECT proof (a full database snapshot, byte identical before and
 # after a dry run) that neither observe nor a policy dry run writes any row. Over a real

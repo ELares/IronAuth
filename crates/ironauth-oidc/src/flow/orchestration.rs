@@ -745,6 +745,17 @@ async fn run_step_executor(
                     // through the built-in login driver runs (relax counters, foreign rehash, risk
                     // record), record the subject and the honest primary method token, and emit the
                     // routing signals from the SAME step-up + profiling planners.
+                    //
+                    // Placement residual (issue #359, resolved when the imperative driver retires in
+                    // PR8e): the follow through runs here, at primary success, exactly once on every
+                    // path. On a multi step path (challenge / enroll / profiling) that matches the
+                    // imperative driver, which also runs it before the next step. On a DIRECT
+                    // complete it runs before the session mint rather than after it, and if the mint
+                    // is then refused at the rare central fence TOCTOU (the account turns non
+                    // authenticatable between verify and mint) the follow through has already fired
+                    // for a login that does not complete. Both effects are best effort, feed nothing
+                    // into establish_session, and are invisible to the rendered flow, so they are
+                    // outside the byte equivalence gate.
                     login_follow_through(state, scope, &success, headers).await;
                     let primary_methods = [AuthMethod::Password];
                     scratch.subject = Some(success.subject.clone());
@@ -968,6 +979,11 @@ async fn complete_via_table(
         .iter()
         .filter_map(|token| AuthMethod::from_token(token))
         .collect();
+    // auth_time is now_micros (the drive entry instant), which is what the imperative step up and
+    // profiling completions already used. It unifies the direct complete path onto the same clock;
+    // the imperative direct complete alone read a post verify instant, so a no MFA login now stamps
+    // auth_time a password verify latency earlier. Same request, sub second, and not a rendered
+    // value, so it is outside the byte equivalence gate (issue #359).
     let event = AuthenticationEvent::from_methods(&methods, now_micros);
     let actor = interaction::user_actor(&subject_id);
     let continuation = consume_and_complete(
@@ -1000,6 +1016,12 @@ async fn complete_via_table(
 /// type-checked predicate never hits) is treated as a non-match, never fail-open.
 fn choose_edge(compiled: &CompiledJourney, from: &str, ctx: &EvalContext) -> Option<String> {
     for edge in compiled.edges(from) {
+        // An eval error counts as "guard did not match" so a corrupt guard cannot force a route.
+        // SAFETY INVARIANT for a built-in artifact: a POSITIVE guard whose false skips a security
+        // requirement (for example /mfa_required gating the challenge edge) must never be able to
+        // error, or "false on error" would relax that requirement. Today the built-in login guards
+        // are depth 1 Cmp predicates that only ever error on MAX_PREDICATE_DEPTH, which they cannot
+        // hit, so this holds; a future built-in guard must preserve it (issue #359).
         let taken = match &edge.guard {
             None => true,
             Some(guard) => evaluate(guard, ctx).unwrap_or(false),
@@ -1041,6 +1063,12 @@ fn table_state(
 /// to the login entry step. Returns [`None`] when no compiled step renders as `tag` (a corrupt row,
 /// a uniform not found, never an oracle). A genuine custom journey never uses this (it holds the
 /// concrete step in `custom_step`).
+///
+/// Sharp edge that stays fail closed: [`wire_state_for`] folds a built-in Terminal to the flat
+/// `FlowStateTag::Custom`, so a tampered login row carrying `step = custom` reverse-maps to the
+/// Terminal step rather than an immediate not found. The Terminal step has no runnable executor, so
+/// the drive still refuses it with [`FlowError::NotFound`] and mints nothing (proven by the
+/// `flow_login_flip_adversarial` forged-custom-tag probe).
 fn builtin_step_for(
     journey: Journey,
     compiled: &CompiledJourney,
