@@ -326,14 +326,16 @@ impl std::error::Error for PredicateError {}
 /// Resolution and comparison follow closed, documented total rules:
 ///
 /// - A [`FieldRef`] resolves against its source; a source that is a set, array, or object is not
-///   a scalar and every comparison against it is `false`.
+///   a scalar. It is never equal to any scalar literal, so `eq` is `false` and `ne` is `true`
+///   (they stay exact complements), while an ordering comparison against it is `false`.
 /// - An absent optional trait resolves to JSON null; `null` equals only `null` under `eq`, so a
 ///   comparison of an absent trait against a non-null literal is `false` (and `ne` is its
 ///   negation).
 /// - A comparison between incompatible scalar types (for example a string trait against a number
-///   literal) is `false` under every operator, never a panic. Such a comparison only reaches the
-///   evaluator through a dynamically-typed trait; the load-time type check rejects a statically
-///   incompatible comparison.
+///   literal) is `false` under `eq` (and `ne` is its negation), and `false` under every ordering
+///   operator, never a panic. Such a comparison only reaches the evaluator through a
+///   dynamically-typed trait; the load-time type check rejects a statically incompatible
+///   comparison.
 /// - Ordering operators (`lt`/`le`/`gt`/`ge`) are defined only between two numbers or two
 ///   strings; every other ordering comparison is `false`.
 /// - A [`Predicate::Member`] tests the named group or scope against the subject's group or scope
@@ -411,12 +413,22 @@ fn eval_member(ctx: &EvalContext, set: &MemberSet) -> bool {
     }
 }
 
-/// Apply a comparison operator to a resolved field and a literal under the total rules. A
-/// non-scalar field is `false` under every operator.
+/// Apply a comparison operator to a resolved field and a literal under the total rules. `eq` and
+/// `ne` are ALWAYS exact complements for every resolution: a non-scalar field (a set, array, or
+/// object) is never equal to any scalar literal, so `eq` is `false` and `ne` is `true`. Only the
+/// ordering operators (`lt`/`le`/`gt`/`ge`) collapse to `false` for a non-scalar field, because
+/// ordering against a set, array, or object is undefined.
 fn compare(resolution: &Resolution, op: CmpOp, literal: &Literal) -> bool {
     let scalar = match resolution {
         Resolution::Scalar(scalar) => scalar,
-        Resolution::NonScalar => return false,
+        // A non-scalar is never equal to any scalar literal, so ne stays the exact complement of
+        // eq (never fail-open); ordering against a non-scalar is undefined and so is false.
+        Resolution::NonScalar => {
+            return match op {
+                CmpOp::Ne => true,
+                CmpOp::Eq | CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge => false,
+            };
+        }
     };
     match op {
         CmpOp::Eq => typed_eq(scalar, literal),
@@ -453,10 +465,21 @@ fn typed_ordering(scalar: &ResolvedScalar, literal: &Literal) -> Option<Ordering
     }
 }
 
-/// Order two JSON numbers by their `f64` value. JSON numbers are always finite, so the comparison
-/// is total (never [`None`] for a real number); using `partial_cmp` keeps the float comparison off
-/// the equality operator.
+/// Order two JSON numbers, EXACTLY when both are integers of the same signedness and by `f64`
+/// otherwise. Two `i64` integers compare as `i64`, and two `u64` integers compare as `u64`, so two
+/// distinct integers beyond 2^53 never collapse to equal. A mixed comparison (an integer against a
+/// float, such as `1` against `1.0`, or a large `u64` against a negative `i64`) falls back to the
+/// `f64` value, which still compares `1` and `1.0` equal and gives the correct sign across the
+/// signed and unsigned ranges. JSON numbers are always finite, so the comparison is total (never
+/// [`None`] for a real number); using `partial_cmp` keeps the float comparison off the equality
+/// operator.
 fn num_ordering(a: &Number, b: &Number) -> Option<Ordering> {
+    if let (Some(x), Some(y)) = (a.as_i64(), b.as_i64()) {
+        return Some(x.cmp(&y));
+    }
+    if let (Some(x), Some(y)) = (a.as_u64(), b.as_u64()) {
+        return Some(x.cmp(&y));
+    }
     match (a.as_f64(), b.as_f64()) {
         (Some(x), Some(y)) => x.partial_cmp(&y),
         _ => None,
@@ -1215,9 +1238,54 @@ mod tests {
     }
 
     #[test]
+    fn large_integer_traits_compare_exactly_yet_one_still_equals_one_point_zero() {
+        let mut ctx = sample_context();
+        // Two distinct integers beyond 2^53 that share an f64 rounding must NOT compare equal.
+        ctx.subject_traits = json!({ "big": 9_007_199_254_740_993_i64, "one": 1 });
+        assert_eq!(
+            evaluate(
+                &cmp(
+                    FieldSource::SubjectTraits,
+                    "/big",
+                    CmpOp::Ne,
+                    Literal::Number(Number::from(9_007_199_254_740_992_i64)),
+                ),
+                &ctx
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            evaluate(
+                &cmp(
+                    FieldSource::SubjectTraits,
+                    "/big",
+                    CmpOp::Eq,
+                    Literal::Number(Number::from(9_007_199_254_740_993_i64)),
+                ),
+                &ctx
+            ),
+            Ok(true)
+        );
+        // A mixed integer/float comparison still unifies: 1 equals 1.0.
+        let one_point_zero = Number::from_f64(1.0).expect("1.0 is a finite number");
+        assert_eq!(
+            evaluate(
+                &cmp(
+                    FieldSource::SubjectTraits,
+                    "/one",
+                    CmpOp::Eq,
+                    Literal::Number(one_point_zero),
+                ),
+                &ctx
+            ),
+            Ok(true)
+        );
+    }
+
+    #[test]
     fn a_non_scalar_source_never_compares() {
         let ctx = sample_context();
-        // A group set is not a scalar; every comparison against it is false.
+        // A group set is not a scalar; eq is false, ordering is false.
         assert_eq!(
             evaluate(
                 &cmp(
@@ -1230,7 +1298,19 @@ mod tests {
             ),
             Ok(false)
         );
-        // A trait object is not a scalar either.
+        assert_eq!(
+            evaluate(
+                &cmp(
+                    FieldSource::SubjectGroups,
+                    "",
+                    CmpOp::Lt,
+                    Literal::String("staff".to_owned())
+                ),
+                &ctx
+            ),
+            Ok(false)
+        );
+        // A trait object is not a scalar either; eq null is false.
         let mut object_ctx = ctx;
         object_ctx.subject_traits = json!({ "address": { "city": "here" } });
         assert_eq!(
@@ -1245,6 +1325,55 @@ mod tests {
             ),
             Ok(false)
         );
+    }
+
+    #[test]
+    fn a_non_scalar_trait_keeps_ne_the_exact_complement_of_eq() {
+        // A subject_traits pointer that resolves to a JSON object is Dynamic, so it type-checks,
+        // yet it is non-scalar at evaluation. eq/ne must stay exact complements (a present object
+        // trait must NOT read as absent under a `ne null` presence guard), and ordering collapses
+        // to false. This is the exact coverage gap that hid the fail-open bug.
+        let mut ctx = sample_context();
+        ctx.subject_traits = json!({ "profile": { "city": "x" } });
+        let obj = |op, value| {
+            evaluate(
+                &cmp(FieldSource::SubjectTraits, "/profile", op, value),
+                &ctx,
+            )
+        };
+        // A present object is never null: `ne null` is true (the presence guard reads it present).
+        assert_eq!(obj(CmpOp::Eq, Literal::Null), Ok(false));
+        assert_eq!(obj(CmpOp::Ne, Literal::Null), Ok(true));
+        // Ordering against a non-scalar is false under every ordering operator.
+        assert_eq!(obj(CmpOp::Lt, Literal::Number(Number::from(1))), Ok(false));
+        assert_eq!(obj(CmpOp::Gt, Literal::String("x".to_owned())), Ok(false));
+        // ne == !eq, and not(eq) == ne, for the non-scalar case across several literals.
+        for value in [
+            Literal::Null,
+            Literal::Bool(true),
+            Literal::Number(Number::from(3)),
+            Literal::String("x".to_owned()),
+        ] {
+            let eq = cmp(
+                FieldSource::SubjectTraits,
+                "/profile",
+                CmpOp::Eq,
+                value.clone(),
+            );
+            let ne = cmp(
+                FieldSource::SubjectTraits,
+                "/profile",
+                CmpOp::Ne,
+                value.clone(),
+            );
+            let eq_result = evaluate(&eq, &ctx);
+            let ne_result = evaluate(&ne, &ctx);
+            assert_eq!(ne_result, eq_result.map(|value| !value));
+            let not_eq = Predicate::Not {
+                operand: Box::new(eq),
+            };
+            assert_eq!(evaluate(&not_eq, &ctx), ne_result);
+        }
     }
 
     #[test]
