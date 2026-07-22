@@ -60,6 +60,12 @@ pub enum Journey {
     /// the requested scopes rendered as flow nodes, resolving to an allow (record the grant
     /// and resume `/authorize`) or a deny (`access_denied` to the client).
     Consent,
+    /// A custom (declarative) journey (issue #92, PR 4): a flow driven by a compiled transition
+    /// table rather than one of the hardcoded built-in journeys. Its concrete step is held server
+    /// side; the wire [`FlowStateTag::Custom`] state is flat for every custom step, so a client
+    /// renders any custom step from the same field (it reads the ui nodes). Additive: the custom
+    /// path reuses the SAME login / MFA / profiling executor cores the built-ins use.
+    Custom,
 }
 
 impl Journey {
@@ -73,6 +79,7 @@ impl Journey {
             Journey::Recovery => "recovery",
             Journey::Federation => "federation",
             Journey::Consent => "consent",
+            Journey::Custom => "custom",
         }
     }
 
@@ -86,6 +93,7 @@ impl Journey {
             "recovery" => Some(Journey::Recovery),
             "federation" => Some(Journey::Federation),
             "consent" => Some(Journey::Consent),
+            "custom" => Some(Journey::Custom),
             _ => None,
         }
     }
@@ -131,7 +139,12 @@ impl Journey {
             // its plan is the single prompt state with no `Completed` terminal, exactly like
             // the federation launcher.
             Journey::Consent => &[ConsentPrompt],
-            Journey::Mfa => &[],
+            // The MFA pseudo journey and a custom (declarative) journey both have an EMPTY flat
+            // plan: the MFA states live in the login plan (reached FROM a login flow), and a
+            // custom journey's plan is its COMPILED table's reachable step set (projected by the
+            // inspector's anti-drift gate from the compiled entry, never a fixed built-in list),
+            // so neither contributes a fixed position list here.
+            Journey::Mfa | Journey::Custom => &[],
         }
     }
 }
@@ -201,6 +214,12 @@ pub enum FlowStateTag {
     ConsentPrompt,
     /// The flow completed and a session was minted.
     Completed,
+    /// A custom (declarative) journey step (issue #92, PR 4): the FLAT wire state for EVERY step
+    /// of a [`Journey::Custom`] flow. The concrete compiled step id is held server side (never on
+    /// the wire), so a client renders any custom step from the `ui.nodes` alone, exactly as it
+    /// renders any built-in state. Additive: no built-in state changes, and a built-in driver on a
+    /// `Custom` state is a uniform not found.
+    Custom,
 }
 
 /// A node group (issue #84). The group both categorizes a node for the client and fixes

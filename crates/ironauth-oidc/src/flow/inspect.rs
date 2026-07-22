@@ -254,9 +254,14 @@ fn canonical_nodes(
         // #87) plus the consent prompt (issue #88) render DYNAMIC nodes from the LIVE client form
         // / client and requested scopes, which the pure inspector (no store handle) cannot
         // synthesize, so they too project an empty node set.
+        // A custom (declarative) journey renders DYNAMIC nodes from its compiled step's node
+        // builder, which the pure inspector (no compiled table, no store handle) cannot
+        // synthesize, so it projects an empty node set like the progressive profiling and consent
+        // states.
         FlowStateTag::Completed
         | FlowStateTag::ProgressiveProfiling
-        | FlowStateTag::ConsentPrompt => Vec::new(),
+        | FlowStateTag::ConsentPrompt
+        | FlowStateTag::Custom => Vec::new(),
     }
 }
 
@@ -743,6 +748,21 @@ mod tests {
         //    against the engine's node builders) is a member of its journey's plan, so a new
         //    engine state cannot be added without appearing in the plan.
         for golden in golden_flows() {
+            // A custom (declarative) journey's PLAN is its COMPILED table's reachable step set
+            // (`CompiledJourney::reachable`), not a fixed built-in list, so it cannot be projected
+            // from the pure `Journey::plan` here. On the wire every custom step is the FLAT
+            // `Custom` state, so a custom golden's state is `Custom` by construction; the
+            // reachable-set-equals-plan gate itself lives in the journey crate's compile tests and
+            // the custom drive tests. The built-in half is unchanged.
+            if golden.flow.journey == Journey::Custom {
+                assert_eq!(
+                    golden.flow.state,
+                    FlowStateTag::Custom,
+                    "a custom golden's wire state is the flat Custom state: {}",
+                    golden.name
+                );
+                continue;
+            }
             let plan = golden.flow.journey.plan();
             assert!(
                 plan.contains(&golden.flow.state),
@@ -937,6 +957,7 @@ mod tests {
             enroll_credential: Some("ENROLLMENTSECRETSENTINEL".to_owned()),
             identifier: Some("RECOVERYIDENTIFIERPIISENTINEL".to_owned()),
             connector: Some("acme-oidc".to_owned()),
+            custom_step: None,
         };
         let context = FlowContextView::from_state(&persisted);
         write!(

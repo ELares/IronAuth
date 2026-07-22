@@ -323,6 +323,7 @@ async fn seed_login_flow(harness: &Harness, scope: Scope) -> String {
                     "/authorize?client_id=rp&state=RETURNTOSTATESENTINEL&nonce=RETURNTONONCESENTINEL",
                 ),
                 contract_version: 1,
+                flow_version_id: None,
                 expires_at_unix_micros: common::FAR_FUTURE_MICROS,
             },
         )

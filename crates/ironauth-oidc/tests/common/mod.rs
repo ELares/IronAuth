@@ -899,6 +899,18 @@ impl Harness {
         self.state = state;
     }
 
+    /// Install the custom (declarative) journey source (issue #92, PR 4) and rebuild the protocol
+    /// router, so a `custom` flow resolves its compiled transition table. Preserves any previously
+    /// installed hashing pool and the flows toggle.
+    pub fn install_custom_journey_source(
+        &mut self,
+        source: Arc<dyn ironauth_oidc::flow::CompiledJourneySource>,
+    ) {
+        let state = self.state.clone().with_custom_journey_source(source);
+        self.router = oidc_router(state.clone());
+        self.state = state;
+    }
+
     /// Arm the hosted-page cutover (issue #85) for the harness: BOTH the flow engine and the
     /// hosted-pages toggle, so the `/authorize` login and registration interaction redirects
     /// retarget onto the scope-routed flow browser page. Rebuilds the protocol router and

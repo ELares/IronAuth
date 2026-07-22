@@ -1,0 +1,27 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+--
+-- Flow version pin for custom journeys (issue #92, PR 4).
+--
+-- A custom (declarative-journey) flow is dispatched by a compiled transition table rather than
+-- one of the six hardcoded built-in journeys. So a live custom flow re-resolves the SAME
+-- compiled table across every submission (never a different table mid-flow), the flow row records
+-- the PINNED version of the journey it was created against: flow_version_id. It is:
+--
+--   - NULL for every built-in flow (login, registration, mfa, recovery, federation, consent),
+--     which carry no version pin, so this column is purely additive and leaves every existing
+--     row and the built-in engine path byte-identical;
+--   - a bare, nullable text column for now: the foreign key to a flow_versions table (the admin
+--     journey store) is DEFERRED to PR 5, which lands that table. Adding the column now is the
+--     clean seam: the engine stamps and reads the pin in PR 4, and PR 5 adds the referential
+--     integrity without a second migration to the hot flow row.
+--
+-- Row level security is INHERITED from the flows table (0067_headless_flows.sql): the column
+-- lives on the already-RLS-forced flows table, whose (tenant, environment) isolation policy and
+-- scope CHECK apply unchanged. No new table, no new policy, no new grant. Every statement is
+-- additive, so this migration is an EXPAND.
+
+-- ---------------------------------------------------------------------------
+-- The pinned custom-journey version this flow row was created against (issue #92, PR 4). NULL
+-- for every built-in flow; a compiled-table version id for a custom flow. FK to flow_versions
+-- deferred to PR 5.
+ALTER TABLE flows ADD COLUMN flow_version_id text;

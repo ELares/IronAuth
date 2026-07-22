@@ -136,7 +136,9 @@ pub struct Step {
     /// journey's `subflows` list).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subflow: Option<SubflowId>,
-    /// The decision this step evaluates, for a [`StepKind::Decision`] step.
+    /// The decision predicate carried by a [`StepKind::Decision`] step. It is validated and type
+    /// checked at load, but the built-in engine routes a decision step through its guarded
+    /// transitions, not this attachment, which is reserved for a future outcome-based routing mode.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decision: Option<DecisionSpec>,
     /// An optional human-readable comment about the step (data, round-trip-safe).
@@ -164,7 +166,11 @@ pub enum StepKind {
     MfaEnroll,
     /// A progressive-profiling step that collects held later-login fields.
     ProgressiveProfiling,
-    /// A branch step: evaluate a decision and route on its outcome.
+    /// A pure routing hub: it renders nothing and runs no executor, and the engine routes
+    /// onward through this step's own guarded transitions (the transition guards carry the
+    /// branching predicates). The step's `decision` attachment is a reserved slot for a future
+    /// outcome-based routing mode (the M11 sandbox seam) and is not consulted by the built-in
+    /// edge-guard routing.
     Decision,
     /// A call into a subflow named by the step's `subflow` reference.
     SubflowCall,

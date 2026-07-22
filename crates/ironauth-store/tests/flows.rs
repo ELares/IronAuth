@@ -33,6 +33,7 @@ async fn create_flow(db: &TestDatabase, scope: Scope, submit_token: &str) -> Flo
                 transient_payload: None,
                 return_to: None,
                 contract_version: 1,
+                flow_version_id: None,
                 expires_at_unix_micros: FAR_FUTURE_MICROS,
             },
         )

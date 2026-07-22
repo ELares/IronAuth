@@ -316,8 +316,12 @@ fn flow_title(flow: &Flow) -> message::MessageId {
         FlowStateTag::RecoveryStart | FlowStateTag::RecoveryAck => message::RECOVERY_TITLE,
         FlowStateTag::FederationStart => message::FEDERATION_TITLE,
         FlowStateTag::ConsentPrompt => message::CONSENT_TITLE,
+        // A custom (declarative) journey renders the SAME flat wire state for every step, so the
+        // page heads with the neutral sign-in title regardless of which concrete step it is on.
+        // The generic node renderer draws the actual form from `ui.nodes`.
         FlowStateTag::IdentifierPassword
         | FlowStateTag::ProgressiveProfiling
+        | FlowStateTag::Custom
         | FlowStateTag::Completed => message::LOGIN_TITLE,
     }
 }
@@ -592,6 +596,7 @@ mod tests {
             (FlowStateTag::RecoveryAck, Journey::Recovery),
             (FlowStateTag::FederationStart, Journey::Federation),
             (FlowStateTag::ConsentPrompt, Journey::Consent),
+            (FlowStateTag::Custom, Journey::Custom),
         ] {
             let flow = flow_with(
                 state,

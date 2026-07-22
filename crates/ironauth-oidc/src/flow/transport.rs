@@ -128,6 +128,10 @@ pub struct ApiCreateBody {
     /// federation flow. Ignored by the other journeys.
     #[serde(default)]
     connector: Option<String>,
+    /// The author-facing custom journey id to run (issue #92, PR 4), for a `custom` journey. The
+    /// source resolves it to a pinned compiled version. Ignored by the built-in journeys.
+    #[serde(default)]
+    journey_id: Option<String>,
 }
 
 /// The browser GET query: the optional resume target seeded at creation.
@@ -140,6 +144,10 @@ pub struct BrowserCreateQuery {
     /// journeys.
     #[serde(default)]
     connector: Option<String>,
+    /// The author-facing custom journey id to run (issue #92, PR 4), for a `custom` journey.
+    /// Ignored by the built-in journeys.
+    #[serde(default)]
+    journey_id: Option<String>,
 }
 
 // -------------------------------------------------------------------------------------
@@ -165,20 +173,38 @@ pub async fn flow_api_create(
     let Some(journey) = creation_journey(&journey) else {
         return error_json(FlowError::NotFound);
     };
-    // The headers carry the session cookie the Consent journey (issue #88) reads to resolve the
-    // subject for its render-time scope diff; the other journeys ignore them.
-    match create_flow(
-        &state,
-        scope,
-        Transport::Api,
-        journey,
-        body.return_to.as_deref(),
-        body.transient_payload.as_ref(),
-        body.connector.as_deref(),
-        &headers,
-    )
-    .await
-    {
+    // A custom (declarative) journey is created THROUGH the compiled-table engine path (issue
+    // #92, PR 4): it names its journey id in the body and the source pins a compiled version. The
+    // built-in journeys are unchanged.
+    let created = if journey == Journey::Custom {
+        let Some(journey_id) = body.journey_id.as_deref() else {
+            return error_json(FlowError::NotFound);
+        };
+        super::orchestration::create_custom_flow(
+            &state,
+            scope,
+            Transport::Api,
+            journey_id,
+            body.return_to.as_deref(),
+            body.transient_payload.as_ref(),
+        )
+        .await
+    } else {
+        // The headers carry the session cookie the Consent journey (issue #88) reads to resolve the
+        // subject for its render-time scope diff; the other journeys ignore them.
+        create_flow(
+            &state,
+            scope,
+            Transport::Api,
+            journey,
+            body.return_to.as_deref(),
+            body.transient_payload.as_ref(),
+            body.connector.as_deref(),
+            &headers,
+        )
+        .await
+    };
+    match created {
         Ok((_id, submit_token, flow)) => api_flow_envelope(StatusCode::OK, &flow, &submit_token),
         Err(error) => error_json(error),
     }
@@ -195,7 +221,8 @@ fn creation_journey(raw: &str) -> Option<Journey> {
             | Journey::Registration
             | Journey::Recovery
             | Journey::Federation
-            | Journey::Consent),
+            | Journey::Consent
+            | Journey::Custom),
         ) => Some(journey),
         _ => None,
     }
@@ -305,18 +332,35 @@ pub async fn flow_browser_get(
     let Some(journey) = creation_journey(&journey) else {
         return error_html(FlowError::NotFound);
     };
-    match create_flow(
-        &state,
-        scope,
-        Transport::Browser,
-        journey,
-        query.return_to.as_deref(),
-        None,
-        query.connector.as_deref(),
-        &headers,
-    )
-    .await
-    {
+    // A custom (declarative) journey is created THROUGH the compiled-table engine path (issue
+    // #92, PR 4): it names its journey id in the query and the source pins a compiled version.
+    let created = if journey == Journey::Custom {
+        let Some(journey_id) = query.journey_id.as_deref() else {
+            return error_html(FlowError::NotFound);
+        };
+        super::orchestration::create_custom_flow(
+            &state,
+            scope,
+            Transport::Browser,
+            journey_id,
+            query.return_to.as_deref(),
+            None,
+        )
+        .await
+    } else {
+        create_flow(
+            &state,
+            scope,
+            Transport::Browser,
+            journey,
+            query.return_to.as_deref(),
+            None,
+            query.connector.as_deref(),
+            &headers,
+        )
+        .await
+    };
+    match created {
         Ok((_id, _submit_token, flow)) => with_contract_header(
             render_browser_flow(&state, scope, &tenant_id, &environment_id, &flow, &headers).await,
         ),

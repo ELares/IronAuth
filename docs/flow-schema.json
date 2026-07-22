@@ -159,6 +159,11 @@
           "const": "completed",
           "description": "The flow completed and a session was minted.",
           "type": "string"
+        },
+        {
+          "const": "custom",
+          "description": "A custom (declarative) journey step (issue #92, PR 4): the FLAT wire state for EVERY step\nof a [`Journey::Custom`] flow. The concrete compiled step id is held server side (never on\nthe wire), so a client renders any custom step from the `ui.nodes` alone, exactly as it\nrenders any built-in state. Additive: no built-in state changes, and a built-in driver on a\n`Custom` state is a uniform not found.",
+          "type": "string"
         }
       ]
     },
@@ -233,6 +238,11 @@
         {
           "const": "consent",
           "description": "A consent decision for an authenticated subject (issue #88): the client identity and\nthe requested scopes rendered as flow nodes, resolving to an allow (record the grant\nand resume `/authorize`) or a deny (`access_denied` to the client).",
+          "type": "string"
+        },
+        {
+          "const": "custom",
+          "description": "A custom (declarative) journey (issue #92, PR 4): a flow driven by a compiled transition\ntable rather than one of the hardcoded built-in journeys. Its concrete step is held server\nside; the wire [`FlowStateTag::Custom`] state is flat for every custom step, so a client\nrenders any custom step from the same field (it reads the ui nodes). Additive: the custom\npath reuses the SAME login / MFA / profiling executor cores the built-ins use.",
           "type": "string"
         }
       ]

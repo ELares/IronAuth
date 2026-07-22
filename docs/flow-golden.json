@@ -310,6 +310,156 @@
         ]
       }
     },
+    "custom_primary_api": {
+      "contract_version": 2,
+      "expires_at": 900,
+      "id": "flw_golden00000000000000000000",
+      "journey": "custom",
+      "state": "custom",
+      "transport": "api",
+      "ui": {
+        "action": "/t/tnt_golden/e/env_golden/flow/api/custom/submit",
+        "messages": [],
+        "method": "POST",
+        "nodes": [
+          {
+            "attributes": {
+              "autocomplete": "username",
+              "disabled": false,
+              "input_type": "text",
+              "name": "identifier",
+              "node_type": "input",
+              "required": true
+            },
+            "group": "default",
+            "label": {
+              "context": {},
+              "id": 1010002,
+              "kind": "info",
+              "text": "Identifier"
+            },
+            "messages": []
+          },
+          {
+            "attributes": {
+              "autocomplete": "current-password",
+              "disabled": false,
+              "input_type": "password",
+              "name": "password",
+              "node_type": "input",
+              "required": true
+            },
+            "group": "password",
+            "label": {
+              "context": {},
+              "id": 1010003,
+              "kind": "info",
+              "text": "Password"
+            },
+            "messages": []
+          },
+          {
+            "attributes": {
+              "disabled": false,
+              "input_type": "submit",
+              "name": "method",
+              "node_type": "input",
+              "required": false,
+              "value": "password"
+            },
+            "group": "password",
+            "label": {
+              "context": {},
+              "id": 1010004,
+              "kind": "info",
+              "text": "Sign in"
+            },
+            "messages": []
+          }
+        ]
+      }
+    },
+    "custom_primary_browser": {
+      "contract_version": 2,
+      "expires_at": 900,
+      "id": "flw_golden00000000000000000000",
+      "journey": "custom",
+      "state": "custom",
+      "transport": "browser",
+      "ui": {
+        "action": "/t/tnt_golden/e/env_golden/flow/custom",
+        "messages": [],
+        "method": "POST",
+        "nodes": [
+          {
+            "attributes": {
+              "autocomplete": "username",
+              "disabled": false,
+              "input_type": "text",
+              "name": "identifier",
+              "node_type": "input",
+              "required": true
+            },
+            "group": "default",
+            "label": {
+              "context": {},
+              "id": 1010002,
+              "kind": "info",
+              "text": "Identifier"
+            },
+            "messages": []
+          },
+          {
+            "attributes": {
+              "disabled": false,
+              "input_type": "hidden",
+              "name": "flow",
+              "node_type": "input",
+              "required": true,
+              "value": "flw_golden00000000000000000000"
+            },
+            "group": "default",
+            "messages": []
+          },
+          {
+            "attributes": {
+              "autocomplete": "current-password",
+              "disabled": false,
+              "input_type": "password",
+              "name": "password",
+              "node_type": "input",
+              "required": true
+            },
+            "group": "password",
+            "label": {
+              "context": {},
+              "id": 1010003,
+              "kind": "info",
+              "text": "Password"
+            },
+            "messages": []
+          },
+          {
+            "attributes": {
+              "disabled": false,
+              "input_type": "submit",
+              "name": "method",
+              "node_type": "input",
+              "required": false,
+              "value": "password"
+            },
+            "group": "password",
+            "label": {
+              "context": {},
+              "id": 1010004,
+              "kind": "info",
+              "text": "Sign in"
+            },
+            "messages": []
+          }
+        ]
+      }
+    },
     "federation_start_api": {
       "contract_version": 2,
       "expires_at": 900,
