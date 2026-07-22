@@ -37,9 +37,11 @@ pub mod model;
 pub mod schema;
 
 mod consent;
+mod eval_ctx;
 mod federation;
 mod login;
 mod mfa;
+mod orchestration;
 mod profiling;
 mod recovery;
 mod registration;
@@ -51,6 +53,9 @@ pub use golden::{GoldenFlow, golden_corpus, golden_flows};
 pub use localize::{
     LanguageTag, LocaleBundle, ResolvedLocale, TextDirection, localize, resolve_locale,
 };
+pub use orchestration::CompiledJourneySource;
+#[cfg(any(test, feature = "testing"))]
+pub use orchestration::EmbeddedJourneySource;
 pub use schema::{flow_messages_snapshot, flow_object_schema};
 pub use transport::{
     FLOW_API_SUBMIT_PATH, FLOW_BRAND_ASSET_PATH, FLOW_BROWSER_PATH, FLOW_CREATE_API_PATH,
@@ -233,6 +238,13 @@ struct PersistedState {
     /// choice), stored so the redirect target is server side, never a client controllable field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     connector: Option<String>,
+    /// The concrete compiled step id a custom (declarative) journey flow is on (issue #92, PR 4),
+    /// or [`None`] for every built-in journey. The wire `state` stays the FLAT
+    /// [`FlowStateTag::Custom`] for every custom step; the precise step lives HERE, server side.
+    /// `skip_serializing_if` keeps a built-in row's serialized `state` BYTE-IDENTICAL (a built-in
+    /// never sets it), so the default path is unperturbed and the flow goldens are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    custom_step: Option<String>,
 }
 
 impl PersistedState {
@@ -245,6 +257,7 @@ impl PersistedState {
             enroll_credential: None,
             identifier: None,
             connector: None,
+            custom_step: None,
         }
     }
 }
@@ -497,7 +510,12 @@ fn start_state(
         // appends them via [`consent::consent_start_nodes`] (like the registration signup
         // fields), so the synchronous start state seeds only the position with no nodes.
         Journey::Consent => Some((PersistedState::step(start), Vec::new())),
-        Journey::Mfa => None,
+        // Neither the MFA pseudo journey nor a custom (declarative) journey is seeded here: both
+        // have an empty `plan()`, so `plan().first()` above already returned `None` and these arms
+        // are unreachable. An MFA state is reached FROM a login flow; a custom flow's creation runs
+        // through `orchestration::create_custom_flow`, which seeds the entry step from the compiled
+        // table. The arms exist only for match exhaustiveness.
+        Journey::Mfa | Journey::Custom => None,
     }
 }
 
@@ -521,7 +539,7 @@ fn start_state(
 // journey, and the four per-request inputs: resume target, transient payload, connector, and
 // the headers the Consent journey reads); grouping them into a struct would only rename the same
 // fields the two transports already assemble inline.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn create_flow(
     state: &OidcState,
     scope: Scope,
@@ -612,6 +630,7 @@ pub async fn create_flow(
                 transient_payload: transient.as_deref(),
                 return_to,
                 contract_version: i32::try_from(CONTRACT_VERSION).unwrap_or(1),
+                flow_version_id: None, // A built-in journey carries no version pin.
                 expires_at_unix_micros: expires_at_micros,
             },
         )
@@ -628,6 +647,7 @@ pub async fn create_flow(
         transient_payload: transient,
         return_to: return_to.map(str::to_owned),
         contract_version: i32::try_from(CONTRACT_VERSION).unwrap_or(1),
+        flow_version_id: None,
         consumed_at_unix_micros: None,
         expires_at_unix_micros: expires_at_micros,
     };
@@ -657,6 +677,9 @@ pub async fn create_flow(
 /// [`NotFound`](FlowError::NotFound) on an unknown, cross scope, or cross transport id,
 /// [`InvalidSubmission`](FlowError::InvalidSubmission) on a submit token mismatch, and
 /// [`Store`](FlowError::Store) on a genuine persistence fault (the ONLY 500).
+// A flat per-journey dispatch match: the length reflects the journey count (each arm is a short
+// call into that journey's driver), so the line lint is allowed here.
+#[allow(clippy::too_many_lines)]
 pub async fn drive(
     state: &OidcState,
     scope: Scope,
@@ -765,6 +788,22 @@ pub async fn drive(
         // The MFA states are reached FROM a login flow, never a creation entry. Typed not
         // found, never a 500.
         Journey::Mfa => Err(FlowError::NotFound),
+        // A custom (declarative) journey is driven by its compiled transition table through the
+        // ADDITIVE parallel path, reusing the SAME login / MFA / profiling executor cores.
+        Journey::Custom => {
+            orchestration::drive_custom(
+                state,
+                scope,
+                flow_id,
+                transport,
+                &record,
+                &persisted,
+                &submission,
+                headers,
+                now_micros,
+            )
+            .await
+        }
     }
 }
 
@@ -953,6 +992,7 @@ async fn drive_login(
         | FlowStateTag::RecoveryAck
         | FlowStateTag::FederationStart
         | FlowStateTag::ConsentPrompt
+        | FlowStateTag::Custom
         | FlowStateTag::Completed => Err(FlowError::NotFound),
     }
 }
@@ -996,6 +1036,7 @@ async fn complete_primary_or_step_up(
                     enroll_credential: None,
                     identifier: None,
                     connector: None,
+                    custom_step: None,
                 };
                 let nodes = profiling::start_nodes(transport, &record.id, &plan);
                 return persist_and_render(
@@ -1074,6 +1115,7 @@ async fn complete_primary_or_step_up(
                 enroll_credential: None,
                 identifier: None,
                 connector: None,
+                custom_step: None,
             };
             let nodes = mfa::challenge_start_nodes(transport, &record.id);
             persist_and_render(
@@ -1100,6 +1142,7 @@ async fn complete_primary_or_step_up(
                 enroll_credential: Some(begin.credential_id.clone()),
                 identifier: None,
                 connector: None,
+                custom_step: None,
             };
             let nodes = mfa::enroll_nodes(transport, &record.id, &begin, false);
             persist_and_render(
@@ -1320,6 +1363,7 @@ async fn complete_with_second_factor(
             enroll_credential: None,
             identifier: None,
             connector: None,
+            custom_step: None,
         };
         let nodes = profiling::start_nodes(transport, &record.id, &plan);
         return persist_and_render(
@@ -1608,6 +1652,7 @@ async fn drive_recovery(
         | FlowStateTag::ProgressiveProfiling
         | FlowStateTag::FederationStart
         | FlowStateTag::ConsentPrompt
+        | FlowStateTag::Custom
         | FlowStateTag::Completed => Err(FlowError::NotFound),
     }
 }

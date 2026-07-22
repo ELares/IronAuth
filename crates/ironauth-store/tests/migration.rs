@@ -494,8 +494,8 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
     );
     assert_eq!(
         report.already_applied(),
-        78,
-        "the production chain is exactly seventy eight migrations (isolation, audit log, management \
+        79,
+        "the production chain is exactly seventy nine migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -515,17 +515,17 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
          risk signals, signup fraud review, advanced recovery modes, headless flows, branding, \
          locale bundles, brand assets, diagnostic reason detail, diagnostics control read, \
          policy decision traces, flows control read, signup forms, consent lockdown, client admin \
-         grants, consent control grants)"
+         grants, consent control grants, flow version pin)"
     );
 
-    // The ledger holds exactly versions 1 through 78.
+    // The ledger holds exactly versions 1 through 79.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
             46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67,
-            68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78
+            68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79
         ]
     );
     let phase_of = |version: i64| async move {

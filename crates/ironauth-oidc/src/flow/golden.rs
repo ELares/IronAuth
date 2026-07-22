@@ -247,6 +247,29 @@ fn push_transport_goldens(
 
     // Consent (issue #88): the prompt state (see [`push_consent_golden`]).
     push_consent_golden(corpus, transport, id);
+
+    // Custom (issue #92, PR 4): a custom (declarative) journey's entry step (see
+    // [`push_custom_golden`]).
+    push_custom_golden(corpus, transport, id);
+}
+
+/// Push the custom (declarative) journey golden for one transport (issue #92, PR 4): a custom
+/// journey's ENTRY step rendered on the FLAT [`FlowStateTag::Custom`] wire state. The nodes come
+/// from the SAME identifier-plus-password node builder a login flow's primary step uses (an
+/// identifier-first custom journey's entry), so the golden LOCKS the custom render shape; the
+/// journey and state fields are Custom and the submit action routes to the `custom` journey path.
+/// Additive: it never touches the six built-in goldens.
+fn push_custom_golden(corpus: &mut Vec<GoldenFlow>, transport: Transport, id: &str) {
+    let suffix = transport.as_str();
+    corpus.push(golden(
+        leaked(format!("custom_primary_{suffix}")),
+        transport,
+        Journey::Custom,
+        FlowStateTag::Custom,
+        login::start_nodes(transport, id),
+        Vec::new(),
+        None,
+    ));
 }
 
 /// Push the consent prompt golden for one transport (issue #88): a fixed client identity and a

@@ -31,6 +31,7 @@
 //! survive both composition and materialization. The compile-to-table executor is PR 4.
 
 mod artifact;
+mod compile;
 mod eval;
 mod schema;
 mod subflow;
@@ -42,6 +43,7 @@ pub use artifact::{
     Journey, Literal, MemberSet, Predicate, Step, StepId, StepKind, Subflow, SubflowId, SubflowRef,
     SubflowSource, Transition,
 };
+pub use compile::{CompiledJourney, CompiledStep, GuardedEdge, compile};
 pub use eval::{
     DecisionEvaluator, EvalContext, FlowContext, MAX_PREDICATE_DEPTH, OutcomeSignal,
     PredicateError, PredicateTypeError, RiskLevel, RiskView, SignalSet, evaluate,

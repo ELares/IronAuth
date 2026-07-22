@@ -259,6 +259,12 @@ pub enum JourneyError {
         /// The composed step ceiling this build admits.
         limit: usize,
     },
+    /// The journey has no completion reachable from the entry (issue #92, PR 4): a journey
+    /// completes by routing into a [`StepKind::Terminal`] step, and no such step is reachable (an
+    /// exit-less cycle, or a graph that reaches no terminal). This LIVENESS failure is deferred
+    /// from load-time structural validation to compile time ([`crate::compile`]), because judging
+    /// completion needs the executor's semantics. Refused at compile, never at flow time.
+    NoReachableCompletion,
 }
 
 impl fmt::Display for JourneyError {
@@ -385,6 +391,9 @@ impl fmt::Display for JourneyError {
             }
             JourneyError::ComposedTooLarge { limit } => {
                 write!(f, "composition exceeds the step ceiling of {limit}")
+            }
+            JourneyError::NoReachableCompletion => {
+                write!(f, "no completion is reachable from the entry step")
             }
         }
     }

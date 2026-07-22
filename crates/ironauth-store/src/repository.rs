@@ -21533,9 +21533,9 @@ impl FlowRepo<'_> {
         let result = sqlx::query(
             "INSERT INTO flows \
              (id, tenant_id, environment_id, journey, transport, state, submit_token, \
-              transient_payload, return_to, contract_version, expires_at) \
-             VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8::jsonb, $9, $10, \
-                     TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval)",
+              transient_payload, return_to, contract_version, flow_version_id, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8::jsonb, $9, $10, $11, \
+                     TIMESTAMPTZ 'epoch' + ($12::text || ' microseconds')::interval)",
         )
         .bind(id.to_string())
         .bind(scope.tenant().to_string())
@@ -21547,6 +21547,7 @@ impl FlowRepo<'_> {
         .bind(params.transient_payload)
         .bind(params.return_to)
         .bind(params.contract_version)
+        .bind(params.flow_version_id)
         .bind(params.expires_at_unix_micros)
         .execute(&mut *tx)
         .await;
@@ -21577,6 +21578,7 @@ impl FlowRepo<'_> {
         let row = sqlx::query(
             "SELECT id, journey, transport, state::text AS state, submit_token, \
                     transient_payload::text AS transient_payload, return_to, contract_version, \
+                    flow_version_id, \
                     (EXTRACT(EPOCH FROM consumed_at) * 1000000)::bigint AS consumed_us, \
                     (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint AS expires_us \
              FROM flows WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
@@ -21596,6 +21598,7 @@ impl FlowRepo<'_> {
             transient_payload: row.get("transient_payload"),
             return_to: row.get("return_to"),
             contract_version: row.get("contract_version"),
+            flow_version_id: row.get("flow_version_id"),
             consumed_at_unix_micros: row.get("consumed_us"),
             expires_at_unix_micros: row.get("expires_us"),
         }))

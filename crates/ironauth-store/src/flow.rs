@@ -31,6 +31,10 @@ pub struct NewFlow<'a> {
     pub return_to: Option<&'a str>,
     /// The flow contract version this row was minted under.
     pub contract_version: i32,
+    /// The pinned custom-journey version this flow was created against (issue #92, PR 4), or
+    /// [`None`] for a built-in journey. A custom flow re-resolves the SAME compiled table across
+    /// submissions from this pin; a built-in flow carries no pin.
+    pub flow_version_id: Option<&'a str>,
     /// The row expiry in microseconds since the epoch (from the clock seam).
     pub expires_at_unix_micros: i64,
 }
@@ -55,6 +59,9 @@ pub struct FlowRecord {
     pub return_to: Option<String>,
     /// The flow contract version this row was minted under.
     pub contract_version: i32,
+    /// The pinned custom-journey version this flow was created against (issue #92, PR 4), or
+    /// [`None`] for a built-in journey.
+    pub flow_version_id: Option<String>,
     /// The single use completion instant in microseconds since the epoch, or [`None`]
     /// while the flow is still open.
     pub consumed_at_unix_micros: Option<i64>,

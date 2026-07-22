@@ -313,6 +313,15 @@ pub struct OidcState {
     // off the protocol-I/O threads) with no admission, which keeps the many DB-only
     // OIDC tests and the self-hoster who wants no admission control unaffected.
     hashing_pool: Option<Arc<crate::hashing_pool::HashingPool>>,
+    // The custom (declarative) journey source (issue #92, PR 4): the seam that resolves a
+    // compiled transition table for a `custom` flow, keyed by the version pinned on the flow
+    // row. Kept OUTSIDE `Inner` and installed through the builder because it is a swappable
+    // capability, exactly like the counter store and the hashing pool: PR 4 wires a test-only
+    // embedded source; PR 5 installs the RLS-scoped, store-backed `flow_versions` source here
+    // with no engine change. Default: `None`, so a `custom` flow answers a uniform not found and
+    // the six built-in journeys are the only live flow surface until an operator installs a
+    // journey store (the ADDITIVE custom path is inert until then).
+    custom_journey_source: Option<Arc<dyn crate::flow::CompiledJourneySource>>,
     // The in-process L1 counter store for the fast request-shaping layer (issue #64).
     // Kept OUTSIDE `Inner` so it is swappable with a cheap builder: the optional
     // IronCache L2 installs its `CounterStore` impl here later, and a test wires a
@@ -860,6 +869,7 @@ impl OidcState {
             quota: None,
             migration_hook: None,
             hashing_pool: None,
+            custom_journey_source: None,
             abuse_counters: Arc::new(crate::abuse::MemoryCounterStore::new()),
             geoip_provider: Arc::new(crate::risk::NullGeoIpProvider),
             ip_reputation_provider: Arc::new(crate::risk::NullIpReputationProvider),
@@ -1082,6 +1092,31 @@ impl OidcState {
     #[must_use]
     pub fn flows_enabled(&self) -> bool {
         self.flows_enabled
+    }
+
+    /// Install the custom (declarative) journey source (issue #92, PR 4): the seam that resolves a
+    /// compiled transition table for a `custom` flow. PR 4 installs a test-only embedded source;
+    /// PR 5 installs the RLS-scoped, store-backed `flow_versions` source with no engine change.
+    /// With none installed, a `custom` flow answers a uniform not found and only the built-in
+    /// journeys are live.
+    #[must_use]
+    pub fn with_custom_journey_source(
+        mut self,
+        source: Arc<dyn crate::flow::CompiledJourneySource>,
+    ) -> Self {
+        self.custom_journey_source = Some(source);
+        self
+    }
+
+    /// The installed custom (declarative) journey source (issue #92, PR 4), or [`None`] when no
+    /// journey store is wired. The custom-flow engine path resolves its compiled table through
+    /// this seam; absent it, a `custom` flow is a uniform not found (the ADDITIVE custom path is
+    /// inert).
+    #[must_use]
+    pub(crate) fn custom_journey_source(
+        &self,
+    ) -> Option<Arc<dyn crate::flow::CompiledJourneySource>> {
+        self.custom_journey_source.clone()
     }
 
     /// Arm the hosted-page render app as the live browser interaction surface (issue #85, the

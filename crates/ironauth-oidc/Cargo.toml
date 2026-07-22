@@ -20,6 +20,13 @@ ironauth-env.workspace = true
 ironauth-config.workspace = true
 ironauth-store.workspace = true
 ironauth-jose.workspace = true
+# The declarative journey engine (issue #92): the pure artifact model, its load-time
+# validator, the predicate evaluator + typed EvalContext, and the compile-to-table
+# lowering. The flow engine's ADDITIVE custom-journey path (PR 4) compiles a validated
+# journey to a transition table and drives it through the SAME already-factored login /
+# mfa / profiling executor cores the built-in journeys use. Pure value logic only (no
+# database, clock, or entropy), so it adds no runtime surface of its own.
+ironauth-journey.workspace = true
 # The WebAuthn Level 3 ceremony core (issue #65): builds the registration and
 # authentication option documents and verifies the ceremony responses. The signature
 # check inside it is delegated to the ring-backed ironauth-jose core, so this crate
@@ -205,6 +212,15 @@ path = "tests/sector.rs"
 [[test]]
 name = "flow"
 path = "tests/flow.rs"
+required-features = ["testing"]
+
+# The custom (declarative) journey engine path (issue #92, PR 4): a journey compiled from a
+# declarative artifact drives end to end through BOTH transports (AC1), reusing the built-in
+# login / MFA executor cores; the built-in journeys coexist unchanged. Over a real database
+# (DATABASE_URL); see scripts/with-test-db.sh.
+[[test]]
+name = "flow_custom"
+path = "tests/flow_custom.rs"
 required-features = ["testing"]
 
 # The read only flow inspector (issue #91, PR4): the OBSERVE projection of an existing
