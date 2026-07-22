@@ -28,11 +28,15 @@
 //! [`StepKind::SubflowCall`] step, resolved by id against a shared definition (so two journeys see
 //! one definition), with reference cycles rejected at load; a template materializes into a concrete
 //! journey before validation, so the compiled table always sees fully-resolved topology. Comments
-//! survive both composition and materialization. The compile-to-table executor is PR 4.
+//! survive both composition and materialization. The compile-to-table executor is PR 4. PR 7 adds
+//! GOLDEN-PATH REPLAY ([`replay`]): a recorded journey transcript re-executed against a compiled
+//! journey's routing (the same document-order-first-true-guard rule the engine drives), so a CI
+//! gate fails on any behavioral drift between flow versions.
 
 mod artifact;
 mod compile;
 mod eval;
+pub mod replay;
 mod schema;
 mod subflow;
 mod template;

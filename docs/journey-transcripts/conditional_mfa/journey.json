@@ -1,0 +1,61 @@
+{
+  "schema_version": "ironauth.journey/v1",
+  "id": "login_conditional_mfa",
+  "engine_version": 1,
+  "entry": "primary",
+  "comment": "Identifier plus password, then a second factor only when the primary step reports one is required. The self-contained artifact the transcripts in this directory replay against.",
+  "steps": [
+    {
+      "id": "primary",
+      "kind": "identifier_password",
+      "node_group": "password",
+      "comment": "The first factor: it emits primary_verified and whether a second factor is required."
+    },
+    {
+      "id": "mfa",
+      "kind": "mfa_challenge",
+      "node_group": "totp",
+      "comment": "The second factor challenge, reached only on the stepped-up path."
+    },
+    {
+      "id": "done",
+      "kind": "terminal",
+      "comment": "The session is minted with the honest amr the run earned."
+    }
+  ],
+  "transitions": [
+    {
+      "from": "primary",
+      "to": "mfa",
+      "guard": {
+        "type": "cmp",
+        "field": {
+          "source": "signals",
+          "pointer": "/mfa_required"
+        },
+        "op": "eq",
+        "value": true
+      },
+      "comment": "Step up only when a second factor is required."
+    },
+    {
+      "from": "primary",
+      "to": "done",
+      "guard": {
+        "type": "cmp",
+        "field": {
+          "source": "signals",
+          "pointer": "/mfa_required"
+        },
+        "op": "eq",
+        "value": false
+      },
+      "comment": "No second factor required: complete straight from the primary step."
+    },
+    {
+      "from": "mfa",
+      "to": "done",
+      "comment": "After the second factor, the unguarded edge completes the run."
+    }
+  ]
+}
