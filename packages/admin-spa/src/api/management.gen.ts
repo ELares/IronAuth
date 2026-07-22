@@ -652,9 +652,16 @@ export interface paths {
         };
         /** List every version of a custom journey (ascending by version). */
         get: operations["listFlowVersions"];
-        /** Create a new version of a custom journey. */
-        put: operations["createFlowVersion"];
-        post?: never;
+        put?: never;
+        /**
+         * Create a new version of a custom journey.
+         * @description This is a POST, not a PUT: it APPENDS a new immutable version (a server-assigned monotonic
+         *     version number), so it is NOT a PUT-to-a-fixed-resource upsert. Per the codebase convention it
+         *     REQUIRES an `Idempotency-Key`, wired through the shared idempotency path: a retry with the same
+         *     key REPLAYS the stored response (the SAME version number), so a client or network retry never
+         *     silently appends a duplicate version. A key reused with a different body is a 422.
+         */
+        post: operations["createFlowVersion"];
         delete?: never;
         options?: never;
         head?: never;
@@ -690,6 +697,9 @@ export interface paths {
         /**
          * Pin a version of a custom journey as the active version (the version a fresh custom flow is
          *     created against).
+         * @description A mutating POST, so per the codebase convention it REQUIRES an `Idempotency-Key`: a retry with
+         *     the same key REPLAYS the stored response without re-writing the pin (and pinning is naturally
+         *     idempotent on the target version anyway).
          */
         post: operations["pinFlowVersion"];
         delete?: never;
@@ -6782,7 +6792,10 @@ export interface operations {
     createFlowVersion: {
         parameters: {
             query?: never;
-            header?: never;
+            header: {
+                /** @description Required. Replaying a POST with the same key returns the original response (the same version) without appending a duplicate. */
+                "Idempotency-Key": string;
+            };
             path: {
                 /** @description The tenant identifier */
                 tenant_id: string;
@@ -6837,6 +6850,24 @@ export interface operations {
             };
             /** @description Environment not found or malformed journey id */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description A concurrent create took the next version; retry */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Idempotency-Key reused with a different request */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -6905,7 +6936,10 @@ export interface operations {
     pinFlowVersion: {
         parameters: {
             query?: never;
-            header?: never;
+            header: {
+                /** @description Required. Replaying a POST with the same key returns the original response without re-executing. */
+                "Idempotency-Key": string;
+            };
             path: {
                 /** @description The tenant identifier */
                 tenant_id: string;
@@ -6949,6 +6983,15 @@ export interface operations {
             };
             /** @description The version does not exist in this scope */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Idempotency-Key reused with a different request */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

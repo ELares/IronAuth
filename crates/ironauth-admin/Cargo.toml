@@ -116,6 +116,15 @@ name = "signup_forms"
 path = "tests/signup_forms.rs"
 required-features = ["testing"]
 
+# Per-environment custom-journey version management endpoint (issue #92, PR 5): the POST
+# append-only create idempotent on the Idempotency-Key (a retry returns the same version, a
+# reused key with a different body is 422), the load-valid write validation (a precise 400), and
+# the idempotent pin. Needs a real database.
+[[test]]
+name = "flow_versions"
+path = "tests/flow_versions.rs"
+required-features = ["testing"]
+
 # Config snapshot export endpoint (issue #43): the operator and the environment's
 # own management key export a canonical secret-free snapshot; a cross-environment
 # key is refused. Needs a real database (DATABASE_URL).

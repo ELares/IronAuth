@@ -347,10 +347,10 @@ pub fn management_router(state: AdminState) -> Router {
                 .delete(signup_forms::delete_signup_form),
         )
         // Per-environment custom-journey versions (issue #92, PR 5): create a new immutable version
-        // (load-valid validated) and list a journey's versions.
+        // (POST, append-only, Idempotency-Key required) and list a journey's versions.
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/journeys/{journey_id}/versions",
-            put(flow_versions::create_flow_version).get(flow_versions::list_flow_versions),
+            post(flow_versions::create_flow_version).get(flow_versions::list_flow_versions),
         )
         // Get one version of a custom journey by its version number.
         .route(

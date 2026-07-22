@@ -22810,6 +22810,31 @@ impl FlowVersionRepo<'_> {
         Ok(rows.iter().map(flow_version_from_row).collect())
     }
 
+    /// The NEXT per-scope, per-journey_id version number (`MAX(version) + 1`, 1 for the first)
+    /// (issue #92, PR 5): the management create surface resolves this BEFORE the write so it can
+    /// build the response it stores under the idempotency key. This is a plain read, not a lock;
+    /// the append-only `UNIQUE` index makes a concurrent create of the same number fail rather than
+    /// duplicate.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn next_version(&self, journey_id: &str) -> Result<i32, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let next: i32 = sqlx::query(
+            "SELECT COALESCE(MAX(version), 0) + 1 AS next FROM flow_versions \
+             WHERE tenant_id = $1 AND environment_id = $2 AND journey_id = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(journey_id)
+        .fetch_one(&mut *tx)
+        .await?
+        .get("next");
+        tx.commit().await?;
+        Ok(next)
+    }
+
     /// EVERY version in this scope (no pagination), ordered by journey id then version: the set the
     /// config-snapshot export (issue #43) projects, each carrying its `pinned` flag. A flow version
     /// is promotable config, so its whole non-secret artifact travels in the snapshot.
@@ -22845,33 +22870,51 @@ pub struct ActingFlowVersionRepo<'a> {
 }
 
 impl ActingFlowVersionRepo<'_> {
-    /// Create a new immutable version of `journey_id`, returning the stored record (issue #92,
-    /// PR 5). The artifact is proved LOAD-VALID (parse + [`ironauth_journey::compile`]) BEFORE the
-    /// transaction, so a malformed or non-live journey never reaches the registry. The per-scope,
-    /// per-journey_id version number is `MAX(version) + 1`, computed under the audited
-    /// transaction's row lock. Writes a `flow_version.create` audit row in the same transaction.
+    /// Create the immutable version `version` of `journey_id` under the caller-minted `id` (issue
+    /// #92, PR 5), storing the mutation, its `flow_version.create` audit row, and the optional
+    /// idempotency record in ONE transaction. The artifact is proved LOAD-VALID (parse +
+    /// [`ironauth_journey::compile`]) BEFORE the transaction, so a malformed or non-live journey
+    /// never reaches the registry. The caller resolves `version` from [`FlowVersionRepo::next_version`]
+    /// and builds the response it stores under the idempotency key, exactly like the other
+    /// server-minted creates (the management surface generates the id and computes the response
+    /// before the write, so a retry with the same key REPLAYS the stored response rather than
+    /// appending a duplicate).
+    ///
+    /// Append-only is enforced by the `UNIQUE (tenant, environment, journey_id, version)` index,
+    /// NOT a row lock: two concurrent creates of the same journey both compute the same next
+    /// version, the first commits, and the second fails the unique constraint. That collision is
+    /// surfaced as [`StoreError::Conflict`] (the caller re-plans against the now-higher next
+    /// version), never a silent duplicate or overwrite.
     ///
     /// # Errors
     ///
     /// [`StoreError::JourneyInvalid`] if the artifact is not a load-valid journey;
+    /// [`StoreError::Conflict`] if `version` was concurrently taken for this journey;
+    /// [`StoreError::IdempotencyConflict`] if the idempotency key is already stored;
     /// [`StoreError::Database`] on a persistence failure.
     pub async fn create_version(
         &self,
         env: &Env,
+        id: &FlowVersionId,
         params: NewFlowVersion<'_>,
+        version: i32,
         created_at_micros: i64,
-    ) -> Result<FlowVersionRecord, StoreError> {
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
         // Prove the artifact is a load-valid, compilable journey BEFORE the transaction: a bad
         // artifact never reaches the registry, so the drive-path compile of a stored version never
         // fails.
         crate::flow_version::validate_artifact_json(params.artifact_json)
             .map_err(StoreError::JourneyInvalid)?;
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
         let scope = self.scope;
-        let id = FlowVersionId::generate(env, &scope);
         let actor = self.acting.actor();
         let created_by = format!("{}:{}", actor.kind_str(), actor.id_string());
         let journey_id = params.journey_id.to_owned();
         let artifact = params.artifact_json.to_owned();
+        let id_string = id.to_string();
         write_audited(
             AuditedWrite {
                 store: self.store,
@@ -22879,52 +22922,83 @@ impl ActingFlowVersionRepo<'_> {
                 acting: &self.acting,
                 env,
                 action: Action::FlowVersionCreate,
-                target: &id,
+                target: id,
             },
             async move |tx| {
-                // The next per-scope, per-journey_id version number under the row lock the audited
-                // transaction holds, so two concurrent creates cannot mint the same version (the
-                // unique index would also refuse it).
-                let next: i32 = sqlx::query(
-                    "SELECT COALESCE(MAX(version), 0) + 1 AS next FROM flow_versions \
-                     WHERE tenant_id = $1 AND environment_id = $2 AND journey_id = $3",
-                )
-                .bind(scope.tenant().to_string())
-                .bind(scope.environment().to_string())
-                .bind(&journey_id)
-                .fetch_one(&mut **tx)
-                .await?
-                .get("next");
-                sqlx::query(
+                // Insert the idempotency record FIRST, so a concurrent retry with the SAME key is
+                // caught HERE as an idempotency conflict (the caller replays the stored response),
+                // before the version insert below would mask it as a plain unique-violation. A
+                // different key racing for the same version number is still caught by the version
+                // unique index (a retriable Conflict), and either failure rolls the whole
+                // transaction back (the idempotency row never outlives a failed create).
+                insert_idempotency(tx, idempotency).await?;
+                let result = sqlx::query(
                     "INSERT INTO flow_versions \
                      (id, tenant_id, environment_id, journey_id, version, artifact, created_by, \
                       created_at) \
                      VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, \
                              TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval)",
                 )
-                .bind(id.to_string())
+                .bind(&id_string)
                 .bind(scope.tenant().to_string())
                 .bind(scope.environment().to_string())
                 .bind(&journey_id)
-                .bind(next)
+                .bind(version)
                 .bind(&artifact)
                 .bind(&created_by)
                 .bind(created_at_micros)
                 .execute(&mut **tx)
-                .await?;
+                .await;
+                match result {
+                    Ok(_) => {}
+                    // The append-only unique index refused a concurrently-taken version.
+                    Err(error) if is_unique_violation(&error) => return Err(StoreError::Conflict),
+                    Err(error) => return Err(error.into()),
+                }
                 Ok(())
             },
             false,
         )
-        .await?;
-        // Read back the version the audited insert minted (its in-transaction MAX + 1), keyed by
-        // the id just created. A freshly created version is never pinned.
-        self.store
+        .await
+    }
+
+    /// Create the NEXT immutable version of `journey_id`, returning the stored record (issue #92,
+    /// PR 5): the non-idempotent convenience the store's own callers use (tests, the engine
+    /// harness). It resolves the next per-scope, per-journey_id version, mints the id, and delegates
+    /// to [`ActingFlowVersionRepo::create_version`] with no idempotency record. The management
+    /// surface does NOT use this (it needs the id and version BEFORE the write to store the
+    /// idempotent response); it calls `create_version` directly.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::JourneyInvalid`] if the artifact is not a load-valid journey;
+    /// [`StoreError::Conflict`] if the next version was concurrently taken;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn create_next_version(
+        &self,
+        env: &Env,
+        params: NewFlowVersion<'_>,
+        created_at_micros: i64,
+    ) -> Result<FlowVersionRecord, StoreError> {
+        let scope = self.scope;
+        let version = self
+            .store
             .scoped(scope)
             .flow_versions()
-            .get_by_id(&id.to_string())
-            .await?
-            .ok_or(StoreError::NotFound)
+            .next_version(params.journey_id)
+            .await?;
+        let id = FlowVersionId::generate(env, &scope);
+        self.create_version(env, &id, params, version, created_at_micros, None)
+            .await?;
+        // A freshly created version is never pinned. Build the record from the known fields rather
+        // than a read-back (the write just committed exactly these).
+        Ok(FlowVersionRecord {
+            id: id.to_string(),
+            journey_id: params.journey_id.to_owned(),
+            version,
+            artifact_json: params.artifact_json.to_owned(),
+            pinned: false,
+        })
     }
 
     /// Set or MOVE `journey_id`'s active version PIN to `version`, returning the pin id (issue #92,
@@ -22938,6 +23012,7 @@ impl ActingFlowVersionRepo<'_> {
     /// # Errors
     ///
     /// [`StoreError::NotFound`] if the version does not exist in this scope;
+    /// [`StoreError::IdempotencyConflict`] if the idempotency key is already stored;
     /// [`StoreError::Database`] on a persistence failure.
     pub async fn pin(
         &self,
@@ -22945,6 +23020,7 @@ impl ActingFlowVersionRepo<'_> {
         journey_id: &str,
         version: i32,
         now_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<FlowVersionPinId, StoreError> {
         let scope = self.scope;
         // Resolve the version -> its flv_ id (a uniform not-found when the version is absent), and
@@ -22987,6 +23063,7 @@ impl ActingFlowVersionRepo<'_> {
                 .bind(now_micros)
                 .execute(&mut **tx)
                 .await?;
+                insert_idempotency(tx, idempotency).await?;
                 Ok(())
             },
             false,

@@ -54,7 +54,7 @@ async fn create_is_append_only_and_pin_moves_the_active_version() {
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .flow_versions()
-        .create_version(
+        .create_next_version(
             &env,
             NewFlowVersion {
                 journey_id: journey,
@@ -71,7 +71,7 @@ async fn create_is_append_only_and_pin_moves_the_active_version() {
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .flow_versions()
-        .create_version(
+        .create_next_version(
             &env,
             NewFlowVersion {
                 journey_id: journey,
@@ -99,7 +99,7 @@ async fn create_is_append_only_and_pin_moves_the_active_version() {
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .flow_versions()
-        .pin(&env, journey, 1, 3_000_000)
+        .pin(&env, journey, 1, 3_000_000, None)
         .await
         .expect("pin v1");
     let pinned = app
@@ -118,7 +118,7 @@ async fn create_is_append_only_and_pin_moves_the_active_version() {
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .flow_versions()
-        .pin(&env, journey, 2, 4_000_000)
+        .pin(&env, journey, 2, 4_000_000, None)
         .await
         .expect("pin v2");
     let pinned = app
@@ -144,7 +144,7 @@ async fn create_is_append_only_and_pin_moves_the_active_version() {
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .flow_versions()
-        .create_version(
+        .create_next_version(
             &env,
             NewFlowVersion {
                 journey_id: journey,
@@ -171,7 +171,7 @@ async fn pinning_an_unknown_version_is_a_uniform_not_found() {
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .flow_versions()
-        .pin(&env, "ghost", 1, 1_000_000)
+        .pin(&env, "ghost", 1, 1_000_000, None)
         .await;
     assert!(matches!(result, Err(StoreError::NotFound)), "{result:?}");
 }
@@ -200,7 +200,7 @@ async fn a_load_invalid_artifact_is_refused_before_it_is_stored() {
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .flow_versions()
-        .create_version(
+        .create_next_version(
             &env,
             NewFlowVersion {
                 journey_id: "broken",
@@ -239,7 +239,7 @@ async fn versions_round_trip_through_a_config_snapshot_and_stay_scoped() {
         .scoped(scope_a)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .flow_versions()
-        .create_version(
+        .create_next_version(
             &env,
             NewFlowVersion {
                 journey_id: journey,
@@ -253,7 +253,7 @@ async fn versions_round_trip_through_a_config_snapshot_and_stay_scoped() {
         .scoped(scope_a)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .flow_versions()
-        .pin(&env, journey, 1, 2_000_000)
+        .pin(&env, journey, 1, 2_000_000, None)
         .await
         .expect("pin v1 in A");
 

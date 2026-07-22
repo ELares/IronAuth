@@ -20,15 +20,17 @@
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::Response;
 use ironauth_journey::Journey;
 use ironauth_store::{
-    CorrelationId, FlowVersionRecord, NewFlowVersion, Scope, validate_journey_artifact,
+    CorrelationId, FlowVersionId, FlowVersionRecord, IdempotencyWrite, NewFlowVersion, Scope,
+    StoreError, validate_journey_artifact,
 };
 
 use crate::auth::Principal;
 use crate::error::{ApiError, ErrorBody};
+use crate::idempotency;
 use crate::input::parse_json;
 use crate::response::json;
 use crate::state::AdminState;
@@ -124,8 +126,14 @@ fn view_of(record: FlowVersionRecord) -> Result<FlowVersionView, ApiError> {
 }
 
 /// Create a new version of a custom journey.
+///
+/// This is a POST, not a PUT: it APPENDS a new immutable version (a server-assigned monotonic
+/// version number), so it is NOT a PUT-to-a-fixed-resource upsert. Per the codebase convention it
+/// REQUIRES an `Idempotency-Key`, wired through the shared idempotency path: a retry with the same
+/// key REPLAYS the stored response (the SAME version number), so a client or network retry never
+/// silently appends a duplicate version. A key reused with a different body is a 422.
 #[utoipa::path(
-    put,
+    post,
     path = "/v1/tenants/{tenant_id}/environments/{environment_id}/journeys/{journey_id}/versions",
     operation_id = "createFlowVersion",
     tag = "flow-versions",
@@ -133,7 +141,10 @@ fn view_of(record: FlowVersionRecord) -> Result<FlowVersionView, ApiError> {
     params(
         ("tenant_id" = String, Path, description = "The tenant identifier"),
         ("environment_id" = String, Path, description = "The environment identifier"),
-        ("journey_id" = String, Path, description = "The author-facing journey identifier")
+        ("journey_id" = String, Path, description = "The author-facing journey identifier"),
+        ("Idempotency-Key" = String, Header, description = "Required. Replaying a POST \
+         with the same key returns the original response (the same version) without appending a \
+         duplicate.")
     ),
     security(("bearer" = [])),
     responses(
@@ -141,12 +152,16 @@ fn view_of(record: FlowVersionRecord) -> Result<FlowVersionView, ApiError> {
         (status = 400, description = "A load-invalid journey artifact", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Environment not found or malformed journey id", body = ErrorBody)
+        (status = 404, description = "Environment not found or malformed journey id", body = ErrorBody),
+        (status = 409, description = "A concurrent create took the next version; retry", body = ErrorBody),
+        (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
     )
 )]
 pub async fn create_flow_version(
     State(state): State<AdminState>,
     principal: Principal,
+    uri: Uri,
+    headers: HeaderMap,
     Path((tenant_id, environment_id, journey_id)): Path<(String, String, String)>,
     body: Bytes,
 ) -> Result<Response, ApiError> {
@@ -156,6 +171,15 @@ pub async fn create_flow_version(
     // environment-scoped management writes (locales, signup forms).
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     let journey_id = parse_journey_id(&journey_id)?;
+
+    let key = idempotency::required_key(&headers)?;
+    let fingerprint = idempotency::fingerprint("POST", uri.path(), &body);
+    let credential_ref = principal.credential_ref();
+    if let Some(replay) =
+        idempotency::replay_if_stored(&state, &credential_ref, &key, &fingerprint).await?
+    {
+        return Ok(replay);
+    }
 
     // The environment must exist (a clean 404 rather than a foreign-key error).
     state
@@ -170,25 +194,62 @@ pub async fn create_flow_version(
     // written.
     let artifact_json = validated_artifact(&request)?;
 
+    // Resolve the id and the next version BEFORE the write so the response is fully known, then
+    // store it under the idempotency key IN THE SAME transaction as the version and its audit row
+    // (exactly like the other server-minted creates). The append-only unique index makes a
+    // concurrent create of the same version fail (surfaced as a retriable 409), never a duplicate.
+    let id = FlowVersionId::generate(state.env(), &scope);
+    let version = state
+        .store()
+        .scoped(scope)
+        .flow_versions()
+        .next_version(&journey_id)
+        .await?;
+    let view = view_of(FlowVersionRecord {
+        id: id.to_string(),
+        journey_id: journey_id.clone(),
+        version,
+        artifact_json: artifact_json.clone(),
+        pinned: false,
+    })?;
+    let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
+
+    let write = IdempotencyWrite {
+        credential_ref: &credential_ref,
+        key: &key,
+        request_fingerprint: &fingerprint,
+        response_status: 200,
+        response_body: &body_string,
+    };
     let created_at_micros = state.now_unix_micros();
-    let record = state
+    let result = state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .flow_versions()
         .create_version(
             state.env(),
+            &id,
             NewFlowVersion {
                 journey_id: &journey_id,
                 artifact_json: &artifact_json,
             },
+            version,
             created_at_micros,
+            Some(write),
         )
-        .await?;
-
-    let view = view_of(record)?;
-    let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
-    Ok(json(StatusCode::OK, body_string))
+        .await;
+    match result {
+        Ok(()) => Ok(json(StatusCode::OK, body_string)),
+        Err(StoreError::IdempotencyConflict) => {
+            idempotency::replay_after_conflict(&state, &credential_ref, &key, &fingerprint).await
+        }
+        // A concurrent create took the next version: retriable, not a duplicate or overwrite.
+        Err(StoreError::Conflict) => Err(ApiError::Conflict(
+            "a concurrent create took the next version of this journey; retry".to_owned(),
+        )),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// List every version of a custom journey (ascending by version).
@@ -273,6 +334,10 @@ pub async fn get_flow_version(
 
 /// Pin a version of a custom journey as the active version (the version a fresh custom flow is
 /// created against).
+///
+/// A mutating POST, so per the codebase convention it REQUIRES an `Idempotency-Key`: a retry with
+/// the same key REPLAYS the stored response without re-writing the pin (and pinning is naturally
+/// idempotent on the target version anyway).
 #[utoipa::path(
     post,
     path = "/v1/tenants/{tenant_id}/environments/{environment_id}/journeys/{journey_id}/versions/{version}/pin",
@@ -282,19 +347,24 @@ pub async fn get_flow_version(
         ("tenant_id" = String, Path, description = "The tenant identifier"),
         ("environment_id" = String, Path, description = "The environment identifier"),
         ("journey_id" = String, Path, description = "The author-facing journey identifier"),
-        ("version" = i32, Path, description = "The version number to pin")
+        ("version" = i32, Path, description = "The version number to pin"),
+        ("Idempotency-Key" = String, Header, description = "Required. Replaying a POST \
+         with the same key returns the original response without re-executing.")
     ),
     security(("bearer" = [])),
     responses(
         (status = 200, description = "The now-pinned version", body = FlowVersionView),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "The version does not exist in this scope", body = ErrorBody)
+        (status = 404, description = "The version does not exist in this scope", body = ErrorBody),
+        (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
     )
 )]
 pub async fn pin_flow_version(
     State(state): State<AdminState>,
     principal: Principal,
+    uri: Uri,
+    headers: HeaderMap,
     Path((tenant_id, environment_id, journey_id, version)): Path<(String, String, String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
@@ -303,15 +373,19 @@ pub async fn pin_flow_version(
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     let journey_id = parse_journey_id(&journey_id)?;
     let version = parse_version(&version)?;
-    let now_micros = state.now_unix_micros();
-    state
-        .store()
-        .scoped(scope)
-        .acting(actor, CorrelationId::generate(state.env()))
-        .flow_versions()
-        .pin(state.env(), &journey_id, version, now_micros)
-        .await?;
-    // Read the now-pinned version back so the response confirms the active pointer moved.
+
+    let key = idempotency::required_key(&headers)?;
+    let fingerprint = idempotency::fingerprint("POST", uri.path(), &[]);
+    let credential_ref = principal.credential_ref();
+    if let Some(replay) =
+        idempotency::replay_if_stored(&state, &credential_ref, &key, &fingerprint).await?
+    {
+        return Ok(replay);
+    }
+
+    // Resolve the target version BEFORE the pin so the response (the now-pinned version) is fully
+    // known and can be stored under the idempotency key in the SAME transaction as the pin. A
+    // version's artifact is immutable, so reading it before the pin gives the correct body.
     let record = state
         .store()
         .scoped(scope)
@@ -319,9 +393,32 @@ pub async fn pin_flow_version(
         .get_version(&journey_id, version)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let view = view_of(record)?;
+    let mut view = view_of(record)?;
+    view.pinned = true;
     let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
-    Ok(json(StatusCode::OK, body_string))
+
+    let write = IdempotencyWrite {
+        credential_ref: &credential_ref,
+        key: &key,
+        request_fingerprint: &fingerprint,
+        response_status: 200,
+        response_body: &body_string,
+    };
+    let now_micros = state.now_unix_micros();
+    let result = state
+        .store()
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(state.env()))
+        .flow_versions()
+        .pin(state.env(), &journey_id, version, now_micros, Some(write))
+        .await;
+    match result {
+        Ok(_) => Ok(json(StatusCode::OK, body_string)),
+        Err(StoreError::IdempotencyConflict) => {
+            idempotency::replay_after_conflict(&state, &credential_ref, &key, &fingerprint).await
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 // A version is immutable and never deleted (a change is a new version), so the append-only

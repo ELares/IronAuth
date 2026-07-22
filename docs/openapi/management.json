@@ -4781,11 +4781,12 @@
           }
         ]
       },
-      "put": {
+      "post": {
         "tags": [
           "flow-versions"
         ],
         "summary": "Create a new version of a custom journey.",
+        "description": "This is a POST, not a PUT: it APPENDS a new immutable version (a server-assigned monotonic\nversion number), so it is NOT a PUT-to-a-fixed-resource upsert. Per the codebase convention it\nREQUIRES an `Idempotency-Key`, wired through the shared idempotency path: a retry with the same\nkey REPLAYS the stored response (the SAME version number), so a client or network retry never\nsilently appends a duplicate version. A key reused with a different body is a 422.",
         "operationId": "createFlowVersion",
         "parameters": [
           {
@@ -4810,6 +4811,15 @@
             "name": "journey_id",
             "in": "path",
             "description": "The author-facing journey identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying a POST with the same key returns the original response (the same version) without appending a duplicate.",
             "required": true,
             "schema": {
               "type": "string"
@@ -4869,6 +4879,26 @@
           },
           "404": {
             "description": "Environment not found or malformed journey id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent create took the next version; retry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency-Key reused with a different request",
             "content": {
               "application/json": {
                 "schema": {
@@ -4986,6 +5016,7 @@
           "flow-versions"
         ],
         "summary": "Pin a version of a custom journey as the active version (the version a fresh custom flow is\ncreated against).",
+        "description": "A mutating POST, so per the codebase convention it REQUIRES an `Idempotency-Key`: a retry with\nthe same key REPLAYS the stored response without re-writing the pin (and pinning is naturally\nidempotent on the target version anyway).",
         "operationId": "pinFlowVersion",
         "parameters": [
           {
@@ -5024,6 +5055,15 @@
               "type": "integer",
               "format": "int32"
             }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying a POST with the same key returns the original response without re-executing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -5059,6 +5099,16 @@
           },
           "404": {
             "description": "The version does not exist in this scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency-Key reused with a different request",
             "content": {
               "application/json": {
                 "schema": {

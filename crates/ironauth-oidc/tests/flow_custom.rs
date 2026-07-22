@@ -31,7 +31,7 @@ use ironauth_journey::{
     CmpOp, FieldRef, FieldSource, JOURNEY_ENGINE_VERSION, JOURNEY_SCHEMA_VERSION, Journey, Literal,
     Predicate, Step, StepKind, Transition,
 };
-use ironauth_oidc::flow::FlowVersionJourneySource;
+use ironauth_oidc::flow::{CompiledJourneySource, FlowVersionJourneySource};
 use ironauth_oidc::{Argon2Params, HashingPool, SESSION_COOKIE};
 use ironauth_store::{CorrelationId, NewFlowVersion};
 use serde_json::{Value, json};
@@ -226,7 +226,7 @@ async fn store_and_pin(harness: &Harness, journey: &Journey, now_micros: i64) ->
         .scoped(scope)
         .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
         .flow_versions()
-        .create_version(
+        .create_next_version(
             &env,
             NewFlowVersion {
                 journey_id: JOURNEY_ID,
@@ -242,7 +242,7 @@ async fn store_and_pin(harness: &Harness, journey: &Journey, now_micros: i64) ->
         .scoped(scope)
         .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
         .flow_versions()
-        .pin(&env, JOURNEY_ID, record.version, now_micros + 1)
+        .pin(&env, JOURNEY_ID, record.version, now_micros + 1, None)
         .await
         .expect("pin the version");
     record.version
@@ -882,6 +882,44 @@ async fn a_live_flow_keeps_its_pinned_version_after_the_pin_moves() {
         auth_methods.contains("pwd") && auth_methods.contains("totp"),
         "the live flow ran the pinned v1 (pwd + totp), not the newly-pinned pwd-only v2: \
          {auth_methods}"
+    );
+}
+
+#[tokio::test]
+async fn the_compile_cache_is_scope_safe() {
+    // The store-backed source caches compiled tables keyed by (scope, version id). A version
+    // resolved in scope A must NOT serve scope B on a cache HIT: the key includes the scope, and
+    // the scope-forced read returns None for a cross-scope id.
+    let (harness, _pool) = setup_custom(conditional_mfa_journey()).await;
+    let scope_a = harness.scope();
+    let scope_b = harness.second_scope().await;
+    let flv_id = harness
+        .db()
+        .control_store()
+        .scoped(scope_a)
+        .flow_versions()
+        .get_version(JOURNEY_ID, 1)
+        .await
+        .expect("get v1")
+        .expect("v1 exists")
+        .id;
+
+    let source = FlowVersionJourneySource::new(harness.store().clone());
+    // Scope A resolves its own version and populates the cache under (A, id).
+    assert!(
+        source.resolve(scope_a, &flv_id).await.is_some(),
+        "scope A resolves its own version"
+    );
+    // Scope B must NOT resolve the SAME id: the cache key includes the scope, so scope A's entry is
+    // never served here, and the scope-forced read returns None for a cross-scope id.
+    assert!(
+        source.resolve(scope_b, &flv_id).await.is_none(),
+        "a cross-scope version id must not resolve from another scope's cache"
+    );
+    // Scope A still resolves (a cache hit): the negative scope-B lookup did not perturb it.
+    assert!(
+        source.resolve(scope_a, &flv_id).await.is_some(),
+        "scope A's cached entry survives a cross-scope miss"
     );
 }
 

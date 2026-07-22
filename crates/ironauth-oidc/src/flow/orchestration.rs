@@ -105,8 +105,13 @@ pub trait CompiledJourneySource: Send + Sync {
 /// moves to a newer version.
 pub struct FlowVersionJourneySource {
     store: Store,
-    /// The compile cache: version id -> its compiled table. Guarded by a plain mutex; the lock is
-    /// held only for the brief sync get / insert, never across the store read or compilation.
+    /// The compile cache, keyed by (tenant, environment, version id) -> its compiled table. The
+    /// key includes the SCOPE so a cache hit can never serve one environment's compiled table for
+    /// another's lookup: the scope-forced `get_by_id` returns None for a cross-scope id, and this
+    /// key preserves that isolation on a hit (a `flv_` id embeds scope + entropy, so a collision is
+    /// already unreachable, but the key is scope-safe by construction). Guarded by a plain mutex;
+    /// the lock is held only for the brief sync get / insert, never across the store read or
+    /// compilation.
     cache: Mutex<HashMap<String, Arc<CompiledJourney>>>,
 }
 
@@ -129,7 +134,7 @@ impl FlowVersionJourneySource {
         scope: Scope,
         flow_version_id: &str,
     ) -> Option<Arc<CompiledJourney>> {
-        if let Some(hit) = self.cached(flow_version_id) {
+        if let Some(hit) = self.cached(scope, flow_version_id) {
             return Some(hit);
         }
         let record = self
@@ -140,13 +145,13 @@ impl FlowVersionJourneySource {
             .await
             .ok()??;
         let compiled = Arc::new(compile_stored_artifact(&record.artifact_json)?);
-        self.insert(flow_version_id, &compiled);
+        self.insert(scope, flow_version_id, &compiled);
         Some(compiled)
     }
 
     /// The pinned version id and compiled table for an author-facing `journey_id` in `scope`, or
     /// [`None`] when the journey has no pin (an unknown or unpinned journey names no creatable
-    /// custom flow). Reuses the compile cache keyed by the resolved version id.
+    /// custom flow). Reuses the compile cache keyed by the (scope, resolved version id).
     async fn resolve_pinned(
         &self,
         scope: Scope,
@@ -160,24 +165,38 @@ impl FlowVersionJourneySource {
             .await
             .ok()??;
         let version_id = record.id;
-        if let Some(hit) = self.cached(&version_id) {
+        if let Some(hit) = self.cached(scope, &version_id) {
             return Some((version_id, hit));
         }
         let compiled = Arc::new(compile_stored_artifact(&record.artifact_json)?);
-        self.insert(&version_id, &compiled);
+        self.insert(scope, &version_id, &compiled);
         Some((version_id, compiled))
     }
 
-    /// A cache hit for `flow_version_id`, holding the lock only for the sync lookup.
-    fn cached(&self, flow_version_id: &str) -> Option<Arc<CompiledJourney>> {
-        let cache = self.cache.lock().expect("compile cache mutex not poisoned");
-        cache.get(flow_version_id).cloned()
+    /// The scope-safe cache key: (tenant, environment, version id), so a lookup in one scope can
+    /// never hit an entry cached for another.
+    fn cache_key(scope: Scope, flow_version_id: &str) -> String {
+        format!(
+            "{}:{}:{}",
+            scope.tenant(),
+            scope.environment(),
+            flow_version_id
+        )
     }
 
-    /// Insert a compiled table into the cache, holding the lock only for the sync insert.
-    fn insert(&self, flow_version_id: &str, compiled: &Arc<CompiledJourney>) {
+    /// A cache hit for `(scope, flow_version_id)`, holding the lock only for the sync lookup.
+    fn cached(&self, scope: Scope, flow_version_id: &str) -> Option<Arc<CompiledJourney>> {
+        let key = Self::cache_key(scope, flow_version_id);
+        let cache = self.cache.lock().expect("compile cache mutex not poisoned");
+        cache.get(&key).cloned()
+    }
+
+    /// Insert a compiled table into the cache under the scope-safe key, holding the lock only for
+    /// the sync insert.
+    fn insert(&self, scope: Scope, flow_version_id: &str, compiled: &Arc<CompiledJourney>) {
+        let key = Self::cache_key(scope, flow_version_id);
         let mut cache = self.cache.lock().expect("compile cache mutex not poisoned");
-        cache.insert(flow_version_id.to_owned(), compiled.clone());
+        cache.insert(key, compiled.clone());
     }
 }
 
