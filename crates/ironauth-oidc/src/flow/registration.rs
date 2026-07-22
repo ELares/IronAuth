@@ -31,15 +31,10 @@ use ironauth_store::{
 };
 
 use super::message::{self, Message, MessageId};
-use super::model::{
-    Autocomplete, FlowStateTag, InputType, Node, NodeAttributes, NodeGroup, Transport,
-};
+use super::model::{Autocomplete, InputType, Node, NodeAttributes, NodeGroup, Transport};
 use super::signup_fields::{self, FieldFailure, SignupValidation};
 use super::{FlowError, Submission};
-use crate::authn::AuthenticationEvent;
-use crate::interaction;
 use crate::state::OidcState;
-use crate::util::epoch_micros;
 
 /// The signup field nodes for a freshly created registration flow (issue #87): the Signup-step
 /// fields of the client's active form, appended to the initial details form so the very NEXT
@@ -90,11 +85,6 @@ pub(super) enum RegistrationStep {
 pub(super) struct RegistrationSuccess {
     /// The created subject (a `usr_` id string).
     pub subject: String,
-    /// The audit actor for the session mint.
-    pub actor: ActorRef,
-    /// The recorded authentication event (a password login at the current instant, since
-    /// registration authenticates the new user with the password they just set).
-    pub event: AuthenticationEvent,
 }
 
 /// Build the registration details nodes in the deterministic contract order (issue #84):
@@ -202,12 +192,6 @@ pub(super) fn start_nodes(transport: Transport, flow_id: &str) -> Vec<Node> {
 #[must_use]
 pub(super) fn ack_nodes() -> Vec<Node> {
     Vec::new()
-}
-
-/// The state tag a registration render stays on (issue #84): the details state.
-#[must_use]
-pub(super) fn render_state_tag() -> FlowStateTag {
-    FlowStateTag::RegistrationDetails
 }
 
 /// Advance the registration journey one step (issue #84). Returns the transition outcome;
@@ -535,12 +519,8 @@ pub(super) async fn advance_registration(
         }),
         Ok(user_id) => {
             let subject = user_id.to_string();
-            let session_actor = interaction::user_actor(&user_id);
-            let event = AuthenticationEvent::password(epoch_micros(state.now()));
             Ok(RegistrationStep::Complete(Box::new(RegistrationSuccess {
                 subject,
-                actor: session_actor,
-                event,
             })))
         }
         // The open mode duplicate disclosure: emitted ONLY here (the tenant runs open

@@ -41,16 +41,11 @@
 use ironauth_store::{FlowRecord, Scope, UserId, UserRecord};
 
 use super::message::{self, Message};
-use super::model::{
-    Autocomplete, FlowStateTag, InputType, Node, NodeAttributes, NodeGroup, Transport,
-};
+use super::model::{Autocomplete, InputType, Node, NodeAttributes, NodeGroup, Transport};
 use super::{FlowError, Submission};
-use crate::authn::AuthenticationEvent;
-use crate::interaction;
 use crate::risk::RiskDecision;
 use crate::state::OidcState;
-use crate::util::epoch_micros;
-use ironauth_store::{ActorRef, AuthPath};
+use ironauth_store::AuthPath;
 
 /// The outcome of one login transition (issue #84). The driver turns [`Render`] into a
 /// re-rendered flow (rotating the API submit token) and [`Complete`] into the single use
@@ -80,10 +75,6 @@ pub(super) struct LoginSuccess {
     pub subject: String,
     /// The authenticated subject as a typed id (for the risk follow through).
     pub user_id: UserId,
-    /// The audit actor for the session mint.
-    pub actor: ActorRef,
-    /// The recorded authentication event (a password login at the current instant).
-    pub event: AuthenticationEvent,
     /// The credential abuse attempt context, so a successful mint RESETS the SAME failure
     /// counters the pre verify [`OidcState::regulate_before`] recorded.
     pub ctx: crate::abuse::AttemptContext,
@@ -461,8 +452,6 @@ pub(super) async fn advance_login(
             Ok(LoginStep::Complete(Box::new(LoginSuccess {
                 subject: user.id.to_string(),
                 user_id: user.id,
-                actor: interaction::user_actor(&user.id),
-                event: AuthenticationEvent::password(epoch_micros(state.now())),
                 ctx,
                 risk_decision,
                 identifier: identifier.to_owned(),
@@ -484,10 +473,4 @@ pub(super) async fn advance_login(
             })
         }
     }
-}
-
-/// The state tag a login render stays on (issue #84): the identifier plus password state.
-#[must_use]
-pub(super) fn render_state_tag() -> FlowStateTag {
-    FlowStateTag::IdentifierPassword
 }

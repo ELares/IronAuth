@@ -117,6 +117,12 @@ impl Journey {
     /// an EMPTY plan and is not a creation entry. The federation launcher hands off to an
     /// EXTERNAL browser leg (a redirect, never a local completion), so its plan is the
     /// single launcher state with no `Completed` terminal.
+    ///
+    /// End state (issue #92, closed by PR 8e): the three mint-family arms (login, registration,
+    /// recovery) stay a `&'static` list here AND are continuously pinned to equal the compiled
+    /// table's projection by the three projection pins in [`super::inspect`], so there is one
+    /// truth that drift turns into a test failure. Federation and Consent have no compiled
+    /// artifact, so their arms remain purely static residuals.
     #[must_use]
     pub fn plan(self) -> &'static [FlowStateTag] {
         use FlowStateTag::{

@@ -27,9 +27,7 @@
 use ironauth_store::{FlowRecord, Scope, UserId};
 
 use super::message::{self, Message};
-use super::model::{
-    Autocomplete, FlowStateTag, InputType, Node, NodeAttributes, NodeGroup, Transport,
-};
+use super::model::{Autocomplete, InputType, Node, NodeAttributes, NodeGroup, Transport};
 use super::{FlowError, Submission};
 use crate::authn::{self, AuthMethod, CredentialClass};
 use crate::state::OidcState;
@@ -424,16 +422,4 @@ fn transport_of(record: &FlowRecord) -> Transport {
     } else {
         Transport::Browser
     }
-}
-
-/// The state tag an MFA challenge render stays on.
-#[must_use]
-pub(super) fn challenge_state_tag() -> FlowStateTag {
-    FlowStateTag::MfaChallenge
-}
-
-/// The state tag an MFA enroll render stays on.
-#[must_use]
-pub(super) fn enroll_state_tag() -> FlowStateTag {
-    FlowStateTag::MfaEnroll
 }
