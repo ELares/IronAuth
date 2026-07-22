@@ -27,10 +27,11 @@
 use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
-    ActorRef, CorrelationId, DcrPolicyId, NewDcrPolicy, NewResourceServer, PromotionApplyError,
-    PromotionOutcome, Reference, Resolved, ResourceServerId, SNAPSHOT_SCHEMA_VERSION, Scope,
-    Snapshot, SnapshotResources, Store, TokenFormat, VariableSnapshot, diff_snapshots,
-    export_snapshot, plan_promotion, promotion_revision, resolve_value,
+    ActorRef, CorrelationId, DcrPolicyId, FlowVersionRecord, FlowVersionSnapshot, NewDcrPolicy,
+    NewFlowVersion, NewResourceServer, PromotionApplyError, PromotionOutcome, Reference, Resolved,
+    ResourceServerId, SNAPSHOT_SCHEMA_VERSION, Scope, Snapshot, SnapshotResources, Store,
+    TokenFormat, VariableSnapshot, diff_snapshots, export_snapshot, plan_promotion,
+    promotion_revision, resolve_value,
 };
 
 /// A fresh write actor plus correlation id for a mutation.
@@ -106,6 +107,90 @@ async fn create_client(db: &TestDatabase, env: &Env, scope: Scope, display_name:
         .create(env, display_name)
         .await
         .expect("create client");
+}
+
+/// A minimal load-valid journey artifact whose internal id embeds `variant`, so distinct
+/// variants are distinct (differing) artifacts for the same registry (`journey_id`, version).
+fn journey_artifact(journey: &str, variant: u32) -> String {
+    serde_json::json!({
+        "schema_version": "ironauth.journey/v1",
+        "id": format!("{journey}_v{variant}"),
+        "engine_version": 1,
+        "entry": "primary",
+        "steps": [
+            {"id": "primary", "kind": "identifier_password", "node_group": "password"},
+            {"id": "done", "kind": "terminal"}
+        ],
+        "transitions": [{"from": "primary", "to": "done"}]
+    })
+    .to_string()
+}
+
+/// Create the next custom-journey version in `scope` (control plane), returning its number.
+async fn create_flow_version(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    journey: &str,
+    artifact_json: &str,
+) -> i32 {
+    let (actor, corr) = acting(db, env);
+    db.control_store()
+        .scoped(scope)
+        .acting(actor, corr)
+        .flow_versions()
+        .create_next_version(
+            env,
+            NewFlowVersion {
+                journey_id: journey,
+                artifact_json,
+            },
+            1_000_000,
+        )
+        .await
+        .expect("create flow version")
+        .version
+}
+
+/// Move `journey`'s active pin to `version` in `scope` (control plane).
+async fn pin_flow_version(db: &TestDatabase, env: &Env, scope: Scope, journey: &str, version: i32) {
+    let (actor, corr) = acting(db, env);
+    db.control_store()
+        .scoped(scope)
+        .acting(actor, corr)
+        .flow_versions()
+        .pin(env, journey, version, 2_000_000, None)
+        .await
+        .expect("pin flow version");
+}
+
+/// A journey's specific version in `scope`, if present (control plane).
+async fn get_flow_version(
+    db: &TestDatabase,
+    scope: Scope,
+    journey: &str,
+    version: i32,
+) -> Option<FlowVersionRecord> {
+    control(db)
+        .scoped(scope)
+        .flow_versions()
+        .get_version(journey, version)
+        .await
+        .expect("get flow version")
+}
+
+/// A journey's active pinned version in `scope`, if any (control plane).
+async fn get_pinned_flow_version(
+    db: &TestDatabase,
+    scope: Scope,
+    journey: &str,
+) -> Option<FlowVersionRecord> {
+    control(db)
+        .scoped(scope)
+        .flow_versions()
+        .get_pinned(journey)
+        .await
+        .expect("get pinned flow version")
 }
 
 /// The control-plane store the promotion engine runs on.
@@ -634,4 +719,296 @@ async fn a_submitted_snapshot_is_a_valid_promotion_source() {
         diff_snapshots(&submitted, &target_after).is_empty(),
         "a submitted snapshot promotes and round-trips"
     );
+}
+
+/// Custom-journey versions (issue #92) promote as APPEND-ONLY definitions into a fresh
+/// target: every version is created (load-valid), a re-apply is an idempotent no-op, and
+/// because the empty target had no pin the target stays UNPINNED (the version definitions
+/// travel; activation does not).
+#[tokio::test]
+async fn flow_versions_promote_into_a_fresh_target_and_re_apply_is_a_no_op() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let source = db.seed_scope(&env).await;
+    let target = Scope::new(
+        source.tenant(),
+        db.seed_environment(&env, source.tenant()).await,
+    );
+
+    // Source has three append-only versions of "login" (v3 pinned as its active journey).
+    let journey = "login";
+    assert_eq!(
+        create_flow_version(&db, &env, source, journey, &journey_artifact(journey, 1)).await,
+        1
+    );
+    assert_eq!(
+        create_flow_version(&db, &env, source, journey, &journey_artifact(journey, 2)).await,
+        2
+    );
+    assert_eq!(
+        create_flow_version(&db, &env, source, journey, &journey_artifact(journey, 3)).await,
+        3
+    );
+    pin_flow_version(&db, &env, source, journey, 3).await;
+
+    let source_snapshot = export(&db, source).await;
+    // The snapshot carries the source pin informationally (v3), but it is not an apply action.
+    assert!(
+        source_snapshot
+            .resources
+            .flow_version
+            .iter()
+            .any(|v| v.version == 3 && v.pinned),
+        "the source pin travels in the snapshot for visibility"
+    );
+
+    let plan = plan_promotion(&control(&db).scoped(target), &source_snapshot)
+        .await
+        .expect("plan db")
+        .expect("plan builds");
+    assert_eq!(plan.diff().len(), 3, "one create per source version");
+
+    let (actor, corr) = acting(&db, &env);
+    control(&db)
+        .scoped(target)
+        .acting(actor, corr)
+        .apply_promotion(&env, &source_snapshot, plan.base_revision(), false)
+        .await
+        .expect("apply");
+
+    // All three versions landed in the target and are load-valid (get_version returns them).
+    for version in 1..=3 {
+        let record = get_flow_version(&db, target, journey, version)
+            .await
+            .unwrap_or_else(|| panic!("v{version} promoted into the target"));
+        assert!(record.artifact_json.contains("identifier_password"));
+    }
+    // THE ACTIVATION GATE: the empty target had no pin, and the promoted pin was NOT applied,
+    // so the target has NO active journey until a target-env admin pins one.
+    assert!(
+        get_pinned_flow_version(&db, target, journey)
+            .await
+            .is_none(),
+        "a promoted pin must never auto-activate a journey in the target"
+    );
+
+    // AUDITED and ROUND-TRIPS: re-diff is empty and a re-apply is an idempotent no-op.
+    assert_eq!(apply_audit_count(&db, target).await, 1);
+    let target_after = export(&db, target).await;
+    assert!(
+        diff_snapshots(&source_snapshot, &target_after).is_empty(),
+        "apply then re-diff must be empty"
+    );
+    let (actor, corr) = acting(&db, &env);
+    let again = control(&db)
+        .scoped(target)
+        .acting(actor, corr)
+        .apply_promotion(&env, &source_snapshot, plan.base_revision(), false)
+        .await
+        .expect("re-apply");
+    assert_eq!(again, PromotionOutcome::NoOp, "re-apply is a no-op");
+    assert_eq!(apply_audit_count(&db, target).await, 1);
+}
+
+/// THE PER-ENVIRONMENT ACTIVATION GATE (security-critical): promoting a journey whose SOURCE
+/// pin is v3 into a target whose ACTIVE pin is v1 imports v2 and v3 as definitions but LEAVES
+/// the target's active pin on v1. A promoted pin never silently swaps the journey that
+/// authenticates users in the target; a target admin must deliberately pin v3 to activate it.
+#[tokio::test]
+async fn apply_imports_versions_but_never_moves_the_targets_active_pin() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let source = db.seed_scope(&env).await;
+    let target = Scope::new(
+        source.tenant(),
+        db.seed_environment(&env, source.tenant()).await,
+    );
+
+    let journey = "login";
+    // Source: v1, v2, v3, with v3 the active (pinned) journey.
+    create_flow_version(&db, &env, source, journey, &journey_artifact(journey, 1)).await;
+    create_flow_version(&db, &env, source, journey, &journey_artifact(journey, 2)).await;
+    create_flow_version(&db, &env, source, journey, &journey_artifact(journey, 3)).await;
+    pin_flow_version(&db, &env, source, journey, 3).await;
+
+    // Target already runs its OWN v1 (byte-identical to the source's v1, so no conflict) and
+    // has pinned it as its active journey.
+    create_flow_version(&db, &env, target, journey, &journey_artifact(journey, 1)).await;
+    pin_flow_version(&db, &env, target, journey, 1).await;
+    assert_eq!(
+        get_pinned_flow_version(&db, target, journey)
+            .await
+            .expect("target pin exists")
+            .version,
+        1,
+        "the target starts pinned to v1"
+    );
+
+    let source_snapshot = export(&db, source).await;
+    let plan = plan_promotion(&control(&db).scoped(target), &source_snapshot)
+        .await
+        .expect("plan db")
+        .expect("plan builds");
+    // v1 is already present with the same artifact (a no-op); only v2 and v3 are created.
+    assert_eq!(
+        plan.diff().len(),
+        2,
+        "only the two missing versions are creates"
+    );
+
+    let (actor, corr) = acting(&db, &env);
+    control(&db)
+        .scoped(target)
+        .acting(actor, corr)
+        .apply_promotion(&env, &source_snapshot, plan.base_revision(), false)
+        .await
+        .expect("apply");
+
+    // The target now HAS v3 (its definition was imported).
+    assert!(
+        get_flow_version(&db, target, journey, 3).await.is_some(),
+        "v3's definition promoted into the target"
+    );
+    // THE GATE, proven: the target's ACTIVE pin is STILL v1, not the source's v3. A target
+    // admin must pin v3 to activate it; promotion never did.
+    let target_pin = get_pinned_flow_version(&db, target, journey)
+        .await
+        .expect("target still has a pin");
+    assert_eq!(
+        target_pin.version, 1,
+        "apply must NOT move the target's active pin: it keeps its own v1"
+    );
+}
+
+/// A source version whose `(journey_id, version)` already exists in the target with a
+/// DIFFERENT artifact is refused as an append-only conflict: apply changes nothing and never
+/// overwrites the target's immutable version.
+#[tokio::test]
+async fn a_conflicting_flow_version_artifact_is_refused_and_changes_nothing() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let source = db.seed_scope(&env).await;
+    let target = Scope::new(
+        source.tenant(),
+        db.seed_environment(&env, source.tenant()).await,
+    );
+
+    let journey = "login";
+    // Source v1 and target v1 are BOTH version 1 of "login" but carry DIFFERENT artifacts.
+    create_flow_version(&db, &env, source, journey, &journey_artifact(journey, 1)).await;
+    create_flow_version(&db, &env, target, journey, &journey_artifact(journey, 99)).await;
+    let target_v1_before = get_flow_version(&db, target, journey, 1)
+        .await
+        .expect("target v1")
+        .artifact_json;
+
+    let source_snapshot = export(&db, source).await;
+    let plan = plan_promotion(&control(&db).scoped(target), &source_snapshot)
+        .await
+        .expect("plan db")
+        .expect("plan builds");
+
+    let (actor, corr) = acting(&db, &env);
+    let error = control(&db)
+        .scoped(target)
+        .acting(actor, corr)
+        .apply_promotion(&env, &source_snapshot, plan.base_revision(), false)
+        .await
+        .expect_err("a conflicting version must be refused");
+    match error {
+        PromotionApplyError::FlowVersionArtifactConflict {
+            journey_id,
+            version,
+        } => {
+            assert_eq!(journey_id, journey);
+            assert_eq!(version, 1);
+        }
+        other => panic!("expected an append-only conflict, got {other:?}"),
+    }
+
+    // The target's immutable v1 is byte-for-byte unchanged, and nothing was audited.
+    let target_v1_after = get_flow_version(&db, target, journey, 1)
+        .await
+        .expect("target v1 still present")
+        .artifact_json;
+    assert_eq!(
+        target_v1_before, target_v1_after,
+        "an append-only version is never overwritten"
+    );
+    assert_eq!(apply_audit_count(&db, target).await, 0);
+}
+
+/// A load-invalid promoted journey artifact rolls the WHOLE apply back (transactional): the
+/// variable staged earlier in the same apply is not left behind.
+#[tokio::test]
+async fn a_load_invalid_promoted_artifact_rolls_back_the_whole_apply() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let source = db.seed_scope(&env).await;
+    let target = Scope::new(
+        source.tenant(),
+        db.seed_environment(&env, source.tenant()).await,
+    );
+
+    // A hand-built snapshot: a valid variable AND a load-invalid journey artifact (a transition
+    // to an undeclared step, which does not compile). A store export could never produce the
+    // invalid artifact (the write gate refuses it), so a submitted snapshot exercises the apply
+    // gate directly.
+    let invalid_artifact = serde_json::json!({
+        "schema_version": "ironauth.journey/v1",
+        "id": "broken",
+        "engine_version": 1,
+        "entry": "primary",
+        "steps": [
+            {"id": "primary", "kind": "identifier_password", "node_group": "password"},
+            {"id": "done", "kind": "terminal"}
+        ],
+        "transitions": [{"from": "primary", "to": "nowhere"}]
+    });
+    let submitted = Snapshot {
+        schema_version: SNAPSHOT_SCHEMA_VERSION.to_owned(),
+        resources: SnapshotResources {
+            variable: vec![VariableSnapshot {
+                name: "staged".to_owned(),
+                value: "value".to_owned(),
+            }],
+            flow_version: vec![FlowVersionSnapshot {
+                journey_id: "login".to_owned(),
+                version: 1,
+                artifact: invalid_artifact,
+                pinned: false,
+            }],
+            ..SnapshotResources::default()
+        },
+    };
+
+    let plan = plan_promotion(&control(&db).scoped(target), &submitted)
+        .await
+        .expect("plan db")
+        .expect("plan builds");
+
+    let (actor, corr) = acting(&db, &env);
+    let error = control(&db)
+        .scoped(target)
+        .acting(actor, corr)
+        .apply_promotion(&env, &submitted, plan.base_revision(), false)
+        .await
+        .expect_err("a load-invalid artifact must fail the apply");
+    assert!(
+        matches!(error, PromotionApplyError::Store(_)),
+        "a load-invalid promoted artifact fails the apply: {error:?}"
+    );
+
+    // TRANSACTIONAL: the variable staged earlier in the same apply rolled back with it, and no
+    // version and no audit row survive.
+    let target_after = export(&db, target).await;
+    assert!(
+        target_after.resources.variable.is_empty(),
+        "the staged variable must roll back with the failed apply"
+    );
+    assert!(
+        get_flow_version(&db, target, "login", 1).await.is_none(),
+        "no version survives a rolled-back apply"
+    );
+    assert_eq!(apply_audit_count(&db, target).await, 0);
 }
