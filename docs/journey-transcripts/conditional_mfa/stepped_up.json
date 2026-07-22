@@ -1,0 +1,26 @@
+{
+  "journey_id": "login_conditional_mfa",
+  "engine_version": 1,
+  "description": "Stepped-up golden path: the primary step reports a second factor is required, so routing threads the MFA challenge, then completes to the terminal.",
+  "steps": [
+    {
+      "comment": "At the primary factor, the subject requires a second factor.",
+      "signals": [
+        "primary_verified",
+        "mfa_required"
+      ],
+      "expect": {
+        "step": "mfa"
+      }
+    },
+    {
+      "comment": "The second factor is proven; the unguarded edge completes the run.",
+      "signals": [
+        "primary_verified"
+      ],
+      "expect": {
+        "terminal": "done"
+      }
+    }
+  ]
+}

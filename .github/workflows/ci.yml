@@ -244,6 +244,15 @@ jobs:
         run: |
           scripts/flow-golden.sh
           git diff --exit-code docs/flow-golden.json
+      - name: journey golden-path replay (recorded transcripts vs compiled routing)
+        # Re-execute every committed journey transcript against its artifact's compiled routing,
+        # the SAME document-order-first-true-guard walk the live engine drives (pinned context,
+        # pure evaluator, no database). A version whose routing drifts (a guard edited, a
+        # transition added or reordered) makes a recorded transcript diverge and fails here, so
+        # behavioral drift between flow versions cannot land silently. The regenerate mode
+        # (scripts/journey-replay.sh --regenerate) rewrites the expected outcomes for a reviewable
+        # diff when a routing change is deliberate.
+        run: scripts/journey-replay.sh
       - name: openapi freshness (served management spec vs committed artifact)
         run: scripts/openapi-check.sh
       - name: governance files present
