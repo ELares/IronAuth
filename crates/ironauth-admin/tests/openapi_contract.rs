@@ -116,6 +116,7 @@ fn operation_ids_are_the_stable_set() {
             "listSessions",
             "listSignupQuarantines",
             "listTenants",
+            "listUserConsents",
             "listUsers",
             "planConfigPromotion",
             "postFlowDryRun",
@@ -127,6 +128,7 @@ fn operation_ids_are_the_stable_set() {
             "resumeTenant",
             "revokeInvitation",
             "revokeSession",
+            "revokeUserConsent",
             "revokeUserSessions",
             "setBrandFavicon",
             "setBrandLogo",
@@ -312,6 +314,7 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/signup-quarantine",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/users",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/consents",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/webauthn/mds3/health",
             "PATCH /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}",
             "POST /v1/tenants",
@@ -341,6 +344,7 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/signup-quarantine/{user_id}/extend",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/signup-quarantine/{user_id}/reject",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/users",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/consents/{client_id}/revoke",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/sessions/revoke",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/state",
             "POST /v1/tenants/{tenant_id}/restore",
@@ -391,7 +395,7 @@ fn committed_artifact_matches_generated_spec() {
 async fn served_routes_match_documented_routes() {
     let router = db_free_router();
     let documented = documented_method_paths();
-    assert_eq!(documented.len(), 94, "the documented route count is pinned");
+    assert_eq!(documented.len(), 96, "the documented route count is pinned");
 
     // The OUTBOUND lazy-migration endpoint (issue #58) is the one documented route
     // that is NOT gated by the management `Principal` at 401. It is DISABLED BY

@@ -47,6 +47,7 @@ mod brand_assets;
 mod client_admin_grants;
 mod config;
 mod connectors;
+mod consents;
 mod dcr;
 mod diagnostics;
 mod environments;
@@ -388,6 +389,19 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/sessions/revoke",
             post(sessions::revoke_user_sessions),
+        )
+        // User consent (connected apps) management (issue #88): list a user's
+        // remembered consents and revoke one. The revoke cascades to the (subject,
+        // client) refresh families in the store transaction and is sudo-gated. Keyed by
+        // SUBJECT, distinct from the client-keyed admin consent pre-authorization
+        // surface (`applications/{client_id}/admin-consent`).
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/consents",
+            get(consents::list_user_consents),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/consents/{client_id}/revoke",
+            post(consents::revoke_user_consent),
         )
         // Admin user CRUD, lifecycle, and external ids (issue #52). The static
         // suffixes (`/state`, `/external-id`) are siblings of the parameterized

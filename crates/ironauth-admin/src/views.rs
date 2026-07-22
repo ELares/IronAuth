@@ -794,6 +794,65 @@ pub struct UserRevocationView {
     pub hard_kill: bool,
 }
 
+/// One connected app a user has granted a remembered consent to (issue #88), as the
+/// admin consent surface reports it: the client the grant authorizes, its display
+/// metadata (present when the client still exists), the scope the grant was recorded
+/// against, and when it was granted or lapses. Auto-grant clients (`implicit` consent
+/// mode or `skip_consent`) are FILTERED OUT of the list, since a stored grant for one
+/// is not a meaningfully revocable authorization.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct UserConsentView {
+    /// The client the grant authorizes (`cli_...`).
+    pub client_id: String,
+    /// The client's human-readable display name, or null when the client has since
+    /// been deleted (the grant is still listed by id and stays revocable).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// The client's registered logo URI, or null when it registered none or was
+    /// deleted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logo_uri: Option<String>,
+    /// The space-separated scope the grant was recorded against, or null when the
+    /// consented request carried no scope.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// When the grant was recorded, milliseconds since the Unix epoch.
+    pub granted_at_unix_ms: i64,
+    /// The remembered-consent expiry, milliseconds since the Unix epoch, or null when
+    /// the grant never expires.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at_unix_ms: Option<i64>,
+}
+
+/// A user's connected apps (issue #88): the remembered consents they hold, oldest
+/// first. Not cursor paginated: a subject's grant count is bounded by the number of
+/// clients in the environment, so the whole set is returned.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct UserConsentList {
+    /// The consents the user holds.
+    pub items: Vec<UserConsentView>,
+}
+
+/// The result of revoking one user's consent to a client (issue #88). Reports the
+/// POST-CONDITION and the cascade extent: whether the guarded consent flip happened,
+/// and how many of the (subject, client) refresh families were revoked with it.
+///
+/// `revoked` is false for the idempotent no-op (an already-revoked or absent grant),
+/// which is byte-identical to a real flip that owned no live family only in
+/// `families_revoked` (0 either way); the two cases are distinguished by `revoked`.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ConsentRevocationView {
+    /// The client whose consent was targeted.
+    pub client_id: String,
+    /// Whether the guarded consent UPDATE flipped a live grant to revoked. False for
+    /// the idempotent no-op (an already-revoked or absent grant), in which case
+    /// nothing was audited and no cascade ran.
+    pub revoked: bool,
+    /// How many refresh-token families the same-transaction cascade revoked (both
+    /// session-bound and `offline_access` families of the (subject, client) pair).
+    pub families_revoked: u64,
+}
+
 /// A user's lifecycle state on the wire (issue #52). The stable, closed enum the
 /// management API exposes: state changes are explicit API operations validated
 /// against a state machine in the store.

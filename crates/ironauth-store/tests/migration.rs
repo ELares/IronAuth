@@ -471,7 +471,7 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
     );
 }
 
-/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the seventy-seven
+/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the seventy-eight
 /// real migrations and leaves no throwaway demo object in a real database.
 // A long but linear ledger-and-table assertion sweep (one line per migration and
 // per real table); splitting it would not make it clearer.
@@ -494,8 +494,8 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
     );
     assert_eq!(
         report.already_applied(),
-        77,
-        "the production chain is exactly seventy seven migrations (isolation, audit log, management \
+        78,
+        "the production chain is exactly seventy eight migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -515,17 +515,17 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
          risk signals, signup fraud review, advanced recovery modes, headless flows, branding, \
          locale bundles, brand assets, diagnostic reason detail, diagnostics control read, \
          policy decision traces, flows control read, signup forms, consent lockdown, client admin \
-         grants)"
+         grants, consent control grants)"
     );
 
-    // The ledger holds exactly versions 1 through 77.
+    // The ledger holds exactly versions 1 through 78.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
             46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67,
-            68, 69, 70, 71, 72, 73, 74, 75, 76, 77
+            68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78
         ]
     );
     let phase_of = |version: i64| async move {
@@ -1670,6 +1670,45 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
     assert!(
         role_has_table_privilege(pool, "ironauth_control", "client_admin_grants", "INSERT").await,
         "the control-plane role must hold INSERT on client_admin_grants (it owns the lifecycle)"
+    );
+
+    // The consent-control-grants migration (issue #88, PR 5, migration 0078) is an EXPAND: a
+    // pure pair of grants (no table, column, or policy change).
+    assert_eq!(phase_of(78).await, "expand");
+
+    // The control plane gains the two coherent privileges the admin consent revocation surface
+    // needs: SELECT (to target a row and list a subject's grants) and a COLUMN-scoped
+    // UPDATE (revoked_at) (to flip it), matching the data plane's own column-scoped grant (0076).
+    assert!(
+        role_has_table_privilege(pool, "ironauth_control", "consents", "SELECT").await,
+        "the control-plane role must hold SELECT on consents (target the row and list grants)"
+    );
+    assert!(
+        role_has_column_privilege(pool, "ironauth_control", "consents", "revoked_at", "UPDATE")
+            .await,
+        "the control-plane role must hold column-scoped UPDATE on consents.revoked_at (admin revoke)"
+    );
+    // The UPDATE is COLUMN scoped, never table-wide: the control plane can never rewrite a
+    // consent's subject (or any column but revoked_at), so it can review and revoke, nothing more.
+    assert!(
+        !role_has_column_privilege(pool, "ironauth_control", "consents", "subject", "UPDATE").await,
+        "the control-plane role must NOT hold UPDATE on consents.subject (revoke is revoked_at only)"
+    );
+    // The control plane never MINTS or DELETES a consent (only the data-plane gate records one,
+    // and a revoked row is retained for audit rather than deleted), so it holds neither privilege.
+    assert!(
+        !role_has_table_privilege(pool, "ironauth_control", "consents", "INSERT").await,
+        "the control-plane role must NOT hold INSERT on consents (only the data plane mints one)"
+    );
+    assert!(
+        !role_has_table_privilege(pool, "ironauth_control", "consents", "DELETE").await,
+        "the control-plane role must NOT hold DELETE on consents (a revoked row is retained)"
+    );
+    // The data plane's own self-service grant (0076) is untouched: it still holds column-scoped
+    // UPDATE (revoked_at), so 0078 added the control-plane grants WITHOUT disturbing the data plane.
+    assert!(
+        role_has_column_privilege(pool, "ironauth_app", "consents", "revoked_at", "UPDATE").await,
+        "the data-plane role must still hold column-scoped UPDATE on consents.revoked_at (0076)"
     );
 
     // The demo object never reaches a production database.

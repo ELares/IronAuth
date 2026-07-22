@@ -1,0 +1,47 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+--
+-- Control-plane consent revocation grants (issue #88, PR 5).
+--
+-- The admin (control-plane) consent revocation surface lands here, so the
+-- control role finally gains the two coherent privileges it needs to target and
+-- revoke a recorded consent. Migration 0076 deliberately DEFERRED these: it
+-- granted the data plane its self-service UPDATE (revoked_at) but left the
+-- control plane ungranted, because the control plane holds no SELECT on consents
+-- and a column-scoped UPDATE alone would have been a dead grant (the guarded
+-- revoke reads the row to target it). This migration ships both together, now
+-- that the admin surface (crates/ironauth-admin) is the first caller:
+--
+--   1. GRANT SELECT ON consents: the admin consent list reads a subject's active
+--      grants, and the guarded revoke reads the (subject, client) row (its WHERE
+--      predicate plus RETURNING id) to target it. Read only; the control plane
+--      never enumerates PII beyond the consent registry it already governs.
+--   2. GRANT UPDATE (revoked_at) ON consents: the admin revoke flips exactly this
+--      column to stamp the revocation instant. COLUMN scoped, never a table-wide
+--      UPDATE, so a compromised or buggy control-plane path can never rewrite a
+--      consent's subject, client, or granted scope. It matches the data plane's
+--      own column-scoped grant (0076).
+--
+-- The control plane is deliberately granted NO INSERT and NO DELETE on consents:
+-- it never MINTS a consent (only the data-plane authorization gate records one)
+-- and never DELETES one (a revoked consent row is retained for audit, stamped
+-- rather than removed). The least-privilege split is preserved: the control plane
+-- can review and revoke, nothing more.
+--
+-- The refresh-family cascade the revoke performs in the SAME transaction (a
+-- consent revoke also revokes the (subject, client) refresh families) reuses the
+-- control plane's EXISTING column-scoped UPDATE (revoked_at) ON refresh_families
+-- from migration 0022. No new refresh-family grant is needed here.
+--
+-- Row-level security is already ENABLED and FORCED on consents (0006), and this
+-- migration adds no table, no column, and no policy: it is a pure pair of grants.
+-- Every statement is additive, so this migration is an EXPAND.
+
+-- ---------------------------------------------------------------------------
+-- The control plane READS a subject's consents (the admin consent list) and
+-- targets a row on the guarded revoke.
+GRANT SELECT ON consents TO ironauth_control;
+
+-- The control plane flips exactly revoked_at to revoke a consent. Column scoped,
+-- never a table-wide UPDATE (least privilege, the #31 lesson), matching the
+-- data-plane self-service grant (0076).
+GRANT UPDATE (revoked_at) ON consents TO ironauth_control;

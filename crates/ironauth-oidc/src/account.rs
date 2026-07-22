@@ -40,9 +40,9 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use ironauth_store::{
-    AccountLinkId, CorrelationId, CredentialRemoveOutcome, CredentialType, FirstPasswordOutcome,
-    IdentifierType, PasswordRemovalOutcome, Scope, SessionFleetFilter, SessionId, SessionSummary,
-    StoreError, TrustedDeviceRevokeReason, UnlinkOutcome, UserId,
+    AccountLinkId, ClientId, CorrelationId, CredentialRemoveOutcome, CredentialType,
+    FirstPasswordOutcome, IdentifierType, PasswordRemovalOutcome, Scope, SessionFleetFilter,
+    SessionId, SessionSummary, StoreError, TrustedDeviceRevokeReason, UnlinkOutcome, UserId,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -335,6 +335,144 @@ pub async fn revoke_other_sessions(
         ),
         Err(_) => server_error(),
     }
+}
+
+/// `GET /t/{tenant}/e/{environment}/account/consents`: list the connected apps the
+/// authenticated user has granted a remembered consent to (issue #88), each enriched
+/// with the client's display name and logo, oldest first. Reads ONLY the caller's own
+/// grants (the subject is recovered from the session, NEVER a query parameter), so
+/// another user's grants are never listed.
+///
+/// Auto-grant clients are EXCLUDED: a client whose consent mode is `implicit` or that
+/// sets `skip_consent` never shows a consent screen, so a stored grant for it is not a
+/// meaningfully revocable authorization (a fresh authorization would just auto-grant
+/// again). A client that has since been DELETED is still listed (by its client id), so
+/// a grant to a removed client stays revocable rather than silently unmanageable.
+pub async fn list_consents(
+    State(state): State<OidcState>,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let account = match authenticate(&state, &tenant_id, &environment_id, &headers).await {
+        Ok(account) => account,
+        Err(response) => return response,
+    };
+    let listed = state
+        .store()
+        .scoped(account.scope)
+        .consents()
+        .list_for_subject(&account.subject_str)
+        .await;
+    let Ok(grants) = listed else {
+        return server_error();
+    };
+    let clients = state.store().scoped(account.scope).clients();
+    let mut consents: Vec<Value> = Vec::with_capacity(grants.len());
+    for grant in &grants {
+        // A client id recorded on a live consent parses in scope by construction; a
+        // value that does not is skipped defensively rather than surfaced.
+        let Ok(client_id) = ClientId::parse_in_scope(&grant.client_id, &account.scope) else {
+            continue;
+        };
+        match clients.get(&client_id).await {
+            Ok(client) => {
+                // Auto-grant clients are not meaningfully revocable: omit them.
+                if is_auto_grant(&client.consent_mode, client.skip_consent) {
+                    continue;
+                }
+                consents.push(json!({
+                    "client_id": grant.client_id,
+                    "display_name": client.display_name,
+                    "logo_uri": client.logo_uri,
+                    "scope": grant.granted_scope,
+                    "granted_at": grant.granted_at_unix_micros,
+                    "expires_at": grant.expires_at_unix_micros,
+                }));
+            }
+            // The client was deleted after the grant: still list it (revocable) by id,
+            // with no display metadata, rather than dropping it silently.
+            Err(StoreError::NotFound) => consents.push(json!({
+                "client_id": grant.client_id,
+                "display_name": Value::Null,
+                "logo_uri": Value::Null,
+                "scope": grant.granted_scope,
+                "granted_at": grant.granted_at_unix_micros,
+                "expires_at": grant.expires_at_unix_micros,
+            })),
+            Err(_) => return server_error(),
+        }
+    }
+    json_response(StatusCode::OK, json!({ "consents": consents }))
+}
+
+/// The revoke-consent request body: the client whose remembered consent to revoke.
+#[derive(Deserialize)]
+pub struct RevokeConsentBody {
+    /// The client id whose consent to revoke. The subject is NEVER in the body (it is
+    /// the authenticated caller, recovered from the session): binding a revoke to a
+    /// body-supplied subject would be an IDOR. A client id in another scope, or one
+    /// the caller never consented to, is a harmless no-op.
+    client_id: String,
+}
+
+/// `POST /t/{tenant}/e/{environment}/account/consents/revoke`: revoke the caller's OWN
+/// remembered consent to one client (issue #88). The subject is the authenticated
+/// caller (recovered from the session, NEVER the body), so a user can only ever revoke
+/// their own grant: revoking a consent bound to a body-supplied subject would be an
+/// IDOR. The revoke cascades to the (subject, client) refresh families in the store's
+/// single transaction, so the connected app's live tokens die with the consent, and it
+/// is audited to the end user.
+pub async fn revoke_consent(
+    State(state): State<OidcState>,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<RevokeConsentBody>,
+) -> Response {
+    if !interaction::same_origin_ok(&headers, state.self_origin().as_deref()) {
+        return forbidden();
+    }
+    let account = match authenticate(&state, &tenant_id, &environment_id, &headers).await {
+        Ok(account) => account,
+        Err(response) => return response,
+    };
+    // Parse the untrusted client id under the caller's OWN scope; a malformed or
+    // cross-scope id is the uniform not-found.
+    let Ok(client_id) = ClientId::parse_in_scope(&body.client_id, &account.scope) else {
+        return not_found_json();
+    };
+    let actor = interaction::user_actor(&account.subject);
+    let result = state
+        .store()
+        .scoped(account.scope)
+        .acting(actor, CorrelationId::generate(state.env()))
+        .consents()
+        .revoke(
+            state.env(),
+            &account.subject_str,
+            &client_id.to_string(),
+            epoch_micros(state.now()),
+        )
+        .await;
+    match result {
+        Ok(revocation) => json_response(
+            StatusCode::OK,
+            json!({
+                "client_id": client_id.to_string(),
+                "revoked": revocation.consent_revoked,
+                "families_revoked": revocation.families_revoked,
+            }),
+        ),
+        Err(_) => server_error(),
+    }
+}
+
+/// Whether a client's consent is AUTO-GRANTED (issue #88): its consent mode is
+/// `implicit`, or it sets the orthogonal `skip_consent` knob. Such a client never shows
+/// a consent screen, so a stored grant for it is not a meaningfully revocable
+/// authorization and is filtered from the connected-apps list on both the self-service
+/// and admin surfaces.
+fn is_auto_grant(consent_mode: &str, skip_consent: bool) -> bool {
+    consent_mode == "implicit" || skip_consent
 }
 
 /// `GET /t/{tenant}/e/{environment}/account/trusted-devices`: list the caller's OWN

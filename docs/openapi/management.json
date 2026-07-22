@@ -8192,6 +8192,185 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/consents": {
+      "get": {
+        "tags": [
+          "users"
+        ],
+        "summary": "List the connected apps a user has granted a remembered consent to (issue #88),\noldest first, each enriched with the client's display name and logo when the client\nstill exists. Auto-grant clients (`implicit` or `skip_consent`) are filtered out; a\ngrant to a DELETED client is still listed by its client id (so it stays revocable).",
+        "operationId": "listUserConsents",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "user_id",
+            "in": "path",
+            "description": "The user identifier (usr_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The user's remembered consents",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserConsentList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (absent or in another scope)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/consents/{client_id}/revoke": {
+      "post": {
+        "tags": [
+          "users"
+        ],
+        "summary": "Revoke a user's remembered consent to one client (issue #88). Stamps the consent\nrevoked and cascades to the (subject, client) refresh families in the store's single\ntransaction, so the connected app's live long-lived tokens die with the consent. A\nsecurity mutation, so it is sudo-gated. Idempotent: revoking an already-revoked or\nabsent grant is a no-op success (`revoked = false`).",
+        "operationId": "revokeUserConsent",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "user_id",
+            "in": "path",
+            "description": "The user identifier (usr_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "client_id",
+            "in": "path",
+            "description": "The client identifier (cli_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The consent was revoked",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConsentRevocationView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope, or fresh privilege required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (absent or in another scope)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/external-id": {
       "put": {
         "tags": [
@@ -9465,6 +9644,31 @@
             "type": "integer",
             "format": "int64",
             "description": "Last-update time, milliseconds since the Unix epoch."
+          }
+        }
+      },
+      "ConsentRevocationView": {
+        "type": "object",
+        "description": "The result of revoking one user's consent to a client (issue #88). Reports the\nPOST-CONDITION and the cascade extent: whether the guarded consent flip happened,\nand how many of the (subject, client) refresh families were revoked with it.\n\n`revoked` is false for the idempotent no-op (an already-revoked or absent grant),\nwhich is byte-identical to a real flip that owned no live family only in\n`families_revoked` (0 either way); the two cases are distinguished by `revoked`.",
+        "required": [
+          "client_id",
+          "revoked",
+          "families_revoked"
+        ],
+        "properties": {
+          "client_id": {
+            "type": "string",
+            "description": "The client whose consent was targeted."
+          },
+          "families_revoked": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many refresh-token families the same-transaction cascade revoked (both\nsession-bound and `offline_access` families of the (subject, client) pair).",
+            "minimum": 0
+          },
+          "revoked": {
+            "type": "boolean",
+            "description": "Whether the guarded consent UPDATE flipped a live grant to revoked. False for\nthe idempotent no-op (an already-revoked or absent grant), in which case\nnothing was audited and no cascade ran."
           }
         }
       },
@@ -12355,6 +12559,70 @@
           "claims": {
             "type": "object",
             "description": "The replacement standard-claim JSON document. Absent leaves the claims\nunchanged."
+          }
+        }
+      },
+      "UserConsentList": {
+        "type": "object",
+        "description": "A user's connected apps (issue #88): the remembered consents they hold, oldest\nfirst. Not cursor paginated: a subject's grant count is bounded by the number of\nclients in the environment, so the whole set is returned.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UserConsentView"
+            },
+            "description": "The consents the user holds."
+          }
+        }
+      },
+      "UserConsentView": {
+        "type": "object",
+        "description": "One connected app a user has granted a remembered consent to (issue #88), as the\nadmin consent surface reports it: the client the grant authorizes, its display\nmetadata (present when the client still exists), the scope the grant was recorded\nagainst, and when it was granted or lapses. Auto-grant clients (`implicit` consent\nmode or `skip_consent`) are FILTERED OUT of the list, since a stored grant for one\nis not a meaningfully revocable authorization.",
+        "required": [
+          "client_id",
+          "granted_at_unix_ms"
+        ],
+        "properties": {
+          "client_id": {
+            "type": "string",
+            "description": "The client the grant authorizes (`cli_...`)."
+          },
+          "display_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The client's human-readable display name, or null when the client has since\nbeen deleted (the grant is still listed by id and stays revocable)."
+          },
+          "expires_at_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The remembered-consent expiry, milliseconds since the Unix epoch, or null when\nthe grant never expires."
+          },
+          "granted_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When the grant was recorded, milliseconds since the Unix epoch."
+          },
+          "logo_uri": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The client's registered logo URI, or null when it registered none or was\ndeleted."
+          },
+          "scope": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The space-separated scope the grant was recorded against, or null when the\nconsented request carried no scope."
           }
         }
       },

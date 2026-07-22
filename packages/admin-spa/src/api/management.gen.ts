@@ -1116,6 +1116,51 @@ export interface paths {
         patch: operations["updateUser"];
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/consents": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List the connected apps a user has granted a remembered consent to (issue #88),
+         *     oldest first, each enriched with the client's display name and logo when the client
+         *     still exists. Auto-grant clients (`implicit` or `skip_consent`) are filtered out; a
+         *     grant to a DELETED client is still listed by its client id (so it stays revocable).
+         */
+        get: operations["listUserConsents"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/consents/{client_id}/revoke": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Revoke a user's remembered consent to one client (issue #88). Stamps the consent
+         *     revoked and cascades to the (subject, client) refresh families in the store's single
+         *     transaction, so the connected app's live long-lived tokens die with the consent. A
+         *     security mutation, so it is sudo-gated. Idempotent: revoking an already-revoked or
+         *     absent grant is a no-op success (`revoked = false`).
+         */
+        post: operations["revokeUserConsent"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/external-id": {
         parameters: {
             query?: never;
@@ -1532,6 +1577,31 @@ export interface components {
              * @description Last-update time, milliseconds since the Unix epoch.
              */
             updated_at_unix_ms: number;
+        };
+        /**
+         * @description The result of revoking one user's consent to a client (issue #88). Reports the
+         *     POST-CONDITION and the cascade extent: whether the guarded consent flip happened,
+         *     and how many of the (subject, client) refresh families were revoked with it.
+         *
+         *     `revoked` is false for the idempotent no-op (an already-revoked or absent grant),
+         *     which is byte-identical to a real flip that owned no live family only in
+         *     `families_revoked` (0 either way); the two cases are distinguished by `revoked`.
+         */
+        ConsentRevocationView: {
+            /** @description The client whose consent was targeted. */
+            client_id: string;
+            /**
+             * Format: int64
+             * @description How many refresh-token families the same-transaction cascade revoked (both
+             *     session-bound and `offline_access` families of the (subject, client) pair).
+             */
+            families_revoked: number;
+            /**
+             * @description Whether the guarded consent UPDATE flipped a live grant to revoked. False for
+             *     the idempotent no-op (an already-revoked or absent grant), in which case
+             *     nothing was audited and no cascade ran.
+             */
+            revoked: boolean;
         };
         /** @description The request body to place a ban. */
         CreateBanRequest: {
@@ -3205,6 +3275,53 @@ export interface components {
              *     unchanged.
              */
             claims?: Record<string, never>;
+        };
+        /**
+         * @description A user's connected apps (issue #88): the remembered consents they hold, oldest
+         *     first. Not cursor paginated: a subject's grant count is bounded by the number of
+         *     clients in the environment, so the whole set is returned.
+         */
+        UserConsentList: {
+            /** @description The consents the user holds. */
+            items: components["schemas"]["UserConsentView"][];
+        };
+        /**
+         * @description One connected app a user has granted a remembered consent to (issue #88), as the
+         *     admin consent surface reports it: the client the grant authorizes, its display
+         *     metadata (present when the client still exists), the scope the grant was recorded
+         *     against, and when it was granted or lapses. Auto-grant clients (`implicit` consent
+         *     mode or `skip_consent`) are FILTERED OUT of the list, since a stored grant for one
+         *     is not a meaningfully revocable authorization.
+         */
+        UserConsentView: {
+            /** @description The client the grant authorizes (`cli_...`). */
+            client_id: string;
+            /**
+             * @description The client's human-readable display name, or null when the client has since
+             *     been deleted (the grant is still listed by id and stays revocable).
+             */
+            display_name?: string | null;
+            /**
+             * Format: int64
+             * @description The remembered-consent expiry, milliseconds since the Unix epoch, or null when
+             *     the grant never expires.
+             */
+            expires_at_unix_ms?: number | null;
+            /**
+             * Format: int64
+             * @description When the grant was recorded, milliseconds since the Unix epoch.
+             */
+            granted_at_unix_ms: number;
+            /**
+             * @description The client's registered logo URI, or null when it registered none or was
+             *     deleted.
+             */
+            logo_uri?: string | null;
+            /**
+             * @description The space-separated scope the grant was recorded against, or null when the
+             *     consented request carried no scope.
+             */
+            scope?: string | null;
         };
         /** @description A user's external id after a link or unlink (issue #52). */
         UserExternalIdView: {
@@ -8759,6 +8876,116 @@ export interface operations {
                 };
             };
             /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found (absent or in another scope) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listUserConsents: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The user identifier (usr_...) */
+                user_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The user's remembered consents */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UserConsentList"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found (absent or in another scope) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    revokeUserConsent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The user identifier (usr_...) */
+                user_id: string;
+                /** @description The client identifier (cli_...) */
+                client_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The consent was revoked */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConsentRevocationView"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope, or fresh privilege required */
             403: {
                 headers: {
                     [name: string]: unknown;
