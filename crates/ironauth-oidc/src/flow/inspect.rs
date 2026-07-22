@@ -928,6 +928,25 @@ mod tests {
     }
 
     #[test]
+    fn login_plan_projection_pins_the_static_list() {
+        // The projection pin (issue #92, PR 8b): the EMBEDDED login artifact, driven through the
+        // table engine, projects to the SAME ordered plan the static `Journey::Login.plan()` lists,
+        // `[IdentifierPassword, MfaChallenge, MfaEnroll, ProgressiveProfiling, Completed]`. This
+        // locks the load-bearing edge order (the `primary -> mfa_chal` edge before `primary ->
+        // mfa_enrl`) that makes BOTH the engine's routing priority and this BFS plan match the
+        // imperative login journey. It is the "one-time assertion pins the projection equals the old
+        // list" the PR 8a docs describe; PR 8e retires the static arm once every mint-family journey
+        // is pinned.
+        let compiled = super::super::builtin_artifacts::builtin_compiled(Journey::Login)
+            .expect("the login journey has an embedded artifact");
+        assert_eq!(
+            project_plan(Journey::Login, compiled),
+            Journey::Login.plan().to_vec(),
+            "the projected login plan equals the static Journey::Login.plan()"
+        );
+    }
+
+    #[test]
     fn project_plan_maps_the_registration_mint_family_kind() {
         // A built-in-only mint-family kind projects to its real wire state, and the terminal to the
         // Completed plan terminal.

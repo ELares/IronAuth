@@ -44,9 +44,11 @@ use ironauth_journey::{
 };
 use ironauth_store::{FlowId, FlowRecord, NewFlow, Scope, Store, UserId};
 
+use super::builtin_artifacts::builtin_compiled;
 use super::eval_ctx::assemble_eval_context;
 use super::message::Message;
 use super::model::{CONTRACT_VERSION, Flow, FlowStateTag, Journey, Node, Transport};
+use super::wire_identity::wire_state_for;
 use super::{
     Continuation, FlowError, PersistedState, Submission, build_flow, consume_and_complete,
     generate_submit_token, login, login_follow_through, method_tokens, mfa,
@@ -439,21 +441,87 @@ pub(super) async fn create_custom_flow(
     Ok((flow_id, submit_token, flow))
 }
 
-/// Drive one submission of a custom-journey flow through the compiled table (issue #92, PR 4).
-/// Resolve the pinned compiled journey, run the current step's executor, and either re-render or
-/// walk the guarded transitions to the next render step, a decision (routed in-call), or a
-/// terminal completion.
+/// A resolved compiled-table handle for one drive (issue #92, PR 8b): a genuine custom journey's
+/// table arrives as an [`Arc`] (from the store-backed source's compile cache), a converged built-in
+/// journey's as a `'static` reference (from the embedded [`builtin_compiled`] registry). The handle
+/// owns the reference for the whole drive, so the borrowed [`CompiledJourney`] outlives the walk.
+enum TableRef {
+    /// A genuine custom journey's pinned table.
+    Custom(Arc<CompiledJourney>),
+    /// A converged built-in journey's embedded artifact.
+    Builtin(&'static CompiledJourney),
+}
+
+impl TableRef {
+    /// The borrowed compiled table, whichever source it came from.
+    fn get(&self) -> &CompiledJourney {
+        match self {
+            TableRef::Custom(compiled) => compiled,
+            TableRef::Builtin(compiled) => compiled,
+        }
+    }
+}
+
+/// Resolve the compiled table for a table-driven flow (issue #92, PR 8b): a genuine custom journey
+/// resolves its PINNED table from the store-backed source keyed by the version id stamped on its
+/// row (so a live flow keeps the version it started under even after the pin moves); a converged
+/// built-in journey resolves its embedded artifact from [`builtin_compiled`].
 ///
 /// # Errors
 ///
-/// [`FlowError::NotFound`] when the source, the pin, the current step, or a routing target cannot
-/// resolve (a corrupt row or a mis-compiled table, never an oracle); the executor cores' own
-/// typed errors otherwise.
+/// [`FlowError::NotFound`] when no source is configured, the pin or version cannot resolve, or the
+/// journey has no embedded artifact (a corrupt row, a uniform not found, never an oracle).
+async fn resolve_table(
+    state: &OidcState,
+    scope: Scope,
+    record: &FlowRecord,
+    journey: Journey,
+) -> Result<TableRef, FlowError> {
+    match journey {
+        Journey::Custom => {
+            let flow_version_id = record
+                .flow_version_id
+                .as_deref()
+                .ok_or(FlowError::NotFound)?;
+            let source = state.custom_journey_source().ok_or(FlowError::NotFound)?;
+            let compiled = source
+                .resolve(scope, flow_version_id)
+                .await
+                .ok_or(FlowError::NotFound)?;
+            Ok(TableRef::Custom(compiled))
+        }
+        _ => builtin_compiled(journey)
+            .map(TableRef::Builtin)
+            .ok_or(FlowError::NotFound),
+    }
+}
+
+/// Drive one submission of a TABLE-DRIVEN flow through the compiled engine (issue #92, PR 4;
+/// generalized PR 8b). This is the ONE compiled-table drive, serving BOTH a genuine
+/// [`Journey::Custom`] flow (its pinned table resolved from the store-backed source) and a converged
+/// BUILT-IN journey (its embedded artifact from [`builtin_compiled`], starting with
+/// [`Journey::Login`] in PR 8b). Resolve the compiled table and the current step, run that step's
+/// executor, and either re-render or walk the guarded transitions to the next render step, a
+/// decision (routed in-call), or a terminal completion.
+///
+/// The one difference between the two is the WIRE identity, and it is the whole point of the
+/// convergence: a built-in journey emits its own [`Journey`] and the built-in per-step
+/// [`FlowStateTag`] ([`wire_state_for`]), resolving the current step by REVERSE-mapping the
+/// persisted tag and writing NO `custom_step`, so a built-in row's serialized `flows.state` and its
+/// rendered [`Flow`] stay byte-identical to the imperative driver. A genuine custom journey keeps
+/// the flat [`FlowStateTag::Custom`] wire state with the concrete step held in `custom_step`,
+/// exactly as before.
+///
+/// # Errors
+///
+/// [`FlowError::NotFound`] when the source, the pin, the artifact, the current step, or a routing
+/// target cannot resolve (a corrupt row or a mis-compiled table, never an oracle); the executor
+/// cores' own typed errors otherwise.
 // The routing walk is one linear pass (resolve, run the executor, then a bounded transition loop
 // with one short arm per StepKind); a flat body reads best and the length reflects the kind count,
 // not any real branching complexity.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-pub(super) async fn drive_custom(
+pub(super) async fn drive_via_table(
     state: &OidcState,
     scope: Scope,
     flow_id: &FlowId,
@@ -463,21 +531,24 @@ pub(super) async fn drive_custom(
     submission: &Submission,
     headers: &axum::http::HeaderMap,
     now_micros: i64,
+    journey: Journey,
 ) -> Result<Continuation, FlowError> {
-    let flow_version_id = record
-        .flow_version_id
-        .as_deref()
-        .ok_or(FlowError::NotFound)?;
-    let source = state.custom_journey_source().ok_or(FlowError::NotFound)?;
-    let compiled = source
-        .resolve(scope, flow_version_id)
-        .await
-        .ok_or(FlowError::NotFound)?;
+    let table = resolve_table(state, scope, record, journey).await?;
+    let compiled = table.get();
 
-    let current_step_id = persisted
-        .custom_step
-        .clone()
-        .unwrap_or_else(|| compiled.entry.clone());
+    // Resolve the current compiled step. A custom flow holds the concrete step id in `custom_step`
+    // (or the entry on the first submission); a built-in flow REVERSE-maps its persisted per-step
+    // wire tag to the unique compiled step whose `wire_state_for` renders as it, so no `custom_step`
+    // is ever written for a built-in row.
+    let current_step_id: String = match journey {
+        Journey::Custom => persisted
+            .custom_step
+            .clone()
+            .unwrap_or_else(|| compiled.entry.clone()),
+        _ => builtin_step_for(journey, compiled, persisted.step)
+            .ok_or(FlowError::NotFound)?
+            .to_owned(),
+    };
     let current = compiled.step(&current_step_id).ok_or(FlowError::NotFound)?;
 
     // The scratch carries the subject and proven method tokens across submissions; the executor
@@ -501,24 +572,17 @@ pub(super) async fn drive_custom(
             messages,
             state_override,
         } => {
-            // A re-render normally stays on the current wire state (flat Custom); a mint-family
-            // executor whose render advances the wire position (registration's non-terminal Ack)
-            // sets a state override. Behavior-neutral in PR 8a: every executor sets `None`, so the
-            // wire state is the flat Custom, byte-identical to before.
-            let mut next = custom_state(&scratch, &current_step_id);
+            // A re-render stays on the current step's wire state (the flat Custom for a custom
+            // journey, or the built-in per-step state for a converged one). A mint-family executor
+            // whose render advances the wire position (registration's non-terminal Ack, PR 8c) sets
+            // a state override; login sets `None`, so a login re-render stays on its real per-step
+            // tag, byte-identical to the imperative driver.
+            let mut next = table_state(journey, &scratch, &current.kind, &current_step_id);
             if let Some(tag) = state_override {
                 next.step = tag;
             }
             return persist_and_render(
-                state,
-                scope,
-                flow_id,
-                transport,
-                Journey::Custom,
-                record,
-                &next,
-                nodes,
-                messages,
+                state, scope, flow_id, transport, journey, record, &next, nodes, messages,
                 now_micros,
             )
             .await;
@@ -532,22 +596,38 @@ pub(super) async fn drive_custom(
     let mut cursor = current_step_id;
     for _ in 0..=compiled.steps.len() {
         let ctx = assemble_eval_context(state, scope, &cursor, &scratch, &signals).await;
-        let next_id = choose_edge(&compiled, &cursor, &ctx).ok_or(FlowError::NotFound)?;
+        let next_id = choose_edge(compiled, &cursor, &ctx).ok_or(FlowError::NotFound)?;
         let next_step = compiled.step(&next_id).ok_or(FlowError::NotFound)?;
         match &next_step.kind {
             StepKind::Terminal => {
-                // The generalized session mint (issue #92, PR 8a): a custom journey's terminal
-                // completes through the polymorphic [`CompletionKind::SessionMint`]. For a genuine
-                // custom flow the fenced re-render is empty and there is no post-mint reset, so this
-                // is byte-identical to the pre-PR-8a direct mint; the per-journey convergence PRs
-                // populate the fenced nodes and the recovery post-reset.
+                // The pre-terminal step is the cursor (no state is persisted for the terminal), and
+                // it fixes the per-journey fenced re-render for the rare central-fence TOCTOU. The
+                // built-in fenced nodes reproduce the imperative driver's fence exactly; a custom
+                // journey's fence is empty. `post_reset` is None for login (only recovery, PR 8d,
+                // relaxes counters post-mint), so this stays byte-identical to the pre-8b mint for a
+                // custom journey.
+                let from_kind = compiled
+                    .step(&cursor)
+                    .map(|step| step.kind.clone())
+                    .ok_or(FlowError::NotFound)?;
+                let fenced_nodes = builtin_fenced_nodes(
+                    state,
+                    scope,
+                    journey,
+                    &from_kind,
+                    transport,
+                    &record.id,
+                    record.return_to.as_deref(),
+                    &scratch,
+                )
+                .await;
                 let completion = CompletionKind::SessionMint {
-                    fenced_nodes: Vec::new(),
+                    fenced_nodes,
                     post_reset: None,
                 };
-                return complete_custom(
-                    state, scope, flow_id, transport, record, &scratch, completion, headers,
-                    now_micros,
+                return complete_via_table(
+                    state, scope, flow_id, transport, journey, record, &scratch, completion,
+                    headers, now_micros,
                 )
                 .await;
             }
@@ -570,13 +650,13 @@ pub(super) async fn drive_custom(
                     &mut scratch,
                 )
                 .await?;
-                let next = custom_state(&scratch, &next_id);
+                let next = table_state(journey, &scratch, &next_step.kind, &next_id);
                 return persist_and_render(
                     state,
                     scope,
                     flow_id,
                     transport,
-                    Journey::Custom,
+                    journey,
                     record,
                     &next,
                     nodes,
@@ -585,12 +665,12 @@ pub(super) async fn drive_custom(
                 )
                 .await;
             }
-            // The mint-family kinds (issue #92, PR 8a) are BUILT-IN-ONLY and not wired to their
-            // render-into executors until the per-journey convergence PRs (8c registration, 8d
-            // recovery): a custom artifact cannot name them and no built-in is table-driven yet, so
-            // the walk never routes into one on a live custom flow. A subflow_call is inlined away
-            // at compile time and an unknown kind never compiles. Any of these on a live table is a
-            // corrupt table: a uniform not found, never an oracle.
+            // The mint-family kinds (issue #92) are BUILT-IN-ONLY and not wired to their render-into
+            // executors until the per-journey convergence PRs (8c registration, 8d recovery): the
+            // login artifact and every custom artifact cannot route into one, so the walk never
+            // reaches one on a live flow yet. A subflow_call is inlined away at compile time and an
+            // unknown kind never compiles. Any of these on a live table is a corrupt table: a
+            // uniform not found, never an oracle.
             StepKind::Registration
             | StepKind::RecoveryStart
             | StepKind::RecoveryVerify
@@ -599,6 +679,40 @@ pub(super) async fn drive_custom(
         }
     }
     Err(FlowError::NotFound)
+}
+
+/// Drive one submission of a genuine custom-journey flow (issue #92, PR 4; a thin wrapper since PR
+/// 8b): a [`Journey::Custom`] flow drives through the generalized [`drive_via_table`] engine,
+/// preserving every custom-journey behavior byte-identically.
+///
+/// # Errors
+///
+/// The same typed errors [`drive_via_table`] reports.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn drive_custom(
+    state: &OidcState,
+    scope: Scope,
+    flow_id: &FlowId,
+    transport: Transport,
+    record: &FlowRecord,
+    persisted: &PersistedState,
+    submission: &Submission,
+    headers: &axum::http::HeaderMap,
+    now_micros: i64,
+) -> Result<Continuation, FlowError> {
+    drive_via_table(
+        state,
+        scope,
+        flow_id,
+        transport,
+        record,
+        persisted,
+        submission,
+        headers,
+        now_micros,
+        Journey::Custom,
+    )
+    .await
 }
 
 /// Run one custom step's executor on a submission (issue #92, PR 4), reusing the SAME already
@@ -631,6 +745,17 @@ async fn run_step_executor(
                     // through the built-in login driver runs (relax counters, foreign rehash, risk
                     // record), record the subject and the honest primary method token, and emit the
                     // routing signals from the SAME step-up + profiling planners.
+                    //
+                    // Placement residual (issue #359, resolved when the imperative driver retires in
+                    // PR8e): the follow through runs here, at primary success, exactly once on every
+                    // path. On a multi step path (challenge / enroll / profiling) that matches the
+                    // imperative driver, which also runs it before the next step. On a DIRECT
+                    // complete it runs before the session mint rather than after it, and if the mint
+                    // is then refused at the rare central fence TOCTOU (the account turns non
+                    // authenticatable between verify and mint) the follow through has already fired
+                    // for a login that does not complete. Both effects are best effort, feed nothing
+                    // into establish_session, and are invisible to the rendered flow, so they are
+                    // outside the byte equivalence gate.
                     login_follow_through(state, scope, &success, headers).await;
                     let primary_methods = [AuthMethod::Password];
                     scratch.subject = Some(success.subject.clone());
@@ -820,22 +945,23 @@ async fn enter_step_nodes(
     }
 }
 
-/// Complete a custom flow at a terminal step (issue #92, PR 4; generalized PR 8a): mint the session
-/// through the ONE choke point with the honest amr the flow earned (the primary factor plus any
-/// genuinely proven second factor, carried on the scratch method tokens), executing the polymorphic
-/// [`CompletionKind::SessionMint`].
+/// Complete a table-driven flow at a terminal step (issue #92, PR 4; generalized PR 8a/8b): mint
+/// the session through the ONE choke point with the honest amr the flow earned (the primary factor
+/// plus any genuinely proven second factor, carried on the scratch method tokens), executing the
+/// polymorphic [`CompletionKind::SessionMint`] for the flow's real `journey` (login since PR 8b, or
+/// a genuine custom journey).
 ///
-/// The completion carries the per-journey fenced re-render nodes (empty for a genuine custom
-/// journey) and an optional post-mint counter reset (issue #92, PR 8a): recovery relaxes its path
-/// abuse counters on a GENUINE mint, exactly as the built-in `drive_recovery` does. In PR 8a the
-/// only caller passes an empty fenced set and no reset, so this stays byte-identical to the
-/// pre-generalization mint.
+/// The completion carries the per-journey fenced re-render nodes (login's uniform-incorrect / MFA
+/// challenge / profiling forms, empty for a genuine custom journey) and an optional post-mint
+/// counter reset (issue #92, PR 8a): recovery relaxes its path abuse counters on a GENUINE mint (PR
+/// 8d), exactly as the built-in `drive_recovery` does; login and a custom journey pass [`None`].
 #[allow(clippy::too_many_arguments)]
-async fn complete_custom(
+async fn complete_via_table(
     state: &OidcState,
     scope: Scope,
     flow_id: &FlowId,
     transport: Transport,
+    journey: Journey,
     record: &FlowRecord,
     scratch: &PersistedState,
     completion: CompletionKind,
@@ -853,6 +979,11 @@ async fn complete_custom(
         .iter()
         .filter_map(|token| AuthMethod::from_token(token))
         .collect();
+    // auth_time is now_micros (the drive entry instant), which is what the imperative step up and
+    // profiling completions already used. It unifies the direct complete path onto the same clock;
+    // the imperative direct complete alone read a post verify instant, so a no MFA login now stamps
+    // auth_time a password verify latency earlier. Same request, sub second, and not a rendered
+    // value, so it is outside the byte equivalence gate (issue #359).
     let event = AuthenticationEvent::from_methods(&methods, now_micros);
     let actor = interaction::user_actor(&subject_id);
     let continuation = consume_and_complete(
@@ -860,7 +991,7 @@ async fn complete_custom(
         scope,
         flow_id,
         transport,
-        Journey::Custom,
+        journey,
         record,
         &subject,
         actor,
@@ -885,6 +1016,12 @@ async fn complete_custom(
 /// type-checked predicate never hits) is treated as a non-match, never fail-open.
 fn choose_edge(compiled: &CompiledJourney, from: &str, ctx: &EvalContext) -> Option<String> {
     for edge in compiled.edges(from) {
+        // An eval error counts as "guard did not match" so a corrupt guard cannot force a route.
+        // SAFETY INVARIANT for a built-in artifact: a POSITIVE guard whose false skips a security
+        // requirement (for example /mfa_required gating the challenge edge) must never be able to
+        // error, or "false on error" would relax that requirement. Today the built-in login guards
+        // are depth 1 Cmp predicates that only ever error on MAX_PREDICATE_DEPTH, which they cannot
+        // hit, so this holds; a future built-in guard must preserve it (issue #359).
         let taken = match &edge.guard {
             None => true,
             Some(guard) => evaluate(guard, ctx).unwrap_or(false),
@@ -896,14 +1033,98 @@ fn choose_edge(compiled: &CompiledJourney, from: &str, ctx: &EvalContext) -> Opt
     None
 }
 
-/// The persisted state for a custom flow ON a given concrete step: the FLAT [`FlowStateTag::Custom`]
-/// wire position with the concrete step id held server side, carrying the scratch's subject and
-/// method tokens forward.
-fn custom_state(scratch: &PersistedState, step_id: &str) -> PersistedState {
+/// The persisted state for a table-driven flow ON a given compiled step (issue #92, PR 4;
+/// generalized PR 8b), carrying the scratch's subject and method tokens forward.
+///
+/// For a genuine custom journey the wire `step` is the FLAT [`FlowStateTag::Custom`] with the
+/// concrete step id held server side in `custom_step`. For a converged built-in journey the wire
+/// `step` is the journey's REAL per-step [`FlowStateTag`] ([`wire_state_for`]) and NO `custom_step`
+/// is written, so the serialized `flows.state` is BYTE-IDENTICAL to the imperative driver's row (a
+/// built-in row never carried a `custom_step`, and `skip_serializing_if` omits the [`None`]).
+fn table_state(
+    journey: Journey,
+    scratch: &PersistedState,
+    kind: &StepKind,
+    step_id: &str,
+) -> PersistedState {
     let mut next = scratch.clone();
-    next.step = FlowStateTag::Custom;
-    next.custom_step = Some(step_id.to_owned());
+    next.step = wire_state_for(journey, kind);
+    next.custom_step = match journey {
+        Journey::Custom => Some(step_id.to_owned()),
+        _ => None,
+    };
     next
+}
+
+/// The compiled step a converged built-in journey's persisted wire tag names (issue #92, PR 8b):
+/// the REVERSE of [`wire_state_for`]. Each renderable step kind of a built-in artifact maps to a
+/// distinct per-step [`FlowStateTag`], so a persisted tag names exactly one compiled step (a
+/// bijection over the renderable kinds); the first submission's `IdentifierPassword` tag resolves
+/// to the login entry step. Returns [`None`] when no compiled step renders as `tag` (a corrupt row,
+/// a uniform not found, never an oracle). A genuine custom journey never uses this (it holds the
+/// concrete step in `custom_step`).
+///
+/// Sharp edge that stays fail closed: [`wire_state_for`] folds a built-in Terminal to the flat
+/// `FlowStateTag::Custom`, so a tampered login row carrying `step = custom` reverse-maps to the
+/// Terminal step rather than an immediate not found. The Terminal step has no runnable executor, so
+/// the drive still refuses it with [`FlowError::NotFound`] and mints nothing (proven by the
+/// `flow_login_flip_adversarial` forged-custom-tag probe).
+fn builtin_step_for(
+    journey: Journey,
+    compiled: &CompiledJourney,
+    tag: FlowStateTag,
+) -> Option<&str> {
+    compiled
+        .steps
+        .iter()
+        .find(|(_, step)| wire_state_for(journey, &step.kind) == tag)
+        .map(|(id, _)| id.as_str())
+}
+
+/// The per-journey fenced re-render nodes for a table-driven terminal (issue #92, PR 8b): the
+/// UNIFORM nodes to re-render on the rare central-fence TOCTOU after the completion latch tripped,
+/// keyed on the PRE-TERMINAL step kind, reproducing the imperative login driver's fence EXACTLY. A
+/// direct primary complete re-renders the uniform-incorrect primary form; a complete after a second
+/// factor re-renders the MFA challenge form; a complete after profiling re-renders the held-field
+/// form (or nothing, when the plan has emptied by the mint). A genuine custom journey carries no
+/// built-in fallback form, so its fence is empty. This path is a rare TOCTOU that is NOT in the
+/// golden corpus, so it is not byte-gated; it is reproduced for fidelity regardless.
+#[allow(clippy::too_many_arguments)]
+async fn builtin_fenced_nodes(
+    state: &OidcState,
+    scope: Scope,
+    journey: Journey,
+    from_kind: &StepKind,
+    transport: Transport,
+    flow_id: &str,
+    return_to: Option<&str>,
+    scratch: &PersistedState,
+) -> Vec<Node> {
+    match (journey, from_kind) {
+        (Journey::Login, StepKind::IdentifierPassword) => {
+            login::uniform_incorrect_render(transport, flow_id)
+        }
+        (Journey::Login, StepKind::MfaChallenge | StepKind::MfaEnroll) => {
+            mfa::challenge_start_nodes(transport, flow_id)
+        }
+        (Journey::Login, StepKind::ProgressiveProfiling) => {
+            // The held-field plan may have emptied by the mint; an empty fenced set is then correct,
+            // exactly as the imperative `drive_profiling` fence recomputes it. A missing subject (a
+            // corrupt row that could never have reached here) folds to empty rather than fault: the
+            // flow is already consumed and this is a best-effort re-render, never an oracle.
+            match scratch_subject(scope, scratch) {
+                Ok(subject_id) => match profiling::plan(state, scope, &subject_id, return_to).await
+                {
+                    Some(plan) => profiling::start_nodes(transport, flow_id, &plan),
+                    None => Vec::new(),
+                },
+                Err(_) => Vec::new(),
+            }
+        }
+        // A genuine custom journey (and any not-yet-converged built-in) carries no built-in
+        // fallback form: its wire state renders from its own nodes, so the fence is empty.
+        _ => Vec::new(),
+    }
 }
 
 /// A fresh custom scratch seated on the entry step (no subject or method tokens yet).
