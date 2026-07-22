@@ -370,6 +370,13 @@ pub enum Action {
     /// self-service and admin revocation surfaces in the same transaction as the
     /// revocation.
     ConsentRevoke,
+    /// A user consent screen was SKIPPED and the authorization auto-granted (issue #88, PR 4):
+    /// either a trusted first-party carve-out with the no-store knob off (so no consent row is
+    /// written), or a third-party client covered by an admin consent pre-authorization (the admin
+    /// grant is the consent of record). The audit row TARGETS the client and carries an
+    /// operator-safe `detail` naming the reason (`first_party_carveout` or `admin_preauthorized`),
+    /// so a silent auto-grant that persists no consent row still leaves an audit trail.
+    ConsentSkipped,
     /// A per-environment signing key was provisioned (issue #19). Covers both a
     /// day-one key and a manually rotated-in successor.
     SigningKeyProvision,
@@ -559,6 +566,16 @@ pub enum Action {
     /// A per-environment, per-client SIGNUP FORM was deleted through the management API (issue
     /// #87). The audit row names the signup form id and scope.
     SignupFormDelete,
+    /// A per-environment, per-client ADMIN CONSENT PRE-AUTHORIZATION was set through the
+    /// management API (issue #88, PR 4): a first write or an overwrite of the scope set an admin
+    /// pre-authorized for a third-party client. The audit row names the pre-authorization id and
+    /// scope; the pre-authorized scope set itself is not recorded here.
+    AdminConsentGrant,
+    /// A per-environment, per-client ADMIN CONSENT PRE-AUTHORIZATION was deleted (revoked) through
+    /// the management API (issue #88, PR 4). The audit row names the pre-authorization id and
+    /// scope; the third-party client is once again refused with the administrator-approval
+    /// terminal until re-authorized.
+    AdminConsentRevoke,
     /// An environment VARIABLE (a non-secret named config value) was set through
     /// the management API (issue #45): a first write or an overwrite. The audit row
     /// names the variable id and scope; the value itself is not recorded here.
@@ -995,6 +1012,7 @@ impl Action {
             Action::UserSessionsRevokeAll => "user.sessions.revoke_all",
             Action::ConsentGrant => "consent.grant",
             Action::ConsentRevoke => "consent.revoke",
+            Action::ConsentSkipped => "consent.skip",
             Action::SigningKeyProvision => "signing_key.provision",
             Action::ResourceServerRegister => "resource_server.register",
             Action::RefreshTokenIssue => "refresh_token.issue",
@@ -1047,6 +1065,8 @@ impl Action {
             Action::LocaleDelete => "locale.delete",
             Action::SignupFormSet => "signup_form.set",
             Action::SignupFormDelete => "signup_form.delete",
+            Action::AdminConsentGrant => "admin_consent.grant",
+            Action::AdminConsentRevoke => "admin_consent.revoke",
             Action::EnvironmentVariableSet => "environment_variable.set",
             Action::EnvironmentVariableDelete => "environment_variable.delete",
             Action::EnvironmentSecretPut => "environment_secret.put",

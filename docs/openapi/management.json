@@ -1188,6 +1188,270 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/admin-consent": {
+      "get": {
+        "tags": [
+          "client-admin-consent"
+        ],
+        "summary": "Get a per-environment, per-client admin consent pre-authorization.",
+        "operationId": "getClientAdminConsent",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "client_id",
+            "in": "path",
+            "description": "The authorize client identifier the pre-authorization governs",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The admin consent pre-authorization",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientAdminConsentView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (absent or in another scope)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "client-admin-consent"
+        ],
+        "summary": "Set (create or overwrite) a per-environment, per-client admin consent pre-authorization.",
+        "operationId": "setClientAdminConsent",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "client_id",
+            "in": "path",
+            "description": "The authorize client identifier the pre-authorization governs",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetClientAdminConsentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Set",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientAdminConsentView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "An empty scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found or malformed client id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "client-admin-consent"
+        ],
+        "summary": "Delete (revoke) a per-environment, per-client admin consent pre-authorization.",
+        "operationId": "deleteClientAdminConsent",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "client_id",
+            "in": "path",
+            "description": "The authorize client identifier the pre-authorization governs",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (absent or in another scope)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/signup-form": {
       "get": {
         "tags": [
@@ -8903,6 +9167,24 @@
           }
         }
       },
+      "ClientAdminConsentView": {
+        "type": "object",
+        "description": "A per-environment, per-client admin consent pre-authorization, as returned by the management\nAPI (issue #88, PR 4).",
+        "required": [
+          "client_id",
+          "scope"
+        ],
+        "properties": {
+          "client_id": {
+            "type": "string",
+            "description": "The authorize client id this pre-authorization governs (the per-environment natural key)."
+          },
+          "scope": {
+            "type": "string",
+            "description": "The space-separated OAuth scope set the admin pre-authorized."
+          }
+        }
+      },
       "ClientAuthDiagnosticView": {
         "type": "object",
         "description": "One recorded client authentication failure diagnostic (issue #91).\n\nEvery field is a bounded, non secret datum the store record already holds: the\n`client_id`, `key_id`, and `signing_alg` are attacker influenced but non secret\nidentifiers the failed attempt itself presented, and `reason`, `skew_seconds`,\nand `expected` are derived, bounded cardinality values. There is deliberately NO\nfield for an assertion body, a secret, or a token: the wire response stayed the\nopaque `invalid_client`, and this record is the ONLY additional detail.",
@@ -11610,6 +11892,19 @@
               "null"
             ],
             "description": "The recorded user agent (only when the device binding knob is on)."
+          }
+        }
+      },
+      "SetClientAdminConsentRequest": {
+        "type": "object",
+        "description": "The body to set (create or overwrite) a per-environment, per-client admin consent\npre-authorization (issue #88, PR 4).\n\nThe `scope` is the space-separated OAuth scope set the admin pre-authorizes for the\nthird-party client. A later authorization request whose requested scope is a SUBSET of this set\nSKIPS the user consent screen (the admin grant is the consent of record); a broader request is\nrefused with a \"requires administrator approval\" terminal.",
+        "required": [
+          "scope"
+        ],
+        "properties": {
+          "scope": {
+            "type": "string",
+            "description": "The space-separated OAuth scope set the admin pre-authorizes for the client."
           }
         }
       },

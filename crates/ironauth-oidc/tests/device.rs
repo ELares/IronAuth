@@ -1219,3 +1219,49 @@ async fn device_authorization_blocks_an_unverified_client_requesting_a_sensitive
     let verified = start_flow(&harness, &client_str, Some("openid offline_access")).await;
     assert!(verified["device_code"].is_string());
 }
+
+#[tokio::test]
+async fn device_authorization_blocks_a_third_party_client_without_admin_consent() {
+    // The third-party admin-consent gate (issue #88, PR 4) guards the device consent surface too:
+    // a third-party (not first_party) client with NO covering admin consent pre-authorization is
+    // refused BEFORE a device code is issued, so human approval on the verification page can never
+    // grant it. A covering pre-authorization is the escape.
+    let mut harness = Harness::start().await;
+    let client = *harness.client_id();
+    harness
+        .enable_device_grant(&client, DEVICE_GRANTS, Some(TEST_LOGO))
+        .await;
+    harness.enable_third_party_admin_consent();
+    let client_str = client.to_string();
+
+    // A third-party client with no pre-authorization is refused with access_denied, no device
+    // code.
+    let (status, _headers, body) = harness
+        .post_form(
+            "/device_authorization",
+            &form(&[
+                ("client_id", client_str.as_str()),
+                ("scope", "openid profile"),
+            ]),
+            None,
+        )
+        .await;
+    let blocked = json(&body);
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "third-party no preauth: {blocked}"
+    );
+    assert_eq!(blocked["error"], "access_denied");
+    assert!(
+        blocked.get("device_code").is_none(),
+        "no device code is issued for a blocked request"
+    );
+
+    // A covering admin pre-authorization lets the same client through.
+    harness
+        .set_client_admin_grant(&client, Some("openid profile"))
+        .await;
+    let carved = start_flow(&harness, &client_str, Some("openid profile")).await;
+    assert!(carved["device_code"].is_string());
+}

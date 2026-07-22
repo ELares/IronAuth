@@ -2628,12 +2628,23 @@ pub struct ConsentLockdownConfig {
     /// safe default never strands a legitimate client. Set it to `false` to restore the prior
     /// behavior (the request proceeds to the consent screen as before).
     pub gate_unverified_sensitive_scopes: bool,
+    /// Whether a THIRD-PARTY (not `first_party`) client must be ADMIN PRE-AUTHORIZED for its
+    /// requested scope before it can obtain user consent (issue #88, PR 4). Default `true`: a
+    /// third-party request whose scope is not covered by an admin consent pre-authorization is
+    /// refused with `access_denied` and a "requires administrator approval" terminal, and there
+    /// is no user self-consent (the Microsoft admin-consent model). A pre-authorization covering
+    /// the requested scope SKIPS the user consent screen (the admin grant is the consent of
+    /// record). The escapes are: classify the client `first_party`, or record an admin consent
+    /// pre-authorization for it. Set it to `false` to restore the prior behavior (a third-party
+    /// client routes to the user consent screen with no admin pre-authorization required).
+    pub third_party_requires_admin_consent: bool,
 }
 
 impl Default for ConsentLockdownConfig {
     fn default() -> Self {
         Self {
             gate_unverified_sensitive_scopes: true,
+            third_party_requires_admin_consent: true,
         }
     }
 }
@@ -5565,6 +5576,13 @@ mod tests {
                 .gate_unverified_sensitive_scopes,
             "the unverified-sensitive-scope gate defaults ON"
         );
+        assert!(
+            default
+                .oidc
+                .consent_lockdown
+                .third_party_requires_admin_consent,
+            "the third-party admin-consent gate defaults ON"
+        );
 
         // A config that names [oidc.quarantine] but OMITS [oidc.consent_lockdown] still
         // inherits the safe default (the gate stays on).
@@ -5581,6 +5599,13 @@ mod tests {
                 .gate_unverified_sensitive_scopes,
             "omitting the section keeps the gate on"
         );
+        assert!(
+            other_section
+                .oidc
+                .consent_lockdown
+                .third_party_requires_admin_consent,
+            "omitting the section keeps the third-party admin-consent gate on"
+        );
 
         // The gate is tunable OFF per environment and round-trips.
         let tuned = Config::from_toml_str(
@@ -5592,6 +5617,36 @@ mod tests {
         assert!(
             !tuned.oidc.consent_lockdown.gate_unverified_sensitive_scopes,
             "the gate can be turned off"
+        );
+        // The unrelated key stays defaulted ON when only the sibling is tuned.
+        assert!(
+            tuned
+                .oidc
+                .consent_lockdown
+                .third_party_requires_admin_consent,
+            "tuning one lockdown knob leaves the other at its default"
+        );
+
+        // The third-party admin-consent gate is independently tunable OFF and round-trips.
+        let tuned_admin = Config::from_toml_str(
+            "[oidc.consent_lockdown]\nthird_party_requires_admin_consent = false\n",
+            "<inline>",
+        )
+        .expect("tuned config is valid")
+        .config;
+        assert!(
+            !tuned_admin
+                .oidc
+                .consent_lockdown
+                .third_party_requires_admin_consent,
+            "the third-party admin-consent gate can be turned off"
+        );
+        assert!(
+            tuned_admin
+                .oidc
+                .consent_lockdown
+                .gate_unverified_sensitive_scopes,
+            "tuning the admin-consent knob leaves the sensitive-scope gate at its default"
         );
     }
 

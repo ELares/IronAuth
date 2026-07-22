@@ -51,6 +51,7 @@ pub mod abuse;
 pub mod audit;
 pub mod brand;
 pub mod classification;
+pub mod client_admin_grant;
 pub mod connector;
 pub mod custom_domain;
 pub mod email_otp;
@@ -93,6 +94,9 @@ pub use brand::{
     canonicalize_host,
 };
 pub use classification::{ResourceClassification, ResourceLevel, ResourceType, classify};
+pub use client_admin_grant::{
+    ClientAdminGrantRecord, NewClientAdminGrant, admin_grant_covers_scope,
+};
 pub use connector::{ConnectorCapabilities, ConnectorRecord, NewConnector, StoredCapabilities};
 pub use custom_domain::{
     AcmeChallengeRecord, ChallengeOutcome, ChallengeStatus, ChallengeType, CustomDomainError,
@@ -118,18 +122,18 @@ pub use id::{
     AdminSudoElevationId, AdminSudoElevationKind, AgentId, AgentKind, AssertionMappingId,
     AssertionMappingKind, AttestationConfigId, AttestationConfigKind, AuditId, AuditKind,
     AuditTarget, AuthorizationCodeId, AuthorizationCodeKind, BackChannelDeliveryId,
-    BackChannelDeliveryKind, BrandId, BrandKind, COMPONENT_BYTES, ClientId, ClientKind,
-    ClientSessionId, ClientSessionKind, ConnectorId, ConnectorKind, ConsentId, ConsentKind,
-    CorrelationId, CorrelationKind, CredentialClassPolicyId, CredentialClassPolicyKind,
-    CredentialId, CredentialKind, CustomDomainId, CustomDomainKind, DcrPolicyId, DcrPolicyKind,
-    DekId, DekKind, DeviceCodeId, DeviceCodeKind, EmailOtpCodeId, EmailOtpCodeKind,
-    EncryptedSecretId, EncryptedSecretKind, EnvironmentId, EnvironmentKind, EnvironmentSecretId,
-    EnvironmentSecretKind, ExternalIssuerId, ExternalIssuerKind, FedcmNonceId, FedcmNonceKind,
-    FederationLoginStateId, FederationLoginStateKind, FlowId, FlowKind, GrantId, GrantKind,
-    HumanId, HumanKind, IdParseError, InitialAccessTokenId, InitialAccessTokenKind, InvitationId,
-    InvitationKind, IssuedTokenId, IssuedTokenKind, KekId, KekKind, LevelId, LevelKind,
-    LocaleBundleId, LocaleBundleKind, MagicLinkTokenId, MagicLinkTokenKind, ManagementKeyId,
-    ManagementKeyKind, MigrationRunId, MigrationRunKind, MigrationRunRecordId,
+    BackChannelDeliveryKind, BrandId, BrandKind, COMPONENT_BYTES, ClientAdminGrantId,
+    ClientAdminGrantKind, ClientId, ClientKind, ClientSessionId, ClientSessionKind, ConnectorId,
+    ConnectorKind, ConsentId, ConsentKind, CorrelationId, CorrelationKind, CredentialClassPolicyId,
+    CredentialClassPolicyKind, CredentialId, CredentialKind, CustomDomainId, CustomDomainKind,
+    DcrPolicyId, DcrPolicyKind, DekId, DekKind, DeviceCodeId, DeviceCodeKind, EmailOtpCodeId,
+    EmailOtpCodeKind, EncryptedSecretId, EncryptedSecretKind, EnvironmentId, EnvironmentKind,
+    EnvironmentSecretId, EnvironmentSecretKind, ExternalIssuerId, ExternalIssuerKind, FedcmNonceId,
+    FedcmNonceKind, FederationLoginStateId, FederationLoginStateKind, FlowId, FlowKind, GrantId,
+    GrantKind, HumanId, HumanKind, IdParseError, InitialAccessTokenId, InitialAccessTokenKind,
+    InvitationId, InvitationKind, IssuedTokenId, IssuedTokenKind, KekId, KekKind, LevelId,
+    LevelKind, LocaleBundleId, LocaleBundleKind, MagicLinkTokenId, MagicLinkTokenKind,
+    ManagementKeyId, ManagementKeyKind, MigrationRunId, MigrationRunKind, MigrationRunRecordId,
     MigrationRunRecordKind, NotInScope, OperatorId, OperatorKind, OrgConnectionId,
     OrgConnectionKind, OrganizationId, OrganizationKind, PowChallengeId, PowChallengeKind,
     PushedRequestId, PushedRequestKind, RecoveryApprovalId, RecoveryApprovalKind, RecoveryCodeId,

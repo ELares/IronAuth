@@ -216,13 +216,14 @@ pub async fn device_authorization(
     }
 }
 
-/// Enforce the consent-lockdown gate (issue #88) on the device authorization request: an
-/// unverified, non-first-party client requesting a sensitive scope is refused BEFORE a device
-/// code is issued, so human approval on the verification page can never grant it. This is the
-/// same predicate the redirect flow's consent gate uses, keeping the two consent surfaces in
-/// agreement (no dangling device code for a request that can never grant). The authenticated
-/// client carries only its id, so the record (with quarantine and first-party status) is read
-/// here under the client's own scope.
+/// Enforce the consent-lockdown gates (issue #88) on the device authorization request: an
+/// unverified, non-first-party client requesting a sensitive scope (PR 3), OR a third-party client
+/// with no covering admin consent pre-authorization (PR 4), is refused BEFORE a device code is
+/// issued, so human approval on the verification page can never grant it. These are the same
+/// predicates the redirect flow's consent gate uses, keeping the two consent surfaces in agreement
+/// (no dangling device code for a request that can never grant). The authenticated client carries
+/// only its id, so the record (with quarantine and first-party status) is read here under the
+/// client's own scope.
 async fn enforce_consent_lockdown(
     state: &OidcState,
     scope: Scope,
@@ -240,7 +241,29 @@ async fn enforce_consent_lockdown(
     {
         return Err(DeviceAuthError::AccessDenied);
     }
-    Ok(())
+    // Third-party admin-consent gate (issue #88, PR 4): a third-party client with no covering
+    // pre-authorization is refused with `access_denied` here, exactly as on the redirect path,
+    // so the device verification page can never approve a request the admin has not authorized. A
+    // covering pre-authorization (or a first-party client, or the knob off) proceeds. A store
+    // fault fails closed to `server_error`.
+    match crate::authorize::third_party_admin_consent_outcome(
+        state,
+        scope,
+        &client_record,
+        &client_id.to_string(),
+        requested_scope,
+    )
+    .await
+    {
+        Ok(
+            crate::authorize::AdminConsentOutcome::NotApplicable
+            | crate::authorize::AdminConsentOutcome::Covered,
+        ) => Ok(()),
+        Ok(crate::authorize::AdminConsentOutcome::RequiresAdminApproval) => {
+            Err(DeviceAuthError::AccessDenied)
+        }
+        Err(()) => Err(DeviceAuthError::ServerError),
+    }
 }
 
 async fn device_authorization_inner(

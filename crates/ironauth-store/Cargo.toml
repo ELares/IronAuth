@@ -130,6 +130,14 @@ name = "signup_forms"
 path = "tests/signup_forms.rs"
 required-features = ["testing"]
 
+# Per-environment, per-client admin consent pre-authorizations (issue #88, PR 4): the
+# control-plane set / data-plane read repo, the overwrite-reuses-the-row-id invariant, audited
+# set / delete, cross-scope uniform-not-found, and tenant isolation, against a real database.
+[[test]]
+name = "client_admin_grants"
+path = "tests/client_admin_grants.rs"
+required-features = ["testing"]
+
 # Enterprise inbound routing (issue #77): org connections and routing rules over a real
 # database -- selector lookup on the data plane, the per-scope unique-index routing-
 # confusion defence, and the secret-free snapshot export (the user selector is an opaque

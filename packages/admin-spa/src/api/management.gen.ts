@@ -189,6 +189,25 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/admin-consent": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get a per-environment, per-client admin consent pre-authorization. */
+        get: operations["getClientAdminConsent"];
+        /** Set (create or overwrite) a per-environment, per-client admin consent pre-authorization. */
+        put: operations["setClientAdminConsent"];
+        post?: never;
+        /** Delete (revoke) a per-environment, per-client admin consent pre-authorization. */
+        delete: operations["deleteClientAdminConsent"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/signup-form": {
         parameters: {
             query?: never;
@@ -1320,6 +1339,16 @@ export interface components {
              *     its existence), so a batch can never reach across a scope boundary.
              */
             session_ids?: string[];
+        };
+        /**
+         * @description A per-environment, per-client admin consent pre-authorization, as returned by the management
+         *     API (issue #88, PR 4).
+         */
+        ClientAdminConsentView: {
+            /** @description The authorize client id this pre-authorization governs (the per-environment natural key). */
+            client_id: string;
+            /** @description The space-separated OAuth scope set the admin pre-authorized. */
+            scope: string;
         };
         /**
          * @description One recorded client authentication failure diagnostic (issue #91).
@@ -2910,6 +2939,19 @@ export interface components {
             user_agent?: string | null;
         };
         /**
+         * @description The body to set (create or overwrite) a per-environment, per-client admin consent
+         *     pre-authorization (issue #88, PR 4).
+         *
+         *     The `scope` is the space-separated OAuth scope set the admin pre-authorizes for the
+         *     third-party client. A later authorization request whose requested scope is a SUBSET of this set
+         *     SKIPS the user consent screen (the admin grant is the consent of record); a broader request is
+         *     refused with a "requires administrator approval" terminal.
+         */
+        SetClientAdminConsentRequest: {
+            /** @description The space-separated OAuth scope set the admin pre-authorizes for the client. */
+            scope: string;
+        };
+        /**
          * @description The body to set (create or overwrite) a per-environment locale bundle (issue #86, PR 2).
          *
          *     The entries map keys on the STABLE NUMERIC message id (as a string) and values are the
@@ -4160,6 +4202,179 @@ export interface operations {
                 };
             };
             /** @description Sudo mode is disabled, or the scope is not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    getClientAdminConsent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The authorize client identifier the pre-authorization governs */
+                client_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The admin consent pre-authorization */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ClientAdminConsentView"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found (absent or in another scope) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    setClientAdminConsent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The authorize client identifier the pre-authorization governs */
+                client_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetClientAdminConsentRequest"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ClientAdminConsentView"];
+                };
+            };
+            /** @description An empty scope */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Environment not found or malformed client id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    deleteClientAdminConsent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The authorize client identifier the pre-authorization governs */
+                client_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found (absent or in another scope) */
             404: {
                 headers: {
                     [name: string]: unknown;

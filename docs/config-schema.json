@@ -318,6 +318,11 @@
           "default": true,
           "description": "Whether an UNVERIFIED (quarantined) client that is NOT classified first-party is\nBLOCKED from an authorization request whose effective scope intersects the sensitive\ndenylist (`oidc.quarantine.sensitive_scopes`). Default `true`: such a request is\nrefused with `access_denied` at the validated `redirect_uri` rather than proceeding to\nconsent and minting a sensitive scope. The escapes both already exist -- verify the\nclient (which lifts `quarantined`) or set its `first_party` classification -- so the\nsafe default never strands a legitimate client. Set it to `false` to restore the prior\nbehavior (the request proceeds to the consent screen as before).",
           "type": "boolean"
+        },
+        "third_party_requires_admin_consent": {
+          "default": true,
+          "description": "Whether a THIRD-PARTY (not `first_party`) client must be ADMIN PRE-AUTHORIZED for its\nrequested scope before it can obtain user consent (issue #88, PR 4). Default `true`: a\nthird-party request whose scope is not covered by an admin consent pre-authorization is\nrefused with `access_denied` and a \"requires administrator approval\" terminal, and there\nis no user self-consent (the Microsoft admin-consent model). A pre-authorization covering\nthe requested scope SKIPS the user consent screen (the admin grant is the consent of\nrecord). The escapes are: classify the client `first_party`, or record an admin consent\npre-authorization for it. Set it to `false` to restore the prior behavior (a third-party\nclient routes to the user consent screen with no admin pre-authorization required).",
+          "type": "boolean"
         }
       },
       "type": "object"
@@ -833,7 +838,8 @@
         "consent_lockdown": {
           "$ref": "#/$defs/ConsentLockdownConfig",
           "default": {
-            "gate_unverified_sensitive_scopes": true
+            "gate_unverified_sensitive_scopes": true,
+            "third_party_requires_admin_consent": true
           },
           "description": "The consent-lockdown policy (issue #88, PR 3): the tunable hardening applied to an\nUNVERIFIED (quarantined) client that requests a SENSITIVE scope at the authorization\nendpoint. On by default; the sensitive-scope set is REUSED from [`QuarantineConfig`]\n(a single source of truth), and the escapes (verify the client, which lifts\n`quarantined`, or mark it first-party) already exist, so the safe default never\nstrands a legitimate integration. See [`ConsentLockdownConfig`]."
         },
@@ -2468,7 +2474,8 @@
         "client_credentials_default_audience": "client_id",
         "conform_id_token_claims": false,
         "consent_lockdown": {
-          "gate_unverified_sensitive_scopes": true
+          "gate_unverified_sensitive_scopes": true,
+          "third_party_requires_admin_consent": true
         },
         "default_access_token_format": "at_jwt",
         "device_code_ttl_secs": 600,

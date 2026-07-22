@@ -1617,6 +1617,29 @@ pub struct SignupFormView {
     pub fields: Vec<SignupFormFieldView>,
 }
 
+/// The body to set (create or overwrite) a per-environment, per-client admin consent
+/// pre-authorization (issue #88, PR 4).
+///
+/// The `scope` is the space-separated OAuth scope set the admin pre-authorizes for the
+/// third-party client. A later authorization request whose requested scope is a SUBSET of this set
+/// SKIPS the user consent screen (the admin grant is the consent of record); a broader request is
+/// refused with a "requires administrator approval" terminal.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct SetClientAdminConsentRequest {
+    /// The space-separated OAuth scope set the admin pre-authorizes for the client.
+    pub scope: String,
+}
+
+/// A per-environment, per-client admin consent pre-authorization, as returned by the management
+/// API (issue #88, PR 4).
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ClientAdminConsentView {
+    /// The authorize client id this pre-authorization governs (the per-environment natural key).
+    pub client_id: String,
+    /// The space-separated OAuth scope set the admin pre-authorized.
+    pub scope: String,
+}
+
 /// A stored brand asset's METADATA, as returned by the management API upload (issue #86, PR 3).
 /// The bytes are never echoed back; only the by-reference metadata is (the same shape the brand
 /// snapshot carries).

@@ -30,10 +30,10 @@ use ironauth_oidc::{
 use ironauth_quota::QuotaEnforcer;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
-    AssertionMappingId, ClientId, CorrelationId, ExternalIssuerId, InitialAccessTokenId,
-    NewAdminUser, NewAssertionSubjectMapping, NewExternalAssertionIssuer, NewInitialAccessToken,
-    NewJwtAuthClient, NewSigningKey, Scope, SessionId, SigningKeyId, SigningKeyMaterialKind, Store,
-    UserState,
+    AssertionMappingId, ClientAdminGrantId, ClientId, CorrelationId, ExternalIssuerId,
+    InitialAccessTokenId, NewAdminUser, NewAssertionSubjectMapping, NewClientAdminGrant,
+    NewExternalAssertionIssuer, NewInitialAccessToken, NewJwtAuthClient, NewSigningKey, Scope,
+    SessionId, SigningKeyId, SigningKeyMaterialKind, Store, UserState,
 };
 use tower::ServiceExt;
 
@@ -327,6 +327,7 @@ impl Harness {
                 ISSUER_BASE,
             ),
         };
+        let state = admin_gate_off(state);
         // Install the tenant/environment quota engine over the SAME deterministic
         // clock when the test asked for it (issue #50), so an over-quota scope on the
         // real request path short-circuits with a 429 and refill is clock-driven.
@@ -400,13 +401,13 @@ impl Harness {
         );
         let registry = Arc::new(registry);
 
-        let state = OidcState::new(
+        let state = admin_gate_off(OidcState::new(
             db.store().clone(),
             env.clone(),
             Arc::clone(&registry),
             &config,
             ISSUER_BASE,
-        );
+        ));
         let issuer = state.issuer_for(&scope);
         let router = oidc_router(state.clone());
 
@@ -591,6 +592,7 @@ impl Harness {
                 state = state.with_breach_provider(provider);
             }
         }
+        let state = admin_gate_off(state);
         let issuer = state.issuer_for(&scope);
         let router = oidc_router(state.clone())
             .merge(issuer_router(issuer_state))
@@ -637,13 +639,13 @@ impl Harness {
             DiscoveryCapabilities::from_config(config),
             Arc::clone(&registry),
         );
-        let state = OidcState::new(
+        let state = admin_gate_off(OidcState::new(
             store,
             self.env.clone(),
             Arc::clone(&registry),
             config,
             ISSUER_BASE,
-        );
+        ));
         let router = oidc_router(state.clone())
             .merge(issuer_router(issuer_state))
             .merge(discovery_router(discovery_state));
@@ -844,13 +846,13 @@ impl Harness {
     /// and clock are shared with this harness, so a `return_to` minted here resolves.
     pub fn router_without_master_key(&self) -> Router {
         let store = ironauth_store::Store::from_pool(self.db.app_pool().clone());
-        let state = OidcState::new(
+        let state = admin_gate_off(OidcState::new(
             store,
             self.env.clone(),
             Arc::clone(&self.registry),
             &OidcConfig::default(),
             ISSUER_BASE,
-        );
+        ));
         oidc_router(state)
     }
 
@@ -864,13 +866,13 @@ impl Harness {
     /// the same pool and rows), so credential registration and session establishment
     /// seal and open PII compatibly.
     pub fn serving_router(&self, config: &OidcConfig, serving_origin: &str) -> Router {
-        let state = OidcState::new(
+        let state = admin_gate_off(OidcState::new(
             self.db.store().clone(),
             self.env.clone(),
             Arc::clone(&self.registry),
             config,
             serving_origin,
-        );
+        ));
         oidc_router(state)
     }
 
@@ -946,7 +948,8 @@ impl Harness {
             &config,
             ISSUER_BASE,
         )
-        .with_fedcm_enabled(true);
+        .with_fedcm_enabled(true)
+        .with_third_party_admin_consent_required(false);
         // Mount the protocol, issuer/JWKS, and discovery routers over the one registry,
         // exactly as `main.rs` mounts all three, so a test can assert the OIDC discovery
         // document is UNCHANGED (never advertises FedCM) with the flag on.
@@ -986,7 +989,8 @@ impl Harness {
             &config,
             ISSUER_BASE,
         )
-        .with_risk_signals_enabled(true);
+        .with_risk_signals_enabled(true)
+        .with_third_party_admin_consent_required(false);
         self.router = oidc_router(state.clone());
         self.state = state;
     }
@@ -1005,7 +1009,8 @@ impl Harness {
             config,
             ISSUER_BASE,
         )
-        .with_signup_quarantine_enabled(true);
+        .with_signup_quarantine_enabled(true)
+        .with_third_party_admin_consent_required(false);
         self.router = oidc_router(state.clone());
         self.state = state;
     }
@@ -1031,7 +1036,8 @@ impl Harness {
         )
         .with_advanced_recovery_enabled(true)
         .with_risk_evaluator(evaluator)
-        .with_verification_sender(sender);
+        .with_verification_sender(sender)
+        .with_third_party_admin_consent_required(false);
         self.router = oidc_router(state.clone());
         self.state = state;
     }
@@ -2303,6 +2309,48 @@ impl Harness {
         .expect("update client first_party");
     }
 
+    /// Turn the third-party admin-consent gate (issue #88, PR 4) ON for this harness and rebuild
+    /// the protocol router. The general fixture defaults the gate OFF (the seed client is
+    /// third-party); the PR 4 tests call this to exercise the ON behavior. It rebuilds the state
+    /// from the current one with the override flipped, so all other state (keys, config, seeded
+    /// data) is preserved.
+    pub fn enable_third_party_admin_consent(&mut self) {
+        let state = self
+            .state
+            .clone()
+            .with_third_party_admin_consent_required(true);
+        self.router = oidc_router(state.clone());
+        self.state = state;
+    }
+
+    /// Record an admin consent PRE-AUTHORIZATION for `client_id` covering `scope` (issue #88, PR
+    /// 4), through the CONTROL-plane store (the role that owns the `client_admin_grants`
+    /// lifecycle), exactly as the management admin-consent surface does. A later authorization
+    /// request whose scope is a subset of `scope` is COVERED (the user consent screen is skipped).
+    pub async fn set_client_admin_grant(&self, client_id: &ClientId, scope: Option<&str>) {
+        let id = ClientAdminGrantId::generate(&self.env, &self.scope);
+        self.db
+            .control_store()
+            .scoped(self.scope)
+            .acting(
+                self.db.test_actor(&self.env),
+                CorrelationId::generate(&self.env),
+            )
+            .client_admin_grants()
+            .set(
+                &self.env,
+                &id,
+                0,
+                NewClientAdminGrant {
+                    client_id: &client_id.to_string(),
+                    granted_scope: scope,
+                    granted_by: "admin_test",
+                },
+            )
+            .await
+            .expect("set client admin grant");
+    }
+
     /// Additionally arm the signup fraud-review queue (issue #82, PR 2) on the CURRENT
     /// state and rebuild the protocol router, COMPOSING with an already-armed feature such
     /// as FedCM (unlike [`Self::enable_signup_quarantine`], which builds a fresh default
@@ -2333,6 +2381,19 @@ impl Harness {
         .await
         .expect("update user quarantine");
     }
+}
+
+/// Default the third-party admin-consent gate (issue #88, PR 4) OFF for a harness-built state.
+///
+/// The general fixture uses a THIRD-PARTY seed client, so driving it through consent must NOT
+/// require an admin pre-authorization; every harness-built state therefore defaults the gate off,
+/// exactly as the harness relaxes the confidential-client PKCE policy. This is a test-fixture
+/// default only, never a production weakening: production boot never calls the override, so the
+/// config value (default ON) governs there. The dedicated PR 4 tests opt the gate back ON with
+/// [`Harness::enable_third_party_admin_consent`].
+#[must_use]
+fn admin_gate_off(state: OidcState) -> OidcState {
+    state.with_third_party_admin_consent_required(false)
 }
 
 /// A clock at the token's issuance time (the frozen epoch), for verification.

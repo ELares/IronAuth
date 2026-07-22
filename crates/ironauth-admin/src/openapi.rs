@@ -21,9 +21,9 @@ use utoipa::{Modify, OpenApi};
 
 use crate::error::ErrorBody;
 use crate::views::{
-    BrandAssetView, BulkRevocationView, BulkRevokeSessionsRequest, ClientVerificationView,
-    ConnectorCapabilitiesView, ConnectorHealthView, ConnectorList, ConnectorView,
-    CreateConnectorRequest, CreateDcrPolicyRequest, CreateEnvironmentRequest,
+    BrandAssetView, BulkRevocationView, BulkRevokeSessionsRequest, ClientAdminConsentView,
+    ClientVerificationView, ConnectorCapabilitiesView, ConnectorHealthView, ConnectorList,
+    ConnectorView, CreateConnectorRequest, CreateDcrPolicyRequest, CreateEnvironmentRequest,
     CreateInitialAccessTokenRequest, CreateInvitationRequest, CreateManagementKeyRequest,
     CreateOrganizationRequest, CreateTenantRequest, CreateUserRequest, DcrPolicyList,
     DcrPolicyView, EnvironmentList, EnvironmentView, ExtendSignupQuarantineRequest, GuardrailView,
@@ -33,11 +33,11 @@ use crate::views::{
     OperatorView, OrganizationList, OrganizationView, RecoveryApprovalCaseView,
     RecoveryApprovalDecisionView, RecoveryApprovalList, RecoveryApprovalStateView,
     RefreshFamilyList, RefreshFamilyView, ResourceTypeView, ResourceTypesList,
-    RevokeSessionsRequest, SessionList, SessionRevocationView, SessionView, SetLocaleRequest,
-    SetSignupFormRequest, SetUserStateRequest, SignupFormFieldView, SignupFormView,
-    SignupQuarantineCaseView, SignupQuarantineDecisionView, SignupQuarantineList,
-    SignupQuarantineReasonView, SignupQuarantineStateView, TenantCreated, TenantList,
-    TenantStatusView, TenantView, UpdateUserRequest, UserExternalIdView, UserList,
+    RevokeSessionsRequest, SessionList, SessionRevocationView, SessionView,
+    SetClientAdminConsentRequest, SetLocaleRequest, SetSignupFormRequest, SetUserStateRequest,
+    SignupFormFieldView, SignupFormView, SignupQuarantineCaseView, SignupQuarantineDecisionView,
+    SignupQuarantineList, SignupQuarantineReasonView, SignupQuarantineStateView, TenantCreated,
+    TenantList, TenantStatusView, TenantView, UpdateUserRequest, UserExternalIdView, UserList,
     UserRevocationView, UserStateChangeView, UserStateView, UserView,
 };
 
@@ -165,6 +165,9 @@ use crate::views::{
         crate::signup_forms::set_signup_form,
         crate::signup_forms::get_signup_form,
         crate::signup_forms::delete_signup_form,
+        crate::client_admin_grants::set_client_admin_consent,
+        crate::client_admin_grants::get_client_admin_consent,
+        crate::client_admin_grants::delete_client_admin_consent,
         crate::brand_assets::set_brand_logo,
         crate::brand_assets::delete_brand_logo,
         crate::brand_assets::set_brand_favicon,
@@ -253,6 +256,8 @@ use crate::views::{
         SetSignupFormRequest,
         SignupFormFieldView,
         SignupFormView,
+        SetClientAdminConsentRequest,
+        ClientAdminConsentView,
         BrandAssetView,
         SessionView,
         SessionList,

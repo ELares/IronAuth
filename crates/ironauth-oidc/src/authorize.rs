@@ -32,7 +32,7 @@ use ironauth_config::QuarantineConfig;
 use ironauth_store::{
     AuthorizationCodeId, ClientId, ClientRecord, ConsumePushedRequest, CorrelationId, GrantId,
     GrantedConsent, IssueCode, PushedRequestId, Scope, SessionId, StoreError, UserId,
-    redirect_uri_is_registrable, redirect_uri_matches,
+    admin_grant_covers_scope, redirect_uri_is_registrable, redirect_uri_matches,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1934,6 +1934,90 @@ pub(crate) fn unverified_sensitive_scope_blocked(
         })
 }
 
+/// The outcome of the third-party admin-consent gate (issue #88, PR 4) for one authorization
+/// request, resolved by [`third_party_admin_consent_outcome`]. Shared by the redirect consent
+/// gate (`resolve_consent_gate`) and the device-authorization endpoint
+/// (`device::device_authorization`), so both consent surfaces enforce the same gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdminConsentOutcome {
+    /// The gate does not apply: the knob is off, or the client is classified `first_party` (a
+    /// first-party client is exempt wholesale). The gate falls through unchanged.
+    NotApplicable,
+    /// A third-party client whose requested scope is COVERED by an admin consent pre-authorization
+    /// (the admin grant is the consent of record). The user consent screen is SKIPPED and the code
+    /// is issued directly (the Microsoft admin-consent model).
+    Covered,
+    /// A third-party client with NO covering pre-authorization. The request is refused with a
+    /// terminal "requires administrator approval"; there is no user self-consent.
+    RequiresAdminApproval,
+}
+
+/// Resolve the third-party admin-consent gate (issue #88, PR 4) for one authorization request. A
+/// THIRD-PARTY (not `first_party`) client must be admin-pre-authorized for its requested
+/// `effective_scope` before it can obtain user consent: a covering pre-authorization SKIPS the
+/// user consent screen ([`AdminConsentOutcome::Covered`]), an uncovered request is a terminal
+/// ([`AdminConsentOutcome::RequiresAdminApproval`]), and the gate does not apply when the knob is
+/// off or the client is `first_party` ([`AdminConsentOutcome::NotApplicable`]).
+///
+/// Returns `Err(())` on a store fault, so the caller FAILS CLOSED to a `server_error` (consistent
+/// with the sibling security reads): a transient blip must NOT silently admit a third-party client
+/// the admin has not pre-authorized.
+pub(crate) async fn third_party_admin_consent_outcome(
+    state: &OidcState,
+    scope: Scope,
+    client: &ClientRecord,
+    client_id_str: &str,
+    effective_scope: Option<&str>,
+) -> Result<AdminConsentOutcome, ()> {
+    // The knob is off, or the client is a first-party (operator-owned) app: the gate does not
+    // apply and the request falls through to the ordinary consent path.
+    if !state.third_party_admin_consent_required() || client.first_party {
+        return Ok(AdminConsentOutcome::NotApplicable);
+    }
+    let grant = state
+        .store()
+        .scoped(scope)
+        .client_admin_grants()
+        .get(client_id_str)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "could not read a client admin consent pre-authorization");
+        })?;
+    match grant {
+        Some(record)
+            if admin_grant_covers_scope(record.granted_scope.as_deref(), effective_scope) =>
+        {
+            Ok(AdminConsentOutcome::Covered)
+        }
+        _ => Ok(AdminConsentOutcome::RequiresAdminApproval),
+    }
+}
+
+/// Audit that a user consent screen was SKIPPED for `client_id` (issue #88, PR 4), targeting the
+/// CLIENT, with an operator-safe `detail` naming the reason (`first_party_carveout` or
+/// `admin_preauthorized`). This records a `consent.skip` audit row WITHOUT persisting a consent
+/// row, so a silent auto-grant that stores no consent still leaves an audit trail. Returns
+/// `Err(())` on a store failure so the caller fails closed to a `server_error`.
+async fn audit_skipped_consent(
+    state: &OidcState,
+    scope: Scope,
+    subject: &str,
+    client_id: &ClientId,
+    detail: &str,
+) -> Result<(), ()> {
+    let actor = interaction::subject_actor(state, scope, subject);
+    state
+        .store()
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(state.env()))
+        .consents()
+        .audit_skipped_consent(state.env(), client_id, detail)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "could not audit a skipped consent");
+        })
+}
+
 // The consent gate is a single cohesive decision procedure (quarantine read, first-party
 // carve-out, the consent-lockdown block, the recorded-consent fast path, and the prompt=none
 // surfaces); splitting it would scatter one security decision across helpers and hurt
@@ -2033,6 +2117,57 @@ async fn resolve_consent_gate(
     let first_party = !client.quarantined
         && !user_quarantined
         && (matches!(consent_mode, ConsentMode::Implicit) || client.skip_consent);
+
+    // Third-party admin-consent gate (issue #88, PR 4): a THIRD-PARTY (not `first_party`) client
+    // must be admin-pre-authorized for its requested scope before it can obtain user consent. It
+    // fires HERE, ahead of the first-party carve-out AND the recorded-consent fast path below, so
+    // the admin gate DOMINATES a client's `skip_consent`/`implicit` trust and any prior recorded
+    // user consent: a covering pre-authorization SKIPS the user screen (the admin grant is the
+    // consent of record, the Microsoft model), an uncovered request is a non-approvable terminal
+    // (`access_denied`, the same under `prompt=none`), and it does not apply to a first-party
+    // client or when the knob is off. Fails closed to `server_error` on a store fault.
+    match third_party_admin_consent_outcome(state, scope, client, &client_id_str, effective_scope)
+        .await
+    {
+        Ok(AdminConsentOutcome::NotApplicable) => {}
+        Ok(AdminConsentOutcome::Covered) => {
+            // The admin pre-authorization is the consent of record: skip the user consent screen
+            // and issue the code. Audit `consent.skip` so the silent auto-grant stays enumerable
+            // even though no user consent row is persisted.
+            if audit_skipped_consent(
+                state,
+                scope,
+                &session.subject,
+                client_id,
+                "admin_preauthorized",
+            )
+            .await
+            .is_err()
+            {
+                return Err(gate_error(
+                    AuthzErrorCode::ServerError,
+                    "the authorization request could not be processed",
+                ));
+            }
+            return Ok(Gate::Ready {
+                session,
+                consent_ref: None,
+            });
+        }
+        Ok(AdminConsentOutcome::RequiresAdminApproval) => {
+            return Err(gate_error(
+                AuthzErrorCode::AccessDenied,
+                "this application requires administrator approval before it can be authorized",
+            ));
+        }
+        Err(()) => {
+            return Err(gate_error(
+                AuthzErrorCode::ServerError,
+                "the authorization request could not be processed",
+            ));
+        }
+    }
+
     if first_party && !force_consent {
         // Record the skipped consent so an offline grant stays enumerable and
         // revocable per app, UNLESS the no-store performance knob is off.
@@ -2056,6 +2191,24 @@ async fn resolve_consent_gate(
                 }
             }
         } else {
+            // The no-store knob is off, so no consent row is persisted. Audit `consent.skip` so
+            // the silent first-party auto-grant still leaves an audit trail naming the client
+            // (issue #88, PR 4: closing the prior no-audit gap).
+            if audit_skipped_consent(
+                state,
+                scope,
+                &session.subject,
+                client_id,
+                "first_party_carveout",
+            )
+            .await
+            .is_err()
+            {
+                return Err(gate_error(
+                    AuthzErrorCode::ServerError,
+                    "the authorization request could not be processed",
+                ));
+            }
             None
         };
         return Ok(Gate::Ready {
