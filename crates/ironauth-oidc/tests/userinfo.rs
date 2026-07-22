@@ -676,6 +676,7 @@ async fn seed_opaque_token_with_audience(
                 grant_id: &grant_id,
                 client_id: &code_client,
                 redirect_uri: REDIRECT_URI,
+                browserless: false,
                 nonce: None,
                 code_challenge: None,
                 code_challenge_method: None,

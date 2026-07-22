@@ -347,6 +347,39 @@ pub async fn resolve_session(
     })
 }
 
+/// Resolve the session THIS request just established (issue #93, Bet 3) by its minted id, into
+/// the authenticated context (subject, recorded methods, `auth_time`) a browserless first-party
+/// challenge code is minted from.
+///
+/// Unlike [`resolve_session`] this reads by the freshly minted [`SessionCookies`] id rather than a
+/// presented cookie: the challenge endpoint drives the login flow to completion (which establishes
+/// the session server-side, returning the cookies) and then must read back the subject the flow
+/// authenticated to bind the code. It fails CLOSED to [`None`] on a store fault or an
+/// already-gone/revoked session, exactly as [`resolve_session`] does, so the caller renders its
+/// uniform failure rather than minting a code for an unresolved subject.
+pub(crate) async fn resolve_established_session(
+    state: &OidcState,
+    scope: Scope,
+    cookies: &SessionCookies,
+) -> Option<AuthenticatedSession> {
+    let now = epoch_micros(state.now());
+    let idle_ttl = idle_ttl_micros(state);
+    let record = state
+        .store()
+        .scoped(scope)
+        .sessions()
+        .get(&cookies.session_id, now, idle_ttl)
+        .await
+        .ok()
+        .flatten()?;
+    Some(AuthenticatedSession {
+        session_id: cookies.session_id,
+        subject: record.subject,
+        auth_time_unix_micros: record.auth_time_unix_micros,
+        auth_methods: record.auth_methods,
+    })
+}
+
 /// The configured idle window in microseconds, saturating (never negative), for the
 /// idle slide on the session read path (issue #32).
 fn idle_ttl_micros(state: &OidcState) -> i64 {

@@ -363,6 +363,7 @@ impl Harness {
                     grant_id: &grant_id,
                     client_id: &client,
                     redirect_uri: "https://rp.example/cb",
+                    browserless: false,
                     nonce: None,
                     code_challenge: None,
                     code_challenge_method: None,

@@ -460,6 +460,7 @@ async fn plant_refresh_family(
                 grant_id: &grant_id,
                 client_id: &client_id,
                 redirect_uri: "https://client.test/cb",
+                browserless: false,
                 nonce: None,
                 code_challenge: None,
                 code_challenge_method: None,

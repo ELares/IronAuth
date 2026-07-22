@@ -494,8 +494,8 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
     );
     assert_eq!(
         report.already_applied(),
-        80,
-        "the production chain is exactly eighty migrations (isolation, audit log, management \
+        81,
+        "the production chain is exactly eighty-one migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -515,17 +515,18 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
          risk signals, signup fraud review, advanced recovery modes, headless flows, branding, \
          locale bundles, brand assets, diagnostic reason detail, diagnostics control read, \
          policy decision traces, flows control read, signup forms, consent lockdown, client admin \
-         grants, consent control grants, flow version pin, flow versions)"
+         grants, consent control grants, flow version pin, flow versions, first-party challenge \
+         codes)"
     );
 
-    // The ledger holds exactly versions 1 through 80.
+    // The ledger holds exactly versions 1 through 81.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
             46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67,
-            68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80
+            68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81
         ]
     );
     let phase_of = |version: i64| async move {
@@ -1801,6 +1802,14 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
     assert!(
         flows_fk,
         "the flows.flow_version_id foreign key into flow_versions must exist after 0080"
+    );
+
+    // EXPAND (issue #93): an additive browserless flag on the authorization codes table for the
+    // OAuth 2.0 Authorization Challenge Endpoint's browserless first-party codes.
+    assert_eq!(phase_of(81).await, "expand");
+    assert!(
+        column_exists(pool, "authorization_codes", "browserless").await,
+        "authorization_codes.browserless exists after 0081"
     );
 
     // The demo object never reaches a production database.

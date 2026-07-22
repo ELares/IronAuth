@@ -987,5 +987,18 @@ name = "hosted_pages_cutover"
 path = "tests/hosted_pages_cutover.rs"
 required-features = ["testing"]
 
+# The OAuth 2.0 Authorization Challenge Endpoint (issue #93, Bet 3, PR1,
+# draft-ietf-oauth-first-party-apps-03): the browserless first-party native login surface. Pins the
+# flag-off uniform 404, the login-only happy path (a first-party native client submits credentials,
+# the endpoint drives login to completion in one request, mints a browserless authorization code,
+# and the ordinary token endpoint redeems it with no redirect_uri), the non-first-party and
+# non-code rejections, and the token-endpoint FORK A regression (the browser code path stays
+# byte-identical; a browser code without a redirect_uri is rejected; a browserless code with a
+# redirect_uri is rejected). Over a real database (DATABASE_URL).
+[[test]]
+name = "first_party_challenge"
+path = "tests/first_party_challenge.rs"
+required-features = ["testing"]
+
 [lints]
 workspace = true

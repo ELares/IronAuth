@@ -429,14 +429,30 @@ async fn authorization_code_grant(
 /// (see the exchange). This runs BEFORE the code is consumed, so a mismatch does
 /// not burn the one-time code.
 fn bindings_match(bindings: &CodeBindings, params: &TokenParams) -> bool {
-    // The redirect_uri re-check is EXACT string against the value bound at
-    // authorization (RFC 6749 4.1.3): the code was bound to the specific URI the
-    // client used, so no loopback-port latitude applies here (that latitude was
-    // already spent when the code was issued against the presented port).
-    let redirect_ok = params
-        .redirect_uri
-        .as_deref()
-        .is_some_and(|presented| presented == bindings.redirect_uri);
+    // The redirect_uri re-check in BOTH directions, symmetric with the PKCE rule below (issue
+    // #93, Bet 3, FORK A):
+    // - a BROWSER code (the shipped default) was bound to the specific URI the client used, so it
+    //   is redeemable ONLY with that EXACT presented redirect_uri (RFC 6749 4.1.3); no loopback-port
+    //   latitude applies here (that latitude was already spent when the code was issued against the
+    //   presented port). An absent presented value is a mismatch. This is BYTE-IDENTICAL to before.
+    // - a BROWSERLESS first-party challenge code carries NO redirect_uri, so the token request must
+    //   present NONE: an absent (or empty) presented value is accepted and a present one is REJECTED
+    //   as a mismatch, exactly mirroring how a no-challenge code rejects a presented PKCE verifier.
+    let redirect_ok = if bindings.browserless {
+        // No redirect_uri was bound: the request must present none. An empty/whitespace value is
+        // treated as absent (accepted); any real presented URI is a mismatch (rejected).
+        params
+            .redirect_uri
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+    } else {
+        // The shipped browser rule, UNCHANGED: an exact-string match of the presented value against
+        // the bound URI, with an absent presented value a mismatch.
+        params
+            .redirect_uri
+            .as_deref()
+            .is_some_and(|presented| presented == bindings.redirect_uri)
+    };
     // PKCE downgrade prevention in BOTH directions (RFC 7636, RFC 9700):
     // - a code issued WITH a challenge is redeemable ONLY with a verifier that
     //   hashes (S256) to that challenge;

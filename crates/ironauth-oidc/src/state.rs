@@ -253,6 +253,16 @@ pub struct OidcState {
     // the confirmation threshold, and the IDV providers that SHAPE the modes live in `Inner`
     // (config data cannot arm the surface).
     advanced_recovery_enabled: bool,
+    // Whether the experimental OAuth 2.0 Authorization Challenge Endpoint (issue #93, Bet 3,
+    // draft-ietf-oauth-first-party-apps) is served. Kept OUTSIDE `Inner` and set through the
+    // builder for the SAME anti-bypass reason as the other experimental surfaces: it is NOT a plain
+    // `OidcConfig` toggle an operator can flip (that would arm the browserless challenge endpoint,
+    // and its ability to mint an authorization code, outside the experimental acknowledgment gate).
+    // The ONLY writer is the boot path, which resolves it from the strict config feature ladder (the
+    // `first-party-challenge` experimental feature enabled AND acked at the exact draft revision) and
+    // sets it here. Default: false, so the `.../authorize-challenge` route answers a uniform 404 and
+    // no browserless code can be minted until an operator opts in.
+    first_party_challenge_enabled: bool,
     // Whether the headless flow API (issue #84) is served. Kept OUTSIDE `Inner` and set
     // through the builder because it is sourced from the TOP-LEVEL `[flows]` config section
     // (`flows.enabled`), not from `OidcConfig`: the boot path resolves `config.flows.enabled`
@@ -862,6 +872,7 @@ impl OidcState {
             signup_quarantine_enabled: false,
             third_party_admin_consent_required_override: None,
             advanced_recovery_enabled: false,
+            first_party_challenge_enabled: false,
             flows_enabled: false,
             hosted_pages_enabled: false,
             diagnostics_verbosity: DiagnosticVerbosity::Standard,
@@ -1074,6 +1085,27 @@ impl OidcState {
     #[must_use]
     pub fn advanced_recovery_enabled(&self) -> bool {
         self.advanced_recovery_enabled
+    }
+
+    /// Arm (or not) the experimental OAuth 2.0 Authorization Challenge Endpoint (issue #93, Bet 3).
+    ///
+    /// The boot path is the ONLY caller: it resolves `enabled` from the strict config feature
+    /// ladder (the `first-party-challenge` experimental feature enabled AND acknowledged at the
+    /// exact draft revision) and passes the result here. It is a builder rather than an
+    /// `OidcConfig` field precisely so an operator cannot arm the browserless challenge endpoint
+    /// (and its authorization-code mint) from a plain config toggle and bypass the experimental ack
+    /// gate. When false (the default), the `.../authorize-challenge` handler answers a uniform 404.
+    #[must_use]
+    pub fn with_first_party_challenge_enabled(mut self, enabled: bool) -> Self {
+        self.first_party_challenge_enabled = enabled;
+        self
+    }
+
+    /// Whether the experimental OAuth 2.0 Authorization Challenge Endpoint is served (issue #93,
+    /// Bet 3). The challenge handler's first action is to return a uniform 404 when this is false.
+    #[must_use]
+    pub fn first_party_challenge_enabled(&self) -> bool {
+        self.first_party_challenge_enabled
     }
 
     /// Arm the headless flow API (issue #84). The boot path resolves the top-level

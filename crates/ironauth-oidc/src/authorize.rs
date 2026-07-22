@@ -1874,7 +1874,7 @@ async fn resolve_gate(
 /// subject that may be quarantined. The caller gates this on the experimental flag, so it
 /// never runs when the feature is off (a quarantined-user flag can only ever be set behind
 /// the same flag).
-async fn user_is_quarantined(
+pub(crate) async fn user_is_quarantined(
     state: &OidcState,
     scope: Scope,
     subject_text: &str,
@@ -2749,6 +2749,36 @@ async fn persist_code(
     mode: ResponseMode,
     resolved: &Resolved<'_>,
 ) -> Result<String, AuthorizeError> {
+    // The BROWSER code-mint: a code bound to the presented `redirect_uri`, never browserless. A
+    // store fault surfaces as the negotiated-mode `server_error` (the `redirect_uri` is valid).
+    // The browser path stays byte-identical to before the browserless extraction.
+    issue_code_core(state, scope, client_id, redirect_uri, false, resolved)
+        .await
+        .map_err(|()| AuthorizeError::Redirect {
+            redirect_uri: redirect_uri.to_owned(),
+            error: AuthzErrorCode::ServerError,
+            description: "the authorization request could not be processed".to_owned(),
+            state: resolved.state_echo.map(str::to_owned),
+            iss: iss.to_owned(),
+            mode,
+        })
+}
+
+/// The shared authorization-code mint core (issue #93, Bet 3): build the [`IssueCode`] bound to
+/// the resolved authentication/authorization context, persist the code and its grant in one
+/// audited transaction, and return the issued code string. `browserless` marks a first-party
+/// challenge code (bound with an empty `redirect_uri`, redeemed at the token endpoint with none
+/// presented); the browser path passes `false` and the exact bound `redirect_uri`. A store fault
+/// is `Err(())`, which each caller renders in its own transport shape (a redirect for the browser
+/// authorize path, a JSON `server_error` for the challenge endpoint).
+async fn issue_code_core(
+    state: &OidcState,
+    scope: Scope,
+    client_id: &ClientId,
+    redirect_uri: &str,
+    browserless: bool,
+    resolved: &Resolved<'_>,
+) -> Result<String, ()> {
     let now = state.now();
     let code_id = AuthorizationCodeId::generate(state.env(), &scope);
     let grant_id = GrantId::generate(state.env(), &scope);
@@ -2759,6 +2789,7 @@ async fn persist_code(
         grant_id: &grant_id,
         client_id,
         redirect_uri,
+        browserless,
         nonce: resolved.nonce,
         code_challenge: resolved.code_challenge,
         code_challenge_method: resolved.code_challenge_method,
@@ -2787,17 +2818,114 @@ async fn persist_code(
         .await
     {
         tracing::error!(error = %error, "failed to issue authorization code");
-        return Err(AuthorizeError::Redirect {
-            redirect_uri: redirect_uri.to_owned(),
-            error: AuthzErrorCode::ServerError,
-            description: "the authorization request could not be processed".to_owned(),
-            state: resolved.state_echo.map(str::to_owned),
-            iss: iss.to_owned(),
-            mode,
-        });
+        return Err(());
     }
 
     Ok(code_id.to_string())
+}
+
+/// The authentication context a completed first-party challenge (issue #93, Bet 3) mints its
+/// browserless authorization code from: the authenticated subject and the session the challenge
+/// login established, plus the optional PKCE binding the client presented. Borrowed for the mint.
+pub(crate) struct ChallengeCodeContext<'a> {
+    /// The client the code is issued to (must be classified `first_party`).
+    pub client: &'a ClientRecord,
+    /// The authenticated end-user subject (a `usr_` id string).
+    pub subject: &'a str,
+    /// The recorded authentication method tokens frozen onto the code (issue #14).
+    pub auth_methods: &'a str,
+    /// The recorded authentication instant, present only when the client registered
+    /// `require_auth_time` (issue #14); [`None`] omits the claim.
+    pub auth_time_micros: Option<i64>,
+    /// The authenticating session handle (the session established by the challenge login).
+    pub session_ref: &'a str,
+    /// The requested OAuth `scope`, or [`None`].
+    pub oauth_scope: Option<&'a str>,
+    /// Whether the authenticated subject is a QUARANTINED account (issue #82). Belt-and-suspenders:
+    /// the challenge completion path escalates a quarantined user to the browser BEFORE minting, so
+    /// this is normally `false` here; when `true` the SENSITIVE scopes are stripped from the code's
+    /// bound scope regardless, so a future change to the escalation gate still cannot leak
+    /// `offline_access` onto a quarantined user's code.
+    pub user_quarantined: bool,
+    /// The presented PKCE `code_challenge`, or [`None`].
+    pub code_challenge: Option<&'a str>,
+    /// The presented PKCE `code_challenge_method`, or [`None`].
+    pub code_challenge_method: Option<&'a str>,
+}
+
+/// Mint an authorization code for a completed first-party challenge (issue #93, Bet 3).
+///
+/// Records the implicit grant under the SAME first-party consent carve-out the browser
+/// `/authorize` path uses (FORK E): a first-party client skips the interactive consent leg, so the
+/// skipped consent is recorded (when the client stores it) or audited, exactly as the carve-out
+/// does. Then persists a BROWSERLESS code (FORK A) through the SAME [`issue_code_core`] machinery
+/// the browser path uses, bound to NO `redirect_uri`. Returns the code string, or `Err(())` on a
+/// store fault (the caller renders a JSON `server_error`).
+pub(crate) async fn mint_challenge_code(
+    state: &OidcState,
+    scope: Scope,
+    client_id: &ClientId,
+    context: &ChallengeCodeContext<'_>,
+) -> Result<String, ()> {
+    // Belt-and-suspenders (issue #82): a QUARANTINED user's code can never carry a SENSITIVE scope
+    // (`offline_access`, an admin/management scope, a configured payment-class scope). The challenge
+    // completion path escalates a quarantined user to the browser BEFORE reaching here, so this is
+    // normally a no-op, but binding the strip to the mint means a future change to the escalation
+    // gate still cannot leak a sensitive scope onto a quarantined user's code. This MIRRORS the
+    // UNCONDITIONAL strip the browser path applies for a quarantined user (authorize.rs, step 6a).
+    let effective_scope: Option<String> = if context.user_quarantined {
+        strip_sensitive_scopes(context.oauth_scope, state.quarantine_config())
+    } else {
+        context.oauth_scope.map(str::to_owned)
+    };
+
+    // FORK E: record the implicit grant exactly as the first-party carve-out (the block at the top
+    // of `resolve_consent_gate`) does: persist a skipped-consent row when the client stores it, so
+    // the grant stays enumerable and revocable per app; otherwise audit the skip so the silent
+    // auto-grant still leaves an audit trail naming the client.
+    let consent_mode = ConsentMode::parse(&context.client.consent_mode);
+    let client_id_str = client_id.to_string();
+    let consent_ref = if context.client.store_skipped_consent {
+        Some(
+            record_skipped_consent(
+                state,
+                scope,
+                context.subject,
+                &client_id_str,
+                effective_scope.as_deref(),
+                consent_mode,
+            )
+            .await?,
+        )
+    } else {
+        audit_skipped_consent(
+            state,
+            scope,
+            context.subject,
+            client_id,
+            "first_party_challenge",
+        )
+        .await?;
+        None
+    };
+
+    let resolved = Resolved {
+        nonce: None,
+        oauth_scope: effective_scope.as_deref(),
+        code_challenge: context.code_challenge,
+        code_challenge_method: context.code_challenge_method,
+        state_echo: None,
+        subject: context.subject,
+        auth_methods: context.auth_methods,
+        auth_time_micros: context.auth_time_micros,
+        session_ref: context.session_ref,
+        consent_ref: consent_ref.as_deref(),
+        claims_request: None,
+        granted_resources: &[],
+    };
+    // FORK A: a browserless code is bound to NO redirect_uri (the empty sentinel), so the token
+    // endpoint accepts an absent presented redirect_uri and rejects a present one.
+    issue_code_core(state, scope, client_id, "", true, &resolved).await
 }
 
 #[cfg(test)]

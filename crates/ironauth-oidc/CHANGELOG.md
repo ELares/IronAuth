@@ -6,6 +6,32 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- OAuth 2.0 Authorization Challenge Endpoint (draft-ietf-oauth-first-party-apps-03) behind an
+  experimental flag (issue #93, Bet 3, PR1, EXPLORATORY, the browserless first-party native login
+  surface). The `first-party-challenge` experimental feature (ack version
+  `draft-ietf-oauth-first-party-apps-03`, this changelog is its ack target) gates the whole
+  surface; it is off by default and boot-refuses when enabled without the exact draft ack (a future
+  draft bump invalidates every deployed ack). With the flag off the endpoint is a uniform 404 and
+  no browserless code can be minted.
+  - **`POST /t/{t}/e/{e}/authorize-challenge`** accepts a FIRST-PARTY native client's `client_id`,
+    `response_type=code`, optional `scope`/PKCE, and implementation-defined credential params
+    (username, password). It drives the SAME login flow engine the browser and headless-API
+    transports drive (a THIRD projection over `create_flow`+`drive`, never a bypass) and, on a
+    login that completes in one request, mints a BROWSERLESS authorization code under the
+    first-party consent carve-out and returns `200 {"authorization_code": "<ac_...>"}`. A
+    non-first-party client is `unauthorized_client`; a non-code `response_type` is
+    `unsupported_response_type`. PR1 is LOGIN-ONLY: a login that does not complete (bad credentials
+    or a second factor required) returns a minimal `insufficient_authorization` (the MFA
+    `auth_session` continuation loop, high-risk `redirect_to_web` escalation, discovery
+    advertisement, and per-`auth_session` rate limiting are later PRs).
+  - **Token endpoint**: the browserless code is redeemed at the ORDINARY token endpoint with
+    `grant_type=authorization_code` and NO `redirect_uri`. The `redirect_uri` re-check is now
+    two-directional (symmetric with the shipped PKCE rule): a browserless code accepts an absent
+    presented `redirect_uri` and rejects a present one, while a BROWSER code stays BYTE-IDENTICAL
+    (its exact bound `redirect_uri` is still required and its absence still rejected).
+  - **Migration 0081** adds the additive `authorization_codes.browserless` boolean (DEFAULT FALSE,
+    RLS inherited) that discriminates a browserless challenge code from a browser code, so no
+    reader has to infer intent from an empty-string `redirect_uri`.
 - IdP-side FedCM (W3C Federated Credential Management) READ surface behind an experimental
   flag (issue #83, PR 1, EXPLORATORY). The `fedcm` experimental feature (ack version
   `0.1.0-exp.1`, this changelog is its ack target) gates the whole surface; it is off by

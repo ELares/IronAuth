@@ -48,6 +48,7 @@
 /t/{tenant_id}/e/{environment_id}/account/trusted-devices
 /t/{tenant_id}/e/{environment_id}/account/trusted-devices/revoke
 /t/{tenant_id}/e/{environment_id}/account/trusted-devices/revoke-all
+/t/{tenant_id}/e/{environment_id}/authorize-challenge
 /t/{tenant_id}/e/{environment_id}/brand/{slug}/{kind}
 /t/{tenant_id}/e/{environment_id}/connect/register
 /t/{tenant_id}/e/{environment_id}/connect/register/{client_id}

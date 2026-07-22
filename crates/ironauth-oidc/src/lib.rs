@@ -79,6 +79,7 @@ mod authorize;
 mod backchannel;
 pub mod branding;
 mod broker_overlay;
+mod challenge;
 mod claims_request;
 mod client_auth;
 mod client_credentials;
@@ -549,6 +550,17 @@ pub fn oidc_router(state: OidcState) -> Router {
         .route(
             "/t/{tenant_id}/e/{environment_id}/recover/idv/callback",
             post(advanced_recovery::idv_callback),
+        )
+        // The OAuth 2.0 Authorization Challenge Endpoint (issue #93, Bet 3, EXPERIMENTAL,
+        // draft-ietf-oauth-first-party-apps): the browserless first-party native login surface. A
+        // first-party native client POSTs credentials and, on a login that completes in one
+        // request, receives an authorization code it redeems at the ordinary token endpoint with no
+        // redirect_uri. The handler fails closed with a 404 when the `first-party-challenge`
+        // experimental feature is off, so the route literal (a path const) stays UNCONDITIONAL for
+        // the RFC 9700 endpoint inventory.
+        .route(
+            challenge::AUTHORIZATION_CHALLENGE_PATH,
+            post(challenge::authorize_challenge),
         )
         // WebAuthn passkey ceremonies (issue #65), scope-routed so the RP ID/origin
         // and the credential reads/writes run under the right per-environment scope.
