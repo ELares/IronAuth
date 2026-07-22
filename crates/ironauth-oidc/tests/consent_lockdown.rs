@@ -336,6 +336,65 @@ async fn a_covering_admin_pre_authorization_skips_the_user_consent_screen() {
 }
 
 #[tokio::test]
+async fn a_covered_but_quarantined_client_still_sees_the_consent_screen() {
+    // The admin pre-authorization grants ALLOWANCE, not consent-screen invisibility. A
+    // quarantined (unverified) client that is admin-pre-authorized for the scope is let through
+    // (not a terminal) but STILL shows the user a fresh consent screen, preserving the issue #31
+    // "a quarantined client always re-prompts" property. No silent code, no consent.skip audit.
+    let mut harness = Harness::start_store_backed().await;
+    harness.enable_third_party_admin_consent();
+    let client_id = harness.client_id().to_string();
+    harness
+        .set_client_admin_grant(harness.client_id(), Some(NON_SENSITIVE_SCOPE))
+        .await;
+    harness
+        .set_client_quarantined(harness.client_id(), true)
+        .await;
+
+    let subject = harness.seed_unique_user().await;
+    let cookie = harness.session_cookie(&subject).await;
+    let (status, headers, body) = harness
+        .authorize_with_cookie(&authorize_query(&client_id, NON_SENSITIVE_SCOPE), &cookie)
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
+    assert_proceeds_to_consent(&headers);
+    assert!(
+        location_param(&headers, "code").is_none(),
+        "a quarantined client is not silently auto-authorized even when admin-pre-authorized"
+    );
+    assert!(
+        consent_skip_audit(&harness).await.is_empty(),
+        "no consent.skip is audited when the consent screen is shown"
+    );
+}
+
+#[tokio::test]
+async fn a_covered_client_for_a_quarantined_user_still_sees_the_consent_screen() {
+    // The mirror for a quarantined USER (issue #82): a covering admin pre-authorization does not
+    // silently auto-authorize a quarantined user; the consent screen is still shown.
+    let mut harness = Harness::start_store_backed().await;
+    harness.enable_third_party_admin_consent();
+    harness.also_enable_signup_quarantine();
+    let client_id = harness.client_id().to_string();
+    harness
+        .set_client_admin_grant(harness.client_id(), Some(NON_SENSITIVE_SCOPE))
+        .await;
+
+    let subject = harness.seed_unique_user().await;
+    harness.set_user_quarantined(&subject, true).await;
+    let cookie = harness.session_cookie(&subject).await;
+    let (status, headers, body) = harness
+        .authorize_with_cookie(&authorize_query(&client_id, NON_SENSITIVE_SCOPE), &cookie)
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
+    assert_proceeds_to_consent(&headers);
+    assert!(
+        location_param(&headers, "code").is_none(),
+        "a quarantined user is not silently auto-authorized even when the client is pre-authorized"
+    );
+}
+
+#[tokio::test]
 async fn a_third_party_client_without_a_pre_authorization_is_a_terminal() {
     let mut harness = Harness::start_store_backed().await;
     harness.enable_third_party_admin_consent();

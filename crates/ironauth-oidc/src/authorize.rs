@@ -1983,6 +1983,11 @@ pub(crate) async fn third_party_admin_consent_outcome(
         .map_err(|error| {
             tracing::error!(%error, "could not read a client admin consent pre-authorization");
         })?;
+    // Coverage is checked against the LITERAL requested scope, not the consent-normalized one:
+    // an admin must explicitly pre-authorize every requested scope (including `offline_access`,
+    // which grants refresh tokens) for the request to be covered. This is deliberate and fails
+    // CLOSED: a request naming a scope the admin did not list is refused (RequiresAdminApproval),
+    // never partially or silently granted. Do NOT route this through `consent_check_scope`.
     match grant {
         Some(record)
             if admin_grant_covers_scope(record.granted_scope.as_deref(), effective_scope) =>
@@ -2122,15 +2127,23 @@ async fn resolve_consent_gate(
     // must be admin-pre-authorized for its requested scope before it can obtain user consent. It
     // fires HERE, ahead of the first-party carve-out AND the recorded-consent fast path below, so
     // the admin gate DOMINATES a client's `skip_consent`/`implicit` trust and any prior recorded
-    // user consent: a covering pre-authorization SKIPS the user screen (the admin grant is the
-    // consent of record, the Microsoft model), an uncovered request is a non-approvable terminal
-    // (`access_denied`, the same under `prompt=none`), and it does not apply to a first-party
-    // client or when the knob is off. Fails closed to `server_error` on a store fault.
+    // user consent: a covering pre-authorization ALLOWS the request (normally skipping the user
+    // screen, the admin grant being the consent of record, the Microsoft model), an uncovered
+    // request is a non-approvable terminal (`access_denied`, the same under `prompt=none`), and it
+    // does not apply to a first-party client or when the knob is off. Fails closed to
+    // `server_error` on a store fault.
+    //
+    // The admin pre-authorization grants ALLOWANCE, never consent-screen INVISIBILITY: a covering
+    // grant lets the request through, but a quarantined client (issue #31) or quarantined user
+    // (issue #82), or an explicit `prompt=consent`, STILL sees a fresh consent screen. So the
+    // silent skip applies only when consent is not forced; otherwise a `Covered` outcome falls
+    // through to the normal flow, where `force_consent` disables the recorded-consent fast path
+    // and the user is shown consent. This keeps the quarantine "always re-prompt" property true
+    // even for an admin-pre-authorized client.
     match third_party_admin_consent_outcome(state, scope, client, &client_id_str, effective_scope)
         .await
     {
-        Ok(AdminConsentOutcome::NotApplicable) => {}
-        Ok(AdminConsentOutcome::Covered) => {
+        Ok(AdminConsentOutcome::Covered) if !force_consent && !user_quarantined => {
             // The admin pre-authorization is the consent of record: skip the user consent screen
             // and issue the code. Audit `consent.skip` so the silent auto-grant stays enumerable
             // even though no user consent row is persisted.
@@ -2154,6 +2167,11 @@ async fn resolve_consent_gate(
                 consent_ref: None,
             });
         }
+        // Fall through: either the gate does not apply (`NotApplicable`), or the request is
+        // covered but its consent is FORCED (a quarantined client or user, or `prompt=consent`).
+        // A forced-but-covered request is ALLOWED but not silently skipped, so the consent screen
+        // is still shown, preserving the quarantine consent-visibility property.
+        Ok(AdminConsentOutcome::NotApplicable | AdminConsentOutcome::Covered) => {}
         Ok(AdminConsentOutcome::RequiresAdminApproval) => {
             return Err(gate_error(
                 AuthzErrorCode::AccessDenied,
