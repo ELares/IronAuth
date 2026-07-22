@@ -777,8 +777,16 @@ pub async fn drive(
             )
             .await
         }
+        // The built-in recovery journey (issue #92, PR 8d): re-expressed as the embedded recovery
+        // artifact (a three-step guard-free machine: identifier start, code verify, then a terminal
+        // mint) and driven through the SAME compiled-table engine, byte-identically to the retired
+        // imperative `drive_recovery`. Recovery is a passwordless email-OTP identity proof that MINTS
+        // an email-factor session (`amr = [otp]`); its genuine mint relaxes the recovery-path abuse
+        // counters through the executor-threaded `post_reset`, exactly as `drive_recovery` does. The
+        // imperative `drive_recovery` stays in the tree (unused, `#[allow(dead_code)]`, retired in PR
+        // 8e) so a revert is this one dispatch line.
         Journey::Recovery => {
-            drive_recovery(
+            orchestration::drive_via_table(
                 state,
                 scope,
                 flow_id,
@@ -788,6 +796,7 @@ pub async fn drive(
                 &submission,
                 headers,
                 now_micros,
+                Journey::Recovery,
             )
             .await
         }
@@ -1585,6 +1594,10 @@ async fn drive_registration(
 /// session. The uniform acknowledgment and every non completing outcome leave the flow OPEN, so
 /// recovery is never a completion or enumeration oracle. The #81 `hold_until` delay and
 /// downgrade invariant are UNCHANGED and live downstream at factor removal (see [`recovery`]).
+// PR8e: retire. Dead after the PR 8d table flip (the `Journey::Recovery` arm now drives through
+// `orchestration::drive_via_table`). Kept in the tree so a revert is one dispatch line; deleted in
+// PR 8e once every mint-family journey has converged.
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 async fn drive_recovery(
     state: &OidcState,

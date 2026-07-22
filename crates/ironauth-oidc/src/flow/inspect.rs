@@ -993,6 +993,22 @@ mod tests {
     }
 
     #[test]
+    fn recovery_plan_projection_pins_the_static_list() {
+        // The projection pin (issue #92, PR 8d): the EMBEDDED recovery artifact, driven through the
+        // table engine, projects to the SAME ordered plan the static `Journey::Recovery.plan()`
+        // lists, `[RecoveryStart, RecoveryAck, Completed]`. Unlike registration this needs no
+        // render-override: recovery's ack is a REAL routed step (RecoveryVerify -> RecoveryAck via
+        // wire_state_for). PR 8e retires the static arm once every mint-family journey is pinned.
+        let compiled = super::super::builtin_artifacts::builtin_compiled(Journey::Recovery)
+            .expect("the recovery journey has an embedded artifact");
+        assert_eq!(
+            project_plan(Journey::Recovery, compiled),
+            Journey::Recovery.plan().to_vec(),
+            "the projected recovery plan equals the static Journey::Recovery.plan()"
+        );
+    }
+
+    #[test]
     fn project_plan_is_flat_for_a_genuine_custom_journey() {
         // A genuine custom journey stays flat: every step folds to the Custom wire state, so the
         // projection is the deduplicated [Custom, Completed].
