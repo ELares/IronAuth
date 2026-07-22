@@ -365,6 +365,12 @@ fn promoted_projection(snapshot: &Snapshot) -> Snapshot {
             // transactional engine yet (a later slice), so the promoted projection empties them
             // exactly like `brand` and `locale_bundle`.
             signup_form: Vec::new(),
+            // Custom-journey versions (issue #92, PR 5) are carried in the EXPORT (a promotable,
+            // diffable journey artifact and its pin) but not applied by the transactional engine
+            // yet: promoting an append-only, per-journey versioned resource with an active pin is
+            // its own slice, so the promoted projection empties it exactly like `signup_form`,
+            // keeping the revision consistent between the source projection and the target read.
+            flow_version: Vec::new(),
         },
     }
 }

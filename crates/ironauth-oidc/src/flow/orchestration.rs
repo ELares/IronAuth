@@ -33,13 +33,16 @@
 
 #[cfg(any(test, feature = "testing"))]
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ironauth_journey::{
     CompiledJourney, CompiledStep, EvalContext, OutcomeSignal, SignalSet, StepKind, evaluate,
 };
-use ironauth_store::{FlowId, FlowRecord, NewFlow, Scope, UserId};
+use ironauth_store::{FlowId, FlowRecord, NewFlow, Scope, Store, UserId};
 
 use super::eval_ctx::assemble_eval_context;
 use super::message::Message;
@@ -54,26 +57,172 @@ use crate::interaction;
 use crate::state::OidcState;
 use crate::util::epoch_micros;
 
-/// The seam that resolves a compiled custom journey (issue #92, PR 4): the boundary between the
-/// engine (which drives a compiled table) and the store (which persists and version-pins the
-/// journey documents). PR 4 ships the test-only [`EmbeddedJourneySource`] behind this trait; PR 5
-/// swaps in a [`FlowVersionStore`]-backed implementation (RLS-scoped `flow_versions`, admin
-/// authoring, and pin resolution), so the trait boundary is the exact PR 4 / PR 5 seam. A live
-/// custom flow re-resolves the SAME table across submissions from the version id stamped on its
-/// row, so the journey it started under cannot change mid-flow.
+/// A boxed resolve future (issue #92): a store-backed source AWAITS its scoped, RLS-forced
+/// `flow_versions` read and then compiles; the embedded test source resolves immediately. Boxed so
+/// [`CompiledJourneySource`] stays object-safe behind `Arc<dyn ...>` (the codebase's async-trait
+/// convention, matching the pow / migration-hook seams) without an async-trait dependency.
+pub type ResolveFuture<'a> =
+    Pin<Box<dyn Future<Output = Option<Arc<CompiledJourney>>> + Send + 'a>>;
+
+/// A boxed creation-resolve future (issue #92): resolves an author-facing `journey_id` to the
+/// PINNED version id to stamp on a new flow row and the compiled table to drive it.
+pub type ResolveForCreationFuture<'a> =
+    Pin<Box<dyn Future<Output = Option<(String, Arc<CompiledJourney>)>> + Send + 'a>>;
+
+/// The seam that resolves a compiled custom journey (issue #92): the boundary between the engine
+/// (which drives a compiled table) and the store (which persists and version-pins the journey
+/// documents). PR 4 shipped the test-only [`EmbeddedJourneySource`] behind this trait; PR 5 wires
+/// the [`FlowVersionJourneySource`] production implementation (RLS-scoped `flow_versions`, admin
+/// authoring, and pin resolution, with a compile cache keyed by version id), so the trait boundary
+/// is the exact PR 4 / PR 5 seam. Resolution is async so a store-backed source can await its
+/// scoped DB read. A live custom flow re-resolves the SAME table across submissions from the
+/// version id stamped on its row, so the journey it started under cannot change mid-flow even after
+/// the pin moves.
 pub trait CompiledJourneySource: Send + Sync {
     /// Resolve the compiled journey for a stamped `flow_version_id` (the pin a live flow carries),
     /// or [`None`] when it names no known version in this scope.
-    fn resolve(&self, scope: Scope, flow_version_id: &str) -> Option<Arc<CompiledJourney>>;
+    fn resolve<'a>(&'a self, scope: Scope, flow_version_id: &str) -> ResolveFuture<'a>;
 
     /// Resolve the CURRENT version for an author-facing `journey_id` at creation, returning the
     /// version id to PIN on the new flow row and the compiled table to drive it, or [`None`] when
-    /// the journey is unknown in this scope.
-    fn resolve_for_creation(
+    /// the journey is unknown (or unpinned) in this scope.
+    fn resolve_for_creation<'a>(
+        &'a self,
+        scope: Scope,
+        journey_id: &str,
+    ) -> ResolveForCreationFuture<'a>;
+}
+
+/// The production compiled-journey source (issue #92, PR 5): a [`Store`]-backed implementation of
+/// [`CompiledJourneySource`] that resolves a pinned journey through the RLS-scoped `flow_versions`
+/// registry and CACHES the compiled table keyed by `flow_version_id`. A version's artifact is
+/// immutable (append-only registry), so a compiled table keyed by its version id is a sound cache:
+/// compilation is a pure, load-time lowering, so caching it never observes a stale artifact.
+///
+/// The pinning guarantee flows from the version id: creation resolves the journey's PINNED version
+/// and stamps its id on the flow row; every later submission re-resolves the SAME version id (never
+/// the current pin), so a live flow keeps running the version it started under even after the pin
+/// moves to a newer version.
+pub struct FlowVersionJourneySource {
+    store: Store,
+    /// The compile cache, keyed by (tenant, environment, version id) -> its compiled table. The
+    /// key includes the SCOPE so a cache hit can never serve one environment's compiled table for
+    /// another's lookup: the scope-forced `get_by_id` returns None for a cross-scope id, and this
+    /// key preserves that isolation on a hit (a `flv_` id embeds scope + entropy, so a collision is
+    /// already unreachable, but the key is scope-safe by construction). Guarded by a plain mutex;
+    /// the lock is held only for the brief sync get / insert, never across the store read or
+    /// compilation.
+    cache: Mutex<HashMap<String, Arc<CompiledJourney>>>,
+}
+
+impl FlowVersionJourneySource {
+    /// Build a store-backed source over `store` (a cheap handle clone sharing the pool). The
+    /// compile cache starts empty and fills lazily on first resolution of each version.
+    #[must_use]
+    pub fn new(store: Store) -> Self {
+        Self {
+            store,
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The compiled table for `flow_version_id` in `scope`: a cache hit, or a scoped read of the
+    /// stored artifact compiled once and cached. [`None`] when the version is absent in scope or
+    /// its stored artifact does not compile (a corrupt row; a uniform not-found, never an oracle).
+    async fn resolve_version(
+        &self,
+        scope: Scope,
+        flow_version_id: &str,
+    ) -> Option<Arc<CompiledJourney>> {
+        if let Some(hit) = self.cached(scope, flow_version_id) {
+            return Some(hit);
+        }
+        let record = self
+            .store
+            .scoped(scope)
+            .flow_versions()
+            .get_by_id(flow_version_id)
+            .await
+            .ok()??;
+        let compiled = Arc::new(compile_stored_artifact(&record.artifact_json)?);
+        self.insert(scope, flow_version_id, &compiled);
+        Some(compiled)
+    }
+
+    /// The pinned version id and compiled table for an author-facing `journey_id` in `scope`, or
+    /// [`None`] when the journey has no pin (an unknown or unpinned journey names no creatable
+    /// custom flow). Reuses the compile cache keyed by the (scope, resolved version id).
+    async fn resolve_pinned(
         &self,
         scope: Scope,
         journey_id: &str,
-    ) -> Option<(String, Arc<CompiledJourney>)>;
+    ) -> Option<(String, Arc<CompiledJourney>)> {
+        let record = self
+            .store
+            .scoped(scope)
+            .flow_versions()
+            .get_pinned(journey_id)
+            .await
+            .ok()??;
+        let version_id = record.id;
+        if let Some(hit) = self.cached(scope, &version_id) {
+            return Some((version_id, hit));
+        }
+        let compiled = Arc::new(compile_stored_artifact(&record.artifact_json)?);
+        self.insert(scope, &version_id, &compiled);
+        Some((version_id, compiled))
+    }
+
+    /// The scope-safe cache key: (tenant, environment, version id), so a lookup in one scope can
+    /// never hit an entry cached for another.
+    fn cache_key(scope: Scope, flow_version_id: &str) -> String {
+        format!(
+            "{}:{}:{}",
+            scope.tenant(),
+            scope.environment(),
+            flow_version_id
+        )
+    }
+
+    /// A cache hit for `(scope, flow_version_id)`, holding the lock only for the sync lookup.
+    fn cached(&self, scope: Scope, flow_version_id: &str) -> Option<Arc<CompiledJourney>> {
+        let key = Self::cache_key(scope, flow_version_id);
+        let cache = self.cache.lock().expect("compile cache mutex not poisoned");
+        cache.get(&key).cloned()
+    }
+
+    /// Insert a compiled table into the cache under the scope-safe key, holding the lock only for
+    /// the sync insert.
+    fn insert(&self, scope: Scope, flow_version_id: &str, compiled: &Arc<CompiledJourney>) {
+        let key = Self::cache_key(scope, flow_version_id);
+        let mut cache = self.cache.lock().expect("compile cache mutex not poisoned");
+        cache.insert(key, compiled.clone());
+    }
+}
+
+impl CompiledJourneySource for FlowVersionJourneySource {
+    fn resolve<'a>(&'a self, scope: Scope, flow_version_id: &str) -> ResolveFuture<'a> {
+        let id = flow_version_id.to_owned();
+        Box::pin(async move { self.resolve_version(scope, &id).await })
+    }
+
+    fn resolve_for_creation<'a>(
+        &'a self,
+        scope: Scope,
+        journey_id: &str,
+    ) -> ResolveForCreationFuture<'a> {
+        let journey = journey_id.to_owned();
+        Box::pin(async move { self.resolve_pinned(scope, &journey).await })
+    }
+}
+
+/// Compile a stored journey artifact into a table (issue #92, PR 5). A stored artifact is
+/// LOAD-VALID by construction (the store validated it on write), so this never fails on a real
+/// row; [`None`] means a corrupt or forward-versioned row, treated as a uniform not-found rather
+/// than an oracle. Compilation is pure, so a cached result is safe.
+fn compile_stored_artifact(artifact_json: &str) -> Option<CompiledJourney> {
+    let journey: ironauth_journey::Journey = serde_json::from_str(artifact_json).ok()?;
+    ironauth_journey::compile(&journey).ok()
 }
 
 /// A test-only, in-memory compiled-journey source (issue #92, PR 4): the AC1 fixture compiled
@@ -105,18 +254,24 @@ impl EmbeddedJourneySource {
 
 #[cfg(any(test, feature = "testing"))]
 impl CompiledJourneySource for EmbeddedJourneySource {
-    fn resolve(&self, _scope: Scope, flow_version_id: &str) -> Option<Arc<CompiledJourney>> {
-        self.by_version.get(flow_version_id).cloned()
+    fn resolve<'a>(&'a self, _scope: Scope, flow_version_id: &str) -> ResolveFuture<'a> {
+        // The lookup is sync (an in-memory map); the source resolves immediately with a
+        // ready future so the engine wiring is identical to the store-backed source.
+        let result = self.by_version.get(flow_version_id).cloned();
+        Box::pin(async move { result })
     }
 
-    fn resolve_for_creation(
-        &self,
+    fn resolve_for_creation<'a>(
+        &'a self,
         _scope: Scope,
         journey_id: &str,
-    ) -> Option<(String, Arc<CompiledJourney>)> {
-        let version = self.by_journey.get(journey_id)?;
-        let compiled = self.by_version.get(version)?.clone();
-        Some((version.clone(), compiled))
+    ) -> ResolveForCreationFuture<'a> {
+        let result = self.by_journey.get(journey_id).and_then(|version| {
+            self.by_version
+                .get(version)
+                .map(|compiled| (version.clone(), compiled.clone()))
+        });
+        Box::pin(async move { result })
     }
 }
 
@@ -164,6 +319,7 @@ pub(super) async fn create_custom_flow(
     let source = state.custom_journey_source().ok_or(FlowError::NotFound)?;
     let (flow_version_id, compiled) = source
         .resolve_for_creation(scope, journey_id)
+        .await
         .ok_or(FlowError::NotFound)?;
 
     // A present resume target is validated the SAME way the built-in creation path validates it:
@@ -277,6 +433,7 @@ pub(super) async fn drive_custom(
     let source = state.custom_journey_source().ok_or(FlowError::NotFound)?;
     let compiled = source
         .resolve(scope, flow_version_id)
+        .await
         .ok_or(FlowError::NotFound)?;
 
     let current_step_id = persisted

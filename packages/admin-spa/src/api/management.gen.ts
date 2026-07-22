@@ -643,6 +643,71 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/journeys/{journey_id}/versions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List every version of a custom journey (ascending by version). */
+        get: operations["listFlowVersions"];
+        put?: never;
+        /**
+         * Create a new version of a custom journey.
+         * @description This is a POST, not a PUT: it APPENDS a new immutable version (a server-assigned monotonic
+         *     version number), so it is NOT a PUT-to-a-fixed-resource upsert. Per the codebase convention it
+         *     REQUIRES an `Idempotency-Key`, wired through the shared idempotency path: a retry with the same
+         *     key REPLAYS the stored response (the SAME version number), so a client or network retry never
+         *     silently appends a duplicate version. A key reused with a different body is a 422.
+         */
+        post: operations["createFlowVersion"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/journeys/{journey_id}/versions/{version}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get one version of a custom journey by its version number. */
+        get: operations["getFlowVersion"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/journeys/{journey_id}/versions/{version}/pin": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Pin a version of a custom journey as the active version (the version a fresh custom flow is
+         *     created against).
+         * @description A mutating POST, so per the codebase convention it REQUIRES an `Idempotency-Key`: a retry with
+         *     the same key REPLAYS the stored response without re-writing the pin (and pinning is naturally
+         *     idempotent on the target version anyway).
+         */
+        post: operations["pinFlowVersion"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/keys": {
         parameters: {
             query?: never;
@@ -1739,6 +1804,20 @@ export interface components {
              */
             region?: string | null;
         };
+        /**
+         * @description The body to create a new version of a custom journey (issue #92, PR 5).
+         *
+         *     The `artifact` is the canonical journey document. It is validated LOAD-VALID before the write
+         *     (it must parse and COMPILE: known step kinds and node groups, no dangling or ambiguous
+         *     transition, no unreachable step or dead end, and a reachable completion); a load-invalid
+         *     artifact is a loud 400 naming the offending location and nothing is stored. A journey artifact
+         *     carries no secret and no PII (a predicate references trait pointers and group / scope names,
+         *     never values).
+         */
+        CreateFlowVersionRequest: {
+            /** @description The canonical journey artifact (a JSON document). */
+            artifact: unknown;
+        };
         /** @description The body to mint a DCR initial access token (RFC 7591, issue #31). */
         CreateInitialAccessTokenRequest: {
             /**
@@ -2097,6 +2176,25 @@ export interface components {
             traces: components["schemas"]["PolicyTraceView"][];
             /** @description The transport it was created on. */
             transport: string;
+        };
+        /** @description A custom-journey version, as returned by the management API (issue #92, PR 5). */
+        FlowVersionView: {
+            /** @description The canonical journey artifact (a JSON document). */
+            artifact: unknown;
+            /** @description The `flv_` version id (embeds its scope). */
+            id: string;
+            /** @description The author-facing journey id this version belongs to. */
+            journey_id: string;
+            /**
+             * @description Whether this version is the journey's active pin (the version a fresh custom flow is created
+             *     against).
+             */
+            pinned: boolean;
+            /**
+             * Format: int32
+             * @description The per-scope, per-journey monotonic version number.
+             */
+            version: number;
         };
         /**
          * @description The typed guardrails an environment enforces (issue #42), derived purely from
@@ -6618,6 +6716,272 @@ export interface operations {
                 };
             };
             /** @description Not found (absent, not pending, or in another scope) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Idempotency-Key reused with a different request */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listFlowVersions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The author-facing journey identifier */
+                journey_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The journey's versions */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FlowVersionView"][];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Malformed journey id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    createFlowVersion: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Required. Replaying a POST with the same key returns the original response (the same version) without appending a duplicate. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The author-facing journey identifier */
+                journey_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateFlowVersionRequest"];
+            };
+        };
+        responses: {
+            /** @description The created version */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FlowVersionView"];
+                };
+            };
+            /** @description A load-invalid journey artifact */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Environment not found or malformed journey id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description A concurrent create took the next version; retry */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Idempotency-Key reused with a different request */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    getFlowVersion: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The author-facing journey identifier */
+                journey_id: string;
+                /** @description The version number */
+                version: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The version */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FlowVersionView"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found (absent or in another scope) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    pinFlowVersion: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Required. Replaying a POST with the same key returns the original response without re-executing. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The author-facing journey identifier */
+                journey_id: string;
+                /** @description The version number to pin */
+                version: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The now-pinned version */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FlowVersionView"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The version does not exist in this scope */
             404: {
                 headers: {
                     [name: string]: unknown;

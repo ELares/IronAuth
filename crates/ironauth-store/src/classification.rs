@@ -192,13 +192,19 @@ pub enum ResourceType {
     /// paths as RFC 6901 pointers plus a narrowing-only rule set: all non-secret per-environment
     /// config a config snapshot carries and a promotion replays, so it is Promotable.
     SignupForm,
+    /// A per-environment custom-journey version (issue #92, PR 5): one immutable version of a
+    /// declarative journey artifact in a (tenant, environment) registry, plus its active pin. The
+    /// whole canonical artifact is non-secret per-environment config (a predicate references trait
+    /// pointers and group / scope names, never values): a config snapshot carries it and a
+    /// promotion replays it, so it is Promotable.
+    FlowVersion,
 }
 
 impl ResourceType {
     /// Every resource type, in a stable order. The classification lint and the
     /// metadata endpoint both iterate this; a variant missing here is caught by
     /// the `all_lists_every_variant` test and by `scripts/classification-lint.sh`.
-    pub const ALL: [ResourceType; 27] = [
+    pub const ALL: [ResourceType; 28] = [
         ResourceType::Operator,
         ResourceType::Tenant,
         ResourceType::Environment,
@@ -226,6 +232,7 @@ impl ResourceType {
         ResourceType::Brand,
         ResourceType::LocaleBundle,
         ResourceType::SignupForm,
+        ResourceType::FlowVersion,
     ];
 
     /// The stable wire name of this resource type (for example `organization`).
@@ -259,6 +266,7 @@ impl ResourceType {
             ResourceType::Brand => "brand",
             ResourceType::LocaleBundle => "locale_bundle",
             ResourceType::SignupForm => "signup_form",
+            ResourceType::FlowVersion => "flow_version",
         }
     }
 
@@ -293,7 +301,8 @@ impl ResourceType {
             | ResourceType::Flow
             | ResourceType::Brand
             | ResourceType::LocaleBundle
-            | ResourceType::SignupForm => ResourceLevel::Environment,
+            | ResourceType::SignupForm
+            | ResourceType::FlowVersion => ResourceLevel::Environment,
         }
     }
 
@@ -348,6 +357,11 @@ pub fn classify(resource: ResourceType) -> ResourceClassification {
         // per-environment config: its field list references trait paths as RFC 6901
         // pointers plus a narrowing-only rule set, exactly the "static configuration" a
         // config snapshot carries and a promotion replays.
+        // A per-environment custom-journey version (issue #92, PR 5) is non-secret
+        // per-environment config: the whole canonical journey artifact (its topology,
+        // node-group references, and predicate guards that name trait pointers and
+        // group / scope names, never values) plus its active pin travel in a snapshot,
+        // exactly the "static configuration" the promotion story moves.
         ResourceType::Client
         | ResourceType::ResourceServer
         | ResourceType::DcrPolicy
@@ -358,7 +372,8 @@ pub fn classify(resource: ResourceType) -> ResourceClassification {
         | ResourceType::UpstreamTokenGrant
         | ResourceType::Brand
         | ResourceType::LocaleBundle
-        | ResourceType::SignupForm => Promotable,
+        | ResourceType::SignupForm
+        | ResourceType::FlowVersion => Promotable,
 
         // Environment-intrinsic identity, excluded from every snapshot so a
         // promotion never copies one environment's identity onto another: the

@@ -53,6 +53,7 @@ mod diagnostics;
 mod environments;
 mod error;
 mod export;
+mod flow_versions;
 mod hash;
 mod idempotency;
 mod input;
@@ -344,6 +345,22 @@ pub fn management_router(state: AdminState) -> Router {
             put(signup_forms::set_signup_form)
                 .get(signup_forms::get_signup_form)
                 .delete(signup_forms::delete_signup_form),
+        )
+        // Per-environment custom-journey versions (issue #92, PR 5): create a new immutable version
+        // (POST, append-only, Idempotency-Key required) and list a journey's versions.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/journeys/{journey_id}/versions",
+            post(flow_versions::create_flow_version).get(flow_versions::list_flow_versions),
+        )
+        // Get one version of a custom journey by its version number.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/journeys/{journey_id}/versions/{version}",
+            get(flow_versions::get_flow_version),
+        )
+        // Pin a version of a custom journey as the active version a fresh custom flow runs against.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/journeys/{journey_id}/versions/{version}/pin",
+            post(flow_versions::pin_flow_version),
         )
         // Per-environment, per-client admin consent pre-authorizations (issue #88, PR 4): set
         // (create or overwrite), get, and delete (revoke) the scope an admin pre-authorized for a

@@ -53,9 +53,11 @@ pub use golden::{GoldenFlow, golden_corpus, golden_flows};
 pub use localize::{
     LanguageTag, LocaleBundle, ResolvedLocale, TextDirection, localize, resolve_locale,
 };
-pub use orchestration::CompiledJourneySource;
 #[cfg(any(test, feature = "testing"))]
 pub use orchestration::EmbeddedJourneySource;
+pub use orchestration::{
+    CompiledJourneySource, FlowVersionJourneySource, ResolveForCreationFuture, ResolveFuture,
+};
 pub use schema::{flow_messages_snapshot, flow_object_schema};
 pub use transport::{
     FLOW_API_SUBMIT_PATH, FLOW_BRAND_ASSET_PATH, FLOW_BROWSER_PATH, FLOW_CREATE_API_PATH,

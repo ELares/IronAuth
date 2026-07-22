@@ -82,7 +82,7 @@ pub const CONNECTOR_CLIENT_SECRET_REFERENCE: &str = "connector_client_secret";
 /// (and by the export), and an environment-identity or runtime type can never be
 /// added without failing it. This is the live binding between the snapshot and the
 /// single source of truth, not a hand-maintained parallel list.
-pub const SNAPSHOT_RESOURCE_TYPES: [ResourceType; 11] = [
+pub const SNAPSHOT_RESOURCE_TYPES: [ResourceType; 12] = [
     ResourceType::Client,
     ResourceType::ResourceServer,
     ResourceType::DcrPolicy,
@@ -94,6 +94,7 @@ pub const SNAPSHOT_RESOURCE_TYPES: [ResourceType; 11] = [
     ResourceType::Brand,
     ResourceType::LocaleBundle,
     ResourceType::SignupForm,
+    ResourceType::FlowVersion,
 ];
 
 /// A named reference to a secret in the environment-scoped secret store (issue
@@ -401,6 +402,28 @@ pub struct SignupFormSnapshot {
     pub fields: serde_json::Value,
 }
 
+/// The secret-free projection of one per-environment custom-journey version (issue #92, PR 5). A
+/// flow version is NON-secret promotable config: the journey id and version it identifies, the
+/// whole canonical journey artifact (embedded as parsed JSON so it canonicalizes recursively), and
+/// whether it is its journey's active pin. No secret and no PII: a journey artifact's predicates
+/// reference trait POINTERS and group / scope NAMES, never values. The version's actor and
+/// timestamps are NOT projected (they are per-environment provenance, never promoted).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlowVersionSnapshot {
+    /// The author-facing journey id this version belongs to. Part of the stable natural key the
+    /// export orders by (journey id then version).
+    pub journey_id: String,
+    /// The per-scope, per-journey_id version number. Part of the stable natural key.
+    pub version: i32,
+    /// The canonical journey artifact (a JSON object), embedded as parsed JSON so it canonicalizes
+    /// recursively. Validated LOAD-VALID on import ([`validate_document`]): a snapshotted journey
+    /// must parse and compile, so a promotion never carries a broken journey.
+    pub artifact: serde_json::Value,
+    /// Whether this version is its journey's active pin in the environment. At most one version per
+    /// journey carries `true`; a promotion replays the pin as authored.
+    pub pinned: bool,
+}
+
 /// The promotable resources a snapshot carries, keyed by resource-type wire name
 /// (issue #41 classification). Each array is ordered by its type's stable natural
 /// key, so the collection order is deterministic and documented.
@@ -452,6 +475,12 @@ pub struct SnapshotResources {
     /// rules); no secret and no PII travels (issue #87).
     #[serde(default)]
     pub signup_form: Vec<SignupFormSnapshot>,
+    /// The environment's custom-journey versions (`flow_version`). Each is secret-free config (a
+    /// journey id, a version, the whole canonical journey artifact, and the active-pin flag); a
+    /// journey artifact references trait pointers and group / scope names, never values, so no
+    /// secret and no PII travels (issue #92, PR 5).
+    #[serde(default)]
+    pub flow_version: Vec<FlowVersionSnapshot>,
 }
 
 /// A canonical, deterministic, secret-free snapshot of one environment's
@@ -846,6 +875,27 @@ pub async fn export(scoped: &ScopedStore<'_>) -> Result<Snapshot, StoreError> {
     }
     signup_form.sort_by(|a, b| a.client_id.cmp(&b.client_id));
 
+    // Custom-journey versions (issue #92, PR 5): non-secret promotable config. The whole canonical
+    // journey ARTIFACT is embedded as PARSED JSON so it canonicalizes recursively (a decode fault
+    // here is a real persistence corruption, surfaced rather than swallowed; a stored artifact is
+    // load-valid by construction). The version's actor and timestamps are NOT projected (per-env
+    // provenance). No secret and no PII travels (a predicate references pointers and names, never
+    // values). Ordered by the stable (journey_id, version) natural key.
+    let mut flow_version = Vec::new();
+    for record in scoped.flow_versions().list_all().await? {
+        let artifact: serde_json::Value =
+            serde_json::from_str(&record.artifact_json).map_err(serde_fault)?;
+        flow_version.push(FlowVersionSnapshot {
+            journey_id: record.journey_id,
+            version: record.version,
+            artifact,
+            pinned: record.pinned,
+        });
+    }
+    flow_version.sort_by(|a, b| {
+        (a.journey_id.as_str(), a.version).cmp(&(b.journey_id.as_str(), b.version))
+    });
+
     Ok(Snapshot {
         schema_version: SNAPSHOT_SCHEMA_VERSION.to_string(),
         resources: SnapshotResources {
@@ -860,6 +910,7 @@ pub async fn export(scoped: &ScopedStore<'_>) -> Result<Snapshot, StoreError> {
             brand,
             locale_bundle,
             signup_form,
+            flow_version,
         },
     })
 }
@@ -1039,6 +1090,11 @@ const LOCALE_BUNDLE_KEYS: [&str; 3] = ["locale", "is_env_default", "entries"];
 /// form holds no secret material and no PII (only trait pointers, bounded rules, and numeric
 /// ids). The published schema pins `additionalProperties: false`.
 const SIGNUP_FORM_KEYS: [&str; 2] = ["client_id", "fields"];
+
+/// Every key a snapshot `flow_version` element may carry (issue #92, PR 5). No secret slot: a
+/// journey artifact holds no secret and no PII (a predicate references trait pointers and group /
+/// scope names, never values). The published schema pins `additionalProperties: false`.
+const FLOW_VERSION_KEYS: [&str; 4] = ["journey_id", "version", "artifact", "pinned"];
 
 /// Every key a snapshot `connector` element may carry, besides the secret REFERENCE
 /// slot (issue #75). The published schema pins `additionalProperties: false`.
@@ -1434,6 +1490,59 @@ fn validate_resource(
                 )),
             }
         }
+        ResourceType::FlowVersion => {
+            // A flow version is secret-free config (issue #92, PR 5): a journey id, a version, the
+            // whole canonical journey artifact (a JSON object), and the active-pin flag. The
+            // forbidden-secret-key scan above already blocks secret-shaped material; a journey
+            // artifact references trait pointers and group / scope names, never values.
+            reject_unknown_keys(object, &FLOW_VERSION_KEYS, None, path, violations);
+            require_nonempty_string(object, "journey_id", path, violations);
+            match object.get("version") {
+                Some(value) if value.is_i64() || value.is_u64() => {}
+                Some(_) => violations.push(SnapshotViolation::new(
+                    format!("{path}/version"),
+                    "must be an integer",
+                )),
+                None => violations.push(SnapshotViolation::new(
+                    format!("{path}/version"),
+                    "missing required integer field",
+                )),
+            }
+            // The pin flag is a bool; export always emits a real bool, so a genuine round trip
+            // never trips this (a hand-authored document that supplies a non-bool is a fault).
+            if let Some(value) = object.get("pinned") {
+                if !value.is_boolean() {
+                    violations.push(SnapshotViolation::new(
+                        format!("{path}/pinned"),
+                        "must be a boolean",
+                    ));
+                }
+            }
+            // The artifact must be a JSON object that is a LOAD-VALID journey: a snapshotted
+            // journey must parse AND compile, so a promotion never carries a broken journey. The
+            // check reuses the SAME load-time gate the store applies on write (issue #92, PR 5).
+            match object.get("artifact") {
+                Some(artifact @ serde_json::Value::Object(_)) => {
+                    let load_valid = serde_json::to_string(artifact).ok().is_some_and(|text| {
+                        crate::flow_version::validate_artifact_json(&text).is_ok()
+                    });
+                    if !load_valid {
+                        violations.push(SnapshotViolation::new(
+                            format!("{path}/artifact"),
+                            "artifact is not a load-valid journey (it must parse and compile)",
+                        ));
+                    }
+                }
+                Some(_) => violations.push(SnapshotViolation::new(
+                    format!("{path}/artifact"),
+                    "must be a JSON object",
+                )),
+                None => violations.push(SnapshotViolation::new(
+                    format!("{path}/artifact"),
+                    "missing required object field",
+                )),
+            }
+        }
         // Only the promotable set is ever passed here (the caller iterates
         // SNAPSHOT_RESOURCE_TYPES); a non-promotable type is a programmer error, not
         // a document fault, so it is reported at the element path.
@@ -1702,9 +1811,9 @@ pub fn classification_coverage_gaps() -> (Vec<ResourceType>, Vec<ResourceType>) 
 #[cfg(test)]
 mod tests {
     use super::{
-        PRIVATE_JWK_PARAMS, SNAPSHOT_RESOURCE_TYPES, SNAPSHOT_SCHEMA_VERSION, SignupFormSnapshot,
-        Snapshot, SnapshotResources, classification_coverage_gaps, project_jwks_public,
-        validate_document,
+        FlowVersionSnapshot, PRIVATE_JWK_PARAMS, SNAPSHOT_RESOURCE_TYPES, SNAPSHOT_SCHEMA_VERSION,
+        SignupFormSnapshot, Snapshot, SnapshotResources, classification_coverage_gaps,
+        project_jwks_public, validate_document,
     };
     use crate::classification::{ResourceClassification, ResourceType, classify};
 
@@ -1758,9 +1867,10 @@ mod tests {
         assert_eq!(
             text,
             "{\"resources\":{\"brand\":[],\"client\":[],\"connector\":[],\"dcr_policy\":[],\
-             \"locale_bundle\":[],\"org_connection\":[],\"resource_server\":[],\
-             \"routing_rule\":[],\"signup_form\":[],\"upstream_token_grant\":[],\
-             \"variable\":[]},\"schema_version\":\"ironauth.config-snapshot/v1\"}"
+             \"flow_version\":[],\"locale_bundle\":[],\"org_connection\":[],\
+             \"resource_server\":[],\"routing_rule\":[],\"signup_form\":[],\
+             \"upstream_token_grant\":[],\"variable\":[]},\
+             \"schema_version\":\"ironauth.config-snapshot/v1\"}"
         );
     }
 
@@ -1796,6 +1906,89 @@ mod tests {
             "a signup form must round-trip losslessly"
         );
         assert_eq!(parsed.resources.signup_form, snapshot.resources.signup_form);
+    }
+
+    /// A minimal load-valid journey artifact (an identifier/password step to a terminal), the
+    /// fixture the flow-version round-trip and rejection tests build on.
+    fn valid_journey_artifact() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": "ironauth.journey/v1",
+            "id": "login_basic",
+            "engine_version": 1,
+            "entry": "primary",
+            "steps": [
+                {"id": "primary", "kind": "identifier_password", "node_group": "password"},
+                {"id": "done", "kind": "terminal"}
+            ],
+            "transitions": [
+                {"from": "primary", "to": "done"}
+            ]
+        })
+    }
+
+    #[test]
+    fn a_flow_version_survives_export_validate_round_trip_byte_identically() {
+        // issue #92, PR 5: a FlowVersion in a snapshot validates (its artifact is a load-valid
+        // journey) and canonicalizes losslessly, so a promotion carries the artifact and its pin
+        // byte-for-byte.
+        let mut resources = SnapshotResources::default();
+        resources.flow_version.push(FlowVersionSnapshot {
+            journey_id: "login_basic".to_string(),
+            version: 2,
+            artifact: valid_journey_artifact(),
+            pinned: true,
+        });
+        let snapshot = Snapshot {
+            schema_version: SNAPSHOT_SCHEMA_VERSION.to_string(),
+            resources,
+        };
+        let canonical = snapshot.to_canonical_string().expect("canonicalize");
+        let parsed = validate_document(canonical.as_bytes()).expect("valid flow version");
+        assert_eq!(
+            canonical,
+            parsed.to_canonical_string().expect("reserialize"),
+            "a flow version must round-trip losslessly"
+        );
+        assert_eq!(
+            parsed.resources.flow_version,
+            snapshot.resources.flow_version
+        );
+    }
+
+    #[test]
+    fn a_flow_version_with_a_load_invalid_artifact_is_rejected() {
+        // A snapshotted journey whose artifact does not compile (a transition to an undeclared
+        // step) is a document fault, caught at its artifact path: a promotion never carries a
+        // broken journey.
+        let mut resources = SnapshotResources::default();
+        resources.flow_version.push(FlowVersionSnapshot {
+            journey_id: "broken".to_string(),
+            version: 1,
+            artifact: serde_json::json!({
+                "schema_version": "ironauth.journey/v1",
+                "id": "broken",
+                "engine_version": 1,
+                "entry": "primary",
+                "steps": [
+                    {"id": "primary", "kind": "identifier_password", "node_group": "password"},
+                    {"id": "done", "kind": "terminal"}
+                ],
+                "transitions": [{"from": "primary", "to": "nowhere"}]
+            }),
+            pinned: false,
+        });
+        let snapshot = Snapshot {
+            schema_version: SNAPSHOT_SCHEMA_VERSION.to_string(),
+            resources,
+        };
+        let canonical = snapshot.to_canonical_string().expect("canonicalize");
+        let violations = validate_document(canonical.as_bytes()).expect_err("rejected");
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.path == "/resources/flow_version/0/artifact"),
+            "a load-invalid journey artifact must be rejected with its path: {violations:?}"
+        );
     }
 
     #[test]

@@ -55,6 +55,7 @@ fn operation_ids_are_the_stable_set() {
             "createDcrInitialAccessToken",
             "createDcrPolicy",
             "createEnvironment",
+            "createFlowVersion",
             "createInvitation",
             "createManagementKey",
             "createOrganization",
@@ -84,6 +85,7 @@ fn operation_ids_are_the_stable_set() {
             "getDiagnosticsWarnings",
             "getEnvironment",
             "getFlowObservation",
+            "getFlowVersion",
             "getInvitation",
             "getLocale",
             "getManagementKey",
@@ -104,6 +106,7 @@ fn operation_ids_are_the_stable_set() {
             "listConnectors",
             "listDcrPolicies",
             "listEnvironments",
+            "listFlowVersions",
             "listInvitations",
             "listManagementKeys",
             "listMigrationRunViolations",
@@ -118,6 +121,7 @@ fn operation_ids_are_the_stable_set() {
             "listTenants",
             "listUserConsents",
             "listUsers",
+            "pinFlowVersion",
             "planConfigPromotion",
             "postFlowDryRun",
             "probePasswordHashing",
@@ -205,6 +209,8 @@ fn every_post_documents_the_idempotency_key_header() {
         "createDcrPolicy",
         "createDcrInitialAccessToken",
         "createConnector",
+        "createFlowVersion",
+        "pinFlowVersion",
         "verifyDcrClient",
         "revokeSession",
         "bulkRevokeSessions",
@@ -297,6 +303,8 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/export",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/invitations",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/invitations/{invitation_id}",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/journeys/{journey_id}/versions",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/journeys/{journey_id}/versions/{version}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/keys",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/keys/{key_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/locales/{locale}",
@@ -332,6 +340,8 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/invitations",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/invitations/{invitation_id}/resend",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/invitations/{invitation_id}/revoke",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/journeys/{journey_id}/versions",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/journeys/{journey_id}/versions/{version}/pin",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/keys",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/migration/verify-credential",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations",
@@ -395,7 +405,11 @@ fn committed_artifact_matches_generated_spec() {
 async fn served_routes_match_documented_routes() {
     let router = db_free_router();
     let documented = documented_method_paths();
-    assert_eq!(documented.len(), 96, "the documented route count is pinned");
+    assert_eq!(
+        documented.len(),
+        100,
+        "the documented route count is pinned"
+    );
 
     // The OUTBOUND lazy-migration endpoint (issue #58) is the one documented route
     // that is NOT gated by the management `Principal` at 401. It is DISABLED BY

@@ -16,6 +16,13 @@ autotests = false
 
 [dependencies]
 ironauth-env.workspace = true
+# The pure, database-free journey artifact library (issue #92): the store validates a
+# flow_versions artifact on write (only a load-valid journey is persisted) and the
+# config-snapshot import validates a snapshotted journey artifact, both through
+# ironauth_journey::validate / compile. A path edge to an in-tree crate ironauth-oidc
+# already depends on, so no new external crate and cargo-deny is unchanged; the crate
+# is pure (serde only) so it adds no cycle and keeps MSRV 1.85 and the musl lane clean.
+ironauth-journey.workspace = true
 # Per-tenant envelope encryption for PII and secrets at rest (issue #48). The
 # AEAD envelope primitive (a standard ring::aead AES-256-GCM DEK/KEK scheme) lives
 # in ironauth-jose because the workspace lets exactly ONE crate name `ring`
@@ -136,6 +143,15 @@ required-features = ["testing"]
 [[test]]
 name = "client_admin_grants"
 path = "tests/client_admin_grants.rs"
+required-features = ["testing"]
+
+# Custom-journey version registry (issue #92, PR 5): append-only versioning, control-plane
+# authoring / data-plane read grant split, pinning (get_pinned resolves and the pin moves),
+# fail-fast load-valid write validation, the promotable snapshot round-trip, and cross-scope
+# isolation, against a real database.
+[[test]]
+name = "flow_versions"
+path = "tests/flow_versions.rs"
 required-features = ["testing"]
 
 # Enterprise inbound routing (issue #77): org connections and routing rules over a real

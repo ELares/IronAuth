@@ -19,6 +19,12 @@ ironauth-env.workspace = true
 ironauth-config.workspace = true
 ironauth-connector.workspace = true
 ironauth-store.workspace = true
+# The pure journey artifact library (issue #92): the flow-versions admin surface
+# validates a submitted journey artifact (load-time validate + compile) before the
+# store write, so a load-invalid journey is a precise 400 naming the offending
+# location. A path edge to an in-tree crate already in the graph; no new external
+# crate, cargo-deny unchanged, MSRV 1.85 and the musl lane hold.
+ironauth-journey.workspace = true
 # The DCR abuse controls (issue #31) mint initial access tokens carrying named,
 # reusable policy chains. The policy-primitive type and its parse/serialize helpers
 # are owned by the OIDC policy engine, so the management API reuses them to validate
@@ -108,6 +114,15 @@ required-features = ["testing"]
 [[test]]
 name = "signup_forms"
 path = "tests/signup_forms.rs"
+required-features = ["testing"]
+
+# Per-environment custom-journey version management endpoint (issue #92, PR 5): the POST
+# append-only create idempotent on the Idempotency-Key (a retry returns the same version, a
+# reused key with a different body is 422), the load-valid write validation (a precise 400), and
+# the idempotent pin. Needs a real database.
+[[test]]
+name = "flow_versions"
+path = "tests/flow_versions.rs"
 required-features = ["testing"]
 
 # Config snapshot export endpoint (issue #43): the operator and the environment's

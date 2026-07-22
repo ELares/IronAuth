@@ -60,6 +60,7 @@ mod error;
 pub mod esv;
 pub mod federation_state;
 pub mod flow;
+pub mod flow_version;
 mod id;
 pub mod identifier;
 pub mod locale_bundle;
@@ -117,6 +118,10 @@ pub use esv::{
 };
 pub use federation_state::{ConsumedFederationLoginState, NewFederationLoginState};
 pub use flow::{FlowRecord, NewFlow};
+pub use flow_version::{
+    FlowVersionRecord, NewFlowVersion, validate_artifact as validate_journey_artifact,
+    validate_artifact_json as validate_journey_artifact_json,
+};
 pub use id::{
     AbuseBanId, AbuseBanKind, AccountLinkId, AccountLinkKind, AcmeChallengeId, AcmeChallengeKind,
     AdminSudoElevationId, AdminSudoElevationKind, AgentId, AgentKind, AssertionMappingId,
@@ -129,11 +134,12 @@ pub use id::{
     DcrPolicyId, DcrPolicyKind, DekId, DekKind, DeviceCodeId, DeviceCodeKind, EmailOtpCodeId,
     EmailOtpCodeKind, EncryptedSecretId, EncryptedSecretKind, EnvironmentId, EnvironmentKind,
     EnvironmentSecretId, EnvironmentSecretKind, ExternalIssuerId, ExternalIssuerKind, FedcmNonceId,
-    FedcmNonceKind, FederationLoginStateId, FederationLoginStateKind, FlowId, FlowKind, GrantId,
-    GrantKind, HumanId, HumanKind, IdParseError, InitialAccessTokenId, InitialAccessTokenKind,
-    InvitationId, InvitationKind, IssuedTokenId, IssuedTokenKind, KekId, KekKind, LevelId,
-    LevelKind, LocaleBundleId, LocaleBundleKind, MagicLinkTokenId, MagicLinkTokenKind,
-    ManagementKeyId, ManagementKeyKind, MigrationRunId, MigrationRunKind, MigrationRunRecordId,
+    FedcmNonceKind, FederationLoginStateId, FederationLoginStateKind, FlowId, FlowKind,
+    FlowVersionId, FlowVersionKind, FlowVersionPinId, FlowVersionPinKind, GrantId, GrantKind,
+    HumanId, HumanKind, IdParseError, InitialAccessTokenId, InitialAccessTokenKind, InvitationId,
+    InvitationKind, IssuedTokenId, IssuedTokenKind, KekId, KekKind, LevelId, LevelKind,
+    LocaleBundleId, LocaleBundleKind, MagicLinkTokenId, MagicLinkTokenKind, ManagementKeyId,
+    ManagementKeyKind, MigrationRunId, MigrationRunKind, MigrationRunRecordId,
     MigrationRunRecordKind, NotInScope, OperatorId, OperatorKind, OrgConnectionId,
     OrgConnectionKind, OrganizationId, OrganizationKind, PowChallengeId, PowChallengeKind,
     PushedRequestId, PushedRequestKind, RecoveryApprovalId, RecoveryApprovalKind, RecoveryCodeId,
@@ -264,10 +270,11 @@ pub use signup_form::{
 };
 pub use sms_otp::{ActiveSmsOtpCode, NewSmsOtpCode, SmsRouteStat, SmsTenantConfig};
 pub use snapshot::{
-    CLIENT_SECRET_REFERENCE, ClientSnapshot, DcrPolicySnapshot, OrgConnectionSnapshot,
-    ResourceServerSnapshot, RoutingRuleSnapshot, SNAPSHOT_RESOURCE_TYPES, SNAPSHOT_SCHEMA_VERSION,
-    SecretRef, Snapshot, SnapshotResources, SnapshotViolation, UpstreamTokenGrantSnapshot,
-    VariableSnapshot, classification_coverage_gaps, export as export_snapshot, validate_document,
+    CLIENT_SECRET_REFERENCE, ClientSnapshot, DcrPolicySnapshot, FlowVersionSnapshot,
+    OrgConnectionSnapshot, ResourceServerSnapshot, RoutingRuleSnapshot, SNAPSHOT_RESOURCE_TYPES,
+    SNAPSHOT_SCHEMA_VERSION, SecretRef, Snapshot, SnapshotResources, SnapshotViolation,
+    UpstreamTokenGrantSnapshot, VariableSnapshot, classification_coverage_gaps,
+    export as export_snapshot, validate_document,
 };
 pub use store::Store;
 pub use trait_schema::{
