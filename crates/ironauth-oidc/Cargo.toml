@@ -252,6 +252,16 @@ name = "flow_register_flip"
 path = "tests/flow_register_flip.rs"
 required-features = ["testing"]
 
+# The byte-equivalence gate for the RECOVERY journey flip (issue #92, PR 8d): the embedded recovery
+# artifact driven through the compiled-table engine reproduces the imperative `drive_recovery`
+# render byte-for-byte (recovery_start + recovery_ack goldens on both transports), plus the
+# empty-identifier / wrong-code shape checks, the honest otp-amr completion, and the forged-custom-tag
+# fail-closed probe. Over a real database (DATABASE_URL).
+[[test]]
+name = "flow_recovery_flip"
+path = "tests/flow_recovery_flip.rs"
+required-features = ["testing"]
+
 # The read only flow inspector (issue #91, PR4): the OBSERVE projection of an existing
 # flow, and the ZERO SIDE EFFECT proof (a full database snapshot, byte identical before and
 # after a dry run) that neither observe nor a policy dry run writes any row. Over a real

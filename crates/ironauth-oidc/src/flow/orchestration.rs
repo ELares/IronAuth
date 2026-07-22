@@ -46,13 +46,13 @@ use ironauth_store::{FlowId, FlowRecord, NewFlow, Scope, Store, UserId};
 
 use super::builtin_artifacts::builtin_compiled;
 use super::eval_ctx::assemble_eval_context;
-use super::message::Message;
+use super::message::{self, Message};
 use super::model::{CONTRACT_VERSION, Flow, FlowStateTag, Journey, Node, Transport};
 use super::wire_identity::{render_override_states, wire_state_for};
 use super::{
     Continuation, FlowError, PersistedState, Submission, build_flow, consume_and_complete,
     generate_submit_token, login, login_follow_through, method_tokens, mfa,
-    normalize_transient_payload, persist_and_render, profiling, registration,
+    normalize_transient_payload, persist_and_render, profiling, recovery, registration,
 };
 use crate::authn::{AuthMethod, AuthenticationEvent};
 use crate::interaction;
@@ -302,6 +302,14 @@ enum StepOutcome {
     Advance {
         /// The boolean routing signals this executor emitted.
         signals: SignalSet,
+        /// An optional post-mint counter reset to thread to the terminal (issue #92, PR 8d): the
+        /// recovery verify executor carries the recovery-path abuse context here, so a genuine
+        /// completion relaxes the SAME counters the built-in `drive_recovery` does through
+        /// `reset_after_success`. [`None`] for every other Advance producer (login / mfa / profiling
+        /// / registration run no post-mint reset). Threaded pure in-memory (never persisted to
+        /// `flows.state`): the verify executor advances and the walk hits the terminal in the SAME
+        /// drive call, consuming the flow.
+        post_reset: Option<crate::abuse::AttemptContext>,
     },
 }
 
@@ -555,7 +563,12 @@ pub(super) async fn drive_via_table(
     // updates it on an advance.
     let mut scratch = persisted.clone();
 
-    let signals = match run_step_executor(
+    // The advancing executor yields the routing signals plus an optional post-mint counter reset to
+    // thread to the terminal (issue #92, PR 8d): recovery's verify carries its recovery-path abuse
+    // context here so a genuine mint relaxes the SAME counters. Pure in-memory: the flow is consumed
+    // in this same drive call, so the ctx is never persisted to `flows.state`. Every other executor
+    // yields None.
+    let (signals, post_reset) = match run_step_executor(
         state,
         scope,
         record,
@@ -587,7 +600,10 @@ pub(super) async fn drive_via_table(
             )
             .await;
         }
-        StepOutcome::Advance { signals } => signals,
+        StepOutcome::Advance {
+            signals,
+            post_reset,
+        } => (signals, post_reset),
     };
 
     // Walk the compiled transitions. Only a decision step continues the walk in-call; a render
@@ -603,9 +619,10 @@ pub(super) async fn drive_via_table(
                 // The pre-terminal step is the cursor (no state is persisted for the terminal), and
                 // it fixes the per-journey fenced re-render for the rare central-fence TOCTOU. The
                 // built-in fenced nodes reproduce the imperative driver's fence exactly; a custom
-                // journey's fence is empty. `post_reset` is None for login (only recovery, PR 8d,
-                // relaxes counters post-mint), so this stays byte-identical to the pre-8b mint for a
-                // custom journey.
+                // journey's fence is empty. `post_reset` is the ctx the advancing executor threaded
+                // (Some only for recovery's verify, PR 8d, which relaxes its counters post-mint;
+                // None for login / registration / a custom journey), so this stays byte-identical to
+                // the pre-8b mint for a custom journey.
                 let from_kind = compiled
                     .step(&cursor)
                     .map(|step| step.kind.clone())
@@ -623,7 +640,7 @@ pub(super) async fn drive_via_table(
                 .await;
                 let completion = CompletionKind::SessionMint {
                     fenced_nodes,
-                    post_reset: None,
+                    post_reset,
                 };
                 return complete_via_table(
                     state, scope, flow_id, transport, journey, record, &scratch, completion,
@@ -665,15 +682,40 @@ pub(super) async fn drive_via_table(
                 )
                 .await;
             }
-            // The mint-family kinds (issue #92) are BUILT-IN-ONLY and not wired to their render-into
-            // executors until the per-journey convergence PRs (8c registration, 8d recovery): the
-            // login artifact and every custom artifact cannot route into one, so the walk never
-            // reaches one on a live flow yet. A subflow_call is inlined away at compile time and an
-            // unknown kind never compiles. Any of these on a live table is a corrupt table: a
-            // uniform not found, never an oracle.
+            // Entering the recovery VERIFY step (issue #92, PR 8d) is the uniform acknowledgment plus
+            // code entry, which unlike the login MFA / profiling entries above MUST carry the
+            // flow-level `RECOVERY_ACK` message, byte-identical to the imperative `drive_recovery`
+            // Ack render (its `ack_nodes(false)` + `[RECOVERY_ACK]`). The generic enter path passes
+            // empty messages, so recovery routes through this dedicated arm rather than
+            // `enter_step_nodes`. `table_state` persists on `RecoveryAck` with NO `custom_step`,
+            // carrying the stored `identifier` forward, so the row is byte-identical to the
+            // imperative `PersistedState::step(RecoveryAck){identifier}`.
+            StepKind::RecoveryVerify => {
+                let nodes = recovery::ack_nodes(transport, &record.id, false);
+                let next = table_state(journey, &scratch, &next_step.kind, &next_id);
+                return persist_and_render(
+                    state,
+                    scope,
+                    flow_id,
+                    transport,
+                    journey,
+                    record,
+                    &next,
+                    nodes,
+                    vec![Message::of(message::RECOVERY_ACK)],
+                    now_micros,
+                )
+                .await;
+            }
+            // The remaining mint-family kinds (issue #92) are BUILT-IN-ONLY and not wired to their
+            // render-into entry: registration's Ack is a render-override (never routed into), and
+            // recovery's `start` entry is never routed INTO (it is the creation seed). The login
+            // artifact and every custom artifact cannot route into one, so the walk never reaches one
+            // on a live flow. A subflow_call is inlined away at compile time and an unknown kind never
+            // compiles. Any of these on a live table is a corrupt table: a uniform not found, never
+            // an oracle.
             StepKind::Registration
             | StepKind::RecoveryStart
-            | StepKind::RecoveryVerify
             | StepKind::SubflowCall
             | StepKind::Unknown(_) => return Err(FlowError::NotFound),
         }
@@ -783,7 +825,10 @@ async fn run_step_executor(
                             matches!(plan, mfa::MfaPlan::Enroll),
                         )
                         .with(OutcomeSignal::ProfilingPending, profiling_pending);
-                    Ok(StepOutcome::Advance { signals })
+                    Ok(StepOutcome::Advance {
+                        signals,
+                        post_reset: None,
+                    })
                 }
             }
         }
@@ -801,7 +846,10 @@ async fn run_step_executor(
                     add_method(scratch, new_method);
                     let signals =
                         signals_after_second_factor(state, scope, record, &subject_id).await;
-                    Ok(StepOutcome::Advance { signals })
+                    Ok(StepOutcome::Advance {
+                        signals,
+                        post_reset: None,
+                    })
                 }
             }
         }
@@ -831,7 +879,10 @@ async fn run_step_executor(
                     scratch.enroll_credential = None;
                     let signals =
                         signals_after_second_factor(state, scope, record, &subject_id).await;
-                    Ok(StepOutcome::Advance { signals })
+                    Ok(StepOutcome::Advance {
+                        signals,
+                        post_reset: None,
+                    })
                 }
             }
         }
@@ -849,7 +900,10 @@ async fn run_step_executor(
                         .with(OutcomeSignal::MfaRequired, false)
                         .with(OutcomeSignal::EnrollRequired, false)
                         .with(OutcomeSignal::ProfilingPending, false);
-                    Ok(StepOutcome::Advance { signals })
+                    Ok(StepOutcome::Advance {
+                        signals,
+                        post_reset: None,
+                    })
                 }
             }
         }
@@ -891,22 +945,73 @@ async fn run_step_executor(
                     scratch.enroll_credential = None;
                     Ok(StepOutcome::Advance {
                         signals: SignalSet::new(),
+                        post_reset: None,
+                    })
+                }
+            }
+        }
+        // The RECOVERY journey (issue #92, PR 8d): the SAME `advance_start` / `advance_verify`
+        // executors the imperative `drive_recovery` runs, reusing every #64/#80/#81/#84 defense
+        // unchanged. A passwordless email-OTP identity proof: request a code, enter it, mint an
+        // email-factor session (`amr = [otp]`).
+        //
+        // - `RecoveryStart` (`Render` -> stay on the identifier form on an empty identifier;
+        //   `Ack` -> store the identifier server-side and ADVANCE: the single unguarded
+        //   `start -> verify` edge routes to the verify step, whose dedicated walk arm renders the
+        //   ack + code entry with the flow-level `RECOVERY_ACK` message);
+        // - `RecoveryVerify` (reads the stored identifier or a uniform not found; `Render` -> stay
+        //   on the ack + code entry on an empty / wrong code; `Complete` -> record the subject and
+        //   the honest `email_otp` method token and ADVANCE with the recovery-path abuse context as
+        //   `post_reset`, so a genuine mint relaxes the SAME counters `drive_recovery` does through
+        //   `reset_after_success`). `success.event` / `success.actor` are DROPPED (as login /
+        //   registration drop theirs): `complete_via_table` rebuilds
+        //   `AuthenticationEvent::from_methods(&[EmailOtp], ...)` (== `email_otp()` field-for-field)
+        //   and `interaction::user_actor`.
+        StepKind::RecoveryStart => {
+            match recovery::advance_start(state, scope, record, submission, headers).await? {
+                recovery::RecoveryStartStep::Render { nodes } => Ok(StepOutcome::Render {
+                    nodes,
+                    messages: Vec::new(),
+                    state_override: None,
+                }),
+                recovery::RecoveryStartStep::Ack { identifier } => {
+                    scratch.identifier = Some(identifier);
+                    Ok(StepOutcome::Advance {
+                        signals: SignalSet::new(),
+                        post_reset: None,
+                    })
+                }
+            }
+        }
+        StepKind::RecoveryVerify => {
+            let identifier = scratch.identifier.clone().ok_or(FlowError::NotFound)?;
+            match recovery::advance_verify(state, scope, record, &identifier, submission, headers)
+                .await?
+            {
+                recovery::RecoveryVerifyStep::Render { nodes, messages } => {
+                    Ok(StepOutcome::Render {
+                        nodes,
+                        messages,
+                        state_override: None,
+                    })
+                }
+                recovery::RecoveryVerifyStep::Complete(success) => {
+                    scratch.subject = Some(success.subject.clone());
+                    scratch.methods = method_tokens(&[AuthMethod::EmailOtp]);
+                    scratch.enroll_credential = None;
+                    Ok(StepOutcome::Advance {
+                        signals: SignalSet::new(),
+                        post_reset: Some(success.ctx),
                     })
                 }
             }
         }
         // A decision, terminal, or subflow_call step is never a client-submittable render: the
-        // engine routes THROUGH it, it does not advance it by a submission. The remaining
-        // mint-family kinds (issue #92, PR 8a) are built-in-only and not wired to their executors
-        // until the recovery convergence PR (8d); a custom artifact cannot name them and no built-in
-        // routes into one yet, so they are unreachable on a live flow too. A uniform not found,
+        // engine routes THROUGH it, it does not advance it by a submission. A uniform not found,
         // never an oracle.
-        StepKind::RecoveryStart
-        | StepKind::RecoveryVerify
-        | StepKind::Decision
-        | StepKind::Terminal
-        | StepKind::SubflowCall
-        | StepKind::Unknown(_) => Err(FlowError::NotFound),
+        StepKind::Decision | StepKind::Terminal | StepKind::SubflowCall | StepKind::Unknown(_) => {
+            Err(FlowError::NotFound)
+        }
     }
 }
 
@@ -1177,6 +1282,13 @@ async fn builtin_fenced_nodes(
         // so reproduce it exactly. Registration runs NO post-mint reset (`post_reset` stays None).
         (Journey::Registration, StepKind::Registration) => {
             registration::start_nodes(transport, flow_id)
+        }
+        // Recovery's pre-terminal step is the `verify` code-entry step (issue #92, PR 8d): the
+        // imperative `drive_recovery` fences `ack_nodes(false)` on the rare central-fence TOCTOU, so
+        // reproduce it exactly. The genuine mint relaxes the recovery-path counters through the
+        // threaded `post_reset`, not here.
+        (Journey::Recovery, StepKind::RecoveryVerify) => {
+            recovery::ack_nodes(transport, flow_id, false)
         }
         // A genuine custom journey (and any not-yet-converged built-in) carries no built-in
         // fallback form: its wire state renders from its own nodes, so the fence is empty.

@@ -45,11 +45,8 @@ pub(super) fn builtin_compiled(journey: Journey) -> Option<&'static CompiledJour
     match journey {
         Journey::Login => Some(login_compiled()),
         Journey::Registration => Some(registration_compiled()),
-        Journey::Recovery
-        | Journey::Mfa
-        | Journey::Federation
-        | Journey::Consent
-        | Journey::Custom => None,
+        Journey::Recovery => Some(recovery_compiled()),
+        Journey::Mfa | Journey::Federation | Journey::Consent | Journey::Custom => None,
     }
 }
 
@@ -205,6 +202,60 @@ fn registration_artifact() -> JourneyDoc {
     }
 }
 
+/// The compiled recovery artifact, compiled once and shared (issue #92, PR 8d).
+///
+/// # Panics
+///
+/// Never in practice: the fixed recovery artifact is load-valid by construction (a compile-time
+/// verified fixture, pinned by `recovery_artifact_compiles_and_pins_its_shape` and the projection
+/// tests), so the `expect` is a programming-error guard, not a runtime path.
+fn recovery_compiled() -> &'static CompiledJourney {
+    static COMPILED: OnceLock<CompiledJourney> = OnceLock::new();
+    COMPILED.get_or_init(|| {
+        compile_builtin(&recovery_artifact())
+            .expect("the embedded built-in recovery journey compiles")
+    })
+}
+
+/// The embedded built-in RECOVERY artifact (issue #92, PR 8d): the passwordless email-OTP identity
+/// proof, a three-step guard-free machine (identifier start, code verify, then a terminal mint).
+///
+/// Recovery requests a one-time code for an identifier ([`StepKind::RecoveryStart`]), enters the
+/// code ([`StepKind::RecoveryVerify`]), and mints an email-factor session (`amr = [otp]`) on a
+/// genuine verification. Unlike login it steps up to no MFA or profiling, and unlike registration
+/// its acknowledgment (the [`FlowStateTag::RecoveryAck`](super::model::FlowStateTag) code-entry
+/// form) is a REAL routed step, not a render-override: entering the `verify` step renders the ack
+/// with the flow-level `RECOVERY_ACK` message (see the dedicated `RecoveryVerify` walk arm in
+/// [`super::orchestration::drive_via_table`]). Both edges are unconditional (guard-free): a request
+/// advances `start -> verify`, and a genuine verification advances `verify -> done` to the terminal
+/// mint. The `node_group` is validation metadata only (`enter_step_nodes` renders through fixed
+/// builders and never routes into the entry step).
+///
+/// [`StepKind::RecoveryStart`] / [`StepKind::RecoveryVerify`] are built-in-only
+/// ([`StepKind::is_builtin_only`]), so this artifact compiles ONLY through [`compile_builtin`],
+/// never the stricter [`ironauth_journey::compile`] a custom-authored journey uses.
+fn recovery_artifact() -> JourneyDoc {
+    JourneyDoc {
+        schema_version: JOURNEY_SCHEMA_VERSION.to_owned(),
+        id: "builtin_recovery".to_owned(),
+        engine_version: JOURNEY_ENGINE_VERSION,
+        entry: "start".to_owned(),
+        comment: None,
+        steps: vec![
+            step("start", StepKind::RecoveryStart, Some("email_otp")),
+            step("verify", StepKind::RecoveryVerify, Some("email_otp")),
+            step("done", StepKind::Terminal, None),
+        ],
+        // Two unconditional forward edges (recovery is guard-free): a request advances the start
+        // step and the walk enters `verify` (the ack + code entry); a genuine verification advances
+        // the verify step and the walk takes the fallback edge to the terminal mint. Every
+        // non-completing outcome (empty identifier, empty / wrong code) stays on its step.
+        transitions: vec![edge("start", "verify"), edge("verify", "done")],
+        subflows: None,
+        subflow_definitions: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,6 +299,35 @@ mod tests {
         assert!(
             register_edges[0].guard.is_none(),
             "the direct-mint edge is unguarded"
+        );
+        // The terminal is reachable (liveness).
+        assert!(compiled.reachable().contains("done"));
+    }
+
+    #[test]
+    fn recovery_artifact_compiles_and_pins_its_shape() {
+        // The embedded recovery artifact is load-valid and compiles cleanly, and its topology is the
+        // three-step guard-free machine PR 8d flips the imperative recovery journey onto.
+        let compiled = recovery_compiled();
+        assert_eq!(compiled.entry, "start");
+        assert_eq!(compiled.steps.len(), 3);
+        // The start step has exactly one forward edge, unguarded, to the verify step (a request
+        // advances start and the walk enters the ack + code entry).
+        let start_edges = compiled.edges("start");
+        assert_eq!(start_edges.len(), 1);
+        assert_eq!(start_edges[0].to, "verify");
+        assert!(
+            start_edges[0].guard.is_none(),
+            "the start -> verify edge is unguarded"
+        );
+        // The verify step has exactly one forward edge, unguarded, the direct-mint fallback to the
+        // terminal (a genuine verification advances verify and the walk takes it).
+        let verify_edges = compiled.edges("verify");
+        assert_eq!(verify_edges.len(), 1);
+        assert_eq!(verify_edges[0].to, "done");
+        assert!(
+            verify_edges[0].guard.is_none(),
+            "the verify -> done edge is unguarded"
         );
         // The terminal is reachable (liveness).
         assert!(compiled.reachable().contains("done"));
