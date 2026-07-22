@@ -403,7 +403,10 @@
         "progressive_profiling",
         "decision",
         "subflow_call",
-        "terminal"
+        "terminal",
+        "registration",
+        "recovery_start",
+        "recovery_verify"
       ],
       "type": "string"
     },

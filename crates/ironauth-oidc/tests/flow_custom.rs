@@ -745,10 +745,12 @@ async fn an_unknown_custom_journey_id_is_a_uniform_not_found() {
 }
 
 #[test]
-fn the_contract_and_engine_versions_are_unchanged() {
-    // PR 4 is additive: the flow contract stays 2 and the journey engine ABI stays 1.
+fn the_flow_contract_is_unchanged_and_the_engine_abi_is_v2() {
+    // The flow wire contract stays 2 (no rendered flow change). The journey engine ABI is bumped
+    // to 2 by PR 8a (the additive mint-family StepKind vocabulary), while a version-1 artifact
+    // still loads.
     assert_eq!(ironauth_oidc::flow::model::CONTRACT_VERSION, 2);
-    assert_eq!(JOURNEY_ENGINE_VERSION, 1);
+    assert_eq!(JOURNEY_ENGINE_VERSION, 2);
 }
 
 // ------------------------------------------------------------------------------------------

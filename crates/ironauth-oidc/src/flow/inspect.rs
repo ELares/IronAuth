@@ -31,11 +31,15 @@
 //! has no field on any view here), and it NEVER carries the recovery `identifier` (a PII
 //! contact), only a `has_identifier` boolean. A secret is unrepresentable, not scrubbed.
 
+use std::collections::{BTreeSet, VecDeque};
+
 use serde::Serialize;
 
+use ironauth_journey::{CompiledJourney, StepKind};
 use ironauth_store::{FlowRecord, Scope};
 
 use super::model::{Flow, FlowStateTag, Journey, Node, Transport};
+use super::wire_identity::wire_state_for;
 use super::{PersistedState, build_flow, federation, login, mfa, recovery, registration};
 use crate::risk::{RiskAction, RiskDecision, RiskLevel, SignalOutcome, decide_from_signals};
 use crate::step_up::{self, AuthnRequirement, Satisfaction};
@@ -125,6 +129,76 @@ impl FlowPlanView {
             journey,
             steps: journey.plan().to_vec(),
         }
+    }
+}
+
+/// Project a built-in journey's PLAN from its COMPILED table (issue #92, PR 8a): the anti-drift
+/// generalization that lets a converged built-in derive its ordered [`FlowStateTag`] plan from the
+/// compiled artifact instead of a hand-maintained static list.
+///
+/// The projection is a deterministic BFS from the compiled entry, following each step's guarded
+/// edges IN DOCUMENT ORDER, mapping every reachable step to the wire state it renders as via the
+/// wire-identity map ([`wire_state_for`]): a renderable executor kind yields its per-step
+/// [`FlowStateTag`], a [`StepKind::Terminal`] yields [`FlowStateTag::Completed`], and a routing-only
+/// kind (a decision, or a `subflow_call` composition already inlined away) contributes no state.
+/// Each distinct wire state is kept once, in first-visit order, so the result is the ordered plan
+/// the flow inspector projects.
+///
+/// This is the mechanism the per-journey convergence PRs (PR 8b onward) point each built-in's
+/// [`Journey::plan`] at, replacing the retired static arm once a one-time assertion pins that the
+/// projection equals the old list. In PR 8a the six built-ins still use their static [`Journey::plan`]
+/// (this helper is exercised only by its unit tests and the journey crate's compile tests), so no
+/// journey's plan changes.
+///
+/// For a GENUINE [`Journey::Custom`] flow every step is the flat [`FlowStateTag::Custom`], so the
+/// projection folds to `[Custom, Completed]`; the custom half already drives from
+/// [`CompiledJourney::reachable`] and does not consult a plan.
+#[must_use]
+pub fn project_plan(journey: Journey, compiled: &CompiledJourney) -> Vec<FlowStateTag> {
+    let mut plan: Vec<FlowStateTag> = Vec::new();
+    let mut visited: BTreeSet<String> = BTreeSet::new();
+    let mut queue: VecDeque<String> = VecDeque::new();
+    queue.push_back(compiled.entry.clone());
+    visited.insert(compiled.entry.clone());
+
+    while let Some(step_id) = queue.pop_front() {
+        if let Some(step) = compiled.step(&step_id) {
+            if let Some(tag) = projected_state(journey, &step.kind) {
+                if !plan.contains(&tag) {
+                    plan.push(tag);
+                }
+            }
+        }
+        // Enqueue the step's edge targets in DOCUMENT ORDER (the compiled edge order is
+        // load-bearing), skipping any already seen so a cyclic table cannot loop.
+        for edge in compiled.edges(&step_id) {
+            if visited.insert(edge.to.clone()) {
+                queue.push_back(edge.to.clone());
+            }
+        }
+    }
+    plan
+}
+
+/// The wire [`FlowStateTag`] a compiled step contributes to a projected plan (issue #92, PR 8a), or
+/// [`None`] for a routing-only kind that persists no flow of its own. A terminal projects the
+/// [`FlowStateTag::Completed`] plan terminal; every renderable kind projects through the
+/// wire-identity map.
+fn projected_state(journey: Journey, kind: &StepKind) -> Option<FlowStateTag> {
+    match kind {
+        // A terminal is the plan's completion.
+        StepKind::Terminal => Some(FlowStateTag::Completed),
+        // A decision routes onward and a subflow_call is inlined away before compilation, so
+        // neither is a persisted wire position: they contribute no plan state.
+        StepKind::Decision | StepKind::SubflowCall | StepKind::Unknown(_) => None,
+        // Every renderable executor kind maps to its per-step wire state.
+        StepKind::IdentifierPassword
+        | StepKind::MfaChallenge
+        | StepKind::MfaEnroll
+        | StepKind::ProgressiveProfiling
+        | StepKind::Registration
+        | StepKind::RecoveryStart
+        | StepKind::RecoveryVerify => Some(wire_state_for(journey, kind)),
     }
 }
 
@@ -773,6 +847,115 @@ mod tests {
                 plan
             );
         }
+    }
+
+    /// A linear built-in journey artifact of the given kinds ending in a terminal (issue #92, PR
+    /// 8a): each step routes unconditionally to the next, so the BFS projection is the kind order.
+    fn linear_builtin_journey(
+        id: &str,
+        kinds: &[(&str, StepKind, Option<&str>)],
+    ) -> CompiledJourney {
+        let mut steps: Vec<ironauth_journey::Step> = kinds
+            .iter()
+            .map(|(step_id, kind, group)| ironauth_journey::Step {
+                id: (*step_id).to_owned(),
+                kind: kind.clone(),
+                node_group: group.map(str::to_owned),
+                subflow: None,
+                decision: None,
+                comment: None,
+            })
+            .collect();
+        steps.push(ironauth_journey::Step {
+            id: "done".to_owned(),
+            kind: StepKind::Terminal,
+            node_group: None,
+            subflow: None,
+            decision: None,
+            comment: None,
+        });
+        let mut transitions: Vec<ironauth_journey::Transition> = Vec::new();
+        for window in kinds
+            .iter()
+            .map(|(step_id, _, _)| (*step_id).to_owned())
+            .chain(std::iter::once("done".to_owned()))
+            .collect::<Vec<_>>()
+            .windows(2)
+        {
+            transitions.push(ironauth_journey::Transition {
+                from: window[0].clone(),
+                to: window[1].clone(),
+                guard: None,
+                comment: None,
+            });
+        }
+        let doc = ironauth_journey::Journey {
+            schema_version: ironauth_journey::JOURNEY_SCHEMA_VERSION.to_owned(),
+            id: id.to_owned(),
+            engine_version: ironauth_journey::JOURNEY_ENGINE_VERSION,
+            entry: kinds[0].0.to_owned(),
+            comment: None,
+            steps,
+            transitions,
+            subflows: None,
+            subflow_definitions: None,
+        };
+        ironauth_journey::compile_builtin(&doc).expect("the built-in journey compiles")
+    }
+
+    #[test]
+    fn project_plan_derives_the_login_family_plan_from_the_compiled_table() {
+        // The anti-drift projection (issue #92, PR 8a): a compiled login-family artifact projects
+        // to the SAME ordered wire states the static `Journey::Login` plan lists (minus MfaEnroll,
+        // which this linear fixture omits), by a deterministic BFS from the entry in edge order.
+        let compiled = linear_builtin_journey(
+            "login_like",
+            &[
+                ("primary", StepKind::IdentifierPassword, Some("password")),
+                ("mfa", StepKind::MfaChallenge, Some("totp")),
+                ("profiling", StepKind::ProgressiveProfiling, Some("profile")),
+            ],
+        );
+        assert_eq!(
+            project_plan(Journey::Login, &compiled),
+            vec![
+                FlowStateTag::IdentifierPassword,
+                FlowStateTag::MfaChallenge,
+                FlowStateTag::ProgressiveProfiling,
+                FlowStateTag::Completed,
+            ]
+        );
+    }
+
+    #[test]
+    fn project_plan_maps_the_registration_mint_family_kind() {
+        // A built-in-only mint-family kind projects to its real wire state, and the terminal to the
+        // Completed plan terminal.
+        let compiled = linear_builtin_journey(
+            "registration_like",
+            &[("details", StepKind::Registration, Some("password"))],
+        );
+        assert_eq!(
+            project_plan(Journey::Registration, &compiled),
+            vec![FlowStateTag::RegistrationDetails, FlowStateTag::Completed]
+        );
+    }
+
+    #[test]
+    fn project_plan_is_flat_for_a_genuine_custom_journey() {
+        // A genuine custom journey stays flat: every step folds to the Custom wire state, so the
+        // projection is the deduplicated [Custom, Completed].
+        let compiled = linear_builtin_journey(
+            "custom_like",
+            &[
+                ("a", StepKind::IdentifierPassword, Some("password")),
+                ("b", StepKind::MfaChallenge, Some("totp")),
+            ],
+        );
+        assert_eq!(
+            project_plan(Journey::Custom, &compiled),
+            vec![FlowStateTag::Custom, FlowStateTag::Completed]
+        );
     }
 
     #[test]

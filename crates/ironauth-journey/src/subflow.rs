@@ -87,7 +87,11 @@ fn mfa_step_up() -> Subflow {
 /// definition is a well-formed fragment (validated with the same structural rules as a journey,
 /// with exits playing the completion role a journey's terminals play); and no subflow references
 /// itself directly or transitively. Pure and deterministic.
-pub(crate) fn validate_subflows(doc: &Journey, errors: &mut Vec<JourneyError>) {
+pub(crate) fn validate_subflows(
+    doc: &Journey,
+    admit_builtin_only: bool,
+    errors: &mut Vec<JourneyError>,
+) {
     let builtins = builtin_subflows();
     let inline = doc.subflow_definitions.as_deref().unwrap_or(&[]);
 
@@ -147,7 +151,7 @@ pub(crate) fn validate_subflows(doc: &Journey, errors: &mut Vec<JourneyError>) {
     // Validate each inline definition as a fragment.
     for (index, def) in inline.iter().enumerate() {
         let base = format!("/subflow_definitions/{index}");
-        validate_subflow_fragment(def, &base, &all_keys, errors);
+        validate_subflow_fragment(def, &base, &all_keys, admit_builtin_only, errors);
     }
 
     // Reject reference cycles across the whole definition graph.
@@ -164,13 +168,14 @@ fn validate_subflow_fragment(
     def: &Subflow,
     base: &str,
     all_keys: &BTreeSet<&str>,
+    admit_builtin_only: bool,
     errors: &mut Vec<JourneyError>,
 ) {
     let ids = collect_step_ids(&def.steps, base, errors);
 
     for (index, step) in def.steps.iter().enumerate() {
         let step_ptr = format!("{base}/steps/{index}");
-        check_kind_and_node_group(step, &step_ptr, errors);
+        check_kind_and_node_group(step, &step_ptr, admit_builtin_only, errors);
         if step.id.contains(NAMESPACE_SEPARATOR) {
             errors.push(JourneyError::ReservedStepIdSeparator {
                 pointer: format!("{step_ptr}/id"),
@@ -333,7 +338,33 @@ fn reaches(graph: &BTreeMap<String, Vec<String>>, from: &str, to: &str) -> bool 
 /// validation failures should the splice ever produce a malformed journey (a defense against a
 /// future splice bug, so a caller never receives an unchecked composed journey).
 pub fn compose(journey: &Journey) -> Result<Journey, Vec<JourneyError>> {
-    crate::validate::validate(journey)?;
+    compose_inner(journey, crate::validate::BUILTIN_ONLY_REJECTED)
+}
+
+/// Compose an EMBEDDED BUILT-IN journey into a flat journey (issue #92, PR 8a): identical to
+/// [`compose`] except that the BUILT-IN-ONLY mint-family step kinds
+/// ([`StepKind::is_builtin_only`]) are ADMITTED, so the built-in login/registration/recovery
+/// journeys that converge onto the compiled table validate and splice. A custom-authored artifact
+/// still uses [`compose`], which refuses those kinds.
+///
+/// # Errors
+///
+/// The same failures [`compose`] reports, minus the built-in-only rejection.
+pub fn compose_builtin(journey: &Journey) -> Result<Journey, Vec<JourneyError>> {
+    compose_inner(journey, crate::validate::BUILTIN_ONLY_ADMITTED)
+}
+
+/// Compose a journey into a flat journey (issue #92), with `admit_builtin_only` selecting the
+/// custom ([`compose`]) or embedded built-in ([`compose_builtin`]) validation context.
+pub(crate) fn compose_inner(
+    journey: &Journey,
+    admit_builtin_only: bool,
+) -> Result<Journey, Vec<JourneyError>> {
+    crate::validate::validate_inner(
+        journey,
+        crate::validate::RESERVED_IDS_REJECTED,
+        admit_builtin_only,
+    )?;
 
     let registry = full_registry(journey);
     let alias_to_key = alias_to_key(journey);
@@ -385,8 +416,14 @@ pub fn compose(journey: &Journey) -> Result<Journey, Vec<JourneyError>> {
 
     // Insurance: the composed journey is itself validated before it is returned, so the invariant
     // "compose output is always validate-clean" is enforced, not merely documented. The reserved
-    // namespace separator is admitted here because composition mints the only legitimate `::` ids.
-    crate::validate::validate_inner(&flat, crate::validate::RESERVED_IDS_ADMITTED)?;
+    // namespace separator is admitted here because composition mints the only legitimate `::` ids;
+    // the built-in-only context is preserved so an embedded built-in's mint-family kinds survive
+    // the re-validation.
+    crate::validate::validate_inner(
+        &flat,
+        crate::validate::RESERVED_IDS_ADMITTED,
+        admit_builtin_only,
+    )?;
 
     Ok(flat)
 }
@@ -575,6 +612,7 @@ mod tests {
             &mfa_step_up(),
             "/subflow_definitions/0",
             &all_keys,
+            crate::validate::BUILTIN_ONLY_REJECTED,
             &mut errors,
         );
         assert_eq!(errors, Vec::new());
@@ -598,7 +636,11 @@ mod tests {
         );
         // The composed journey passes the structural validation with reserved ids admitted.
         assert_eq!(
-            crate::validate::validate_inner(&composed, crate::validate::RESERVED_IDS_ADMITTED),
+            crate::validate::validate_inner(
+                &composed,
+                crate::validate::RESERVED_IDS_ADMITTED,
+                crate::validate::BUILTIN_ONLY_REJECTED
+            ),
             Ok(())
         );
         // Control routes into the subflow entry and back to the caller's continuation.

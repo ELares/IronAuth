@@ -284,6 +284,15 @@ enum StepOutcome {
         nodes: Vec<Node>,
         /// The flow-level messages.
         messages: Vec<Message>,
+        /// An optional WIRE-STATE override for this render (issue #92, PR 8a). Normally a re-render
+        /// stays on the flow's current wire state (the flat [`FlowStateTag::Custom`], or the
+        /// built-in per-step state once a journey converges). A mint-family executor whose render is
+        /// a NON-TERMINAL acknowledgment on a DIFFERENT wire state (registration's uniform
+        /// [`FlowStateTag::RegistrationAck`], shown while the flow stays OPEN) sets it here, so the
+        /// re-render advances the wire position without completing. [`None`] keeps the current
+        /// state. Behavior-neutral in PR 8a: no built-in drives through this path yet, so every
+        /// executor sets [`None`] and the wire state is unchanged.
+        state_override: Option<FlowStateTag>,
     },
     /// The step is done: route onward. The signals the executor emitted drive the guarded
     /// transitions, and the persisted scratch (subject, method tokens, enroll credential) has been
@@ -291,6 +300,32 @@ enum StepOutcome {
     Advance {
         /// The boolean routing signals this executor emitted.
         signals: SignalSet,
+    },
+}
+
+/// The polymorphic completion a mint-family step performs at a terminal (issue #92, PR 8a): the
+/// generalization of the custom engine's session mint so the converging built-in journeys
+/// (login/mfa/profiling, registration, recovery) can complete through the ONE choke point with
+/// their own per-journey fenced re-render and post-mint side effects.
+///
+/// Only [`CompletionKind::SessionMint`] exists: the five converging journeys are the MINT-FAMILY,
+/// so the mechanism carries no redirect or consent-decision variant (federation and consent stay
+/// thin single-step drivers and never run through the table drive). The enum shape is kept so a
+/// later need can extend it without a breaking change.
+enum CompletionKind {
+    /// Mint the session through the existing [`consume_and_complete`] choke point.
+    SessionMint {
+        /// The nodes to re-render UNIFORMLY on the rare central-fence TOCTOU after the completion
+        /// latch tripped (login's uniform-incorrect render, MFA's challenge form, registration's
+        /// details form, recovery's ack form). Empty for a genuine custom journey, whose wire state
+        /// carries no built-in fallback form.
+        fenced_nodes: Vec<Node>,
+        /// An optional post-mint counter reset to run on a genuine completion (issue #92, PR 8a):
+        /// recovery relaxes its path abuse counters after a genuine mint, exactly as the built-in
+        /// `drive_recovery` does through `reset_after_success`. [`None`] for login/mfa/profiling and
+        /// for a genuine custom journey, which run no post-mint reset. Behavior-neutral in PR 8a:
+        /// the only live producer (the custom Terminal path) sets [`None`].
+        post_reset: Option<crate::abuse::AttemptContext>,
     },
 }
 
@@ -414,7 +449,10 @@ pub(super) async fn create_custom_flow(
 /// [`FlowError::NotFound`] when the source, the pin, the current step, or a routing target cannot
 /// resolve (a corrupt row or a mis-compiled table, never an oracle); the executor cores' own
 /// typed errors otherwise.
-#[allow(clippy::too_many_arguments)]
+// The routing walk is one linear pass (resolve, run the executor, then a bounded transition loop
+// with one short arm per StepKind); a flat body reads best and the length reflects the kind count,
+// not any real branching complexity.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(super) async fn drive_custom(
     state: &OidcState,
     scope: Scope,
@@ -458,8 +496,19 @@ pub(super) async fn drive_custom(
     )
     .await?
     {
-        StepOutcome::Render { nodes, messages } => {
-            let next = custom_state(&scratch, &current_step_id);
+        StepOutcome::Render {
+            nodes,
+            messages,
+            state_override,
+        } => {
+            // A re-render normally stays on the current wire state (flat Custom); a mint-family
+            // executor whose render advances the wire position (registration's non-terminal Ack)
+            // sets a state override. Behavior-neutral in PR 8a: every executor sets `None`, so the
+            // wire state is the flat Custom, byte-identical to before.
+            let mut next = custom_state(&scratch, &current_step_id);
+            if let Some(tag) = state_override {
+                next.step = tag;
+            }
             return persist_and_render(
                 state,
                 scope,
@@ -487,8 +536,18 @@ pub(super) async fn drive_custom(
         let next_step = compiled.step(&next_id).ok_or(FlowError::NotFound)?;
         match &next_step.kind {
             StepKind::Terminal => {
+                // The generalized session mint (issue #92, PR 8a): a custom journey's terminal
+                // completes through the polymorphic [`CompletionKind::SessionMint`]. For a genuine
+                // custom flow the fenced re-render is empty and there is no post-mint reset, so this
+                // is byte-identical to the pre-PR-8a direct mint; the per-journey convergence PRs
+                // populate the fenced nodes and the recovery post-reset.
+                let completion = CompletionKind::SessionMint {
+                    fenced_nodes: Vec::new(),
+                    post_reset: None,
+                };
                 return complete_custom(
-                    state, scope, flow_id, transport, record, &scratch, headers, now_micros,
+                    state, scope, flow_id, transport, record, &scratch, completion, headers,
+                    now_micros,
                 )
                 .await;
             }
@@ -526,9 +585,17 @@ pub(super) async fn drive_custom(
                 )
                 .await;
             }
-            // A subflow_call is inlined away at compile time and an unknown kind never compiles, so
-            // either on a live table is a corrupt table: a uniform not found, never an oracle.
-            StepKind::SubflowCall | StepKind::Unknown(_) => return Err(FlowError::NotFound),
+            // The mint-family kinds (issue #92, PR 8a) are BUILT-IN-ONLY and not wired to their
+            // render-into executors until the per-journey convergence PRs (8c registration, 8d
+            // recovery): a custom artifact cannot name them and no built-in is table-driven yet, so
+            // the walk never routes into one on a live custom flow. A subflow_call is inlined away
+            // at compile time and an unknown kind never compiles. Any of these on a live table is a
+            // corrupt table: a uniform not found, never an oracle.
+            StepKind::Registration
+            | StepKind::RecoveryStart
+            | StepKind::RecoveryVerify
+            | StepKind::SubflowCall
+            | StepKind::Unknown(_) => return Err(FlowError::NotFound),
         }
     }
     Err(FlowError::NotFound)
@@ -557,6 +624,7 @@ async fn run_step_executor(
                 login::LoginStep::Render { nodes } => Ok(StepOutcome::Render {
                     nodes,
                     messages: Vec::new(),
+                    state_override: None,
                 }),
                 login::LoginStep::Complete(success) => {
                     // The primary factor genuinely verified: run the SAME post-success follow
@@ -599,9 +667,11 @@ async fn run_step_executor(
             match mfa::advance_challenge(state, scope, record, &subject_id, submission, headers)
                 .await?
             {
-                mfa::MfaStep::Render { nodes, messages } => {
-                    Ok(StepOutcome::Render { nodes, messages })
-                }
+                mfa::MfaStep::Render { nodes, messages } => Ok(StepOutcome::Render {
+                    nodes,
+                    messages,
+                    state_override: None,
+                }),
                 mfa::MfaStep::Complete { new_method } => {
                     add_method(scratch, new_method);
                     let signals =
@@ -626,9 +696,11 @@ async fn run_step_executor(
             )
             .await?
             {
-                mfa::MfaStep::Render { nodes, messages } => {
-                    Ok(StepOutcome::Render { nodes, messages })
-                }
+                mfa::MfaStep::Render { nodes, messages } => Ok(StepOutcome::Render {
+                    nodes,
+                    messages,
+                    state_override: None,
+                }),
                 mfa::MfaStep::Complete { new_method } => {
                     add_method(scratch, new_method);
                     scratch.enroll_credential = None;
@@ -641,9 +713,11 @@ async fn run_step_executor(
         StepKind::ProgressiveProfiling => {
             let (subject_id, _) = super::mfa_context(scope, scratch)?;
             match profiling::advance(state, scope, record, &subject_id, submission).await? {
-                profiling::ProfilingStep::Render { nodes, messages } => {
-                    Ok(StepOutcome::Render { nodes, messages })
-                }
+                profiling::ProfilingStep::Render { nodes, messages } => Ok(StepOutcome::Render {
+                    nodes,
+                    messages,
+                    state_override: None,
+                }),
                 profiling::ProfilingStep::Complete => {
                     let signals = SignalSet::new()
                         .with(OutcomeSignal::PrimaryVerified, true)
@@ -655,10 +729,18 @@ async fn run_step_executor(
             }
         }
         // A decision, terminal, or subflow_call step is never a client-submittable render: the
-        // engine routes THROUGH it, it does not advance it by a submission.
-        StepKind::Decision | StepKind::Terminal | StepKind::SubflowCall | StepKind::Unknown(_) => {
-            Err(FlowError::NotFound)
-        }
+        // engine routes THROUGH it, it does not advance it by a submission. The mint-family kinds
+        // (issue #92, PR 8a) are built-in-only and not wired to their executors until the
+        // per-journey convergence PRs (8c registration, 8d recovery); a custom artifact cannot name
+        // them and no built-in is table-driven yet, so they are unreachable on a live flow too. A
+        // uniform not found, never an oracle.
+        StepKind::Registration
+        | StepKind::RecoveryStart
+        | StepKind::RecoveryVerify
+        | StepKind::Decision
+        | StepKind::Terminal
+        | StepKind::SubflowCall
+        | StepKind::Unknown(_) => Err(FlowError::NotFound),
     }
 }
 
@@ -724,16 +806,30 @@ async fn enter_step_nodes(
                 None => Ok(Vec::new()),
             }
         }
-        StepKind::Decision | StepKind::Terminal | StepKind::SubflowCall | StepKind::Unknown(_) => {
-            Err(FlowError::NotFound)
-        }
+        // The mint-family kinds (issue #92, PR 8a) render their entry nodes (registration's details
+        // form, recovery's start / ack forms) once the per-journey convergence PRs (8c, 8d) wire
+        // them; until then no live table routes into one. A decision, terminal, or subflow_call step
+        // renders nothing here. Any of these is a uniform not found, never an oracle.
+        StepKind::Registration
+        | StepKind::RecoveryStart
+        | StepKind::RecoveryVerify
+        | StepKind::Decision
+        | StepKind::Terminal
+        | StepKind::SubflowCall
+        | StepKind::Unknown(_) => Err(FlowError::NotFound),
     }
 }
 
-/// Complete a custom flow at a terminal step (issue #92, PR 4): mint the session through the ONE
-/// choke point with the honest amr the flow earned (the primary factor plus any genuinely proven
-/// second factor, carried on the scratch method tokens). The fenced re-render is empty (a custom
-/// flow's wire state carries no built-in fallback form; the flow is consumed regardless).
+/// Complete a custom flow at a terminal step (issue #92, PR 4; generalized PR 8a): mint the session
+/// through the ONE choke point with the honest amr the flow earned (the primary factor plus any
+/// genuinely proven second factor, carried on the scratch method tokens), executing the polymorphic
+/// [`CompletionKind::SessionMint`].
+///
+/// The completion carries the per-journey fenced re-render nodes (empty for a genuine custom
+/// journey) and an optional post-mint counter reset (issue #92, PR 8a): recovery relaxes its path
+/// abuse counters on a GENUINE mint, exactly as the built-in `drive_recovery` does. In PR 8a the
+/// only caller passes an empty fenced set and no reset, so this stays byte-identical to the
+/// pre-generalization mint.
 #[allow(clippy::too_many_arguments)]
 async fn complete_custom(
     state: &OidcState,
@@ -742,9 +838,14 @@ async fn complete_custom(
     transport: Transport,
     record: &FlowRecord,
     scratch: &PersistedState,
+    completion: CompletionKind,
     headers: &axum::http::HeaderMap,
     now_micros: i64,
 ) -> Result<Continuation, FlowError> {
+    let CompletionKind::SessionMint {
+        fenced_nodes,
+        post_reset,
+    } = completion;
     let subject = scratch.subject.clone().ok_or(FlowError::NotFound)?;
     let subject_id = UserId::parse_in_scope(&subject, &scope).map_err(|_| FlowError::NotFound)?;
     let methods: Vec<AuthMethod> = scratch
@@ -754,7 +855,7 @@ async fn complete_custom(
         .collect();
     let event = AuthenticationEvent::from_methods(&methods, now_micros);
     let actor = interaction::user_actor(&subject_id);
-    consume_and_complete(
+    let continuation = consume_and_complete(
         state,
         scope,
         flow_id,
@@ -764,11 +865,19 @@ async fn complete_custom(
         &subject,
         actor,
         &event,
-        Vec::new(),
+        fenced_nodes,
         headers,
         now_micros,
     )
-    .await
+    .await?;
+    // A post-mint counter reset runs only on a GENUINE completion (never on the rare central-fence
+    // re-render), exactly as the built-in recovery driver relaxes its counters after a real mint.
+    if let Some(ctx) = post_reset {
+        if matches!(continuation, Continuation::Complete { .. }) {
+            state.reset_after_success(&ctx).await;
+        }
+    }
+    Ok(continuation)
 }
 
 /// Choose the first guarded edge that applies from `from` (issue #92, PR 4): document order, first
