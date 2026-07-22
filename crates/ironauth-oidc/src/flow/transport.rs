@@ -173,6 +173,16 @@ pub async fn flow_api_create(
     let Some(journey) = creation_journey(&journey) else {
         return error_json(FlowError::NotFound);
     };
+    // The `challenge` transient payload namespace is RESERVED for the authorization challenge
+    // endpoint (issue #93, PR2): its opaque `auth_session` continuity handle sources the code's
+    // bound OAuth params from that server only stash, so a client able to seed it through this
+    // PUBLIC create route would forge the handle's provenance. Reject a client payload carrying the
+    // reserved key with a uniform 400 (no oracle) BEFORE any flow is created; this is the ONE
+    // client create edge that forwards a client supplied transient payload (the browser GET create
+    // never accepts one), so it covers both the built-in and the custom dispatch below.
+    if super::transient_payload_has_reserved_namespace(body.transient_payload.as_ref()) {
+        return error_json(FlowError::MalformedTransientPayload);
+    }
     // A custom (declarative) journey is created THROUGH the compiled-table engine path (issue
     // #92, PR 4): it names its journey id in the body and the source pins a compiled version. The
     // built-in journeys are unchanged.

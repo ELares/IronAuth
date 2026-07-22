@@ -14,11 +14,15 @@
 mod common;
 
 use axum::body::Body;
-use axum::http::{Request, StatusCode, header};
+use axum::http::{HeaderMap, Request, StatusCode, header};
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use common::{Harness, PKCE_CHALLENGE, PKCE_VERIFIER, REDIRECT_URI, form, json};
 use ironauth_env::Clock;
 use ironauth_jose::{TotpParams, code_at};
 use ironauth_oidc::ClientAuthMethod;
+use ironauth_oidc::flow::create_flow;
+use ironauth_oidc::flow::model::{Journey, Transport};
 
 /// The identifier and password the suite's first-party user is seeded with.
 const IDENTIFIER: &str = "native@example.test";
@@ -114,6 +118,52 @@ async fn first_hop_auth_session(harness: &Harness, client_id: &str) -> String {
         .as_str()
         .unwrap_or_else(|| panic!("an auth_session in the step-up render: {body}"))
         .to_owned()
+}
+
+/// Forge the opaque continuity handle the endpoint decodes: `base64url(flow_id.submit_token)`. Used
+/// by the adversarial regression probes to hand a NON challenge-endpoint flow to the resume branch.
+fn forge_auth_session(flow_id: &str, submit_token: &str) -> String {
+    URL_SAFE_NO_PAD.encode(format!("{flow_id}.{submit_token}"))
+}
+
+/// The `amr` tokens carried in an id token's payload (decoded, unverified: the suite only needs to
+/// read the honest method set the mint recorded).
+fn id_token_amr(id_token: &str) -> Vec<String> {
+    let payload = id_token.split('.').nth(1).expect("a jwt payload segment");
+    let bytes = URL_SAFE_NO_PAD.decode(payload).expect("decode the payload");
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).expect("parse the claims");
+    claims["amr"]
+        .as_array()
+        .map(|array| {
+            array
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// POST a JSON body to the public headless flow-create route for `journey`, returning the raw
+/// status and body (no success assertion, so a rejection is observable).
+async fn flow_api_create(
+    harness: &Harness,
+    journey: &str,
+    body: serde_json::Value,
+) -> (StatusCode, String) {
+    let scope = harness.scope();
+    let uri = format!(
+        "/t/{}/e/{}/flow/api/{journey}",
+        scope.tenant(),
+        scope.environment()
+    );
+    let request = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("request builds");
+    let (status, _headers, response) = harness.send(request).await;
+    (status, response)
 }
 
 #[tokio::test]
@@ -440,9 +490,20 @@ async fn step_up_completes_and_the_token_endpoint_redeems_the_resumed_code() {
         json(&response)["access_token"].is_string(),
         "an access token: {response}"
     );
+    let id_token = json(&response)["id_token"]
+        .as_str()
+        .expect("an id token")
+        .to_owned();
+    // The MFA is provably reflected in the token: the amr carries the second factor (never a
+    // fabricated one) alongside the primary, so the step-up genuinely happened before the mint.
+    let amr = id_token_amr(&id_token);
     assert!(
-        json(&response)["id_token"].is_string(),
-        "an id token: {response}"
+        amr.iter().any(|method| method == "otp" || method == "mfa"),
+        "the resumed step-up token reflects the second factor in amr, got {amr:?}"
+    );
+    assert!(
+        amr.iter().any(|method| method == "pwd"),
+        "the primary factor is still reflected in amr, got {amr:?}"
     );
 }
 
@@ -709,4 +770,139 @@ async fn a_garbage_auth_session_is_a_uniform_invalid_grant() {
         "a garbage handle is rejected: {body}"
     );
     assert_eq!(json(&body)["error"], "invalid_grant");
+}
+
+// ---------------------------------------------------------------------------------------------
+// PR2 security review (HIGH): auth_session provenance. The `challenge` transient_payload namespace
+// is SERVER-ONLY, so a client cannot seed a forged stash through the public flow-create API and
+// hand the flow to the resume branch; and the resume branch binds the flow to the LOGIN journey.
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_public_flow_create_rejects_the_reserved_challenge_namespace() {
+    // A client that could seed a top-level `challenge` transient stash through the public headless
+    // flow-create API would forge the continuity handle's provenance. The create edge rejects it
+    // with a uniform 400 BEFORE any flow exists, so the attacker cannot even seed the stash.
+    let mut harness = Harness::start().await;
+    harness.enable_first_party_challenge();
+    harness.enable_flows();
+    let client_id = harness.client_id().to_string();
+
+    let (status, body) = flow_api_create(
+        &harness,
+        "login",
+        serde_json::json!({
+            "transient_payload": {
+                "challenge": {
+                    "client_id": client_id,
+                    "scope": "openid offline_access",
+                    "code_challenge": PKCE_CHALLENGE,
+                    "code_challenge_method": "S256",
+                }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the reserved challenge namespace is refused at create: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_foreign_flow_without_a_challenge_stash_cannot_be_resumed() {
+    // Even a plainly-created public flow API login flow (no stash, which the create edge allows)
+    // cannot be resumed through the challenge endpoint: with no `challenge` stash to source the
+    // bound params from, the handle is the uniform stale rejection, never a mint.
+    let mut harness = Harness::start().await;
+    harness.enable_first_party_challenge();
+    harness.enable_flows();
+    let cid = *harness.client_id();
+    harness.set_client_first_party(&cid, true).await;
+    harness.seed_user(IDENTIFIER, PASSWORD).await;
+
+    let (status, created) = flow_api_create(&harness, "login", serde_json::json!({})).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a plain login flow is created: {created}"
+    );
+    let flow_id = json(&created)["flow"]["id"]
+        .as_str()
+        .expect("flow id")
+        .to_owned();
+    let submit_token = json(&created)["submit_token"]
+        .as_str()
+        .expect("submit token")
+        .to_owned();
+
+    let auth_session = forge_auth_session(&flow_id, &submit_token);
+    let (status, resp) = challenge(
+        &harness,
+        &form(&[
+            ("auth_session", &auth_session),
+            ("username", IDENTIFIER),
+            ("password", PASSWORD),
+        ]),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a foreign flow with no challenge stash is rejected: {resp}"
+    );
+    assert_eq!(json(&resp)["error"], "invalid_grant");
+    assert!(
+        json(&resp)["authorization_code"].is_null(),
+        "no code is minted from a foreign flow: {resp}"
+    );
+}
+
+#[tokio::test]
+async fn a_resume_against_a_non_login_journey_is_rejected() {
+    // Defense in depth (Part 2): even if a `challenge` stash ever reached a NON-login flow, the
+    // resume branch binds the flow to the LOGIN journey, so the login-only mint can never drive a
+    // Registration / Recovery / Custom journey. White-box: seed a Registration flow carrying a
+    // challenge stash directly (a client can no longer seed one through the public API), then try
+    // to resume it. The journey binding rejects it uniform, before the stash is ever read.
+    let (harness, client_id) = armed_mfa_harness().await;
+
+    let stash = serde_json::json!({
+        "challenge": {
+            "client_id": client_id,
+            "scope": "openid",
+            "code_challenge": PKCE_CHALLENGE,
+            "code_challenge_method": "S256",
+        }
+    });
+    let (flow_id, submit_token, _flow) = create_flow(
+        harness.state(),
+        harness.scope(),
+        Transport::Api,
+        Journey::Registration,
+        None,
+        Some(&stash),
+        None,
+        &HeaderMap::new(),
+    )
+    .await
+    .expect("seed a registration flow with a challenge stash");
+
+    let auth_session = forge_auth_session(&flow_id.to_string(), &submit_token);
+    let (status, resp) = challenge(
+        &harness,
+        &form(&[("auth_session", &auth_session), ("otp", "000000")]),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a non-login journey is rejected on resume: {resp}"
+    );
+    assert_eq!(json(&resp)["error"], "invalid_grant");
+    assert!(
+        json(&resp)["authorization_code"].is_null(),
+        "no code is minted from a non-login journey: {resp}"
+    );
 }

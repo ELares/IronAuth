@@ -323,6 +323,23 @@ pub(super) fn submit_action_for(
     }
 }
 
+/// The reserved SERVER-ONLY transient payload namespace (issue #93, PR2). A top-level `challenge`
+/// object is stashed ONLY by the authorization challenge endpoint, which sources its opaque
+/// `auth_session` continuity handle's bound OAuth params (client, scope, PKCE) from it. Every
+/// CLIENT facing flow create rejects a payload carrying this key, so the handle's provenance can
+/// never be forged through the public headless flow API.
+const RESERVED_TRANSIENT_NAMESPACE: &str = "challenge";
+
+/// Whether a client supplied transient payload carries the reserved server only `challenge`
+/// namespace (issue #93, PR2). A non object payload, or an absent one, never does. The client
+/// facing create edges call this and reject a hit with a uniform 400, so a client cannot seed the
+/// server only stash the challenge endpoint's continuity handle trusts.
+fn transient_payload_has_reserved_namespace(payload: Option<&serde_json::Value>) -> bool {
+    payload
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|object| object.contains_key(RESERVED_TRANSIENT_NAMESPACE))
+}
+
 /// Validate and normalize a transient payload (issue #84): it must be well formed JSON
 /// within a size cap, else [`FlowError::MalformedTransientPayload`] (400, never a 500).
 /// Returns the serialized JSON to store, or [`None`] when absent.

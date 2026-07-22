@@ -405,6 +405,14 @@ async fn resume_challenge(
             );
         }
     };
+    // Bind the resumed flow to the LOGIN journey (issue #93, PR2, defense in depth): the challenge
+    // endpoint is login only, so a Registration / Recovery / Custom flow must NEVER be driven
+    // through its mint even if a `challenge` stash ever reached one. A foreign journey is the
+    // uniform stale handle rejection, closing the journey confusion vector independently of how the
+    // stash's provenance is enforced at creation.
+    if Journey::parse(&record.journey) != Some(Journey::Login) {
+        return invalid_auth_session();
+    }
     let Some(params) = record
         .transient_payload
         .as_deref()
