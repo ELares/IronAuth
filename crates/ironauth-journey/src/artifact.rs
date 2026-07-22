@@ -59,9 +59,62 @@ pub struct Journey {
     pub steps: Vec<Step>,
     /// The transitions between steps, in document order.
     pub transitions: Vec<Transition>,
-    /// The subflow references this journey can call, or [`None`] when it calls none.
+    /// The subflow references this journey can call, or [`None`] when it calls none. Each
+    /// reference maps a document-local alias id to its source (a built-in subflow or an inline
+    /// definition), and a [`StepKind::SubflowCall`] step names the alias.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subflows: Option<Vec<SubflowRef>>,
+    /// The inline subflow DEFINITIONS this artifact carries (issue #92, PR 3), or [`None`] when it
+    /// carries none. A [`SubflowRef`] with an [`SubflowSource::Inline`] source resolves to the
+    /// definition here whose `id` matches its `subflow_id`. Distinct from the `subflows` REFERENCE
+    /// list: `subflows` declares which subflows a journey uses (alias plus source), while
+    /// `subflow_definitions` carries the reusable fragment bodies themselves. A single definition
+    /// is a shared, id-resolved fragment: two journeys that reference the same definition compile
+    /// against the same body (edit-once-both-change), with version pinning layered on in a later PR.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subflow_definitions: Option<Vec<Subflow>>,
+}
+
+/// A reusable sub-flow fragment (issue #92, PR 3): a mini-journey the composition step splices
+/// into a calling journey (the inner-tree analog). It mirrors the [`Journey`] shape but is NOT a
+/// standalone flow: it has an entry, a set of steps and transitions, and one or more RETURN
+/// points (its `exits`). A subflow never mints a session; it always RETURNS to its caller, so a
+/// subflow declares no terminal step (a [`StepKind::Terminal`] inside a subflow is a load-time
+/// error). Its steps and transitions are validated with the SAME structural rules as a journey's
+/// (vocabulary, reachability, dead-end, kind and attachment coherence, predicate type-check),
+/// except that the `exits` play the completion role a journey's terminal steps play.
+///
+/// ## Composition and return semantics
+///
+/// A [`StepKind::SubflowCall`] step names a subflow. On composition the subflow's fragment is
+/// spliced into the journey: the transitions that targeted the call step are redirected to the
+/// subflow's `entry`, and each of the call step's OUTGOING transitions (the RETURN edges) is
+/// grafted onto every one of the subflow's `exits`, so control flows into the subflow at its
+/// entry and returns to the caller from its exits. Each exit is a leaf step (no outgoing
+/// transition within the subflow); its own kind executor runs, and on completion routing follows
+/// the caller's return edges. Composition is a pure, load-time splice: it never runs at flow time.
+///
+/// An unknown property is a hard parse error (`deny_unknown_fields`).
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Subflow {
+    /// The subflow definition id (the key an inline [`SubflowSource::Inline`] reference and a
+    /// nested [`StepKind::SubflowCall`] resolve against). Unique across the artifact's inline
+    /// definitions and distinct from every built-in subflow name.
+    pub id: SubflowId,
+    /// The entry step: the step id control enters the subflow at.
+    pub entry: StepId,
+    /// The return points: the step ids control returns to the caller from. Each must name a
+    /// declared step that is a leaf (no outgoing transition within the subflow) and is not a
+    /// terminal. A subflow declares at least one exit.
+    pub exits: Vec<StepId>,
+    /// An optional human-readable comment about the subflow (data, round-trip-safe).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    /// The steps this subflow can occupy, in document order (the same shape as a journey's steps).
+    pub steps: Vec<Step>,
+    /// The transitions between the subflow's steps, in document order.
+    pub transitions: Vec<Transition>,
 }
 
 /// One step of a journey (issue #92): a document-local id, the built-in kind that executes
@@ -488,6 +541,7 @@ mod tests {
                 },
             ],
             subflows: None,
+            subflow_definitions: None,
         }
     }
 
