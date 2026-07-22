@@ -36,6 +36,7 @@ pub mod message;
 pub mod model;
 pub mod schema;
 
+mod builtin_artifacts;
 mod consent;
 mod eval_ctx;
 mod federation;
@@ -732,8 +733,15 @@ pub async fn drive(
         serde_json::from_str(&record.state).map_err(|_| FlowError::Store)?;
 
     match journey {
+        // The built-in login journey (issue #92, PR 8b): re-expressed as the embedded login
+        // artifact and driven through the SAME compiled-table engine a custom journey uses, byte-
+        // identically to the retired imperative `drive_login`. The flip subsumes the in-flow MFA
+        // challenge / enroll and progressive-profiling holds, because they are substates of the
+        // login state machine (not separate journeys). The imperative `drive_login` and its helpers
+        // stay in the tree (unused, `#[allow(dead_code)]`, retired in PR 8e) so a revert is this one
+        // dispatch line.
         Journey::Login => {
-            drive_login(
+            orchestration::drive_via_table(
                 state,
                 scope,
                 flow_id,
@@ -743,6 +751,7 @@ pub async fn drive(
                 &submission,
                 headers,
                 now_micros,
+                Journey::Login,
             )
             .await
         }
@@ -928,6 +937,10 @@ fn persisted_step_for(state_json: &str) -> FlowStateTag {
 /// or transition to an in flow second factor. The MFA states funnel through the SAME
 /// [`totp::verify_second_factor`] / enroll ceremonies, and completion mints the honest
 /// combined amr/acr.
+// PR8e: retire. Dead after the PR 8b table flip (the `Journey::Login` arm now drives through
+// `orchestration::drive_via_table`). Kept in the tree so a revert is one dispatch line; deleted in
+// PR 8e once every mint-family journey has converged.
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 async fn drive_login(
     state: &OidcState,
@@ -1006,6 +1019,8 @@ async fn drive_login(
 /// challenge or enrollment is required, transition to that state WITHOUT minting a session or
 /// consuming the flow (the single mint happens once, at the MFA completion, with the honest
 /// combined amr).
+// PR8e: retire (dead after the PR 8b table flip; see `drive_login`).
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn complete_primary_or_step_up(
     state: &OidcState,
@@ -1231,6 +1246,8 @@ fn mfa_context(
 
 /// Drive the MFA challenge state (issue #84): verify the second factor and, on a genuine
 /// proof, complete with the honest combined amr.
+// PR8e: retire (dead after the PR 8b table flip; see `drive_login`).
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 async fn drive_mfa_challenge(
     state: &OidcState,
@@ -1280,6 +1297,8 @@ async fn drive_mfa_challenge(
 
 /// Drive the MFA enrollment state (issue #84): confirm the enrollment code (activating the
 /// factor through the shared ceremony) and, on success, complete with the honest combined amr.
+// PR8e: retire (dead after the PR 8b table flip; see `drive_login`).
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 async fn drive_mfa_enroll(
     state: &OidcState,
@@ -1334,6 +1353,8 @@ async fn drive_mfa_enroll(
 /// Mint the session for a completed login plus second factor (issue #84): combine the primary
 /// factor with the factor the REAL ceremony just proved and record the event at the CURRENT
 /// instant, so the token's amr/acr HONESTLY reflects what happened (never a fabricated `mfa`).
+// PR8e: retire (dead after the PR 8b table flip; see `drive_login`).
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 async fn complete_with_second_factor(
     state: &OidcState,
@@ -1411,6 +1432,8 @@ async fn complete_with_second_factor(
 /// factor, carried on the state). A non-empty invalid value re-renders the profiling nodes with
 /// the flow OPEN, so the profiling step is never a completion oracle; the step is always
 /// SKIPPABLE, so a blank submit mints.
+// PR8e: retire (dead after the PR 8b table flip; see `drive_login`).
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 async fn drive_profiling(
     state: &OidcState,
