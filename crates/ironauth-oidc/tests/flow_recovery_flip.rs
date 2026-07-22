@@ -547,6 +547,217 @@ async fn a_recovery_completes_with_an_honest_otp_amr() {
     );
 }
 
+// ==========================================================================================
+// REVIEW PROBES (adversarial, added by the PR8d review). Not part of the shipped suite.
+// ==========================================================================================
+
+/// A regulation-ENABLED harness (high soft threshold so two attempts never throttle), so the
+/// recovery-path abuse counter actually climbs and `reset_after_success` is a live op (it early
+/// returns when regulation is disabled). Otherwise identical to `setup`.
+async fn setup_regulated() -> (Harness, Arc<RecordingSender>) {
+    let mut harness = Harness::start_store_backed_with(OidcConfig {
+        require_pkce_for_confidential_clients: false,
+        regulation: RegulationConfig {
+            enabled: true,
+            window_secs: 3600,
+            soft_threshold: 1000,
+            ..RegulationConfig::default()
+        },
+        ..OidcConfig::default()
+    })
+    .await;
+    harness.enable_flows();
+    let sender = Arc::new(RecordingSender::default());
+    harness.install_verification_sender(sender.clone());
+    let pool = Arc::new(HashingPool::new(
+        harness.env().clone(),
+        Argon2Params::new(8, 1, 1),
+        1,
+        64,
+        None,
+    ));
+    harness.install_hashing_pool(pool);
+    (harness, sender)
+}
+
+/// The summed `count` over the recovery-path IDENTIFIER abuse-counter rows (the only dimension the
+/// recovery flow writes to `dcr_rate_counters`; the IP and tenant dimensions are in-memory L1). A
+/// positive value means the recovery-path identifier counter is non-relaxed.
+async fn recovery_identifier_counter_sum(harness: &Harness) -> i64 {
+    use sqlx::Row;
+    let pool = harness.db().owner_pool();
+    let row = sqlx::query(
+        "SELECT COALESCE(SUM(count), 0) AS n FROM dcr_rate_counters \
+         WHERE rate_key LIKE 'abuse:recovery:identifier:%'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("sum recovery identifier counters");
+    row.get::<i64, _>("n")
+}
+
+/// PROBE (crux 1c, the marquee novel bit): the threaded `post_reset` relaxes the recovery-path
+/// counter ONLY on a genuine mint, and NEVER on a failed verify. With regulation enabled, every
+/// recovery-path attempt climbs the identifier counter; a genuine completion runs
+/// `reset_after_success` (zeroing it), and a wrong code returns a Render (never reaching the
+/// terminal / `complete_via_table`, so no reset fires).
+#[tokio::test]
+async fn post_reset_relaxes_the_counter_on_completion_but_not_on_a_failed_verify() {
+    let (harness, sender) = setup_regulated().await;
+    harness.seed_user(KNOWN, PASSWORD).await;
+
+    // --- Positive: a genuine completion relaxes the counter. ---
+    let (flow_id, token0, _start) = create_recovery(&harness, Transport::Api).await;
+    let ack = submit(
+        &harness,
+        &flow_id,
+        Transport::Api,
+        &token0,
+        &[("identifier", KNOWN)],
+    )
+    .await;
+    let (_ack_flow, token1) = expect_render(ack);
+    // advance_start's regulate_before has recorded one attempt on the recovery identifier counter.
+    assert!(
+        recovery_identifier_counter_sum(&harness).await >= 1,
+        "the recovery-path identifier counter climbed on the initiation"
+    );
+    let code = last_code(&sender, KNOWN);
+    let done = submit(
+        &harness,
+        &flow_id,
+        Transport::Api,
+        &token1,
+        &[("code", &code)],
+    )
+    .await;
+    assert!(
+        matches!(done, Continuation::Complete { .. }),
+        "the genuine code completes"
+    );
+    assert_eq!(
+        recovery_identifier_counter_sum(&harness).await,
+        0,
+        "a genuine recovery mint RELAXED the recovery-path identifier counter (post_reset ran)"
+    );
+
+    // --- Negative: a failed verify does NOT relax the counter. ---
+    let (flow_id2, token2, _start2) = create_recovery(&harness, Transport::Api).await;
+    let ack2 = submit(
+        &harness,
+        &flow_id2,
+        Transport::Api,
+        &token2,
+        &[("identifier", KNOWN)],
+    )
+    .await;
+    let (_ack2_flow, token3) = expect_render(ack2);
+    let after_initiate = recovery_identifier_counter_sum(&harness).await;
+    assert!(
+        after_initiate >= 1,
+        "the second initiation climbed the counter again"
+    );
+    let wrong = submit(
+        &harness,
+        &flow_id2,
+        Transport::Api,
+        &token3,
+        &[("code", "000000")],
+    )
+    .await;
+    let (rendered, _r) = expect_render(wrong);
+    assert_eq!(
+        rendered.state,
+        FlowStateTag::RecoveryAck,
+        "a wrong code stays open"
+    );
+    assert!(
+        recovery_identifier_counter_sum(&harness).await >= after_initiate,
+        "a FAILED verify must NOT relax the recovery-path counter (no post_reset on a non-complete): \
+         before={after_initiate}, after={}",
+        recovery_identifier_counter_sum(&harness).await
+    );
+}
+
+/// PROBE (crux 3, anti-enumeration on the FLIPPED path): a KNOWN and an UNKNOWN identifier both
+/// converge to a byte-identical `RecoveryAck` render, and the unknown identifier has NO deliverable
+/// code (the send is suppressed internally). Existence never leaks through the flipped render.
+#[tokio::test]
+async fn known_and_unknown_identifiers_render_byte_identical_acks() {
+    const UNKNOWN: &str = "nobody-here@example.test";
+    let (harness, sender) = setup().await;
+    harness.seed_user(KNOWN, PASSWORD).await;
+
+    let render_ack = |ident: &'static str| {
+        let harness = &harness;
+        async move {
+            let (flow_id, token, _s) = create_recovery(harness, Transport::Api).await;
+            let ack = submit(
+                harness,
+                &flow_id,
+                Transport::Api,
+                &token,
+                &[("identifier", ident)],
+            )
+            .await;
+            let (flow, _r) = expect_render(ack);
+            // Normalize the per-flow id so two distinct flows are directly comparable.
+            let json = serde_json::to_string(&flow).expect("serialize");
+            json.replace(flow.id.as_str(), "<flow-id>")
+        }
+    };
+
+    let known_json = render_ack(KNOWN).await;
+    let unknown_json = render_ack(UNKNOWN).await;
+    assert_eq!(
+        known_json, unknown_json,
+        "a known and an unknown identifier render BYTE-IDENTICAL acks on the flipped path"
+    );
+    // The unknown identifier's send is suppressed: no code is deliverable-observable for it.
+    let no_unknown_code = sender
+        .otp
+        .lock()
+        .expect("lock")
+        .iter()
+        .all(|(to, _)| to != UNKNOWN);
+    assert!(
+        no_unknown_code,
+        "no recovery code is delivered to an unknown identifier (suppressed send)"
+    );
+}
+
+/// PROBE (crux 7, identifier threading fail-closed): a recovery row sitting on the ack state with NO
+/// stored `identifier` (a tampered/corrupt row) must fail CLOSED at the verify executor
+/// (`scratch.identifier.ok_or(NotFound)`), minting nothing. The identifier can never be absent or
+/// client-supplied at verify time.
+#[tokio::test]
+async fn an_absent_identifier_on_the_ack_row_fails_closed() {
+    let (harness, _sender) = setup().await;
+    harness.seed_user(KNOWN, PASSWORD).await;
+    let (flow_id, token, _start) = create_recovery(&harness, Transport::Api).await;
+
+    // Force the row onto the ack (verify) state with NO identifier stored.
+    tamper_state(&harness, &flow_id, r#"{"step":"recovery_ack"}"#).await;
+
+    let result = try_submit(
+        &harness,
+        &flow_id,
+        Transport::Api,
+        &token,
+        &[("code", "123456")],
+    )
+    .await;
+    assert!(
+        matches!(result, Err(FlowError::NotFound)),
+        "an ack row with no stored identifier must be a uniform not found (got a non-NotFound)"
+    );
+    assert_eq!(
+        session_count(&harness).await,
+        0,
+        "an identifier-less ack row mints no session"
+    );
+}
+
 // ------------------------------------------------------------------------------------------
 // ADVERSARIAL (H11): a forged flat `custom` step on a RECOVERY row reverse-maps to the Terminal
 // `done` step (Terminal folds to the Custom wire tag), which the executor refuses. It must not mint
