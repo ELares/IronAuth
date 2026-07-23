@@ -16,9 +16,17 @@
 //! returns `400 insufficient_authorization` carrying a rotating opaque `auth_session` plus node
 //! derived hints (`otp_required`) instead of a code; the native client resubmits with the
 //! `auth_session` and its one time code; the endpoint resumes the SAME flow and either loops (a new
-//! `auth_session`) or, on completion, mints the code. High-risk escalation (`redirect_to_web` for
-//! the unsatisfiable-headless states) and hardening (per-`auth_session` rate limiting, client-auth
-//! parity, `DPoP`) are LATER PRs.
+//! `auth_session`) or, on completion, mints the code.
+//!
+//! PR3 scope: the `redirect_to_web` escalation is GENERALIZED to every UNSATISFIABLE-HEADLESS hold.
+//! A held render whose state cannot be completed with further direct credential input (a
+//! `ProgressiveProfiling` collection, a `FederationStart` browser leg, or a `ConsentPrompt`
+//! decision) escalates the native client to the browser with `400 {"error": "redirect_to_web"}`
+//! rather than stranding it behind the uniform failure (see [`classify_step`]). The escalation is
+//! NARROW by design: a risk `Block`, a locked/fenced account, a wrong password, and an unknown user
+//! ALL stay the uniform `insufficient_authorization` at `IdentifierPassword` (the anti-enumeration
+//! invariant, below), because a hard deny is byte-identical to a wrong password and is NOT a browser
+//! handoff. Hardening (per-`auth_session` rate limiting, client-auth parity, `DPoP`) is a LATER PR.
 //!
 //! The security crux (PR2):
 //! - The OAuth params (`client_id`, `scope`, `code_challenge`, `code_challenge_method`) are
@@ -362,9 +370,11 @@ pub async fn authorize_challenge(
         Continuation::Render { flow, submit_token } => {
             render_step_response(&flow_id, &flow, &submit_token)
         }
-        Continuation::Redirect { .. } | Continuation::ConsentDecision { .. } => {
-            insufficient_uniform()
-        }
+        // A federation browser leg or a consent decision cannot be completed headlessly, so the
+        // native client is escalated to the browser rather than stranded (issue #93, PR3). Both are
+        // structurally UNREACHABLE from a browserless login flow (a login never hands off to a
+        // federation leg or a consent decision here), so this is the correct total-match projection.
+        Continuation::Redirect { .. } | Continuation::ConsentDecision { .. } => redirect_to_web(),
     }
 }
 
@@ -508,9 +518,10 @@ async fn resume_challenge(
         Continuation::Render { flow, submit_token } => {
             render_step_response(&flow_id, &flow, &submit_token)
         }
-        Continuation::Redirect { .. } | Continuation::ConsentDecision { .. } => {
-            insufficient_uniform()
-        }
+        // As on the fresh path (issue #93, PR3): a federation browser leg or a consent decision is
+        // escalated to the browser, never stranded. Both are unreachable for a login resume, so this
+        // is the correct total-match projection.
+        Continuation::Redirect { .. } | Continuation::ConsentDecision { .. } => redirect_to_web(),
     }
 }
 
@@ -582,18 +593,67 @@ async fn complete_challenge(
     }
 }
 
-/// Map a `Continuation::Render` to the client response (issue #93, PR2). A step-up hold
+/// The response class a held [`Continuation::Render`] maps to (issue #93, PR3), derived from the
+/// flow state by the TOTAL match in [`classify_step`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepResponse {
+    /// A step-up hold (`MfaChallenge`/`MfaEnroll`): carry the rotating `auth_session` plus hints.
+    Continuation,
+    /// An unsatisfiable-headless hold (`ProgressiveProfiling`/`FederationStart`/`ConsentPrompt`):
+    /// escalate the native client to the browser with `redirect_to_web`.
+    RedirectToWeb,
+    /// Every other hold (including the anti-enumeration `IdentifierPassword` failure): the uniform
+    /// `auth_session`-free `insufficient_authorization`.
+    Uniform,
+}
+
+/// Classify a held flow state into its client response (issue #93, PR3). A TOTAL, EXPLICIT match on
+/// every [`FlowStateTag`] (NO wildcard), so a future new state fails to compile here rather than
+/// silently mis-routing to the uniform failure.
+///
+/// - `MfaChallenge`/`MfaEnroll` are the step-up holds, reachable ONLY after a genuine primary
+///   success, so they disclose only "a second factor is required" (PR2).
+/// - `ProgressiveProfiling`/`FederationStart`/`ConsentPrompt` cannot be completed with further
+///   direct credential input, so they escalate to the browser (PR3). `ProgressiveProfiling` is a
+///   reachable login-plan step in GENERAL; `FederationStart`/`ConsentPrompt` belong to other
+///   journeys and are handled defensively for the total match.
+/// - `IdentifierPassword` stays UNIFORM: this is the anti-enumeration surface where a risk `Block`,
+///   a locked/fenced account, a wrong password, and an unknown user are ALL byte-identical. Routing
+///   any of them to `redirect_to_web` would reintroduce a credential-validity oracle and is
+///   semantically wrong (a hard deny is not a browser handoff). The remaining registration /
+///   recovery / completed / custom states are unreachable from a login flow and stay conservatively
+///   uniform.
+fn classify_step(state: FlowStateTag) -> StepResponse {
+    match state {
+        FlowStateTag::MfaChallenge | FlowStateTag::MfaEnroll => StepResponse::Continuation,
+        FlowStateTag::ProgressiveProfiling
+        | FlowStateTag::FederationStart
+        | FlowStateTag::ConsentPrompt => StepResponse::RedirectToWeb,
+        FlowStateTag::IdentifierPassword
+        | FlowStateTag::RegistrationDetails
+        | FlowStateTag::RegistrationAck
+        | FlowStateTag::RecoveryStart
+        | FlowStateTag::RecoveryAck
+        | FlowStateTag::Completed
+        | FlowStateTag::Custom => StepResponse::Uniform,
+    }
+}
+
+/// Map a `Continuation::Render` to the client response (issue #93, PR2 + PR3). A step-up hold
 /// (`MfaChallenge`/`MfaEnroll`) returns `insufficient_authorization` carrying the rotating
-/// `auth_session` (built from the freshly rotated submit token) plus the node derived hints; every
-/// other render (a primary-factor failure such as a wrong password or an unknown user) stays the
-/// UNIFORM `auth_session`-free failure, so a render is never an account existence oracle.
+/// `auth_session` (built from the freshly rotated submit token) plus the node derived hints; an
+/// unsatisfiable-headless hold escalates to the browser with `redirect_to_web` (PR3); every other
+/// render (a primary-factor failure such as a wrong password, an unknown user, a risk `Block`, or a
+/// locked account) stays the UNIFORM `auth_session`-free failure, so a render is never an account
+/// existence oracle. The classification is a TOTAL match (see [`classify_step`]).
 fn render_step_response(flow_id: &FlowId, flow: &Flow, submit_token: &str) -> Response {
-    match flow.state {
-        FlowStateTag::MfaChallenge | FlowStateTag::MfaEnroll => {
+    match classify_step(flow.state) {
+        StepResponse::Continuation => {
             let auth_session = encode_auth_session(flow_id, submit_token);
             insufficient_with_session(&auth_session, mfa_hints(&flow.ui.nodes))
         }
-        _ => insufficient_uniform(),
+        StepResponse::RedirectToWeb => redirect_to_web(),
+        StepResponse::Uniform => insufficient_uniform(),
     }
 }
 
@@ -731,12 +791,27 @@ fn not_found() -> Response {
     (StatusCode::NOT_FOUND, "not found").into_response()
 }
 
-/// The draft's `redirect_to_web` escalation (issue #93): when the interaction cannot be completed
-/// headlessly (here: a quarantined client or user, whose consent gate the browserless endpoint
-/// cannot satisfy), direct the native client to complete authorization in the browser (where the
-/// interactive consent screen and the sensitive-scope strip apply) instead of minting a code. PR3
-/// generalizes it (risk-based escalation plus an optional PAR `request_uri`). A `400 application/json
-/// {"error": "redirect_to_web"}` with `no-store`.
+/// The draft's `redirect_to_web` escalation (issue #93). When the interaction cannot be completed
+/// headlessly, direct the native client to complete authorization in the browser (where the
+/// interactive consent screen, the sensitive-scope strip, and the profiling / federation / consent
+/// UIs apply) instead of minting a code. Two families reach here:
+/// - the completed-login consent gate (a quarantined client or user, PR1): the browserless endpoint
+///   cannot render consent, so it escalates rather than auto-grant; and
+/// - an unsatisfiable-headless HELD render (`ProgressiveProfiling`/`FederationStart`/`ConsentPrompt`
+///   via [`classify_step`], PR3): a hold that further direct credential input cannot resolve.
+///
+/// It stays a UNIFORM body (`{"error": "redirect_to_web"}`, no per-account fields) with `no-store`,
+/// carries NO resumable handle, and mints NOTHING, so it is not a bypass and not an oracle. It is
+/// NEVER returned for a risk `Block`, a locked/fenced account, a wrong password, or an unknown user:
+/// those stay the uniform `insufficient_authorization` at `IdentifierPassword` (the anti-enumeration
+/// invariant), because a hard deny is byte-identical to a wrong password.
+///
+/// PAR is OMITTED in PR3 (a documented residual): the body carries no PAR `request_uri`, so the
+/// native client re-initiates a FRESH `/authorize` + PKCE in the browser. The challenge endpoint
+/// binds a browserless code with NO `redirect_uri`, whereas PAR's push runs the full `/authorize`
+/// validator (a registered `redirect_uri` match) and mints under back-channel client auth, which
+/// this endpoint defers to a later PR. A PAR `request_uri` in the body is a residual pending a
+/// `redirect_uri` channel and client-auth parity.
 fn redirect_to_web() -> Response {
     json_no_store(
         StatusCode::BAD_REQUEST,
@@ -786,10 +861,10 @@ mod tests {
     use ironauth_store::{EnvironmentId, TenantId};
 
     use super::{
-        ChallengeParams, ChallengeTransient, decode_auth_session, encode_auth_session, mfa_hints,
-        parse_challenge_params,
+        ChallengeParams, ChallengeTransient, StepResponse, classify_step, decode_auth_session,
+        encode_auth_session, mfa_hints, parse_challenge_params,
     };
-    use crate::flow::model::{InputType, Node, NodeAttributes, NodeGroup};
+    use crate::flow::model::{FlowStateTag, InputType, Node, NodeAttributes, NodeGroup};
 
     /// A Totp `code` input node (present in both the MFA challenge and the enroll render).
     fn code_node() -> Node {
@@ -843,6 +918,49 @@ mod tests {
             },
             None,
         )
+    }
+
+    #[test]
+    fn classify_step_maps_each_flow_state_group_to_the_right_response() {
+        // The step-up holds carry the continuity handle (reachable only after a genuine primary
+        // success, so they disclose only "a second factor is required").
+        for state in [FlowStateTag::MfaChallenge, FlowStateTag::MfaEnroll] {
+            assert_eq!(
+                classify_step(state),
+                StepResponse::Continuation,
+                "{state:?} is a step-up continuation"
+            );
+        }
+        // The unsatisfiable-headless holds escalate to the browser (issue #93, PR3).
+        for state in [
+            FlowStateTag::ProgressiveProfiling,
+            FlowStateTag::FederationStart,
+            FlowStateTag::ConsentPrompt,
+        ] {
+            assert_eq!(
+                classify_step(state),
+                StepResponse::RedirectToWeb,
+                "{state:?} escalates to the browser"
+            );
+        }
+        // Everything else is the uniform failure. IdentifierPassword is the anti-enumeration
+        // surface (a risk Block, a locked account, a wrong password, and an unknown user are all
+        // byte-identical here); the rest are unreachable-in-login conservative uniform.
+        for state in [
+            FlowStateTag::IdentifierPassword,
+            FlowStateTag::RegistrationDetails,
+            FlowStateTag::RegistrationAck,
+            FlowStateTag::RecoveryStart,
+            FlowStateTag::RecoveryAck,
+            FlowStateTag::Completed,
+            FlowStateTag::Custom,
+        ] {
+            assert_eq!(
+                classify_step(state),
+                StepResponse::Uniform,
+                "{state:?} stays the uniform insufficient_authorization"
+            );
+        }
     }
 
     #[test]

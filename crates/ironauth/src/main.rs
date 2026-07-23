@@ -724,7 +724,8 @@ async fn build_oidc_router(
     // (issue #194), so discovery, JWKS, and minted tokens can never advertise
     // divergent algorithms; an unprovisioned or cross-tenant scope resolves to no
     // entry and returns 404, exactly like the JWKS surface.
-    let capabilities = DiscoveryCapabilities::from_config(oidc_config);
+    let capabilities = DiscoveryCapabilities::from_config(oidc_config)
+        .with_first_party_challenge_endpoint(first_party_challenge_enabled);
     let discovery = discovery_router(DiscoveryState::new(
         issuer_base.clone(),
         cache,

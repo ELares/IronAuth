@@ -18,17 +18,24 @@ use axum::http::{HeaderMap, Request, StatusCode, header};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use common::{Harness, PKCE_CHALLENGE, PKCE_VERIFIER, REDIRECT_URI, form, json};
+use ironauth_config::OidcConfig;
 use ironauth_env::Clock;
 use ironauth_jose::{TotpParams, code_at};
 use ironauth_oidc::ClientAuthMethod;
 use ironauth_oidc::flow::create_flow;
 use ironauth_oidc::flow::model::{Journey, Transport};
+use ironauth_store::UserState;
 
 /// The identifier and password the suite's first-party user is seeded with.
 const IDENTIFIER: &str = "native@example.test";
 const PASSWORD: &str = "correct horse battery staple";
 /// The TOTP seed the harness `seed_active_totp` enrolls, so a real code is reproducible.
 const TOTP_SEED: [u8; 20] = [0x0A; 20];
+
+/// A denylisted client IP that scores the risk engine HIGH (drives a post-primary-success Block).
+const DENYLISTED_IP: &str = "203.0.113.9";
+/// A clean client IP (no risk signal), for the wrong-password control.
+const CLEAN_IP: &str = "198.51.100.7";
 
 /// POST an `application/x-www-form-urlencoded` body to the scope-routed challenge endpoint.
 async fn challenge(harness: &Harness, body: &str) -> (StatusCode, String) {
@@ -42,6 +49,26 @@ async fn challenge(harness: &Harness, body: &str) -> (StatusCode, String) {
         .method("POST")
         .uri(uri)
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(body.to_owned()))
+        .expect("request builds");
+    let (status, _headers, response) = harness.send(request).await;
+    (status, response)
+}
+
+/// POST a challenge body carrying the non-forgeable peer-IP header (issue #31) the risk engine
+/// resolves, so an IP-based signal sees a stable client address in the in-process router.
+async fn challenge_from_ip(harness: &Harness, body: &str, ip: &str) -> (StatusCode, String) {
+    let scope = harness.scope();
+    let uri = format!(
+        "/t/{}/e/{}/authorize-challenge",
+        scope.tenant(),
+        scope.environment()
+    );
+    let request = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("x-ironauth-peer-ip", ip)
         .body(Body::from(body.to_owned()))
         .expect("request builds");
     let (status, _headers, response) = harness.send(request).await;
@@ -752,6 +779,128 @@ async fn a_primary_failure_is_indistinguishable_from_an_unknown_user() {
             "no otp hint on a primary failure: {body}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// PR3 escalation: the redirect_to_web escalation is GENERALIZED to the unsatisfiable-headless holds,
+// but a risk Block and a locked/fenced account STAY the uniform insufficient_authorization at
+// IdentifierPassword (the anti-enumeration invariant): a hard deny is byte-identical to a wrong
+// password and is NEVER a browser handoff. These pin that A.1 boundary end to end (OWNER decision R1).
+// ---------------------------------------------------------------------------------------------
+
+/// An armed challenge harness whose risk engine BLOCKS a login from [`DENYLISTED_IP`] after a
+/// successful primary verify (issue #79 `block_on_high` + an IP denylist), with the #64 failure
+/// throttle off so the wrong-password control is a clean uniform failure rather than a throttle.
+async fn armed_block_harness() -> (Harness, String) {
+    let mut config = OidcConfig::default();
+    config.risk.enabled = true;
+    config.risk.new_device_enabled = false;
+    config.risk.impossible_travel_enabled = false;
+    config.risk.ip_reputation_enabled = true;
+    config.risk.velocity_enabled = false;
+    config.risk.block_on_high = true;
+    config.risk.ip_denylist = vec![DENYLISTED_IP.to_owned()];
+    config.regulation.enabled = false;
+    let mut harness = Harness::start_store_backed_with(config).await;
+    harness.enable_first_party_challenge();
+    let client_id = *harness.client_id();
+    harness.set_client_first_party(&client_id, true).await;
+    harness.seed_user(IDENTIFIER, PASSWORD).await;
+    (harness, client_id.to_string())
+}
+
+#[tokio::test]
+async fn a_risk_block_stays_the_uniform_failure_and_is_never_redirect_to_web() {
+    // A.1 (OWNER R1): a risk Block is consumed AFTER a successful primary verify and produces the
+    // SAME uniform render a wrong password does, on IdentifierPassword. render_step_response maps
+    // IdentifierPassword to the uniform failure, so the CORRECT password from a denylisted IP is a
+    // uniform insufficient_authorization, byte-identical to a wrong password and NEVER
+    // redirect_to_web (routing a Block to the browser would reintroduce a credential-validity
+    // oracle: a hard deny is not a browser handoff).
+    let (harness, client_id) = armed_block_harness().await;
+
+    // The CORRECT password from a denylisted IP: the risk engine blocks post-verify.
+    let (block_status, block_body) = challenge_from_ip(
+        &harness,
+        &challenge_form(&client_id, IDENTIFIER, PASSWORD),
+        DENYLISTED_IP,
+    )
+    .await;
+    // The control: a WRONG password from a clean IP (an ordinary primary failure).
+    let (wrong_status, wrong_body) = challenge_from_ip(
+        &harness,
+        &challenge_form(&client_id, IDENTIFIER, "not-the-password"),
+        CLEAN_IP,
+    )
+    .await;
+
+    assert_eq!(block_status, StatusCode::BAD_REQUEST, "block: {block_body}");
+    assert_eq!(
+        json(&block_body)["error"],
+        "insufficient_authorization",
+        "a Block stays the uniform failure, not redirect_to_web: {block_body}"
+    );
+    assert_ne!(
+        json(&block_body)["error"],
+        "redirect_to_web",
+        "a Block must NEVER escalate to the browser (no credential-validity oracle): {block_body}"
+    );
+    assert!(
+        json(&block_body)["authorization_code"].is_null(),
+        "a Block mints nothing: {block_body}"
+    );
+    assert!(
+        json(&block_body)["auth_session"].is_null(),
+        "a Block carries no continuity handle: {block_body}"
+    );
+    // The anti-enumeration invariant: byte-identical to a wrong password.
+    assert_eq!(
+        block_status, wrong_status,
+        "a Block and a wrong password share a status"
+    );
+    assert_eq!(
+        block_body, wrong_body,
+        "a Block is byte-identical to a wrong password: block={block_body} wrong={wrong_body}"
+    );
+}
+
+#[tokio::test]
+async fn a_locked_account_stays_the_uniform_failure_and_is_never_redirect_to_web() {
+    // A.1 (OWNER R1): a locked/fenced account (login.rs: `!can_authenticate()`) renders the SAME
+    // uniform failure at IdentifierPassword after spending the timing-uniform Argon2 op. A correct
+    // password against a blocked account is therefore a uniform insufficient_authorization, NEVER
+    // redirect_to_web and never a code.
+    let mut harness = Harness::start().await;
+    harness.enable_first_party_challenge();
+    let client_id = *harness.client_id();
+    harness.set_client_first_party(&client_id, true).await;
+    let subject = harness.seed_user(IDENTIFIER, PASSWORD).await;
+    harness.set_user_state(&subject, UserState::Blocked).await;
+
+    let (status, body) = challenge(
+        &harness,
+        &challenge_form(&client_id.to_string(), IDENTIFIER, PASSWORD),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "locked: {body}");
+    assert_eq!(
+        json(&body)["error"],
+        "insufficient_authorization",
+        "a locked account stays uniform, not redirect_to_web: {body}"
+    );
+    assert_ne!(
+        json(&body)["error"],
+        "redirect_to_web",
+        "a locked account must NEVER escalate to the browser: {body}"
+    );
+    assert!(
+        json(&body)["authorization_code"].is_null(),
+        "a locked account mints nothing: {body}"
+    );
+    assert!(
+        json(&body)["auth_session"].is_null(),
+        "a locked account carries no continuity handle: {body}"
+    );
 }
 
 #[tokio::test]

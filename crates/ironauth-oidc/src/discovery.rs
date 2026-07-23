@@ -272,6 +272,15 @@ pub struct DiscoveryCapabilities {
     /// never advertises an endpoint the server does not serve. Default-off, gated by
     /// `oidc.registration_enabled`.
     registration_endpoint_enabled: bool,
+    /// Whether the OAuth 2.0 Authorization Challenge Endpoint (issue #93, Bet 3,
+    /// draft-ietf-oauth-first-party-apps) is enabled (EXPERIMENTAL). When `true`, the
+    /// document advertises the per-environment `authorization_challenge_endpoint`
+    /// (`{issuer}/authorize-challenge`); when `false` the field is absent, so discovery
+    /// never advertises an endpoint the server fails closed on. Default-off, gated by the
+    /// `first-party-challenge` feature ladder (NOT an `OidcConfig` field), so this is set
+    /// through [`DiscoveryCapabilities::with_first_party_challenge_endpoint`], never
+    /// [`DiscoveryCapabilities::from_config`].
+    first_party_challenge_endpoint_enabled: bool,
     /// Whether OIDC Session Management 1.0 is enabled (issue #39). When `true`, the
     /// document advertises `check_session_iframe` (`{base}/connect/check_session`);
     /// when `false` the field is absent, so discovery never advertises an iframe the
@@ -399,6 +408,17 @@ impl DiscoveryCapabilities {
         self
     }
 
+    /// Declare whether the OAuth 2.0 Authorization Challenge Endpoint (issue #93) is
+    /// served, so discovery advertises `authorization_challenge_endpoint` only when the
+    /// browserless first-party surface is armed. Gated by the `first-party-challenge`
+    /// feature ladder (not an `OidcConfig` field), so it is threaded here rather than in
+    /// [`DiscoveryCapabilities::from_config`].
+    #[must_use]
+    pub fn with_first_party_challenge_endpoint(mut self, enabled: bool) -> Self {
+        self.first_party_challenge_endpoint_enabled = enabled;
+        self
+    }
+
     /// Declare the `ui_locales_supported` set this environment can render (issue #86, PR 2):
     /// the installed locale-bundle tags unioned with `en`. The store-backed discovery path sets
     /// this per environment so discovery advertises exactly what the pages can produce (the
@@ -489,6 +509,21 @@ pub fn discovery_document(
         document.insert(
             "registration_endpoint".to_owned(),
             json!(format!("{issuer}/connect/register")),
+        );
+    }
+
+    // The OAuth 2.0 Authorization Challenge Endpoint (issue #93, Bet 3,
+    // draft-ietf-oauth-first-party-apps) is PER ENVIRONMENT, like the DCR endpoint: it is
+    // scope-routed under the issuer path (`{issuer}/authorize-challenge`, the route the
+    // challenge module mounts). It is advertised ONLY when the experimental feature is armed
+    // (the handler otherwise fails closed to a 404), so discovery never announces a surface the
+    // server does not serve. This is a CAPABILITY-GATED key, not an ADVERTISED_ENDPOINTS entry
+    // (that registry is for the deployment-root, always-on protocol endpoints). This literal must
+    // live ONLY in this generator module (the self-discovery lint scans for its assembly).
+    if capabilities.first_party_challenge_endpoint_enabled {
+        document.insert(
+            "authorization_challenge_endpoint".to_owned(),
+            json!(format!("{issuer}/authorize-challenge")),
         );
     }
 

@@ -443,6 +443,64 @@ async fn discovery_routes_coexist_with_a_sibling_well_known_route() {
     }
 }
 
+#[tokio::test]
+async fn authorization_challenge_endpoint_is_advertised_only_when_enabled_on_both_forms() {
+    // Issue #93, Bet 3, PR3: the OAuth 2.0 Authorization Challenge Endpoint is per-environment
+    // (`{issuer}/authorize-challenge`) and advertised ONLY when the experimental feature is armed,
+    // so discovery never announces a surface the handler fails closed on. Absent by default, present
+    // under `with_first_party_challenge_endpoint(true)`, on EVERY well-known form.
+
+    // Default off: absent on all three forms.
+    let (router, scope) = router_and_scope(DiscoveryCapabilities::default());
+    for uri in well_known_urls(&scope) {
+        let (status, _, body) = get(&router, &uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        let doc: Value = serde_json::from_str(&body).expect("json");
+        assert!(
+            doc.get("authorization_challenge_endpoint").is_none(),
+            "the challenge endpoint is absent when the feature is off: {uri}"
+        );
+    }
+
+    // Enabled: the per-environment issuer path, on all three forms.
+    let (router, scope) = router_and_scope(
+        DiscoveryCapabilities::default().with_first_party_challenge_endpoint(true),
+    );
+    let expected = format!(
+        "{ISSUER_BASE}/t/{}/e/{}/authorize-challenge",
+        scope.tenant(),
+        scope.environment()
+    );
+    for uri in well_known_urls(&scope) {
+        let (status, _, body) = get(&router, &uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        let doc: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(
+            doc["authorization_challenge_endpoint"],
+            json!(expected),
+            "the challenge endpoint is advertised at its per-environment path: {uri}"
+        );
+    }
+}
+
+#[test]
+fn from_config_does_not_advertise_the_challenge_endpoint() {
+    // The challenge endpoint is a feature-ladder gate, NOT an OidcConfig field, so from_config alone
+    // never advertises it: it is threaded separately via with_first_party_challenge_endpoint in the
+    // live boot path (mirroring how the feature ladder, not oidc config, arms the endpoint).
+    let doc = discovery_document(
+        "https://issuer.test/t/tnt/e/env",
+        ISSUER_BASE,
+        "https://issuer.test/t/tnt/e/env/jwks.json",
+        &SigningPolicy::eddsa_default(),
+        &DiscoveryCapabilities::from_config(&OidcConfig::default()),
+    );
+    assert!(
+        doc.get("authorization_challenge_endpoint").is_none(),
+        "from_config does not advertise the experimental challenge endpoint"
+    );
+}
+
 #[test]
 fn no_trailing_slash_drift_when_the_base_url_carries_one() {
     // The issuer value must exact-match regardless of a trailing slash on the
