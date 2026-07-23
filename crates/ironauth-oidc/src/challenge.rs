@@ -78,8 +78,11 @@ use serde_json::Value;
 
 use ironauth_store::{ClientId, ClientRecord, FlowId, Scope};
 
-use crate::authorize::{ChallengeCodeContext, mint_challenge_code, user_is_quarantined};
+use crate::authorize::{
+    AdminConsentOutcome, ChallengeCodeContext, mint_challenge_code, user_is_quarantined,
+};
 use crate::client_auth::{self, ClientAuthError, ClientAuthInputs, ClientAuthMethod};
+use crate::consent_core;
 use crate::flow::model::{Flow, FlowStateTag, Journey, Node, NodeAttributes, NodeGroup, Transport};
 use crate::flow::{Continuation, FlowError, Submission, TransportAuth, create_flow, drive};
 use crate::interaction::{self, SessionCookies};
@@ -768,11 +771,13 @@ fn enforce_challenge_rate_limit(state: &OidcState, key: &str) -> Option<Response
 }
 
 /// Mint the browserless authorization code for a completed challenge login (issue #93). Reads back
-/// the subject the flow authenticated, replicates the browser consent gate's quarantine escalation
-/// (issue #31 / #82: a quarantined client OR user escalates to the browser with `redirect_to_web`
-/// rather than an auto-grant), then mints through [`mint_challenge_code`] with scope / PKCE / the
-/// bound client sourced from `params`. Shared by the fresh one-shot completion and a resume
-/// completion, so BOTH bind the ORIGINAL params.
+/// the subject the flow authenticated, routes the consent decision through the SHARED consent core
+/// (issue #365) so this browserless surface can never again diverge from the browser `/authorize`
+/// gate's quarantine/carve-out logic (the #93 Bet 3 bypass), then mints through
+/// [`mint_challenge_code`] with the core's bound scope / PKCE / the bound client sourced from
+/// `params`. A quarantined client OR user resolves to an interactive-consent need which, since the
+/// browserless endpoint cannot render one, escalates to the browser with `redirect_to_web`. Shared
+/// by the fresh one-shot completion and a resume completion, so BOTH bind the ORIGINAL params.
 async fn complete_challenge(
     state: &OidcState,
     scope: Scope,
@@ -790,23 +795,52 @@ async fn complete_challenge(
             "the request could not be processed",
         );
     };
-    // Replicate the browser consent gate's quarantine checks (issue #31 / #82) that the first-party
-    // carve-out honors: the browserless endpoint cannot render a consent screen, so a quarantined
-    // client or user ESCALATES to the browser instead of minting. `first_party` is enforced at
-    // entry; a challenge carries no `prompt`, so `force_consent` reduces to `client.quarantined`.
+    // The SINGLE quarantine read this surface makes (issue #82), flag-gated exactly as the browser
+    // gate's: its result feeds the shared core, which folds the sensitive-scope strip into
+    // `bound_scope`. FAIL CLOSED on a store fault: never silently mint for a possibly-quarantined
+    // subject; escalate to the browser.
     let user_quarantined = if state.signup_quarantine_enabled() {
         match user_is_quarantined(state, scope, &authenticated.subject).await {
             Ok(quarantined) => quarantined,
-            // FAIL CLOSED: a store fault on the quarantine read must never silently mint a code for
-            // a possibly-quarantined subject; escalate to the browser.
             Err(()) => return redirect_to_web(),
         }
     } else {
         false
     };
-    if client.quarantined || user_quarantined {
-        return redirect_to_web();
-    }
+    // Route the consent decision through the SHARED consent core (issue #365): the challenge surface
+    // is FIRST-PARTY ONLY (enforced at entry), carries NO `prompt`, and cannot render a consent
+    // screen. It therefore supplies `carveout_trusted = true` (every first-party challenge client is
+    // carve-out eligible, the surface's own predicate, NOT re-derived from `consent_mode`), the
+    // not-applicable admin outcome, no consent-lockdown block (the lockdown needs a NON-first-party
+    // client), and no recorded-consent fast path. The core owns the ordered quarantine decision, the
+    // scope strip, and the record-vs-audit choice, so this endpoint can never diverge from the gate.
+    let inputs = consent_core::ConsentInputs {
+        client_quarantined: client.quarantined,
+        user_quarantined,
+        prompt_consent: false,
+        prompt_none: false,
+        carveout_trusted: true,
+        store_skipped_consent: client.store_skipped_consent,
+        unverified_sensitive_block: false,
+        admin: AdminConsentOutcome::NotApplicable,
+        recorded: None,
+        effective_scope: params.scope.as_deref(),
+        consent_check_scope: None,
+        now_micros: crate::util::epoch_micros(state.now()),
+        quarantine_cfg: state.quarantine_config(),
+    };
+    let (bound_scope, consent_ref) = match consent_core::decide(&inputs) {
+        consent_core::ConsentDecision::AutoGrant {
+            bound_scope,
+            consent_ref,
+        } => (bound_scope, consent_ref),
+        // The browserless endpoint cannot render an interactive consent screen, so a required
+        // consent (a quarantined client or a quarantined user) escalates to the browser. `Denied` is
+        // UNREACHABLE on the first-party surface (the lockdown needs a third-party client and the
+        // admin gate is not applicable), but fail closed to the same escalation.
+        consent_core::ConsentDecision::NeedsInteractiveConsent
+        | consent_core::ConsentDecision::Denied { .. } => return redirect_to_web(),
+    };
     let session_ref = authenticated.session_id.to_string();
     // auth_time is frozen onto the code only when the client registered require_auth_time (issue
     // #14), matching the browser path's honesty rule. The challenge parses no `max_age`, so there
@@ -820,8 +854,8 @@ async fn complete_challenge(
         auth_methods: &authenticated.auth_methods,
         auth_time_micros,
         session_ref: &session_ref,
-        oauth_scope: params.scope.as_deref(),
-        user_quarantined,
+        bound_scope: bound_scope.as_deref(),
+        consent_ref,
         code_challenge: params.code_challenge.as_deref(),
         code_challenge_method: params.code_challenge_method.as_deref(),
     };
