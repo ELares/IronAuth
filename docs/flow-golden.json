@@ -1297,14 +1297,7 @@
       "transport": "api",
       "ui": {
         "action": "/t/tnt_golden/e/env_golden/flow/api/recovery/submit",
-        "messages": [
-          {
-            "context": {},
-            "id": 1040004,
-            "kind": "info",
-            "text": "If an account exists for that identifier, we have sent a recovery code. Enter it below to continue."
-          }
-        ],
+        "messages": [],
         "method": "POST",
         "nodes": [
           {
@@ -1362,14 +1355,7 @@
       "transport": "browser",
       "ui": {
         "action": "/t/tnt_golden/e/env_golden/flow/recovery",
-        "messages": [
-          {
-            "context": {},
-            "id": 1040004,
-            "kind": "info",
-            "text": "If an account exists for that identifier, we have sent a recovery code. Enter it below to continue."
-          }
-        ],
+        "messages": [],
         "method": "POST",
         "nodes": [
           {

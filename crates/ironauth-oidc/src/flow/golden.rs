@@ -224,12 +224,18 @@ fn push_transport_goldens(
         None,
     ));
     corpus.push(golden(
+        // The wrong-code re-render carries NO flow-level message (issue #362): the
+        // incorrect-code error rides the code node (RECOVERY_CODE_INCORRECT), and
+        // recovery::advance_verify's Invalid arm returns empty flow messages, so the
+        // "we sent a code" RECOVERY_ACK ack is not repeated on a retry. The golden was
+        // previously stale (it claimed a RECOVERY_ACK flow message the driver never
+        // emits); it now matches the driver.
         leaked(format!("recovery_ack_code_error_{suffix}")),
         transport,
         Journey::Recovery,
         FlowStateTag::RecoveryAck,
         recovery::ack_nodes(transport, id, true),
-        vec![Message::of(message::RECOVERY_ACK)],
+        Vec::new(),
         None,
     ));
 
