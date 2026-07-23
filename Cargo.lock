@@ -1203,7 +1203,7 @@ dependencies = [
  "ironauth-store",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "sqlx",
  "tokio",
  "tower 0.5.3",
@@ -1390,7 +1390,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_urlencoded",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "sqlx",
  "tokio",
  "tower 0.5.3",
@@ -1452,7 +1452,7 @@ dependencies = [
  "ironauth-kms",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "sqlx",
  "tokio",
  "trybuild",
@@ -1469,7 +1469,7 @@ dependencies = [
  "ironauth-jose",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
 ]
 
 [[package]]
