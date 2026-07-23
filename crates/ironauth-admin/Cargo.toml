@@ -306,5 +306,15 @@ name = "oidc_bridge"
 path = "tests/oidc_bridge.rs"
 required-features = ["testing"]
 
+# Multi-algorithm day-one signing-key provisioning (issue #93): env-create
+# provisions all three JWKS algorithms (EdDSA + ES256 + RS256), EdDSA stays the
+# deterministic default signer, each algorithm round-trips through the one verify
+# path, the operator backfill adds only the missing algorithms idempotently, and
+# generation is reproducible under a fixed entropy source. Needs a real database.
+[[test]]
+name = "signing_provisioning"
+path = "tests/signing_provisioning.rs"
+required-features = ["testing"]
+
 [lints]
 workspace = true

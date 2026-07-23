@@ -127,7 +127,7 @@ impl Fixture {
                     region: None,
                 },
                 region,
-                key.as_new(),
+                &[key.as_new()],
                 None,
             )
             .await
@@ -230,7 +230,7 @@ impl Fixture {
                     custom_domain: None,
                     region,
                 },
-                key.as_new(),
+                &[key.as_new()],
                 None,
             )
             .await;

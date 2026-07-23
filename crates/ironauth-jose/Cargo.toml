@@ -28,7 +28,19 @@ serde_json.workspace = true
 serde.workspace = true
 # The determinism seam: exp/nbf/iat are evaluated against env.clock().now_utc(),
 # never SystemTime::now, so claim-window logic is testable with a manual clock.
+# ALSO the source of the keygen RNG bridge (`keygen_rng`): ES256/RS256 day-one keys
+# are generated from a ChaCha20 stream seeded off the entropy seam.
 ironauth-env.workspace = true
+# Asymmetric key GENERATION only (issue #93): ring cannot generate RSA keys and
+# binds its ECDSA generation to its own RNG, so day-one ES256 and RS256 keys are
+# generated here with p256/rsa and exported to PKCS#8 / PKCS#1 DER, then LOADED and
+# signed exclusively through ring (still the one and only signature backend). These
+# crates NEVER sign, verify, or decrypt; the rsa Marvin advisory
+# (RUSTSEC-2023-0071) is on the unreachable decryption path (scoped-ignored in
+# deny.toml). The keygen RNG is seeded off the ironauth-env entropy seam, so keys
+# are reproducible under a fixed test entropy source.
+p256.workspace = true
+rsa.workspace = true
 
 [features]
 default = []

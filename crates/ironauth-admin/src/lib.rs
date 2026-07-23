@@ -42,6 +42,7 @@
 //! `ironauth_store::Store::management` and `docs/adr/0005-management-api.md`.
 
 mod auth;
+mod backfill;
 mod bans;
 mod brand_assets;
 mod client_admin_grants;
@@ -91,9 +92,11 @@ use axum::response::Response;
 use axum::routing::{get, post, put};
 
 pub use auth::Principal;
+pub use backfill::{BackfillError, BackfillReport, backfill_signing_algorithms};
 pub use error::{ApiError, ErrorBody};
 pub use openapi::{management_openapi, openapi_json};
 pub use pagination::ListQuery;
+pub use provision::{DayOneSigningKeys, ProvisionError};
 pub use state::{AdminOidcBridge, AdminState, StateError};
 
 /// Build the management API router.

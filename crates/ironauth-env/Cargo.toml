@@ -10,6 +10,14 @@ repository.workspace = true
 
 [dependencies]
 getrandom.workspace = true
+# The determinism-seam keygen bridge: asymmetric key generation (ironauth-jose,
+# issue #93) needs a CryptoRng, but the seam only exposes raw bytes. `keygen_rng`
+# draws a 32-byte seed off the entropy seam and expands it with a ChaCha20 CSPRNG,
+# so key generation stays reproducible under a fixed test entropy source. Kept in
+# THIS crate (the sole owner of the entropy seam) so no other crate names an RNG
+# crate directly; the invariant lint that bans `rand_core::`/`getrandom::` outside
+# ironauth-env is thereby preserved.
+rand_chacha = { workspace = true }
 
 [lints]
 workspace = true

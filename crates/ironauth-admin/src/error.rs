@@ -253,6 +253,15 @@ impl IntoResponse for ApiError {
     }
 }
 
+impl From<crate::provision::ProvisionError> for ApiError {
+    fn from(error: crate::provision::ProvisionError) -> Self {
+        // Day-one signing-key generation failing is an internal fault (a healthy RNG
+        // never fails ES256/RS256 keygen); the detail is logged, never returned.
+        tracing::error!(error = %error, "day-one signing key generation failed");
+        ApiError::Internal
+    }
+}
+
 impl From<StoreError> for ApiError {
     fn from(error: StoreError) -> Self {
         match error {

@@ -86,7 +86,7 @@ async fn create_tenant_with_first_environment(
                 region: None,
             },
             None,
-            key.as_new(),
+            &[key.as_new()],
             None,
         )
         .await
@@ -121,7 +121,7 @@ async fn create_environment(
                 custom_domain,
                 region: None,
             },
-            key.as_new(),
+            &[key.as_new()],
             None,
         )
         .await
