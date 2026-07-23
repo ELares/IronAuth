@@ -114,10 +114,10 @@ function ClientsForScope({
 }
 
 // The token signing compatibility wizard (issue #93). An operator who has a
-// registered client id picks what will verify that client's ID tokens (the
+// registered client id picks what will verify the client ID tokens (the
 // verifier); the wizard shows the recommended JOSE algorithm, a one line reason,
 // and the alternatives and supported sets for that verifier; on confirm it pins
-// the recommended algorithm onto the client. The interop table is the SERVER's
+// the recommended algorithm onto the client. The interop table is server owned:
 // single source of truth (unit tested in Rust), so this panel renders exactly the
 // rows the read returns and hardcodes NO matrix. The read is unscoped, so it fires
 // once; the write injects the active {tenant, environment} plus the client id.
@@ -136,7 +136,7 @@ function SigningAlgorithmWizard({
     <div class="resource-subsection">
       <h3>Token signing compatibility wizard</h3>
       <p class="resource-note">
-        Pick what will verify a registered client's ID tokens. The wizard shows
+        Pick what will verify the ID tokens of a registered client. The wizard shows
         the recommended signing algorithm for that verifier and, on confirm, pins
         it onto the client. The recommendations come from the server; nothing here
         is hardcoded.
@@ -212,7 +212,7 @@ function SigningAlgorithmWizardForm({
     <form
       class="resource-form"
       onSubmit={onConfirm}
-      aria-label="Set a client's signing algorithm"
+      aria-label="Set the signing algorithm for a client"
     >
       <div class="resource-field">
         <label for="signing-client-id">Client id</label>

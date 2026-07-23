@@ -108,7 +108,7 @@ export type InitialAccessTokenCreated =
 // the single source of truth on the SERVER: SigningRecommendationView is one row
 // (the verifier, its human label, the recommended JOSE algorithm, the one-line
 // reason, and the alternatives / supported sets), and ClientSigningAlgorithmView
-// is the post-condition of pinning a client's ID-token algorithm. Re-exported from
+// is the post-condition of pinning the ID-token algorithm of a client. Re-exported from
 // the generated schema so the wizard never hand maintains a shape the management
 // contract already owns, and never hardcodes the matrix in TypeScript.
 export type SigningRecommendationView =
@@ -897,7 +897,7 @@ export async function createDcrInitialAccessToken(
 // getSigningRecommendations): one row per verifier, each carrying its human
 // label, the recommended JOSE algorithm, a one-line reason, and the alternatives
 // and supported sets. Unscoped and read only: the wizard renders these rows so
-// the recommendation the operator sees is the server's, not a client invented one.
+// the recommendation the operator sees comes from the server, not a client invented one.
 export async function fetchSigningRecommendations(): Promise<
   SigningRecommendationView[]
 > {
@@ -918,7 +918,7 @@ export async function fetchSigningRecommendations(): Promise<
   return Array.isArray(data) ? data : [];
 }
 
-// Pin an EXISTING client's ID-token signing algorithm (operationId
+// Pin the ID-token signing algorithm of an EXISTING client (operationId
 // setClientSigningAlgorithm): a PUT the wizard issues on confirm. The tenant,
 // environment, and client ids substitute into the documented path; the body is
 // the single `{ algorithm }` field (one of EdDSA, ES256, RS256). Idempotency-Key
