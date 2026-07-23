@@ -30,10 +30,13 @@ import {
   type CreateInitialAccessTokenRequest,
   type DcrPolicyView,
   type InitialAccessTokenCreated,
+  type SigningRecommendationView,
   createDcrInitialAccessToken,
   createDcrPolicy,
   fetchDcrPolicies,
+  fetchSigningRecommendations,
   getDcrClient,
+  setClientSigningAlgorithm,
   verifyDcrClient,
 } from "../api/client";
 import { activeScope } from "../scope/store";
@@ -97,12 +100,176 @@ function ClientsForScope({
         registered by a registrant presenting an initial access token.
       </p>
       <DcrClientLookup tenantId={tenantId} environmentId={environmentId} />
+      <SigningAlgorithmWizard
+        tenantId={tenantId}
+        environmentId={environmentId}
+      />
       <DcrPoliciesPanel tenantId={tenantId} environmentId={environmentId} />
       <DcrInitialAccessTokenPanel
         tenantId={tenantId}
         environmentId={environmentId}
       />
     </section>
+  );
+}
+
+// The token signing compatibility wizard (issue #93). An operator who has a
+// registered client id picks what will verify the client ID tokens (the
+// verifier); the wizard shows the recommended JOSE algorithm, a one line reason,
+// and the alternatives and supported sets for that verifier; on confirm it pins
+// the recommended algorithm onto the client. The interop table is server owned:
+// single source of truth (unit tested in Rust), so this panel renders exactly the
+// rows the read returns and hardcodes NO matrix. The read is unscoped, so it fires
+// once; the write injects the active {tenant, environment} plus the client id.
+function SigningAlgorithmWizard({
+  tenantId,
+  environmentId,
+}: {
+  tenantId: string;
+  environmentId: string;
+}) {
+  const { state } = useAsyncResource<SigningRecommendationView[]>(
+    () => fetchSigningRecommendations(),
+    [],
+  );
+  return (
+    <div class="resource-subsection">
+      <h3>Token signing compatibility wizard</h3>
+      <p class="resource-note">
+        Pick what will verify the ID tokens of a registered client. The wizard shows
+        the recommended signing algorithm for that verifier and, on confirm, pins
+        it onto the client. The recommendations come from the server; nothing here
+        is hardcoded.
+      </p>
+      <AsyncBoundary
+        state={state}
+        loadingLabel="Loading recommendations"
+        empty={{
+          when: (rows) => rows.length === 0,
+          render: () => (
+            <p class="resource-empty">
+              No verifier recommendations are available.
+            </p>
+          ),
+        }}
+      >
+        {(rows) => (
+          <SigningAlgorithmWizardForm
+            tenantId={tenantId}
+            environmentId={environmentId}
+            rows={rows}
+          />
+        )}
+      </AsyncBoundary>
+    </div>
+  );
+}
+
+function SigningAlgorithmWizardForm({
+  tenantId,
+  environmentId,
+  rows,
+}: {
+  tenantId: string;
+  environmentId: string;
+  rows: SigningRecommendationView[];
+}) {
+  const [clientId, setClientId] = useState("");
+  const [verifier, setVerifier] = useState(rows[0]?.verifier ?? "");
+  const mutation = useMutation();
+  const scope = activeScope.value;
+  const sudo: SudoRecovery | undefined =
+    scope === null ? undefined : { scope, retry: mutation.retry };
+
+  // The selected row drives the whole recommendation panel. It is derived from
+  // the verifier state, so switching the verifier re-renders the recommended
+  // algorithm, reason, and sets from what the server returned, never a client
+  // computed value. A verifier that is no longer in the rows falls back to the
+  // first row so the panel never renders a stale selection.
+  const selected =
+    rows.find((row) => row.verifier === verifier) ?? rows[0] ?? null;
+
+  function onConfirm(event: Event): void {
+    event.preventDefault();
+    if (selected === null) {
+      return;
+    }
+    const trimmed = clientId.trim();
+    if (trimmed === "") {
+      return;
+    }
+    void mutation.run(async () => {
+      await setClientSigningAlgorithm(
+        tenantId,
+        environmentId,
+        trimmed,
+        selected.recommended,
+      );
+    }, `Signing algorithm set to ${selected.recommended}.`);
+  }
+
+  return (
+    <form
+      class="resource-form"
+      onSubmit={onConfirm}
+      aria-label="Set the signing algorithm for a client"
+    >
+      <div class="resource-field">
+        <label for="signing-client-id">Client id</label>
+        <input
+          id="signing-client-id"
+          type="text"
+          value={clientId}
+          onInput={(event) => setClientId(inputValue(event))}
+        />
+      </div>
+      <div class="resource-field">
+        <label for="signing-verifier">Token verifier</label>
+        <select
+          id="signing-verifier"
+          value={verifier}
+          onInput={(event) =>
+            setVerifier((event.target as HTMLSelectElement).value)
+          }
+        >
+          {rows.map((row) => (
+            <option key={row.verifier} value={row.verifier}>
+              {row.label}
+            </option>
+          ))}
+        </select>
+      </div>
+      {selected === null ? null : (
+        <dl class="resource-detail" aria-label="Recommendation">
+          <dt>Recommended algorithm</dt>
+          <dd>
+            <code class="signing-recommended">{selected.recommended}</code>
+          </dd>
+          <dt>Reason</dt>
+          <dd class="signing-reason">{selected.reason}</dd>
+          <dt>Alternatives</dt>
+          <dd>
+            {selected.alternatives.length === 0
+              ? "none"
+              : selected.alternatives.join(", ")}
+          </dd>
+          <dt>Supported</dt>
+          <dd>{selected.supported.join(", ")}</dd>
+        </dl>
+      )}
+      <button
+        type="submit"
+        class="resource-btn resource-btn-primary"
+        disabled={
+          mutation.state.pending ||
+          selected === null ||
+          clientId.trim() === ""
+        }
+      >
+        Set signing algorithm
+      </button>
+      <MutationFeedback state={mutation.state} sudo={sudo} />
+    </form>
   );
 }
 

@@ -104,6 +104,18 @@ export type CreateInitialAccessTokenRequest =
 export type InitialAccessTokenCreated =
   components["schemas"]["InitialAccessTokenCreated"];
 
+// The token-signing compatibility wizard shapes (issue #93). The interop table is
+// the single source of truth on the SERVER: SigningRecommendationView is one row
+// (the verifier, its human label, the recommended JOSE algorithm, the one-line
+// reason, and the alternatives / supported sets), and ClientSigningAlgorithmView
+// is the post-condition of pinning the ID-token algorithm of a client. Re-exported from
+// the generated schema so the wizard never hand maintains a shape the management
+// contract already owns, and never hardcodes the matrix in TypeScript.
+export type SigningRecommendationView =
+  components["schemas"]["SigningRecommendationView"];
+export type ClientSigningAlgorithmView =
+  components["schemas"]["ClientSigningAlgorithmView"];
+
 // The recorded client-authentication failure diagnostic the admin flow inspector
 // reads (issue #91). Re-exported from the generated schema so the diagnostics view
 // never hand maintains a shape the management contract already owns. It carries ONLY
@@ -863,6 +875,74 @@ export async function createDcrInitialAccessToken(
         header: { "Idempotency-Key": idempotencyKey() },
       },
       body: request,
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+// ---- The token-signing compatibility wizard operations (issue #93) ----------
+//
+// The compatibility wizard (src/ui/ClientsView.tsx) calls these named wrappers,
+// never a path, so the single funnel holds: each literal below is a path the
+// committed docs/openapi/management.json documents, and each throws a
+// ManagementError carrying the verbatim ErrorBody on a non 2xx (the same
+// bodyless-non-2xx guard as above), which the ErrorView boundary renders
+// unchanged. The interop table itself lives on the SERVER (unit tested in Rust);
+// the SPA renders exactly what the read returns and never hardcodes the matrix.
+
+// Read the token-signing compatibility interop table (operationId
+// getSigningRecommendations): one row per verifier, each carrying its human
+// label, the recommended JOSE algorithm, a one-line reason, and the alternatives
+// and supported sets. Unscoped and read only: the wizard renders these rows so
+// the recommendation the operator sees comes from the server, not a client invented one.
+export async function fetchSigningRecommendations(): Promise<
+  SigningRecommendationView[]
+> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.GET(
+    "/v1/interop/signing-recommendations",
+    {},
+  );
+  // A non 2xx is a failure even when openapi-fetch yields no error body (it
+  // returns `error: undefined` for a bodyless response, for example a 401 or 502
+  // with Content-Length 0 from a proxy or gateway). Checking `response.ok` too
+  // means such a response is never silently read as success (an empty table).
+  if (error !== undefined || !response.ok) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  // The 2xx body is the interop array. Guard the shape (a proxy could yield a
+  // bodyless 2xx or a non-array) so the wizard always renders over an array.
+  return Array.isArray(data) ? data : [];
+}
+
+// Pin the ID-token signing algorithm of an EXISTING client (operationId
+// setClientSigningAlgorithm): a PUT the wizard issues on confirm. The tenant,
+// environment, and client ids substitute into the documented path; the body is
+// the single `{ algorithm }` field (one of EdDSA, ES256, RS256). Idempotency-Key
+// guarded (mirroring verifyDcrClient) so a retried confirm records the write once.
+// The returned ClientSigningAlgorithmView states the post-condition.
+export async function setClientSigningAlgorithm(
+  tenantId: string,
+  environmentId: string,
+  clientId: string,
+  algorithm: string,
+): Promise<ClientSigningAlgorithmView> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.PUT(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/signing-algorithm",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          client_id: clientId,
+        },
+        header: { "Idempotency-Key": idempotencyKey() },
+      },
+      body: { algorithm },
     },
   );
   if (error !== undefined || !response.ok || data === undefined) {
