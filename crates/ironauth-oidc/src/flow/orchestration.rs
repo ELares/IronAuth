@@ -227,6 +227,13 @@ impl CompiledJourneySource for FlowVersionJourneySource {
 /// LOAD-VALID by construction (the store validated it on write), so this never fails on a real
 /// row; [`None`] means a corrupt or forward-versioned row, treated as a uniform not-found rather
 /// than an oracle. Compilation is pure, so a cached result is safe.
+///
+/// Compilation is re-run here on every read, so a validity rule TIGHTENED after a row was written
+/// applies retroactively on the read path. Issue #355 tightened the validator to reject a guard on
+/// a source the engine does not populate (a subject group or scope set, or the risk score); a
+/// journey that was stored before that tightening with such a guard now returns [`None`] here, so
+/// its pinned flows resolve to a uniform not-found (fail-closed) rather than the always-default
+/// misroute they took before. This is a deliberate fail-closed migration, never a grant.
 fn compile_stored_artifact(artifact_json: &str) -> Option<CompiledJourney> {
     let journey: ironauth_journey::Journey = serde_json::from_str(artifact_json).ok()?;
     ironauth_journey::compile(&journey).ok()

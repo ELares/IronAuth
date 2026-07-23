@@ -216,6 +216,11 @@ pub struct TranscriptRisk {
 
 impl TranscriptRisk {
     /// The engine [`RiskView`] this transcript form denotes.
+    ///
+    /// A transcript may carry a nonzero `score`, but the engine always emits `score: 0` (the risk
+    /// verdict exposes a level, not a numeric score). This is faithful by vacuity: the risk `/score`
+    /// source is validator-rejected (issue #355), so no compiled guard can ever route on the score,
+    /// and the difference is unreachable at replay time.
     #[must_use]
     pub fn to_view(self) -> RiskView {
         RiskView {
