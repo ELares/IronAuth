@@ -1400,8 +1400,9 @@ mod tests {
 
     #[test]
     fn an_ill_typed_decision_predicate_fails_validation_with_a_pointer() {
-        // A Member over a numeric field (not a string set) is a static mismatch, located at the
-        // decision predicate's pointer.
+        // A Member whose field reads a LIVE but non-matching source (a signal, not the group set)
+        // is a static mismatch, located at the decision predicate's pointer. The source is live so
+        // the reject is the set-kind mismatch rather than the issue #355 source-not-live gate.
         let doc = Journey {
             schema_version: JOURNEY_SCHEMA_VERSION.to_owned(),
             id: "j".to_owned(),
@@ -1414,8 +1415,8 @@ mod tests {
                     decision: Some(DecisionSpec::Predicate {
                         predicate: Predicate::Member {
                             field: FieldRef {
-                                source: FieldSource::Risk,
-                                pointer: "/score".to_owned(),
+                                source: FieldSource::Signals,
+                                pointer: "/mfa_required".to_owned(),
                             },
                             set: crate::artifact::MemberSet::Group {
                                 name: "staff".to_owned(),
@@ -1438,5 +1439,116 @@ mod tests {
                 }
             )])
         );
+    }
+
+    #[test]
+    fn a_guard_on_a_source_the_engine_does_not_populate_fails_validation() {
+        // Issue #355: a decision predicate that reads a NOT-LIVE source (a subject group set, a
+        // subject scope set, or the risk score) is refused at LOAD time (fail-closed at authoring)
+        // rather than silently misrouting to the default branch at runtime.
+        let mismatched_source = |predicate: Predicate| Journey {
+            schema_version: JOURNEY_SCHEMA_VERSION.to_owned(),
+            id: "j".to_owned(),
+            engine_version: JOURNEY_ENGINE_VERSION,
+            entry: "primary".to_owned(),
+            comment: None,
+            steps: vec![
+                step("primary", StepKind::IdentifierPassword, Some("password")),
+                Step {
+                    decision: Some(DecisionSpec::Predicate { predicate }),
+                    ..step("branch", StepKind::Decision, None)
+                },
+                step("done", StepKind::Terminal, None),
+            ],
+            transitions: vec![unguarded("primary", "branch"), unguarded("branch", "done")],
+            subflows: None,
+            subflow_definitions: None,
+        };
+        let group_member = Predicate::Member {
+            field: FieldRef {
+                source: FieldSource::SubjectGroups,
+                pointer: String::new(),
+            },
+            set: crate::artifact::MemberSet::Group {
+                name: "staff".to_owned(),
+            },
+        };
+        assert_eq!(
+            validate(&mismatched_source(group_member)),
+            Err(vec![JourneyError::PredicateType(
+                PredicateTypeError::SourceNotLive {
+                    pointer: "/steps/1/decision/predicate/field".to_owned(),
+                    source: FieldSource::SubjectGroups,
+                }
+            )])
+        );
+        let scope_member = Predicate::Member {
+            field: FieldRef {
+                source: FieldSource::SubjectScopes,
+                pointer: String::new(),
+            },
+            set: crate::artifact::MemberSet::Scope {
+                name: "read".to_owned(),
+            },
+        };
+        assert_eq!(
+            validate(&mismatched_source(scope_member)),
+            Err(vec![JourneyError::PredicateType(
+                PredicateTypeError::SourceNotLive {
+                    pointer: "/steps/1/decision/predicate/field".to_owned(),
+                    source: FieldSource::SubjectScopes,
+                }
+            )])
+        );
+        let score_cmp = Predicate::Cmp {
+            field: FieldRef {
+                source: FieldSource::Risk,
+                pointer: "/score".to_owned(),
+            },
+            op: crate::artifact::CmpOp::Lt,
+            value: crate::artifact::Literal::Number(serde_json::Number::from(50)),
+        };
+        assert_eq!(
+            validate(&mismatched_source(score_cmp)),
+            Err(vec![JourneyError::PredicateType(
+                PredicateTypeError::SourceNotLive {
+                    pointer: "/steps/1/decision/predicate/field".to_owned(),
+                    source: FieldSource::Risk,
+                }
+            )])
+        );
+    }
+
+    #[test]
+    fn a_guard_on_the_live_risk_level_passes_validation() {
+        // Issue #355: the risk `/level` IS engine-live, so a guard reading it is accepted.
+        let doc = Journey {
+            schema_version: JOURNEY_SCHEMA_VERSION.to_owned(),
+            id: "j".to_owned(),
+            engine_version: JOURNEY_ENGINE_VERSION,
+            entry: "primary".to_owned(),
+            comment: None,
+            steps: vec![
+                step("primary", StepKind::IdentifierPassword, Some("password")),
+                Step {
+                    decision: Some(DecisionSpec::Predicate {
+                        predicate: Predicate::Cmp {
+                            field: FieldRef {
+                                source: FieldSource::Risk,
+                                pointer: "/level".to_owned(),
+                            },
+                            op: crate::artifact::CmpOp::Eq,
+                            value: crate::artifact::Literal::String("high".to_owned()),
+                        },
+                    }),
+                    ..step("branch", StepKind::Decision, None)
+                },
+                step("done", StepKind::Terminal, None),
+            ],
+            transitions: vec![unguarded("primary", "branch"), unguarded("branch", "done")],
+            subflows: None,
+            subflow_definitions: None,
+        };
+        assert_eq!(validate(&doc), Ok(()));
     }
 }

@@ -175,6 +175,59 @@ fn pwd_only_journey() -> Journey {
     }
 }
 
+/// A guard on the risk `/level` (issue #355): `Risk /level <op> "<level>"`. The `/level` is a
+/// live engine source as of #355, so a custom journey can route on the real login risk verdict.
+fn risk_level_guard(op: CmpOp, level: &str) -> Predicate {
+    Predicate::Cmp {
+        field: FieldRef {
+            source: FieldSource::Risk,
+            pointer: "/level".to_owned(),
+        },
+        op,
+        value: Literal::String(level.to_owned()),
+    }
+}
+
+/// A journey whose primary step routes on the REAL login risk verdict (issue #355): a High verdict
+/// takes the `review` (MFA) branch, any other verdict completes straight through. Proves the engine
+/// threads the login step's real risk into the routing context rather than a hardcoded Low.
+fn risk_routed_journey() -> Journey {
+    Journey {
+        schema_version: JOURNEY_SCHEMA_VERSION.to_owned(),
+        id: JOURNEY_ID.to_owned(),
+        engine_version: JOURNEY_ENGINE_VERSION,
+        entry: "primary".to_owned(),
+        comment: None,
+        steps: vec![
+            step("primary", StepKind::IdentifierPassword, Some("password")),
+            step("review", StepKind::MfaChallenge, Some("totp")),
+            step("done", StepKind::Terminal, None),
+        ],
+        transitions: vec![
+            Transition {
+                from: "primary".to_owned(),
+                to: "review".to_owned(),
+                guard: Some(risk_level_guard(CmpOp::Eq, "high")),
+                comment: None,
+            },
+            Transition {
+                from: "primary".to_owned(),
+                to: "done".to_owned(),
+                guard: Some(risk_level_guard(CmpOp::Ne, "high")),
+                comment: None,
+            },
+            Transition {
+                from: "review".to_owned(),
+                to: "done".to_owned(),
+                guard: None,
+                comment: None,
+            },
+        ],
+        subflows: None,
+        subflow_definitions: None,
+    }
+}
+
 // ------------------------------------------------------------------------------------------
 // Harness setup with the custom journey source installed.
 // ------------------------------------------------------------------------------------------
@@ -189,15 +242,27 @@ fn pwd_only_journey() -> Journey {
 /// real stored version. The `EmbeddedJourneySource` stays available (exported) for pure,
 /// non-database unit tests of the engine.
 async fn setup_custom(journey: Journey) -> (Harness, Arc<HashingPool>) {
-    let mut harness = Harness::start_store_backed_with(OidcConfig {
-        require_pkce_for_confidential_clients: false,
-        regulation: RegulationConfig {
-            enabled: false,
-            ..RegulationConfig::default()
+    setup_custom_with_config(
+        OidcConfig {
+            require_pkce_for_confidential_clients: false,
+            regulation: RegulationConfig {
+                enabled: false,
+                ..RegulationConfig::default()
+            },
+            ..OidcConfig::default()
         },
-        ..OidcConfig::default()
-    })
-    .await;
+        journey,
+    )
+    .await
+}
+
+/// The custom-journey harness with an explicit `config` (issue #355): the risk-routing test needs
+/// the risk engine ENABLED, so it drives its own config rather than the plain default above.
+async fn setup_custom_with_config(
+    config: OidcConfig,
+    journey: Journey,
+) -> (Harness, Arc<HashingPool>) {
+    let mut harness = Harness::start_store_backed_with(config).await;
     harness.enable_flows();
     let pool = Arc::new(HashingPool::new(
         harness.env().clone(),
@@ -471,6 +536,110 @@ async fn a_custom_journey_conditionally_steps_up_and_completes_with_pwd_plus_tot
     assert!(
         auth_methods.contains("totp"),
         "records the proven totp: {auth_methods}"
+    );
+}
+
+// ------------------------------------------------------------------------------------------
+// Issue #355: a custom journey routes on the REAL login risk verdict, not a hardcoded Low.
+// ------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_custom_journey_routes_on_the_real_login_risk_verdict() {
+    // The risk engine ON with the velocity signal only: a per-account flood scores HIGH, and the
+    // login still COMPLETES (velocity is not a hard-deny), so the risk verdict reaches the routing
+    // context. A fresh login (no history) scores Low.
+    let mut config = OidcConfig {
+        require_pkce_for_confidential_clients: false,
+        regulation: RegulationConfig {
+            enabled: false,
+            ..RegulationConfig::default()
+        },
+        ..OidcConfig::default()
+    };
+    config.risk.enabled = true;
+    config.risk.new_device_enabled = false;
+    config.risk.impossible_travel_enabled = false;
+    config.risk.ip_reputation_enabled = false;
+    config.risk.velocity_enabled = true;
+    config.risk.velocity_med_threshold = 2;
+    config.risk.velocity_high_threshold = 3;
+    let (harness, _pool) = setup_custom_with_config(config, risk_routed_journey()).await;
+
+    // Control: a fresh subject on its first login sees a Low verdict (no velocity history), so the
+    // `Risk /level == "high"` guard falls through to the default branch and the journey completes.
+    harness.seed_user("risk-low@example.test", PASSWORD).await;
+    let (low_flow, low_token, _create) = api_create(&harness).await;
+    let (status, _h, low_done) = post_json(
+        &harness,
+        &submit_api_path(&harness),
+        &json!({
+            "id": low_flow,
+            "submit_token": low_token,
+            "nodes": { "identifier": "risk-low@example.test", "password": PASSWORD },
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "low submit: {low_done}");
+    assert_eq!(
+        low_done["state"], "completed",
+        "a Low verdict routes to the default (done) branch: {low_done}"
+    );
+
+    // The high-risk subject with an enrolled TOTP (so the `review` MFA step can render).
+    let high_subject = harness.seed_user("risk-high@example.test", PASSWORD).await;
+    harness.seed_active_totp(&high_subject).await;
+
+    // Flood the per-account velocity counter past the HIGH threshold with wrong-password submits on
+    // one flow: each re-renders on the primary step and rotates the submit token.
+    let (high_flow, token, _create) = api_create(&harness).await;
+    let mut token = token;
+    for _ in 0..4 {
+        let (status, _h, render) = post_json(
+            &harness,
+            &submit_api_path(&harness),
+            &json!({
+                "id": high_flow,
+                "submit_token": token,
+                "nodes": { "identifier": "risk-high@example.test", "password": "WRONG" },
+            }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a wrong password re-renders: {render}"
+        );
+        assert_ne!(
+            render["state"], "completed",
+            "a wrong password never completes"
+        );
+        token = render["submit_token"]
+            .as_str()
+            .expect("a rotated submit token")
+            .to_owned();
+    }
+
+    // The correct password now: the login step computes a HIGH verdict, so the `Risk /level` guard
+    // fires the `review` (MFA) branch instead of completing. Before #355 the engine hardcoded Low
+    // and this ALWAYS took the default (done) branch.
+    let (status, _h, routed) = post_json(
+        &harness,
+        &submit_api_path(&harness),
+        &json!({
+            "id": high_flow,
+            "submit_token": token,
+            "nodes": { "identifier": "risk-high@example.test", "password": PASSWORD },
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "high submit: {routed}");
+    assert_ne!(
+        routed["state"], "completed",
+        "a High verdict routes to the review branch, not completion: {routed}"
+    );
+    assert!(
+        has_node(&routed["flow"], "code"),
+        "the review (MFA) step renders on the High branch: {routed}"
     );
 }
 

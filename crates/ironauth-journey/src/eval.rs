@@ -574,6 +574,27 @@ fn source_type(source: FieldSource, pointer: &str) -> Option<StaticType> {
     }
 }
 
+/// Whether the flow engine populates a live runtime value for this `(source, pointer)` today
+/// (issue #355): the ONE shared source of truth the engine's context assembly (`assemble_eval_context`)
+/// and the load-time validator agree on. A guard that reads a LIVE source routes on a real value; a
+/// guard that reads a NOT-LIVE source has no populated source, so routing on it would silently take
+/// the default branch. The validator refuses a NOT-LIVE guard at LOAD time (fail-closed at
+/// authoring) rather than letting it misroute at runtime, and the engine assembles the NOT-LIVE
+/// fields as safe empties/defaults knowing no validated guard can reach them.
+///
+/// LIVE: [`FieldSource::Flow`], [`FieldSource::Signals`], [`FieldSource::SubjectTraits`], and
+/// [`FieldSource::Risk`] at `/level`. NOT-LIVE: [`FieldSource::SubjectGroups`],
+/// [`FieldSource::SubjectScopes`], and [`FieldSource::Risk`] at `/score` (the risk decision exposes
+/// a categorical level, not a numeric score). Keyed per `(source, pointer)` exactly as
+/// [`source_type`] is.
+fn source_is_engine_live(source: FieldSource, pointer: &str) -> bool {
+    match source {
+        FieldSource::Flow | FieldSource::Signals | FieldSource::SubjectTraits => true,
+        FieldSource::Risk => pointer == "/level",
+        FieldSource::SubjectGroups | FieldSource::SubjectScopes => false,
+    }
+}
+
 /// The static type of a literal (issue #92).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LiteralType {
@@ -643,6 +664,16 @@ pub enum PredicateTypeError {
         /// The RFC 6901 pointer to the over-deep sub-predicate within the artifact.
         pointer: String,
     },
+    /// A field reads a source the flow engine does not populate at runtime (issue #355): a subject
+    /// group set, a subject scope set, or the risk score. Routing on it would silently take the
+    /// default branch, so it is refused at LOAD time (fail-closed at authoring) rather than
+    /// misrouted at runtime. See [`source_is_engine_live`] for the shared LIVE / NOT-LIVE truth.
+    SourceNotLive {
+        /// The RFC 6901 pointer to the offending `field` within the artifact.
+        pointer: String,
+        /// The source the field reads.
+        source: FieldSource,
+    },
 }
 
 impl fmt::Display for PredicateTypeError {
@@ -671,6 +702,12 @@ impl fmt::Display for PredicateTypeError {
             }
             PredicateTypeError::TooDeep { pointer } => {
                 write!(f, "predicate at {pointer} nests too deep")
+            }
+            PredicateTypeError::SourceNotLive { pointer, source } => {
+                write!(
+                    f,
+                    "field at {pointer} reads a {source:?} source the engine does not populate (see issue #355)"
+                )
             }
         }
     }
@@ -732,6 +769,13 @@ fn typecheck_cmp(
     base: &str,
     errors: &mut Vec<PredicateTypeError>,
 ) {
+    if !source_is_engine_live(field.source, &field.pointer) {
+        errors.push(PredicateTypeError::SourceNotLive {
+            pointer: format!("{base}/field"),
+            source: field.source,
+        });
+        return;
+    }
     let Some(field_type) = source_type(field.source, &field.pointer) else {
         errors.push(PredicateTypeError::UnknownField {
             pointer: format!("{base}/field"),
@@ -767,6 +811,13 @@ fn typecheck_in(
     base: &str,
     errors: &mut Vec<PredicateTypeError>,
 ) {
+    if !source_is_engine_live(field.source, &field.pointer) {
+        errors.push(PredicateTypeError::SourceNotLive {
+            pointer: format!("{base}/field"),
+            source: field.source,
+        });
+        return;
+    }
     let Some(field_type) = source_type(field.source, &field.pointer) else {
         errors.push(PredicateTypeError::UnknownField {
             pointer: format!("{base}/field"),
@@ -797,6 +848,13 @@ fn typecheck_member(
     base: &str,
     errors: &mut Vec<PredicateTypeError>,
 ) {
+    if !source_is_engine_live(field.source, &field.pointer) {
+        errors.push(PredicateTypeError::SourceNotLive {
+            pointer: format!("{base}/field"),
+            source: field.source,
+        });
+        return;
+    }
     let agrees = match set {
         MemberSet::Group { .. } => field.source == FieldSource::SubjectGroups,
         MemberSet::Scope { .. } => field.source == FieldSource::SubjectScopes,
@@ -1461,6 +1519,9 @@ mod tests {
 
     #[test]
     fn the_type_check_accepts_a_well_typed_predicate() {
+        // Every operand reads a LIVE source (issue #355): flow signals, the risk `/level`, and a
+        // subject trait. A guard on a NOT-LIVE source (subject groups / scopes, the risk `/score`)
+        // is covered by `the_type_check_rejects_a_guard_on_a_source_the_engine_does_not_populate`.
         let predicate = Predicate::And {
             operands: vec![
                 cmp(
@@ -1469,24 +1530,12 @@ mod tests {
                     CmpOp::Eq,
                     Literal::Bool(true),
                 ),
-                cmp(
-                    FieldSource::Risk,
-                    "/score",
-                    CmpOp::Lt,
-                    Literal::Number(Number::from(50)),
-                ),
                 Predicate::In {
                     field: field(FieldSource::Risk, "/level"),
                     values: vec![
                         Literal::String("low".to_owned()),
                         Literal::String("medium".to_owned()),
                     ],
-                },
-                Predicate::Member {
-                    field: field(FieldSource::SubjectGroups, ""),
-                    set: MemberSet::Group {
-                        name: "staff".to_owned(),
-                    },
                 },
                 cmp(
                     FieldSource::SubjectTraits,
@@ -1498,6 +1547,85 @@ mod tests {
         };
         let mut errors = Vec::new();
         typecheck_predicate(&predicate, "/root", &mut errors);
+        assert_eq!(errors, Vec::new());
+    }
+
+    #[test]
+    fn the_type_check_rejects_a_guard_on_a_source_the_engine_does_not_populate() {
+        // Issue #355: a guard reading a NOT-LIVE source is refused at load time (fail-closed at
+        // authoring) rather than silently misrouting at runtime. The subject groups, the subject
+        // scopes, and the risk `/score` have no live engine source; the risk `/level` does.
+        let group_member = Predicate::Member {
+            field: field(FieldSource::SubjectGroups, ""),
+            set: MemberSet::Group {
+                name: "staff".to_owned(),
+            },
+        };
+        let mut errors = Vec::new();
+        typecheck_predicate(&group_member, "/g", &mut errors);
+        assert_eq!(
+            errors,
+            vec![PredicateTypeError::SourceNotLive {
+                pointer: "/g/field".to_owned(),
+                source: FieldSource::SubjectGroups,
+            }]
+        );
+
+        let scope_member = Predicate::Member {
+            field: field(FieldSource::SubjectScopes, ""),
+            set: MemberSet::Scope {
+                name: "read".to_owned(),
+            },
+        };
+        let mut errors = Vec::new();
+        typecheck_predicate(&scope_member, "/g", &mut errors);
+        assert_eq!(
+            errors,
+            vec![PredicateTypeError::SourceNotLive {
+                pointer: "/g/field".to_owned(),
+                source: FieldSource::SubjectScopes,
+            }]
+        );
+
+        let score_cmp = cmp(
+            FieldSource::Risk,
+            "/score",
+            CmpOp::Lt,
+            Literal::Number(Number::from(50)),
+        );
+        let mut errors = Vec::new();
+        typecheck_predicate(&score_cmp, "/g", &mut errors);
+        assert_eq!(
+            errors,
+            vec![PredicateTypeError::SourceNotLive {
+                pointer: "/g/field".to_owned(),
+                source: FieldSource::Risk,
+            }]
+        );
+
+        let score_in = Predicate::In {
+            field: field(FieldSource::Risk, "/score"),
+            values: vec![Literal::Number(Number::from(1))],
+        };
+        let mut errors = Vec::new();
+        typecheck_predicate(&score_in, "/g", &mut errors);
+        assert_eq!(
+            errors,
+            vec![PredicateTypeError::SourceNotLive {
+                pointer: "/g/field".to_owned(),
+                source: FieldSource::Risk,
+            }]
+        );
+
+        // The risk `/level` IS live, so a guard on it type-checks cleanly.
+        let level_cmp = cmp(
+            FieldSource::Risk,
+            "/level",
+            CmpOp::Eq,
+            Literal::String("high".to_owned()),
+        );
+        let mut errors = Vec::new();
+        typecheck_predicate(&level_cmp, "/g", &mut errors);
         assert_eq!(errors, Vec::new());
     }
 
@@ -1577,11 +1705,14 @@ mod tests {
 
     #[test]
     fn the_type_check_rejects_a_comparison_over_a_set() {
+        // The flow `/method_tokens` is a LIVE string set (issue #355), so a comparison over it is
+        // rejected as not comparable rather than as a not-live source; the set-comparison guard is
+        // the point being exercised here.
         let predicate = cmp(
-            FieldSource::SubjectGroups,
-            "",
+            FieldSource::Flow,
+            "/method_tokens",
             CmpOp::Eq,
-            Literal::String("staff".to_owned()),
+            Literal::String("password".to_owned()),
         );
         let mut errors = Vec::new();
         typecheck_predicate(&predicate, "/g", &mut errors);
@@ -1595,10 +1726,12 @@ mod tests {
 
     #[test]
     fn the_type_check_rejects_membership_over_a_mismatched_set() {
-        // A membership whose field is a non-set numeric source is a mismatch (Member over a
-        // non-string set).
+        // A membership whose field reads a LIVE but non-matching source is a set-kind mismatch. The
+        // source is live (issue #355) so the reject is the mismatch, not the not-live gate. A group
+        // set requires the (not-live) subject-groups source, so a live source never agrees; the
+        // matching subject-groups / subject-scopes sources are rejected earlier as not-live.
         let predicate = Predicate::Member {
-            field: field(FieldSource::Risk, "/score"),
+            field: field(FieldSource::Signals, "/mfa_required"),
             set: MemberSet::Group {
                 name: "staff".to_owned(),
             },
@@ -1611,11 +1744,11 @@ mod tests {
                 pointer: "/g/field".to_owned()
             }]
         );
-        // A group set paired with the scope source is also a mismatch.
+        // A scope set paired with a live flow source is also a mismatch.
         let crossed = Predicate::Member {
-            field: field(FieldSource::SubjectScopes, ""),
-            set: MemberSet::Group {
-                name: "staff".to_owned(),
+            field: field(FieldSource::Flow, "/step_id"),
+            set: MemberSet::Scope {
+                name: "read".to_owned(),
             },
         };
         let mut crossed_errors = Vec::new();
