@@ -44,8 +44,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ironauth_journey::{
-    CompiledJourney, CompiledStep, EvalContext, OutcomeSignal, RiskView, SignalSet, StepKind,
-    evaluate,
+    CompiledJourney, CompiledStep, OutcomeSignal, RiskView, SignalSet, StepKind,
 };
 use ironauth_store::{FlowId, FlowRecord, NewFlow, Scope, Store, UserId};
 
@@ -632,7 +631,9 @@ pub(super) async fn drive_via_table(
     let mut cursor = current_step_id;
     for _ in 0..=compiled.steps.len() {
         let ctx = assemble_eval_context(state, scope, &cursor, &scratch, &signals, risk).await;
-        let next_id = choose_edge(compiled, &cursor, &ctx).ok_or(FlowError::NotFound)?;
+        let next_id = compiled
+            .choose_edge(&cursor, &ctx)
+            .ok_or(FlowError::NotFound)?;
         let next_step = compiled.step(&next_id).ok_or(FlowError::NotFound)?;
         match &next_step.kind {
             StepKind::Terminal => {
@@ -1194,28 +1195,6 @@ async fn complete_via_table(
         }
     }
     Ok(continuation)
-}
-
-/// Choose the first guarded edge that applies from `from` (issue #92, PR 4): document order, first
-/// whose guard is absent or evaluates true. An evaluation error (only the depth guard, which a
-/// type-checked predicate never hits) is treated as a non-match, never fail-open.
-fn choose_edge(compiled: &CompiledJourney, from: &str, ctx: &EvalContext) -> Option<String> {
-    for edge in compiled.edges(from) {
-        // An eval error counts as "guard did not match" so a corrupt guard cannot force a route.
-        // SAFETY INVARIANT for a built-in artifact: a POSITIVE guard whose false skips a security
-        // requirement (for example /mfa_required gating the challenge edge) must never be able to
-        // error, or "false on error" would relax that requirement. Today the built-in login guards
-        // are depth 1 Cmp predicates that only ever error on MAX_PREDICATE_DEPTH, which they cannot
-        // hit, so this holds; a future built-in guard must preserve it (issue #359).
-        let taken = match &edge.guard {
-            None => true,
-            Some(guard) => evaluate(guard, ctx).unwrap_or(false),
-        };
-        if taken {
-            return Some(edge.to.clone());
-        }
-    }
-    None
 }
 
 /// The persisted state for a table-driven flow ON a given compiled step (issue #92, PR 4;
