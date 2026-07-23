@@ -19,8 +19,8 @@
 //! - an empty-identifier re-render attaches `RECOVERY_IDENTIFIER_REQUIRED` to the identifier node (a
 //!   node-attached error has no fixed golden; its shape is pinned);
 //! - a wrong-code re-render carries `RECOVERY_CODE_INCORRECT` on the code node with EMPTY flow
-//!   messages (the imperative shape, which diverges from the `recovery_ack_code_error` golden's
-//!   `[RECOVERY_ACK]`, so it is a SHAPE check, not a byte-golden compare; see plan H8);
+//!   messages, byte-equal to the `recovery_ack_code_error` golden (reconciled to the driver in
+//!   issue #362, so this is now a full byte-golden compare);
 //! - the terminal yields `Continuation::Complete` with a session whose amr HONESTLY records `otp` and
 //!   never `pwd` / `totp`;
 //! - an ADVERSARIAL forged `custom` step on a recovery row fails closed (no session).
@@ -435,9 +435,9 @@ async fn an_empty_identifier_attaches_to_the_identifier_node() {
 
 // ------------------------------------------------------------------------------------------
 // The gate: a wrong-code re-render carries the uniform incorrect-code message on the code node with
-// EMPTY flow messages (the imperative shape). This DIVERGES from the recovery_ack_code_error golden
-// (which fixes [RECOVERY_ACK]); the flip reproduces the imperative (empty messages), so it is a
-// SHAPE check, not a byte-golden compare (plan H8).
+// EMPTY flow messages. Since issue #362 reconciled the recovery_ack_code_error golden to the driver
+// (empty flow messages, not a repeated RECOVERY_ACK), this is now a full byte-golden compare, not a
+// shape check.
 // ------------------------------------------------------------------------------------------
 
 #[tokio::test]
@@ -483,9 +483,17 @@ async fn a_wrong_code_re_renders_the_uniform_incorrect_code_shape() {
     );
     assert!(
         flow_messages(&rendered).is_empty(),
-        "the imperative wrong-code render carries NO flow message (diverges from the golden's \
-         [RECOVERY_ACK]; plan H8): {:?}",
+        "the wrong-code render carries NO flow message (the incorrect-code error rides the code \
+         node): {:?}",
         flow_messages(&rendered)
+    );
+    // Byte-golden compare: the reconciled recovery_ack_code_error golden (issue #362) now matches
+    // this render exactly, so the flip proves byte-equivalence rather than a shape approximation.
+    assert_golden(
+        &rendered,
+        "recovery_ack_code_error_api",
+        &harness,
+        &rendered.id.clone(),
     );
     assert_eq!(
         session_count(&harness).await,
