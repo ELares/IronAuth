@@ -17,7 +17,9 @@ use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode, header};
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
-use common::{Harness, PKCE_CHALLENGE, PKCE_VERIFIER, REDIRECT_URI, form, json};
+use common::{
+    Harness, PKCE_CHALLENGE, PKCE_VERIFIER, REDIRECT_URI, enc, form, json, location_param,
+};
 use ironauth_config::OidcConfig;
 use ironauth_env::Clock;
 use ironauth_jose::{TotpParams, code_at};
@@ -461,6 +463,95 @@ async fn a_quarantined_user_is_escalated_and_gets_no_offline_refresh() {
     assert!(
         json(&resp)["authorization_code"].is_null(),
         "no code is minted for a quarantined user, so no offline refresh family is reachable: {resp}"
+    );
+}
+
+/// An `/authorize` query for the browser control leg (PKCE + the harness `redirect_uri`).
+fn authorize_query(client_id: &str, scope: &str) -> String {
+    format!(
+        "response_type=code&client_id={client_id}&redirect_uri={}&scope={}&\
+         code_challenge={PKCE_CHALLENGE}&code_challenge_method=S256",
+        enc(REDIRECT_URI),
+        enc(scope),
+    )
+}
+
+#[tokio::test]
+async fn the_challenge_and_browser_escalate_the_same_quarantined_user_through_the_shared_core() {
+    // #365: the browserless challenge endpoint and the browser `/authorize` gate now make the
+    // consent decision in ONE place (`consent_core::decide`), so they can never diverge again (the
+    // #93 Bet 3 bypass). Prove it end to end on the SAME first-party carve-out client: a quarantined
+    // user is ESCALATED (never silently auto-granted) on BOTH surfaces, while a non-quarantined user
+    // is auto-granted on both. If either surface hand-mirrored its own decision, one of these four
+    // assertions would drift.
+    let mut harness = Harness::start().await;
+    harness.enable_first_party_challenge();
+    harness.also_enable_signup_quarantine();
+    let client_id = *harness.client_id();
+    harness.set_client_first_party(&client_id, true).await;
+    // `skip_consent` makes the BROWSER carve-out eligible (the challenge trusts a first-party client
+    // wholesale); with it set, absent quarantine BOTH surfaces silently auto-grant, so a quarantine
+    // is the ONLY thing that can escalate either. That is exactly the shared-core property under test.
+    harness
+        .configure_client_policy(&client_id, "explicit", true, false, None)
+        .await;
+    let client_id_str = client_id.to_string();
+    let subject = harness.seed_user(IDENTIFIER, PASSWORD).await;
+
+    // Control, a non-quarantined user: the challenge mints a code, and the browser silently grants.
+    let (status, body) = challenge(
+        &harness,
+        &challenge_form(&client_id_str, IDENTIFIER, PASSWORD),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the challenge mints for a clean user: {body}"
+    );
+    assert!(
+        json(&body)["authorization_code"].is_string(),
+        "a code is minted for a clean user: {body}"
+    );
+    let cookie = harness.session_cookie(&subject).await;
+    let (status, headers, body) = harness
+        .authorize_with_cookie(&authorize_query(&client_id_str, "openid profile"), &cookie)
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "browser authorize: {body}");
+    assert!(
+        location_param(&headers, "code").is_some(),
+        "the browser silently grants a clean user (the carve-out): {body}"
+    );
+
+    // Quarantine the SAME user: the shared core now escalates it on BOTH surfaces.
+    harness.set_user_quarantined(&subject, true).await;
+
+    // The challenge cannot render a consent screen, so it escalates with redirect_to_web and mints
+    // nothing (the `NeedsInteractiveConsent` mapping).
+    let (status, body) = challenge(
+        &harness,
+        &challenge_form(&client_id_str, IDENTIFIER, PASSWORD),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the challenge escalates a quarantined user: {body}"
+    );
+    assert_eq!(json(&body)["error"], "redirect_to_web");
+    assert!(
+        json(&body)["authorization_code"].is_null(),
+        "no code is minted for a quarantined user: {body}"
+    );
+
+    // The browser makes the SAME decision: no silent grant, routed to the consent screen instead.
+    let (status, headers, body) = harness
+        .authorize_with_cookie(&authorize_query(&client_id_str, "openid profile"), &cookie)
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "browser authorize: {body}");
+    assert!(
+        location_param(&headers, "code").is_none(),
+        "the browser does NOT silently grant a quarantined user (same core decision): {body}"
     );
 }
 

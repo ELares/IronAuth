@@ -2729,7 +2729,8 @@ async fn issue_code_core(
 /// browserless authorization code from: the authenticated subject and the session the challenge
 /// login established, plus the optional PKCE binding the client presented. Borrowed for the mint.
 pub(crate) struct ChallengeCodeContext<'a> {
-    /// The client the code is issued to (must be classified `first_party`).
+    /// The client the code is issued to (must be classified `first_party`). Read for its consent
+    /// mode when a skipped consent is recorded.
     pub client: &'a ClientRecord,
     /// The authenticated end-user subject (a `usr_` id string).
     pub subject: &'a str,
@@ -2740,14 +2741,13 @@ pub(crate) struct ChallengeCodeContext<'a> {
     pub auth_time_micros: Option<i64>,
     /// The authenticating session handle (the session established by the challenge login).
     pub session_ref: &'a str,
-    /// The requested OAuth `scope`, or [`None`].
-    pub oauth_scope: Option<&'a str>,
-    /// Whether the authenticated subject is a QUARANTINED account (issue #82). Belt-and-suspenders:
-    /// the challenge completion path escalates a quarantined user to the browser BEFORE minting, so
-    /// this is normally `false` here; when `true` the SENSITIVE scopes are stripped from the code's
-    /// bound scope regardless, so a future change to the escalation gate still cannot leak
-    /// `offline_access` onto a quarantined user's code.
-    pub user_quarantined: bool,
+    /// The scope to freeze onto the code (issue #365): the shared consent core's `bound_scope`,
+    /// already stripped of sensitive scopes for a quarantined user. [`None`] for the empty set.
+    pub bound_scope: Option<&'a str>,
+    /// The consent-reference IO the shared consent core dictated (issue #365): record a skipped
+    /// consent, audit the skip, or reuse a recorded consent. This minter PERFORMS it; the core
+    /// DECIDED it.
+    pub consent_ref: crate::consent_core::ConsentRefAction,
     /// The presented PKCE `code_challenge`, or [`None`].
     pub code_challenge: Option<&'a str>,
     /// The presented PKCE `code_challenge_method`, or [`None`].
@@ -2756,63 +2756,58 @@ pub(crate) struct ChallengeCodeContext<'a> {
 
 /// Mint an authorization code for a completed first-party challenge (issue #93, Bet 3).
 ///
-/// Records the implicit grant under the SAME first-party consent carve-out the browser
-/// `/authorize` path uses (FORK E): a first-party client skips the interactive consent leg, so the
-/// skipped consent is recorded (when the client stores it) or audited, exactly as the carve-out
-/// does. Then persists a BROWSERLESS code (FORK A) through the SAME [`issue_code_core`] machinery
-/// the browser path uses, bound to NO `redirect_uri`. Returns the code string, or `Err(())` on a
-/// store fault (the caller renders a JSON `server_error`).
+/// The consent decision, the sensitive-scope strip, and the record-vs-audit choice all belong to
+/// the SHARED consent core (issue #365); the caller ran `consent_core::decide` and this minter only
+/// PERFORMS the consent-reference IO the core dictated. FORK E: a skipped consent is recorded (when
+/// the client stores it) so the implicit grant stays enumerable and revocable per app, else audited
+/// so the silent auto-grant still leaves a `consent.skip` trail. Then persists a BROWSERLESS code
+/// (FORK A) through the SAME [`issue_code_core`] machinery the browser path uses, bound to NO
+/// `redirect_uri` and to the core's `bound_scope`. Returns the code string, or `Err(())` on a store
+/// fault (the caller renders a JSON `server_error`).
 pub(crate) async fn mint_challenge_code(
     state: &OidcState,
     scope: Scope,
     client_id: &ClientId,
     context: &ChallengeCodeContext<'_>,
 ) -> Result<String, ()> {
-    // Belt-and-suspenders (issue #82): a QUARANTINED user's code can never carry a SENSITIVE scope
-    // (`offline_access`, an admin/management scope, a configured payment-class scope). The challenge
-    // completion path escalates a quarantined user to the browser BEFORE reaching here, so this is
-    // normally a no-op, but binding the strip to the mint means a future change to the escalation
-    // gate still cannot leak a sensitive scope onto a quarantined user's code. This MIRRORS the
-    // UNCONDITIONAL strip the browser path applies for a quarantined user (authorize.rs, step 6a).
-    let effective_scope: Option<String> = if context.user_quarantined {
-        strip_sensitive_scopes(context.oauth_scope, state.quarantine_config())
-    } else {
-        context.oauth_scope.map(str::to_owned)
-    };
-
-    // FORK E: record the implicit grant exactly as the first-party carve-out (the block at the top
-    // of `resolve_consent_gate`) does: persist a skipped-consent row when the client stores it, so
-    // the grant stays enumerable and revocable per app; otherwise audit the skip so the silent
-    // auto-grant still leaves an audit trail naming the client.
-    let consent_mode = ConsentMode::parse(&context.client.consent_mode);
+    // FORK E: perform the consent-reference IO the shared core dictated. `RecordSkipped` persists a
+    // skipped-consent row against the core's `bound_scope` (the same scope frozen onto the code, so
+    // the recorded scope is byte-identical to the pre-#365 mint, which recorded the same
+    // never-stripped-here scope). `AuditOnly` audits the skip; the challenge surface's own reason
+    // string is preserved verbatim (`first_party_challenge`) so this refactor stays byte-identical
+    // (the core's carve-out reason is the browser's `consent.skip` label, not observable here).
+    // `UseRecorded` is unreachable on the challenge (no recorded-consent fast path) but reused
+    // faithfully if a future surface supplies one.
     let client_id_str = client_id.to_string();
-    let consent_ref = if context.client.store_skipped_consent {
-        Some(
+    let consent_ref = match &context.consent_ref {
+        consent_core::ConsentRefAction::UseRecorded(id) => Some(id.clone()),
+        consent_core::ConsentRefAction::RecordSkipped => Some(
             record_skipped_consent(
                 state,
                 scope,
                 context.subject,
                 &client_id_str,
-                effective_scope.as_deref(),
-                consent_mode,
+                context.bound_scope,
+                ConsentMode::parse(&context.client.consent_mode),
             )
             .await?,
-        )
-    } else {
-        audit_skipped_consent(
-            state,
-            scope,
-            context.subject,
-            client_id,
-            "first_party_challenge",
-        )
-        .await?;
-        None
+        ),
+        consent_core::ConsentRefAction::AuditOnly { .. } => {
+            audit_skipped_consent(
+                state,
+                scope,
+                context.subject,
+                client_id,
+                "first_party_challenge",
+            )
+            .await?;
+            None
+        }
     };
 
     let resolved = Resolved {
         nonce: None,
-        oauth_scope: effective_scope.as_deref(),
+        oauth_scope: context.bound_scope,
         code_challenge: context.code_challenge,
         code_challenge_method: context.code_challenge_method,
         state_echo: None,
