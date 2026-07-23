@@ -309,13 +309,25 @@ pub fn tenant_counter_key(path: AuthPath, tenant: &str, environment: &str) -> St
 }
 
 /// The L1 counter key for the browserless authorization challenge RESUME rate-limit cap (issue
-/// #93, PR4): keyed on the STABLE half of the `auth_session` handle, the `flow_id`, so every
-/// resume hop of one login (the handle rotates each step but the `flow_id` does not) shares one
-/// bucket. Reuses the fast request-shaping L1 layer, not a new store.
+/// #93, PR4): keyed on the STABLE half of the `auth_session` handle (the `flow_id`, which does not
+/// rotate between hops) AND the resolved socket-peer `ip`, so a legit client's own rapid resumes on
+/// one flow share a bucket WITHOUT letting a third party lock the flow out. The `ip` is REQUIRED
+/// (2-lens review MEDIUM 2): the `auth_session` is un-MAC'd and carries the `flow_id` in the clear,
+/// so keying purely on the `flow_id` let an attacker who observed a victim's handle forge decodable
+/// handles (`base64url(flow_id.garbage)`) that each fail the drive but charge the VICTIM's shared
+/// bucket, denying the victim's own legit resume. Adding the non-forgeable resolved peer IP (the
+/// #31 lesson) confines a forged-handle spray to the ATTACKER's `{flow_id, attacker_ip}` bucket,
+/// leaving the victim's `{flow_id, victim_ip}` bucket untouched. A co-located / NAT attacker sharing
+/// the victim's IP is the accepted residual LOW; the substantive per-subject bound remains the
+/// in-flow `SecondFactor` regulation. Reuses the fast request-shaping L1 layer, not a new store.
 #[must_use]
-pub fn challenge_session_counter_key(scope: ironauth_store::Scope, flow_id: &str) -> String {
+pub fn challenge_session_counter_key(
+    scope: ironauth_store::Scope,
+    flow_id: &str,
+    ip: &str,
+) -> String {
     format!(
-        "challenge:session:{}:{}:{flow_id}",
+        "challenge:session:{}:{}:{flow_id}:{ip}",
         scope.tenant(),
         scope.environment()
     )
@@ -323,7 +335,12 @@ pub fn challenge_session_counter_key(scope: ironauth_store::Scope, flow_id: &str
 
 /// The L1 counter key for the browserless authorization challenge FRESH rate-limit cap (issue
 /// #93, PR4): keyed on the client id and the resolved socket-peer IP (the #31 lesson, non-
-/// forgeable), so fresh flow-creation spray from one client and IP shares one bucket.
+/// forgeable), so fresh flow-creation spray from one client and IP shares one bucket. Because the
+/// key is IP-scoped and the cap is fail-OPEN, a co-located (shared-IP / NAT) attacker can exhaust a
+/// PUBLIC client's `{client, ip}` bucket and briefly deny a co-located legit user; this is an
+/// inherent, accepted residual of any IP-keyed limit (the same class as the resume key's post-fix
+/// NAT residual), bounded to a public client and to the window, and never a confidentiality or
+/// integrity failure.
 #[must_use]
 pub fn challenge_fresh_counter_key(
     scope: ironauth_store::Scope,
@@ -661,20 +678,27 @@ mod tests {
 
         let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x00C0_FFEE);
         let scope = Scope::new(TenantId::generate(&env), EnvironmentId::generate(&env));
-        // The resume key is namespaced under `challenge:session` and carries the scope + flow id;
-        // it is STABLE for a given flow id (so a rotating handle keeps one bucket).
-        let session = challenge_session_counter_key(scope, "flw_example");
+        // The resume key is namespaced under `challenge:session` and carries the scope, flow id, and
+        // resolved IP; it is STABLE for a given flow id + IP (so a legit client's rotating handle
+        // keeps one bucket), and a DIFFERENT IP is a different bucket (MEDIUM 2: a forged-handle
+        // spray from another IP cannot exhaust the victim's bucket).
+        let session = challenge_session_counter_key(scope, "flw_example", "203.0.113.7");
         assert!(session.starts_with("challenge:session:"));
-        assert!(session.ends_with(":flw_example"));
+        assert!(session.ends_with(":flw_example:203.0.113.7"));
         assert_eq!(
             session,
-            challenge_session_counter_key(scope, "flw_example"),
-            "the resume key is stable for a flow id"
+            challenge_session_counter_key(scope, "flw_example", "203.0.113.7"),
+            "the resume key is stable for a flow id + IP"
         );
         assert_ne!(
             session,
-            challenge_session_counter_key(scope, "flw_other"),
+            challenge_session_counter_key(scope, "flw_other", "203.0.113.7"),
             "a different flow id is a different bucket"
+        );
+        assert_ne!(
+            session,
+            challenge_session_counter_key(scope, "flw_example", "198.51.100.4"),
+            "a different IP on the same flow is a different bucket (MEDIUM 2)"
         );
         // The fresh key is namespaced under `challenge:fresh` and carries the scope + client + IP.
         let fresh = challenge_fresh_counter_key(scope, "cli_example", "203.0.113.7");

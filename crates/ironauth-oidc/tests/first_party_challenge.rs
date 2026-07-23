@@ -24,7 +24,7 @@ use ironauth_jose::{TotpParams, code_at};
 use ironauth_oidc::ClientAuthMethod;
 use ironauth_oidc::flow::create_flow;
 use ironauth_oidc::flow::model::{Journey, Transport};
-use ironauth_store::UserState;
+use ironauth_store::{ClientId, UserState};
 
 /// The identifier and password the suite's first-party user is seeded with.
 const IDENTIFIER: &str = "native@example.test";
@@ -1450,5 +1450,169 @@ async fn otp_brute_force_on_one_auth_session_is_bounded() {
     assert!(
         bounded,
         "the otp brute force is bounded by a uniform throttle after the threshold"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// PR4 2-lens security review regressions (both live-confirmed, now fixed):
+//  MEDIUM 1 - the malformed-credential 400 path fingerprinted a confidential client's type and
+//             existence. FIXED by collapsing InvalidRequest into the uniform 401 invalid_client.
+//  MEDIUM 2 - the resume rate-limit keyed purely on the cleartext flow_id let a forged-handle spray
+//             lock a victim out of their own resume. FIXED by adding the resolved peer IP to the key.
+// ---------------------------------------------------------------------------------------------
+
+/// The JWT-bearer assertion type; presented WITHOUT an assertion it is a malformed client-auth
+/// attempt that `parse_presented` maps to the seam's `InvalidRequest`, reached only when the parity
+/// seam is CALLED (a confidential client).
+const JWT_BEARER: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
+
+#[tokio::test]
+async fn a_malformed_credential_on_a_confidential_client_is_uniform_invalid_client() {
+    // MEDIUM 1 (fixed): the SAME malformed body (a `client_assertion_type` with no assertion) sent
+    // to a CONFIDENTIAL first-party client must now be BYTE-IDENTICAL to the response for an UNKNOWN
+    // client (401 invalid_client, same body), so it cannot fingerprint that a client_id exists and
+    // is confidential. It must NOT be the old 400 invalid_request, and it must NOT be distinguishable
+    // from the unknown-client rejection.
+    let (harness, conf_id, _secret) = armed_confidential_harness(ClientAuthMethod::Post).await;
+    // A well-formed, in-scope, but NON-existent client id.
+    let unknown_id = ClientId::generate(harness.env(), &harness.scope()).to_string();
+
+    let malformed = |cid: &str| {
+        form(&[
+            ("client_id", cid),
+            ("response_type", "code"),
+            ("username", IDENTIFIER),
+            ("password", PASSWORD),
+            ("client_assertion_type", JWT_BEARER),
+        ])
+    };
+
+    let (conf_status, _h, conf_body) =
+        challenge_full(&harness, &malformed(&conf_id), None, None).await;
+    let (unknown_status, _h, unknown_body) =
+        challenge_full(&harness, &malformed(&unknown_id), None, None).await;
+
+    // The confidential-malformed response is a uniform 401 invalid_client (NOT the old 400).
+    assert_eq!(
+        conf_status,
+        StatusCode::UNAUTHORIZED,
+        "a malformed credential on a confidential client is a uniform 401, not a 400: {conf_body}"
+    );
+    assert_eq!(json(&conf_body)["error"], "invalid_client");
+    assert_ne!(
+        json(&conf_body)["error"],
+        "invalid_request",
+        "the 400 invalid_request fingerprint is closed: {conf_body}"
+    );
+    // The fingerprint is closed: confidential-malformed is BYTE-IDENTICAL to unknown-client.
+    assert_eq!(
+        conf_status, unknown_status,
+        "confidential-malformed shares the unknown-client status"
+    );
+    assert_eq!(
+        conf_body, unknown_body,
+        "confidential-malformed is byte-identical to unknown-client (no existence/type oracle): \
+         conf={conf_body} unknown={unknown_body}"
+    );
+    assert!(
+        json(&conf_body)["authorization_code"].is_null(),
+        "a malformed credential mints nothing: {conf_body}"
+    );
+}
+
+#[tokio::test]
+async fn a_request_field_cannot_downgrade_a_confidential_client_to_public() {
+    // The parity gate keys on the REGISTERED method, so no request field can coerce a confidential
+    // client into the public `none` path (a confused-deputy downgrade). A confidential client with
+    // NO secret plus fields naming `none` / an empty secret is still a uniform 401 invalid_client.
+    let (harness, conf_id, _secret) = armed_confidential_harness(ClientAuthMethod::Post).await;
+    let body = form(&[
+        ("client_id", &conf_id),
+        ("response_type", "code"),
+        ("username", IDENTIFIER),
+        ("password", PASSWORD),
+        // Attempted downgrade vectors (all ignored: the method is the REGISTERED one).
+        ("token_endpoint_auth_method", "none"),
+        ("client_auth_method", "none"),
+        ("auth_method", "none"),
+        ("client_secret", ""),
+    ]);
+    let (status, _h, resp) = challenge_full(&harness, &body, None, None).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a confidential client cannot be downgraded to public via a request field: {resp}"
+    );
+    assert_eq!(json(&resp)["error"], "invalid_client");
+    assert!(json(&resp)["authorization_code"].is_null());
+}
+
+#[tokio::test]
+async fn a_forged_handle_spray_does_not_lock_out_a_victims_resume() {
+    // MEDIUM 2 (fixed): the resume rate-limit key now includes the resolved peer IP, so an attacker
+    // who observed a victim's (un-MAC'd) handle and forges decodable handles (same cleartext
+    // flow_id, garbage submit token) charges only the ATTACKER's {flow_id, attacker_ip} bucket. The
+    // victim's own {flow_id, victim_ip} bucket is untouched, so the victim's genuine resume still
+    // succeeds.
+    const VICTIM_IP: &str = "198.51.100.7";
+    const ATTACKER_IP: &str = "203.0.113.55";
+
+    let (harness, client_id) = armed_mfa_harness().await;
+    let victim_handle = first_hop_auth_session(&harness, &client_id).await;
+
+    // The attacker recovers the stable flow_id in the clear (no MAC) and sprays forged handles from
+    // its OWN IP, saturating its own bucket (soft threshold 5, so the 6th is a 429).
+    let decoded = String::from_utf8(
+        URL_SAFE_NO_PAD
+            .decode(victim_handle.as_bytes())
+            .expect("handle is plain base64url"),
+    )
+    .expect("utf8");
+    let (flow_id, _submit) = decoded.rsplit_once('.').expect("flow_id.submit_token");
+    let mut attacker_saw_429 = false;
+    for i in 0..8 {
+        let forged = forge_auth_session(flow_id, &format!("garbage-submit-{i}"));
+        let (status, _h, body) = challenge_full(
+            &harness,
+            &form(&[("auth_session", &forged), ("otp", "000000")]),
+            None,
+            Some(ATTACKER_IP),
+        )
+        .await;
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            attacker_saw_429 = true;
+        }
+        assert!(
+            json(&body)["authorization_code"].is_null(),
+            "a forged handle never mints a code: {body}"
+        );
+    }
+    assert!(
+        attacker_saw_429,
+        "the attacker's own {{flow_id, attacker_ip}} bucket saturates"
+    );
+
+    // The VICTIM presents their genuine handle and a correct OTP from a DIFFERENT IP: their bucket
+    // is untouched by the attacker's spray, so the resume succeeds and mints the code.
+    harness.clock().advance(std::time::Duration::from_secs(90));
+    let code = totp_code(&harness);
+    let (victim_status, _h, victim_body) = challenge_full(
+        &harness,
+        &form(&[("auth_session", &victim_handle), ("otp", &code)]),
+        None,
+        Some(VICTIM_IP),
+    )
+    .await;
+    assert_eq!(
+        victim_status,
+        StatusCode::OK,
+        "the victim's legitimate resume is NOT locked out by the attacker's forged-handle spray: \
+         {victim_body}"
+    );
+    assert!(
+        json(&victim_body)["authorization_code"]
+            .as_str()
+            .is_some_and(|code| code.starts_with("ac_")),
+        "the victim's resume mints the browserless code: {victim_body}"
     );
 }

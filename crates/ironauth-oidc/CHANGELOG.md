@@ -40,11 +40,15 @@ range per docs/RELEASING.md.
     drive a confidential client's login without its secret; a public `none` client is UNCHANGED (the
     gate is on the REGISTERED method). A failed attempt is a uniform `invalid_client` (401, with
     `WWW-Authenticate: Basic` on a Basic attempt), byte-identical to the malformed/unknown-client
-    rejection so it is not a client-existence oracle. A thin, fail-OPEN L1 rate-limit cap
-    (per-`auth_session` on resume, keyed on the stable `flow_id`; per-client-and-IP on a fresh
-    request) REUSES the issue #64 regulation budget (its window and soft threshold), so over budget
-    is a uniform `429` with the standard `RateLimit` headers; the substantive fail-CLOSED
-    per-credential bound remains the in-flow `regulate_before` that already runs inside `drive`.
+    rejection so it is not a client-existence oracle (a malformed client-auth attempt is collapsed
+    into the same `invalid_client`, not a `400`, so it cannot fingerprint a confidential client). A
+    thin, fail-OPEN L1 rate-limit cap (per-`auth_session` on resume, keyed on the stable `flow_id`
+    AND the resolved peer IP so a forged un-MAC'd handle cannot exhaust a victim's bucket;
+    per-client-and-IP on a fresh request) REUSES the issue #64 regulation budget (its window and soft
+    threshold), so over budget is a uniform `429` with the standard `RateLimit` headers; the
+    substantive fail-CLOSED per-credential bound remains the in-flow `regulate_before` that already
+    runs inside `drive`. A co-located / NAT attacker sharing a victim's IP is an accepted residual of
+    the IP-keyed caps (bounded to the window, fail-open, never a confidentiality or integrity loss).
     `DPoP` / sender-constraint of the browserless code stays a documented residual SHOULD (a
     follow-up), with the shared RFC 7800 `cnf` plumbing as its future insertion point.
 - IdP-side FedCM (W3C Federated Credential Management) READ surface behind an experimental

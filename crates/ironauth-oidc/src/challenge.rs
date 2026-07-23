@@ -34,8 +34,9 @@
 //! request AND every resume hop, so a stolen `auth_session` or a spoofed `client_id` cannot drive a
 //! confidential client's login without its secret; a public `none` client is UNCHANGED (parity is
 //! gated on the REGISTERED method, so a credential free public request is never rejected). (2) A
-//! thin, fail OPEN L1 rate-limit cap (per `auth_session` on resume, keyed on the stable `flow_id`;
-//! per client and resolved IP on a fresh request) reusing the issue #64 regulation budget (its
+//! thin, fail OPEN L1 rate-limit cap (per `auth_session` on resume, keyed on the stable `flow_id`
+//! AND the resolved peer IP so a forged handle cannot lock a victim out; per client and resolved IP
+//! on a fresh request) reusing the issue #64 regulation budget (its
 //! window and soft threshold, so NO new config key), capping request spray before a flow is created
 //! or driven. The SUBSTANTIVE, fail CLOSED per credential bound remains the in-flow
 //! `regulate_before` that already runs inside [`drive`] (the login password verify and the second
@@ -490,12 +491,14 @@ async fn resume_challenge(
     };
 
     // Thin L1 rate-limit cap (issue #93, PR4): cap rapid resume hammering keyed on the STABLE
-    // flow_id (the handle rotates each hop, the flow_id does not), BEFORE the row load. This also
-    // caps the empty-code early-return path the in-flow second-factor counter misses. Fail OPEN;
-    // the substantive per-credential bound is the in-flow regulation inside drive.
+    // flow_id AND the resolved peer IP (2-lens review MEDIUM 2: the IP confines a forged-handle
+    // spray to the attacker's own bucket, so it cannot lock a victim out of their flow), BEFORE the
+    // row load. This also caps the empty-code early-return path the in-flow second-factor counter
+    // misses. Fail OPEN; the substantive per-credential bound is the in-flow regulation inside drive.
+    let resume_ip = crate::abuse::resolved_client_ip(headers).unwrap_or_default();
     if let Some(response) = enforce_challenge_rate_limit(
         state,
-        &crate::abuse::challenge_session_counter_key(scope, &flow_id.to_string()),
+        &crate::abuse::challenge_session_counter_key(scope, &flow_id.to_string(), &resume_ip),
     ) {
         return response;
     }
@@ -642,9 +645,20 @@ async fn resume_challenge(
 /// parity with NO credential and returns `Ok` WITHOUT calling the seam (the seam would reject the
 /// credential-free public request as `MissingClientId` and break the public login loop); a
 /// confidential (or an unrecognized, hence fail-closed) registered method routes through the seam.
-/// A failure maps to a uniform `invalid_client` (401), stamping `WWW-Authenticate: Basic` on a
-/// Basic attempt (RFC 6749 5.2), mirroring the token endpoint (token.rs). On success the
-/// authenticated client id is re-checked against the bound `client_id` (mirrors the token
+///
+/// ANY failure (a wrong/absent credential OR a MALFORMED client-auth attempt) maps to the SAME
+/// uniform `invalid_client` (401), stamping `WWW-Authenticate: Basic` on a Basic attempt (RFC 6749
+/// 5.2). This deliberately DIVERGES from the token endpoint's `InvalidRequest -> 400` mapping
+/// (2-lens review MEDIUM 1): because the challenge endpoint resolves the client (and its
+/// first-party status) BEFORE this seam runs, a 400 on a malformed credential would UNIQUELY
+/// fingerprint a known + first-party + CONFIDENTIAL client (confidential -> 400, unknown -> 401
+/// `invalid_client`, third-party -> 401 `unauthorized_client`, public -> proceeds), a client
+/// existence/type oracle that contradicts this endpoint's own no-oracle posture. A LEGIT
+/// confidential client never produces `InvalidRequest` (it fires only on attacker-shaped auth: an
+/// `assertion_type` without an assertion, a Basic userid that disagrees with the bound id, a dual
+/// method), so collapsing it into `invalid_client` breaks no legit flow and closes the fingerprint:
+/// a confidential-malformed response is now BYTE-IDENTICAL to an unknown-client response. On success
+/// the authenticated client id is re-checked against the bound `client_id` (mirrors the token
 /// endpoint's step-5 binding re-check), so an authenticated-as-another-client credential is refused.
 async fn enforce_client_auth_parity(
     state: &OidcState,
@@ -674,10 +688,27 @@ async fn enforce_client_auth_parity(
         Ok(authenticated) if authenticated.client_id == client_id_str => Ok(()),
         Ok(_) => Err(invalid_client(false)),
         Err(ClientAuthError::InvalidClient { via_basic }) => Err(invalid_client(via_basic)),
-        Err(ClientAuthError::InvalidRequest(message)) => {
-            Err(error(StatusCode::BAD_REQUEST, "invalid_request", message))
-        }
+        // MEDIUM 1: a malformed client-auth attempt is collapsed into the SAME uniform
+        // `invalid_client` (not the token endpoint's 400 `invalid_request`), so it cannot
+        // fingerprint a confidential client. `WWW-Authenticate: Basic` is preserved on a Basic
+        // attempt (a malformed Basic header still presented Basic).
+        Err(ClientAuthError::InvalidRequest(_)) => Err(invalid_client(presented_via_basic(auth))),
     }
+}
+
+/// Whether the request presented an `Authorization: Basic` credential (a Basic authentication
+/// attempt), so a failed attempt carries the RFC 6749 5.2 `WWW-Authenticate: Basic` challenge even
+/// when the seam mapped it to a parse-level `InvalidRequest` (which carries no `via_basic` flag).
+/// The scheme test mirrors the seam's own `is_basic` (a case-insensitive `basic` followed by a
+/// space); `get(..5)` avoids a panic on a non-ASCII byte straddling the boundary.
+fn presented_via_basic(auth: &ChallengeClientAuth<'_>) -> bool {
+    auth.authorization.is_some_and(|value| {
+        value.len() >= 6
+            && value
+                .get(..5)
+                .is_some_and(|scheme| scheme.eq_ignore_ascii_case("basic"))
+            && value.as_bytes()[5] == b' '
+    })
 }
 
 /// The uniform `invalid_client` (401) a confidential client-auth failure returns (issue #93, PR4),
@@ -703,8 +734,9 @@ fn invalid_client(via_basic: bool) -> Response {
 /// The thin, fail-OPEN L1 rate-limit cap the challenge endpoint applies BEFORE driving a flow
 /// (issue #93, PR4), reusing the issue #64 regulation budget (its window and soft threshold) so NO
 /// new config key is introduced. It caps request spray (rapid resume hammering keyed on the stable
-/// `flow_id`, and fresh flow-creation spray keyed on the client and resolved IP) and the empty-code
-/// early-return path the in-flow second-factor counter misses. It is AVAILABILITY biased and FAILS
+/// `flow_id` plus the resolved peer IP, and fresh flow-creation spray keyed on the client and
+/// resolved IP) and the empty-code early-return path the in-flow second-factor counter misses. It
+/// is AVAILABILITY biased and FAILS
 /// OPEN: a disabled regulation or a counter-store error never blocks a login. The SUBSTANTIVE, fail
 /// CLOSED per-credential bound remains the in-flow `regulate_before` that runs inside [`drive`].
 /// Over budget is a uniform `429` carrying the standard `RateLimit` headers, never an oracle.
