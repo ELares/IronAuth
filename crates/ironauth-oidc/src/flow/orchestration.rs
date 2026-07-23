@@ -44,12 +44,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ironauth_journey::{
-    CompiledJourney, CompiledStep, EvalContext, OutcomeSignal, SignalSet, StepKind, evaluate,
+    CompiledJourney, CompiledStep, EvalContext, OutcomeSignal, RiskView, SignalSet, StepKind,
+    evaluate,
 };
 use ironauth_store::{FlowId, FlowRecord, NewFlow, Scope, Store, UserId};
 
 use super::builtin_artifacts::builtin_compiled;
-use super::eval_ctx::assemble_eval_context;
+use super::eval_ctx::{assemble_eval_context, risk_view_from_level};
 use super::message::{self, Message};
 use super::model::{CONTRACT_VERSION, Flow, FlowStateTag, Journey, Node, Transport};
 use super::wire_identity::{render_override_states, wire_state_for};
@@ -306,6 +307,13 @@ enum StepOutcome {
     Advance {
         /// The boolean routing signals this executor emitted.
         signals: SignalSet,
+        /// The risk view a post-step guard routes on (issue #355): the login step carries its real
+        /// risk verdict (mapped from `success.risk_decision.level`), every other executor carries
+        /// the default Low (risk is not recomputed on those hops). Threaded pure in-memory into
+        /// [`assemble_eval_context`]; never persisted (`PersistedState` is byte-gated). Meaningful
+        /// only on the routing hop immediately after the risk-computing login step, matching how the
+        /// imperative driver gates step-up; a risk guard on a later decision step sees Low.
+        risk: RiskView,
         /// An optional post-mint counter reset to thread to the terminal (issue #92, PR 8d): the
         /// recovery verify executor carries the recovery-path abuse context here, so a genuine
         /// completion relaxes the SAME counters the built-in `drive_recovery` does through
@@ -572,7 +580,7 @@ pub(super) async fn drive_via_table(
     // context here so a genuine mint relaxes the SAME counters. Pure in-memory: the flow is consumed
     // in this same drive call, so the ctx is never persisted to `flows.state`. Every other executor
     // yields None.
-    let (signals, post_reset) = match run_step_executor(
+    let (signals, risk, post_reset) = match run_step_executor(
         state,
         scope,
         record,
@@ -606,8 +614,9 @@ pub(super) async fn drive_via_table(
         }
         StepOutcome::Advance {
             signals,
+            risk,
             post_reset,
-        } => (signals, post_reset),
+        } => (signals, risk, post_reset),
     };
 
     // Walk the compiled transitions. Only a decision step continues the walk in-call; a render
@@ -615,7 +624,7 @@ pub(super) async fn drive_via_table(
     // (a well-compiled one always reaches a render or terminal within `steps.len()` hops).
     let mut cursor = current_step_id;
     for _ in 0..=compiled.steps.len() {
-        let ctx = assemble_eval_context(state, scope, &cursor, &scratch, &signals).await;
+        let ctx = assemble_eval_context(state, scope, &cursor, &scratch, &signals, risk).await;
         let next_id = choose_edge(compiled, &cursor, &ctx).ok_or(FlowError::NotFound)?;
         let next_step = compiled.step(&next_id).ok_or(FlowError::NotFound)?;
         match &next_step.kind {
@@ -831,6 +840,10 @@ async fn run_step_executor(
                         .with(OutcomeSignal::ProfilingPending, profiling_pending);
                     Ok(StepOutcome::Advance {
                         signals,
+                        // The risk verdict the login step just computed (issue #355): a post-login
+                        // guard routes on the REAL risk level, matching how the imperative driver
+                        // gates step-up on the same decision.
+                        risk: risk_view_from_level(success.risk_decision.level),
                         post_reset: None,
                     })
                 }
@@ -852,6 +865,9 @@ async fn run_step_executor(
                         signals_after_second_factor(state, scope, record, &subject_id).await;
                     Ok(StepOutcome::Advance {
                         signals,
+                        // Risk is not recomputed on this hop (issue #355): the default Low. A guard
+                        // routing on risk is meaningful only on the post-login hop.
+                        risk: RiskView::default(),
                         post_reset: None,
                     })
                 }
@@ -885,6 +901,9 @@ async fn run_step_executor(
                         signals_after_second_factor(state, scope, record, &subject_id).await;
                     Ok(StepOutcome::Advance {
                         signals,
+                        // Risk is not recomputed on this hop (issue #355): the default Low. A guard
+                        // routing on risk is meaningful only on the post-login hop.
+                        risk: RiskView::default(),
                         post_reset: None,
                     })
                 }
@@ -906,6 +925,9 @@ async fn run_step_executor(
                         .with(OutcomeSignal::ProfilingPending, false);
                     Ok(StepOutcome::Advance {
                         signals,
+                        // Risk is not recomputed on this hop (issue #355): the default Low. A guard
+                        // routing on risk is meaningful only on the post-login hop.
+                        risk: RiskView::default(),
                         post_reset: None,
                     })
                 }
@@ -949,6 +971,8 @@ async fn run_step_executor(
                     scratch.enroll_credential = None;
                     Ok(StepOutcome::Advance {
                         signals: SignalSet::new(),
+                        // Risk is not recomputed on this hop (issue #355): the default Low.
+                        risk: RiskView::default(),
                         post_reset: None,
                     })
                 }
@@ -982,6 +1006,8 @@ async fn run_step_executor(
                     scratch.identifier = Some(identifier);
                     Ok(StepOutcome::Advance {
                         signals: SignalSet::new(),
+                        // Risk is not recomputed on this hop (issue #355): the default Low.
+                        risk: RiskView::default(),
                         post_reset: None,
                     })
                 }
@@ -1005,6 +1031,8 @@ async fn run_step_executor(
                     scratch.enroll_credential = None;
                     Ok(StepOutcome::Advance {
                         signals: SignalSet::new(),
+                        // Risk is not recomputed on this hop (issue #355): the default Low.
+                        risk: RiskView::default(),
                         post_reset: Some(success.ctx),
                     })
                 }

@@ -32,16 +32,20 @@ use crate::state::OidcState;
 /// current step id, the proven method tokens, and the blind subject handle come from the
 /// persisted flow scratch; the outcome signals come from the executor that just ran; the subject
 /// traits come from the #53 sealed trait document (null before a primary factor authenticates a
-/// subject); and the risk view is mapped from the risk compute core's decision (Low pre-mint,
-/// with no live signals to raise it). The subject groups and scopes are wired in PR 5 (the admin
-/// journey store lands the membership sources); a `Member` guard resolves to `false` against the
-/// empty sets until then, which is type-safe (never fail-open).
+/// subject); and the `risk` view is threaded in from the executor that just ran (issue #355): the
+/// login step carries its real risk verdict, every other hop carries the default Low.
+///
+/// The subject groups and scopes are left empty: they have no live engine source, so
+/// [`ironauth_journey`]'s `source_is_engine_live` marks them NOT-LIVE and the load-time validator
+/// REFUSES any guard that reads them (fail-closed at authoring, issue #355). The empties are
+/// therefore unreachable by any validated guard, never a silent misroute and never fail-open.
 pub(super) async fn assemble_eval_context(
     state: &OidcState,
     scope: Scope,
     step_id: &str,
     scratch: &PersistedState,
     signals: &SignalSet,
+    risk: RiskView,
 ) -> EvalContext {
     // The subject's sealed trait document, read at assembly so evaluate stays pure. An absent
     // subject (pre-primary) or an unreadable document resolves to JSON null, which the evaluator
@@ -59,12 +63,13 @@ pub(super) async fn assemble_eval_context(
     EvalContext {
         flow,
         subject_traits,
-        // PR 5 wiring: the subject's group and scope memberships. Empty until then, so a `Member`
-        // guard is a type-safe `false` (the load-time type check already guarantees only a group
-        // set reads `subject_groups` and only a scope set reads `subject_scopes`).
+        // No live engine source: `source_is_engine_live` marks `subject_groups` / `subject_scopes`
+        // NOT-LIVE, so the load-time validator refuses any guard reading them (issue #355). The
+        // empties are unreachable by any validated guard, so a `Member` guard is never a silent
+        // misroute and never fail-open.
         subject_groups: BTreeSet::new(),
         subject_scopes: BTreeSet::new(),
-        risk: risk_view(),
+        risk,
     }
 }
 
@@ -89,14 +94,12 @@ async fn subject_traits(state: &OidcState, scope: Scope, subject: Option<&str>) 
     }
 }
 
-/// The risk view a custom-journey guard reads (issue #92, PR 4): the risk compute core's decision
-/// mapped to the evaluator's [`RiskView`]. Pre-mint, the flow carries no live risk signals, so the
-/// compute core's default decision is `Low`; a later PR that threads live signals into the flow
-/// raises it here without any evaluator change. The numeric score has no pre-mint source, so it
-/// is zero.
-fn risk_view() -> RiskView {
-    let decision = crate::risk::decide_from_signals(Vec::new(), false, None, false, false);
-    let level = match decision.level {
+/// Map the flow's risk decision level to the evaluator's [`RiskView`] (issue #355): the risk level
+/// a custom-journey guard routes on, threaded in from the login step that computed it. Only the
+/// categorical `/level` is engine-live (`source_is_engine_live`), so the numeric score is left
+/// zero; a guard on `/score` is validator-rejected at load time and can never reach this value.
+pub(super) fn risk_view_from_level(level: crate::risk::RiskLevel) -> RiskView {
+    let level = match level {
         crate::risk::RiskLevel::Low => RiskLevel::Low,
         crate::risk::RiskLevel::Med => RiskLevel::Medium,
         crate::risk::RiskLevel::High => RiskLevel::High,
