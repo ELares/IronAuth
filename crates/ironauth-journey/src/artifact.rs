@@ -144,9 +144,12 @@ pub struct Step {
     /// journey's `subflows` list).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subflow: Option<SubflowId>,
-    /// The decision predicate carried by a [`StepKind::Decision`] step. It is validated and type
-    /// checked at load, but the built-in engine routes a decision step through its guarded
-    /// transitions, not this attachment, which is reserved for a future outcome-based routing mode.
+    /// The OPTIONAL decision predicate a [`StepKind::Decision`] step may carry (issue #351). It is a
+    /// reserved slot for a future outcome-based routing mode (the M11 sandbox seam): when ABSENT the
+    /// decision step is a pure routing hub whose guarded transitions carry the branching, and when
+    /// PRESENT it is validated and type checked at load but not yet consulted by the built-in
+    /// edge-guard routing. Only a decision step may carry it: a `decision` on any other kind is a
+    /// load-time [`crate::JourneyError::UnexpectedStepAttachment`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decision: Option<DecisionSpec>,
     /// An optional human-readable comment about the step (data, round-trip-safe).
@@ -176,9 +179,10 @@ pub enum StepKind {
     ProgressiveProfiling,
     /// A pure routing hub: it renders nothing and runs no executor, and the engine routes
     /// onward through this step's own guarded transitions (the transition guards carry the
-    /// branching predicates). The step's `decision` attachment is a reserved slot for a future
-    /// outcome-based routing mode (the M11 sandbox seam) and is not consulted by the built-in
-    /// edge-guard routing.
+    /// branching predicates). Its `decision` attachment is OPTIONAL (issue #351): when ABSENT the
+    /// step is a pure edge-guard routing hub, and when PRESENT the [`DecisionSpec`] is a reserved
+    /// slot for a future outcome-based routing mode (the M11 sandbox seam), validated and type
+    /// checked at load but not yet consulted by the built-in edge-guard routing.
     Decision,
     /// A call into a subflow named by the step's `subflow` reference.
     SubflowCall,
@@ -294,6 +298,37 @@ impl StepKind {
     #[must_use]
     pub fn is_terminal(&self) -> bool {
         matches!(self, StepKind::Terminal)
+    }
+
+    /// Whether this kind READS an already-established subject and so cannot run before one exists
+    /// (issue #351): the second-factor kinds ([`StepKind::MfaChallenge`], [`StepKind::MfaEnroll`])
+    /// and [`StepKind::ProgressiveProfiling`] all resolve the flow's subject (through the engine's
+    /// `mfa_context`) before they render, so a journey that routes into one with no preceding
+    /// subject-establishing step is permanently broken. The load-time validator's
+    /// `check_subject_establishment` uses this to refuse such an artifact. Disjoint from
+    /// [`StepKind::establishes_subject`].
+    #[must_use]
+    pub fn requires_subject(&self) -> bool {
+        matches!(
+            self,
+            StepKind::MfaChallenge | StepKind::MfaEnroll | StepKind::ProgressiveProfiling
+        )
+    }
+
+    /// Whether this kind ESTABLISHES the flow's subject, satisfying the ordering requirement for
+    /// every step downstream of it (issue #351): [`StepKind::IdentifierPassword`] verifies the
+    /// subject the primary factor names, and the mint-family kinds [`StepKind::Registration`] and
+    /// [`StepKind::RecoveryVerify`] mint a session (so they establish a subject too).
+    /// [`StepKind::RecoveryStart`] does NOT (it only delivers a one-time code, no subject yet), and
+    /// neither does [`StepKind::Decision`], [`StepKind::SubflowCall`], [`StepKind::Terminal`], or
+    /// [`StepKind::Unknown`]. Disjoint from [`StepKind::requires_subject`]. A future
+    /// subject-establishing kind MUST be added here so the ordering rule keeps admitting it.
+    #[must_use]
+    pub fn establishes_subject(&self) -> bool {
+        matches!(
+            self,
+            StepKind::IdentifierPassword | StepKind::Registration | StepKind::RecoveryVerify
+        )
     }
 }
 
@@ -680,6 +715,35 @@ mod tests {
         }
         // The closed built-in set grew from seven to ten.
         assert_eq!(StepKind::BUILT_IN.len(), 10);
+    }
+
+    #[test]
+    fn the_subject_taxonomy_is_disjoint_and_correct() {
+        // Issue #351: requires_subject and establishes_subject are disjoint. The second-factor and
+        // profiling kinds read a subject; identifier_password and the two minting kinds establish one.
+        for wire in ["mfa_challenge", "mfa_enroll", "progressive_profiling"] {
+            let kind = StepKind::from_wire(wire);
+            assert!(kind.requires_subject(), "{wire} reads a subject");
+            assert!(!kind.establishes_subject(), "{wire} does not establish one");
+        }
+        for wire in ["identifier_password", "registration", "recovery_verify"] {
+            let kind = StepKind::from_wire(wire);
+            assert!(kind.establishes_subject(), "{wire} establishes a subject");
+            assert!(!kind.requires_subject(), "{wire} does not read one first");
+        }
+        // recovery_start delivers a code but establishes no subject; the routing/terminal kinds do
+        // neither.
+        for wire in ["recovery_start", "decision", "subflow_call", "terminal"] {
+            let kind = StepKind::from_wire(wire);
+            assert!(
+                !kind.requires_subject(),
+                "{wire} does not require a subject"
+            );
+            assert!(
+                !kind.establishes_subject(),
+                "{wire} does not establish a subject"
+            );
+        }
     }
 
     #[test]
