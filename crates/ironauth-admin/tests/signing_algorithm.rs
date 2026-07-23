@@ -241,3 +241,91 @@ async fn get_recommendations_returns_the_matrix_including_the_pinned_rows() {
         );
     }
 }
+
+/// The number of `client.id_token_signed_response_alg.set` audit rows recorded for
+/// `client` in `scope`, read through the control store's audit reader.
+async fn alg_set_audit_rows(h: &Harness, scope: ironauth_store::Scope, client: &ClientId) -> usize {
+    h.control_store()
+        .scoped(scope)
+        .audit()
+        .list()
+        .await
+        .expect("audit list")
+        .into_iter()
+        .filter(|row| {
+            row.action == "client.id_token_signed_response_alg.set"
+                && row.target_id == client.to_string()
+        })
+        .count()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_same_key_same_body_puts_write_exactly_one_audit_row() {
+    // FIX 1 regression: two concurrent PUTs sharing an Idempotency-Key and a body both
+    // pass the cross-role replay check, but the CONDITIONAL, change-only store write plus
+    // the database row lock collapse them into exactly ONE audited change. (Before the
+    // fix, both wrote an audited UPDATE, yielding two rows for one logical operation.)
+    let h = Harness::start_with_signing_registry(50).await;
+    let (scope, client) = provisioned_client(&h).await;
+    let uri = path(scope, &client);
+    let body = r#"{"algorithm":"RS256"}"#;
+
+    let (a, b) = tokio::join!(
+        h.put_with_key(&uri, "k-concurrent", body),
+        h.put_with_key(&uri, "k-concurrent", body),
+    );
+    assert_eq!(a.0, StatusCode::OK, "first concurrent PUT: {}", a.2);
+    assert_eq!(b.0, StatusCode::OK, "second concurrent PUT: {}", b.2);
+    // Both callers see the same recorded 200 response (one is a replay of the other).
+    assert_eq!(a.2, b.2, "both callers receive the same response body");
+
+    assert_eq!(
+        h.client_signing_alg(scope, &client).await.as_deref(),
+        Some("RS256"),
+        "the column holds the pinned value"
+    );
+    assert_eq!(
+        alg_set_audit_rows(&h, scope, &client).await,
+        1,
+        "exactly one audit row for the one logical change"
+    );
+}
+
+#[tokio::test]
+async fn a_no_op_re_pin_of_the_same_value_writes_no_second_audit_row() {
+    // The change-only write also means a sequential re-pin of the SAME value (under a
+    // fresh Idempotency-Key, so it is not an idempotency replay) is a no-op: it succeeds
+    // but writes no additional audit row.
+    let h = Harness::start_with_signing_registry(50).await;
+    let (scope, client) = provisioned_client(&h).await;
+    let uri = path(scope, &client);
+
+    let (status, _, _) = h
+        .put_with_key(&uri, "k-first", r#"{"algorithm":"RS256"}"#)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(alg_set_audit_rows(&h, scope, &client).await, 1);
+
+    // Re-pin the same value under a DIFFERENT key: a real request (not a replay), but a
+    // no-op change, so it succeeds and writes no second audit row.
+    let (status, _, _) = h
+        .put_with_key(&uri, "k-second", r#"{"algorithm":"RS256"}"#)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        alg_set_audit_rows(&h, scope, &client).await,
+        1,
+        "a same-value re-pin writes no additional audit row"
+    );
+
+    // A genuine change (RS256 -> ES256) audits again.
+    let (status, _, _) = h
+        .put_with_key(&uri, "k-third", r#"{"algorithm":"ES256"}"#)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        alg_set_audit_rows(&h, scope, &client).await,
+        2,
+        "a real change writes a second audit row"
+    );
+}

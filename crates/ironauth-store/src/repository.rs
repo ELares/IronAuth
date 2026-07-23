@@ -4274,8 +4274,7 @@ impl ActingClientRepo<'_> {
 
     /// Set a client's `id_token_signed_response_alg` within scope (issue #93): the
     /// compatibility wizard's write through, pinning the algorithm the mint signs
-    /// THIS client's ID token with. Writes a `client.id_token_signed_response_alg.set`
-    /// audit row in the same transaction. Only that one column is touched, under the
+    /// THIS client's ID token with. Only that one column is touched, under the
     /// migration's column-scoped `UPDATE` grant (the data-plane role holds it; the
     /// control role deliberately does not, so this write flows through the data plane).
     ///
@@ -4283,6 +4282,16 @@ impl ActingClientRepo<'_> {
     /// wizard set and the environment's actually signable set (the two-layer check in
     /// the management handler), exactly as DCR's negotiation guarantees the recorded
     /// value is always one the mint can sign with.
+    ///
+    /// CONDITIONAL, change-only audit: the `UPDATE` matches only when the stored value
+    /// actually DIFFERS from `alg` (`IS DISTINCT FROM`), and the
+    /// `client.id_token_signed_response_alg.set` audit row is written only when a row
+    /// changed. Setting the column to the value it already holds is an idempotent no-op
+    /// that commits nothing and writes NO audit row. This is what makes a retry or two
+    /// concurrent same-value writes (the wizard's idempotency is CROSS-ROLE, see the
+    /// management handler) produce exactly ONE audit row: under READ COMMITTED the
+    /// second same-value writer re-evaluates its `WHERE` after the first commits and
+    /// matches zero rows, so it neither writes nor audits.
     ///
     /// # Errors
     ///
@@ -4298,35 +4307,58 @@ impl ActingClientRepo<'_> {
             return Err(StoreError::NotFound);
         }
         let scope = self.scope;
-        let alg = alg.to_owned();
-        write_audited(
-            AuditedWrite {
-                store: self.store,
-                scope,
-                acting: &self.acting,
-                env,
-                action: Action::ClientIdTokenAlgSet,
-                target: id,
-            },
-            async move |tx| {
-                let result = sqlx::query(
-                    "UPDATE clients SET id_token_signed_response_alg = $1 \
-                     WHERE id = $2 AND tenant_id = $3 AND environment_id = $4",
-                )
-                .bind(alg)
-                .bind(id.to_string())
-                .bind(scope.tenant().to_string())
-                .bind(scope.environment().to_string())
-                .execute(&mut **tx)
-                .await?;
-                if result.rows_affected() == 0 {
-                    return Err(StoreError::NotFound);
-                }
-                Ok(())
-            },
-            false,
+
+        let mut tx = begin_scoped(self.store, scope).await?;
+        // Change-only write: `IS DISTINCT FROM` matches solely when the value actually
+        // changes, so a same-value writer (a retry or a concurrent same-key request)
+        // changes nothing. `RETURNING` reports whether a row was in fact updated.
+        let changed = sqlx::query(
+            "UPDATE clients SET id_token_signed_response_alg = $1 \
+             WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 \
+             AND id_token_signed_response_alg IS DISTINCT FROM $1 \
+             RETURNING id",
         )
-        .await
+        .bind(alg)
+        .bind(id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if changed.is_none() {
+            // No row changed: either the client is absent in this scope (the uniform
+            // not-found) or it already holds the target value (an idempotent no-op that
+            // writes NO audit row). A scoped existence probe distinguishes the two.
+            let exists = sqlx::query(
+                "SELECT 1 FROM clients \
+                 WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+            )
+            .bind(id.to_string())
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .fetch_optional(&mut *tx)
+            .await?;
+            if exists.is_none() {
+                // Absent in scope: roll back (drop) and return the uniform not-found.
+                return Err(StoreError::NotFound);
+            }
+            // Already the target value: commit nothing new, write no audit row.
+            tx.commit().await?;
+            return Ok(());
+        }
+
+        // A real change: audit it in the SAME transaction, then commit.
+        let spec = AuditedWrite {
+            store: self.store,
+            scope,
+            acting: &self.acting,
+            env,
+            action: Action::ClientIdTokenAlgSet,
+            target: id,
+        };
+        insert_audit_row(&mut tx, &spec, None).await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Set (or clear) a client's `require_pushed_authorization_requests` flag (RFC

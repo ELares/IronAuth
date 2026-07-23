@@ -13,13 +13,30 @@
 //!   the environment's ACTUALLY signable set (layer 2), so an operator can never pin
 //!   an algorithm the mint would silently fall back from.
 //!
-//! The per-client column is data-plane writable only (the control role holds no grant
-//! on it), and the Idempotency-Key replay table is control-plane only, so the write
-//! and its idempotency row are inherently on different roles. The write (an absolute
-//! value PUT, naturally idempotent) is performed on the data plane through the shared
-//! [`ironauth_oidc::IssuerRegistry`]'s store, then the response is recorded on the
-//! control plane; a concurrent duplicate that stored the key first is resolved by
-//! replaying the original response.
+//! CROSS-ROLE idempotency (NOT same-transaction). The per-client column is data-plane
+//! writable only (the control role holds no grant on it), and the Idempotency-Key replay
+//! table is control-plane only, so the write and its idempotency row are inherently on
+//! DIFFERENT roles and CANNOT share one transaction the way `verify_dcr_client` does. The
+//! write (an absolute value PUT) is performed on the data plane through the shared
+//! [`ironauth_oidc::IssuerRegistry`]'s store, then the response is recorded on the control
+//! plane; a concurrent duplicate that stored the key first is resolved by replaying the
+//! original response.
+//!
+//! Two consequences of the cross-role split, both bounded and safe:
+//!
+//! - Same key, SAME body (a retry or a concurrent duplicate): the store setter is a
+//!   CONDITIONAL, change-only audited write (`ActingClientRepo::set_id_token_signed_response_alg`),
+//!   so the database row lock serializes the racers and exactly ONE audit row is written
+//!   for the one logical change; every caller still gets the same 200.
+//! - Same key, DIFFERENT body (RS256 then ES256): this VIOLATES the Idempotency-Key
+//!   contract (a unique key per distinct request), which the sequential path enforces
+//!   with a 422 fingerprint-mismatch conflict. Under CONCURRENCY, however, two different
+//!   bodies are two real changes, so the persisted column and the recorded 200 response
+//!   can diverge (the column ends at one value while a caller received the other). This is
+//!   an operator KEY-MISUSE edge only; every value ever persisted is validated and
+//!   signable (the two-layer check holds regardless), so it is a consistency, not a
+//!   security, wrinkle. A distributed lock would be disproportionate for an admin
+//!   endpoint, so it is documented rather than closed.
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};

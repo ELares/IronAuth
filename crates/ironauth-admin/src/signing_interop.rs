@@ -108,16 +108,22 @@ const MATRIX: &[InteropCell] = &[
         alternatives: &[],
         reason: "AWS API Gateway JWT authorizers verify RS256, not EdDSA",
     },
-    // citation: Cloudflare Workers Web Crypto (SubtleCrypto) documentation: the supported
-    // verify algorithms are RSASSA PKCS1 v1_5, RSA PSS, and ECDSA; Ed25519 is not part of
-    // the verifiable set for JWT signatures.
+    // citation: Cloudflare Workers Web Crypto (SubtleCrypto) documentation: recent Workers
+    // runtimes verify Ed25519 in addition to RSASSA PKCS1 v1_5, RSA PSS, and ECDSA. RS256
+    // stays the conservative default because it is the most broadly compatible across
+    // runtime versions and downstream tooling.
     InteropCell {
         verifier: Verifier::CloudflareWorkers,
         label: "Cloudflare Workers WebCrypto",
-        supported: &[JwsAlgorithm::Rs256, JwsAlgorithm::Es256],
+        supported: &[
+            JwsAlgorithm::EdDsa,
+            JwsAlgorithm::Es256,
+            JwsAlgorithm::Rs256,
+        ],
         recommended: JwsAlgorithm::Rs256,
-        alternatives: &[JwsAlgorithm::Es256],
-        reason: "Cloudflare Workers WebCrypto verifies RSA and ECDSA signatures, not EdDSA",
+        alternatives: &[JwsAlgorithm::EdDsa, JwsAlgorithm::Es256],
+        reason: "Cloudflare Workers WebCrypto verifies Ed25519 on recent runtimes as well as \
+                 RSA and ECDSA; RS256 stays the broadly compatible default",
     },
     // citation: Azure API Management validate jwt policy, backed by Microsoft.IdentityModel:
     // it validates RSA and ECDSA signed tokens; EdDSA (Ed25519) is not a supported signature
