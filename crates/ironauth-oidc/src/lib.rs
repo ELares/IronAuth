@@ -86,6 +86,7 @@ mod client_credentials;
 mod client_keys;
 mod client_registration;
 mod consent;
+mod consent_core;
 mod dcr_policy;
 mod device;
 mod device_verify;
