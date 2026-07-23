@@ -31594,6 +31594,13 @@ impl ActingTenantRepo<'_> {
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
         let scope = Scope::new(*tenant_id, *environment_id);
+        // An environment must be created with at least one signing key, or its JWKS is
+        // empty and it can issue no tokens; the slice parameter (issue #93) makes a
+        // keyless create expressible, so guard the invariant every live caller upholds.
+        debug_assert!(
+            !signing_keys.is_empty(),
+            "an environment must be created with at least one signing key"
+        );
         // Every day-one key (issue #93: EdDSA + ES256 + RS256) must be in the first
         // environment's scope; a stray out-of-scope key aborts the whole create.
         if signing_keys.iter().any(|key| key.id.scope() != scope) {
@@ -32357,6 +32364,13 @@ impl ActingEnvironmentRepo<'_> {
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
         let scope = Scope::new(self.tenant, *environment_id);
+        // An environment must be created with at least one signing key, or its JWKS is
+        // empty and it can issue no tokens; the slice parameter (issue #93) makes a
+        // keyless create expressible, so guard the invariant every live caller upholds.
+        debug_assert!(
+            !signing_keys.is_empty(),
+            "an environment must be created with at least one signing key"
+        );
         // Every day-one key (issue #93: EdDSA + ES256 + RS256) must be in this new
         // environment's scope; a stray out-of-scope key aborts the whole create.
         if signing_keys.iter().any(|key| key.id.scope() != scope) {
