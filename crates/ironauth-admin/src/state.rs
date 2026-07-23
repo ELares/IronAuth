@@ -386,10 +386,10 @@ impl AdminState {
         // Resolve the admin issuer's registry entry (the SAME keys its JWKS serves).
         // A store-backed registry re-reads the suspension fence here; an unprovisioned,
         // cross-tenant, or fenced scope yields `None` and fails closed.
-        let Some(entry) = bridge.issuers.entry_for(&bridge.issuer_scope).await else {
+        let now = self.inner.env.clock().now_utc();
+        let Some(entry) = bridge.issuers.entry_for(&bridge.issuer_scope, now).await else {
             return Ok(None);
         };
-        let now = self.inner.env.clock().now_utc();
         // The keys published at `now` are exactly those a currently-valid token could
         // have been signed by; a token's `kid` only selects among them, never
         // introduces one (the #9 verify path).

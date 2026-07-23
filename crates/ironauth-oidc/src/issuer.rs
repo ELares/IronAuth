@@ -204,6 +204,27 @@ impl IssuerEntry {
     }
 }
 
+/// An upper bound on the negative cache size (issue #204). When a well-formed but
+/// nonexistent scope is looked up, its miss is recorded here so a flood of
+/// attacker-generated scopes does not drive a fresh `signing_keys` SELECT each
+/// time. The map is bounded: at the cap it is cleared wholesale on the next insert
+/// (a flush just re-queries, so correctness is preserved), which is O(1) amortized
+/// and dependency-free versus an LRU.
+const NEGATIVE_CACHE_CAP: usize = 1024;
+
+/// A cached issuer entry stamped with the instant it was loaded from the store.
+///
+/// The stamp lets the positive cache enforce a bounded staleness ceiling (issue
+/// #204): a store-backed entry older than the registry's `entry_ttl` is treated as
+/// stale and reloaded, so a key rotation or an added algorithm on a still-serving
+/// scope is picked up within one TTL with no restart. A loader-less (pre-populated)
+/// registry has no store to reload from, so its entries never expire (the stamp is
+/// unused on that path).
+struct CachedEntry {
+    entry: Arc<IssuerEntry>,
+    loaded_at: SystemTime,
+}
+
 /// The registry of per-environment issuers.
 ///
 /// Keyed by the FULL `(tenant, environment)` [`Scope`], so an entry can never be
@@ -224,10 +245,20 @@ pub struct IssuerRegistry {
     // Interior-mutable so the store-backed registry fills entries lazily behind a
     // shared `Arc`. The async store read happens OUTSIDE this lock; the lock is
     // taken only for the fast map lookup and the insert.
-    entries: RwLock<HashMap<Scope, Arc<IssuerEntry>>>,
+    entries: RwLock<HashMap<Scope, CachedEntry>>,
+    // The bounded, TTL'd negative cache (issue #204): a scope maps to the instant
+    // its genuine post-fence miss was recorded, so a repeated lookup of a
+    // well-formed nonexistent scope short-circuits the signing_keys SELECT (never
+    // the fence) until the TTL lapses.
+    negatives: RwLock<HashMap<Scope, SystemTime>>,
     // The data-plane store the lazy loader reads per-environment signing keys
     // through. `None` for a pre-populated registry, which never loads from a store.
     loader: Option<Store>,
+    // The bounded staleness ceiling on the positive keyset cache (issue #204):
+    // defaults to the JWKS cache window (`cache.max_age()`) and is tunable through
+    // `with_entry_ttl`. This is the interim mechanism that bounds rotation-pickup
+    // latency until M16 wires event-driven invalidation on the rotation write path.
+    entry_ttl: Duration,
 }
 
 impl IssuerRegistry {
@@ -242,7 +273,12 @@ impl IssuerRegistry {
             issuer_base: issuer_base.into(),
             cache,
             entries: RwLock::new(HashMap::new()),
+            negatives: RwLock::new(HashMap::new()),
             loader: None,
+            // Default the positive-cache staleness ceiling to the JWKS cache window,
+            // so a rotation is picked up within the same window a relying party may
+            // cache the JWKS for (issue #204). Tunable through `with_entry_ttl`.
+            entry_ttl: cache.max_age(),
         }
     }
 
@@ -262,8 +298,25 @@ impl IssuerRegistry {
             issuer_base: issuer_base.into(),
             cache,
             entries: RwLock::new(HashMap::new()),
+            negatives: RwLock::new(HashMap::new()),
             loader: Some(store),
+            // Same default as `new`: the positive-cache staleness ceiling is the
+            // JWKS cache window (issue #204), tunable through `with_entry_ttl`.
+            entry_ttl: cache.max_age(),
         }
+    }
+
+    /// Override the positive/negative cache staleness ceiling (issue #204).
+    ///
+    /// The default is the JWKS cache window (`cache.max_age()`), which is already a
+    /// safe, configured bound; this setter exists so a deployment can tune the
+    /// rotation-pickup latency independently. The TTL bounds how long a rotation or
+    /// an added algorithm on a serving scope can take to appear (the positive
+    /// cache), and how long a well-formed nonexistent scope stays negatively cached.
+    #[must_use]
+    pub fn with_entry_ttl(mut self, ttl: Duration) -> Self {
+        self.entry_ttl = ttl;
+        self
     }
 
     /// Pre-populate `scope`'s issuer entry (the pre-populated path). Takes `&self`
@@ -274,10 +327,19 @@ impl IssuerRegistry {
     /// Panics only if the internal lock is poisoned, which happens after a panic
     /// while another thread held it (never in normal operation).
     pub fn insert(&self, scope: Scope, entry: IssuerEntry) {
+        // A pre-populated entry belongs to a loader-less registry, which never
+        // expires its cache (there is no store to reload from), so the stamp is
+        // unused; the Unix epoch is the honest placeholder.
         self.entries
             .write()
             .expect("issuer registry lock is not poisoned")
-            .insert(scope, Arc::new(entry));
+            .insert(
+                scope,
+                CachedEntry {
+                    entry: Arc::new(entry),
+                    loaded_at: SystemTime::UNIX_EPOCH,
+                },
+            );
     }
 
     /// The JWKS cache window.
@@ -296,15 +358,17 @@ impl IssuerRegistry {
         self.loader.as_ref()
     }
 
-    /// The issuer entry for `scope`, loading and caching it on the first access
-    /// when this registry is store-backed. `None` when the environment has no
-    /// provisioned signing key (fail closed) or names a cross-tenant environment
-    /// (RLS yields no rows), or when this registry has no loader and the scope was
-    /// never pre-populated.
+    /// The issuer entry for `scope` at `now`, loading and caching it on the first
+    /// access (or after the cached entry goes stale) when this registry is
+    /// store-backed. `None` when the environment has no provisioned signing key
+    /// (fail closed) or names a cross-tenant environment (RLS yields no rows), or
+    /// when this registry has no loader and the scope was never pre-populated.
     ///
     /// A cache miss reads the store OUTSIDE the lock; two concurrent misses for the
     /// same scope may both load, which is idempotent (both build from the same
-    /// RLS-scoped rows) and the first insert wins.
+    /// RLS-scoped rows). The insert is last-writer-wins: a stale refresh MUST
+    /// overwrite the stale value, and two cold misses overwrite each other with an
+    /// equivalent entry plus a fresher stamp, which is harmless.
     ///
     /// The data-plane suspension fence (issue #46) is AUTHORITATIVE on EVERY
     /// resolution for a store-backed registry, not only on a cold load: the
@@ -313,16 +377,33 @@ impl IssuerRegistry {
     /// request, with no process restart and no cache eviction. A previously cached
     /// (already-served) entry is therefore never handed back once its scope is
     /// fenced. A store error reading the fence FAILS CLOSED (denies serving), never
-    /// open. (This per-request re-fence closes the never-invalidated registry-cache
-    /// class tracked as #204 for the serving-state dimension: a stale cached entry
-    /// can no longer outlive a suspend, delete, or resume.)
+    /// open.
+    ///
+    /// The positive keyset cache now carries a bounded TTL (issue #204, default =
+    /// the JWKS cache window): a store-backed entry older than `entry_ttl` is
+    /// treated as stale and reloaded, so a key rotation or an added algorithm on a
+    /// still-serving scope is picked up within one TTL with no restart, on every
+    /// instance. A loader-less (pre-populated) registry has no store to reload from
+    /// and NEVER expires its entries. Event-driven invalidation on the rotation
+    /// write path is deferred to M16; this TTL is the interim staleness ceiling.
+    ///
+    /// A CONFIRMED post-fence absence (the store answered, and there is genuinely no
+    /// entry) is recorded in a bounded, TTL'd negative cache so a flood of well-formed
+    /// nonexistent scopes does not drive a fresh `signing_keys` SELECT each time. A
+    /// TRANSIENT store error is NEVER negative-cached (that would 404 a real, healthy
+    /// scope for a full TTL over a momentary blip): it returns `None` so the very next
+    /// request retries, exactly as an uncached miss did before #204. The negative
+    /// cache short-circuits ONLY the store load, never the fence (which runs first,
+    /// every request); a suspended real scope is fenced before the negative cache is
+    /// consulted, and a successful load evicts any negative for the scope so a freshly
+    /// provisioned scope is never shadowed.
     ///
     /// # Panics
     ///
     /// Panics only if the internal lock is poisoned, which happens after a panic
     /// while another thread held it (never in normal operation).
-    pub async fn entry_for(&self, scope: &Scope) -> Option<Arc<IssuerEntry>> {
-        // The fence is consulted FIRST, ahead of the cache, so it governs the fast
+    pub async fn entry_for(&self, scope: &Scope, now: SystemTime) -> Option<Arc<IssuerEntry>> {
+        // The fence is consulted FIRST, ahead of every cache, so it governs the fast
         // path too. A pre-populated (loader-less) registry has no serving state to
         // read and is never fenced here (the store-free test path).
         if let Some(store) = self.loader.as_ref() {
@@ -330,26 +411,104 @@ impl IssuerRegistry {
                 return None;
             }
         }
-        // Fast path: an already-cached entry (pre-populated or previously loaded).
-        if let Some(entry) = self
-            .entries
-            .read()
-            .expect("issuer registry lock is not poisoned")
-            .get(scope)
-        {
-            return Some(Arc::clone(entry));
+        // Fast path: a cached entry served only when this registry is loader-less
+        // (no store to reload from, so it never expires) OR the entry is still fresh
+        // within the TTL. A stale store-backed entry falls through to a reload.
+        if let Some(entry) = self.fresh_cached(scope, now) {
+            return Some(entry);
+        }
+        // A still-fresh negative short-circuits the store load (never the fence,
+        // which already ran above).
+        if self.negative_is_fresh(scope, now) {
+            return None;
         }
         // Slow path: load from the store, scoped to this exact (tenant, environment).
         let store = self.loader.as_ref()?;
-        let entry = Arc::new(load_issuer_entry(store, scope).await?);
-        let mut guard = self
+        match load_issuer_entry(store, scope).await {
+            LoadOutcome::Loaded(loaded) => {
+                let entry = Arc::new(loaded);
+                self.store_positive(*scope, Arc::clone(&entry), now);
+                Some(entry)
+            }
+            // A CONFIRMED absence: safe to negative-cache so a scope flood is bounded.
+            LoadOutcome::Empty => {
+                self.record_negative(*scope, now);
+                None
+            }
+            // A TRANSIENT store error: do NOT negative-cache (that would amplify a blip
+            // into a TTL-long fail-closed outage for a real scope) and do NOT serve a
+            // stale entry (that would extend a compromise-rotation staleness window
+            // during errors). Return None so the very next request retries, exactly as
+            // pre-#204 did.
+            LoadOutcome::Error => None,
+        }
+    }
+
+    /// Whether `stamped` is within the cache staleness ceiling at `now`. A backwards
+    /// clock (`duration_since` errs because `now < stamped`) reads as NOT fresh, so
+    /// the registry fails toward reloading fresh data.
+    fn is_fresh(&self, stamped: SystemTime, now: SystemTime) -> bool {
+        now.duration_since(stamped)
+            .is_ok_and(|age| age < self.entry_ttl)
+    }
+
+    /// The cached entry for `scope`, if present AND servable: a loader-less registry
+    /// always serves a present entry (no store to reload from), a store-backed one
+    /// serves it only while fresh.
+    fn fresh_cached(&self, scope: &Scope, now: SystemTime) -> Option<Arc<IssuerEntry>> {
+        let guard = self
             .entries
+            .read()
+            .expect("issuer registry lock is not poisoned");
+        let cached = guard.get(scope)?;
+        if self.loader.is_none() || self.is_fresh(cached.loaded_at, now) {
+            Some(Arc::clone(&cached.entry))
+        } else {
+            None
+        }
+    }
+
+    /// Whether `scope` has a still-fresh negative-cache entry at `now`.
+    fn negative_is_fresh(&self, scope: &Scope, now: SystemTime) -> bool {
+        self.negatives
+            .read()
+            .expect("issuer registry lock is not poisoned")
+            .get(scope)
+            .is_some_and(|recorded| self.is_fresh(*recorded, now))
+    }
+
+    /// Cache a freshly loaded entry (last-writer-wins) and evict any negative for
+    /// the scope, so a freshly provisioned scope is never shadowed by a stale
+    /// negative within the TTL.
+    fn store_positive(&self, scope: Scope, entry: Arc<IssuerEntry>, now: SystemTime) {
+        self.entries
+            .write()
+            .expect("issuer registry lock is not poisoned")
+            .insert(
+                scope,
+                CachedEntry {
+                    entry,
+                    loaded_at: now,
+                },
+            );
+        self.negatives
+            .write()
+            .expect("issuer registry lock is not poisoned")
+            .remove(&scope);
+    }
+
+    /// Record a genuine post-fence miss in the bounded negative cache. When the map
+    /// is at the cap and this scope is not already present, it is cleared wholesale
+    /// (a flush just re-queries), keeping the cache bounded without an LRU.
+    fn record_negative(&self, scope: Scope, now: SystemTime) {
+        let mut guard = self
+            .negatives
             .write()
             .expect("issuer registry lock is not poisoned");
-        // A concurrent load may have inserted first; keep whichever is present.
-        Some(Arc::clone(
-            guard.entry(*scope).or_insert_with(|| Arc::clone(&entry)),
-        ))
+        if guard.len() >= NEGATIVE_CACHE_CAP && !guard.contains_key(&scope) {
+            guard.clear();
+        }
+        guard.insert(scope, now);
     }
 
     /// The per-environment issuer string for `scope`. Two environments never share
@@ -385,7 +544,7 @@ impl IssuerRegistry {
         scope: &Scope,
         now: SystemTime,
     ) -> Option<Result<String, SigningKeyError>> {
-        let entry = self.entry_for(scope).await?;
+        let entry = self.entry_for(scope, now).await?;
         Some(
             entry
                 .keyset()
@@ -410,26 +569,67 @@ async fn scope_is_fenced(store: &Store, scope: &Scope) -> bool {
     }
 }
 
+/// The outcome of a store-backed issuer load (issue #204). A CONFIRMED absence is
+/// negative-cacheable; a transient store error must NOT be cached, so a real scope
+/// is never 404-ed for a full TTL because of a momentary blip.
+enum LoadOutcome {
+    /// The environment's live issuer entry loaded successfully.
+    Loaded(IssuerEntry),
+    /// A CONFIRMED absence: no key rows, RLS-zero (cross-tenant), or every row
+    /// unreconstructable. This is a real 404 and is safe to negative-cache.
+    Empty,
+    /// A TRANSIENT store read error: the caller must retry on the next request and
+    /// must NEVER negative-cache this, or a millisecond DB blip would 404 a real,
+    /// healthy scope for a full TTL.
+    Error,
+}
+
 /// Load one environment's live issuer entry from the store, scoped (RLS-forced) to
 /// `scope`.
 ///
-/// Returns `None` when the environment has no provisioned signing key (the empty
-/// key set is the fail-closed 404 / `server_error`), when a stored key cannot be
-/// reconstructed, or when the derived policy is empty. A request that names an
-/// environment under the wrong tenant loads zero rows here (RLS), so it too
-/// resolves to `None`: a self-consistent bogus issuer can never resolve.
-async fn load_issuer_entry(store: &Store, scope: &Scope) -> Option<IssuerEntry> {
+/// Returns [`LoadOutcome::Empty`] (a fail-closed 404 / `server_error`) when the
+/// environment has no provisioned signing key, when NO stored key can be
+/// reconstructed, or when the derived policy is empty. A single unreconstructable
+/// row is DEGRADED, not fatal: it is skipped (and logged) and the loadable subset
+/// still serves, so one bad sibling never 404s a healthy environment; an all-bad
+/// environment still fails closed. A request that names an environment under the
+/// wrong tenant loads zero rows here (RLS), so it too resolves to
+/// [`LoadOutcome::Empty`]: a self-consistent bogus issuer can never resolve.
+///
+/// A TRANSIENT store read error (a pool timeout, a reset connection, a statement
+/// timeout) on either the keys or the guardrails SELECT returns
+/// [`LoadOutcome::Error`], distinct from a confirmed absence, so the caller can
+/// retry it on the next request instead of caching it as a 404.
+async fn load_issuer_entry(store: &Store, scope: &Scope) -> LoadOutcome {
     // The data-plane suspension fence (issue #46) is enforced by the caller,
     // `IssuerRegistry::entry_for`, on EVERY resolution (see `scope_is_fenced`), so it
     // governs both this cold load and the cached fast path. It is not re-checked here.
-    let records = store.scoped(*scope).signing_keys().list().await.ok()?;
+    // A transient read error is NOT a confirmed absence: retry, never cache.
+    let Ok(records) = store.scoped(*scope).signing_keys().list().await else {
+        return LoadOutcome::Error;
+    };
     if records.is_empty() {
-        return None;
+        return LoadOutcome::Empty;
     }
     let mut keyset: Option<KeySet> = None;
     let mut algorithms: Vec<JwsAlgorithm> = Vec::new();
     for record in &records {
-        let key = load_signing_key(record).ok()?;
+        // Degrade, do not fail the whole environment: a single unreconstructable
+        // row is skipped so the loadable subset still serves (issue #204). Log only
+        // the row id and the algorithm string, NEVER key material (which the record
+        // redacts in Debug regardless).
+        let key = match load_signing_key(record) {
+            Ok(key) => key,
+            Err(err) => {
+                tracing::warn!(
+                    signing_key_id = %record.id,
+                    algorithm = %record.algorithm,
+                    error = %err,
+                    "skipping a malformed signing key row; serving the loadable subset"
+                );
+                continue;
+            }
+        };
         let algorithm = key.algorithm();
         if !algorithms.contains(&algorithm) {
             algorithms.push(algorithm);
@@ -442,9 +642,14 @@ async fn load_issuer_entry(store: &Store, scope: &Scope) -> Option<IssuerEntry> 
             Some(set) => set.add(key, activate_at),
         }
     }
-    // Non-empty by construction (records is non-empty and every record yielded a
-    // key), so both the keyset and the policy are present.
-    let keyset = keyset?;
+    // Fail closed if NO row yielded a key (an all-bad environment, or every row
+    // unreconstructable): the empty key set is the same 404 as an unprovisioned
+    // environment, so a token is never minted without a signing key. This is a
+    // CONFIRMED absence (the store answered; the rows are just all bad), so it is
+    // negative-cacheable.
+    let Some(keyset) = keyset else {
+        return LoadOutcome::Empty;
+    };
     // The policy is exactly the algorithms the loaded keys sign with, so an
     // ES256-only environment yields policy {ES256} and can emit nothing else
     // (AC #3): signing needs both a key of the algorithm and a policy that permits
@@ -459,7 +664,12 @@ async fn load_issuer_entry(store: &Store, scope: &Scope) -> Option<IssuerEntry> 
     // algorithms actually present, so EdDSA stays the deterministic default whenever
     // it is provisioned. Any present algorithm outside the canonical list (a future
     // key kind) is appended in its loaded order so it is never silently dropped.
-    let policy = SigningPolicy::new(canonical_algorithm_order(&algorithms)).ok()?;
+    let Ok(policy) = SigningPolicy::new(canonical_algorithm_order(&algorithms)) else {
+        // Defensive and unreachable: a non-empty keyset guarantees a non-empty
+        // algorithm list. Treat it as a confirmed absence (not a transient error),
+        // so it 404s deterministically rather than looping a retry.
+        return LoadOutcome::Empty;
+    };
     // PLACEHOLDER salt: per-environment salt persistence and the pairwise wiring
     // are a later milestone; nothing live reads this salt yet (the data-plane token
     // path resolves PUBLIC subjects, which never consult a salt, see
@@ -468,15 +678,19 @@ async fn load_issuer_entry(store: &Store, scope: &Scope) -> Option<IssuerEntry> 
     // The environment's TYPED guardrails (issue #42), read from the scope-forced
     // projection the data plane CAN see (the environments level table it cannot).
     // The environment has a provisioned key (records is non-empty), so its guardrail
-    // row exists; a read failure fails CLOSED (the whole entry resolves to None, a
-    // 404), never silently defaulting to the relaxed non-production set.
-    let guardrails = store
+    // row exists; a read failure fails CLOSED (the whole entry resolves to a 404),
+    // never silently defaulting to the relaxed non-production set. A transient read
+    // error here is a store Error (retry next request), NOT a confirmed absence, so
+    // a blip after the keys already loaded never negative-caches a real scope.
+    let Ok(guardrails) = store
         .scoped(*scope)
         .environment_guardrails()
         .guardrails()
         .await
-        .ok()?;
-    Some(IssuerEntry::new(keyset, policy, salt, guardrails))
+    else {
+        return LoadOutcome::Error;
+    };
+    LoadOutcome::Loaded(IssuerEntry::new(keyset, policy, salt, guardrails))
 }
 
 /// Order an environment's present signing algorithms by IronAuth's CANONICAL

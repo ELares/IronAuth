@@ -61,6 +61,7 @@ fn live_router(harness: &Harness) -> (Router, String) {
         JwksCacheWindow::clamped(600),
         DiscoveryCapabilities::default(),
         Arc::new(registry),
+        harness.env().clone(),
     ));
     let discovery_url = format!(
         "/t/{}/e/{}/.well-known/openid-configuration",

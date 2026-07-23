@@ -55,7 +55,11 @@ jobs:
   test:
     name: test (ubuntu-latest)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # The workspace suite (hundreds of DB integration tests, each on an isolated
+    # database) runs close to 30 minutes and has outgrown that ceiling, so a normal
+    # run now intermittently trips the wall-clock limit with tests still completing
+    # (not a hang). Give it headroom to match the other heavy jobs.
+    timeout-minutes: 45
     # The ironauth-store isolation tests (rls, idor, repository) require a real
     # Postgres. The harness creates a fresh per-run database and provisions the
     # low-privilege application role, so it needs a superuser/owner connection;

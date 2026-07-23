@@ -73,6 +73,13 @@ const ES256_PKCS8: &[u8] = &[
     0xf2, 0x34, 0x12, 0x9d, 0xb0, 0x02, 0x94, 0xe0, 0xc7, 0x4d,
 ];
 
+/// The committed ES256 PKCS#8 material, exposed for the issuer-registry hardening
+/// tests (issue #204) that rotate in a second key of a different algorithm.
+#[must_use]
+pub fn es256_pkcs8() -> &'static [u8] {
+    ES256_PKCS8
+}
+
 /// A committed throwaway RSA-2048 PKCS#1 private key (DER), for provisioning an
 /// environment that can sign RS256 alongside `EdDSA` (issue #30 negotiation and
 /// honor-at-mint). Generated offline exactly like the other committed fixtures;
@@ -571,6 +578,7 @@ impl Harness {
             JwksCacheWindow::clamped(config.jwks_cache_max_age_secs),
             DiscoveryCapabilities::from_config(&config),
             Arc::clone(&registry),
+            env.clone(),
         );
         let mut state = OidcState::new(
             db.store().clone(),
@@ -638,6 +646,7 @@ impl Harness {
             JwksCacheWindow::clamped(config.jwks_cache_max_age_secs),
             DiscoveryCapabilities::from_config(config),
             Arc::clone(&registry),
+            self.env.clone(),
         );
         let state = admin_gate_off(OidcState::new(
             store,
@@ -760,6 +769,55 @@ impl Harness {
         Scope::new(self.scope.tenant(), environment)
     }
 
+    /// Provision a signing key row into `scope` with an explicit algorithm string
+    /// and material, for the issuer-registry hardening tests (issue #204). An
+    /// arbitrary `algorithm` string (including a bogus one) is accepted, so a test
+    /// can insert a MALFORMED row and assert the loader degrades to the loadable
+    /// subset. Returns the generated key id.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the provision insert fails.
+    pub async fn provision_signing_key(
+        &self,
+        scope: Scope,
+        algorithm: &str,
+        material_kind: SigningKeyMaterialKind,
+        material: &[u8],
+    ) -> SigningKeyId {
+        let key_id = SigningKeyId::generate(&self.env, &scope);
+        let (actor, corr) = self.seeding_actor();
+        self.store()
+            .scoped(scope)
+            .acting(actor, corr)
+            .signing_keys()
+            .provision(
+                &self.env,
+                NewSigningKey {
+                    id: &key_id,
+                    algorithm,
+                    material_kind,
+                    material,
+                    publish_at_micros: 0,
+                    activate_at_micros: 0,
+                    retire_at_micros: None,
+                    expire_at_micros: None,
+                },
+            )
+            .await
+            .expect("provision signing key");
+        key_id
+    }
+
+    /// A fresh 32-byte Ed25519 seed drawn from the entropy seam, for provisioning a
+    /// key with [`Harness::provision_signing_key`].
+    #[must_use]
+    pub fn fresh_ed25519_seed(&self) -> [u8; 32] {
+        let mut seed = [0_u8; 32];
+        self.env.entropy().fill_bytes(&mut seed);
+        seed
+    }
+
     /// Seed a SEPARATE tenant and environment (a foreign scope, owned by a
     /// DIFFERENT tenant) and provision its own Ed25519 signing key. Returns the
     /// foreign scope.
@@ -811,7 +869,7 @@ impl Harness {
     pub async fn sign_at_jwt(&self, claims: &serde_json::Value) -> String {
         let entry = self
             .registry
-            .entry_for(&self.scope)
+            .entry_for(&self.scope, self.state.now())
             .await
             .expect("issuer entry for scope");
         let signer = entry
@@ -983,6 +1041,7 @@ impl Harness {
             JwksCacheWindow::clamped(config.jwks_cache_max_age_secs),
             DiscoveryCapabilities::from_config(&config),
             Arc::clone(&self.registry),
+            self.env.clone(),
         );
         self.router = oidc_router(state.clone())
             .merge(issuer_router(issuer_state))

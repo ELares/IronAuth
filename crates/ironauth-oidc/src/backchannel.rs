@@ -412,12 +412,12 @@ impl<S: LogoutSender> BackChannelLogoutWorker<S> {
         sid: &str,
         jti: &str,
     ) -> Result<String, SendFailure> {
+        let now = self.env.clock().now_utc();
         let entry = self
             .issuers
-            .entry_for(&scope)
+            .entry_for(&scope, now)
             .await
             .ok_or(SendFailure::Transport)?;
-        let now = self.env.clock().now_utc();
         let signer = entry.signer(now).ok_or(SendFailure::Transport)?;
         let policy = entry.policy();
         let issuer = self.issuers.issuer_for(&scope);

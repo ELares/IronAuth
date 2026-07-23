@@ -586,6 +586,15 @@ name = "lifecycle_fence"
 path = "tests/lifecycle_fence.rs"
 required-features = ["testing"]
 
+# The live issuer-registry hardening (issue #204): the positive keyset cache bounded
+# TTL (fresh-within/reload-after/loader-less-never-expires/fence-still-wins), the
+# degrade-one-malformed-row behavior, and the bounded TTL'd negative cache. Over a
+# real database (DATABASE_URL); see scripts/with-test-db.sh.
+[[test]]
+name = "issuer_registry"
+path = "tests/issuer_registry.rs"
+required-features = ["testing"]
+
 # JWT (RFC 9068) and opaque access tokens with per-resource-server format selection
 # (issue #29): the per-RS format choice from one environment, RFC 9068 typ/claims,
 # acr/auth_time from an authenticated flow, opaque tokens that resolve only via the
