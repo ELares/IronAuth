@@ -32,6 +32,21 @@ range per docs/RELEASING.md.
   - **Migration 0081** adds the additive `authorization_codes.browserless` boolean (DEFAULT FALSE,
     RLS inherited) that discriminates a browserless challenge code from a browser code, so no
     reader has to infer intent from an empty-string `redirect_uri`.
+  - **Hardening (PR4, the closer)**: client-auth parity plus a per-`auth_session` rate-limit, with
+    NO new route, NO migration, and NO new config key. A CONFIDENTIAL first-party client must now
+    present its registered `token_endpoint_auth_method` credential (`client_secret_basic`/`post` or
+    `private_key_jwt`, through the SAME `authenticate_client` seam the token endpoint uses) on BOTH a
+    fresh request AND every resume hop, so a stolen `auth_session` or a spoofed `client_id` cannot
+    drive a confidential client's login without its secret; a public `none` client is UNCHANGED (the
+    gate is on the REGISTERED method). A failed attempt is a uniform `invalid_client` (401, with
+    `WWW-Authenticate: Basic` on a Basic attempt), byte-identical to the malformed/unknown-client
+    rejection so it is not a client-existence oracle. A thin, fail-OPEN L1 rate-limit cap
+    (per-`auth_session` on resume, keyed on the stable `flow_id`; per-client-and-IP on a fresh
+    request) REUSES the issue #64 regulation budget (its window and soft threshold), so over budget
+    is a uniform `429` with the standard `RateLimit` headers; the substantive fail-CLOSED
+    per-credential bound remains the in-flow `regulate_before` that already runs inside `drive`.
+    `DPoP` / sender-constraint of the browserless code stays a documented residual SHOULD (a
+    follow-up), with the shared RFC 7800 `cnf` plumbing as its future insertion point.
 - IdP-side FedCM (W3C Federated Credential Management) READ surface behind an experimental
   flag (issue #83, PR 1, EXPLORATORY). The `fedcm` experimental feature (ack version
   `0.1.0-exp.1`, this changelog is its ack target) gates the whole surface; it is off by

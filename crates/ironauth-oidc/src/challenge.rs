@@ -26,7 +26,26 @@
 //! NARROW by design: a risk `Block`, a locked/fenced account, a wrong password, and an unknown user
 //! ALL stay the uniform `insufficient_authorization` at `IdentifierPassword` (the anti-enumeration
 //! invariant, below), because a hard deny is byte-identical to a wrong password and is NOT a browser
-//! handoff. Hardening (per-`auth_session` rate limiting, client-auth parity, `DPoP`) is a LATER PR.
+//! handoff.
+//!
+//! PR4 scope: HARDENING (the closer). Two controls tighten the endpoint. (1) CLIENT-AUTH PARITY:
+//! a CONFIDENTIAL first-party client MUST present its registered token-endpoint credential (the
+//! SAME [`crate::client_auth::authenticate_client`] seam the token endpoint uses) on BOTH a fresh
+//! request AND every resume hop, so a stolen `auth_session` or a spoofed `client_id` cannot drive a
+//! confidential client's login without its secret; a public `none` client is UNCHANGED (parity is
+//! gated on the REGISTERED method, so a credential free public request is never rejected). (2) A
+//! thin, fail OPEN L1 rate-limit cap (per `auth_session` on resume, keyed on the stable `flow_id`;
+//! per client and resolved IP on a fresh request) reusing the issue #64 regulation budget (its
+//! window and soft threshold, so NO new config key), capping request spray before a flow is created
+//! or driven. The SUBSTANTIVE, fail CLOSED per credential bound remains the in-flow
+//! `regulate_before` that already runs inside [`drive`] (the login password verify and the second
+//! factor OTP verify).
+//!
+//! Residual SHOULD (deferred): `DPoP` / sender constraint. Binding the `auth_session` to a `DPoP`
+//! proof and sender constraining the browserless code is net new work (only the shared RFC 7800
+//! `cnf` plumbing exists today, at `ironauth-jose/src/cnf.rs`, with the binding seam at
+//! `ironauth-jose/src/seams.rs`); it is the future insertion point and is tracked as a follow-up
+//! rather than shipped here.
 //!
 //! The security crux (PR2):
 //! - The OAuth params (`client_id`, `scope`, `code_challenge`, `code_challenge_method`) are
@@ -59,6 +78,7 @@ use serde_json::Value;
 use ironauth_store::{ClientId, ClientRecord, FlowId, Scope};
 
 use crate::authorize::{ChallengeCodeContext, mint_challenge_code, user_is_quarantined};
+use crate::client_auth::{self, ClientAuthError, ClientAuthInputs, ClientAuthMethod};
 use crate::flow::model::{Flow, FlowStateTag, Journey, Node, NodeAttributes, NodeGroup, Transport};
 use crate::flow::{Continuation, FlowError, Submission, TransportAuth, create_flow, drive};
 use crate::interaction::{self, SessionCookies};
@@ -107,6 +127,24 @@ struct ChallengeTransient {
     challenge: ChallengeParams,
 }
 
+/// The client-authentication material a challenge request presents (issue #93, PR4): the
+/// `Authorization` header plus the pulled-out `client_secret` / `client_assertion` /
+/// `client_assertion_type` form fields, packaged so BOTH the fresh and the resume branch can
+/// enforce client-auth parity through the ONE reusable [`client_auth::authenticate_client`] seam.
+/// The secret is pulled out as a KNOWN field in the parse loop, so it is NEVER forwarded to the
+/// login flow as a node value.
+#[derive(Debug, Clone, Copy)]
+struct ChallengeClientAuth<'a> {
+    /// The `Authorization` header value, if present (a `client_secret_basic` credential).
+    authorization: Option<&'a str>,
+    /// The `client_secret` form field, if present (a `client_secret_post` credential).
+    client_secret: Option<&'a str>,
+    /// The `client_assertion` form field, if present (a JWT-assertion credential).
+    client_assertion: Option<&'a str>,
+    /// The `client_assertion_type` form field, if present.
+    client_assertion_type: Option<&'a str>,
+}
+
 /// `POST /t/{tenant}/e/{env}/authorize-challenge` (issue #93, Bet 3): the browserless first-party
 /// login challenge. Fails closed with a uniform 404 when the `first-party-challenge` experimental
 /// feature is off. A FRESH request (no `auth_session`) creates and drives a login flow; a request
@@ -132,6 +170,13 @@ pub async fn authorize_challenge(
         return not_found();
     };
 
+    // Charge the per-(tenant, environment) request-rate quota (issue #50) at entry, as every
+    // other scoped data-plane handler does (the challenge route carries no route-level quota
+    // middleware). Over quota is a uniform 429; no enforcer installed is a pass-through.
+    if let Some(response) = state.enforce_request_quota(&scope) {
+        return response;
+    }
+
     // Parse the urlencoded body as an ORDERED pair list (the idiom the browser flow POST uses, at
     // flow/transport.rs): serde_urlencoded does not support `#[serde(flatten)]` into a map, and the
     // draft's credential params are implementation-defined arbitrary fields, so the known
@@ -149,6 +194,11 @@ pub async fn authorize_challenge(
     let mut code_challenge_raw: Option<String> = None;
     let mut code_challenge_method: Option<String> = None;
     let mut auth_session: Option<String> = None;
+    // Client-auth credentials (issue #93, PR4), pulled out as KNOWN fields so the secret is NEVER
+    // forwarded to the login flow as a node value AND is available for the client-auth parity call.
+    let mut client_secret: Option<String> = None;
+    let mut client_assertion: Option<String> = None;
+    let mut client_assertion_type: Option<String> = None;
     let mut credentials: BTreeMap<String, Value> = BTreeMap::new();
     for (name, value) in pairs {
         match name.as_str() {
@@ -157,6 +207,11 @@ pub async fn authorize_challenge(
             "scope" => scope_param = Some(value),
             "code_challenge" => code_challenge_raw = Some(value),
             "code_challenge_method" => code_challenge_method = Some(value),
+            // The client-auth credentials (issue #93, PR4): pulled out so they never become flow
+            // node values and are available to the client-auth parity seam on BOTH branches.
+            "client_secret" => client_secret = Some(value),
+            "client_assertion" => client_assertion = Some(value),
+            "client_assertion_type" => client_assertion_type = Some(value),
             // `auth_session` is the draft's continuity handle for the MFA resumption loop: its
             // presence routes the request to the resume branch.
             "auth_session" => auth_session = Some(value),
@@ -190,6 +245,18 @@ pub async fn authorize_challenge(
         .map(str::trim)
         .filter(|value| !value.is_empty());
 
+    // The client-auth material (issue #93, PR4): the `Authorization` header plus the pulled-out
+    // credential fields, packaged once and shared by both branches so client-auth parity is
+    // enforced identically on a fresh request and on every resume hop.
+    let presented_auth = ChallengeClientAuth {
+        authorization: headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok()),
+        client_secret: client_secret.as_deref(),
+        client_assertion: client_assertion.as_deref(),
+        client_assertion_type: client_assertion_type.as_deref(),
+    };
+
     // RESUME: the continuity handle is present, so continue the stashed flow rather than create a
     // new one. The mint sources scope / PKCE / client from the flow's stored params, never here.
     if let Some(auth_session) = auth_session
@@ -204,6 +271,7 @@ pub async fn authorize_challenge(
             auth_session,
             request_client_id,
             node_values,
+            &presented_auth,
         )
         .await;
     }
@@ -294,6 +362,25 @@ pub async fn authorize_challenge(
             "unauthorized_client",
             "this client is not authorized to use the authorization challenge endpoint",
         );
+    }
+
+    // Client-auth parity (issue #93, PR4): a CONFIDENTIAL client must prove possession of its
+    // registered credential BEFORE a flow is created or a password verify is spent, exactly as
+    // at the token endpoint. A public `none` client is unchanged (the gate is method-aware).
+    if let Err(response) =
+        enforce_client_auth_parity(&state, scope, &client, &client_id, &presented_auth).await
+    {
+        return response;
+    }
+
+    // Thin L1 rate-limit cap (issue #93, PR4): cap fresh flow-creation spray keyed on the client
+    // and the resolved socket-peer IP, before a flow is created or driven. Fail OPEN.
+    let fresh_ip = crate::abuse::resolved_client_ip(&headers).unwrap_or_default();
+    if let Some(response) = enforce_challenge_rate_limit(
+        &state,
+        &crate::abuse::challenge_fresh_counter_key(scope, &client_id.to_string(), &fresh_ip),
+    ) {
+        return response;
     }
 
     // The immutable OAuth params the code binds to, stashed into the flow's WRITE ONCE
@@ -395,11 +482,23 @@ async fn resume_challenge(
     auth_session: &str,
     request_client_id: Option<&str>,
     node_values: BTreeMap<String, Value>,
+    auth: &ChallengeClientAuth<'_>,
 ) -> Response {
     // Decode the opaque handle back into its scope-forced flow id and the presented submit token.
     let Some((flow_id, presented_submit_token)) = decode_auth_session(auth_session, scope) else {
         return invalid_auth_session();
     };
+
+    // Thin L1 rate-limit cap (issue #93, PR4): cap rapid resume hammering keyed on the STABLE
+    // flow_id (the handle rotates each hop, the flow_id does not), BEFORE the row load. This also
+    // caps the empty-code early-return path the in-flow second-factor counter misses. Fail OPEN;
+    // the substantive per-credential bound is the in-flow regulation inside drive.
+    if let Some(response) = enforce_challenge_rate_limit(
+        state,
+        &crate::abuse::challenge_session_counter_key(scope, &flow_id.to_string()),
+    ) {
+        return response;
+    }
 
     // Load the row to source the immutable params and the bound client. `load` has no consumed
     // filter, so the params are readable even after completion; `drive` below enforces the single
@@ -486,6 +585,15 @@ async fn resume_challenge(
         );
     }
 
+    // Client-auth parity (issue #93, PR4): EVERY resume hop of a confidential client must
+    // re-present its registered credential, so a stolen `auth_session` (even a structurally
+    // valid one) cannot drive a confidential client's step-up without its secret. A public
+    // `none` client is unchanged (the gate is method-aware).
+    if let Err(response) = enforce_client_auth_parity(state, scope, &client, &client_id, auth).await
+    {
+        return response;
+    }
+
     let submission = Submission {
         node_values,
         transient_payload: None,
@@ -523,6 +631,108 @@ async fn resume_challenge(
         // is the correct total-match projection.
         Continuation::Redirect { .. } | Continuation::ConsentDecision { .. } => redirect_to_web(),
     }
+}
+
+/// Enforce client-auth parity for a first-party challenge client (issue #93, PR4). The challenge
+/// endpoint is the browserless analogue of the token endpoint, so a CONFIDENTIAL client MUST prove
+/// possession of its registered credential exactly as it would at `/token` (the ONE reusable
+/// [`client_auth::authenticate_client`] seam), on BOTH a fresh request and every resume hop.
+///
+/// The gate is on the REGISTERED method (FORK 5, NON-NEGOTIABLE): a public `none` client satisfies
+/// parity with NO credential and returns `Ok` WITHOUT calling the seam (the seam would reject the
+/// credential-free public request as `MissingClientId` and break the public login loop); a
+/// confidential (or an unrecognized, hence fail-closed) registered method routes through the seam.
+/// A failure maps to a uniform `invalid_client` (401), stamping `WWW-Authenticate: Basic` on a
+/// Basic attempt (RFC 6749 5.2), mirroring the token endpoint (token.rs). On success the
+/// authenticated client id is re-checked against the bound `client_id` (mirrors the token
+/// endpoint's step-5 binding re-check), so an authenticated-as-another-client credential is refused.
+async fn enforce_client_auth_parity(
+    state: &OidcState,
+    scope: Scope,
+    client: &ClientRecord,
+    client_id: &ClientId,
+    auth: &ChallengeClientAuth<'_>,
+) -> Result<(), Response> {
+    // FORK 5: a public `none` client needs no credential; do NOT call the seam (a credential-free
+    // public request would fail `MissingClientId` there and break the public login loop).
+    if ClientAuthMethod::parse(&client.auth_method) == Some(ClientAuthMethod::None) {
+        return Ok(());
+    }
+    // Confidential (or an unrecognized registered method, which the seam fails closed on): route
+    // through the ONE reusable client-auth seam, mirroring the token endpoint's inputs.
+    let client_id_str = client_id.to_string();
+    let inputs = ClientAuthInputs {
+        authorization: auth.authorization,
+        client_id: Some(client_id_str.as_str()),
+        client_secret: auth.client_secret,
+        client_assertion: auth.client_assertion,
+        client_assertion_type: auth.client_assertion_type,
+    };
+    match client_auth::authenticate_client(state, scope, inputs).await {
+        // Binding re-check (mirrors token.rs step 5): the authenticated client MUST be the bound
+        // one, so a credential authenticating as a different client cannot proceed.
+        Ok(authenticated) if authenticated.client_id == client_id_str => Ok(()),
+        Ok(_) => Err(invalid_client(false)),
+        Err(ClientAuthError::InvalidClient { via_basic }) => Err(invalid_client(via_basic)),
+        Err(ClientAuthError::InvalidRequest(message)) => {
+            Err(error(StatusCode::BAD_REQUEST, "invalid_request", message))
+        }
+    }
+}
+
+/// The uniform `invalid_client` (401) a confidential client-auth failure returns (issue #93, PR4),
+/// byte-identical to the malformed/unknown `client_id` rejection (same code and description) so a
+/// wrong or absent credential is not a client-existence oracle, plus the RFC 6749 5.2
+/// `WWW-Authenticate: Basic` challenge on a Basic attempt (mirroring the token endpoint). The
+/// challenge value is a fixed server constant (no reflected input), so it is safe to set verbatim.
+fn invalid_client(via_basic: bool) -> Response {
+    let mut response = error(
+        StatusCode::UNAUTHORIZED,
+        "invalid_client",
+        "the client_id is malformed or unknown",
+    );
+    if via_basic {
+        response.headers_mut().insert(
+            header::WWW_AUTHENTICATE,
+            header::HeaderValue::from_static("Basic realm=\"ironauth\", charset=\"UTF-8\""),
+        );
+    }
+    response
+}
+
+/// The thin, fail-OPEN L1 rate-limit cap the challenge endpoint applies BEFORE driving a flow
+/// (issue #93, PR4), reusing the issue #64 regulation budget (its window and soft threshold) so NO
+/// new config key is introduced. It caps request spray (rapid resume hammering keyed on the stable
+/// `flow_id`, and fresh flow-creation spray keyed on the client and resolved IP) and the empty-code
+/// early-return path the in-flow second-factor counter misses. It is AVAILABILITY biased and FAILS
+/// OPEN: a disabled regulation or a counter-store error never blocks a login. The SUBSTANTIVE, fail
+/// CLOSED per-credential bound remains the in-flow `regulate_before` that runs inside [`drive`].
+/// Over budget is a uniform `429` carrying the standard `RateLimit` headers, never an oracle.
+fn enforce_challenge_rate_limit(state: &OidcState, key: &str) -> Option<Response> {
+    let settings = *state.regulation();
+    if !settings.enabled {
+        return None;
+    }
+    // Determinism seam: the counter window is drawn from the app clock via `state.now()` exactly
+    // as `regulate_before` does (never a raw wall clock), so it stays deterministic under a manual
+    // test clock.
+    let now = crate::util::epoch_micros(state.now());
+    // Fail OPEN: a counter-store error is ignored (availability-biased L1).
+    let count = state
+        .risk_counters()
+        .incr(key, settings.window_secs(), now)
+        .ok()?;
+    let delay = crate::abuse::escalating_delay(&settings, count)?;
+    let snapshot = crate::abuse::throttle_snapshot(&settings, count, delay);
+    let mut response = json_no_store(
+        StatusCode::TOO_MANY_REQUESTS,
+        serde_json::json!({
+            "error": "rate_limited",
+            "error_description": "too many authorization challenge requests; retry later",
+        }),
+    );
+    crate::abuse::stamp_rate_limit_headers(&mut response, &snapshot);
+    Some(response)
 }
 
 /// Mint the browserless authorization code for a completed challenge login (issue #93). Reads back

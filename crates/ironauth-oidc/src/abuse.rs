@@ -308,6 +308,35 @@ pub fn tenant_counter_key(path: AuthPath, tenant: &str, environment: &str) -> St
     format!("abuse:{}:tenant:{tenant}:{environment}", path.as_str())
 }
 
+/// The L1 counter key for the browserless authorization challenge RESUME rate-limit cap (issue
+/// #93, PR4): keyed on the STABLE half of the `auth_session` handle, the `flow_id`, so every
+/// resume hop of one login (the handle rotates each step but the `flow_id` does not) shares one
+/// bucket. Reuses the fast request-shaping L1 layer, not a new store.
+#[must_use]
+pub fn challenge_session_counter_key(scope: ironauth_store::Scope, flow_id: &str) -> String {
+    format!(
+        "challenge:session:{}:{}:{flow_id}",
+        scope.tenant(),
+        scope.environment()
+    )
+}
+
+/// The L1 counter key for the browserless authorization challenge FRESH rate-limit cap (issue
+/// #93, PR4): keyed on the client id and the resolved socket-peer IP (the #31 lesson, non-
+/// forgeable), so fresh flow-creation spray from one client and IP shares one bucket.
+#[must_use]
+pub fn challenge_fresh_counter_key(
+    scope: ironauth_store::Scope,
+    client_id: &str,
+    ip: &str,
+) -> String {
+    format!(
+        "challenge:fresh:{}:{}:{client_id}:{ip}",
+        scope.tenant(),
+        scope.environment()
+    )
+}
+
 /// The rate-limit snapshot for a ban or a fail-CLOSED security-layer error (issue #64):
 /// a uniform throttle carrying the SAME shape an escalation throttle carries once it has
 /// saturated at the cap. It is byte-identical to
@@ -621,6 +650,43 @@ mod tests {
         let a = canonical_login_identifier("Alice@Example.COM");
         let b = canonical_login_identifier("alice@example.com");
         assert_eq!(a.as_str(), b.as_str());
+    }
+
+    #[test]
+    fn challenge_counter_keys_are_stable_scoped_and_distinct() {
+        use std::time::SystemTime;
+
+        use ironauth_env::Env;
+        use ironauth_store::{EnvironmentId, Scope, TenantId};
+
+        let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x00C0_FFEE);
+        let scope = Scope::new(TenantId::generate(&env), EnvironmentId::generate(&env));
+        // The resume key is namespaced under `challenge:session` and carries the scope + flow id;
+        // it is STABLE for a given flow id (so a rotating handle keeps one bucket).
+        let session = challenge_session_counter_key(scope, "flw_example");
+        assert!(session.starts_with("challenge:session:"));
+        assert!(session.ends_with(":flw_example"));
+        assert_eq!(
+            session,
+            challenge_session_counter_key(scope, "flw_example"),
+            "the resume key is stable for a flow id"
+        );
+        assert_ne!(
+            session,
+            challenge_session_counter_key(scope, "flw_other"),
+            "a different flow id is a different bucket"
+        );
+        // The fresh key is namespaced under `challenge:fresh` and carries the scope + client + IP.
+        let fresh = challenge_fresh_counter_key(scope, "cli_example", "203.0.113.7");
+        assert!(fresh.starts_with("challenge:fresh:"));
+        assert!(fresh.ends_with(":cli_example:203.0.113.7"));
+        assert_ne!(
+            fresh,
+            challenge_fresh_counter_key(scope, "cli_example", "198.51.100.4"),
+            "a different IP is a different bucket"
+        );
+        // The two families never collide.
+        assert_ne!(session, fresh);
     }
 
     #[test]

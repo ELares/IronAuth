@@ -16,7 +16,7 @@ mod common;
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode, header};
 use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use common::{Harness, PKCE_CHALLENGE, PKCE_VERIFIER, REDIRECT_URI, form, json};
 use ironauth_config::OidcConfig;
 use ironauth_env::Clock;
@@ -1053,5 +1053,402 @@ async fn a_resume_against_a_non_login_journey_is_rejected() {
     assert!(
         json(&resp)["authorization_code"].is_null(),
         "no code is minted from a non-login journey: {resp}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// PR4: client-auth parity + per-auth_session rate-limit (the closer). A CONFIDENTIAL first-party
+// client must present its registered token-endpoint credential on BOTH a fresh request AND every
+// resume hop (the browserless analogue of the token endpoint); a public `none` client is unchanged;
+// and a thin fail-OPEN L1 cap (reusing the #64 regulation budget) throttles request spray.
+// ---------------------------------------------------------------------------------------------
+
+/// A standard-padded `Basic` credential of `client_id:client_secret` (RFC 6749 2.3.1).
+fn basic_header(client_id: &str, secret: &str) -> String {
+    format!("Basic {}", STANDARD.encode(format!("{client_id}:{secret}")))
+}
+
+/// POST a challenge body with an optional `Authorization` header AND an optional non-forgeable
+/// peer-IP header, returning the FULL response (status, headers, body) so a test can assert the
+/// `RateLimit-*` headers on a 429 and the client-auth outcome. The PR1 `challenge` helper drops
+/// the headers and takes no `Authorization`, so PR4 adds this variant (the harness gap).
+async fn challenge_full(
+    harness: &Harness,
+    body: &str,
+    authorization: Option<&str>,
+    ip: Option<&str>,
+) -> (StatusCode, HeaderMap, String) {
+    let scope = harness.scope();
+    let uri = format!(
+        "/t/{}/e/{}/authorize-challenge",
+        scope.tenant(),
+        scope.environment()
+    );
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+    if let Some(value) = authorization {
+        builder = builder.header(header::AUTHORIZATION, value);
+    }
+    if let Some(ip) = ip {
+        builder = builder.header("x-ironauth-peer-ip", ip);
+    }
+    let request = builder
+        .body(Body::from(body.to_owned()))
+        .expect("request builds");
+    harness.send(request).await
+}
+
+/// An armed challenge harness whose first-party client is CONFIDENTIAL (registered for `method`),
+/// returning the harness, the client id string, and the plaintext secret.
+async fn armed_confidential_harness(method: ClientAuthMethod) -> (Harness, String, String) {
+    let mut harness = Harness::start().await;
+    harness.enable_first_party_challenge();
+    let (client, secret) = harness.create_confidential_client(method).await;
+    harness.set_client_first_party(&client, true).await;
+    harness.seed_user(IDENTIFIER, PASSWORD).await;
+    (harness, client.to_string(), secret)
+}
+
+/// Like [`armed_confidential_harness`] but the seeded user has an ACTIVE TOTP factor and the tenant
+/// demands MFA, so a correct primary factor HOLDS on the second factor (the resume loop).
+async fn armed_confidential_mfa_harness(method: ClientAuthMethod) -> (Harness, String, String) {
+    let mut harness = Harness::start().await;
+    harness.enable_first_party_challenge();
+    let (client, secret) = harness.create_confidential_client(method).await;
+    harness.set_client_first_party(&client, true).await;
+    let subject = harness.seed_user(IDENTIFIER, PASSWORD).await;
+    harness.seed_active_totp(&subject).await;
+    harness.set_tenant_min_class("mfa").await;
+    (harness, client.to_string(), secret)
+}
+
+#[tokio::test]
+async fn a_confidential_client_with_a_valid_post_secret_completes_fresh_and_redeems() {
+    // AC1 (client_secret_post): a confidential first-party client presenting its valid secret on a
+    // fresh request completes the login, mints the browserless code, and redeems it at the token
+    // endpoint (which re-authenticates the same client and binds the code to it).
+    let (harness, client_id, secret) = armed_confidential_harness(ClientAuthMethod::Post).await;
+    let body = form(&[
+        ("client_id", &client_id),
+        ("response_type", "code"),
+        ("username", IDENTIFIER),
+        ("password", PASSWORD),
+        ("client_secret", &secret),
+    ]);
+    let (status, _headers, resp) = challenge_full(&harness, &body, None, None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "valid post secret completes: {resp}"
+    );
+    let code = json(&resp)["authorization_code"]
+        .as_str()
+        .expect("authorization_code")
+        .to_owned();
+
+    let redeem = form(&[
+        ("grant_type", "authorization_code"),
+        ("code", &code),
+        ("client_id", &client_id),
+        ("client_secret", &secret),
+    ]);
+    let (status, _headers, tr) = harness.token(&redeem).await;
+    assert_eq!(status, StatusCode::OK, "token redemption: {tr}");
+    assert!(
+        json(&tr)["access_token"].is_string(),
+        "an access token: {tr}"
+    );
+}
+
+#[tokio::test]
+async fn a_confidential_client_with_a_valid_basic_secret_completes_fresh() {
+    // AC1 (client_secret_basic): the SAME fresh completion, with the secret in the `Authorization:
+    // Basic` header instead of the form body.
+    let (harness, client_id, secret) = armed_confidential_harness(ClientAuthMethod::Basic).await;
+    let body = challenge_form(&client_id, IDENTIFIER, PASSWORD);
+    let auth = basic_header(&client_id, &secret);
+    let (status, _headers, resp) = challenge_full(&harness, &body, Some(&auth), None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "valid basic secret completes: {resp}"
+    );
+    assert!(
+        json(&resp)["authorization_code"].as_str().is_some(),
+        "a browserless code: {resp}"
+    );
+}
+
+#[tokio::test]
+async fn a_confidential_client_presents_client_auth_on_every_resume_hop() {
+    // AC1 (resume): a confidential client that holds on the second factor resumes by presenting its
+    // client-auth AGAIN on the resume hop and mints the code. The resume body carries no client_id;
+    // the parity seam sources the bound client from the flow and the secret from the resume body.
+    let (harness, client_id, secret) = armed_confidential_mfa_harness(ClientAuthMethod::Post).await;
+    let fresh = form(&[
+        ("client_id", &client_id),
+        ("response_type", "code"),
+        ("username", IDENTIFIER),
+        ("password", PASSWORD),
+        ("client_secret", &secret),
+    ]);
+    let (status, _headers, resp) = challenge_full(&harness, &fresh, None, None).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "holds on the second factor: {resp}"
+    );
+    let auth_session = json(&resp)["auth_session"]
+        .as_str()
+        .expect("an auth_session")
+        .to_owned();
+
+    harness.clock().advance(std::time::Duration::from_secs(90));
+    let code = totp_code(&harness);
+    let resume = form(&[
+        ("auth_session", &auth_session),
+        ("otp", &code),
+        ("client_secret", &secret),
+    ]);
+    let (status, _headers, resp) = challenge_full(&harness, &resume, None, None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the resume presenting client-auth mints a code: {resp}"
+    );
+    assert!(
+        json(&resp)["authorization_code"].as_str().is_some(),
+        "a code on the authenticated resume: {resp}"
+    );
+}
+
+#[tokio::test]
+async fn a_confidential_client_without_a_valid_secret_is_rejected_on_fresh() {
+    // AC2 (fresh): an absent AND a wrong secret are BOTH a uniform 401 invalid_client on the fresh
+    // request, so a confidential client never creates a flow or spends a password verify without
+    // proving its credential.
+    let (harness, client_id, _secret) = armed_confidential_harness(ClientAuthMethod::Post).await;
+
+    // Absent secret.
+    let absent = challenge_form(&client_id, IDENTIFIER, PASSWORD);
+    let (status, _headers, resp) = challenge_full(&harness, &absent, None, None).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "absent secret rejected: {resp}"
+    );
+    assert_eq!(json(&resp)["error"], "invalid_client");
+    assert!(
+        json(&resp)["authorization_code"].is_null(),
+        "no code without client-auth: {resp}"
+    );
+
+    // Wrong secret.
+    let wrong = form(&[
+        ("client_id", &client_id),
+        ("response_type", "code"),
+        ("username", IDENTIFIER),
+        ("password", PASSWORD),
+        ("client_secret", "not-the-secret"),
+    ]);
+    let (status, _headers, resp) = challenge_full(&harness, &wrong, None, None).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "wrong secret rejected: {resp}"
+    );
+    assert_eq!(json(&resp)["error"], "invalid_client");
+}
+
+#[tokio::test]
+async fn a_confidential_resume_without_a_valid_secret_is_rejected() {
+    // AC2 (resume, THE key assertion): a resume with a STRUCTURALLY VALID auth_session and a real
+    // OTP but an absent (then wrong) secret is STILL a uniform 401 invalid_client. Client-auth is
+    // enforced on every step-up hop, so a stolen handle cannot drive a confidential login.
+    let (harness, client_id, secret) = armed_confidential_mfa_harness(ClientAuthMethod::Post).await;
+    let fresh = form(&[
+        ("client_id", &client_id),
+        ("response_type", "code"),
+        ("username", IDENTIFIER),
+        ("password", PASSWORD),
+        ("client_secret", &secret),
+    ]);
+    let (status, _headers, resp) = challenge_full(&harness, &fresh, None, None).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "holds on the second factor: {resp}"
+    );
+    let auth_session = json(&resp)["auth_session"]
+        .as_str()
+        .expect("an auth_session")
+        .to_owned();
+
+    harness.clock().advance(std::time::Duration::from_secs(90));
+    let code = totp_code(&harness);
+
+    // Absent secret on the resume: rejected even though the handle and OTP are valid.
+    let absent = form(&[("auth_session", &auth_session), ("otp", &code)]);
+    let (status, _headers, resp) = challenge_full(&harness, &absent, None, None).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a resume without the secret is rejected: {resp}"
+    );
+    assert_eq!(json(&resp)["error"], "invalid_client");
+    assert!(
+        json(&resp)["authorization_code"].is_null(),
+        "no code on an unauthenticated resume: {resp}"
+    );
+
+    // Wrong secret on the resume: same rejection (the handle is not consumed by a rejected resume,
+    // so it is still valid here).
+    let wrong = form(&[
+        ("auth_session", &auth_session),
+        ("otp", &code),
+        ("client_secret", "not-the-secret"),
+    ]);
+    let (status, _headers, resp) = challenge_full(&harness, &wrong, None, None).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a resume with a wrong secret is rejected: {resp}"
+    );
+    assert_eq!(json(&resp)["error"], "invalid_client");
+}
+
+#[tokio::test]
+async fn a_public_client_still_works_with_no_client_auth_on_fresh_and_resume() {
+    // AC3 (regression): a public `none` first-party client is UNCHANGED. It drives the fresh hop
+    // and the resume hop with NO client-auth material (the parity gate is method-aware and skips
+    // it), completing the step-up and minting the code exactly as before PR4.
+    let (harness, client_id) = armed_mfa_harness().await;
+    let auth_session = first_hop_auth_session(&harness, &client_id).await;
+
+    harness.clock().advance(std::time::Duration::from_secs(90));
+    let code = totp_code(&harness);
+    let (status, body) = challenge(
+        &harness,
+        &form(&[("auth_session", &auth_session), ("otp", &code)]),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a public client resumes with no client-auth: {body}"
+    );
+    assert!(
+        json(&body)["authorization_code"].as_str().is_some(),
+        "a code for the public client: {body}"
+    );
+}
+
+#[tokio::test]
+async fn rapid_fresh_challenges_from_one_client_and_ip_are_rate_limited() {
+    // AC4 (fresh cap): the thin L1 cap throttles fresh flow-creation spray keyed on the client and
+    // resolved IP. The default regulation soft threshold is 5, so the 6th fresh request in the
+    // window is a uniform 429 carrying the standard RateLimit headers (never an oracle). The first
+    // five complete (a public client with correct credentials mints a code each time).
+    let (harness, client_id) = armed_harness().await;
+    let body = challenge_form(&client_id, IDENTIFIER, PASSWORD);
+    for n in 1..=5 {
+        let (status, _headers, resp) = challenge_full(&harness, &body, None, Some(CLEAN_IP)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "fresh request {n} is under the cap: {resp}"
+        );
+    }
+    let (status, headers, resp) = challenge_full(&harness, &body, None, Some(CLEAN_IP)).await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the 6th fresh request is capped: {resp}"
+    );
+    assert_eq!(json(&resp)["error"], "rate_limited");
+    assert!(
+        headers.get("ratelimit").is_some(),
+        "the structured RateLimit header is stamped: {headers:?}"
+    );
+    assert!(
+        headers.get("retry-after").is_some(),
+        "the Retry-After header is stamped: {headers:?}"
+    );
+}
+
+#[tokio::test]
+async fn rapid_resumes_on_one_auth_session_are_rate_limited() {
+    // AC4 (resume cap): rapid resume hammering on ONE auth_session is capped. The counter keys on
+    // the STABLE flow_id (the handle rotates each hop, the flow_id does not), so every resume shares
+    // one bucket regardless of the drive outcome; the 6th (past the soft threshold) is a uniform 429
+    // with the RateLimit headers.
+    let (harness, client_id) = armed_mfa_harness().await;
+    let auth_session = first_hop_auth_session(&harness, &client_id).await;
+    for _ in 1..=5 {
+        let (status, _headers, _resp) = challenge_full(
+            &harness,
+            &form(&[("auth_session", &auth_session), ("otp", "000000")]),
+            None,
+            None,
+        )
+        .await;
+        assert_ne!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "a resume under the cap is not yet throttled"
+        );
+    }
+    let (status, headers, resp) = challenge_full(
+        &harness,
+        &form(&[("auth_session", &auth_session), ("otp", "000000")]),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the 6th resume on one auth_session is capped: {resp}"
+    );
+    assert_eq!(json(&resp)["error"], "rate_limited");
+    assert!(
+        headers.get("ratelimit").is_some(),
+        "the structured RateLimit header is stamped: {headers:?}"
+    );
+}
+
+#[tokio::test]
+async fn otp_brute_force_on_one_auth_session_is_bounded() {
+    // AC5: OTP guessing on a single auth_session, following the rotating handle each hop, is BOUNDED
+    // (the in-flow second-factor regulation and the L1 cap both refuse after the threshold). The
+    // response is a uniform failure and NEVER a code.
+    let (harness, client_id) = armed_mfa_harness().await;
+    let mut handle = first_hop_auth_session(&harness, &client_id).await;
+    let mut bounded = false;
+    for _ in 0..12 {
+        let (status, _headers, resp) = challenge_full(
+            &harness,
+            &form(&[("auth_session", &handle), ("otp", "000000")]),
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            json(&resp)["authorization_code"].is_null(),
+            "a wrong otp never mints a code: {resp}"
+        );
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            bounded = true;
+            break;
+        }
+        if let Some(next) = json(&resp)["auth_session"].as_str() {
+            handle = next.to_owned();
+        }
+    }
+    assert!(
+        bounded,
+        "the otp brute force is bounded by a uniform throttle after the threshold"
     );
 }
