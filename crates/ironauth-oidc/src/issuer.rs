@@ -387,12 +387,16 @@ impl IssuerRegistry {
     /// and NEVER expires its entries. Event-driven invalidation on the rotation
     /// write path is deferred to M16; this TTL is the interim staleness ceiling.
     ///
-    /// A genuine post-fence miss is recorded in a bounded, TTL'd negative cache so a
-    /// flood of well-formed nonexistent scopes does not drive a fresh `signing_keys`
-    /// SELECT each time. The negative cache short-circuits ONLY that load, never the
-    /// fence (which runs first, every request); a suspended real scope is fenced
-    /// before the negative cache is consulted, and a successful load evicts any
-    /// negative for the scope so a freshly provisioned scope is never shadowed.
+    /// A CONFIRMED post-fence absence (the store answered, and there is genuinely no
+    /// entry) is recorded in a bounded, TTL'd negative cache so a flood of well-formed
+    /// nonexistent scopes does not drive a fresh `signing_keys` SELECT each time. A
+    /// TRANSIENT store error is NEVER negative-cached (that would 404 a real, healthy
+    /// scope for a full TTL over a momentary blip): it returns `None` so the very next
+    /// request retries, exactly as an uncached miss did before #204. The negative
+    /// cache short-circuits ONLY the store load, never the fence (which runs first,
+    /// every request); a suspended real scope is fenced before the negative cache is
+    /// consulted, and a successful load evicts any negative for the scope so a freshly
+    /// provisioned scope is never shadowed.
     ///
     /// # Panics
     ///
@@ -420,14 +424,23 @@ impl IssuerRegistry {
         }
         // Slow path: load from the store, scoped to this exact (tenant, environment).
         let store = self.loader.as_ref()?;
-        if let Some(loaded) = load_issuer_entry(store, scope).await {
-            let entry = Arc::new(loaded);
-            self.store_positive(*scope, Arc::clone(&entry), now);
-            Some(entry)
-        } else {
-            // A genuine post-fence miss: record it in the bounded negative cache.
-            self.record_negative(*scope, now);
-            None
+        match load_issuer_entry(store, scope).await {
+            LoadOutcome::Loaded(loaded) => {
+                let entry = Arc::new(loaded);
+                self.store_positive(*scope, Arc::clone(&entry), now);
+                Some(entry)
+            }
+            // A CONFIRMED absence: safe to negative-cache so a scope flood is bounded.
+            LoadOutcome::Empty => {
+                self.record_negative(*scope, now);
+                None
+            }
+            // A TRANSIENT store error: do NOT negative-cache (that would amplify a blip
+            // into a TTL-long fail-closed outage for a real scope) and do NOT serve a
+            // stale entry (that would extend a compromise-rotation staleness window
+            // during errors). Return None so the very next request retries, exactly as
+            // pre-#204 did.
+            LoadOutcome::Error => None,
         }
     }
 
@@ -556,24 +569,47 @@ async fn scope_is_fenced(store: &Store, scope: &Scope) -> bool {
     }
 }
 
+/// The outcome of a store-backed issuer load (issue #204). A CONFIRMED absence is
+/// negative-cacheable; a transient store error must NOT be cached, so a real scope
+/// is never 404-ed for a full TTL because of a momentary blip.
+enum LoadOutcome {
+    /// The environment's live issuer entry loaded successfully.
+    Loaded(IssuerEntry),
+    /// A CONFIRMED absence: no key rows, RLS-zero (cross-tenant), or every row
+    /// unreconstructable. This is a real 404 and is safe to negative-cache.
+    Empty,
+    /// A TRANSIENT store read error: the caller must retry on the next request and
+    /// must NEVER negative-cache this, or a millisecond DB blip would 404 a real,
+    /// healthy scope for a full TTL.
+    Error,
+}
+
 /// Load one environment's live issuer entry from the store, scoped (RLS-forced) to
 /// `scope`.
 ///
-/// Returns `None` when the environment has no provisioned signing key (the empty
-/// key set is the fail-closed 404 / `server_error`), when NO stored key can be
+/// Returns [`LoadOutcome::Empty`] (a fail-closed 404 / `server_error`) when the
+/// environment has no provisioned signing key, when NO stored key can be
 /// reconstructed, or when the derived policy is empty. A single unreconstructable
 /// row is DEGRADED, not fatal: it is skipped (and logged) and the loadable subset
 /// still serves, so one bad sibling never 404s a healthy environment; an all-bad
 /// environment still fails closed. A request that names an environment under the
-/// wrong tenant loads zero rows here (RLS), so it too resolves to `None`: a
-/// self-consistent bogus issuer can never resolve.
-async fn load_issuer_entry(store: &Store, scope: &Scope) -> Option<IssuerEntry> {
+/// wrong tenant loads zero rows here (RLS), so it too resolves to
+/// [`LoadOutcome::Empty`]: a self-consistent bogus issuer can never resolve.
+///
+/// A TRANSIENT store read error (a pool timeout, a reset connection, a statement
+/// timeout) on either the keys or the guardrails SELECT returns
+/// [`LoadOutcome::Error`], distinct from a confirmed absence, so the caller can
+/// retry it on the next request instead of caching it as a 404.
+async fn load_issuer_entry(store: &Store, scope: &Scope) -> LoadOutcome {
     // The data-plane suspension fence (issue #46) is enforced by the caller,
     // `IssuerRegistry::entry_for`, on EVERY resolution (see `scope_is_fenced`), so it
     // governs both this cold load and the cached fast path. It is not re-checked here.
-    let records = store.scoped(*scope).signing_keys().list().await.ok()?;
+    // A transient read error is NOT a confirmed absence: retry, never cache.
+    let Ok(records) = store.scoped(*scope).signing_keys().list().await else {
+        return LoadOutcome::Error;
+    };
     if records.is_empty() {
-        return None;
+        return LoadOutcome::Empty;
     }
     let mut keyset: Option<KeySet> = None;
     let mut algorithms: Vec<JwsAlgorithm> = Vec::new();
@@ -608,8 +644,12 @@ async fn load_issuer_entry(store: &Store, scope: &Scope) -> Option<IssuerEntry> 
     }
     // Fail closed if NO row yielded a key (an all-bad environment, or every row
     // unreconstructable): the empty key set is the same 404 as an unprovisioned
-    // environment, so a token is never minted without a signing key.
-    let keyset = keyset?;
+    // environment, so a token is never minted without a signing key. This is a
+    // CONFIRMED absence (the store answered; the rows are just all bad), so it is
+    // negative-cacheable.
+    let Some(keyset) = keyset else {
+        return LoadOutcome::Empty;
+    };
     // The policy is exactly the algorithms the loaded keys sign with, so an
     // ES256-only environment yields policy {ES256} and can emit nothing else
     // (AC #3): signing needs both a key of the algorithm and a policy that permits
@@ -624,7 +664,12 @@ async fn load_issuer_entry(store: &Store, scope: &Scope) -> Option<IssuerEntry> 
     // algorithms actually present, so EdDSA stays the deterministic default whenever
     // it is provisioned. Any present algorithm outside the canonical list (a future
     // key kind) is appended in its loaded order so it is never silently dropped.
-    let policy = SigningPolicy::new(canonical_algorithm_order(&algorithms)).ok()?;
+    let Ok(policy) = SigningPolicy::new(canonical_algorithm_order(&algorithms)) else {
+        // Defensive and unreachable: a non-empty keyset guarantees a non-empty
+        // algorithm list. Treat it as a confirmed absence (not a transient error),
+        // so it 404s deterministically rather than looping a retry.
+        return LoadOutcome::Empty;
+    };
     // PLACEHOLDER salt: per-environment salt persistence and the pairwise wiring
     // are a later milestone; nothing live reads this salt yet (the data-plane token
     // path resolves PUBLIC subjects, which never consult a salt, see
@@ -633,15 +678,19 @@ async fn load_issuer_entry(store: &Store, scope: &Scope) -> Option<IssuerEntry> 
     // The environment's TYPED guardrails (issue #42), read from the scope-forced
     // projection the data plane CAN see (the environments level table it cannot).
     // The environment has a provisioned key (records is non-empty), so its guardrail
-    // row exists; a read failure fails CLOSED (the whole entry resolves to None, a
-    // 404), never silently defaulting to the relaxed non-production set.
-    let guardrails = store
+    // row exists; a read failure fails CLOSED (the whole entry resolves to a 404),
+    // never silently defaulting to the relaxed non-production set. A transient read
+    // error here is a store Error (retry next request), NOT a confirmed absence, so
+    // a blip after the keys already loaded never negative-caches a real scope.
+    let Ok(guardrails) = store
         .scoped(*scope)
         .environment_guardrails()
         .guardrails()
         .await
-        .ok()?;
-    Some(IssuerEntry::new(keyset, policy, salt, guardrails))
+    else {
+        return LoadOutcome::Error;
+    };
+    LoadOutcome::Loaded(IssuerEntry::new(keyset, policy, salt, guardrails))
 }
 
 /// Order an environment's present signing algorithms by IronAuth's CANONICAL

@@ -251,3 +251,45 @@ async fn the_negative_cache_is_per_scope() {
     assert!(registry.entry_for(&resolved, at(10)).await.is_some());
     assert!(registry.entry_for(&missing, at(10)).await.is_none());
 }
+
+#[tokio::test]
+async fn a_transient_store_error_does_not_negative_cache_a_real_scope() {
+    let harness = Harness::start_store_backed().await;
+    let scope = harness.scope(); // a healthy, active, fully provisioned scope
+    let registry = store_backed(&harness);
+
+    // Induce a TRANSIENT store error on the guardrails SELECT (which fires AFTER the
+    // keys SELECT already succeeded) by renaming the environment_guardrails view out
+    // from under the load. The fence read (environment_states) and the keys list still
+    // succeed, so this isolates a post-keys read blip on an otherwise healthy scope.
+    // Rename (not drop) preserves the view's OID, so restoring it does not invalidate
+    // any cached statement plan.
+    harness
+        .db()
+        .execute_owner_sql(
+            "ALTER VIEW environment_guardrails RENAME TO environment_guardrails_hidden",
+        )
+        .await;
+
+    // During the blip the load fails closed for THIS request, exactly as pre-#204.
+    assert!(
+        registry.entry_for(&scope, at(0)).await.is_none(),
+        "a transient store error fails closed for that one request"
+    );
+
+    // The blip clears: restore the view.
+    harness
+        .db()
+        .execute_owner_sql(
+            "ALTER VIEW environment_guardrails_hidden RENAME TO environment_guardrails",
+        )
+        .await;
+
+    // The VERY NEXT request (SAME `now`, no TTL advance) must resolve. Had the error
+    // been negative-cached, this would 404 until a full TTL elapsed; it resolves,
+    // proving no negative was recorded for a real scope over a transient error.
+    assert!(
+        registry.entry_for(&scope, at(0)).await.is_some(),
+        "the healthy scope self-heals on the next request (no negative was cached)"
+    );
+}
