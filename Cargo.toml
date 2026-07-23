@@ -59,7 +59,7 @@ ironauth-apply = { path = "crates/ironauth-apply", version = "0.1.0" }
 ironauth-import = { path = "crates/ironauth-import", version = "0.1.0" }
 ironauth-importers = { path = "crates/ironauth-importers", version = "0.1.0" }
 ironauth-journey = { path = "crates/ironauth-journey", version = "0.1.0" }
-getrandom = "0.3"
+getrandom = "0.4"
 
 # OpenAPI 3.1 source of truth for the management API (crates/ironauth-admin,
 # issue #11). utoipa derives the OpenAPI 3.1 document from the `#[utoipa::path]`
