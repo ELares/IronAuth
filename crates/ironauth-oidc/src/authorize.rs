@@ -41,6 +41,7 @@ use crate::broker_overlay;
 use crate::claims_request::{ClaimsRequest, ClaimsRequestError};
 use crate::client_auth::ClientAuthMethod;
 use crate::consent::ConsentMode;
+use crate::consent_core;
 use crate::error::{AuthorizeError, AuthzErrorCode};
 use crate::hints::InteractionHints;
 use crate::interaction;
@@ -590,7 +591,17 @@ async fn issue_code(
     //    redirect_uri), carrying a return_to that resumes this exact request. Under
     //    prompt=none no UI is ever rendered: the matching login_required /
     //    consent_required error is returned through the negotiated mode instead.
-    let (session, consent_ref) = match resolve_gate(
+    // 6a. The quarantined-account scope strip (issue #82, PR 2) is now folded into the
+    //     consent core (issue #365): a QUARANTINED account authenticates with LIMITED
+    //     privileges, so every SENSITIVE scope (offline_access, an admin/management scope,
+    //     a configured payment-class scope) is dropped from the grant at the single shared
+    //     choke point, BEFORE the scope is frozen onto the authorization code and the grant.
+    //     Because the token endpoint mints only from that frozen scope, a quarantined account
+    //     can never obtain an OFFLINE refresh family via offline_access nor any other
+    //     sensitive scope, and the strip cannot be bypassed by a caller. The core decides it
+    //     ONCE from the single quarantine read (replacing the former second read here) and
+    //     returns it as `bound_scope`, which stands in for the effective scope downstream.
+    let (session, consent_ref, effective_scope) = match resolve_gate(
         state,
         headers,
         &client,
@@ -611,38 +622,8 @@ async fn issue_code(
         Gate::Ready {
             session,
             consent_ref,
-        } => (session, consent_ref),
-    };
-
-    // 6a. Quarantined-account scope strip (issue #82, PR 2). A QUARANTINED account can
-    //     authenticate but with LIMITED privileges: every SENSITIVE scope (offline_access,
-    //     an admin/management scope, a configured payment-class scope) is dropped from the
-    //     grant here, at the single shared choke point, BEFORE the scope is frozen onto the
-    //     authorization code and the grant. Because the token endpoint mints only from that
-    //     frozen scope, a quarantined account can never obtain an OFFLINE (long-lived,
-    //     survives-logout) refresh family via offline_access, nor any other sensitive scope,
-    //     and the strip cannot be bypassed by a caller. Flag-gated and
-    //     applied only to a quarantined subject, so a normal account and a flag-off
-    //     deployment are byte-identical.
-    let user_quarantined = if state.signup_quarantine_enabled() {
-        match user_is_quarantined(state, scope, &session.subject).await {
-            Ok(quarantined) => quarantined,
-            // FAIL CLOSED on a store fault (consistent with the sibling security reads): a
-            // transient blip must NOT silently skip the sensitive-scope strip below.
-            Err(()) => {
-                return Err(redirect_error(
-                    AuthzErrorCode::ServerError,
-                    "the authorization request could not be processed",
-                ));
-            }
-        }
-    } else {
-        false
-    };
-    let effective_scope = if user_quarantined {
-        strip_sensitive_scopes(effective_scope.as_deref(), state.quarantine_config())
-    } else {
-        effective_scope
+            bound_scope,
+        } => (session, consent_ref, bound_scope),
     };
 
     // 6b. Step-up authentication (RFC 9470, issue #72). Assemble the effective
@@ -1740,6 +1721,10 @@ enum Gate {
         /// a skipped consent was NOT stored (the no-store performance knob, issue
         /// #21), in which case the grant records no consent reference.
         consent_ref: Option<String>,
+        /// The scope to freeze onto the code (issue #365): the effective scope with
+        /// every sensitive scope stripped when the subject is quarantined (issue #82),
+        /// decided ONCE by the consent core so the old step-6a strip is folded in.
+        bound_scope: Option<String>,
     },
 }
 
@@ -1895,7 +1880,10 @@ pub(crate) async fn user_is_quarantined(
 /// granted scope (issue #82, PR 2), returning the surviving non-sensitive scope, or `None`
 /// when nothing survives. The single authorize choke point that keeps a sensitive scope out
 /// of a quarantined account's frozen grant (and so out of any token minted from it).
-fn strip_sensitive_scopes(effective_scope: Option<&str>, cfg: &QuarantineConfig) -> Option<String> {
+pub(crate) fn strip_sensitive_scopes(
+    effective_scope: Option<&str>,
+    cfg: &QuarantineConfig,
+) -> Option<String> {
     let scope = effective_scope?;
     let kept: Vec<&str> = scope
         .split_whitespace()
@@ -2023,10 +2011,11 @@ async fn audit_skipped_consent(
         })
 }
 
-// The consent gate is a single cohesive decision procedure (quarantine read, first-party
-// carve-out, the consent-lockdown block, the recorded-consent fast path, and the prompt=none
-// surfaces); splitting it would scatter one security decision across helpers and hurt
-// readability, so the length lint is not meaningful here.
+// The consent gate performs the IO for one cohesive decision (the flag-gated quarantine read,
+// the admin-gate read, the recorded-consent lookup, and the record/audit/render per outcome),
+// then delegates the SECURITY-CRITICAL ordered decision to the pure `consent_core` (issue #365),
+// the single source of truth the challenge surface also routes through. Splitting the IO further
+// would scatter one decision across helpers, so the length lint is not meaningful here.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn resolve_consent_gate(
     state: &OidcState,
@@ -2052,191 +2041,49 @@ async fn resolve_consent_gate(
         iss: iss.to_owned(),
         mode,
     };
+    let server_error = || {
+        gate_error(
+            AuthzErrorCode::ServerError,
+            "the authorization request could not be processed",
+        )
+    };
     let client_id_str = client_id.to_string();
-    // Consent lockdown (issue #88, PR 3): an UNVERIFIED (quarantined), non-first-party client
-    // requesting a SENSITIVE scope is BLOCKED with `access_denied` (the authorization SERVER
-    // refusing on policy grounds -- RFC 6749 section 4.1.2.1 -- not a malformed scope, so NOT
-    // `invalid_scope`), HARDENING the prior "proceed to consent and mint it" behavior. It fires
-    // FIRST, ahead of the carve-out AND the recorded-consent fast path below, so it is
-    // unbypassable; see `unverified_sensitive_scope_blocked` for the escapes and safe default.
-    if unverified_sensitive_scope_blocked(state, client, effective_scope) {
-        return Err(gate_error(
-            AuthzErrorCode::AccessDenied,
-            "an unverified client may not obtain the requested sensitive scope",
-        ));
-    }
-    // A QUARANTINED USER (issue #82, PR 2) never gets a SILENT authorization: the
-    // first-party/skip_consent carve-out is disabled below (its trust is ignored, so an
-    // un-consented app always routes to the consent SCREEN), and every sensitive scope is
-    // stripped from the grant at the shared choke point in the authorize handler. Gated on
-    // the experimental flag; when off the read never runs, so the behavior is byte-identical
-    // to before the feature (a quarantined-user flag is only ever set behind the same flag).
-    //
-    // NOTE (issue #82, deliberate divergence from the #31 client mirror): the quarantine is
-    // NOT folded into `force_consent` the way `client.quarantined` is. `force_consent` also
-    // gates the recorded-consent fast path, and because the quarantine flag is a PERSISTENT
-    // server-side flag (unlike the one-shot `prompt=consent`, which the consent resume
-    // strips), folding it into `force_consent` re-forces the screen on the post-consent
-    // resume too and TRAPS the account in a consent loop it can never complete, which would
-    // defeat the acceptance criterion that a quarantined account CAN authenticate. Instead
-    // the quarantine disables the silent CARVE-OUT (so consent is shown for any app the user
-    // has not consented to) while a freshly recorded consent completes the flow, and the
-    // sensitive-scope strip (the real limited-privilege teeth) is enforced UNCONDITIONALLY on
-    // every authorization regardless of consent, so a silent reuse of a prior consent is
-    // still powerless.
+
+    // The IO the pure decision consumes, each read failing CLOSED to a `server_error` (consistent
+    // with the sibling security reads): a transient blip must never silently re-enable the
+    // carve-out or admit an un-pre-authorized third party. See `consent_core::decide` for the
+    // ordered decision these inputs drive.
+
+    // The consent-lockdown block (issue #88, PR 3): a pure config read, no store IO.
+    let unverified_sensitive_block =
+        unverified_sensitive_scope_blocked(state, client, effective_scope);
+
+    // A QUARANTINED USER (issue #82, PR 2): the flag-gated read (when off it never runs, so the
+    // behavior is byte-identical to before the feature). This is the SINGLE quarantine read the
+    // browser path now makes; its result both feeds the decision AND folds the step-6a scope strip
+    // into the core's `bound_scope`, replacing the former second read at the handler choke point.
     let user_quarantined = if state.signup_quarantine_enabled() {
         match user_is_quarantined(state, scope, &session.subject).await {
             Ok(quarantined) => quarantined,
-            // FAIL CLOSED on a store fault (consistent with the sibling security reads): a
-            // transient blip must NOT silently re-enable the first-party carve-out for a
-            // possibly quarantined subject.
-            Err(()) => {
-                return Err(gate_error(
-                    AuthzErrorCode::ServerError,
-                    "the authorization request could not be processed",
-                ));
-            }
+            Err(()) => return Err(server_error()),
         }
     } else {
         false
     };
-    // `prompt=consent` forces a fresh consent screen. A QUARANTINED (unverified,
-    // possibly phishing) client ALWAYS re-prompts too (issue #31, FIX 4): consent is
-    // shown on EVERY authorization until an admin verifies it. This is what disables
-    // the recorded-consent fast path below (`covered && !force_consent`) for a
-    // quarantined client, so a PRE-RECORDED consent can never silently auto-authorize
-    // it; the first-party carve-out block already refuses its implicit/skip_consent
-    // auto-grant. Verification flips `quarantined` off and restores both.
-    let force_consent = prompt.contains(PromptValue::Consent) || client.quarantined;
-    let consent_mode = ConsentMode::parse(&client.consent_mode);
-    // The trusted first-party carve-out: an `implicit`-mode client, or one whose
-    // `skip_consent` flag is set, never sees the consent screen and is auto-granted.
-    // `prompt=consent` still forces a fresh screen, so it wins over the carve-out.
-    //
-    // Unverified-client quarantine (issue #31): a quarantined client NEVER gets the
-    // first-party carve-out. Its `implicit`/`skip_consent`/first-party trust is
-    // IGNORED and consent is ALWAYS shown, until an admin verifies it (which flips
-    // `quarantined` off and restores the carve-out).
-    // A quarantined USER (issue #82, PR 2) also NEVER gets the first-party carve-out, the
-    // exact client-quarantine mirror: its trust is ignored and consent is always shown.
-    let first_party = !client.quarantined
-        && !user_quarantined
-        && (matches!(consent_mode, ConsentMode::Implicit) || client.skip_consent);
 
-    // Third-party admin-consent gate (issue #88, PR 4): a THIRD-PARTY (not `first_party`) client
-    // must be admin-pre-authorized for its requested scope before it can obtain user consent. It
-    // fires HERE, ahead of the first-party carve-out AND the recorded-consent fast path below, so
-    // the admin gate DOMINATES a client's `skip_consent`/`implicit` trust and any prior recorded
-    // user consent: a covering pre-authorization ALLOWS the request (normally skipping the user
-    // screen, the admin grant being the consent of record, the Microsoft model), an uncovered
-    // request is a non-approvable terminal (`access_denied`, the same under `prompt=none`), and it
-    // does not apply to a first-party client or when the knob is off. Fails closed to
-    // `server_error` on a store fault.
-    //
-    // The admin pre-authorization grants ALLOWANCE, never consent-screen INVISIBILITY: a covering
-    // grant lets the request through, but a quarantined client (issue #31) or quarantined user
-    // (issue #82), or an explicit `prompt=consent`, STILL sees a fresh consent screen. So the
-    // silent skip applies only when consent is not forced; otherwise a `Covered` outcome falls
-    // through to the normal flow, where `force_consent` disables the recorded-consent fast path
-    // and the user is shown consent. This keeps the quarantine "always re-prompt" property true
-    // even for an admin-pre-authorized client.
-    match third_party_admin_consent_outcome(state, scope, client, &client_id_str, effective_scope)
-        .await
-    {
-        Ok(AdminConsentOutcome::Covered) if !force_consent && !user_quarantined => {
-            // The admin pre-authorization is the consent of record: skip the user consent screen
-            // and issue the code. Audit `consent.skip` so the silent auto-grant stays enumerable
-            // even though no user consent row is persisted.
-            if audit_skipped_consent(
-                state,
-                scope,
-                &session.subject,
-                client_id,
-                "admin_preauthorized",
-            )
+    // The third-party admin-consent gate (issue #88, PR 4): the caller does the read and fails
+    // closed; the core classifies the outcome (skip, terminal, or fall through).
+    let Ok(admin) =
+        third_party_admin_consent_outcome(state, scope, client, &client_id_str, effective_scope)
             .await
-            .is_err()
-            {
-                return Err(gate_error(
-                    AuthzErrorCode::ServerError,
-                    "the authorization request could not be processed",
-                ));
-            }
-            return Ok(Gate::Ready {
-                session,
-                consent_ref: None,
-            });
-        }
-        // Fall through: either the gate does not apply (`NotApplicable`), or the request is
-        // covered but its consent is FORCED (a quarantined client or user, or `prompt=consent`).
-        // A forced-but-covered request is ALLOWED but not silently skipped, so the consent screen
-        // is still shown, preserving the quarantine consent-visibility property.
-        Ok(AdminConsentOutcome::NotApplicable | AdminConsentOutcome::Covered) => {}
-        Ok(AdminConsentOutcome::RequiresAdminApproval) => {
-            return Err(gate_error(
-                AuthzErrorCode::AccessDenied,
-                "this application requires administrator approval before it can be authorized",
-            ));
-        }
-        Err(()) => {
-            return Err(gate_error(
-                AuthzErrorCode::ServerError,
-                "the authorization request could not be processed",
-            ));
-        }
-    }
+    else {
+        return Err(server_error());
+    };
 
-    if first_party && !force_consent {
-        // Record the skipped consent so an offline grant stays enumerable and
-        // revocable per app, UNLESS the no-store performance knob is off.
-        let consent_ref = if client.store_skipped_consent {
-            match record_skipped_consent(
-                state,
-                scope,
-                &session.subject,
-                &client_id_str,
-                effective_scope,
-                consent_mode,
-            )
-            .await
-            {
-                Ok(id) => Some(id),
-                Err(()) => {
-                    return Err(gate_error(
-                        AuthzErrorCode::ServerError,
-                        "the authorization request could not be processed",
-                    ));
-                }
-            }
-        } else {
-            // The no-store knob is off, so no consent row is persisted. Audit `consent.skip` so
-            // the silent first-party auto-grant still leaves an audit trail naming the client
-            // (issue #88, PR 4: closing the prior no-audit gap).
-            if audit_skipped_consent(
-                state,
-                scope,
-                &session.subject,
-                client_id,
-                "first_party_carveout",
-            )
-            .await
-            .is_err()
-            {
-                return Err(gate_error(
-                    AuthzErrorCode::ServerError,
-                    "the authorization request could not be processed",
-                ));
-            }
-            None
-        };
-        return Ok(Gate::Ready {
-            session,
-            consent_ref,
-        });
-    }
-
-    // A recorded consent authorizes a later request only when that request's scope is
-    // a SUBSET of the granted scope (issue #196) and it has not lapsed (issue #21).
+    // The recorded-consent lookup (issue #21 / #196): read eagerly and let the core decide whether
+    // the fast path applies. A store fault is a `server_error` exactly as before; on the auto-grant
+    // paths that do not reach the fast path, the carve-out and admin audits would already fail
+    // closed on the same consents store, so this read never changes an observable outcome.
     let Ok(recorded) = state
         .store()
         .scoped(scope)
@@ -2244,41 +2091,95 @@ async fn resolve_consent_gate(
         .granted_ref(&session.subject, &client_id_str)
         .await
     else {
-        return Err(gate_error(
-            AuthzErrorCode::ServerError,
-            "the authorization request could not be processed",
-        ));
+        return Err(server_error());
     };
+
     let now_micros = epoch_micros(state.now());
     let consent_scope =
         consent_check_scope(effective_scope, state.offline_access_requires_consent());
-    let covered = recorded
-        .as_ref()
-        .is_some_and(|consent| !consent_expired(consent, now_micros))
-        && consent_covers_scope(recorded.as_ref(), consent_scope.as_deref());
-    if covered && !force_consent {
-        let consent_ref = recorded.expect("a covering consent is recorded").id;
-        return Ok(Gate::Ready {
-            session,
-            consent_ref: Some(consent_ref),
-        });
-    }
+    let consent_mode = ConsentMode::parse(&client.consent_mode);
+    // The browser surface trusts an `implicit`-mode client or one whose `skip_consent` flag is set
+    // for the first-party carve-out. The core takes this trust as an INPUT (it does not re-derive
+    // it) so the challenge surface can supply its own predicate while sharing the same decision.
+    let carveout_trusted = matches!(consent_mode, ConsentMode::Implicit) || client.skip_consent;
 
-    // Consent is required: none recorded, the recorded one is expired or does not
-    // cover the requested scope, or prompt=consent forced a fresh screen. Under
-    // prompt=none no UI is rendered: the consent_required error goes back through the
-    // negotiated mode instead.
-    if prompt_none {
-        return Err(gate_error(
-            AuthzErrorCode::ConsentRequired,
-            "consent is required but prompt=none forbids interaction",
-        ));
+    let inputs = consent_core::ConsentInputs {
+        client_quarantined: client.quarantined,
+        user_quarantined,
+        prompt_consent: prompt.contains(PromptValue::Consent),
+        prompt_none,
+        carveout_trusted,
+        store_skipped_consent: client.store_skipped_consent,
+        unverified_sensitive_block,
+        admin,
+        recorded: recorded.as_ref(),
+        effective_scope,
+        consent_check_scope: consent_scope.as_deref(),
+        now_micros,
+        quarantine_cfg: state.quarantine_config(),
+    };
+
+    match consent_core::decide(&inputs) {
+        consent_core::ConsentDecision::Denied { code, description } => {
+            Err(gate_error(code, description))
+        }
+        consent_core::ConsentDecision::AutoGrant {
+            bound_scope,
+            consent_ref,
+        } => {
+            // Perform the consent-reference IO the decision dictates, each failing CLOSED. The
+            // scope frozen onto the code is the core's `bound_scope` (the effective scope, stripped
+            // for a quarantined user), which for a carve-out RECORD equals the effective scope (the
+            // carve-out only fires for a non-quarantined user, so the strip is a no-op there), so a
+            // recorded skipped consent stores byte-identically to before.
+            let consent_ref = match consent_ref {
+                consent_core::ConsentRefAction::UseRecorded(id) => Some(id),
+                consent_core::ConsentRefAction::RecordSkipped => {
+                    // Record the skipped consent so an offline grant stays enumerable and revocable
+                    // per app (issue #21).
+                    match record_skipped_consent(
+                        state,
+                        scope,
+                        &session.subject,
+                        &client_id_str,
+                        bound_scope.as_deref(),
+                        consent_mode,
+                    )
+                    .await
+                    {
+                        Ok(id) => Some(id),
+                        Err(()) => return Err(server_error()),
+                    }
+                }
+                consent_core::ConsentRefAction::AuditOnly { reason } => {
+                    // No consent row is persisted (the admin skip, or the no-store carve-out knob):
+                    // audit `consent.skip` so the silent auto-grant still leaves a trail naming the
+                    // client (issue #88, PR 4).
+                    if audit_skipped_consent(state, scope, &session.subject, client_id, reason)
+                        .await
+                        .is_err()
+                    {
+                        return Err(server_error());
+                    }
+                    None
+                }
+            };
+            Ok(Gate::Ready {
+                session,
+                consent_ref,
+                bound_scope,
+            })
+        }
+        // Consent is required and prompt did not forbid interaction (the core already turned a
+        // prompt=none interaction need into `Denied(consent_required)`): render the consent screen.
+        consent_core::ConsentDecision::NeedsInteractiveConsent => {
+            Ok(Gate::Interaction(consent_interaction(
+                state,
+                scope,
+                &consent_resume_url(params, hints, prompt, pushed),
+            )))
+        }
     }
-    Ok(Gate::Interaction(consent_interaction(
-        state,
-        scope,
-        &consent_resume_url(params, hints, prompt, pushed),
-    )))
 }
 
 /// Record a SKIPPED consent for a trusted first-party client (issue #21) and
