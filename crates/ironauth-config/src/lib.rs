@@ -769,6 +769,30 @@ pub struct AdminConfig {
     /// radius on a stolen credential.
     #[serde(default = "default_sudo_mode_window_secs")]
     pub sudo_mode_window_secs: u64,
+
+    /// Run the one-shot signing-algorithm backfill at startup (issue #93). Every
+    /// environment provisions all three JWKS signing algorithms (`EdDSA`, `ES256`,
+    /// and `RS256`) at creation, but environments created before that change carry
+    /// only their `EdDSA` day-one key. When this is `true`, the server provisions
+    /// the missing `ES256`/`RS256` keys into every existing environment ONCE at
+    /// startup, before serving, so the compatibility wizard's recommendations are
+    /// signable everywhere. The routine is IDEMPOTENT (it provisions only what is
+    /// absent), so leaving it on merely rescans each boot; the intended use is to
+    /// enable it for one deploy rollout, then turn it back off. The SAFE default
+    /// (`false`) is a no-op: freshly created environments already get all three, so
+    /// only a deployment with pre-#93 environments needs the backfill. Enable it at
+    /// or before a rollout so the fresh server processes load all three algorithms
+    /// on their first use of each environment (the in-process issuer keyset cache
+    /// does not invalidate mid-process, issue #204). Enable it on a SINGLE replica
+    /// for the one-shot rollout: the backfill presence-checks then inserts, and there
+    /// is deliberately no unique constraint on (environment, algorithm) because key
+    /// rotation keeps two non-retired keys of the same algorithm during its prepublish
+    /// overlap, so a fleet where every replica enables this at once can insert a
+    /// duplicate ES256 or RS256 key per environment. Such duplicates are harmless
+    /// (both are the environment's own keys and both publish in the JWKS), but they
+    /// are avoided by running the backfill from one replica.
+    #[serde(default)]
+    pub backfill_signing_algorithms_on_start: bool,
 }
 
 /// The default admin sudo re-authentication freshness window: ten minutes (issue #73).
@@ -796,6 +820,7 @@ impl Default for AdminConfig {
             outbound_verification_environment: None,
             sudo_mode_enabled: false,
             sudo_mode_window_secs: default_sudo_mode_window_secs(),
+            backfill_signing_algorithms_on_start: false,
         }
     }
 }

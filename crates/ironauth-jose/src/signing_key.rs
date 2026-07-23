@@ -24,10 +24,17 @@
 //! which is documented in [`crate::sign`].
 
 use ironauth_env::Entropy;
+// KEY GENERATION ONLY (issue #93): p256/rsa produce fresh ES256/RS256 private
+// material and export it to DER. They never sign, verify, or decrypt; every later
+// use of a generated key flows through `ring` below, so `ring` stays the sole
+// signature backend. The traits are the DER-export traits, not signature traits.
+use p256::pkcs8::EncodePrivateKey;
 use ring::signature::{
     ECDSA_P256_SHA256_FIXED_SIGNING, ECDSA_P384_SHA384_FIXED_SIGNING, EcdsaKeyPair, Ed25519KeyPair,
     KeyPair, RsaKeyPair,
 };
+use rsa::RsaPrivateKey;
+use rsa::pkcs1::EncodeRsaPrivateKey;
 
 use crate::policy::{JwsAlgorithm, KeyError, KeyFamily, TrustedKey};
 use crate::sign;
@@ -283,6 +290,60 @@ impl SigningKey {
     }
 }
 
+/// The RSA modulus size (in bits) generated for a day-one `RS256` key: 2048,
+/// exactly the enforced floor (`RSA_MIN_MODULUS_BYTES` = 256 bytes). Matching the
+/// floor keeps generation fast while never producing a key the verifier rejects.
+const RSA_DAY_ONE_MODULUS_BITS: usize = 2048;
+
+/// Generate a fresh ECDSA P-256 (`ES256`) private key and return it as a PKCS#8 v1
+/// DER document, ready for [`SigningKey::ecdsa_p256_from_pkcs8`] and for storage as
+/// an `ecdsa_pkcs8` material kind.
+///
+/// KEY GENERATION ONLY. The material is produced with the `RustCrypto` `p256` crate,
+/// seeded off the [`Entropy`] seam through the `ChaCha20` bridge, then exported to
+/// DER. It is never signed or verified with `p256`: every later use flows through
+/// `ring` (via the issuer loader), so `ring` stays the sole signature backend.
+/// Deterministic under a fixed entropy source, so a day-one key set is reproducible
+/// in tests.
+///
+/// # Errors
+///
+/// [`SigningKeyError::KeyGeneration`] if the DER export fails (it does not for a
+/// freshly generated key; surfaced for completeness).
+pub fn generate_ecdsa_p256_pkcs8_der(entropy: &dyn Entropy) -> Result<Vec<u8>, SigningKeyError> {
+    let mut rng = ironauth_env::keygen_rng(entropy);
+    let secret = p256::SecretKey::random(&mut rng);
+    let der = secret
+        .to_pkcs8_der()
+        .map_err(|_| SigningKeyError::KeyGeneration)?;
+    Ok(der.as_bytes().to_vec())
+}
+
+/// Generate a fresh 2048-bit RSA (`RS256`) private key and return it as a PKCS#1
+/// `RSAPrivateKey` DER document, ready for [`SigningKey::rsa_from_pkcs1_der`] and
+/// for storage as an `rsa_pkcs1_der` material kind.
+///
+/// KEY GENERATION ONLY (see [`generate_ecdsa_p256_pkcs8_der`]): produced with the
+/// `RustCrypto` `rsa` crate seeded off the [`Entropy`] seam and exported to DER;
+/// never used to sign, verify, or DECRYPT. The `rsa` crate's Marvin advisory
+/// (RUSTSEC-2023-0071) is on the decryption path, which this code never reaches;
+/// signing flows through `ring`. The modulus is 2048 bits, exactly the enforced
+/// floor. Deterministic under a fixed entropy source.
+///
+/// # Errors
+///
+/// [`SigningKeyError::KeyGeneration`] if the `RustCrypto` key generation or the DER
+/// export fails.
+pub fn generate_rsa_pkcs1_der(entropy: &dyn Entropy) -> Result<Vec<u8>, SigningKeyError> {
+    let mut rng = ironauth_env::keygen_rng(entropy);
+    let key = RsaPrivateKey::new(&mut rng, RSA_DAY_ONE_MODULUS_BITS)
+        .map_err(|_| SigningKeyError::KeyGeneration)?;
+    let der = key
+        .to_pkcs1_der()
+        .map_err(|_| SigningKeyError::KeyGeneration)?;
+    Ok(der.as_bytes().to_vec())
+}
+
 impl std::fmt::Debug for SigningKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Never render key material: only the non-secret selectors.
@@ -418,6 +479,9 @@ pub enum SigningKeyError {
     /// The key's public projection could not be formed, indicating corrupt
     /// material.
     MalformedPublicKey,
+    /// Fresh key generation (or its DER export) failed. Raised only by the
+    /// day-one keygen helpers, never by loading provisioned material.
+    KeyGeneration,
 }
 
 impl From<KeyError> for SigningKeyError {
@@ -444,6 +508,9 @@ impl std::fmt::Display for SigningKeyError {
             }
             SigningKeyError::MalformedPublicKey => {
                 f.write_str("signing key has a malformed public projection")
+            }
+            SigningKeyError::KeyGeneration => {
+                f.write_str("fresh signing key generation or DER export failed")
             }
         }
     }

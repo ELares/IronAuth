@@ -36,6 +36,17 @@ wildcards = "deny"
 
 [advisories]
 yanked = "deny"
+# Scoped advisory ignore (issue #93). RUSTSEC-2023-0071 ("Marvin Attack") is a
+# TIMING side channel in the `rsa` crate's RSA DECRYPTION path (PKCS#1 v1.5
+# unpadding). IronAuth uses the `rsa` crate ONLY to GENERATE a day-one RS256
+# signing key and export it to PKCS#1 DER (crates/ironauth-jose keygen); it never
+# decrypts and never signs with the `rsa` crate. Signing and verification run
+# exclusively on `ring`. The vulnerable decryption path is therefore UNREACHABLE
+# in this tree. There is no fixed release of `rsa` for this advisory yet, so the
+# only options are ignore-with-justification or vendoring keygen; the former is
+# correct given the path is unreachable. The dep-review lens MUST re-confirm the
+# `rsa` crate is never used to decrypt or sign before this ignore is trusted.
+ignore = [{ id = "RUSTSEC-2023-0071", reason = "rsa crate used only for RS256 keygen + DER export (crates/ironauth-jose); never decrypts or signs, so the Marvin decryption-timing path is unreachable. Signing/verification is on ring." }]
 
 [sources]
 unknown-registry = "deny"

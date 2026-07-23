@@ -329,6 +329,9 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // Capture what the Back-Channel Logout delivery worker (issue #34) needs before
         // config moves into the server (only when OIDC is mounted AND the switch is on).
         let backchannel_inputs = backchannel_worker_inputs(&config, &env);
+        // Capture what the one-shot signing-algorithm backfill (issue #93) needs before
+        // config moves into the server (only when its switch is on). Runs before serving.
+        let signing_backfill_inputs = signing_backfill_inputs(&config, &env);
 
         let mut server = match Server::new(config, env) {
             Ok(server) => server,
@@ -414,6 +417,13 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             );
         } else {
             tracing::info!("admin console not mounted: admin_spa.enabled is false");
+        }
+        // The one-shot day-one signing-algorithm backfill (issue #93), run to
+        // completion BEFORE the server serves so this fresh process loads all three
+        // algorithms on its first use of each environment. Gated off by default and
+        // idempotent; the intended use is to enable it for one deploy rollout.
+        if let Some(inputs) = signing_backfill_inputs {
+            run_signing_algorithm_backfill(inputs).await;
         }
         // The OIDC Back-Channel Logout delivery worker (issue #34), spawned only when the
         // OIDC provider is mounted AND its posture switch is on. Off by default (the
@@ -1081,6 +1091,86 @@ fn backchannel_worker_inputs(config: &Config, env: &Env) -> Option<BackChannelWo
         control_dsn: select_control_dsn(config),
         env: env.clone(),
     })
+}
+
+/// What the one-shot signing-algorithm backfill (issue #93) needs to run, captured
+/// before `config` moves into the server.
+struct SigningBackfillInputs {
+    /// The data-plane DSN the backfill provisions through (the least-privilege
+    /// `ironauth_app` role in production, which holds the scoped INSERT on
+    /// `signing_keys`).
+    data_plane_dsn: String,
+    /// The control-plane DSN the backfill enumerates `(tenant, environment)` scopes
+    /// on (the non-RLS `environments` table only the control role can read);
+    /// [`None`] disables the backfill (without it there is no way to discover the
+    /// environments to provision into).
+    control_dsn: Option<String>,
+    /// The environment seam (deterministic clock and entropy).
+    env: Env,
+}
+
+/// Capture the signing-algorithm backfill inputs from config (issue #93), or `None`
+/// when the switch is off (the default). The control-plane DSN is resolved here
+/// (the backfill enumerates scopes on the control plane).
+fn signing_backfill_inputs(config: &Config, env: &Env) -> Option<SigningBackfillInputs> {
+    if !config.admin.backfill_signing_algorithms_on_start {
+        return None;
+    }
+    Some(SigningBackfillInputs {
+        data_plane_dsn: config.database.url.expose().to_owned(),
+        control_dsn: select_control_dsn(config),
+        env: env.clone(),
+    })
+}
+
+/// Run the one-shot day-one signing-algorithm backfill (issue #93) to completion.
+///
+/// Provisions the missing `ES256`/`RS256` keys into every environment that predates
+/// the all-three-at-creation change, idempotently. Enumeration is a CONTROL-plane
+/// read (the data-plane role cannot see the non-RLS `environments` table), so it
+/// needs both a data-plane store (to provision) and a control-plane store (to
+/// enumerate). Any connect failure or a missing control DSN is logged and the
+/// backfill is simply skipped; the rest of the server runs unaffected.
+async fn run_signing_algorithm_backfill(inputs: SigningBackfillInputs) {
+    let SigningBackfillInputs {
+        data_plane_dsn,
+        control_dsn,
+        env,
+    } = inputs;
+
+    let Some(control_dsn) = control_dsn else {
+        tracing::error!(
+            "signing-algorithm backfill skipped: no control-plane DSN to enumerate scopes \
+             (set admin.control_database_url, or run in dev_mode)"
+        );
+        return;
+    };
+    let data_store = match Store::connect(&data_plane_dsn).await {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::error!(%error, "signing-algorithm backfill skipped: data-plane connect failed");
+            return;
+        }
+    };
+    let control_store = match Store::connect(&control_dsn).await {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::error!(%error, "signing-algorithm backfill skipped: control-plane connect failed");
+            return;
+        }
+    };
+
+    match ironauth_admin::backfill_signing_algorithms(&env, &control_store, &data_store).await {
+        Ok(report) => tracing::info!(
+            scopes_scanned = report.scopes_scanned,
+            keys_provisioned = report.keys_provisioned,
+            scopes_failed = report.scopes_failed,
+            "signing-algorithm backfill complete"
+        ),
+        Err(error) => {
+            tracing::error!(%error, "signing-algorithm backfill failed to enumerate scopes");
+        }
+    }
 }
 
 /// Spawn the OIDC Back-Channel Logout delivery worker (issue #34) as a detached

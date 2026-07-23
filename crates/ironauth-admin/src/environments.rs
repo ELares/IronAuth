@@ -23,7 +23,7 @@ use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
 use crate::input::{parse_json, require_non_empty};
 use crate::pagination::{ListQuery, Pagination};
-use crate::provision::DayOneSigningKey;
+use crate::provision::DayOneSigningKeys;
 use crate::response::{json, no_content};
 use crate::state::AdminState;
 use crate::views::{CreateEnvironmentRequest, EnvironmentList, EnvironmentView};
@@ -137,9 +137,8 @@ pub async fn create_environment(
     let created_at_micros = state.now_unix_micros();
     let environment_id = EnvironmentId::generate(state.env());
     let scope = Scope::new(tenant, environment_id);
-    // The environment's day-one signing key, generated here (the entropy seam) and
-    // provisioned in the same transaction as the environment.
-    let signing_key = DayOneSigningKey::generate(state.env(), &scope);
+    // The environment's day-one signing keys (EdDSA + ES256 + RS256, issue #93).
+    let signing_keys = DayOneSigningKeys::generate(state.env(), &scope)?;
 
     let view = EnvironmentView {
         id: environment_id.to_string(),
@@ -176,7 +175,7 @@ pub async fn create_environment(
                 custom_domain: custom_domain.as_deref(),
                 region: region.as_deref(),
             },
-            signing_key.as_new(created_at_micros),
+            &signing_keys.as_new(created_at_micros),
             Some(write),
         )
         .await;

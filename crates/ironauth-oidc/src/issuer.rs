@@ -429,7 +429,17 @@ async fn load_issuer_entry(store: &Store, scope: &Scope) -> Option<IssuerEntry> 
     // ES256-only environment yields policy {ES256} and can emit nothing else
     // (AC #3): signing needs both a key of the algorithm and a policy that permits
     // it, and for a non-ES256 algorithm neither is present.
-    let policy = SigningPolicy::new(algorithms).ok()?;
+    //
+    // The policy's FIRST entry is the environment's preferred (default) signer
+    // (SigningPolicy::preferred). Since issue #93 every environment provisions all
+    // three algorithms on day one, all sharing one created_at instant, so list()'s
+    // (created_at, id) order would tie-break on the random id and make the default
+    // signer effectively RANDOM per environment. Build the allowlist in a CANONICAL
+    // preference order instead (EdDSA, then ES256, then RS256), intersected with the
+    // algorithms actually present, so EdDSA stays the deterministic default whenever
+    // it is provisioned. Any present algorithm outside the canonical list (a future
+    // key kind) is appended in its loaded order so it is never silently dropped.
+    let policy = SigningPolicy::new(canonical_algorithm_order(&algorithms)).ok()?;
     // PLACEHOLDER salt: per-environment salt persistence and the pairwise wiring
     // are a later milestone; nothing live reads this salt yet (the data-plane token
     // path resolves PUBLIC subjects, which never consult a salt, see
@@ -447,6 +457,37 @@ async fn load_issuer_entry(store: &Store, scope: &Scope) -> Option<IssuerEntry> 
         .await
         .ok()?;
     Some(IssuerEntry::new(keyset, policy, salt, guardrails))
+}
+
+/// Order an environment's present signing algorithms by IronAuth's CANONICAL
+/// preference (`EdDSA`, then `ES256`, then `RS256`), so the derived
+/// [`SigningPolicy`]'s first entry (its preferred/default signer) is deterministic
+/// regardless of the order the key rows loaded in.
+///
+/// Only algorithms actually present in `present` are emitted (a policy can never
+/// permit an algorithm the environment has no key for). Any present algorithm not
+/// named in the canonical list is appended afterwards in its incoming order, so a
+/// future key kind is never silently dropped from the policy. The input is already
+/// de-duplicated by the caller; the output preserves that.
+fn canonical_algorithm_order(present: &[JwsAlgorithm]) -> Vec<JwsAlgorithm> {
+    // The canonical default-preference order. EdDSA is IronAuth's default and must
+    // stay the default signer whenever it is provisioned.
+    const CANONICAL: [JwsAlgorithm; 3] = [
+        JwsAlgorithm::EdDsa,
+        JwsAlgorithm::Es256,
+        JwsAlgorithm::Rs256,
+    ];
+    let mut ordered: Vec<JwsAlgorithm> = CANONICAL
+        .into_iter()
+        .filter(|alg| present.contains(alg))
+        .collect();
+    // Preserve any present-but-uncanonical algorithm (defense for a future kind).
+    for &alg in present {
+        if !ordered.contains(&alg) {
+            ordered.push(alg);
+        }
+    }
+    ordered
 }
 
 /// Convert an epoch-microseconds instant (as stored on a signing-key row) to a

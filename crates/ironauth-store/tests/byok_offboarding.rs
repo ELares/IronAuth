@@ -115,7 +115,7 @@ impl Fixture {
                     region: None,
                 },
                 None,
-                key.as_new(),
+                &[key.as_new()],
                 None,
             )
             .await

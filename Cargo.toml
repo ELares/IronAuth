@@ -151,6 +151,31 @@ oauth2 = { version = "5", default-features = false }
 # signature primitives on purpose: high-level JOSE crates carry the very CVE
 # classes issue #8 closes.
 ring = "0.17"
+# Asymmetric key GENERATION for day-one signing-key provisioning
+# (crates/ironauth-jose, issue #93): ring cannot generate RSA keys at all and
+# binds its ECDSA generation to its own RNG, so ES256 and RS256 day-one keys are
+# generated with the RustCrypto p256 and rsa crates and exported to PKCS#8 / PKCS#1
+# DER, then LOADED and signed exclusively through ring (the one signature backend).
+# Both crates are used ONLY for keygen + DER export, NEVER to sign, verify, or
+# decrypt: the rsa crate's Marvin timing advisory (RUSTSEC-2023-0071) is on the
+# RSA-DECRYPTION path, which is unreachable here (scoped-ignored in deny.toml). The
+# keygen RNG is a ChaCha20 stream SEEDED from the ironauth-env entropy seam (never
+# an OS RNG), so day-one keys are reproducible under a fixed test entropy source and
+# the determinism seam holds. Both are pure Rust (RustCrypto), permissive (MIT OR
+# Apache-2.0, whole subtree allowlisted), no C dependency, so the musl static lane
+# holds and MSRV 1.85 is satisfied. RSA is fixed at 2048 bits (the enforced modulus
+# floor). Default features are trimmed to keygen + DER: no signing, no PEM.
+p256 = { version = "0.13", default-features = false, features = [
+    "arithmetic",
+    "pkcs8",
+    "std",
+] }
+rsa = { version = "0.9", default-features = false, features = ["std"] }
+# The determinism-seam bridge (crates/ironauth-env): a ChaCha20 CSPRNG seeded from
+# a 32-byte draw off the entropy seam, so the p256/rsa keygen above expands seam
+# entropy deterministically. Already in the tree transitively; this adds a direct
+# edge, not a new crate. Pure Rust, permissive (MIT OR Apache-2.0), musl clean.
+rand_chacha = "0.3"
 # SHA-256 for migration checksums (drift and tamper detection). Pure Rust
 # (no asm/C feature), permissive (MIT OR Apache-2.0), already in the tree via
 # sqlx, so this adds a direct edge but no new crate; MSRV 1.85 and musl clean.
@@ -234,3 +259,16 @@ missing_docs = "warn"
 # Pedantic is the workspace floor; CI promotes warnings to errors with -D warnings.
 # Exceptions are granted per item with an inline reason, never blanket-allowed.
 pedantic = { level = "warn", priority = -1 }
+
+# RSA 2048 keygen (day-one multi-algorithm signing-key provisioning, issue #93) is
+# dominated by bignum primality testing, which is punishingly slow in an unoptimized
+# debug build (seconds per key), inflating the wall clock of any test that creates
+# environments. Optimize only the bignum keygen crates in the dev profile so debug
+# tests and the local loop stay fast; this changes no behavior and leaves the rest of
+# the workspace unoptimized for fast iteration. Signing and verification run on ring;
+# these crates are keygen and DER export only.
+[profile.dev.package.num-bigint-dig]
+opt-level = 3
+
+[profile.dev.package.rsa]
+opt-level = 3

@@ -31590,11 +31590,20 @@ impl ActingTenantRepo<'_> {
         tenant_display_name: &str,
         environment: NewEnvironment<'_>,
         home_region: Option<&str>,
-        signing_key: NewSigningKey<'_>,
+        signing_keys: &[NewSigningKey<'_>],
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
         let scope = Scope::new(*tenant_id, *environment_id);
-        if signing_key.id.scope() != scope {
+        // An environment must be created with at least one signing key, or its JWKS is
+        // empty and it can issue no tokens; the slice parameter (issue #93) makes a
+        // keyless create expressible, so guard the invariant every live caller upholds.
+        debug_assert!(
+            !signing_keys.is_empty(),
+            "an environment must be created with at least one signing key"
+        );
+        // Every day-one key (issue #93: EdDSA + ES256 + RS256) must be in the first
+        // environment's scope; a stray out-of-scope key aborts the whole create.
+        if signing_keys.iter().any(|key| key.id.scope() != scope) {
             return Err(StoreError::NotFound);
         }
         let operator = self.operator;
@@ -31655,13 +31664,16 @@ impl ActingTenantRepo<'_> {
                 .bind(created_at_micros)
                 .execute(&mut **tx)
                 .await?;
-                // Provision the environment's day-one signing key in the SAME
-                // transaction (issue #42): the (tenant, environment) scope is
+                // Provision the environment's day-one signing keys in the SAME
+                // transaction (issues #42, #93): the (tenant, environment) scope is
                 // already bound (this audited write is scoped to the new pair), so
                 // the row-level-security policy on signing_keys is satisfied. The
-                // key is the environment's own identity, so a fresh environment
-                // serves discovery with its own issuer and disjoint JWKS at once.
-                insert_signing_key_row(tx, &scope, &signing_key).await?;
+                // keys are the environment's own identity, so a fresh environment
+                // serves discovery with its own issuer and a disjoint JWKS carrying
+                // every algorithm (EdDSA + ES256 + RS256) at once, all atomic.
+                for signing_key in signing_keys {
+                    insert_signing_key_row(tx, &scope, signing_key).await?;
+                }
                 insert_idempotency(tx, idempotency).await?;
                 Ok(())
             },
@@ -32348,11 +32360,20 @@ impl ActingEnvironmentRepo<'_> {
         environment_id: &EnvironmentId,
         created_at_micros: i64,
         environment: NewEnvironment<'_>,
-        signing_key: NewSigningKey<'_>,
+        signing_keys: &[NewSigningKey<'_>],
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
         let scope = Scope::new(self.tenant, *environment_id);
-        if signing_key.id.scope() != scope {
+        // An environment must be created with at least one signing key, or its JWKS is
+        // empty and it can issue no tokens; the slice parameter (issue #93) makes a
+        // keyless create expressible, so guard the invariant every live caller upholds.
+        debug_assert!(
+            !signing_keys.is_empty(),
+            "an environment must be created with at least one signing key"
+        );
+        // Every day-one key (issue #93: EdDSA + ES256 + RS256) must be in this new
+        // environment's scope; a stray out-of-scope key aborts the whole create.
+        if signing_keys.iter().any(|key| key.id.scope() != scope) {
             return Err(StoreError::NotFound);
         }
         let tenant = self.tenant;
@@ -32410,11 +32431,16 @@ impl ActingEnvironmentRepo<'_> {
                 .bind(created_at_micros)
                 .execute(&mut **tx)
                 .await?;
-                // The environment's day-one signing key, provisioned in the same
-                // transaction and scope (issue #42), so the new environment serves
-                // discovery with its own issuer and disjoint JWKS immediately and
-                // its keys are its own identity from creation.
-                insert_signing_key_row(tx, &scope, &signing_key).await?;
+                // The environment's day-one signing keys, all provisioned in the
+                // same transaction and scope (issues #42, #93), so the new
+                // environment serves discovery with its own issuer and a disjoint
+                // JWKS carrying every algorithm immediately, and its keys are its
+                // own identity from creation. All three (EdDSA + ES256 + RS256) land
+                // atomically with the environment row: a keygen or insert failure
+                // rolls back the whole create.
+                for signing_key in signing_keys {
+                    insert_signing_key_row(tx, &scope, signing_key).await?;
+                }
                 insert_idempotency(tx, idempotency).await?;
                 Ok(())
             },

@@ -24,7 +24,7 @@ use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
 use crate::input::{parse_json, require_non_empty};
 use crate::pagination::{ListQuery, Pagination};
-use crate::provision::DayOneSigningKey;
+use crate::provision::DayOneSigningKeys;
 use crate::response::{json, no_content};
 use crate::state::{AdminState, BOOTSTRAP_OPERATOR_DISPLAY_NAME};
 use crate::views::{
@@ -159,7 +159,8 @@ pub async fn create_tenant(
     let tenant_id = TenantId::generate(state.env());
     let environment_id = EnvironmentId::generate(state.env());
     let scope = Scope::new(tenant_id, environment_id);
-    let signing_key = DayOneSigningKey::generate(state.env(), &scope);
+    // The first environment's day-one signing keys (EdDSA + ES256 + RS256, issue #93).
+    let signing_keys = DayOneSigningKeys::generate(state.env(), &scope)?;
 
     let created = TenantCreated {
         tenant: TenantView {
@@ -212,7 +213,7 @@ pub async fn create_tenant(
                 region: None,
             },
             home_region.as_deref(),
-            signing_key.as_new(created_at_micros),
+            &signing_keys.as_new(created_at_micros),
             Some(write),
         )
         .await;

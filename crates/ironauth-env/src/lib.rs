@@ -15,6 +15,9 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
+use rand_chacha::ChaCha20Rng;
+use rand_chacha::rand_core::SeedableRng;
+
 /// A source of wall-clock and monotonic time.
 ///
 /// Implementations must be cheap to call and safe to share across threads.
@@ -42,6 +45,26 @@ pub trait Entropy: Send + Sync {
     /// source fails: in an identity provider, silently degraded randomness is
     /// strictly worse than a crash.
     fn fill_bytes(&self, buf: &mut [u8]);
+}
+
+/// Seed a `ChaCha20` CSPRNG deterministically from the entropy seam.
+///
+/// Asymmetric key generation (the ES256 and RS256 day-one signing keys, issue #93)
+/// needs a `CryptoRng`, but the [`Entropy`] seam only hands out raw bytes. This
+/// bridge draws a 32-byte seed off the seam and expands it with `ChaCha20`, so the
+/// generated keys are reproducible under a fixed test entropy source (the
+/// determinism seam) while remaining cryptographically strong under
+/// [`OsEntropy`]. It lives in this crate on purpose: ironauth-env is the sole
+/// owner of the entropy seam, so no other crate names an RNG crate directly and
+/// the `entropy-via-env` invariant lint stays intact.
+///
+/// The returned generator is a snapshot of the seam at call time; two calls with
+/// the same `Entropy` state yield the same stream.
+#[must_use]
+pub fn keygen_rng(entropy: &dyn Entropy) -> ChaCha20Rng {
+    let mut seed = [0_u8; 32];
+    entropy.fill_bytes(&mut seed);
+    ChaCha20Rng::from_seed(seed)
 }
 
 /// The production clock, backed by the operating system.
