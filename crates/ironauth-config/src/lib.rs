@@ -783,7 +783,14 @@ pub struct AdminConfig {
     /// only a deployment with pre-#93 environments needs the backfill. Enable it at
     /// or before a rollout so the fresh server processes load all three algorithms
     /// on their first use of each environment (the in-process issuer keyset cache
-    /// does not invalidate mid-process, issue #204).
+    /// does not invalidate mid-process, issue #204). Enable it on a SINGLE replica
+    /// for the one-shot rollout: the backfill presence-checks then inserts, and there
+    /// is deliberately no unique constraint on (environment, algorithm) because key
+    /// rotation keeps two non-retired keys of the same algorithm during its prepublish
+    /// overlap, so a fleet where every replica enables this at once can insert a
+    /// duplicate ES256 or RS256 key per environment. Such duplicates are harmless
+    /// (both are the environment's own keys and both publish in the JWKS), but they
+    /// are avoided by running the backfill from one replica.
     #[serde(default)]
     pub backfill_signing_algorithms_on_start: bool,
 }

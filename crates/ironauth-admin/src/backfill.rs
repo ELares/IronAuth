@@ -13,11 +13,17 @@
 //! path.
 //!
 //! It is IDEMPOTENT: it reads each scope's existing keys and provisions an
-//! algorithm only when absent, so a second run is a no-op (there is no
-//! `unique(environment, algorithm)` constraint; correctness comes from the
-//! presence check, so the routine must be run as a single non-concurrent operator
-//! job, never two at once against the same scope). Key material is generated off the
-//! entropy seam exactly as the day-one provisioning path does, and is loaded and
+//! algorithm only when absent, so a second sequential run is a no-op. There is
+//! deliberately no `unique(environment, algorithm)` constraint, because key rotation
+//! keeps two non-retired keys of the same algorithm during its prepublish overlap;
+//! correctness of the no-op comes from the presence check, so the routine is a single
+//! non-concurrent job. Two concurrent runs against the same scope (for example a
+//! fleet where every replica enables the on-start flag at once) can each observe an
+//! algorithm absent and both insert it, yielding a duplicate key. Such a duplicate is
+//! HARMLESS (both are the environment's own keys off its own entropy and both publish
+//! in the JWKS); to avoid it, run the backfill from a single replica (see the
+//! `backfill_signing_algorithms_on_start` config doc). Key material is generated off
+//! the entropy seam exactly as the day-one provisioning path does, and is loaded and
 //! signed only through `ring`.
 //!
 //! ORDERING against the issuer cache (issue #204): the in-process issuer registry
