@@ -212,10 +212,10 @@ pub async fn set_client_signing_algorithm(
     let registry = state.signing_registry().ok_or_else(|| {
         ApiError::Unprocessable("the environment signing capability cannot be verified".to_owned())
     })?;
-    let entry = registry.entry_for(&scope).await.ok_or_else(|| {
+    let now = state.env().clock().now_utc();
+    let entry = registry.entry_for(&scope, now).await.ok_or_else(|| {
         ApiError::Unprocessable("the environment has no signing capability".to_owned())
     })?;
-    let now = state.env().clock().now_utc();
     if !entry.signable_id_token_algs(now).contains(&alg) {
         return Err(ApiError::Unprocessable(format!(
             "the environment cannot sign {}",

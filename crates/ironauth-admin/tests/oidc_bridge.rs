@@ -158,7 +158,7 @@ impl BridgeHarness {
     async fn sign_with_typ(&self, claims: &Value, typ: &str) -> String {
         let entry = self
             .registry
-            .entry_for(&self.admin_scope)
+            .entry_for(&self.admin_scope, self.env.clock().now_utc())
             .await
             .expect("issuer entry");
         let signer = entry
@@ -529,7 +529,10 @@ async fn the_bridge_rejects_everything_when_disarmed() {
         "iat": now,
         "exp": now + 3600,
     });
-    let entry = registry.entry_for(&admin_scope).await.expect("entry");
+    let entry = registry
+        .entry_for(&admin_scope, env.clock().now_utc())
+        .await
+        .expect("entry");
     let signer = entry.signer(env.clock().now_utc()).expect("signer");
     let token = sign_jws_with_policy(
         entry.policy(),

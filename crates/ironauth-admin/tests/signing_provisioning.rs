@@ -175,7 +175,10 @@ async fn env_create_provisions_all_three_algorithms() {
     );
 
     // Every algorithm is signable (a key exists and the policy permits it).
-    let entry = registry.entry_for(&scope).await.expect("issuer entry");
+    let entry = registry
+        .entry_for(&scope, now())
+        .await
+        .expect("issuer entry");
     for alg in [
         JwsAlgorithm::EdDsa,
         JwsAlgorithm::Es256,
@@ -199,7 +202,10 @@ async fn eddsa_stays_the_default_signer() {
         .await;
 
     let registry = rig.registry();
-    let entry = registry.entry_for(&scope).await.expect("issuer entry");
+    let entry = registry
+        .entry_for(&scope, now())
+        .await
+        .expect("issuer entry");
 
     // All three keys share created_at (one transaction), so list order tie-breaks on
     // the random id. The canonical-order fix pins EdDSA as the default anyway.
@@ -235,7 +241,10 @@ async fn per_algorithm_round_trip_mint() {
         .await;
 
     let registry = rig.registry();
-    let entry = registry.entry_for(&scope).await.expect("issuer entry");
+    let entry = registry
+        .entry_for(&scope, now())
+        .await
+        .expect("issuer entry");
 
     let issuer = ISSUER_BASE;
     let audience = "client-abc";

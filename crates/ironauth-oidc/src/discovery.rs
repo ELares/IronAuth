@@ -62,6 +62,7 @@
 //!   `{host}/.well-known/openid-configuration/{issuer-path}`
 
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use axum::Router;
 use axum::extract::{Path, State};
@@ -69,6 +70,7 @@ use axum::http::HeaderMap;
 use axum::response::Response;
 use axum::routing::get;
 use ironauth_config::OidcConfig;
+use ironauth_env::Env;
 use ironauth_jose::{JwsAlgorithm, SigningPolicy};
 use ironauth_store::{Scope, Store};
 use serde_json::{Value, json};
@@ -749,6 +751,10 @@ pub struct DiscoveryState {
     cache: JwksCacheWindow,
     capabilities: DiscoveryCapabilities,
     registry: Arc<IssuerRegistry>,
+    // The environment clock seam: discovery resolves each scope's entry through the
+    // registry, whose bounded-TTL cache (issue #204) needs the current instant to
+    // decide freshness. Sourced from the seam so it is deterministic under test.
+    env: Env,
 }
 
 impl DiscoveryState {
@@ -766,18 +772,25 @@ impl DiscoveryState {
         cache: JwksCacheWindow,
         capabilities: DiscoveryCapabilities,
         registry: Arc<IssuerRegistry>,
+        env: Env,
     ) -> Self {
         Self {
             issuer_base: issuer_base.into(),
             cache,
             capabilities,
             registry,
+            env,
         }
     }
 
     /// The deployment base URL (issuer root), with any trailing slash trimmed.
     fn base(&self) -> &str {
         self.issuer_base.trim_end_matches('/')
+    }
+
+    /// The current wall-clock instant from the environment clock seam.
+    fn now(&self) -> SystemTime {
+        self.env.clock().now_utc()
     }
 
     /// The per-environment issuer STRING for `scope`. Mirrors
@@ -800,7 +813,7 @@ impl DiscoveryState {
     /// not-found the caller returns for a malformed scope, so the two are
     /// indistinguishable and match the JWKS surface.
     async fn respond(&self, scope: &Scope, headers: &HeaderMap) -> Response {
-        let Some(entry) = self.registry.entry_for(scope).await else {
+        let Some(entry) = self.registry.entry_for(scope, self.now()).await else {
             return not_found();
         };
         let issuer = self.issuer_for(scope);

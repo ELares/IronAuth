@@ -65,6 +65,7 @@ fn router_and_scope(capabilities: DiscoveryCapabilities) -> (Router, Scope) {
         JwksCacheWindow::clamped(600),
         capabilities,
         Arc::new(registry),
+        env,
     );
     (discovery_router(state), scope)
 }

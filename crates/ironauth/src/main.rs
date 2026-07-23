@@ -786,6 +786,7 @@ async fn build_oidc_router(
         cache,
         capabilities,
         Arc::clone(&registry),
+        env.clone(),
     ));
 
     // The per-environment JWKS surface, over the SAME registry the mint reads.
