@@ -11,7 +11,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode, header};
 use http_body_util::BodyExt;
-use ironauth_admin::{AdminState, management_router};
+use ironauth_admin::{AdminState, DayOneSigningKeys, management_router};
 use ironauth_config::{AdminConfig, Secret, SecretString};
 use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
@@ -184,6 +184,109 @@ impl Harness {
             router,
             outbound_scope: Some(scope),
         }
+    }
+
+    /// Start a fresh database and router with a store-backed data-plane issuer registry
+    /// installed (issue #93), so the compatibility wizard can resolve an environment's
+    /// signable set and write the per-client column through the data plane. The registry
+    /// wraps the SAME data-plane store `store()` returns, so a scope this harness seeds
+    /// keys into resolves through the wizard.
+    pub async fn start_with_signing_registry(default_page_size: u32) -> Self {
+        let db = TestDatabase::start().await;
+        let config = AdminConfig {
+            bootstrap_operator_token: Some(Secret::Literal(SecretString::new(OPERATOR_TOKEN))),
+            max_page_size: 200,
+            default_page_size,
+            ..AdminConfig::default()
+        };
+        let registry = std::sync::Arc::new(ironauth_oidc::IssuerRegistry::store_backed(
+            "https://issuer.test",
+            ironauth_oidc::JwksCacheWindow::clamped(300),
+            db.store().clone(),
+        ));
+        let state = AdminState::new(db.control_store().clone(), Env::system(), &config)
+            .expect("admin state builds")
+            .with_signing_registry(registry);
+        let router = management_router(state);
+        Self {
+            db,
+            router,
+            outbound_scope: None,
+        }
+    }
+
+    /// Provision the three day-one signing algorithms (`EdDSA`, `ES256`, `RS256`) into an
+    /// existing `scope` through the data-plane store, so its issuer resolves as fully
+    /// provisioned (every wizard recommendation is signable). Mirrors env-create's
+    /// day-one provisioning; used after [`Harness::seed_scope`], which creates the
+    /// environment row with no keys.
+    pub async fn provision_all_algorithms(&self, scope: Scope) {
+        let env = Env::system();
+        let day_one =
+            DayOneSigningKeys::generate(&env, &scope).expect("generate day-one signing keys");
+        let actor = self.db.test_actor(&env);
+        for key in day_one.as_new(1_000_000) {
+            self.db
+                .store()
+                .scoped(scope)
+                .acting(actor, CorrelationId::generate(&env))
+                .signing_keys()
+                .provision(&env, key)
+                .await
+                .expect("provision day-one signing key");
+        }
+    }
+
+    /// Provision ONLY the day-one `EdDSA` signing key into `scope`, modeling a legacy
+    /// environment that predates the multi-algorithm provisioning (issue #93): the wizard
+    /// must reject pinning `ES256` or `RS256` there until it is backfilled.
+    pub async fn provision_eddsa_only(&self, scope: Scope) {
+        let env = Env::system();
+        let day_one =
+            DayOneSigningKeys::generate(&env, &scope).expect("generate day-one signing keys");
+        let actor = self.db.test_actor(&env);
+        for key in day_one.as_new(1_000_000) {
+            if key.algorithm == "EdDSA" {
+                self.db
+                    .store()
+                    .scoped(scope)
+                    .acting(actor, CorrelationId::generate(&env))
+                    .signing_keys()
+                    .provision(&env, key)
+                    .await
+                    .expect("provision EdDSA signing key");
+            }
+        }
+    }
+
+    /// The stored `id_token_signed_response_alg` for a client in `scope`, read through
+    /// the data-plane reader (the wizard's write through round-trips through this).
+    pub async fn client_signing_alg(&self, scope: Scope, client: &ClientId) -> Option<String> {
+        self.db
+            .store()
+            .scoped(scope)
+            .clients()
+            .id_token_signing_alg(client)
+            .await
+            .expect("read client signing alg")
+    }
+
+    /// An authenticated operator PUT carrying an Idempotency-Key and a JSON body.
+    pub async fn put_with_key(
+        &self,
+        path: &str,
+        idempotency_key: &str,
+        body: &str,
+    ) -> (StatusCode, HeaderMap, String) {
+        let request = Request::builder()
+            .method("PUT")
+            .uri(path)
+            .header(header::AUTHORIZATION, bearer(OPERATOR_TOKEN))
+            .header("idempotency-key", idempotency_key)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_owned()))
+            .expect("request builds");
+        self.send(request).await
     }
 
     /// Start a fresh database and router with a federation runtime installed (issue #76),

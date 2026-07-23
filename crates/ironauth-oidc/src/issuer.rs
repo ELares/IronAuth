@@ -182,6 +182,26 @@ impl IssuerEntry {
     pub fn signer(&self, now: SystemTime) -> Option<&SigningKey> {
         self.keyset.signer_for_policy(now, &self.policy)
     }
+
+    /// The ID token signing algorithms this environment can ACTUALLY sign with at
+    /// `now`, in the policy's preference order: each is permitted by the environment
+    /// policy AND has an active signing key in the key set.
+    ///
+    /// This is the SINGLE SOURCE OF TRUTH for "signable". It is deliberately NOT the
+    /// discovery `id_token_signing_alg_values`, which carries the RS256 floor even in
+    /// an environment with no RS256 key. Both the DCR negotiation (`client_registration`)
+    /// and the management compatibility wizard (issue #93) consult it, so a per client
+    /// `id_token_signed_response_alg` can never be recorded that the mint could not
+    /// actually sign with (which the mint would silently fall back from).
+    #[must_use]
+    pub fn signable_id_token_algs(&self, now: SystemTime) -> Vec<JwsAlgorithm> {
+        self.policy
+            .allowed()
+            .iter()
+            .copied()
+            .filter(|&alg| self.keyset.active_signer_for(now, alg).is_some())
+            .collect()
+    }
 }
 
 /// The registry of per-environment issuers.

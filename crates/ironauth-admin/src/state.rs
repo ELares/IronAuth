@@ -196,6 +196,15 @@ struct Inner {
     // ever accepted, so the console dogfooding surface is fully inert until an operator
     // arms it in `[admin_spa]`.
     admin_oidc_bridge: Option<AdminOidcBridge>,
+    // A store-backed, DATA-plane IssuerRegistry (issue #93), shared with the OIDC data
+    // plane so the compatibility wizard resolves an environment's ACTUALLY signable
+    // ID-token algorithms from the SAME per-environment signing keys the mint and JWKS
+    // read. It also carries the data-plane store the wizard's write through targets: the
+    // per-client id_token_signed_response_alg column is data-plane writable only (the
+    // control role has no grant on it), so the write flows through this registry's store.
+    // None (the default) leaves the wizard's write endpoint failing closed (it cannot
+    // confirm signability), so the feature is inert until the boot path installs it.
+    signing_registry: Option<Arc<IssuerRegistry>>,
 }
 
 impl AdminState {
@@ -284,6 +293,7 @@ impl AdminState {
                 signup_quarantine_enabled: false,
                 advanced_recovery_enabled: false,
                 admin_oidc_bridge: None,
+                signing_registry: None,
             }),
         })
     }
@@ -303,6 +313,30 @@ impl AdminState {
             inner.admin_oidc_bridge = Some(bridge);
         }
         self
+    }
+
+    /// Share a store-backed, DATA-plane [`IssuerRegistry`] with the management plane
+    /// (issue #93), so the compatibility wizard can resolve an environment's actually
+    /// signable ID-token algorithms and write the per-client column through the data
+    /// plane (the only role that can). The boot path installs a registry over the SAME
+    /// data-plane store and issuer base the OIDC plane serves its JWKS from; with none
+    /// installed the wizard's write endpoint fails closed (it cannot confirm
+    /// signability). Kept a builder so the many admin tests need not stand a registry up.
+    #[must_use]
+    pub fn with_signing_registry(mut self, registry: Arc<IssuerRegistry>) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.signing_registry = Some(registry);
+        }
+        self
+    }
+
+    /// The shared data-plane issuer registry (issue #93), or `None` when the boot path
+    /// installed none. The compatibility wizard reads an environment's signable set
+    /// through `entry_for` and reaches the data-plane store (for the write through) via
+    /// [`IssuerRegistry::store`].
+    #[must_use]
+    pub(crate) fn signing_registry(&self) -> Option<&IssuerRegistry> {
+        self.inner.signing_registry.as_deref()
     }
 
     /// Resolve a console `at+jwt` (issue #90, PR 2) to a management [`Principal`].

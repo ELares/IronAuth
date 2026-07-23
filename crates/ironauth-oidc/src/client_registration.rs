@@ -1096,13 +1096,10 @@ async fn env_signing_capability(
 /// mint could never sign with (no key), so the negotiation constrains to exactly the
 /// algorithms a signing key exists for.
 fn signable_id_token_algs(entry: &IssuerEntry, now: SystemTime) -> Vec<JwsAlgorithm> {
-    entry
-        .policy()
-        .allowed()
-        .iter()
-        .copied()
-        .filter(|&alg| entry.keyset().active_signer_for(now, alg).is_some())
-        .collect()
+    // One source of truth: the computation lives on `IssuerEntry` so the DCR
+    // negotiation here and the management compatibility wizard (issue #93) can never
+    // disagree on what an environment can sign with.
+    entry.signable_id_token_algs(now)
 }
 
 /// Negotiate `id_token_signed_response_alg` (RP Metadata Choices 1.0) against the

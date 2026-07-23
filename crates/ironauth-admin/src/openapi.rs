@@ -20,6 +20,9 @@ use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi};
 
 use crate::error::ErrorBody;
+use crate::signing_algorithm::{
+    ClientSigningAlgorithmView, SetClientSigningAlgorithmRequest, SigningRecommendationView,
+};
 use crate::views::{
     BrandAssetView, BulkRevocationView, BulkRevokeSessionsRequest, ClientAdminConsentView,
     ClientVerificationView, ConnectorCapabilitiesView, ConnectorHealthView, ConnectorList,
@@ -153,6 +156,8 @@ use crate::views::{
         crate::dcr::create_initial_access_token,
         crate::dcr::get_dcr_client,
         crate::dcr::verify_dcr_client,
+        crate::signing_algorithm::get_signing_recommendations,
+        crate::signing_algorithm::set_client_signing_algorithm,
         crate::connectors::create_connector,
         crate::connectors::list_connectors,
         crate::connectors::get_connector,
@@ -253,6 +258,9 @@ use crate::views::{
         CreateInitialAccessTokenRequest,
         InitialAccessTokenCreated,
         ClientVerificationView,
+        SigningRecommendationView,
+        SetClientSigningAlgorithmRequest,
+        ClientSigningAlgorithmView,
         CreateConnectorRequest,
         ConnectorView,
         ConnectorList,

@@ -77,6 +77,8 @@ mod recovery_approvals;
 mod resource_types;
 mod response;
 mod sessions;
+mod signing_algorithm;
+mod signing_interop;
 mod signup_forms;
 mod signup_quarantine;
 mod state;
@@ -128,6 +130,12 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/resource-types",
             get(resource_types::list_resource_types),
+        )
+        // The compatibility-wizard interop table (issue #93): an operator-plane read of
+        // the per-verifier signing-algorithm recommendations. Unscoped and read only.
+        .route(
+            "/v1/interop/signing-recommendations",
+            get(signing_algorithm::get_signing_recommendations),
         )
         .route(
             "/v1/tenants",
@@ -307,6 +315,13 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/verify",
             post(dcr::verify_dcr_client),
+        )
+        // The compatibility wizard (issue #93): pin a client's ID-token signing
+        // algorithm, validated against the wizard set and the environment's actually
+        // signable set. A static `.../signing-algorithm` suffix under the client.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/signing-algorithm",
+            put(signing_algorithm::set_client_signing_algorithm),
         )
         // Declarative federation connectors (issue #75): CRUD plus a capability-matrix
         // read endpoint. The static `.../capabilities` suffix is a sibling of the

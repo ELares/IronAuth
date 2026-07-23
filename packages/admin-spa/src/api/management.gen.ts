@@ -4,6 +4,23 @@
  */
 
 export interface paths {
+    "/v1/interop/signing-recommendations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Surface the token-signing compatibility interop table (issue #93). */
+        get: operations["getSigningRecommendations"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/operators": {
         parameters: {
             query?: never;
@@ -273,6 +290,23 @@ export interface paths {
         /** Get a dynamically registered client's verification state. */
         get: operations["getDcrClient"];
         put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/signing-algorithm": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Pin the ID-token signing algorithm for one client (issue #93). */
+        put: operations["setClientSigningAlgorithm"];
         post?: never;
         delete?: never;
         options?: never;
@@ -1515,6 +1549,16 @@ export interface components {
              *     the operator should narrow the client or time window (never a silent truncation).
              */
             truncated: boolean;
+        };
+        /** @description The updated per-client signing-algorithm state. */
+        ClientSigningAlgorithmView: {
+            /** @description The client identifier (`cli_...`). */
+            client_id: string;
+            /**
+             * @description The algorithm now recorded for this client's ID tokens.
+             * @example RS256
+             */
+            id_token_signed_response_alg: string;
         };
         /**
          * @description A dynamically registered client's verification state (issue #31), as returned by
@@ -3119,6 +3163,14 @@ export interface components {
             /** @description The space-separated OAuth scope set the admin pre-authorizes for the client. */
             scope: string;
         };
+        /** @description The body of a set-signing-algorithm request. */
+        SetClientSigningAlgorithmRequest: {
+            /**
+             * @description The JOSE algorithm name to pin, one of `EdDSA`, `ES256`, `RS256`.
+             * @example RS256
+             */
+            algorithm: string;
+        };
         /**
          * @description The body to set (create or overwrite) a per-environment locale bundle (issue #86, PR 2).
          *
@@ -3167,6 +3219,30 @@ export interface components {
             scheduled_offboarding_at_unix_ms?: number | null;
             /** @description The target state. */
             state: components["schemas"]["UserStateView"];
+        };
+        /** @description One interop-table row as surfaced by the recommendations endpoint. */
+        SigningRecommendationView: {
+            /** @description The supported minus recommended alternatives (JOSE algorithm names). */
+            alternatives: string[];
+            /**
+             * @description The human-readable label.
+             * @example AWS API Gateway JWT authorizers
+             */
+            label: string;
+            /** @description The one-line reason for the recommendation. */
+            reason: string;
+            /**
+             * @description The recommended JOSE algorithm name.
+             * @example RS256
+             */
+            recommended: string;
+            /** @description The algorithms this verifier can verify (JOSE algorithm names). */
+            supported: string[];
+            /**
+             * @description The stable verifier identifier (for example `aws_api_gateway`).
+             * @example aws_api_gateway
+             */
+            verifier: string;
         };
         /**
          * @description One field of a signup form, in the management API request and response (issue #87). It
@@ -3578,6 +3654,44 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    getSigningRecommendations: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The interop table of per-verifier recommendations */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SigningRecommendationView"][];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     listOperators: {
         parameters: {
             query?: {
@@ -5058,6 +5172,85 @@ export interface operations {
             };
             /** @description Not found (absent, not a DCR client, or in another scope) */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    setClientSigningAlgorithm: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Required. Replaying with the same key returns the original response without re-executing. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The client identifier (cli_...) */
+                client_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetClientSigningAlgorithmRequest"];
+            };
+        };
+        responses: {
+            /** @description The updated per-client signing-algorithm state */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ClientSigningAlgorithmView"];
+                };
+            };
+            /** @description Malformed request, or an algorithm outside the wizard set */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found (absent client or another scope) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment cannot sign the requested algorithm, or the Idempotency-Key was reused with a different request */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

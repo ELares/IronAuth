@@ -745,6 +745,11 @@ pub enum Action {
     /// `step_up_max_age_secs` registration floor was configured through the
     /// management seam. The row targets the `cli_` client.
     ClientStepUpPolicySet,
+    /// A per-CLIENT `id_token_signed_response_alg` was SET (issue #93): the
+    /// compatibility wizard pinned the algorithm this client's ID tokens are signed
+    /// with through the management seam, validated against the environment's actually
+    /// signable set. The row targets the `cli_` client.
+    ClientIdTokenAlgSet,
     /// An admin sudo elevation was RECORDED (issue #73): a management credential
     /// completed a re-authentication that opens a freshness window for admin
     /// mutations in a (tenant, environment). The row targets the `elv_` elevation; the
@@ -1109,6 +1114,7 @@ impl Action {
             Action::ScopeStepUpPolicySet => "step_up.scope_policy.set",
             Action::ScopeStepUpPolicyRemove => "step_up.scope_policy.remove",
             Action::ClientStepUpPolicySet => "client.step_up_policy.set",
+            Action::ClientIdTokenAlgSet => "client.id_token_signed_response_alg.set",
             Action::AdminPrivilegeElevated => "admin.privilege.elevated",
             Action::AdminPrivilegeChallenged => "admin.privilege.challenged",
             Action::CredentialClassPolicySet => "credential_class.policy.set",
