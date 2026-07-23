@@ -81,6 +81,13 @@ pub enum ApiError {
     Conflict(String),
     /// An Idempotency-Key was replayed with a DIFFERENT request. Renders 422.
     IdempotencyKeyConflict,
+    /// A well-formed request whose value is semantically rejected by a policy the
+    /// request itself cannot satisfy (issue #93): the compatibility wizard rejecting an
+    /// algorithm the environment cannot actually sign with, so the column is left
+    /// unchanged. Distinct from a plain bad request (a malformed or out-of-set value is
+    /// a 400): the value parses and is in the wizard set, but the target environment
+    /// cannot honor it. Renders 422.
+    Unprocessable(String),
     /// A config write failed one or more typed environment guardrails (issue #42):
     /// for example creating a production environment with no custom domain. Renders
     /// 422 with the stable code of every failed guardrail. Distinct from a plain
@@ -113,9 +120,9 @@ impl ApiError {
             ApiError::WrongScope { .. } => StatusCode::FORBIDDEN,
             ApiError::NotFound => StatusCode::NOT_FOUND,
             ApiError::Conflict(_) => StatusCode::CONFLICT,
-            ApiError::IdempotencyKeyConflict | ApiError::GuardrailViolation(_) => {
-                StatusCode::UNPROCESSABLE_ENTITY
-            }
+            ApiError::IdempotencyKeyConflict
+            | ApiError::GuardrailViolation(_)
+            | ApiError::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
             ApiError::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -181,6 +188,14 @@ impl ApiError {
                 expected_scope: None,
                 actual_scope: None,
                 failed_guardrails: Some(violations.iter().map(|v| v.code().to_owned()).collect()),
+                max_age: None,
+            },
+            ApiError::Unprocessable(message) => ErrorBody {
+                error: "unprocessable_entity".to_owned(),
+                message: message.clone(),
+                expected_scope: None,
+                actual_scope: None,
+                failed_guardrails: None,
                 max_age: None,
             },
             ApiError::ReauthRequired { max_age } => ErrorBody {

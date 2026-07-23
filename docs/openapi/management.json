@@ -10,6 +10,55 @@
     "version": "0.1.0"
   },
   "paths": {
+    "/v1/interop/signing-recommendations": {
+      "get": {
+        "tags": [
+          "dcr"
+        ],
+        "summary": "Surface the token-signing compatibility interop table (issue #93).",
+        "operationId": "getSigningRecommendations",
+        "responses": {
+          "200": {
+            "description": "The interop table of per-verifier recommendations",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/SigningRecommendationView"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/operators": {
       "get": {
         "tags": [
@@ -2159,6 +2208,130 @@
           },
           "404": {
             "description": "Not found (absent, not a DCR client, or in another scope)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/signing-algorithm": {
+      "put": {
+        "tags": [
+          "dcr"
+        ],
+        "summary": "Pin the ID-token signing algorithm for one client (issue #93).",
+        "operationId": "setClientSigningAlgorithm",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "client_id",
+            "in": "path",
+            "description": "The client identifier (cli_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying with the same key returns the original response without re-executing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetClientSigningAlgorithmRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The updated per-client signing-algorithm state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientSigningAlgorithmView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request, or an algorithm outside the wizard set",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (absent client or another scope)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The environment cannot sign the requested algorithm, or the Idempotency-Key was reused with a different request",
             "content": {
               "application/json": {
                 "schema": {
@@ -9874,6 +10047,25 @@
           }
         }
       },
+      "ClientSigningAlgorithmView": {
+        "type": "object",
+        "description": "The updated per-client signing-algorithm state.",
+        "required": [
+          "client_id",
+          "id_token_signed_response_alg"
+        ],
+        "properties": {
+          "client_id": {
+            "type": "string",
+            "description": "The client identifier (`cli_...`)."
+          },
+          "id_token_signed_response_alg": {
+            "type": "string",
+            "description": "The algorithm now recorded for this client's ID tokens.",
+            "example": "RS256"
+          }
+        }
+      },
       "ClientVerificationView": {
         "type": "object",
         "description": "A dynamically registered client's verification state (issue #31), as returned by\nthe management API. `quarantined` is the live gate the authorization/consent path\nhonors; `verified_at_unix_ms` records when an admin lifted the quarantine.",
@@ -12588,6 +12780,20 @@
           }
         }
       },
+      "SetClientSigningAlgorithmRequest": {
+        "type": "object",
+        "description": "The body of a set-signing-algorithm request.",
+        "required": [
+          "algorithm"
+        ],
+        "properties": {
+          "algorithm": {
+            "type": "string",
+            "description": "The JOSE algorithm name to pin, one of `EdDSA`, `ES256`, `RS256`.",
+            "example": "RS256"
+          }
+        }
+      },
       "SetLocaleRequest": {
         "type": "object",
         "description": "The body to set (create or overwrite) a per-environment locale bundle (issue #86, PR 2).\n\nThe entries map keys on the STABLE NUMERIC message id (as a string) and values are the\nPLAIN TEXT render. On write, every key must be a REGISTERED message id and every\n`{placeholder}` in a value must be one the id declares, so a translator cannot invent an\ninterpolation that leaks unintended context or reword a string to reference a variable the\nid does not carry; a violation is a loud 400 and nothing is stored. A bundle string is\nplain text, escaped on render exactly like the compiled default, never markup.",
@@ -12649,6 +12855,53 @@
           "state": {
             "$ref": "#/components/schemas/UserStateView",
             "description": "The target state."
+          }
+        }
+      },
+      "SigningRecommendationView": {
+        "type": "object",
+        "description": "One interop-table row as surfaced by the recommendations endpoint.",
+        "required": [
+          "verifier",
+          "label",
+          "recommended",
+          "reason",
+          "alternatives",
+          "supported"
+        ],
+        "properties": {
+          "alternatives": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The supported minus recommended alternatives (JOSE algorithm names)."
+          },
+          "label": {
+            "type": "string",
+            "description": "The human-readable label.",
+            "example": "AWS API Gateway JWT authorizers"
+          },
+          "reason": {
+            "type": "string",
+            "description": "The one-line reason for the recommendation."
+          },
+          "recommended": {
+            "type": "string",
+            "description": "The recommended JOSE algorithm name.",
+            "example": "RS256"
+          },
+          "supported": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The algorithms this verifier can verify (JOSE algorithm names)."
+          },
+          "verifier": {
+            "type": "string",
+            "description": "The stable verifier identifier (for example `aws_api_gateway`).",
+            "example": "aws_api_gateway"
           }
         }
       },

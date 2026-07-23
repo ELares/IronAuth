@@ -514,6 +514,11 @@ async fn build_management_router(
             // PR 3) only when the ladder resolved the feature enabled AND acked; otherwise
             // every recovery-approval endpoint stays a uniform 404.
             let state = state.with_advanced_recovery_enabled(advanced_recovery_enabled);
+            // Share a data-plane issuer registry (issue #93) so the compatibility wizard can
+            // resolve an environment's actually signable ID-token algorithms and write the
+            // per-client column through the data plane (the only role that can). Absent a
+            // reachable data-plane store the wizard's write endpoint fails closed.
+            let state = install_signing_registry(state, config).await;
             // Arm the OIDC-session credential bridge (issue #90, PR 2) when the operator has
             // configured an admin issuer and a management audience AND the OIDC data plane is
             // mounted (so signing keys exist to verify against). Absent config leaves the
@@ -527,6 +532,46 @@ async fn build_management_router(
             None
         }
     }
+}
+
+/// Share a data-plane issuer registry with the management state (issue #93).
+///
+/// The compatibility wizard resolves an environment's ACTUALLY signable ID-token
+/// algorithms (the layer-2 security check) and writes the per-client
+/// `id_token_signed_response_alg` column, both of which need the DATA plane: the
+/// signable set comes from the per-environment signing keys, and that column is
+/// data-plane writable only (the control role holds no grant on it). This builds a
+/// store-backed [`IssuerRegistry`] over the SAME data-plane store and issuer base the
+/// OIDC plane serves its JWKS from, master-keyed so sealed PII opens (signing key
+/// material itself is not sealed), and installs it. Any failure to derive the issuer
+/// base or connect the data-plane store leaves the registry uninstalled, and the
+/// wizard's write endpoint then fails closed (it cannot confirm signability).
+async fn install_signing_registry(state: AdminState, config: &Config) -> AdminState {
+    let issuer_base = match SiteContext::derive(&config.server) {
+        Ok(site) => site.base_url(),
+        Err(error) => {
+            tracing::error!(%error, "compatibility wizard signing registry NOT installed: cannot derive the issuer base");
+            return state;
+        }
+    };
+    let store = match Store::connect(config.database.url.expose()).await {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::error!(%error, "compatibility wizard signing registry NOT installed: cannot connect the data-plane store");
+            return state;
+        }
+    };
+    let store = match resolve_master_key(config) {
+        Some(master) => store.with_master_key(master),
+        None => store,
+    };
+    let cache = JwksCacheWindow::clamped(config.oidc.jwks_cache_max_age_secs);
+    let registry = Arc::new(IssuerRegistry::store_backed(issuer_base, cache, store));
+    tracing::info!(
+        "compatibility wizard signing registry installed (issue #93): the per-client \
+         signing-algorithm endpoint validates against the environment's actually signable set"
+    );
+    state.with_signing_registry(registry)
 }
 
 /// Arm the OIDC-session credential bridge on the management state (issue #90, PR 2).

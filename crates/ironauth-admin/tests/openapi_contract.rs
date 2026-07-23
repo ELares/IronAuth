@@ -97,6 +97,7 @@ fn operation_ids_are_the_stable_set() {
             "getPolicyDecisionTraces",
             "getRefreshFamily",
             "getSession",
+            "getSigningRecommendations",
             "getSignupForm",
             "getTenant",
             "getUser",
@@ -137,6 +138,7 @@ fn operation_ids_are_the_stable_set() {
             "setBrandFavicon",
             "setBrandLogo",
             "setClientAdminConsent",
+            "setClientSigningAlgorithm",
             "setLocale",
             "setSignupForm",
             "setUserState",
@@ -279,6 +281,7 @@ fn documented_paths_are_the_expected_set() {
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/external-id",
+            "GET /v1/interop/signing-recommendations",
             "GET /v1/operators",
             "GET /v1/operators/{operator_id}",
             "GET /v1/resource-types",
@@ -364,6 +367,7 @@ fn documented_paths_are_the_expected_set() {
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/signup-form",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}/favicon",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}/logo",
+            "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/signing-algorithm",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/connectors/{connector_id}",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/locales/{locale}",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/external-id",
@@ -407,7 +411,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        100,
+        102,
         "the documented route count is pinned"
     );
 

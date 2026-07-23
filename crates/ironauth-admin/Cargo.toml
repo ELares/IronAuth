@@ -316,5 +316,16 @@ name = "signing_provisioning"
 path = "tests/signing_provisioning.rs"
 required-features = ["testing"]
 
+# Compatibility wizard write through (issue #93, Bet 2): the PUT that pins a client's
+# id_token_signed_response_alg round-trips through the reader; the two-layer validation
+# rejects an out-of-set algorithm (400) and one the environment cannot sign (422) with
+# the column unchanged; a cross-scope client is a uniform 404; the Idempotency-Key
+# replays the original response; and the interop GET surfaces the pinned matrix rows.
+# Needs a real database.
+[[test]]
+name = "signing_algorithm"
+path = "tests/signing_algorithm.rs"
+required-features = ["testing"]
+
 [lints]
 workspace = true

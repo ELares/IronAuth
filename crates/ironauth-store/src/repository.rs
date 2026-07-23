@@ -4272,6 +4272,63 @@ impl ActingClientRepo<'_> {
         .await
     }
 
+    /// Set a client's `id_token_signed_response_alg` within scope (issue #93): the
+    /// compatibility wizard's write through, pinning the algorithm the mint signs
+    /// THIS client's ID token with. Writes a `client.id_token_signed_response_alg.set`
+    /// audit row in the same transaction. Only that one column is touched, under the
+    /// migration's column-scoped `UPDATE` grant (the data-plane role holds it; the
+    /// control role deliberately does not, so this write flows through the data plane).
+    ///
+    /// The store records the algorithm verbatim; the CALLER validates it against the
+    /// wizard set and the environment's actually signable set (the two-layer check in
+    /// the management handler), exactly as DCR's negotiation guarantees the recorded
+    /// value is always one the mint can sign with.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id is out of scope or no client matches;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn set_id_token_signed_response_alg(
+        &self,
+        env: &Env,
+        id: &ClientId,
+        alg: &str,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let alg = alg.to_owned();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ClientIdTokenAlgSet,
+                target: id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "UPDATE clients SET id_token_signed_response_alg = $1 \
+                     WHERE id = $2 AND tenant_id = $3 AND environment_id = $4",
+                )
+                .bind(alg)
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
     /// Set (or clear) a client's `require_pushed_authorization_requests` flag (RFC
     /// 9126 section 5, issue #27), auditing
     /// `client.require_pushed_authorization_requests.set` in the same transaction.
@@ -31547,6 +31604,51 @@ impl IdempotencyRepo<'_> {
                 response_body: row.get("response_body"),
             }
         }))
+    }
+
+    /// Record a completed response under `(credential_ref, key)` as a STANDALONE
+    /// control-plane write, for a mutation whose data change committed on a DIFFERENT
+    /// role's connection and therefore could not carry the idempotency row in its own
+    /// transaction (issue #93: the compatibility wizard writes the client column on
+    /// the data plane, which has no grant on this control-plane table).
+    ///
+    /// This is the two-phase alternative to the same-transaction [`insert_idempotency`]
+    /// the single-role mutators use: the caller performs its (naturally idempotent,
+    /// absolute-value) write first, then records the response here. A concurrent request
+    /// that stored the same key first surfaces as [`StoreError::IdempotencyConflict`],
+    /// which the caller resolves by replaying the now-committed original response. A key
+    /// reused for a DIFFERENT request is caught earlier by the fingerprint comparison in
+    /// [`IdempotencyRepo::lookup`], never here.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::IdempotencyConflict`] if `(credential_ref, key)` already exists;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn record(
+        &self,
+        credential_ref: &str,
+        key: &str,
+        request_fingerprint: &str,
+        response_status: u16,
+        response_body: &str,
+    ) -> Result<(), StoreError> {
+        let result = sqlx::query(
+            "INSERT INTO idempotency_keys \
+             (credential_ref, idempotency_key, request_fingerprint, response_status, response_body) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(credential_ref)
+        .bind(key)
+        .bind(request_fingerprint)
+        .bind(i32::from(response_status))
+        .bind(response_body)
+        .execute(self.store.pool())
+        .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(error) if is_idempotency_conflict(&error) => Err(StoreError::IdempotencyConflict),
+            Err(error) => Err(error.into()),
+        }
     }
 }
 
