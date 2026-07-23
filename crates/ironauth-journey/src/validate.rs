@@ -108,9 +108,14 @@ pub enum JourneyError {
     /// A step whose kind READS an already-established subject ([`StepKind::requires_subject`]) is
     /// reachable from the entry by at least one path that has not first passed a
     /// subject-establishing step ([`StepKind::establishes_subject`]), so the flow would render a
-    /// form no submission can satisfy (issue #351). Flagged at LOAD, fail-closed. Scoped to the
-    /// TOP-LEVEL graph: it does not descend into `subflow_call` targets (a subflow is validated as an
-    /// isolated fragment that cannot know its call-site subject state).
+    /// form no submission can satisfy (issue #351). Flagged at LOAD, fail-closed. The check itself
+    /// walks the TOP-LEVEL graph and does not descend into `subflow_call` targets (a subflow is
+    /// validated as an isolated fragment that cannot know its call-site subject state). This is NOT
+    /// a subflow escape hatch: composition (`compose_inner`) INLINES every subflow and re-runs this
+    /// check on the flattened graph before a routable table is built (see `compile_inner`), so a
+    /// subflow that injects a subject-less subject-requiring step at a subject-less call site is
+    /// still caught at compile time. Only a standalone `validate()` (which never yields a routable
+    /// table) leaves a subflow interior unwalked.
     SubjectStepNotEstablished {
         /// The RFC 6901 pointer to the subject-requiring step.
         pointer: String,
@@ -814,12 +819,15 @@ pub(crate) fn reachable_steps<'a>(
 /// must first establish, so any subject-less path is a violation, which this pruned walk captures on
 /// cyclic and diamond graphs alike).
 ///
-/// Scope: the TOP-LEVEL journey graph only. A `subflow_call` step is neither establishing nor
-/// requiring here, and the walk does not descend into subflow targets (subflows are validated as
-/// isolated fragments by [`crate::subflow::validate_subflows`], and a fragment cannot know its
-/// call-site subject state). Cross-subflow subject-flow analysis is a candidate follow-up; the
-/// issue's motivating case (entry or an early reachable step is subject-requiring) is fully covered
-/// by the top-level graph. `base` is the RFC 6901 pointer prefix.
+/// Scope: this walk sees the TOP-LEVEL journey graph only. A `subflow_call` step is neither
+/// establishing nor requiring here, and the walk does not descend into subflow targets (subflows are
+/// validated as isolated fragments by [`crate::subflow::validate_subflows`], and a fragment cannot
+/// know its call-site subject state). That is NOT a subflow escape hatch: composition
+/// ([`crate::subflow::compose_inner`]) inlines every subflow and re-runs this check on the flattened
+/// graph before any routable table is built (see [`crate::compile`]), so a subflow that injects a
+/// subject-less subject-requiring step at a subject-less call site is still caught at compile time.
+/// The subflow interior is unwalked only on a standalone [`crate::validate`] pass, which never yields
+/// a routable table. `base` is the RFC 6901 pointer prefix.
 pub(crate) fn check_subject_establishment(
     entry: &str,
     steps: &[Step],
