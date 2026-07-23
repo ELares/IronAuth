@@ -496,6 +496,57 @@ mod tests {
     }
 
     #[test]
+    fn choose_edge_prefers_the_first_edge_when_several_guards_hold() {
+        use crate::eval::{EvalContext, OutcomeSignal, SignalSet};
+
+        // A journey whose entry step has TWO edges with the SAME (satisfiable) guard, so under a
+        // context that asserts the signal BOTH hold at once. This pins the document-order-first-true
+        // rule that complementary guards cannot exercise: an implementation that returned a later or
+        // an arbitrary matching edge would take "second", not "first".
+        let journey = Journey {
+            schema_version: JOURNEY_SCHEMA_VERSION.to_owned(),
+            id: "overlapping_guards".to_owned(),
+            engine_version: JOURNEY_ENGINE_VERSION,
+            entry: "fork".to_owned(),
+            comment: None,
+            steps: vec![
+                step("fork", StepKind::IdentifierPassword, Some("password")),
+                step("first", StepKind::Terminal, None),
+                step("second", StepKind::Terminal, None),
+            ],
+            transitions: vec![
+                Transition {
+                    from: "fork".to_owned(),
+                    to: "first".to_owned(),
+                    guard: Some(mfa_required_guard(true)),
+                    comment: None,
+                },
+                Transition {
+                    from: "fork".to_owned(),
+                    to: "second".to_owned(),
+                    guard: Some(mfa_required_guard(true)),
+                    comment: None,
+                },
+            ],
+            subflows: None,
+            subflow_definitions: None,
+        };
+        let compiled = compile(&journey).expect("compiles");
+        let ctx = EvalContext {
+            flow: crate::eval::FlowContext {
+                signals: SignalSet::new().with(OutcomeSignal::MfaRequired, true),
+                ..crate::eval::FlowContext::default()
+            },
+            ..EvalContext::default()
+        };
+
+        // Both guards hold, so document order decides: the first edge wins.
+        assert_eq!(compiled.choose_edge("fork", &ctx).as_deref(), Some("first"));
+        // With the signal absent, neither guard holds, so the step routes nowhere.
+        assert_eq!(compiled.choose_edge("fork", &EvalContext::default()), None);
+    }
+
+    #[test]
     fn a_structurally_invalid_journey_fails_to_compile() {
         // An unknown step kind fails composition's validate, so compile surfaces it.
         let mut doc = conditional_mfa_journey();
