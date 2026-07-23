@@ -22,7 +22,7 @@
 //! nothing and routes onward under the same signals), exactly as the OIDC crate's `drive_custom`
 //! routes a live custom flow. So a replay observes precisely the routing a real flow would, with
 //! no clock, no entropy, and no database: the evaluation context is pinned by the transcript, and
-//! the evaluator ([`evaluate`]) is pure.
+//! the evaluator ([`evaluate`](crate::eval::evaluate)) is pure.
 //!
 //! ## The engine-faithful context set
 //!
@@ -56,9 +56,7 @@ use serde_json::Value;
 
 use crate::artifact::{StepId, StepKind};
 use crate::compile::CompiledJourney;
-use crate::eval::{
-    EvalContext, FlowContext, OutcomeSignal, RiskLevel, RiskView, SignalSet, evaluate,
-};
+use crate::eval::{EvalContext, FlowContext, OutcomeSignal, RiskLevel, RiskView, SignalSet};
 
 /// A recorded journey transcript (issue #92, PR 7): a whole golden-path run captured as the
 /// scenario that drives it, replayed against a compiled journey to catch routing drift.
@@ -731,7 +729,7 @@ fn route_hop(compiled: &CompiledJourney, start: &str, base: &EvalContext) -> Hop
     for _ in 0..=compiled.steps.len() {
         let mut ctx = base.clone();
         ctx.flow.step_id.clone_from(&cursor);
-        let Some(next_id) = choose_edge(compiled, &cursor, &ctx) else {
+        let Some(next_id) = compiled.choose_edge(&cursor, &ctx) else {
             return HopOutcome::DeadEnd { at: cursor };
         };
         let Some(next) = compiled.step(&next_id) else {
@@ -773,23 +771,6 @@ fn route_hop(compiled: &CompiledJourney, start: &str, base: &EvalContext) -> Hop
         }
     }
     HopOutcome::Unsettled
-}
-
-/// Choose the first guarded edge that applies from `from` (issue #92, PR 7): document order, first
-/// whose guard is absent or evaluates true. This is byte-for-byte the engine `drive_custom`'s
-/// `choose_edge` rule; an evaluation error (only the depth guard, which a type-checked predicate
-/// never hits) is treated as a non-match, never fail-open.
-fn choose_edge(compiled: &CompiledJourney, from: &str, ctx: &EvalContext) -> Option<StepId> {
-    for edge in compiled.edges(from) {
-        let taken = match &edge.guard {
-            None => true,
-            Some(guard) => evaluate(guard, ctx).unwrap_or(false),
-        };
-        if taken {
-            return Some(edge.to.clone());
-        }
-    }
-    None
 }
 
 #[cfg(test)]

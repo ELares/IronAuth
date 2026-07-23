@@ -25,6 +25,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::artifact::{DecisionSpec, Journey, Predicate, StepId, StepKind};
+use crate::eval::{EvalContext, evaluate};
 use crate::validate::JourneyError;
 
 /// One compiled step (issue #92, PR 4): the built-in executor kind, the node group it renders
@@ -90,6 +91,33 @@ impl CompiledJourney {
     #[must_use]
     pub fn edges(&self, id: &str) -> &[GuardedEdge] {
         self.transitions.get(id).map_or(&[], Vec::as_slice)
+    }
+
+    /// Choose the first guarded edge that applies from `from` (issue #92, PR 4): document order,
+    /// first whose guard is absent or evaluates true. This is the ONE routing primitive both the
+    /// engine's `drive_via_table` walk and the replay harness's `route_hop` walk share (issue
+    /// #355 item 2), so the drift-detection harness cannot itself drift from the engine.
+    ///
+    /// An evaluation error (only the depth guard, which a type-checked predicate never hits) is
+    /// treated as a non-match, never fail-open. SAFETY INVARIANT for a built-in artifact: a
+    /// POSITIVE guard whose false skips a security requirement (for example `/mfa_required` gating
+    /// the challenge edge) must never be able to error, or "false on error" would relax that
+    /// requirement. Today the built-in login guards are depth 1 Cmp predicates that only ever error
+    /// on `MAX_PREDICATE_DEPTH`, which they cannot hit, so this holds; a future built-in guard must
+    /// preserve it (issue #359).
+    #[must_use]
+    pub fn choose_edge(&self, from: &str, ctx: &EvalContext) -> Option<StepId> {
+        for edge in self.edges(from) {
+            // An eval error counts as "guard did not match" so a corrupt guard cannot force a route.
+            let taken = match &edge.guard {
+                None => true,
+                Some(guard) => evaluate(guard, ctx).unwrap_or(false),
+            };
+            if taken {
+                return Some(edge.to.clone());
+            }
+        }
+        None
     }
 }
 
@@ -423,6 +451,48 @@ mod tests {
             Some(StepKind::Registration)
         );
         assert!(compiled.reachable().contains("done"));
+    }
+
+    #[test]
+    fn choose_edge_takes_the_first_document_order_guard_that_holds() {
+        use crate::eval::{EvalContext, OutcomeSignal, SignalSet};
+
+        let compiled = compile(&conditional_mfa_journey()).expect("compiles");
+
+        // A context in which the signal `/mfa_required` is asserted, and one in which it is not.
+        let ctx_mfa = EvalContext {
+            flow: crate::eval::FlowContext {
+                signals: SignalSet::new().with(OutcomeSignal::MfaRequired, true),
+                ..crate::eval::FlowContext::default()
+            },
+            ..EvalContext::default()
+        };
+        let ctx_no_mfa = EvalContext::default();
+
+        // `primary` has two guarded edges in document order: mfa (guard mfa_required == true) then
+        // done (guard mfa_required == false). The first whose guard holds wins.
+        assert_eq!(
+            compiled.choose_edge("primary", &ctx_mfa).as_deref(),
+            Some("mfa")
+        );
+        assert_eq!(
+            compiled.choose_edge("primary", &ctx_no_mfa).as_deref(),
+            Some("done")
+        );
+
+        // `mfa` has a single unguarded edge to done, taken under any context.
+        assert_eq!(
+            compiled.choose_edge("mfa", &ctx_mfa).as_deref(),
+            Some("done")
+        );
+        assert_eq!(
+            compiled.choose_edge("mfa", &ctx_no_mfa).as_deref(),
+            Some("done")
+        );
+
+        // A terminal (no outgoing edge) and an unknown step both route nowhere.
+        assert_eq!(compiled.choose_edge("done", &ctx_mfa), None);
+        assert_eq!(compiled.choose_edge("nope", &ctx_mfa), None);
     }
 
     #[test]
