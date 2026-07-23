@@ -1100,7 +1100,14 @@ async fn enter_step_nodes(
 ) -> Result<Vec<Node>, FlowError> {
     match &step.kind {
         StepKind::IdentifierPassword => Ok(login::start_nodes(transport, flow_id)),
-        StepKind::MfaChallenge => Ok(mfa::challenge_start_nodes(transport, flow_id)),
+        StepKind::MfaChallenge => {
+            // A subject-requiring step (issue #351): fail closed to the uniform not-found when no
+            // subject has been established yet, matching the load-time subject-establishment rule
+            // and the sibling MfaEnroll / ProgressiveProfiling checks. A well-compiled journey only
+            // routes here after the primary factor, so this stays inert (no rendered-output change).
+            scratch_subject(scope, scratch)?;
+            Ok(mfa::challenge_start_nodes(transport, flow_id))
+        }
         StepKind::MfaEnroll => {
             let subject_id = scratch_subject(scope, scratch)?;
             let begin = mfa::begin_enroll(state, scope, &subject_id).await?;

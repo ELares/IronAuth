@@ -105,14 +105,32 @@ pub enum JourneyError {
         /// The dead-end step id.
         step: String,
     },
+    /// A step whose kind READS an already-established subject ([`StepKind::requires_subject`]) is
+    /// reachable from the entry by at least one path that has not first passed a
+    /// subject-establishing step ([`StepKind::establishes_subject`]), so the flow would render a
+    /// form no submission can satisfy (issue #351). Flagged at LOAD, fail-closed. The check itself
+    /// walks the TOP-LEVEL graph and does not descend into `subflow_call` targets (a subflow is
+    /// validated as an isolated fragment that cannot know its call-site subject state). This is NOT
+    /// a subflow escape hatch: composition (`compose_inner`) INLINES every subflow and re-runs this
+    /// check on the flattened graph before a routable table is built (see `compile_inner`), so a
+    /// subflow that injects a subject-less subject-requiring step at a subject-less call site is
+    /// still caught at compile time. Only a standalone `validate()` (which never yields a routable
+    /// table) leaves a subflow interior unwalked.
+    SubjectStepNotEstablished {
+        /// The RFC 6901 pointer to the subject-requiring step.
+        pointer: String,
+        /// The subject-requiring step id.
+        step: String,
+    },
     /// A step requires an attachment its kind depends on but does not carry it: a `subflow_call`
-    /// with no `subflow` to call, or a `decision` with no `decision` to route on.
+    /// with no `subflow` to call. (A `decision` step's `decision` attachment is OPTIONAL as of issue
+    /// #351, so a spec-less decision never raises this.)
     MissingStepAttachment {
         /// The RFC 6901 pointer to the step missing the attachment.
         pointer: String,
         /// The step id.
         step: String,
-        /// The kind that requires the missing attachment (`subflow_call` or `decision`).
+        /// The kind that requires the missing attachment (`subflow_call`).
         kind: String,
     },
     /// A step carries an attachment its kind does not use: a `subflow` on a step that is not a
@@ -312,6 +330,10 @@ impl fmt::Display for JourneyError {
                     "step {step} at {pointer} is a non-terminal dead end with no outgoing transition"
                 )
             }
+            JourneyError::SubjectStepNotEstablished { pointer, step } => write!(
+                f,
+                "step {step} at {pointer} requires an authenticated subject but is reachable from the entry with no preceding subject-establishing step (identifier_password)"
+            ),
             JourneyError::MissingStepAttachment {
                 pointer,
                 step,
@@ -557,6 +579,14 @@ pub(crate) fn validate_inner(
             "",
             &mut errors,
         );
+        check_subject_establishment(
+            &doc.entry,
+            &doc.steps,
+            &doc.transitions,
+            &ids,
+            "",
+            &mut errors,
+        );
     }
     check_predicates(&doc.steps, &doc.transitions, "", &mut errors);
 
@@ -779,10 +809,83 @@ pub(crate) fn reachable_steps<'a>(
     reached
 }
 
-/// Check that a step carries exactly the attachments its kind uses: a `subflow_call` names a
-/// subflow to call, a `decision` carries a decision to route on, and neither attachment appears
-/// on a kind that does not use it. Only known kinds are checked; an unknown kind is already
-/// flagged by [`JourneyError::UnknownStepKind`]. `step_ptr` is the RFC 6901 pointer to the step.
+/// Refuse a journey that routes into a subject-REQUIRING step ([`StepKind::requires_subject`]) by
+/// any path that has not first passed a subject-ESTABLISHING step ([`StepKind::establishes_subject`])
+/// (issue #351). Modeled on [`reachable_steps`] (an iterative walk, no recursion), but the walk does
+/// NOT expand the successors of an establishing step: an establishing step satisfies the requirement
+/// for everything downstream of it, so pruning its outgoing edges leaves exactly the set of nodes
+/// reachable from the entry by at least one still-subject-less path. Any `requires_subject` step in
+/// that set is reachable subject-less by SOME path and is flagged (the rule is that EVERY path to it
+/// must first establish, so any subject-less path is a violation, which this pruned walk captures on
+/// cyclic and diamond graphs alike).
+///
+/// Scope: this walk sees the TOP-LEVEL journey graph only. A `subflow_call` step is neither
+/// establishing nor requiring here, and the walk does not descend into subflow targets (subflows are
+/// validated as isolated fragments by [`crate::subflow::validate_subflows`], and a fragment cannot
+/// know its call-site subject state). That is NOT a subflow escape hatch: composition
+/// ([`crate::subflow::compose_inner`]) inlines every subflow and re-runs this check on the flattened
+/// graph before any routable table is built (see [`crate::compile`]), so a subflow that injects a
+/// subject-less subject-requiring step at a subject-less call site is still caught at compile time.
+/// The subflow interior is unwalked only on a standalone [`crate::validate`] pass, which never yields
+/// a routable table. `base` is the RFC 6901 pointer prefix.
+pub(crate) fn check_subject_establishment(
+    entry: &str,
+    steps: &[Step],
+    transitions: &[Transition],
+    ids: &BTreeSet<&str>,
+    base: &str,
+    errors: &mut Vec<JourneyError>,
+) {
+    let mut kind_by_id: BTreeMap<&str, &StepKind> = BTreeMap::new();
+    for step in steps {
+        kind_by_id.entry(step.id.as_str()).or_insert(&step.kind);
+    }
+    let mut adjacency: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for transition in transitions {
+        if ids.contains(transition.from.as_str()) && ids.contains(transition.to.as_str()) {
+            adjacency
+                .entry(transition.from.as_str())
+                .or_default()
+                .push(transition.to.as_str());
+        }
+    }
+    // Every node reachable from the entry by at least one path that has not yet passed an
+    // establishing step. An establishing step is included as a boundary node, but its successors are
+    // NOT walked through this set.
+    let mut reachable_before_establishment: BTreeSet<&str> = BTreeSet::new();
+    let mut stack = vec![entry];
+    while let Some(node) = stack.pop() {
+        if !reachable_before_establishment.insert(node) {
+            continue;
+        }
+        // Prune: an establishing step satisfies the requirement downstream, so its successors are
+        // not reachable subject-less through it.
+        if kind_by_id
+            .get(node)
+            .is_some_and(|kind| kind.establishes_subject())
+        {
+            continue;
+        }
+        if let Some(next) = adjacency.get(node) {
+            stack.extend(next.iter().copied());
+        }
+    }
+    for (index, step) in steps.iter().enumerate() {
+        if step.kind.requires_subject() && reachable_before_establishment.contains(step.id.as_str())
+        {
+            errors.push(JourneyError::SubjectStepNotEstablished {
+                pointer: format!("{base}/steps/{index}"),
+                step: step.id.clone(),
+            });
+        }
+    }
+}
+
+/// Check that a step carries only the attachments its kind may use: a `subflow_call` names a
+/// subflow to call, a `decision` attachment appears only on a `decision` step (but is OPTIONAL
+/// there, issue #351), and a `subflow` attachment appears only on a `subflow_call` step. Only known
+/// kinds are checked; an unknown kind is already flagged by [`JourneyError::UnknownStepKind`].
+/// `step_ptr` is the RFC 6901 pointer to the step.
 pub(crate) fn check_attachment_coherence(
     step: &Step,
     step_ptr: &str,
@@ -796,13 +899,9 @@ pub(crate) fn check_attachment_coherence(
                 kind: "subflow_call".to_owned(),
             });
         }
-        StepKind::Decision if step.decision.is_none() => {
-            errors.push(JourneyError::MissingStepAttachment {
-                pointer: step_ptr.to_owned(),
-                step: step.id.clone(),
-                kind: "decision".to_owned(),
-            });
-        }
+        // A `decision` step with no `DecisionSpec` is VALID (issue #351): the attachment is optional
+        // (a reserved M11 outcome-routing slot), so a spec-less decision is a pure edge-guard routing
+        // hub. An edge-less spec-less decision is still caught as a `DeadEndStep`.
         _ => {}
     }
     // A stray `subflow` on a step that is not a `subflow_call`.
@@ -1074,7 +1173,10 @@ mod tests {
     }
 
     #[test]
-    fn a_decision_step_with_no_decision_is_rejected() {
+    fn a_decision_step_with_no_decision_now_compiles() {
+        // Issue #351: the `decision` attachment is OPTIONAL. A spec-less decision step is a pure
+        // edge-guard routing hub (previously rejected with MissingStepAttachment), so it now
+        // validates clean.
         let doc = Journey {
             schema_version: JOURNEY_SCHEMA_VERSION.to_owned(),
             id: "j".to_owned(),
@@ -1090,14 +1192,167 @@ mod tests {
             subflows: None,
             subflow_definitions: None,
         };
+        assert_eq!(validate(&doc), Ok(()));
+    }
+
+    /// Build a single-hop journey `entry_kind -> terminal` for the subject-establishment tests.
+    fn one_hop(entry_kind: StepKind) -> Journey {
+        Journey {
+            schema_version: JOURNEY_SCHEMA_VERSION.to_owned(),
+            id: "j".to_owned(),
+            engine_version: JOURNEY_ENGINE_VERSION,
+            entry: "entry".to_owned(),
+            comment: None,
+            steps: vec![
+                step("entry", entry_kind, None),
+                step("done", StepKind::Terminal, None),
+            ],
+            transitions: vec![unguarded("entry", "done")],
+            subflows: None,
+            subflow_definitions: None,
+        }
+    }
+
+    #[test]
+    fn an_entry_mfa_challenge_with_no_establishing_step_is_rejected() {
+        // Issue #351: a subject-requiring entry (mfa_challenge) with no preceding
+        // subject-establishing step is refused at load, fail-closed.
         assert_eq!(
-            validate(&doc),
-            Err(vec![JourneyError::MissingStepAttachment {
-                pointer: "/steps/1".to_owned(),
-                step: "branch".to_owned(),
-                kind: "decision".to_owned(),
+            validate(&one_hop(StepKind::MfaChallenge)),
+            Err(vec![JourneyError::SubjectStepNotEstablished {
+                pointer: "/steps/0".to_owned(),
+                step: "entry".to_owned(),
             }])
         );
+    }
+
+    #[test]
+    fn mfa_enroll_and_progressive_profiling_entries_are_each_rejected() {
+        // Issue #351: every subject-requiring kind is flagged the same way at the entry position.
+        for kind in [StepKind::MfaEnroll, StepKind::ProgressiveProfiling] {
+            assert_eq!(
+                validate(&one_hop(kind.clone())),
+                Err(vec![JourneyError::SubjectStepNotEstablished {
+                    pointer: "/steps/0".to_owned(),
+                    step: "entry".to_owned(),
+                }]),
+                "{} must require an establishing step",
+                kind.as_wire()
+            );
+        }
+    }
+
+    #[test]
+    fn establishment_before_a_subject_step_validates() {
+        // identifier_password -> mfa_challenge -> terminal: the primary factor establishes the
+        // subject before the second factor reads it, so the journey is well formed.
+        let doc = Journey {
+            schema_version: JOURNEY_SCHEMA_VERSION.to_owned(),
+            id: "j".to_owned(),
+            engine_version: JOURNEY_ENGINE_VERSION,
+            entry: "primary".to_owned(),
+            comment: None,
+            steps: vec![
+                step("primary", StepKind::IdentifierPassword, Some("password")),
+                step("mfa", StepKind::MfaChallenge, Some("totp")),
+                step("done", StepKind::Terminal, None),
+            ],
+            transitions: vec![unguarded("primary", "mfa"), unguarded("mfa", "done")],
+            subflows: None,
+            subflow_definitions: None,
+        };
+        assert_eq!(validate(&doc), Ok(()));
+    }
+
+    #[test]
+    fn a_subject_step_reachable_by_one_establishment_free_path_is_rejected() {
+        // A diamond: `start` branches to an establishing path (`a_pw` -> `mfa`) and a
+        // establishment-free path (`b_dec` -> `mfa`) that both reach the SAME mfa_challenge. The
+        // rule is that EVERY path must first establish, so the establishment-free path is a
+        // violation even though another path establishes.
+        let doc = Journey {
+            schema_version: JOURNEY_SCHEMA_VERSION.to_owned(),
+            id: "j".to_owned(),
+            engine_version: JOURNEY_ENGINE_VERSION,
+            entry: "start".to_owned(),
+            comment: None,
+            steps: vec![
+                step("start", StepKind::Decision, None),
+                step("a_pw", StepKind::IdentifierPassword, Some("password")),
+                step("b_dec", StepKind::Decision, None),
+                step("mfa", StepKind::MfaChallenge, Some("totp")),
+                step("done", StepKind::Terminal, None),
+            ],
+            transitions: vec![
+                guarded("start", "a_pw"),
+                guarded("start", "b_dec"),
+                unguarded("a_pw", "mfa"),
+                unguarded("b_dec", "mfa"),
+                unguarded("mfa", "done"),
+            ],
+            subflows: None,
+            subflow_definitions: None,
+        };
+        assert_eq!(
+            validate(&doc),
+            Err(vec![JourneyError::SubjectStepNotEstablished {
+                pointer: "/steps/3".to_owned(),
+                step: "mfa".to_owned(),
+            }])
+        );
+    }
+
+    #[test]
+    fn a_decision_hub_between_establishment_and_a_subject_step_validates() {
+        // identifier_password -> decision -> mfa_challenge: the establishing step prunes the walk,
+        // so a Decision hub after it does not reset establishment. Well formed.
+        let doc = Journey {
+            schema_version: JOURNEY_SCHEMA_VERSION.to_owned(),
+            id: "j".to_owned(),
+            engine_version: JOURNEY_ENGINE_VERSION,
+            entry: "primary".to_owned(),
+            comment: None,
+            steps: vec![
+                step("primary", StepKind::IdentifierPassword, Some("password")),
+                step("branch", StepKind::Decision, None),
+                step("mfa", StepKind::MfaChallenge, Some("totp")),
+                step("done", StepKind::Terminal, None),
+            ],
+            transitions: vec![
+                unguarded("primary", "branch"),
+                unguarded("branch", "mfa"),
+                unguarded("mfa", "done"),
+            ],
+            subflows: None,
+            subflow_definitions: None,
+        };
+        assert_eq!(validate(&doc), Ok(()));
+    }
+
+    #[test]
+    fn recovery_verify_establishes_a_subject_for_a_downstream_profiling_step() {
+        // A built-in fragment: recovery_verify mints a session (establishes the subject), so a
+        // progressive_profiling step after it is well formed under validate_builtin (the mint-family
+        // kind is admitted only in the embedded built-in context).
+        let doc = Journey {
+            schema_version: JOURNEY_SCHEMA_VERSION.to_owned(),
+            id: "recovery".to_owned(),
+            engine_version: JOURNEY_ENGINE_VERSION,
+            entry: "verify".to_owned(),
+            comment: None,
+            steps: vec![
+                step("verify", StepKind::RecoveryVerify, Some("email_otp")),
+                step("profiling", StepKind::ProgressiveProfiling, Some("profile")),
+                step("done", StepKind::Terminal, None),
+            ],
+            transitions: vec![
+                unguarded("verify", "profiling"),
+                unguarded("profiling", "done"),
+            ],
+            subflows: None,
+            subflow_definitions: None,
+        };
+        assert_eq!(validate_builtin(&doc), Ok(()));
     }
 
     #[test]
