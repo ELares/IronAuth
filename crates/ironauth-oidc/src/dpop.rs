@@ -27,8 +27,6 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::{Duration, SystemTime};
 
-use ironauth_store::Scope;
-
 use crate::state::OidcState;
 
 /// How far in the past a `DPoP` proof's `iat` may be and still be fresh (RFC 9449
@@ -39,11 +37,14 @@ pub(crate) const DPOP_IAT_LEEWAY: Duration = Duration::from_secs(60);
 /// clock runs slightly ahead. Passed to the core as `iat_skew`.
 pub(crate) const DPOP_IAT_SKEW: Duration = Duration::from_secs(5);
 
-/// The `(jkt, jti)` replay-cache TTL: the WHOLE window in which a proof is
-/// acceptable (leeway plus skew), so a `jti` cannot be replayed while any presented
-/// proof carrying it would still pass the freshness check.
+/// The `(jkt, jti)` replay-cache TTL: one second LONGER than the whole window in
+/// which a proof is acceptable (leeway plus skew), so a `jti` stays remembered
+/// strictly past the point any proof carrying it could still pass the core's
+/// freshness check. The extra second also absorbs the whole-second flooring the core
+/// applies to `now`, closing the boundary where a proof could otherwise be replayed
+/// once just as its freshness lapses.
 const DPOP_REPLAY_TTL: Duration =
-    Duration::from_secs(DPOP_IAT_LEEWAY.as_secs() + DPOP_IAT_SKEW.as_secs());
+    Duration::from_secs(DPOP_IAT_LEEWAY.as_secs() + DPOP_IAT_SKEW.as_secs() + 1);
 
 /// An upper bound on the replay cache size. At the cap the map is cleared wholesale
 /// on the next fresh insert (mirroring the issuer negative cache): a flush only
@@ -138,20 +139,22 @@ impl Default for DpopReplayCache {
 /// The normalized token-endpoint `htu` a `DPoP` proof must match (RFC 9449 section
 /// 4.3): scheme, authority, and path, with NO query or fragment.
 ///
-/// It is derived from the per-environment issuer ([`OidcState::issuer_for`]) plus
-/// the fixed `/token` path the router mounts, so a token minted in one environment
-/// is bound to that environment's own endpoint identity. The issuer base is
-/// server-configured (never client-supplied) and [`OidcState::issuer_for`] emits a
-/// clean scheme+authority+path with no trailing slash, query, or fragment, so this
-/// value is already canonical.
+/// The token endpoint lives at the DEPLOYMENT ROOT and is shared across environments
+/// (the router mounts a flat `/token`, and discovery advertises `token_endpoint` as
+/// `{issuer_base}/token`, NOT under the per-environment issuer path). The scope is
+/// carried by the single-use code, not the URL, so this MUST be the deployment-root
+/// URL a compliant client reads from discovery and POSTs to, not the per-environment
+/// issuer. The issuer base is server-configured (never client-supplied), so no
+/// request header can spoof it.
 ///
 /// This normalization IS the contract: the PR1 core does EXACT string-equality on
 /// `htu` with zero normalization of its own, so a client's proof `htu` must equal
-/// this string byte for byte. A caller that forgot to derive `htu` this way would
-/// accept a proof minted for a different URL.
+/// this string byte for byte, and it must equal the discovery `token_endpoint` value
+/// (a parity test pins that). A caller that derived `htu` any other way would reject
+/// every compliant client.
 #[must_use]
-pub fn normalized_htu_for_token_endpoint(state: &OidcState, scope: &Scope) -> String {
-    format!("{}/token", state.issuer_for(scope))
+pub fn normalized_htu_for_token_endpoint(state: &OidcState) -> String {
+    format!("{}/token", state.issuer_base().trim_end_matches('/'))
 }
 
 #[cfg(test)]
@@ -194,10 +197,19 @@ mod tests {
         let cache = DpopReplayCache::new();
         let now = base();
         assert!(cache.check_and_record("jkt-a", "jti-1", now));
-        // Past the whole window (leeway + skew), the recorded entry is stale: any
-        // proof still carrying this jti would itself fail the freshness check, so
-        // re-accepting the jti is correct.
-        let past_ttl = now + DPOP_IAT_LEEWAY + DPOP_IAT_SKEW + Duration::from_secs(1);
+        // At exactly leeway + skew (the maximum iat-validity span), the proof could
+        // STILL pass the freshness window, so its jti must still be remembered: the
+        // one-second cushion on the replay TTL is what keeps it a replay here. A
+        // rejected replay does not re-record, so the stamp stays at `now`.
+        let at_window_edge = now + DPOP_IAT_LEEWAY + DPOP_IAT_SKEW;
+        assert!(
+            !cache.check_and_record("jkt-a", "jti-1", at_window_edge),
+            "a jti is still a replay at the freshness-window edge (the TTL cushion)"
+        );
+        // One second past the cushion the entry is finally stale: any proof still
+        // carrying this jti would itself fail the freshness check, so re-accepting is
+        // correct.
+        let past_ttl = now + DPOP_IAT_LEEWAY + DPOP_IAT_SKEW + Duration::from_secs(2);
         assert!(
             cache.check_and_record("jkt-a", "jti-1", past_ttl),
             "a jti whose window has lapsed is accepted again"

@@ -319,7 +319,7 @@ async fn authorization_code_grant(
     //     uniform invalid_dpop_proof that never burns the code. Binding is
     //     opportunistic: a client that sent a proof gets a bound token or this error,
     //     never a silent bearer token.
-    let dpop_confirmation = resolve_dpop_binding(state, scope, headers)?;
+    let dpop_confirmation = resolve_dpop_binding(state, headers)?;
     let dpop_jkt = dpop_confirmation.as_ref().map(Confirmation::value);
 
     // 6. Mint (sign) the tokens BEFORE the consume, so a missing key or a signing
@@ -429,7 +429,12 @@ async fn authorization_code_grant(
         // (logged), rather than failing an otherwise-successful exchange.
         Ok(RedeemOutcome::Consumed) => {
             let refresh = issue_refresh_for_code(state, scope, &bindings, dpop_jkt).await?;
-            Ok(token_response(&minted, &bindings, refresh.as_deref()))
+            Ok(token_response(
+                &minted,
+                &bindings,
+                refresh.as_deref(),
+                dpop_jkt.is_some(),
+            ))
         }
         // A benign within-grace retry or an expired/absent code: plain
         // invalid_grant, no revoke.
@@ -474,7 +479,6 @@ async fn authorization_code_grant(
 /// code (it stays live for the legitimate client's retry).
 fn resolve_dpop_binding(
     state: &OidcState,
-    scope: Scope,
     headers: &HeaderMap,
 ) -> Result<Option<Confirmation>, TokenError> {
     // RFC 9449: exactly one DPoP header. Zero is the bearer path; more than one is
@@ -496,7 +500,7 @@ fn resolve_dpop_binding(
     // or fragment (RFC 9449 section 4.3); the core does exact string-equality on it,
     // so this normalization is the whole contract.
     let now = state.now();
-    let htu = crate::dpop::normalized_htu_for_token_endpoint(state, &scope);
+    let htu = crate::dpop::normalized_htu_for_token_endpoint(state);
     let expected = DpopExpectations {
         htm: DPOP_HTM_POST,
         htu: &htu,
@@ -936,10 +940,15 @@ fn token_response(
     minted: &IssuedTokens,
     bindings: &CodeBindings,
     refresh_token: Option<&str>,
+    dpop_bound: bool,
 ) -> Response {
+    // RFC 9449 section 5: a token sender-constrained by a DPoP proof is advertised as
+    // `DPoP`, so the client presents it as `Authorization: DPoP` with a fresh proof
+    // rather than as a plain bearer. An unbound exchange stays `Bearer`.
+    let token_type = if dpop_bound { "DPoP" } else { "Bearer" };
     let mut body = serde_json::json!({
         "access_token": minted.access.token(),
-        "token_type": "Bearer",
+        "token_type": token_type,
         "expires_in": minted.expires_in_secs,
         "id_token": minted.id_token,
     });

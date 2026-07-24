@@ -37,10 +37,46 @@ fn proof_key() -> SigningKey {
     SigningKey::ed25519_from_seed(Some("dpop-client".to_owned()), &[3_u8; 32]).expect("ed25519")
 }
 
-/// The normalized token-endpoint `htu` the server expects: the per-environment
-/// issuer plus the fixed `/token` path (RFC 9449 4.3).
-fn expected_htu(harness: &Harness) -> String {
-    format!("{}/token", harness.issuer())
+/// The token-endpoint `htu` a compliant client signs: the DEPLOYMENT-ROOT
+/// `token_endpoint` discovery advertises (`{issuer_base}/token`), NOT the
+/// per-environment issuer path. Derived from the advertised base so this test can
+/// only pass when the server derives `htu` the same way a real client does (the
+/// server bug this replaced used the per-environment issuer, which no client ever
+/// posts to). See `normalized_htu_matches_the_advertised_token_endpoint`.
+fn expected_htu(_harness: &Harness) -> String {
+    format!("{}/token", common::ISSUER_BASE)
+}
+
+/// The `htu` the server checks a proof against MUST equal the `token_endpoint`
+/// discovery advertises (the deployment-root URL a compliant client reads and posts
+/// to). This pins the two against drift: `expected_htu` is what the binding tests
+/// sign, and the happy path proves the server accepts exactly that, so if this
+/// equals the advertised `token_endpoint` the whole chain agrees with a real client.
+#[tokio::test]
+async fn the_htu_matches_the_advertised_token_endpoint() {
+    let harness = Harness::start_store_backed().await;
+    let scope = harness.scope();
+    let url = format!(
+        "/t/{}/e/{}/.well-known/openid-configuration",
+        scope.tenant(),
+        scope.environment()
+    );
+    let (status, _headers, body) = send_through(
+        harness.router(),
+        Request::builder()
+            .method("GET")
+            .uri(&url)
+            .body(Body::empty())
+            .expect("request builds"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let doc = json(&body);
+    assert_eq!(
+        doc["token_endpoint"].as_str(),
+        Some(expected_htu(&harness).as_str()),
+        "discovery token_endpoint must equal the htu the server checks a proof against"
+    );
 }
 
 /// The whole-seconds `iat` the proof carries, read from the harness clock so the
@@ -172,7 +208,9 @@ async fn valid_dpop_proof_binds_the_opaque_access_token_row() {
 
     let (status, body) = token_with_dpop(&harness, &token_form(&code, &client), &[&proof]).await;
     assert_eq!(status, StatusCode::OK, "bound opaque exchange: {body}");
-    assert_eq!(json(&body)["token_type"], "Bearer");
+    // RFC 9449 section 5: a bound exchange advertises token_type DPoP so the client
+    // presents the token with a proof, not as a plain bearer.
+    assert_eq!(json(&body)["token_type"], "DPoP");
 
     assert_eq!(
         opaque_token_jkt(&harness, &client).await,
@@ -191,6 +229,8 @@ async fn no_dpop_header_issues_a_plain_bearer_token() {
 
     let (status, body) = token_with_dpop(&harness, &token_form(&code, &client), &[]).await;
     assert_eq!(status, StatusCode::OK, "bearer exchange: {body}");
+    // No proof: the exchange stays a plain bearer (token_type Bearer, no cnf).
+    assert_eq!(json(&body)["token_type"], "Bearer");
     let access_token = json(&body)["access_token"]
         .as_str()
         .expect("access_token")
@@ -214,7 +254,7 @@ async fn no_dpop_header_issues_a_plain_bearer_token() {
 /// A present-but-invalid `DPoP` proof is a uniform `invalid_dpop_proof`, mints no
 /// token, and does NOT burn the one-time code (a subsequent bearer exchange with the
 /// SAME code still succeeds). Covers a wrong `htu`, a tampered signature, and a
-/// future `iat` — every reason maps to the same response body (no oracle).
+/// future `iat`; every reason maps to the same response body (no oracle).
 #[tokio::test]
 async fn an_invalid_dpop_proof_is_rejected_and_does_not_burn_the_code() {
     let harness = Harness::start().await;
