@@ -8,8 +8,9 @@ use ironauth_env::Env;
 use ironauth_store::idor_harness::IdorHarness;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
-    ActorRef, CorrelationId, ManagementKeyId, NewAdminUser, NewMembership, NewOrgRole,
-    OrgMembershipId, OrgRoleId, OrganizationId, Scope, ServiceId, StoreError, UserState,
+    ActorRef, CorrelationId, ManagementKeyId, NewAdminUser, NewMembership, NewOrgGroup, NewOrgRole,
+    OrgGroupId, OrgMembershipId, OrgRoleId, OrganizationId, Scope, ServiceId, StoreError,
+    UserState,
 };
 
 /// A stand-in key hash for a planted victim (the probes resolve by id, not hash).
@@ -47,6 +48,13 @@ async fn management_probes_deny_cross_tenant_and_cross_environment_uniformly() {
     let victim_role_b = plant_role(control, &env, scope_b, &victim_org_b).await;
     let victim_role_a2 = plant_role(control, &env, scope_a2, &victim_org_a2).await;
 
+    // Organization groups (issue #97): plant a victim group in each foreign scope so
+    // the group probes have a real cross-scope target, including for the reparent
+    // probe, whose refusal must be the uniform not-found and never a typed cycle or
+    // depth error (either would be an oracle over a foreign group graph).
+    let victim_group_b = plant_group(control, &env, scope_b, &victim_org_b).await;
+    let victim_group_a2 = plant_group(control, &env, scope_a2, &victim_org_a2).await;
+
     // A well-formed key id in the caller's OWN scope that was never stored.
     let absent_in_a = ManagementKeyId::generate(&env, &scope_a).to_string();
 
@@ -73,6 +81,9 @@ async fn management_probes_deny_cross_tenant_and_cross_environment_uniformly() {
             "org_memberships.remove",
             "org_roles.get",
             "org_roles.delete",
+            "org_groups.get",
+            "org_groups.delete",
+            "org_groups.reparent",
         ],
         "every management resolve-by-id operation is registered",
     );
@@ -86,6 +97,8 @@ async fn management_probes_deny_cross_tenant_and_cross_environment_uniformly() {
         victim_member_a2.to_string(),
         victim_role_b.to_string(),
         victim_role_a2.to_string(),
+        victim_group_b.to_string(),
+        victim_group_a2.to_string(),
         absent_in_a.clone(),
     ];
     let foreign_refs: Vec<&str> = foreign.iter().map(String::as_str).collect();
@@ -172,6 +185,55 @@ async fn management_probes_deny_cross_tenant_and_cross_environment_uniformly() {
             .is_ok(),
         "environment A2's role must survive the delete probe"
     );
+
+    // The victim groups must survive both the delete and the reparent probe, and
+    // must still be ROOTS: a cross-scope reparent that silently cleared a parent
+    // would leave the read intact while having mutated the foreign hierarchy.
+    for (scope, group) in [(scope_b, &victim_group_b), (scope_a2, &victim_group_a2)] {
+        let record = control
+            .management()
+            .org_groups(scope)
+            .get(group)
+            .await
+            .expect("the victim group must survive the delete and reparent probes");
+        assert_eq!(
+            record.parent_id, None,
+            "the victim group's position in its own hierarchy must be untouched"
+        );
+    }
+}
+
+/// Plant a live group in `org` within `scope` via the control store, returning the
+/// group id.
+async fn plant_group(
+    control: &ironauth_store::Store,
+    env: &Env,
+    scope: Scope,
+    org: &OrganizationId,
+) -> OrgGroupId {
+    let id = OrgGroupId::generate(env, &scope);
+    let actor = ActorRef::service(ServiceId::generate(env));
+    control
+        .management()
+        .acting(actor, CorrelationId::generate(env))
+        .org_groups(scope)
+        .create(
+            env,
+            NewOrgGroup {
+                id: &id,
+                organization_id: org,
+                parent_id: None,
+                slug: "victim-group",
+                display_name: "victim group",
+                metadata: None,
+            },
+            1_000_000,
+            8,
+            None,
+        )
+        .await
+        .expect("plant victim group");
+    id
 }
 
 /// Plant a live role in `org` within `scope` via the control store, returning the

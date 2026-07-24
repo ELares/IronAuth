@@ -64,6 +64,10 @@ pub struct TestDatabase {
     /// the SAME database and rebuild its process-level state from nothing: the
     /// rolling-restart simulation (issue #32 AC 1).
     app_url: String,
+    /// The control-plane connection URL, kept for the same reason as `app_url`: a
+    /// concurrency test needs a WIDER control-plane pool than the default one so its
+    /// storm actually overlaps rather than queueing on connections.
+    control_url: String,
     /// The platform envelope master key (issue #48), shared across every data-plane
     /// handle this database hands out (including a simulated restart), so encrypted
     /// PII sealed by one handle reads back through another. Deterministic (a fixed
@@ -149,6 +153,7 @@ impl TestDatabase {
             store,
             control_store,
             app_url,
+            control_url,
             master,
         }
     }
@@ -215,6 +220,28 @@ impl TestDatabase {
     #[must_use]
     pub fn control_store(&self) -> &Store {
         &self.control_store
+    }
+
+    /// A CONTROL-plane store over a pool of `max_connections`, for a management-plane
+    /// concurrency storm. The exact counterpart of
+    /// [`TestDatabase::app_store_with_pool`], and needed for the same reason: a storm
+    /// spawned across the default pool queues on connections instead of overlapping,
+    /// so the interleaving it exists to exercise never happens.
+    ///
+    /// Authenticates as the same low-privilege control role as
+    /// [`TestDatabase::control_store`], so forced row-level security and the
+    /// column-scoped grants still apply.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the wider pool cannot be established.
+    pub async fn control_store_with_pool(&self, max_connections: u32) -> Store {
+        let pool = PgPoolOptions::new()
+            .max_connections(max_connections)
+            .connect(&self.control_url)
+            .await
+            .expect("build a wider control-plane pool for the concurrency storm");
+        Store::from_pool(pool).with_master_key(self.master.clone())
     }
 
     /// A raw pool as the low-privilege application role. The RLS test uses it to

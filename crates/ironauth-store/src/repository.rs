@@ -85,8 +85,8 @@ use crate::id::{
     ExternalIssuerId, FedcmNonceId, FederationLoginStateId, FlowId, FlowVersionId,
     FlowVersionPinId, GrantId, InitialAccessTokenId, InvitationId, IssuedTokenId, KekId,
     LocaleBundleId, MagicLinkTokenId, ManagementKeyId, Mds3BlobCacheId, MigrationRunId,
-    MigrationRunRecordId, OperatorId, OrgConnectionId, OrgMembershipId, OrgRoleId, OrganizationId,
-    PowChallengeId, PushedRequestId, RecoveryApprovalId, RecoveryCodeId,
+    MigrationRunRecordId, OperatorId, OrgConnectionId, OrgGroupId, OrgMembershipId, OrgRoleId,
+    OrganizationId, PowChallengeId, PushedRequestId, RecoveryApprovalId, RecoveryCodeId,
     RecoveryContactConfirmationId, RecoveryFlowId, RecoveryIdvSessionId, RecoveryTrustedContactId,
     RefreshFamilyId, RefreshTokenId, ResourceServerId, RiskDecisionId, RiskDisavowalId,
     RiskLoginGeoId, RiskSignalId, RoutingRuleId, ScopeStepUpPolicyId, ServiceAccountId,
@@ -314,6 +314,23 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn org_roles(&self) -> OrgRoleRepo<'a> {
         OrgRoleRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only organization-group repository for this scope on the DATA plane
+    /// (issue #97). Migration 0087 grants the data-plane SELECT on `org_groups` (and
+    /// nothing else), so the token-issuance path can walk a subject's group ancestry
+    /// authoritatively without the control role. The same [`OrgGroupRepo`] the
+    /// control plane reaches through [`ManagementStore::org_groups`]: every read is
+    /// scope-fenced under this scope's forced row-level security, which is what makes
+    /// a recursive ancestor walk structurally unable to leave this tenant even if a
+    /// stored `parent_id` pointed outside it. There is deliberately no MUTATING
+    /// data-plane counterpart: nothing on the data plane ever writes a group.
+    #[must_use]
+    pub fn org_groups(&self) -> OrgGroupRepo<'a> {
+        OrgGroupRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -31513,6 +31530,59 @@ pub struct NewOrgRole<'a> {
     pub metadata: Option<&'a serde_json::Value>,
 }
 
+/// An organization-group row (issue #97): one named group belonging to one
+/// organization within a scope, holding a position in that organization's group
+/// FOREST. Only LIVE (not soft-deleted) groups are ever reconstructed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgGroupRecord {
+    /// The group identifier (`grp_...`, embeds its `(tenant, environment)`).
+    pub id: OrgGroupId,
+    /// The organization the group belongs to (`org_...`).
+    pub organization_id: OrganizationId,
+    /// The parent group, or `None` for a root. Always a group of the SAME
+    /// organization: the repository enforces that on every write, because the
+    /// row-level-security policy fences `(tenant, environment)` only.
+    pub parent_id: Option<OrgGroupId>,
+    /// The IMMUTABLE stable name. A rename changes `display_name`, never this, so
+    /// a name a later authorization or routing decision keys on cannot move under
+    /// it.
+    pub slug: String,
+    /// The mutable human-facing label the admin console shows.
+    pub display_name: String,
+    /// Free-form group metadata, as stored JSON. Never interpreted by the auth core.
+    pub metadata: serde_json::Value,
+    /// Creation time in microseconds since the Unix epoch (the pagination key).
+    pub created_at_unix_micros: i64,
+    /// Last-modification time in microseconds since the Unix epoch.
+    pub updated_at_unix_micros: i64,
+}
+
+/// Everything an organization-group create needs, bundled so the repository method
+/// stays within the readable-argument-count lint (issue #97).
+#[derive(Debug, Clone, Copy)]
+pub struct NewOrgGroup<'a> {
+    /// The group id (minted by the caller, embeds this scope).
+    pub id: &'a OrgGroupId,
+    /// The organization the group belongs to (an `org_` id in this scope).
+    pub organization_id: &'a OrganizationId,
+    /// The parent group, or `None` to create a ROOT. A parent must be a LIVE group
+    /// of the SAME organization in this scope; anything else (absent, soft-deleted,
+    /// foreign scope, foreign organization) is the uniform [`StoreError::NotFound`],
+    /// resolved BEFORE any depth reasoning so the depth refusal can never become an
+    /// existence oracle for a group the caller cannot see.
+    pub parent_id: Option<&'a OrgGroupId>,
+    /// The IMMUTABLE stable name, unique per organization over LIVE rows. Its
+    /// charset (`^[a-z0-9][a-z0-9._-]{0,62}$`, no case folding) is enforced by the
+    /// `org_groups_slug_valid` CHECK; the management edge validates it up front and
+    /// reports it, so a value that reaches here and is refused by the CHECK is a
+    /// caller that bypassed the edge and surfaces as [`StoreError::Database`].
+    pub slug: &'a str,
+    /// The mutable human-facing label; must be nonempty (a CHECK).
+    pub display_name: &'a str,
+    /// Optional free-form group metadata; `None` stores the empty object.
+    pub metadata: Option<&'a serde_json::Value>,
+}
+
 /// The control-plane entry point: reads and the acting door for writes.
 ///
 /// Reached through [`Store::management`]. Its pool must authenticate as
@@ -31585,6 +31655,18 @@ impl<'a> ManagementStore<'a> {
     #[must_use]
     pub fn org_roles(&self, scope: Scope) -> OrgRoleRepo<'a> {
         OrgRoleRepo {
+            store: self.store,
+            scope,
+        }
+    }
+
+    /// The read-only organization-group repository for `scope` (issue #97). Groups
+    /// are environment-scoped, so the repository is constructible only from a
+    /// `(tenant, environment)` scope and binds row-level security to it before
+    /// every statement.
+    #[must_use]
+    pub fn org_groups(&self, scope: Scope) -> OrgGroupRepo<'a> {
+        OrgGroupRepo {
             store: self.store,
             scope,
         }
@@ -31709,6 +31791,18 @@ impl<'a> ActingManagementStore<'a> {
     #[must_use]
     pub fn org_roles(&self, scope: Scope) -> ActingOrgRoleRepo<'a> {
         ActingOrgRoleRepo {
+            store: self.store,
+            acting: self.acting,
+            scope,
+        }
+    }
+
+    /// The mutating organization-group repository for `scope` (issue #97): define a
+    /// group in an organization (optionally under a parent), rename it, move it
+    /// within the organization's group forest, and delete it, each audited.
+    #[must_use]
+    pub fn org_groups(&self, scope: Scope) -> ActingOrgGroupRepo<'a> {
+        ActingOrgGroupRepo {
             store: self.store,
             acting: self.acting,
             scope,
@@ -32290,6 +32384,152 @@ impl OrgRoleRepo<'_> {
         tx.commit().await?;
         rows.iter()
             .map(|row| org_role_from_row(row, &self.scope))
+            .collect()
+    }
+}
+
+/// The projection every organization-group read selects from `org_groups` (the two
+/// timestamps as epoch microseconds, the metadata as JSON text). One constant so
+/// the get and list projections cannot drift.
+const ORG_GROUP_SELECT_COLUMNS: &str = "id, organization_id, parent_id, slug, display_name, \
+     metadata::text AS metadata_text, \
+     (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us, \
+     (EXTRACT(EPOCH FROM updated_at) * 1000000)::bigint AS updated_us";
+
+/// The hard ceiling on the group nesting depth any caller may ask for (issue #97).
+///
+/// A MIRROR of `ironauth_config::ORGANIZATIONS_MAX_GROUP_DEPTH_CEILING`, kept here
+/// because `ironauth-store` deliberately has no dependency on the config crate: the
+/// bound arrives as a call parameter, exactly as the dynamic-registration cap does.
+/// Every group write and every hierarchy walk clamps its parameter to this value
+/// regardless of what the caller passed, mirroring the pagination layer's triple
+/// clamp, so even a miswired caller cannot put an unbounded ancestor walk on the
+/// token-issuance path. A cross-crate test pins the two constants equal.
+///
+/// This bounds tree DEPTH only. Nothing here caps the NUMBER of groups, roles,
+/// members, or assignments: those are uncapped by covenant.
+pub const ORG_GROUP_MAX_DEPTH_CEILING: u32 = 32;
+
+/// Read-only organization groups for one scope (issue #97).
+///
+/// Reached by the control plane through [`ManagementStore::org_groups`] and by the
+/// data plane through [`ScopedStore::org_groups`]. Every read is scope-fenced and
+/// filters `deleted_at IS NULL`, so a deleted group reads as absent, exactly like a
+/// group of another scope and like one that never existed: the four cases (absent,
+/// soft-deleted, foreign scope, foreign organization) are indistinguishable to a
+/// caller. The typed [`OrgGroupId`] embeds its scope, so a cross-scope id fails to
+/// parse in scope before any query runs.
+pub struct OrgGroupRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl OrgGroupRepo<'_> {
+    /// Parse an untrusted group identifier under this scope. A malformed id and one
+    /// minted in another scope both return the uniform not-found.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if malformed or out of scope.
+    pub fn parse_id(&self, raw: &str) -> Result<OrgGroupId, StoreError> {
+        Ok(OrgGroupId::parse_in_scope(raw, &self.scope)?)
+    }
+
+    /// Fetch a live group by id, within scope.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no such live group is visible in this scope.
+    pub async fn get(&self, id: &OrgGroupId) -> Result<OrgGroupRecord, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(&format!(
+            "SELECT {ORG_GROUP_SELECT_COLUMNS} FROM org_groups \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND deleted_at IS NULL"
+        ))
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        org_group_from_row(&row, &self.scope)
+    }
+
+    /// Fetch a live group by id, requiring it to belong to `org_id`: the read a
+    /// nested `/organizations/{org}/groups/{group}` surface performs. A group of
+    /// ANOTHER organization in the same scope is the uniform not-found, exactly
+    /// like an absent one, so the nested path can never be used to read across
+    /// organizations, and neither can it be used to learn that a group id exists
+    /// somewhere else in the environment.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if either id is out of scope, or no such live group
+    /// exists in that organization.
+    pub async fn get_in_org(
+        &self,
+        org_id: &OrganizationId,
+        id: &OrgGroupId,
+    ) -> Result<OrgGroupRecord, StoreError> {
+        if org_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let record = self.get(id).await?;
+        if &record.organization_id == org_id {
+            Ok(record)
+        } else {
+            Err(StoreError::NotFound)
+        }
+    }
+
+    /// One page of live groups for one organization, ordered by `(created_at, id)`.
+    /// The "groups in this organization" list, FLAT: it returns every group of the
+    /// organization with its `parent_id`, not a subtree, so a console renders the
+    /// tree from one page sequence rather than one request per level.
+    ///
+    /// A cross-scope `org_id` matches nothing (its scope columns cannot match the
+    /// bound scope), so the result is empty rather than an error.
+    ///
+    /// This list is PAGE-size clamped like every management list; there is no cap
+    /// on how many groups an organization may hold, at any depth level.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_for_org(
+        &self,
+        org_id: &OrganizationId,
+        limit: i64,
+        after: Option<&CursorPosition>,
+    ) -> Result<Vec<OrgGroupRecord>, StoreError> {
+        if org_id.scope() != self.scope {
+            return Ok(Vec::new());
+        }
+        let (after_micros, after_id) = split_cursor(after);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {ORG_GROUP_SELECT_COLUMNS} FROM org_groups \
+             WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
+             AND deleted_at IS NULL \
+             AND ($4::bigint IS NULL OR (created_at, id) > \
+                  (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval, $5::text)) \
+             ORDER BY created_at, id LIMIT $6"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(org_id.to_string())
+        .bind(after_micros)
+        .bind(after_id)
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| org_group_from_row(row, &self.scope))
             .collect()
     }
 }
@@ -34161,6 +34401,1227 @@ impl ActingOrgRoleRepo<'_> {
     }
 }
 
+/// The mutating organization-group repository (issue #97): define a group in an
+/// organization (optionally directly under a parent), rename it, MOVE it within the
+/// organization's group forest, and delete it, each audited in the same transaction
+/// as the write.
+///
+/// This repository owns the one piece of genuinely concurrent structural logic in
+/// the module: the write-time cycle check and depth bound over a per-organization
+/// tree. Read [`ActingOrgGroupRepo::reparent`] for the whole argument; the short
+/// version is that every write that changes a `parent_id` takes a per-organization
+/// transaction-scoped advisory lock FIRST, so everything it then reads is
+/// authoritative for the life of the transaction, and a refusal rolls the attempted
+/// write and its audit row back together.
+///
+/// There is no count cap, quota, or paywall gate on groups anywhere in this
+/// repository or in migration 0087. An organization may define as many groups as it
+/// likes, at any depth level: the advisory-lock-plus-COUNT registration gate used
+/// elsewhere in this module is deliberately NOT replicated here (a project
+/// covenant). The advisory lock this repository does take is a SERIALIZATION device
+/// for the cycle check and counts nothing.
+pub struct ActingOrgGroupRepo<'a> {
+    store: &'a Store,
+    acting: ActingContext,
+    scope: Scope,
+}
+
+impl ActingOrgGroupRepo<'_> {
+    /// Define a group in an organization, optionally directly under a parent, and
+    /// audit `organization.group.create` in the same transaction, scoped to
+    /// `(tenant, environment)`.
+    ///
+    /// Containment is enforced structurally on three layers: the typed
+    /// [`OrgGroupId`] and [`OrganizationId`] embed this scope (a foreign id never
+    /// reaches the statement), the forced row-level-security WITH CHECK rejects any
+    /// row whose scope is not the bound one, and the `organization_id` foreign key
+    /// rejects a nonexistent organization.
+    ///
+    /// When `spec.parent_id` is `Some`, the parent is resolved as a LIVE group of
+    /// the SAME organization BEFORE any depth reasoning, and the create is then
+    /// subject to the same bounded hierarchy check a reparent is (see
+    /// [`ActingOrgGroupRepo::reparent`]). A brand-new group carries no subtree, so
+    /// only the parent's own depth plus the new edge can exceed the bound. When it
+    /// is `None` the group is a ROOT: depth 0, always admissible, and no advisory
+    /// lock is taken because a new root changes no existing group's ancestry or
+    /// depth and so cannot invalidate a concurrent check. That exemption is what
+    /// keeps a bulk import of an organization's root groups parallel, which matters
+    /// because the number of groups is uncapped by covenant.
+    ///
+    /// A slug already taken by a LIVE group of the same organization is refused as
+    /// [`StoreError::Conflict`] on the partial unique index. A slug freed by a
+    /// DELETED group is available again, and re-using it inserts a FRESH row with a
+    /// fresh id: unlike a membership, a deleted group is never revived, so deleting
+    /// a group can never be quietly undone in its authorization effects.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if any id is not in this scope, or the proposed
+    /// parent is not a live group of the same organization (uniform across absent,
+    /// soft-deleted, foreign scope, and foreign organization);
+    /// [`StoreError::OrgGroupDepthExceeded`] if the new group would nest deeper than
+    /// `max_group_depth`;
+    /// [`StoreError::Conflict`] if a live group of that organization already holds
+    /// the slug;
+    /// [`StoreError::IdempotencyConflict`] on a concurrent Idempotency-Key race;
+    /// [`StoreError::Database`] on a persistence failure (including a nonexistent
+    /// organization, or a slug or display name the CHECK constraints refuse, both of
+    /// which the management edge validates and reports up front).
+    pub async fn create(
+        &self,
+        env: &Env,
+        spec: NewOrgGroup<'_>,
+        created_at_micros: i64,
+        max_group_depth: u32,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        if spec.id.scope() != self.scope || spec.organization_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        // A parent minted in another scope is refused here, before any statement, so
+        // it is indistinguishable from an absent one and cannot be used to learn
+        // that some other environment holds that group.
+        let parent_id = match spec.parent_id {
+            Some(parent) if parent.scope() != self.scope => return Err(StoreError::NotFound),
+            other => other.copied(),
+        };
+        let scope = self.scope;
+        // `None` metadata binds SQL NULL, which COALESCEs to the empty object.
+        let metadata_opt = metadata_json_opt(spec.metadata)?;
+        let id = *spec.id;
+        let organization_id = *spec.organization_id;
+        let slug = spec.slug.to_owned();
+        let display_name = spec.display_name.to_owned();
+        let bound = max_group_depth.min(ORG_GROUP_MAX_DEPTH_CEILING);
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::OrganizationGroupCreate,
+                target: &id,
+            },
+            async move |tx| {
+                if let Some(parent) = parent_id.as_ref() {
+                    check_group_placement(
+                        tx,
+                        GroupPlacement {
+                            scope,
+                            organization_id: &organization_id,
+                            group_id: &id,
+                            parent_id: parent,
+                            max_group_depth: bound,
+                            // The group does not exist yet, so it carries no
+                            // subtree. Passing false skips the descendant walk
+                            // rather than running one that can only ever return
+                            // zero rows.
+                            carries_subtree: false,
+                        },
+                    )
+                    .await?;
+                }
+                let result = sqlx::query(
+                    "INSERT INTO org_groups \
+                     (id, tenant_id, environment_id, organization_id, parent_id, slug, \
+                      display_name, metadata, created_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8::jsonb, '{}'::jsonb), \
+                             TIMESTAMPTZ 'epoch' + ($9::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($9::text || ' microseconds')::interval)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(organization_id.to_string())
+                .bind(parent_id.map(|parent| parent.to_string()))
+                .bind(&slug)
+                .bind(&display_name)
+                .bind(metadata_opt.as_deref())
+                .bind(created_at_micros)
+                .execute(&mut **tx)
+                .await;
+                match result {
+                    Ok(_) => {}
+                    // A live group of this organization already holds the slug.
+                    Err(error) if is_unique_violation(&error) => {
+                        return Err(StoreError::Conflict);
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+                insert_idempotency(tx, idempotency).await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Rename a group (and optionally replace its metadata) and audit
+    /// `organization.group.update` in the same transaction. A `None` argument leaves
+    /// that column unchanged.
+    ///
+    /// This is a COLUMN-scoped UPDATE of exactly the mutable METADATA columns (the
+    /// #31 lesson), guarded on the row being live, so a deleted or foreign group is
+    /// the uniform not-found. It deliberately does NOT touch `parent_id`: moving a
+    /// group is [`ActingOrgGroupRepo::reparent`], which carries its own hierarchy
+    /// check, its own advisory lock, and its own audit action. Folding the two
+    /// together would let a plain rename silently reshape the tree and would put
+    /// the cycle and depth refusals on an endpoint whose other failure modes are
+    /// nothing like them. The group's `slug` is not writable here and is not even
+    /// granted to the control role.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id is not in this scope, or no live group
+    /// matched;
+    /// [`StoreError::Database`] on a persistence failure (including an empty display
+    /// name, which the CHECK refuses).
+    pub async fn update(
+        &self,
+        env: &Env,
+        id: &OrgGroupId,
+        display_name: Option<&str>,
+        metadata: Option<&serde_json::Value>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let metadata_opt = metadata_json_opt(metadata)?;
+        let display_name = display_name.map(str::to_owned);
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::OrganizationGroupUpdate,
+                target: id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "UPDATE org_groups SET \
+                         display_name = COALESCE($1, display_name), \
+                         metadata = COALESCE($2::jsonb, metadata), \
+                         updated_at = \
+                             TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval \
+                     WHERE id = $4 AND tenant_id = $5 AND environment_id = $6 \
+                     AND deleted_at IS NULL",
+                )
+                .bind(display_name.as_deref())
+                .bind(metadata_opt.as_deref())
+                .bind(now_micros)
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// MOVE a group within its organization's group forest and audit
+    /// `organization.group.reparent` in the same transaction. `parent_id` of `None`
+    /// promotes the group to a ROOT, which is always admissible.
+    ///
+    /// This is the one structurally interesting write in the issue, so the whole
+    /// argument is here.
+    ///
+    /// # Ordering (the anti-oracle rule)
+    ///
+    /// Both the group and the proposed parent are resolved as LIVE rows in the
+    /// caller's scope AND in `organization_id` FIRST, and any failure (absent,
+    /// soft-deleted, foreign scope, foreign organization) is a uniform
+    /// [`StoreError::NotFound`]. NO cycle or depth reasoning happens before that.
+    /// The ordering is load-bearing, not stylistic: [`StoreError::OrgGroupCycle`]
+    /// and [`StoreError::OrgGroupDepthExceeded`] are informative errors, so if
+    /// either could be returned for an id the caller cannot see, the pair would
+    /// become an existence and STRUCTURE oracle over another organization's group
+    /// graph (a caller could probe foreign ids and learn which ones are ancestors
+    /// of which).
+    ///
+    /// # The check
+    ///
+    /// Two bounded `WITH RECURSIVE` walks, both run inside this write transaction:
+    /// upward from the proposed parent (yielding the parent's own depth, and
+    /// whether this group is the parent or one of its ancestors), and downward from
+    /// this group (yielding the height of the subtree that moves with it). The
+    /// verdict is [`reparent_verdict`], which owns the arithmetic and nothing else.
+    /// The bound is over the WHOLE affected subtree, because attaching a deep
+    /// subtree under a deep parent violates the depth bound even when neither side
+    /// did on its own.
+    ///
+    /// Both walks carry a `depth < max_group_depth + 1` guard, so they observe one
+    /// level PAST the bound and then stop. That saturation FAILS CLOSED by
+    /// construction: a saturated ancestor walk reports a depth of
+    /// `max_group_depth + 1`, so the sum in [`reparent_verdict`] certainly exceeds
+    /// the bound and the write is refused. There is no input for which a saturated
+    /// walk permits a write, which is the property that makes a BOUNDED walk safe
+    /// rather than merely fast, and it is what keeps a pre-existing over-deep or
+    /// cyclic hierarchy (left behind by an import or by an operator lowering the
+    /// bound) from being extended.
+    ///
+    /// # Concurrency
+    ///
+    /// `begin_scoped` pins READ COMMITTED (deliberately: the single-use code redeem
+    /// depends on a losing writer BLOCKING and re-reading rather than aborting with
+    /// a serialization failure), and a reparent takes no row lock covering the
+    /// graph. Without further ordering, two concurrent transactions reparenting `A`
+    /// under `B` and `B` under `A` would EACH read an acyclic graph, EACH pass the
+    /// check, and BOTH commit, producing a cycle no single transaction could
+    /// observe and nothing would report. That is closed by a per-organization
+    /// transaction-scoped advisory lock taken BEFORE anything is read, so the
+    /// second reparent blocks until the first commits and then re-reads the
+    /// NOW-CHANGED graph and correctly refuses. See [`lock_group_hierarchy`] for
+    /// the lock-space argument.
+    ///
+    /// # Consistency on refusal
+    ///
+    /// The checks run INSIDE the audited write closure, so returning an error means
+    /// the mutation never ran, the audit row is never inserted, and the transaction
+    /// is dropped and rolled back. There is no pre-read in a separate transaction
+    /// (which would reintroduce exactly the window the lock exists to close) and no
+    /// partial write. A refused reparent leaves the store byte-identical.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if any id is out of scope, or either group is not a
+    /// live group of `organization_id`;
+    /// [`StoreError::OrgGroupCycle`] if the move would close a cycle;
+    /// [`StoreError::OrgGroupDepthExceeded`] if the moved subtree would nest deeper
+    /// than `max_group_depth`;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn reparent(
+        &self,
+        env: &Env,
+        organization_id: &OrganizationId,
+        group_id: &OrgGroupId,
+        parent_id: Option<&OrgGroupId>,
+        max_group_depth: u32,
+    ) -> Result<(), StoreError> {
+        if organization_id.scope() != self.scope || group_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let parent_id = match parent_id {
+            Some(parent) if parent.scope() != self.scope => return Err(StoreError::NotFound),
+            other => other.copied(),
+        };
+        let scope = self.scope;
+        let organization_id = *organization_id;
+        let group_id = *group_id;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let bound = max_group_depth.min(ORG_GROUP_MAX_DEPTH_CEILING);
+        // The audit detail records the resulting parent, because a reparent silently
+        // changes the effective roles of every DESCENDANT and the shape of the tree
+        // is otherwise unreconstructable from the audit log. A group id is an
+        // issuer-minted value in the caller's own scope, never attacker-authored free
+        // text, so it is safe to persist and read back.
+        let detail = match parent_id {
+            Some(parent) => format!("parent={parent}"),
+            None => "parent=none".to_owned(),
+        };
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::OrganizationGroupReparent,
+                target: &group_id,
+            },
+            async move |tx| {
+                // The lock comes first, before even the existence resolution, which
+                // is STRONGER than "before the ancestor read": everything read after
+                // it is authoritative for the life of this transaction, so the
+                // parent cannot be deleted or moved between being resolved and being
+                // walked. It leaks nothing, because it is taken unconditionally from
+                // values the caller supplied and produces no observable outcome of
+                // its own.
+                lock_group_hierarchy(tx, scope, &organization_id).await?;
+                // The anti-oracle pre-resolution. Both endpoints must be live groups
+                // of THIS organization before any structural reasoning runs.
+                require_live_group_in_org(tx, scope, &organization_id, &group_id).await?;
+                if let Some(parent) = parent_id.as_ref() {
+                    // Resolves the parent and re-takes the lock this transaction
+                    // already holds (a no-op); see `check_group_placement`.
+                    check_group_placement(
+                        tx,
+                        GroupPlacement {
+                            scope,
+                            organization_id: &organization_id,
+                            group_id: &group_id,
+                            parent_id: parent,
+                            max_group_depth: bound,
+                            // A reparent moves the group's whole subtree with it, so
+                            // the height of that subtree is part of the bound.
+                            carries_subtree: true,
+                        },
+                    )
+                    .await?;
+                }
+                // Clearing the parent (promoting to a root) needs no check at all:
+                // it can only DECREASE the depth of the moved subtree, and a group
+                // with no parent is in no cycle. It still runs under the lock and
+                // still audits, because it still reshapes the tree.
+                //
+                // The `organization_id` predicate below is REDUNDANT with the
+                // resolution above: nothing reaches this statement without the group
+                // having already been proven live in this organization, so removing
+                // it changes no observable behavior and no test can distinguish it
+                // (unlike the delete path, whose organization predicate is the only
+                // containment guard it has). It is retained deliberately as a second
+                // layer: the resolution and the write are separated by the hierarchy
+                // check, and a future edit that moved or weakened the resolution
+                // would otherwise silently turn this into a cross-organization write.
+                let result = sqlx::query(
+                    "UPDATE org_groups SET \
+                         parent_id = $1, \
+                         updated_at = \
+                             TIMESTAMPTZ 'epoch' + ($2::text || ' microseconds')::interval \
+                     WHERE id = $3 AND tenant_id = $4 AND environment_id = $5 \
+                     AND organization_id = $6 AND deleted_at IS NULL",
+                )
+                .bind(parent_id.map(|parent| parent.to_string()))
+                .bind(now_micros)
+                .bind(group_id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(organization_id.to_string())
+                .execute(&mut **tx)
+                .await?;
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+            Some(detail.as_str()),
+        )
+        .await
+    }
+
+    /// Delete a group (soft delete) in this scope and audit
+    /// `organization.group.delete` in the same transaction. The row is retained
+    /// (only the column-scoped `deleted_at` and `updated_at` are written), so the
+    /// audit foreign key to it stays satisfiable; because the uniqueness index is
+    /// partial over live rows, the deleted group's slug is immediately available to
+    /// a new group. A repeat delete of an already deleted group matches no live row
+    /// and is the uniform not-found.
+    ///
+    /// A group's CHILDREN are not deleted with it and are not rewritten. They keep
+    /// pointing at the dead row, and because every hierarchy walk filters
+    /// `deleted_at IS NULL`, each child is thereafter treated as a ROOT: deleting a
+    /// mid-tree group DETACHES its subtree rather than orphaning it into an
+    /// unreachable state or cascading a delete the operator did not ask for.
+    /// Detaching can only ever DECREASE a descendant's depth, so no stored
+    /// hierarchy can be pushed past the bound by a delete.
+    ///
+    /// The delete runs under the same per-organization advisory lock as a reparent,
+    /// so "at most one transaction reshapes one organization's group forest at a
+    /// time" is a single invariant rather than a case analysis over which pairs of
+    /// mutations can interleave.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id is not in this scope, or no live group
+    /// matched;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn delete(
+        &self,
+        env: &Env,
+        organization_id: &OrganizationId,
+        id: &OrgGroupId,
+    ) -> Result<(), StoreError> {
+        if organization_id.scope() != self.scope || id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let organization_id = *organization_id;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::OrganizationGroupDelete,
+                target: id,
+            },
+            async move |tx| {
+                lock_group_hierarchy(tx, scope, &organization_id).await?;
+                let result = sqlx::query(
+                    "UPDATE org_groups SET \
+                         deleted_at = \
+                             TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval, \
+                         updated_at = \
+                             TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+                     WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 \
+                     AND organization_id = $5 AND deleted_at IS NULL",
+                )
+                .bind(now_micros)
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(organization_id.to_string())
+                .execute(&mut **tx)
+                .await?;
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+}
+
+/// Everything one hierarchy-safety check needs, bundled so the helper stays within
+/// the readable-argument-count lint (issue #97).
+struct GroupPlacement<'a> {
+    /// The bound scope; repeated in every statement above row-level security.
+    scope: Scope,
+    /// The organization whose forest is being reshaped. Repeated in EVERY arm of
+    /// both recursive walks: row-level security fences `(tenant, environment)` and
+    /// nothing else, so the organization predicate is the only thing keeping one
+    /// organization's walk out of a sibling organization's groups.
+    organization_id: &'a OrganizationId,
+    /// The group being placed. For a create this row does not exist yet.
+    group_id: &'a OrgGroupId,
+    /// The proposed parent. Already resolved as a live group of `organization_id`.
+    parent_id: &'a OrgGroupId,
+    /// The depth bound, already clamped to [`ORG_GROUP_MAX_DEPTH_CEILING`].
+    max_group_depth: u32,
+    /// Whether `group_id` may already carry descendants that move with it. False
+    /// for a create (a group that does not exist has no subtree), true for a
+    /// reparent.
+    carries_subtree: bool,
+}
+
+/// Serialize concurrent hierarchy writes within ONE organization with a
+/// TRANSACTION-scoped Postgres advisory lock (issue #97).
+///
+/// Taken before anything the hierarchy check reads, so the cycle and depth checks
+/// are authoritative under concurrency. `begin_scoped` pins READ COMMITTED (and
+/// must: the single-use code redeem depends on a losing writer BLOCKING and
+/// re-reading rather than aborting with a 40001 the way REPEATABLE READ or
+/// SERIALIZABLE would), and a reparent takes no row lock covering the whole graph,
+/// so without this two concurrent reparents (`A` under `B`, and `B` under `A`)
+/// would EACH read an acyclic graph, EACH pass the check, and BOTH commit: a cycle
+/// no single transaction could observe. Holding this lock, the second blocks until
+/// the first commits, then re-reads the NOW-CHANGED graph and correctly refuses.
+/// `pg_advisory_xact_lock` auto-releases at commit or rollback, so no unlock path
+/// exists to be forgotten on an error return.
+///
+/// GRANULARITY is per organization, not per environment. A group's parent must be
+/// in the same organization (enforced immediately above this call), so a cycle is
+/// confined to one organization's forest and locking the whole environment would
+/// needlessly serialize reparents across unrelated organizations.
+///
+/// Why an advisory lock and not `SELECT ... FOR UPDATE` on the organization row: a
+/// locking clause requires UPDATE privilege, and `ironauth_control` holds only
+/// COLUMN-scoped UPDATE on `organizations` while `ironauth_app` holds SELECT only,
+/// so whether the locking clause's privilege check is satisfied would have to be
+/// established empirically per role and would fail outright on the data plane.
+/// `pg_advisory_xact_lock` is executable by PUBLIC and needs no grant on either
+/// plane.
+///
+/// LOCK-SPACE DISJOINTNESS. This is the SECOND user of the single-argument
+/// transaction-scoped space; the config-promotion apply is the first, and the
+/// dynamic-registration quota deliberately uses the TWO-argument space, which is
+/// disjoint from both. The namespace prefix inside the hashed string is what keeps
+/// this key apart from the promotion key: a collision between the two namespaces is
+/// possible at roughly one in four billion per pair, and its only cost is that one
+/// config promotion and one unrelated group reparent serialize needlessly, never a
+/// correctness failure, because both operations are safe under additional mutual
+/// exclusion. The migration runner's SESSION-level lock cannot collide with either:
+/// its key (`MIGRATION_ADVISORY_LOCK_KEY`) is a full 64-bit constant far outside
+/// `int4` range, while `hashtext` returns `int4`, so no `hashtext`-derived key can
+/// ever equal it. That is a proof, not a hope.
+async fn lock_group_hierarchy(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    organization_id: &OrganizationId,
+) -> Result<(), StoreError> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+        .bind(format!(
+            "org-group-hierarchy:{}:{}:{organization_id}",
+            scope.tenant(),
+            scope.environment()
+        ))
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// Resolve `group_id` as a LIVE group of `organization_id` within `scope`, or the
+/// uniform [`StoreError::NotFound`] (issue #97).
+///
+/// The single anti-oracle gate every hierarchy write passes through. Absent,
+/// soft-deleted, another scope's, and another organization's all collapse to one
+/// error here, BEFORE any cycle or depth reasoning runs, so the typed structural
+/// refusals can only ever be seen by a caller who has already proven they can see
+/// both endpoints.
+async fn require_live_group_in_org(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    organization_id: &OrganizationId,
+    group_id: &OrgGroupId,
+) -> Result<(), StoreError> {
+    let found = sqlx::query(
+        "SELECT 1 AS present FROM org_groups \
+         WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
+         AND organization_id = $4 AND deleted_at IS NULL",
+    )
+    .bind(group_id.to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(organization_id.to_string())
+    .fetch_optional(&mut **tx)
+    .await?;
+    if found.is_some() {
+        Ok(())
+    } else {
+        Err(StoreError::NotFound)
+    }
+}
+
+/// The COMPLETE write-time hierarchy gate for placing one group under one parent
+/// (issue #97): take the per-organization advisory lock, resolve the proposed parent
+/// as a live group of the same organization, run the two bounded recursive walks,
+/// and decide.
+///
+/// All four steps live here, in that order, deliberately. An earlier shape of this
+/// code left the lock and the parent resolution to each caller and kept only the
+/// walks here, and the create path silently omitted both: a create naming a parent
+/// in a SIBLING organization passed the walks (they simply found nothing), passed
+/// the foreign key (the parent really does exist), and wrote a cross-organization
+/// edge, while a create naming an ABSENT parent surfaced a raw foreign-key error
+/// instead of the uniform not-found. One entry point that cannot be half-used is
+/// the fix; the steps are not separable without recreating exactly that hole.
+///
+/// Taking the lock here means a caller that already holds it (a reparent, which must
+/// hold it before resolving its own endpoint) takes it twice. That is a no-op: a
+/// transaction-scoped advisory lock is already held by the transaction requesting it,
+/// so the second acquisition returns immediately, and both release together at commit
+/// or rollback.
+///
+/// Runs inside the caller's write transaction, so a refusal rolls the attempted write
+/// and its audit row back together.
+///
+/// WHY THIS IS SQL AND NOT AN IN-MEMORY RUST WALK. These are the first (and, at the
+/// time of writing, only) `WITH RECURSIVE` statements in the codebase, so the choice
+/// needs stating.
+///
+///   1. The obvious alternative is to read the organization's whole edge set into
+///      memory and walk it in Rust, which would be pure and database-free testable.
+///      But the number of groups per organization is UNCAPPED BY COVENANT, so that
+///      read transfers an unbounded number of rows on every reparent. These walks
+///      touch only the ancestor CHAIN (bounded by the configured depth) and the
+///      moved subtree.
+///   2. Row-level security makes the traversal safe, not merely permitted. It runs
+///      under the FORCED `(tenant, environment)` policy `begin_scoped` bound, so a
+///      recursive walk CANNOT cross into another tenant's groups even if a corrupt
+///      `parent_id` pointed there. An in-memory walk would have to reproduce that by
+///      hand, correctly, forever.
+///   3. It is one round trip inside the write transaction, so there is no window
+///      between checking and writing.
+///   4. One definition of ancestry. The effective-role resolution a later PR of this
+///      issue adds walks ancestry too; if the write path walked in Rust and the read
+///      path in SQL, the two definitions could drift, and a drift between "what the
+///      writer refuses" and "what the reader follows" is precisely how a cycle
+///      reaches the token-issuance path.
+///
+/// The PURE arithmetic is deliberately NOT in SQL: [`reparent_verdict`] owns the
+/// decision and is exhaustively testable with no database.
+///
+/// These are runtime `sqlx::query` strings, never the compile-time macros, so the
+/// database-free lanes stay database-free.
+async fn check_group_placement(
+    tx: &mut Transaction<'_, Postgres>,
+    placement: GroupPlacement<'_>,
+) -> Result<(), StoreError> {
+    let GroupPlacement {
+        scope,
+        organization_id,
+        group_id,
+        parent_id,
+        max_group_depth,
+        carries_subtree,
+    } = placement;
+    // Step 1: serialize every hierarchy write in this organization.
+    lock_group_hierarchy(tx, scope, organization_id).await?;
+    // Step 2: the anti-oracle pre-resolution of the PARENT. Absent, soft-deleted,
+    // another scope's, and another organization's all collapse to one not-found
+    // BEFORE any structural reasoning runs, so neither typed refusal below can ever
+    // be seen by a caller who cannot already see the parent. This is also what makes
+    // same-organization containment true: the parent foreign key is id-only, so
+    // nothing in the database would stop a group of one organization from parenting
+    // to a group of a sibling organization in the same environment.
+    require_live_group_in_org(tx, scope, organization_id, parent_id).await?;
+
+    // The walk observes ONE level past the bound and then stops. See the saturation
+    // argument on `ActingOrgGroupRepo::reparent`: a saturated walk always yields a
+    // refusal, never a permit.
+    let walk_bound = i64::from(max_group_depth) + 1;
+    let tenant = scope.tenant().to_string();
+    let environment = scope.environment().to_string();
+    let organization = organization_id.to_string();
+
+    // Walk UP from the proposed parent. Each step is a primary-key lookup on `id`,
+    // so no dedicated index is needed for this direction. `UNION ALL` plus the
+    // explicit depth guard is used rather than `UNION`: Postgres's recursive `UNION`
+    // would also terminate a cycle by deduplicating against the accumulated set, but
+    // an explicit guard makes the work bound obvious and testable rather than an
+    // emergent property of the set semantics.
+    //
+    // `closes_cycle` is the whole cycle test: it is true when the group being placed
+    // IS the proposed parent (the seed row) or is one of its ancestors, which are
+    // exactly the placements that would make the group its own ancestor.
+    let row = sqlx::query(
+        "WITH RECURSIVE ancestors AS ( \
+             SELECT g.id, g.parent_id, 0::bigint AS depth \
+               FROM org_groups g \
+              WHERE g.tenant_id = $1 AND g.environment_id = $2 \
+                AND g.organization_id = $3 AND g.id = $4 \
+                AND g.deleted_at IS NULL \
+             UNION ALL \
+             SELECT g.id, g.parent_id, a.depth + 1 \
+               FROM org_groups g \
+               JOIN ancestors a ON g.id = a.parent_id \
+              WHERE g.tenant_id = $1 AND g.environment_id = $2 \
+                AND g.organization_id = $3 \
+                AND g.deleted_at IS NULL \
+                AND a.depth < $5 \
+         ) \
+         SELECT COALESCE(MAX(depth), 0) AS parent_depth, \
+                COALESCE(BOOL_OR(id = $6), false) AS closes_cycle \
+           FROM ancestors",
+    )
+    .bind(&tenant)
+    .bind(&environment)
+    .bind(&organization)
+    .bind(parent_id.to_string())
+    .bind(walk_bound)
+    .bind(group_id.to_string())
+    .fetch_one(&mut **tx)
+    .await?;
+    let parent_depth: i64 = row.get("parent_depth");
+    let closes_cycle: bool = row.get("closes_cycle");
+
+    // Walk DOWN from the group being moved, for the height of the subtree that
+    // travels with it. Skipped for a create, whose group has no row yet and
+    // therefore no descendants. This direction is what `org_groups_parent_idx`
+    // exists for: it joins each child's `parent_id` against the frontier.
+    let subtree_height = if carries_subtree {
+        let row = sqlx::query(
+            "WITH RECURSIVE descendants AS ( \
+                 SELECT g.id, 0::bigint AS depth \
+                   FROM org_groups g \
+                  WHERE g.tenant_id = $1 AND g.environment_id = $2 \
+                    AND g.organization_id = $3 AND g.id = $4 \
+                    AND g.deleted_at IS NULL \
+                 UNION ALL \
+                 SELECT g.id, d.depth + 1 \
+                   FROM org_groups g \
+                   JOIN descendants d ON g.parent_id = d.id \
+                  WHERE g.tenant_id = $1 AND g.environment_id = $2 \
+                    AND g.organization_id = $3 \
+                    AND g.deleted_at IS NULL \
+                    AND d.depth < $5 \
+             ) \
+             SELECT COALESCE(MAX(depth), 0) AS subtree_height FROM descendants",
+        )
+        .bind(&tenant)
+        .bind(&environment)
+        .bind(&organization)
+        .bind(group_id.to_string())
+        .bind(walk_bound)
+        .fetch_one(&mut **tx)
+        .await?;
+        row.get::<i64, _>("subtree_height")
+    } else {
+        0
+    };
+
+    reparent_verdict(parent_depth, subtree_height, closes_cycle, max_group_depth)
+}
+
+/// The pure decision half of the group-hierarchy bound (issue #97), factored out of
+/// the store so it is exhaustively testable with no database, no clock, and no
+/// entropy.
+///
+/// `parent_depth` and `subtree_height` come from the two bounded recursive walks;
+/// this function owns ONLY the arithmetic and the precedence between the two
+/// refusals.
+///
+/// The bound is over the WHOLE affected subtree: the parent's own depth, plus the
+/// new edge, plus the height of the subtree that moves. Attaching a deep subtree
+/// under a deep parent breaches the bound even when neither side did on its own,
+/// which is exactly the case a naive "is the new edge too deep" check misses.
+///
+/// The cycle refusal takes PRECEDENCE over the depth refusal. When the walk
+/// discovered a cycle its depth reading is an artifact of the walk's own bound and
+/// says nothing about the real tree, so reporting the depth would be reporting a
+/// number that does not exist; and the two have different remedies (a cycle is a
+/// malformed request, an over-deep tree is a limit an operator can raise), so the
+/// caller must be told the actual problem.
+///
+/// The addition SATURATES rather than wrapping. Both inputs come from a bounded
+/// walk so neither can realistically approach the limit, but a saturating add makes
+/// the refusal total for every `i64` input, including values a future caller or a
+/// corrupt read could supply, and it can only ever make the sum LARGER, so it can
+/// only ever refuse: it cannot turn a violation into a permit.
+///
+/// # Errors
+///
+/// [`StoreError::OrgGroupCycle`] when the placement closes a cycle;
+/// [`StoreError::OrgGroupDepthExceeded`] when the resulting subtree would nest
+/// deeper than `max_group_depth`.
+pub(crate) fn reparent_verdict(
+    parent_depth: i64,
+    subtree_height: i64,
+    closes_cycle: bool,
+    max_group_depth: u32,
+) -> Result<(), StoreError> {
+    if closes_cycle {
+        return Err(StoreError::OrgGroupCycle);
+    }
+    let attempted = parent_depth
+        .saturating_add(1)
+        .saturating_add(subtree_height);
+    if attempted > i64::from(max_group_depth) {
+        return Err(StoreError::OrgGroupDepthExceeded {
+            max: max_group_depth,
+            attempted,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod org_group_hierarchy_tests {
+    use super::{ORG_GROUP_MAX_DEPTH_CEILING, reparent_verdict};
+    use crate::error::StoreError;
+
+    /// A deterministic `SplitMix64` stream, seeded from a hard-coded constant so a
+    /// failure in CI is reproducible from the log alone.
+    ///
+    /// A file-local generator rather than a crate: the workspace has no
+    /// property-testing dependency, and `scripts/invariant-lints.sh` bans the `rand`
+    /// family outright so that randomness in tests is always seeded and replayable.
+    /// The repository's existing convention for randomized corpora is exactly this
+    /// (a four line generator plus a fixed seed), and these properties are simple
+    /// invariants over small graphs with no need for shrinking.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        /// A value in `0..bound`. `bound` must be nonzero.
+        fn below(&mut self, bound: usize) -> usize {
+            let bound_u64 = u64::try_from(bound).expect("bound fits u64");
+            usize::try_from(self.next_u64() % bound_u64).expect("modulus fits usize")
+        }
+    }
+
+    /// An in-memory model of ONE organization's group forest: node `i`'s parent, or
+    /// `None` for a root.
+    ///
+    /// The model exists so the hierarchy properties can be swept thousands of times
+    /// with no database. It computes the same three quantities the two recursive SQL
+    /// walks compute (the parent's depth, whether the placement closes a cycle, and
+    /// the height of the moving subtree) and feeds them to the SAME
+    /// [`reparent_verdict`] the store calls, so what is under test here is the real
+    /// decision function against a real graph, not a re-implementation of it.
+    #[derive(Debug, Clone)]
+    struct Forest {
+        parent: Vec<Option<usize>>,
+    }
+
+    impl Forest {
+        /// A random forest of `size` nodes.
+        ///
+        /// Node `i` may only parent to a node with a SMALLER index, so the generated
+        /// forest is ACYCLIC BY CONSTRUCTION: the properties below are about what the
+        /// verdict does to an already valid forest, and a generator that could emit a
+        /// cycle would make a failure ambiguous between the generator and the code
+        /// under test.
+        ///
+        /// `max_depth` of `Some` additionally keeps the generated forest WITHIN the
+        /// bound, which is what a forest the store itself built always looks like: the
+        /// store refuses every write that would breach the bound, so a forest that
+        /// starts over-deep can only come from an import or from an operator LOWERING
+        /// the bound afterwards. `None` generates such an over-deep forest deliberately,
+        /// for the grandfathering sweep.
+        fn generate(rng: &mut Rng, size: usize, max_depth: Option<u32>) -> Self {
+            let mut forest = Self {
+                parent: Vec::with_capacity(size),
+            };
+            for index in 0..size {
+                // A quarter of the nodes are roots, so the forest really is a forest
+                // and not one deep chain.
+                if index == 0 || rng.below(4) == 0 {
+                    forest.parent.push(None);
+                    continue;
+                }
+                let candidate = rng.below(index);
+                let admissible = match max_depth {
+                    None => true,
+                    Some(limit) => {
+                        forest.depth(candidate).expect("acyclic by construction") < i64::from(limit)
+                    }
+                };
+                forest
+                    .parent
+                    .push(if admissible { Some(candidate) } else { None });
+            }
+            forest
+        }
+
+        fn len(&self) -> usize {
+            self.parent.len()
+        }
+
+        /// The depth of `node` in edges from its root, or `None` if the parent chain
+        /// does not terminate within one step per node. Returning `None` rather than
+        /// looping forever is what lets acyclicity be ASSERTED below instead of
+        /// assumed: a cyclic model would hang a naive walk, and a hanging test proves
+        /// nothing.
+        fn depth(&self, node: usize) -> Option<i64> {
+            let mut depth = 0_i64;
+            let mut current = node;
+            for _ in 0..=self.len() {
+                match self.parent[current] {
+                    None => return Some(depth),
+                    Some(next) => {
+                        depth += 1;
+                        current = next;
+                    }
+                }
+            }
+            None
+        }
+
+        /// Whether `candidate` is `node` itself or one of its ancestors: exactly the
+        /// `closes_cycle` predicate the ancestor CTE computes (`BOOL_OR(id = $6)`
+        /// over the walk seeded at the proposed parent).
+        fn is_self_or_ancestor_of(&self, candidate: usize, node: usize) -> bool {
+            let mut current = node;
+            for _ in 0..=self.len() {
+                if current == candidate {
+                    return true;
+                }
+                match self.parent[current] {
+                    None => return false,
+                    Some(next) => current = next,
+                }
+            }
+            false
+        }
+
+        /// The height of the subtree rooted at `node`, in edges: 0 for a leaf.
+        fn subtree_height(&self, node: usize) -> i64 {
+            let mut frontier = vec![node];
+            let mut height = 0_i64;
+            for level in 0..=self.len() {
+                let next: Vec<usize> = (0..self.len())
+                    .filter(|child| {
+                        self.parent[*child].is_some_and(|parent| frontier.contains(&parent))
+                    })
+                    .collect();
+                if next.is_empty() {
+                    break;
+                }
+                height = i64::try_from(level).expect("level fits i64") + 1;
+                frontier = next;
+            }
+            height
+        }
+
+        /// Every node's depth, or `None` if any parent chain fails to terminate.
+        fn max_depth(&self) -> Option<i64> {
+            (0..self.len()).try_fold(0_i64, |acc, node| Some(acc.max(self.depth(node)?)))
+        }
+    }
+
+    /// The three walk results for placing `group` under `parent`, saturated exactly
+    /// as the bounded SQL walks saturate: each walk observes ONE level past the
+    /// bound and stops, so a quantity larger than that is reported as the bound.
+    fn walk_results(
+        forest: &Forest,
+        group: usize,
+        parent: usize,
+        max_group_depth: u32,
+    ) -> (i64, i64, bool) {
+        let walk_bound = i64::from(max_group_depth) + 1;
+        let closes_cycle = forest.is_self_or_ancestor_of(group, parent);
+        // A cyclic placement makes the ancestor walk's depth an artifact of the walk
+        // bound, exactly as it is in SQL; the verdict must not read it.
+        let parent_depth = forest.depth(parent).unwrap_or(walk_bound).min(walk_bound);
+        let subtree_height = forest.subtree_height(group).min(walk_bound);
+        (parent_depth, subtree_height, closes_cycle)
+    }
+
+    #[test]
+    fn the_verdict_is_exact_at_and_over_the_depth_bound() {
+        // The boundary, stated once and exactly: a placement whose deepest resulting
+        // node lands ON the bound is admitted, and one level deeper is refused. An
+        // off-by-one here is the difference between a bound that does what it says
+        // and one that quietly admits an extra level on every tree in the fleet.
+        for max in 0_u32..=8 {
+            let limit = i64::from(max);
+            for parent_depth in 0..=limit {
+                let head_room = limit - parent_depth - 1;
+                if head_room >= 0 {
+                    assert!(
+                        reparent_verdict(parent_depth, head_room, false, max).is_ok(),
+                        "a subtree landing exactly on the bound must be admitted \
+                         (max={max}, parent_depth={parent_depth}, height={head_room})"
+                    );
+                }
+                let over = head_room + 1;
+                let verdict = reparent_verdict(parent_depth, over, false, max);
+                assert!(
+                    matches!(
+                        verdict,
+                        Err(StoreError::OrgGroupDepthExceeded { max: reported, attempted })
+                            if reported == max && attempted == parent_depth + 1 + over
+                    ),
+                    "one level past the bound must be refused with the attempted depth \
+                     (max={max}, parent_depth={parent_depth}, height={over}): {verdict:?}"
+                );
+            }
+        }
+        // A bound of zero means FLAT GROUPS ONLY: any parent at all is one edge too
+        // many. It does NOT mean unlimited.
+        assert!(matches!(
+            reparent_verdict(0, 0, false, 0),
+            Err(StoreError::OrgGroupDepthExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn a_cycle_refusal_takes_precedence_and_the_arithmetic_cannot_overflow() {
+        // The cycle refusal wins even when the depth would also have failed. When the
+        // walk found a cycle its depth reading is an artifact of the walk's own bound,
+        // so reporting a depth would report a number that does not exist, and the two
+        // refusals have different remedies.
+        assert!(matches!(
+            reparent_verdict(1_000, 1_000, true, 8),
+            Err(StoreError::OrgGroupCycle)
+        ));
+        assert!(matches!(
+            reparent_verdict(0, 0, true, 8),
+            Err(StoreError::OrgGroupCycle)
+        ));
+        // Saturating arithmetic keeps the decision total for every i64 input,
+        // including values no bounded walk can produce but a corrupt read could.
+        // Saturation can only make the sum LARGER, so it can only ever refuse.
+        assert!(matches!(
+            reparent_verdict(i64::MAX, i64::MAX, false, ORG_GROUP_MAX_DEPTH_CEILING),
+            Err(StoreError::OrgGroupDepthExceeded {
+                attempted: i64::MAX,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one sweep asserting four joint properties over the same generated \
+                  forests; splitting it would re-generate the corpus per property and \
+                  lose the fact that they hold SIMULTANEOUSLY on one graph"
+    )]
+    fn property_accepted_placements_preserve_acyclicity_and_the_depth_bound() {
+        // A randomized sweep over group forests with cycle and depth-violation
+        // injection. Four properties are asserted jointly on each generated forest:
+        //
+        //   1. Every placement whose proposed parent lies in the moved group's own
+        //      subtree (which includes the group itself) is refused as a CYCLE. This
+        //      is the injection: the sweep deliberately proposes back edges.
+        //   2. No ACCEPTED placement ever creates a cycle: after applying it, every
+        //      node's parent chain still terminates.
+        //   3. No ACCEPTED placement ever breaches the depth bound, measured over the
+        //      WHOLE forest afterwards, not just the moved subtree.
+        //   4. No placement that is genuinely legal is refused. This is the
+        //      non-vacuity half: a verdict that refused everything would satisfy 1
+        //      through 3 perfectly, so the sweep also proves the bound is not simply
+        //      closed, and counts its acceptances to prove the corpus exercises both
+        //      outcomes.
+        let mut rng = Rng(0x0097_0002_5EED_1234);
+        let mut accepted_total = 0_usize;
+        let mut cycle_refusals = 0_usize;
+        let mut depth_refusals = 0_usize;
+
+        for round in 0..400_usize {
+            let max_group_depth = u32::try_from(round % 6).expect("small value fits u32");
+            let size = 3 + rng.below(12);
+            // The starting forest respects the bound, because a forest the store
+            // itself built always does. Over-deep starting forests are the separate
+            // grandfathering sweep below.
+            let mut forest = Forest::generate(&mut rng, size, Some(max_group_depth));
+
+            for _ in 0..24 {
+                let group = rng.below(size);
+                let parent = rng.below(size);
+                let (parent_depth, subtree_height, closes_cycle) =
+                    walk_results(&forest, group, parent, max_group_depth);
+                let truly_closes_cycle = forest.is_self_or_ancestor_of(group, parent);
+                let verdict =
+                    reparent_verdict(parent_depth, subtree_height, closes_cycle, max_group_depth);
+
+                // Property 1: every back edge is refused as a cycle.
+                if truly_closes_cycle {
+                    assert!(
+                        matches!(verdict, Err(StoreError::OrgGroupCycle)),
+                        "placing {group} under {parent} closes a cycle and must be refused \
+                         as one; forest={:?} verdict={verdict:?}",
+                        forest.parent
+                    );
+                    cycle_refusals += 1;
+                    continue;
+                }
+
+                // Property 4 (non-vacuity): a placement that is genuinely legal must be
+                // ACCEPTED. Computed from the model's own true (unsaturated) numbers,
+                // so a saturation bug that refused a legal move is caught here rather
+                // than hiding behind properties 2 and 3.
+                let true_parent_depth = forest.depth(parent).expect("acyclic forest");
+                let true_height = forest.subtree_height(group);
+                let would_reach = true_parent_depth + 1 + true_height;
+                let legal = would_reach <= i64::from(max_group_depth);
+                assert_eq!(
+                    verdict.is_ok(),
+                    legal,
+                    "placing {group} under {parent} would reach depth {would_reach} \
+                     against a bound of {max_group_depth}, so it must be \
+                     {}; forest={:?} verdict={verdict:?}",
+                    if legal { "accepted" } else { "refused" },
+                    forest.parent
+                );
+
+                if verdict.is_err() {
+                    depth_refusals += 1;
+                    continue;
+                }
+
+                // Apply the accepted placement, then assert the invariants over the
+                // WHOLE forest.
+                forest.parent[group] = Some(parent);
+                accepted_total += 1;
+
+                // Property 2: acyclicity is preserved.
+                let max_depth = forest.max_depth();
+                assert!(
+                    max_depth.is_some(),
+                    "an accepted placement of {group} under {parent} created a cycle; \
+                     forest={:?}",
+                    forest.parent
+                );
+                // Property 3: the depth bound holds over every node.
+                assert!(
+                    max_depth.expect("acyclic") <= i64::from(max_group_depth),
+                    "an accepted placement of {group} under {parent} pushed the forest to \
+                     depth {:?} past the bound of {max_group_depth}; forest={:?}",
+                    max_depth,
+                    forest.parent
+                );
+            }
+        }
+
+        // The corpus must actually exercise all three outcomes. Without this the whole
+        // sweep could be green against a generator that only ever produced trivially
+        // legal moves.
+        assert!(
+            accepted_total > 100,
+            "the sweep accepted only {accepted_total} placements; it is not exercising \
+             the admitting path"
+        );
+        assert!(
+            cycle_refusals > 100,
+            "the sweep injected only {cycle_refusals} cycles; it is not exercising the \
+             cycle refusal"
+        );
+        assert!(
+            depth_refusals > 100,
+            "the sweep hit the depth bound only {depth_refusals} times; it is not \
+             exercising the depth refusal"
+        );
+    }
+
+    #[test]
+    fn property_an_over_deep_forest_is_grandfathered_but_can_never_be_extended() {
+        // The other half of the bound's contract, and the one an operator actually
+        // meets: LOWERING max_group_depth on a populated environment, or importing a
+        // hierarchy from another system, leaves stored trees deeper than the bound.
+        // Nothing is rewritten and no read is refused, but no new write may keep a
+        // subtree over the bound.
+        //
+        // This is where the walk's SATURATION has to fail closed. Both recursive
+        // walks stop one level past the bound, so on an over-deep tree they report
+        // `max_group_depth + 1` rather than the true figure. The property asserted
+        // here is that a saturated reading can only ever REFUSE: there is no input on
+        // which the walk saturates and the verdict still permits the write. If
+        // saturation reported the bound itself instead of one past it, a placement
+        // under an arbitrarily deep parent would be admitted, and this sweep is what
+        // catches that.
+        let mut rng = Rng(0x0097_0002_DEED_0001);
+        let mut refused_by_saturation = 0_usize;
+
+        for round in 0..300_usize {
+            // Build the forest with NO bound, then judge it against a small one, which
+            // is exactly the shape of an operator lowering the setting.
+            let size = 6 + rng.below(14);
+            let forest = Forest::generate(&mut rng, size, None);
+            let max_group_depth = u32::try_from(round % 3).expect("small value fits u32");
+
+            for _ in 0..24 {
+                let group = rng.below(size);
+                let parent = rng.below(size);
+                let (parent_depth, subtree_height, closes_cycle) =
+                    walk_results(&forest, group, parent, max_group_depth);
+                let verdict =
+                    reparent_verdict(parent_depth, subtree_height, closes_cycle, max_group_depth);
+
+                let true_parent_depth = forest.depth(parent).expect("acyclic by construction");
+                if true_parent_depth <= i64::from(max_group_depth) {
+                    // Not the saturating case; the main sweep covers it.
+                    continue;
+                }
+                refused_by_saturation += 1;
+                assert!(
+                    verdict.is_err(),
+                    "the parent sits at depth {true_parent_depth}, past the bound of \
+                     {max_group_depth}, so the walk saturated and the placement of \
+                     {group} under {parent} MUST be refused; forest={:?} verdict={verdict:?}",
+                    forest.parent
+                );
+            }
+        }
+
+        assert!(
+            refused_by_saturation > 100,
+            "the sweep produced only {refused_by_saturation} over-deep parents; it is \
+             not exercising the saturating walk at all"
+        );
+    }
+}
+
 /// Serialize an optional free-form metadata object to the JSON text bound with a
 /// `::jsonb` cast, or `None` when the caller supplied no metadata. Shared by the
 /// organization-membership (issue #94) and organization-role (issue #97) writes, whose
@@ -34443,6 +35904,41 @@ fn org_role_from_row(row: &PgRow, scope: &Scope) -> Result<OrgRoleRecord, StoreE
     Ok(OrgRoleRecord {
         id,
         organization_id,
+        slug: row.get("slug"),
+        display_name: row.get("display_name"),
+        metadata,
+        created_at_unix_micros: row.get("created_us"),
+        updated_at_unix_micros: row.get("updated_us"),
+    })
+}
+
+/// Reconstruct an [`OrgGroupRecord`] from a row read within scope. The stored ids
+/// are parsed back UNDER the scope, so a corrupt cross-scope row fails to decode
+/// rather than being returned; the metadata is parsed from its JSON text.
+///
+/// `parent_id` is parsed under the SAME scope as the group itself, so a corrupt
+/// parent pointer into another environment surfaces as a decode error rather than
+/// as a group whose ancestry silently leaves this tenant.
+fn org_group_from_row(row: &PgRow, scope: &Scope) -> Result<OrgGroupRecord, StoreError> {
+    let id = OrgGroupId::parse_in_scope(&row.get::<String, _>("id"), scope)?;
+    let organization_id =
+        OrganizationId::parse_in_scope(&row.get::<String, _>("organization_id"), scope)?;
+    let parent_id = row
+        .get::<Option<String>, _>("parent_id")
+        .map(|raw| OrgGroupId::parse_in_scope(&raw, scope))
+        .transpose()?;
+    let metadata_text: String = row.get("metadata_text");
+    // The metadata passed a `::jsonb` cast on write, so a parse failure here is an
+    // internal invariant violation; surface it as a decode error, not a silent empty.
+    let metadata: serde_json::Value = serde_json::from_str(&metadata_text).map_err(|error| {
+        StoreError::Database(sqlx::Error::Decode(
+            format!("org_groups.metadata is not valid JSON: {error}").into(),
+        ))
+    })?;
+    Ok(OrgGroupRecord {
+        id,
+        organization_id,
+        parent_id,
         slug: row.get("slug"),
         display_name: row.get("display_name"),
         metadata,

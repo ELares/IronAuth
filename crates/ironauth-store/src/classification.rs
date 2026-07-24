@@ -204,13 +204,21 @@ pub enum ResourceType {
     /// config snapshot, so a role is Runtime too: a promoted role would reference a
     /// target-environment organization that may not exist.
     OrgRole,
+    /// A per-organization named group (issue #97): one node of an organization's group
+    /// FOREST, carrying a nullable parent pointer. A group in M10 is a NAME and a
+    /// position in that tree. Like a role it is scoped to an ORGANIZATION, and
+    /// organizations are themselves Runtime and never travel in a config snapshot, so a
+    /// group is Runtime too: a promoted group would reference a target-environment
+    /// organization that may not exist, and its parent pointer would reference a
+    /// target-environment group id that certainly does not.
+    OrgGroup,
 }
 
 impl ResourceType {
     /// Every resource type, in a stable order. The classification lint and the
     /// metadata endpoint both iterate this; a variant missing here is caught by
     /// the `all_lists_every_variant` test and by `scripts/classification-lint.sh`.
-    pub const ALL: [ResourceType; 29] = [
+    pub const ALL: [ResourceType; 30] = [
         ResourceType::Operator,
         ResourceType::Tenant,
         ResourceType::Environment,
@@ -240,6 +248,7 @@ impl ResourceType {
         ResourceType::SignupForm,
         ResourceType::FlowVersion,
         ResourceType::OrgRole,
+        ResourceType::OrgGroup,
     ];
 
     /// The stable wire name of this resource type (for example `organization`).
@@ -275,6 +284,7 @@ impl ResourceType {
             ResourceType::SignupForm => "signup_form",
             ResourceType::FlowVersion => "flow_version",
             ResourceType::OrgRole => "org_role",
+            ResourceType::OrgGroup => "org_group",
         }
     }
 
@@ -311,7 +321,8 @@ impl ResourceType {
             | ResourceType::LocaleBundle
             | ResourceType::SignupForm
             | ResourceType::FlowVersion
-            | ResourceType::OrgRole => ResourceLevel::Environment,
+            | ResourceType::OrgRole
+            | ResourceType::OrgGroup => ResourceLevel::Environment,
         }
     }
 
@@ -428,7 +439,12 @@ pub fn classify(resource: ResourceType) -> ResourceClassification {
         // off an organization, and organizations are Runtime and never travel in a config
         // snapshot, so a promotable role would reference a target-environment organization
         // that may not exist. It STRUCTURALLY never enters a snapshot, so it is Runtime.
-        | ResourceType::OrgRole => Runtime,
+        | ResourceType::OrgRole
+        // A per-organization group (issue #97) is dynamic per-environment data for the
+        // same reasons as a role, plus one of its own: its parent pointer names another
+        // group id, and an id is environment specific, so a promoted group tree would
+        // carry dangling edges into an environment that never held those groups.
+        | ResourceType::OrgGroup => Runtime,
     }
 }
 

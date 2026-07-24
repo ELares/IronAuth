@@ -140,6 +140,14 @@ pub struct Config {
     /// the tenant. Off by default; the external-KMS path is owner/infra-gated.
     pub byok: ByokConfig,
 
+    /// Organization settings (issue #97): the structural safety bound on how deep
+    /// an organization's group hierarchy may nest. A top-level section rather than
+    /// a field on `[admin]` deliberately, because the bound is consumed on BOTH
+    /// planes: the management API enforces it at write time and the token-issuance
+    /// path uses it as the hard termination guard on the ancestor walk that
+    /// resolves a subject's effective roles.
+    pub organizations: OrganizationsConfig,
+
     /// Feature toggles keyed by registered feature name. Enabling an
     /// experimental feature additionally requires `ack` equal to the
     /// feature's exact current version; see the feature reference in the
@@ -164,6 +172,22 @@ pub struct FlowsConfig {
     /// answer, sharing one flow object and one state machine.
     pub enabled: bool,
 }
+
+/// The default maximum group nesting depth (issue #97), measured in EDGES from a
+/// root: a root group has depth 0 and its child depth 1, so the default admits a
+/// nine level tree. Deep enough for any realistic organizational structure (real
+/// group trees are single digits deep), shallow enough that the ancestor walk on
+/// the latency-sensitive token-issuance path stays trivially cheap.
+pub const ORGANIZATIONS_DEFAULT_MAX_GROUP_DEPTH: u32 = 8;
+
+/// The hard ceiling on `organizations.max_group_depth` (issue #97). Config load
+/// refuses any larger value, because the ancestor walk's cost is linear in the
+/// depth and an unbounded setting would put an unbounded query on the token
+/// issuance path. Matched to `ironauth_store::trait_schema::MAX_DEPTH`, the repo's
+/// other structural nesting bound, so the two agree on what "absurdly deep" means.
+/// The store mirrors this value and clamps to it independently, so even a miswired
+/// caller cannot exceed it; a cross-crate test pins the two together.
+pub const ORGANIZATIONS_MAX_GROUP_DEPTH_CEILING: u32 = 32;
 
 /// The default client-authentication diagnostic retention, in seconds (seven days).
 ///
@@ -203,6 +227,64 @@ pub enum DiagnosticVerbosity {
     /// and the bounded kid-mismatch hint. Still never the assertion, a secret, or a
     /// token; these are computed values, not captured material.
     Verbose,
+}
+
+/// Organization settings (issue #97).
+///
+/// Organizations own two first-class per-organization resources in M10: named
+/// roles, and named groups that NEST. Nesting is the part that needs a knob: the
+/// ancestor walk that turns a subject's group memberships into an effective role
+/// set runs on the token-issuance path, so its termination has to be bounded by
+/// something an operator can see and set, not by a constant compiled into the
+/// store.
+///
+/// Nothing in this section caps a COUNT. An organization may define unlimited
+/// roles and unlimited groups, and may hold unlimited groups at any single depth
+/// level; there is no quota, count constraint, or paywall gate anywhere in the
+/// role and group model.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct OrganizationsConfig {
+    /// The largest group nesting depth an organization's group hierarchy may
+    /// reach, measured in EDGES from a root: a root group has depth 0 and its
+    /// child depth 1. `0` therefore means FLAT GROUPS ONLY (no nesting), never
+    /// "unlimited"; this setting has no unlimited value, because the bound is
+    /// what makes the ancestor walk on the token-issuance path terminate.
+    ///
+    /// This is a STRUCTURAL SAFETY bound, not a cap on the NUMBER of groups,
+    /// roles, members, or assignments. Those are deliberately uncapped and no
+    /// count check exists anywhere in the schema or the code.
+    ///
+    /// The bound is enforced at WRITE time over the whole affected subtree (a
+    /// create or reparent that would nest deeper is refused with a typed error
+    /// and writes nothing) AND as a hard guard on the READ walk, so a hierarchy
+    /// left over-deep by a lowered bound or an import can never stall
+    /// effective-role resolution.
+    ///
+    /// Lowering this on a populated environment GRANDFATHERS existing trees: no
+    /// stored hierarchy is rewritten and no read is refused, but any new write
+    /// that would leave a subtree over the new bound is rejected until an
+    /// operator flattens it.
+    ///
+    /// Default [`ORGANIZATIONS_DEFAULT_MAX_GROUP_DEPTH`]; config load REJECTS a
+    /// value above [`ORGANIZATIONS_MAX_GROUP_DEPTH_CEILING`]. This is a
+    /// promotable per-environment setting in spirit; the process value is the
+    /// deployment default until per-environment overrides ride the M5 promotion
+    /// pipeline.
+    ///
+    /// Named for GROUP depth specifically, not hierarchy depth generally: the
+    /// organization hierarchy (`organizations.parent_id`, issue #103) is a
+    /// SEPARATE tree, and one shared knob would couple two milestones that are
+    /// otherwise independent.
+    pub max_group_depth: u32,
+}
+
+impl Default for OrganizationsConfig {
+    fn default() -> Self {
+        Self {
+            max_group_depth: ORGANIZATIONS_DEFAULT_MAX_GROUP_DEPTH,
+        }
+    }
 }
 
 /// Admin diagnostics settings (issue #91).
@@ -3845,8 +3927,31 @@ impl Config {
         validate_password_hashing(&self.password_hashing)?;
         validate_password_policy(&self.password_policy)?;
         validate_diagnostics(&self.diagnostics)?;
+        validate_organizations(&self.organizations)?;
         Ok(())
     }
+}
+
+/// Validate the organization group nesting bound (issue #97). The depth has a hard
+/// ceiling because the ancestor walk it bounds runs on the token-issuance path and
+/// its cost is linear in the depth: an unbounded setting would put an unbounded
+/// query on that path, which is exactly the failure the bound exists to prevent.
+/// There is no lower bound: `0` means flat groups only (no nesting), which is a
+/// valid, safe posture and NOT an unlimited setting.
+///
+/// Note what this does NOT validate, because there is nothing to validate: no count
+/// of roles, groups, members, or assignments is capped anywhere in IronAuth.
+fn validate_organizations(organizations: &OrganizationsConfig) -> Result<(), ConfigError> {
+    if organizations.max_group_depth > ORGANIZATIONS_MAX_GROUP_DEPTH_CEILING {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "organizations.max_group_depth ({}) must not exceed \
+                 {ORGANIZATIONS_MAX_GROUP_DEPTH_CEILING}",
+                organizations.max_group_depth
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Validate the admin diagnostics retention (issue #91). The retention has a hard
@@ -5783,6 +5888,55 @@ mod tests {
             .expect("off is valid")
             .config;
         assert_eq!(off.diagnostics.verbosity, DiagnosticVerbosity::Off);
+    }
+
+    #[test]
+    fn organizations_section_defaults_and_enforces_the_group_depth_ceiling() {
+        // Default (issue #97): an eight edge group nesting bound.
+        let config = Config::from_toml_str("", "<inline>").expect("valid").config;
+        assert_eq!(
+            config.organizations.max_group_depth,
+            ORGANIZATIONS_DEFAULT_MAX_GROUP_DEPTH
+        );
+
+        // A depth at the ceiling is accepted.
+        let at_ceiling =
+            format!("[organizations]\nmax_group_depth = {ORGANIZATIONS_MAX_GROUP_DEPTH_CEILING}\n");
+        let config = Config::from_toml_str(&at_ceiling, "<inline>")
+            .expect("the ceiling is valid")
+            .config;
+        assert_eq!(
+            config.organizations.max_group_depth,
+            ORGANIZATIONS_MAX_GROUP_DEPTH_CEILING
+        );
+
+        // A depth ABOVE the ceiling is a boot-time ConfigError::Invalid, so an
+        // unbounded ancestor walk can never reach the token-issuance path.
+        let over = format!(
+            "[organizations]\nmax_group_depth = {}\n",
+            ORGANIZATIONS_MAX_GROUP_DEPTH_CEILING + 1
+        );
+        let err = Config::from_toml_str(&over, "ironauth.toml")
+            .expect_err("a depth above the ceiling is rejected");
+        assert!(
+            matches!(err, ConfigError::Invalid { .. }),
+            "an over-ceiling group depth is a boot-time Invalid: {err:?}"
+        );
+
+        // Zero is VALID and means flat groups only. It is deliberately not
+        // rejected and deliberately does not mean "unlimited": a setting with no
+        // unlimited value is what makes the read-side walk terminate.
+        let flat = Config::from_toml_str("[organizations]\nmax_group_depth = 0\n", "<inline>")
+            .expect("zero is valid")
+            .config;
+        assert_eq!(flat.organizations.max_group_depth, 0);
+
+        // The section rejects unknown keys, so a typo is a startup failure rather
+        // than a silently ignored depth bound.
+        assert!(
+            Config::from_toml_str("[organizations]\nmax_grup_depth = 4\n", "<inline>").is_err(),
+            "a misspelled key in [organizations] must fail the load"
+        );
     }
 
     #[test]

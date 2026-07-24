@@ -288,6 +288,27 @@ impl From<StoreError> for ApiError {
             StoreError::InvalidOrgContext => {
                 ApiError::BadRequest("org_context is not a valid organization id".to_owned())
             }
+            // A group create or reparent the organization's hierarchy cannot honor
+            // (issue #97). 422 rather than 400 (the value is well formed and names
+            // a group the caller can see) and rather than 409 (this is a
+            // structural refusal, not a uniqueness collision), matching the
+            // config-promotion unresolved-reference precedent.
+            //
+            // These arms are here, in the ONE central conversion, and not only at
+            // the handler call sites: the wildcard below turns any unmapped
+            // variant into an opaque 500, so a handler that forgets its explicit
+            // arm degrades to the correct 422 instead of a server error on every
+            // route. Neither message names a group id, so neither can report
+            // anything the caller did not already send.
+            StoreError::OrgGroupCycle => ApiError::Unprocessable(
+                "the requested parent would create a cycle in the group hierarchy".to_owned(),
+            ),
+            StoreError::OrgGroupDepthExceeded { max, attempted } => {
+                ApiError::Unprocessable(format!(
+                    "the requested parent would nest groups {attempted} levels deep, \
+                     exceeding the configured maximum of {max}"
+                ))
+            }
             // Anything else (a database fault, or an idempotency conflict that
             // did not funnel through the re-read path) is an opaque internal
             // error; the detail is logged, never returned. `StoreError` is
@@ -297,5 +318,73 @@ impl From<StoreError> for ApiError {
                 ApiError::Internal
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ApiError, StatusCode};
+    use ironauth_store::StoreError;
+
+    #[test]
+    fn the_group_hierarchy_refusals_render_as_unprocessable_and_never_as_internal() {
+        // `impl From<StoreError> for ApiError` wildcards every unmapped variant to an
+        // opaque 500 with a tracing error. A new typed refusal that is added to the
+        // store but not mapped here is therefore a SILENT 500 on every route that can
+        // produce it, with nothing failing to say so. These two assertions are what
+        // make the issue #97 refusals a caller-facing 422 rather than that.
+        let cycle: ApiError = StoreError::OrgGroupCycle.into();
+        assert_eq!(cycle.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            matches!(&cycle, ApiError::Unprocessable(message) if message.contains("cycle")),
+            "the cycle refusal must render a caller-facing message: {cycle:?}"
+        );
+
+        let depth: ApiError = StoreError::OrgGroupDepthExceeded {
+            max: 8,
+            attempted: 11,
+        }
+        .into();
+        assert_eq!(depth.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        // The configured bound and the attempted depth ride the message, so an
+        // operator learns both the limit and how far past it the request went with no
+        // new field on the stable error body.
+        assert!(
+            matches!(
+                &depth,
+                ApiError::Unprocessable(message)
+                    if message.contains("11") && message.contains('8')
+            ),
+            "the depth refusal must report both the attempted depth and the bound: {depth:?}"
+        );
+    }
+
+    #[test]
+    fn the_config_and_store_group_depth_ceilings_agree() {
+        // The store clamps its `max_group_depth` parameter to its OWN mirror of the
+        // ceiling, because `ironauth-store` deliberately has no dependency on the
+        // config crate. If the two drifted apart, config load would accept a depth the
+        // store then silently clamped, and the operator-visible setting would stop
+        // meaning what it says. This crate is the only one that can see both, so the
+        // agreement is pinned here (the same arrangement as the list hard cap, which
+        // is pinned in the pagination module that consumes it).
+        assert_eq!(
+            ironauth_config::ORGANIZATIONS_MAX_GROUP_DEPTH_CEILING,
+            ironauth_store::ORG_GROUP_MAX_DEPTH_CEILING
+        );
+        // And an EMPTY config file (the shipped defaults) both loads and lands within
+        // the ceiling, so a deployment that never touches the setting boots and its
+        // effective bound is the one the store will honor unclamped.
+        let shipped = ironauth_config::Config::from_toml_str("", "<inline>")
+            .expect("the shipped defaults must load")
+            .config;
+        assert_eq!(
+            shipped.organizations.max_group_depth,
+            ironauth_config::ORGANIZATIONS_DEFAULT_MAX_GROUP_DEPTH
+        );
+        assert!(
+            shipped.organizations.max_group_depth <= ironauth_store::ORG_GROUP_MAX_DEPTH_CEILING,
+            "the shipped default must not be clamped by the store"
+        );
     }
 }

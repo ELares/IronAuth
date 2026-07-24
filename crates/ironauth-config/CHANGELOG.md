@@ -6,6 +6,20 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Organization group nesting bound for issue #97: the new top-level `[organizations]` section
+  (`OrganizationsConfig`) with `organizations.max_group_depth` (default
+  `ORGANIZATIONS_DEFAULT_MAX_GROUP_DEPTH` = 8, refused above the
+  `ORGANIZATIONS_MAX_GROUP_DEPTH_CEILING` = 32 ceiling at load). It is the largest nesting
+  depth an organization's group hierarchy may reach, measured in EDGES from a root, and it is
+  a STRUCTURAL SAFETY bound rather than a cap on any count: the number of groups, roles,
+  members, and role assignments is deliberately uncapped, and `max_group_depth` bounds only
+  the ancestor walk that runs on the token-issuance path so that walk terminates. `0` is valid
+  and means flat groups only, never unlimited. A top-level section rather than a field on
+  `[admin]` because the value is consumed on BOTH planes (write-time enforcement on the
+  management API, and the read-side termination guard at token issuance). This is a promotable
+  per-environment setting in spirit; the process value is the deployment default until
+  per-environment overrides ride the M5 promotion pipeline. `docs/CONFIG.md` and
+  `docs/config-schema.json` regenerate.
 - Federation privacy note surfaced in the operator-facing config docs (issue #76 review): the
   `oidc.federation` description now records that a connector may forward the downstream
   `login_hint` to its upstream provider, DISCLOSING an end-user identifier, and that a connector

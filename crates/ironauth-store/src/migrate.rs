@@ -788,6 +788,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0086_org_roles.sql"),
         },
+        Migration {
+            version: 87,
+            name: "org_groups",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0087_org_groups.sql"),
+        },
     ]
 }
 

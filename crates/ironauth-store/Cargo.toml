@@ -521,6 +521,21 @@ name = "org_roles"
 path = "tests/org_roles.rs"
 required-features = ["testing"]
 
+# Organization groups and hierarchy safety (issue #97, store PR 2): the group half
+# of the M10 role model, plus the write-time cycle check and depth bound. Covers the
+# audited CRUD and reparent vocabulary, the typed cycle and depth refusals (and that
+# a refusal writes NEITHER the data change nor its audit row), the depth boundary at
+# and one past the bound including a moved subtree's height, the CONCURRENCY storm
+# that proves the per-organization advisory lock closes the read-committed hole, the
+# uniform not-found across absent / deleted / foreign-org / foreign-scope on every
+# hierarchy write (so the typed errors are never an existence oracle), forced RLS
+# under both roles, the least-privilege grants, and the covenant that a group set is
+# uncapped at any depth level. Needs a real database (DATABASE_URL).
+[[test]]
+name = "org_groups"
+path = "tests/org_groups.rs"
+required-features = ["testing"]
+
 # The tenant lifecycle state machine, residency attributes, data-plane fence, and
 # crypto-shredding offboarding (#46). Needs a real database (DATABASE_URL).
 [[test]]
