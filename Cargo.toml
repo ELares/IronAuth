@@ -179,7 +179,7 @@ rand_chacha = "0.3"
 # SHA-256 for migration checksums (drift and tamper detection). Pure Rust
 # (no asm/C feature), permissive (MIT OR Apache-2.0), already in the tree via
 # sqlx, so this adds a direct edge but no new crate; MSRV 1.85 and musl clean.
-sha2 = "0.10"
+sha2 = "0.11"
 # SHA-1 for the HIBP k-anonymity breached-password screening (crates/ironauth-screening,
 # issue #63). HIBP's range API keys on the SHA-1 of the password; this is NOT a
 # password hash (Argon2id owns that, issue #62), only the range lookup key, computed
