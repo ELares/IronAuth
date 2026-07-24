@@ -72,8 +72,12 @@ export function InvitationsList() {
       </section>
     );
   }
+  // Key by scope so a header scope switch (a signal update, NOT a route change)
+  // remounts the subtree and drops its memory-only copy-once token, rather than
+  // preserving the instance and showing the prior scope token under the new scope.
   return (
     <InvitationsForScope
+      key={`${scope.tenantId}/${scope.environmentId}`}
       tenantId={scope.tenantId}
       environmentId={scope.environmentId}
     />

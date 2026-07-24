@@ -194,6 +194,34 @@ describe("creating an invitation", () => {
     // ... and never leaks into any request URL (memory-only, never in a URL).
     expect(calls.every((call) => !call.url.includes(secret))).toBe(true);
   });
+
+  it("drops the copy-once token when the scope switches", async () => {
+    const secret = "ira_inv_scope_bound_secret";
+    stubFetch((call) =>
+      call.method === "POST"
+        ? json({ invitation, token: secret }, 201)
+        : json({ items: [] }),
+    );
+    const root = mount(<InvitationsList />);
+    await flush();
+
+    const input = root.querySelector(
+      "#invitation-identifier",
+    ) as HTMLInputElement;
+    input.value = "ada@example.test";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    await flush();
+    button(root, "Create invitation").click();
+    await flush();
+    expect(root.textContent).toContain(secret);
+
+    // Switching tenant/environment in place (a signal update, not a route
+    // change) must remount the subtree and drop the prior scope token, never
+    // display it under the new scope.
+    activeScope.value = { tenantId: "ten_b", environmentId: "env_b" };
+    await flush();
+    expect(root.textContent).not.toContain(secret);
+  });
 });
 
 describe("acting on a pending invitation", () => {
