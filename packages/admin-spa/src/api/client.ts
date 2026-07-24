@@ -69,6 +69,40 @@ export type LinkExternalIdRequest =
 export type UserExternalIdView =
   components["schemas"]["UserExternalIdView"];
 
+// The request and result shapes the organizations, memberships, and invitations
+// CRUD surfaces read (issue #94). Organizations and their memberships, and the
+// invitations, are all ENVIRONMENT scoped, so every wrapper below injects the
+// active {tenant, environment} into the documented path. Re-exported from the
+// generated schema so the views never hand maintain a shape the management
+// contract already owns.
+//
+// OrganizationView / CreateOrganizationRequest for the org reads and create;
+// MembershipView / CreateMembershipRequest for the members of an org (a
+// membership lives UNDER an organization, keyed by user id); InvitationView /
+// CreateInvitationRequest for the invitation reads and create;
+// InvitationCreatedView is the copy-once surface (its `token` is the raw
+// `ira_inv_` token the server returns ONCE at create or resend, never stored, so
+// the UI surfaces it a single time and never persists or logs it);
+// InvitationStateChangeView is the deterministic post-condition of a revoke; and
+// InvitationStateView / InvitationCredentialTypeView are the closed wire enums
+// the invitation filter and create form read.
+export type OrganizationView = components["schemas"]["OrganizationView"];
+export type CreateOrganizationRequest =
+  components["schemas"]["CreateOrganizationRequest"];
+export type MembershipView = components["schemas"]["MembershipView"];
+export type CreateMembershipRequest =
+  components["schemas"]["CreateMembershipRequest"];
+export type InvitationView = components["schemas"]["InvitationView"];
+export type CreateInvitationRequest =
+  components["schemas"]["CreateInvitationRequest"];
+export type InvitationCreatedView =
+  components["schemas"]["InvitationCreatedView"];
+export type InvitationStateChangeView =
+  components["schemas"]["InvitationStateChangeView"];
+export type InvitationStateView = components["schemas"]["InvitationStateView"];
+export type InvitationCredentialTypeView =
+  components["schemas"]["InvitationCredentialTypeView"];
+
 // The request and result shapes the connectors and clients (DCR) surfaces read
 // (issue #90, PR 6). Both surfaces are ENVIRONMENT scoped, so every wrapper below
 // injects the active {tenant, environment} into the documented path, exactly as
@@ -1397,6 +1431,418 @@ export async function linkUserExternalId(
         },
       },
       body: request,
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+// ---- The organizations, memberships, and invitations operations (issue #94) --
+//
+// The organizations surface (src/ui/OrganizationsView.tsx, with its nested
+// memberships panel) and the invitations surface (src/ui/InvitationsView.tsx)
+// call these named wrappers, never a path, so the single funnel holds: every
+// literal below is a path the committed docs/openapi/management.json documents,
+// all three resources live UNDER the active {tenant, environment} scope, and the
+// ids substitute into the documented path parameters exactly as the users and
+// connectors wrappers inject them. Each throws a ManagementError carrying the
+// verbatim ErrorBody on a non 2xx (the same bodyless-non-2xx guard as the reads
+// above), which the ErrorView boundary renders unchanged.
+//
+// The list reads are KEYSET paginated (an items array plus an OPTIONAL
+// next_cursor): this wrapper returns the first page as { items, nextCursor } so
+// the view can surface a "more exist" indicator rather than SILENTLY DROPPING the
+// tail (the no-silent-caps rule, mirroring the diagnostics `truncated` page). The
+// nextCursor is normalised to null when the contract omits it (the last page).
+
+// A keyset page: the items on the first page plus the opaque cursor for the next
+// page, or null when this is the last page. The view reads nextCursor to decide
+// whether to tell the operator more rows exist beyond what is shown.
+export interface KeysetPage<T> {
+  readonly items: T[];
+  readonly nextCursor: string | null;
+}
+
+// List the organizations of one environment (operationId listOrganizations).
+// Scope injection: the active tenant and environment ids substitute into the
+// documented path, targeting `/v1/tenants/<t>/environments/<e>/organizations`.
+export async function fetchOrganizations(
+  tenantId: string,
+  environmentId: string,
+): Promise<KeysetPage<OrganizationView>> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.GET(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations",
+    { params: { path: { tenant_id: tenantId, environment_id: environmentId } } },
+  );
+  // A non 2xx is a failure even when openapi-fetch yields no error body (it
+  // returns `error: undefined` for a bodyless response, for example a 401 or 502
+  // with Content-Length 0 from a proxy or gateway). Checking `response.ok` too
+  // means such a response is never silently read as success (an empty list).
+  if (error !== undefined || !response.ok) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return { items: data?.items ?? [], nextCursor: data?.next_cursor ?? null };
+}
+
+// Read one organization (operationId getOrganization). The detail view reads this.
+export async function getOrganization(
+  tenantId: string,
+  environmentId: string,
+  organizationId: string,
+): Promise<OrganizationView> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.GET(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          organization_id: organizationId,
+        },
+      },
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+// Create an organization under an environment (operationId createOrganization).
+// Idempotency-Key guarded (same pattern the user create uses) so a retried submit
+// records the organization once.
+export async function createOrganization(
+  tenantId: string,
+  environmentId: string,
+  request: CreateOrganizationRequest,
+): Promise<OrganizationView> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.POST(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations",
+    {
+      params: {
+        path: { tenant_id: tenantId, environment_id: environmentId },
+        header: { "Idempotency-Key": idempotencyKey() },
+      },
+      body: request,
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+// Deactivate an organization (operationId deleteOrganization): a soft delete. A
+// 204 carries no body, so the guard reads the bodyless 2xx as success and any
+// non 2xx as the verbatim failure.
+export async function deleteOrganization(
+  tenantId: string,
+  environmentId: string,
+  organizationId: string,
+): Promise<void> {
+  const client = createManagementClient();
+  const { error, response } = await client.DELETE(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          organization_id: organizationId,
+        },
+      },
+    },
+  );
+  if (error !== undefined || !response.ok) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+}
+
+// Disable an organization (operationId disableOrganization): the org stays
+// readable (this is NOT a soft delete) but is marked disabled. The returned
+// OrganizationView states the post-condition (`active: false`). The contract marks
+// this idempotent IN EFFECT (re-disabling is a no-op) and takes no Idempotency-Key
+// header, mirroring the tenant suspend lifecycle shape.
+export async function disableOrganization(
+  tenantId: string,
+  environmentId: string,
+  organizationId: string,
+): Promise<OrganizationView> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.POST(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/disable",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          organization_id: organizationId,
+        },
+      },
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+// Re-enable a disabled organization (operationId enableOrganization). The
+// returned OrganizationView states the post-condition (`active: true`). Idempotent
+// in effect (re-enabling is a no-op) and takes no Idempotency-Key header,
+// mirroring the tenant resume lifecycle shape.
+export async function enableOrganization(
+  tenantId: string,
+  environmentId: string,
+  organizationId: string,
+): Promise<OrganizationView> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.POST(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/enable",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          organization_id: organizationId,
+        },
+      },
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+// List the members of one organization (operationId listMemberships). Scope
+// injection plus the organization id: the path targets
+// `/v1/tenants/<t>/environments/<e>/organizations/<org>/memberships`. Keyset
+// paginated, so the first page and its next_cursor are returned; the view surfaces
+// a "more exist" indicator rather than dropping the tail.
+export async function fetchMemberships(
+  tenantId: string,
+  environmentId: string,
+  organizationId: string,
+): Promise<KeysetPage<MembershipView>> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.GET(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          organization_id: organizationId,
+        },
+      },
+    },
+  );
+  if (error !== undefined || !response.ok) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return { items: data?.items ?? [], nextCursor: data?.next_cursor ?? null };
+}
+
+// Add a user to an organization (operationId createMembership). The body carries
+// the member user id (and optional metadata); Idempotency-Key guarded so a
+// retried submit records the membership once.
+export async function addMembership(
+  tenantId: string,
+  environmentId: string,
+  organizationId: string,
+  request: CreateMembershipRequest,
+): Promise<MembershipView> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.POST(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          organization_id: organizationId,
+        },
+        header: { "Idempotency-Key": idempotencyKey() },
+      },
+      body: request,
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+// Remove a user from an organization (operationId deleteMembership): a soft
+// delete keyed by the membership id. A 204 carries no body, so the guard reads
+// the bodyless 2xx as success and any non 2xx as the verbatim failure.
+export async function removeMembership(
+  tenantId: string,
+  environmentId: string,
+  organizationId: string,
+  membershipId: string,
+): Promise<void> {
+  const client = createManagementClient();
+  const { error, response } = await client.DELETE(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships/{membership_id}",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          organization_id: organizationId,
+          membership_id: membershipId,
+        },
+      },
+    },
+  );
+  if (error !== undefined || !response.ok) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+}
+
+// List the invitations of one environment (operationId listInvitations),
+// optionally filtered by lifecycle state. Scope injection: the active tenant and
+// environment ids substitute into the documented path, targeting
+// `/v1/tenants/<t>/environments/<e>/invitations`. Keyset paginated, so the first
+// page and its next_cursor are returned; the view surfaces a "more exist"
+// indicator rather than dropping the tail. Only a set state filter is sent, so an
+// absent filter reads every invitation in scope.
+export async function fetchInvitations(
+  tenantId: string,
+  environmentId: string,
+  state?: InvitationStateView,
+): Promise<KeysetPage<InvitationView>> {
+  const client = createManagementClient();
+  const query: { state?: InvitationStateView } = {};
+  if (state !== undefined) {
+    query.state = state;
+  }
+  const { data, error, response } = await client.GET(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/invitations",
+    {
+      params: {
+        path: { tenant_id: tenantId, environment_id: environmentId },
+        query,
+      },
+    },
+  );
+  if (error !== undefined || !response.ok) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return { items: data?.items ?? [], nextCursor: data?.next_cursor ?? null };
+}
+
+// Read one invitation (operationId getInvitation). Available for a per-row detail
+// read; the durable view NEVER carries the token (only its digest is stored).
+export async function getInvitation(
+  tenantId: string,
+  environmentId: string,
+  invitationId: string,
+): Promise<InvitationView> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.GET(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/invitations/{invitation_id}",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          invitation_id: invitationId,
+        },
+      },
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+// Create an invitation for a new identity (operationId createInvitation).
+// Idempotency-Key guarded. RETURNS the InvitationCreatedView so the UI can
+// surface the copy-once token: the returned `token` is the raw `ira_inv_` single
+// use token the server returns ONCE (on the genuine 201 create) and never stores;
+// an idempotent replay omits it. This wrapper returns the body so the UI can show
+// the value a single time; it NEVER logs it and the UI NEVER persists it
+// (memory-only, copy-once), consistent with the DCR initial-access-token posture.
+export async function createInvitation(
+  tenantId: string,
+  environmentId: string,
+  request: CreateInvitationRequest,
+): Promise<InvitationCreatedView> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.POST(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/invitations",
+    {
+      params: {
+        path: { tenant_id: tenantId, environment_id: environmentId },
+        header: { "Idempotency-Key": idempotencyKey() },
+      },
+      body: request,
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+// Resend a pending invitation (operationId resendInvitation): invalidate the
+// prior token and issue a fresh one. RETURNS the InvitationCreatedView with the
+// new copy-once `token`, surfaced ONCE exactly as the create does; never logged,
+// never persisted. Idempotency-Key guarded.
+export async function resendInvitation(
+  tenantId: string,
+  environmentId: string,
+  invitationId: string,
+): Promise<InvitationCreatedView> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.POST(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/invitations/{invitation_id}/resend",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          invitation_id: invitationId,
+        },
+        header: { "Idempotency-Key": idempotencyKey() },
+      },
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+// Revoke a pending invitation (operationId revokeInvitation): its token becomes
+// unredeemable. The returned InvitationStateChangeView states the post-condition
+// (`state: revoked`). Idempotency-Key guarded.
+export async function revokeInvitation(
+  tenantId: string,
+  environmentId: string,
+  invitationId: string,
+): Promise<InvitationStateChangeView> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.POST(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/invitations/{invitation_id}/revoke",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          invitation_id: invitationId,
+        },
+        header: { "Idempotency-Key": idempotencyKey() },
+      },
     },
   );
   if (error !== undefined || !response.ok || data === undefined) {

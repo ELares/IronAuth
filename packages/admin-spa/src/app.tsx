@@ -28,6 +28,8 @@ import { EnvironmentDetail, EnvironmentsList } from "./ui/EnvironmentsView";
 import { UserDetail, UsersList } from "./ui/UsersView";
 import { ConnectorDetail, ConnectorsList } from "./ui/ConnectorsView";
 import { ClientsList } from "./ui/ClientsView";
+import { OrganizationDetail, OrganizationsList } from "./ui/OrganizationsView";
+import { InvitationsList } from "./ui/InvitationsView";
 import { DiagnosticsView } from "./ui/DiagnosticsView";
 
 // UI state lives in signals (the locked state primitive). `signedIn` flips true
@@ -113,6 +115,12 @@ function Routes() {
       <Route path="/users/:userId" component={UserDetail} />
       <Route path="/connectors" component={ConnectorsList} />
       <Route path="/connectors/:connectorId" component={ConnectorDetail} />
+      <Route path="/organizations" component={OrganizationsList} />
+      <Route
+        path="/organizations/:organizationId"
+        component={OrganizationDetail}
+      />
+      <Route path="/invitations" component={InvitationsList} />
       <Route path="/diagnostics" component={DiagnosticsView} />
       <Route default component={() => <SectionView label="Overview" />} />
     </Router>
