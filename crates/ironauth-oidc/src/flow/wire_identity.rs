@@ -64,6 +64,8 @@ pub(super) fn wire_state_for(journey: Journey, step_kind: &StepKind) -> FlowStat
             StepKind::MfaChallenge => FlowStateTag::MfaChallenge,
             StepKind::MfaEnroll => FlowStateTag::MfaEnroll,
             StepKind::ProgressiveProfiling => FlowStateTag::ProgressiveProfiling,
+            // The organization picker (issue #94, PR-B2) renders on its own per-step wire state.
+            StepKind::OrgPicker => FlowStateTag::OrgPicker,
             _ => FlowStateTag::Custom,
         },
         // Registration renders the details form; the uniform Ack is a render-override, not a step
@@ -127,6 +129,7 @@ mod tests {
             StepKind::MfaChallenge,
             StepKind::MfaEnroll,
             StepKind::ProgressiveProfiling,
+            StepKind::OrgPicker,
             StepKind::Registration,
             StepKind::RecoveryStart,
             StepKind::RecoveryVerify,
@@ -158,6 +161,10 @@ mod tests {
         assert_eq!(
             wire_state_for(Journey::Login, &StepKind::ProgressiveProfiling),
             FlowStateTag::ProgressiveProfiling
+        );
+        assert_eq!(
+            wire_state_for(Journey::Login, &StepKind::OrgPicker),
+            FlowStateTag::OrgPicker
         );
     }
 

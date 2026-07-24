@@ -251,6 +251,15 @@ pub const CONSENT_ALLOW_LABEL: MessageId = MessageId(1_080_015);
 /// The consent deny button label (issue #88): refuse the client access.
 pub const CONSENT_DENY_LABEL: MessageId = MessageId(1_080_016);
 
+/// The organization picker prompt (issue #94, PR-B2): the leading copy that explains the subject
+/// belongs to several organizations and must choose which one this login is for. Informational.
+pub const ORG_PICKER_PROMPT: MessageId = MessageId(1_090_001);
+/// The organization picker option label (issue #94, PR-B2): ONE id for every listed organization,
+/// the organization's human-facing display name riding the `name` context (mirrors the issue #88
+/// consent client-name pattern) so a locale bundle keys on the id while the numeric registry stays
+/// finite for arbitrary organization names.
+pub const ORG_PICKER_OPTION_LABEL: MessageId = MessageId(1_090_002);
+
 /// The login success note.
 pub const LOGIN_SUCCESS: MessageId = MessageId(1_500_001);
 /// The registration success note (a new account was created and signed in).
@@ -639,6 +648,20 @@ pub const REGISTRY: &[MessageSpec] = &[
         kind: MessageKind::Info,
         text: "Deny",
         context_keys: &[],
+    },
+    MessageSpec {
+        id: ORG_PICKER_PROMPT,
+        name: "org_picker.prompt",
+        kind: MessageKind::Info,
+        text: "Choose the organization to continue as.",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: ORG_PICKER_OPTION_LABEL,
+        name: "org_picker.option.label",
+        kind: MessageKind::Info,
+        text: "Continue",
+        context_keys: &["name"],
     },
     MessageSpec {
         id: LOGIN_SUCCESS,

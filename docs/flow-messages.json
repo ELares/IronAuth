@@ -307,6 +307,22 @@
     },
     {
       "context_keys": [],
+      "id": 1090001,
+      "kind": "info",
+      "name": "org_picker.prompt",
+      "text": "Choose the organization to continue as."
+    },
+    {
+      "context_keys": [
+        "name"
+      ],
+      "id": 1090002,
+      "kind": "info",
+      "name": "org_picker.option.label",
+      "text": "Continue"
+    },
+    {
+      "context_keys": [],
       "id": 1500001,
       "kind": "success",
       "name": "login.success",

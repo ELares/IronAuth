@@ -1265,6 +1265,53 @@ mod tests {
     }
 
     #[test]
+    fn org_picker_after_the_primary_factor_validates_but_a_leading_one_is_rejected() {
+        // Issue #94, PR-B2: org_picker READS the subject (to list memberships), so it is a
+        // requires_subject step. identifier_password -> org_picker -> terminal establishes the
+        // subject first, so it is well formed.
+        let ok = Journey {
+            schema_version: JOURNEY_SCHEMA_VERSION.to_owned(),
+            id: "j".to_owned(),
+            engine_version: JOURNEY_ENGINE_VERSION,
+            entry: "primary".to_owned(),
+            comment: None,
+            steps: vec![
+                step("primary", StepKind::IdentifierPassword, Some("password")),
+                step("picker", StepKind::OrgPicker, None),
+                step("done", StepKind::Terminal, None),
+            ],
+            transitions: vec![unguarded("primary", "picker"), unguarded("picker", "done")],
+            subflows: None,
+            subflow_definitions: None,
+        };
+        assert_eq!(validate(&ok), Ok(()));
+
+        // A journey whose ENTRY is org_picker reaches it with no subject established, so it is
+        // rejected by the #351 subject-establishment rule.
+        let leading = Journey {
+            schema_version: JOURNEY_SCHEMA_VERSION.to_owned(),
+            id: "j".to_owned(),
+            engine_version: JOURNEY_ENGINE_VERSION,
+            entry: "picker".to_owned(),
+            comment: None,
+            steps: vec![
+                step("picker", StepKind::OrgPicker, None),
+                step("done", StepKind::Terminal, None),
+            ],
+            transitions: vec![unguarded("picker", "done")],
+            subflows: None,
+            subflow_definitions: None,
+        };
+        assert_eq!(
+            validate(&leading),
+            Err(vec![JourneyError::SubjectStepNotEstablished {
+                pointer: "/steps/0".to_owned(),
+                step: "picker".to_owned(),
+            }])
+        );
+    }
+
+    #[test]
     fn a_subject_step_reachable_by_one_establishment_free_path_is_rejected() {
         // A diamond: `start` branches to an establishing path (`a_pw` -> `mfa`) and a
         // establishment-free path (`b_dec` -> `mfa`) that both reach the SAME mfa_challenge. The

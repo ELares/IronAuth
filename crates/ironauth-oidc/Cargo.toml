@@ -286,6 +286,16 @@ name = "flow_progressive_profiling"
 path = "tests/flow_progressive_profiling.rs"
 required-features = ["testing"]
 
+# The organization picker in the login flow (issue #94, PR-B2): a multi-org subject with no
+# organization parameter picks which live-and-active membership this login binds; the pick freezes
+# onto the session and PR-B1's relay carries it to the tokens' org_id. Single-org / parameter /
+# no-membership logins skip the picker; a non-member or disabled pick is refused uniformly. Over a
+# real database (DATABASE_URL).
+[[test]]
+name = "flow_org_picker"
+path = "tests/flow_org_picker.rs"
+required-features = ["testing"]
+
 # Consent as flow contract nodes (issue #88, PR 1): a consent-required authorize launches the
 # Consent flow rendering the client identity and requested scopes; an allow records the grant and
 # resumes to issue the code; a deny returns access_denied; both transports render the same node

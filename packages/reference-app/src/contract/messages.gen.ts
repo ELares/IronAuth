@@ -51,6 +51,8 @@ export const MESSAGE_TEXT: Readonly<Record<number, string>> = {
   1080014: "Access an additional permission.",
   1080015: "Allow",
   1080016: "Deny",
+  1090001: "Choose the organization to continue as.",
+  1090002: "Continue",
   1500001: "You are signed in.",
   1520001: "Your account has been created.",
   1530001: "Your identity has been verified.",

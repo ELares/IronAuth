@@ -902,7 +902,11 @@ enum StepResponse {
 fn classify_step(state: FlowStateTag) -> StepResponse {
     match state {
         FlowStateTag::MfaChallenge | FlowStateTag::MfaEnroll => StepResponse::Continuation,
+        // The organization picker (issue #94, PR-B2) is a browser CHOICE reached after primary
+        // success; it cannot be satisfied by further headless credential input, so like progressive
+        // profiling it escalates to the browser.
         FlowStateTag::ProgressiveProfiling
+        | FlowStateTag::OrgPicker
         | FlowStateTag::FederationStart
         | FlowStateTag::ConsentPrompt => StepResponse::RedirectToWeb,
         FlowStateTag::IdentifierPassword

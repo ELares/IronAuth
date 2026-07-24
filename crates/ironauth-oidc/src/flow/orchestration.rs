@@ -56,7 +56,7 @@ use super::wire_identity::{render_override_states, wire_state_for};
 use super::{
     Continuation, FlowError, PersistedState, Submission, build_flow, consume_and_complete,
     generate_submit_token, login, login_follow_through, method_tokens, mfa,
-    normalize_transient_payload, persist_and_render, profiling, recovery, registration,
+    normalize_transient_payload, org_picker, persist_and_render, profiling, recovery, registration,
 };
 use crate::authn::{AuthMethod, AuthenticationEvent};
 use crate::interaction;
@@ -703,6 +703,44 @@ pub(super) async fn drive_via_table(
                 )
                 .await;
             }
+            // The organization picker (issue #94, PR-B2) is RENDER-OR-SKIP: `enter_step_nodes`
+            // yields the choice nodes for a multi-org, no-parameter subject, or an EMPTY set when the
+            // org context is already determined (a parameter was supplied, or the subject has at most
+            // one active membership). On a non-empty render the flow HOLDS on the picker state; on an
+            // empty (SKIP) the org context needs no prompt, so the walk AUTO-ADVANCES in-call through
+            // the picker's single unguarded edge to the terminal (like a decision hop, with no render
+            // and no client round trip), keeping a single-org / no-membership / parameter login
+            // byte-identical to before this step existed.
+            StepKind::OrgPicker => {
+                let nodes = enter_step_nodes(
+                    state,
+                    scope,
+                    &record.id,
+                    record.return_to.as_deref(),
+                    transport,
+                    next_step,
+                    &mut scratch,
+                )
+                .await?;
+                if nodes.is_empty() {
+                    cursor = next_id;
+                } else {
+                    let next = table_state(journey, &scratch, &next_step.kind, &next_id);
+                    return persist_and_render(
+                        state,
+                        scope,
+                        flow_id,
+                        transport,
+                        journey,
+                        record,
+                        &next,
+                        nodes,
+                        Vec::new(),
+                        now_micros,
+                    )
+                    .await;
+                }
+            }
             // Entering the recovery VERIFY step (issue #92, PR 8d) is the uniform acknowledgment plus
             // code entry, which unlike the login MFA / profiling entries above MUST carry the
             // flow-level `RECOVERY_ACK` message, byte-identical to the imperative `drive_recovery`
@@ -941,6 +979,29 @@ async fn run_step_executor(
                 }
             }
         }
+        // The ORGANIZATION PICKER (issue #94, PR-B2): a multi-org subject with no `organization`
+        // parameter picks which live-and-active membership this login binds. The pick is
+        // re-validated AUTHORITATIVELY (a live membership AND an active org, the SAME check PR-B1's
+        // parameter path runs), then written to the scratch's `org_context`; the login completion
+        // freezes it onto the session so PR-B1's frozen-session-wins relay carries it to the tokens'
+        // `org_id`. A pick that is not a live-and-active membership is the uniform
+        // invalid-submission refusal (no oracle), leaving the flow OPEN to re-pick. The single
+        // unguarded `org_picker -> done` edge routes the accepted pick straight to the terminal, so
+        // no routing signal is needed.
+        StepKind::OrgPicker => {
+            let subject_id = scratch_subject(scope, scratch)?;
+            match org_picker::advance(state, scope, &subject_id, submission).await? {
+                org_picker::OrgPickerStep::Complete(org) => {
+                    scratch.org_context = Some(org.to_string());
+                    Ok(StepOutcome::Advance {
+                        signals: SignalSet::new(),
+                        // Risk is not recomputed on this hop (issue #355): the default Low.
+                        risk: RiskView::default(),
+                        post_reset: None,
+                    })
+                }
+            }
+        }
         // The REGISTRATION journey (issue #92, PR 8c): the SAME `advance_registration` executor the
         // imperative `drive_registration` runs, reusing every #64/#80/#82 defense unchanged. Its
         // three outcomes map onto the table engine's vocabulary:
@@ -1124,6 +1185,15 @@ async fn enter_step_nodes(
                 None => Ok(Vec::new()),
             }
         }
+        // The organization picker (issue #94, PR-B2): a subject-requiring plan-or-skip. It reads the
+        // subject's active memberships and returns the choice nodes ONLY for a multi-org, no-
+        // parameter subject, or EMPTY when the org context is already determined (a parameter, at
+        // most one active membership). The walk's `OrgPicker` arm auto-advances on an empty set, so
+        // an empty render here is a SKIP (never a rendered blank page).
+        StepKind::OrgPicker => {
+            let subject_id = scratch_subject(scope, scratch)?;
+            org_picker::enter_nodes(state, scope, &subject_id, return_to, transport, flow_id).await
+        }
         // The mint-family kinds (issue #92, PR 8a) render their entry nodes (registration's details
         // form, recovery's start / ack forms) once the per-journey convergence PRs (8c, 8d) wire
         // them; until then no live table routes into one. A decision, terminal, or subflow_call step
@@ -1189,6 +1259,10 @@ async fn complete_via_table(
         &subject,
         actor,
         &event,
+        // The organization picker's frozen pick (issue #94, PR-B2), re-validated once more and bound
+        // onto the session at the mint so PR-B1's frozen-session-wins relay carries it to the
+        // tokens' `org_id`. [`None`] for every non-picker completion (byte-identical to before).
+        scratch.org_context.as_deref(),
         fenced_nodes,
         headers,
         now_micros,
@@ -1302,6 +1376,18 @@ async fn builtin_fenced_nodes(
                 Err(_) => Vec::new(),
             }
         }
+        // The organization picker (issue #94, PR-B2) can be the pre-terminal step on a login: a
+        // valid pick advances straight to the mint. On the rare central-fence TOCTOU re-render the
+        // picker form again (best effort). A missing subject or a store fault folds to EMPTY (the
+        // flow is already consumed and this is a best-effort re-render, never an oracle).
+        (Journey::Login, StepKind::OrgPicker) => match scratch_subject(scope, scratch) {
+            Ok(subject_id) => {
+                org_picker::enter_nodes(state, scope, &subject_id, return_to, transport, flow_id)
+                    .await
+                    .unwrap_or_default()
+            }
+            Err(_) => Vec::new(),
+        },
         // Registration's pre-terminal step is the `register` details step (issue #92, PR 8c): the
         // imperative `drive_registration` fences the details form on the rare central-fence TOCTOU,
         // so reproduce it exactly. Registration runs NO post-mint reset (`post_reset` stays None).
