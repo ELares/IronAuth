@@ -54,7 +54,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 # exercise genuine verification, and the KATs re-encode them the way each vendor
 # export carries them. Same crates and versions the scheme layer verifies with.
 argon2.workspace = true
-bcrypt = "0.16"
+bcrypt = "0.19"
 scrypt = "0.11"
 pbkdf2 = { version = "0.12", features = ["simple", "sha2"] }
 password-hash = "0.5"
