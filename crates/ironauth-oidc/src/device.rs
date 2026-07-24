@@ -474,6 +474,8 @@ async fn issue_device_tokens(
             scope: grant.requested_scope.as_deref(),
             jti,
             expires_at_unix_micros: *expires_at_unix_micros,
+            // The device-authorization grant carries no DPoP proof: a bearer token.
+            dpop_jkt: None,
         }),
     };
 
@@ -600,6 +602,8 @@ async fn mint_device_tokens(
             c_hash: None,
             extra_claims: &extra_claims,
             id_token_signer: None,
+            // The device-authorization grant carries no DPoP proof: a bearer token.
+            confirmation: None,
         },
         &target,
     )
@@ -677,6 +681,9 @@ async fn issue_device_refresh(
                 created_at_unix_micros: created,
                 idle_expires_at_unix_micros: idle_expires,
                 absolute_expires_at_unix_micros: absolute_expires,
+                // The device-authorization grant carries no DPoP proof: an unbound
+                // (bearer) family.
+                dpop_jkt: None,
             },
         )
         .await;

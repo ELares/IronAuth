@@ -92,6 +92,7 @@ mod device;
 mod device_verify;
 mod discovery;
 mod disposable;
+mod dpop;
 mod email_otp;
 mod error;
 mod fedcm;

@@ -60,7 +60,9 @@ use std::time::{Duration, SystemTime};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use ironauth_jose::{EmissionOptions, SigningKey, SigningPolicy, sign_jws_with_policy};
+use ironauth_jose::{
+    Confirmation, EmissionOptions, SigningKey, SigningPolicy, sign_jws_with_policy,
+};
 use ironauth_store::{
     IssuedTokenId, RefreshTokenId, Scope, TokenFormat, opaque_access_token_digest,
     refresh_token_digest,
@@ -311,6 +313,16 @@ pub struct MintRequest<'a> {
     /// negotiated algorithm IS the environment default). The caller resolves it from
     /// the environment key set, so it is always a key the policy permits.
     pub id_token_signer: Option<&'a SigningKey>,
+    /// The proof-of-possession confirmation to bind the ACCESS token to (RFC 7800,
+    /// issue #368): the [`Confirmation::Jkt`] of a `DPoP` proof key when a valid
+    /// proof accompanied the code exchange. [`Some`] embeds a `cnf` claim in the
+    /// at+jwt (making it sender-constrained); [`None`] leaves it a plain bearer
+    /// token. Issuer-set ONLY: `cnf` is a PROTECTED access-token claim (see
+    /// [`PROTECTED_ACCESS_TOKEN_CLAIMS`]), so a client can never self-assert a
+    /// binding, and it is placed here by the token endpoint after it has itself
+    /// validated the proof. The ID token never carries it (binding is an access
+    /// token property).
+    pub confirmation: Option<&'a Confirmation>,
 }
 
 /// Why building the ID token claims failed. Every variant is fail-closed at
@@ -468,6 +480,15 @@ pub(crate) fn build_access_token_claims(
     // in epoch SECONDS, exactly as the ID token emits it.
     if let Some(auth_micros) = request.auth_time_unix_micros {
         claims["auth_time"] = json!(auth_micros.div_euclid(1_000_000));
+    }
+    // cnf (RFC 7800 / RFC 9449, issue #368): bind the access token to the DPoP proof
+    // key when a valid proof accompanied issuance. `cnf` is issuer-reserved (it is in
+    // PROTECTED_ACCESS_TOKEN_CLAIMS), so embedding it HERE is the only way it can be
+    // set: a client cannot self-assert a binding. Absent for a plain bearer token.
+    if let Some(confirmation) = request.confirmation {
+        if let serde_json::Value::Object(object) = &mut claims {
+            confirmation.embed_in_claims(object);
+        }
     }
     claims
 }
@@ -934,6 +955,7 @@ mod tests {
             c_hash: None,
             extra_claims: empty_extra(),
             id_token_signer: None,
+            confirmation: None,
         }
     }
 

@@ -922,6 +922,9 @@ async fn mint_front_channel_id_token(
         // `response_types = ["code"]` only and so never reaches this path); the
         // `c_hash` above is derived from the same `signer`.
         id_token_signer: None,
+        // The front-channel authorize response mints no DPoP-bound access token here
+        // (DPoP binds at the token endpoint, issue #368): a plain token.
+        confirmation: None,
     };
     tokens::mint_id_token(state, signer, entry.policy(), &request).map(|(id_token, _jti)| id_token)
 }

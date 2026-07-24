@@ -758,6 +758,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0081_first_party_challenge_codes.sql"),
         },
+        Migration {
+            version: 82,
+            name: "dpop_binding",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0082_dpop_binding.sql"),
+        },
     ]
 }
 

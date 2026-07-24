@@ -444,6 +444,112 @@ fn check_iat_window(
     Ok(())
 }
 
+/// Test-only helpers that MINT a genuine `DPoP` proof, for a downstream crate
+/// (the token endpoint's integration tests) to exercise the issuance path end to
+/// end.
+///
+/// Compiled only under the `test-util` feature. These SIGN with the crate's own
+/// asymmetric signer over a fully caller-controlled header and payload, so the
+/// embedded `jwk` header member a proof carries (which the ordinary
+/// [`crate::sign_jws`] header shape cannot express) is produced here. This is
+/// signing only; it adds no verification path, and `ring` stays contained in this
+/// crate. A downstream test builds a proof, presents it at `/token`, and computes
+/// the expected `cnf.jkt` through [`jkt_of`], which is the SAME RFC 7638
+/// thumbprint the validator computes.
+#[cfg(feature = "test-util")]
+pub mod test_util {
+    use super::{DPOP_TYP, jwk_thumbprint};
+    use crate::jwks::Jwk;
+    use crate::signing_key::{PublicComponents, SigningKey};
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use serde_json::{Value, json};
+
+    /// The PUBLIC JWK JSON object for `key`, exactly as it appears in a `DPoP`
+    /// proof's `jwk` protected-header member.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the key's public projection cannot be formed, which does not
+    /// happen for a well-formed signing key.
+    #[must_use]
+    pub fn public_jwk(key: &SigningKey) -> Value {
+        match key.public_components().expect("public components") {
+            PublicComponents::Okp { x } => json!({
+                "kty": "OKP",
+                "crv": "Ed25519",
+                "x": URL_SAFE_NO_PAD.encode(x),
+            }),
+            PublicComponents::Ec { crv, x, y } => json!({
+                "kty": "EC",
+                "crv": crv,
+                "x": URL_SAFE_NO_PAD.encode(x),
+                "y": URL_SAFE_NO_PAD.encode(y),
+            }),
+            PublicComponents::Rsa { n, e } => json!({
+                "kty": "RSA",
+                "n": URL_SAFE_NO_PAD.encode(n),
+                "e": URL_SAFE_NO_PAD.encode(e),
+            }),
+        }
+    }
+
+    /// The RFC 7638 thumbprint (`jkt`) of `key`'s public JWK: the value a bound
+    /// token's `cnf.jkt` must equal. Computed through the very same
+    /// [`jwk_thumbprint`] the validator uses, so a test's expectation cannot drift
+    /// from the production canonicalization.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the thumbprint cannot be computed for `key`, which does not happen
+    /// for a well-formed signing key.
+    #[must_use]
+    pub fn jkt_of(key: &SigningKey) -> String {
+        let jwk = Jwk::from_object(
+            public_jwk(key)
+                .as_object()
+                .expect("public jwk is an object")
+                .clone(),
+        );
+        jwk_thumbprint(&jwk).expect("thumbprint")
+    }
+
+    /// Build and sign a well-formed compact `DPoP` proof JWS over `htm`, `htu`,
+    /// `iat_secs`, and `jti`, signed by `key` and carrying `key`'s public half in
+    /// the `jwk` header. The result verifies through the production validator.
+    ///
+    /// # Panics
+    ///
+    /// Panics if serialization or signing fails, which does not happen for a
+    /// well-formed key and JSON claims.
+    #[must_use]
+    pub fn sign_proof(key: &SigningKey, htm: &str, htu: &str, iat_secs: u64, jti: &str) -> String {
+        let header = json!({
+            "typ": DPOP_TYP,
+            "alg": key.algorithm().as_jose_name(),
+            "jwk": public_jwk(key),
+        });
+        let payload = json!({
+            "htm": htm,
+            "htu": htu,
+            "iat": iat_secs,
+            "jti": jti,
+        });
+        sign_compact(key, &header, &payload)
+    }
+
+    /// Assemble a compact JWS from a header and payload, signed by `key`.
+    fn sign_compact(key: &SigningKey, header: &Value, payload: &Value) -> String {
+        let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(header).expect("header json"));
+        let payload_b64 =
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(payload).expect("payload json"));
+        let signing_input = format!("{header_b64}.{payload_b64}");
+        let signature =
+            crate::sign::sign_asymmetric(key, signing_input.as_bytes()).expect("sign proof");
+        format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(signature))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -723,6 +723,7 @@ async fn seed_opaque_token_with_audience(
                 scope: Some(scope),
                 jti: &jti,
                 expires_at_unix_micros: FAR_FUTURE_MICROS,
+                dpop_jkt: None,
             }),
             Duration::ZERO,
         )

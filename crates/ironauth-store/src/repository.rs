@@ -8038,9 +8038,9 @@ impl ActingAuthorizationRepo<'_> {
                 sqlx::query(
                     "INSERT INTO opaque_access_tokens \
                      (token_digest, tenant_id, environment_id, grant_id, subject, \
-                      client_id, audience, audiences, scope, jti, expires_at) \
+                      client_id, audience, audiences, scope, jti, expires_at, dpop_jkt) \
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
-                             TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval)",
+                             TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval, $12)",
                 )
                 .bind(opaque.token_digest)
                 .bind(scope.tenant().to_string())
@@ -8053,6 +8053,7 @@ impl ActingAuthorizationRepo<'_> {
                 .bind(opaque.scope)
                 .bind(opaque.jti.to_string())
                 .bind(opaque.expires_at_unix_micros)
+                .bind(opaque.dpop_jkt)
                 .execute(&mut *tx)
                 .await?;
             }
@@ -11115,6 +11116,12 @@ pub struct NewOpaqueAccessToken<'a> {
     pub jti: &'a IssuedTokenId,
     /// The token's expiry, in microseconds since the Unix epoch (clock seam).
     pub expires_at_unix_micros: i64,
+    /// The RFC 7638 JWK thumbprint (`jkt`) of the `DPoP` proof key this token is
+    /// bound to (RFC 9449, issue #368). [`None`] for a plain bearer token (no proof
+    /// was presented at issuance), which the store records as SQL NULL. When
+    /// [`Some`], a resource-server verify (a later follow-up) requires a `DPoP`
+    /// proof whose key thumbprint equals this value.
+    pub dpop_jkt: Option<&'a str>,
 }
 
 impl fmt::Debug for NewOpaqueAccessToken<'_> {
@@ -11452,6 +11459,12 @@ pub struct NewRefreshFamily<'a> {
     pub idle_expires_at_unix_micros: i64,
     /// The family's absolute (hard-cap) expiry, in epoch microseconds.
     pub absolute_expires_at_unix_micros: i64,
+    /// The RFC 7638 JWK thumbprint (`jkt`) of the `DPoP` proof key this family is
+    /// bound to (RFC 9449, issue #368). [`None`] for an unbound (bearer) family,
+    /// recorded as SQL NULL. When [`Some`], the refresh-token grant (a later change)
+    /// requires a matching `DPoP` proof to rotate the family; storing it at
+    /// issuance is what lets that enforcement land without re-issuing tokens.
+    pub dpop_jkt: Option<&'a str>,
 }
 
 impl fmt::Debug for NewRefreshFamily<'_> {
@@ -11758,10 +11771,11 @@ impl ActingRefreshRepo<'_> {
         let inserted = sqlx::query(
             "INSERT INTO refresh_families \
              (id, tenant_id, environment_id, grant_id, subject, client_id, scope, \
-              auth_methods, auth_time, session_ref, offline, created_at, absolute_expires_at) \
+              auth_methods, auth_time, session_ref, offline, created_at, absolute_expires_at, \
+              dpop_jkt) \
              SELECT $1, $2, $3, $4, $5, $6, $7, $8, $13, g.session_ref, $9, \
                     TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval, \
-                    TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval \
+                    TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval, $14 \
              FROM grants g \
              WHERE g.id = $4 AND g.tenant_id = $2 AND g.environment_id = $3 \
              AND ($9 OR g.session_ref IS NULL OR EXISTS ( \
@@ -11786,6 +11800,7 @@ impl ActingRefreshRepo<'_> {
         .bind(family.absolute_expires_at_unix_micros)
         .bind(now_micros)
         .bind(family.auth_time_unix_micros)
+        .bind(family.dpop_jkt)
         .execute(&mut *tx)
         .await?
         .rows_affected();

@@ -235,6 +235,13 @@ pub enum TokenError {
     /// The `grant_type` is not one this server supports (only
     /// `authorization_code`). This is where ROPC and every other grant land.
     UnsupportedGrantType,
+    /// A `DPoP` proof accompanied the token request but was not acceptable (RFC
+    /// 9449 section 5): malformed, a bad signature, a wrong `htm`/`htu`/`typ`, a
+    /// stale or future `iat`, a missing `jti`, a replayed `jti`, or more than one
+    /// `DPoP` header. UNIFORM on purpose: every underlying reason maps to this one
+    /// `invalid_dpop_proof` (the granular variant is logged server-side only), so a
+    /// client cannot use the response as an oracle to probe which check failed.
+    InvalidDpopProof,
     /// The device-authorization request is still pending human approval (RFC 8628
     /// section 3.5, issue #24): the device code is valid but the user has not yet
     /// approved (or denied) the flow at the verification page. The device keeps
@@ -283,6 +290,7 @@ impl TokenError {
             TokenError::InvalidScope => "invalid_scope",
             TokenError::InvalidTarget => "invalid_target",
             TokenError::UnsupportedGrantType => "unsupported_grant_type",
+            TokenError::InvalidDpopProof => "invalid_dpop_proof",
             TokenError::AuthorizationPending => "authorization_pending",
             TokenError::SlowDown => "slow_down",
             TokenError::AccessDenied => "access_denied",
@@ -317,6 +325,7 @@ impl TokenError {
                 "the requested resource is invalid, unknown, or not allowed for this client"
             }
             TokenError::UnsupportedGrantType => "the grant type is not supported",
+            TokenError::InvalidDpopProof => "the DPoP proof is missing, malformed, or invalid",
             TokenError::AuthorizationPending => {
                 "the authorization request is still pending user approval"
             }

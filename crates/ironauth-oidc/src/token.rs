@@ -53,7 +53,7 @@ use std::fmt;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use ironauth_jose::JwsAlgorithm;
+use ironauth_jose::{Confirmation, DpopExpectations, JwsAlgorithm, validate_dpop_proof};
 use ironauth_store::{
     ActorRef, AuthorizationCodeId, ClientAuthRecord, ClientId, CodeBindings, CorrelationId,
     IssuedTokenRecord, NewOpaqueAccessToken, NewRefreshFamily, RedeemOutcome, RefreshFamilyId,
@@ -92,6 +92,14 @@ const REFRESH_REUSE_TOTAL: &str = "ironauth_oidc_refresh_reuse_total";
 /// Core 11). Its presence in the granted scope makes the issued refresh-token
 /// family an OFFLINE family (issue #21).
 const OFFLINE_ACCESS_SCOPE: &str = "offline_access";
+
+/// The `DPoP` proof header (RFC 9449 section 4). Matched case-insensitively by the
+/// header map; RFC 9449 permits EXACTLY ONE, so more than one is rejected.
+const DPOP_HEADER: &str = "dpop";
+
+/// The `htm` (HTTP method) a token-endpoint `DPoP` proof must bind to: the token
+/// endpoint is always `POST` (RFC 9449 section 4.2, case-sensitive).
+const DPOP_HTM_POST: &str = "POST";
 
 /// The token-request parameters (form-encoded).
 ///
@@ -304,13 +312,31 @@ async fn authorization_code_grant(
         return Err(error);
     }
 
+    // 5g. Resolve any DPoP proof (RFC 9449, issue #368) BEFORE minting or consuming.
+    //     A valid proof binds the issued tokens to its key (the at+jwt gets a `cnf`
+    //     claim, the opaque token and the refresh family store the jkt); no proof is
+    //     the unchanged bearer path. A present-but-invalid or replayed proof is a
+    //     uniform invalid_dpop_proof that never burns the code. Binding is
+    //     opportunistic: a client that sent a proof gets a bound token or this error,
+    //     never a silent bearer token.
+    let dpop_confirmation = resolve_dpop_binding(state, scope, headers)?;
+    let dpop_jkt = dpop_confirmation.as_ref().map(Confirmation::value);
+
     // 6. Mint (sign) the tokens BEFORE the consume, so a missing key or a signing
     //    failure fails closed without burning the code. The ID token stays lean by
     //    default (scope claims are served from UserInfo); the extra claims are the
     //    `claims`-parameter id_token member and, only under the non-conform
     //    conformIdTokenClaims override, the scope-derived claims (issue #15).
     let extra_claims = id_token_extra_claims(state, scope, &bindings).await;
-    let minted = mint_tokens(state, scope, &bindings, &extra_claims, &target).await?;
+    let minted = mint_tokens(
+        state,
+        scope,
+        &bindings,
+        &extra_claims,
+        &target,
+        dpop_confirmation.as_ref(),
+    )
+    .await?;
 
     // Record a token size (claim bloat) event for the M9 warnings read, best effort and off
     // the mint path (issue #91): only a token whose serialized size crosses the bloat
@@ -365,6 +391,10 @@ async fn authorization_code_grant(
             scope: bindings.oauth_scope.as_deref(),
             jti,
             expires_at_unix_micros: *expires_at_unix_micros,
+            // The DPoP key thumbprint when a valid proof bound this exchange (issue
+            // #368), else None for a plain bearer token. Stored so a resource-server
+            // verify (a follow-up) can require a matching proof.
+            dpop_jkt,
         }),
     };
 
@@ -398,7 +428,7 @@ async fn authorization_code_grant(
         // the family degrades to an access+ID response without a refresh token
         // (logged), rather than failing an otherwise-successful exchange.
         Ok(RedeemOutcome::Consumed) => {
-            let refresh = issue_refresh_for_code(state, scope, &bindings).await?;
+            let refresh = issue_refresh_for_code(state, scope, &bindings, dpop_jkt).await?;
             Ok(token_response(&minted, &bindings, refresh.as_deref()))
         }
         // A benign within-grace retry or an expired/absent code: plain
@@ -420,6 +450,80 @@ async fn authorization_code_grant(
             Err(map_store_error(error))
         }
     }
+}
+
+/// Read and validate a `DPoP` proof (RFC 9449) presented with the token request,
+/// returning the confirmation to bind the issued tokens to.
+///
+/// Binding is OPPORTUNISTIC (issue #368): with NO `DPoP` header this returns
+/// `Ok(None)` and the exchange issues a plain bearer token, byte-identical to
+/// before. With a proof present it is validated against the token endpoint's
+/// expectations (`htm = POST`, the normalized `htu` derived from the per-environment
+/// issuer, the freshness window) and checked for `jti` replay; on success it returns
+/// `Ok(Some(Confirmation::Jkt(..)))` so the caller binds the at+jwt (`cnf`), the
+/// opaque access token, and the refresh family to that proof key.
+///
+/// The response is never a client oracle. EVERY failure collapses to one uniform
+/// [`TokenError::InvalidDpopProof`] (a malformed or unverifiable proof, a wrong
+/// `htm`/`htu`/`typ`, a stale or future `iat`, a missing or replayed `jti`, or MORE
+/// THAN ONE `DPoP` header all map to it), and the granular reason is logged
+/// server-side only. A client that DID present a proof therefore always gets a bound
+/// token or this error, never a silent downgrade to a bearer token.
+///
+/// This runs BEFORE the code is consumed, so a bad proof never burns the one-time
+/// code (it stays live for the legitimate client's retry).
+fn resolve_dpop_binding(
+    state: &OidcState,
+    scope: Scope,
+    headers: &HeaderMap,
+) -> Result<Option<Confirmation>, TokenError> {
+    // RFC 9449: exactly one DPoP header. Zero is the bearer path; more than one is
+    // malformed and rejected uniformly.
+    let mut proofs = headers.get_all(DPOP_HEADER).iter();
+    let Some(first) = proofs.next() else {
+        return Ok(None);
+    };
+    if proofs.next().is_some() {
+        tracing::warn!("rejecting a token request that carried more than one DPoP header");
+        return Err(TokenError::InvalidDpopProof);
+    }
+    let Ok(proof_jws) = first.to_str() else {
+        tracing::warn!("rejecting a DPoP header that is not valid text");
+        return Err(TokenError::InvalidDpopProof);
+    };
+
+    // htu is normalized to the token endpoint's scheme+authority+path with no query
+    // or fragment (RFC 9449 section 4.3); the core does exact string-equality on it,
+    // so this normalization is the whole contract.
+    let now = state.now();
+    let htu = crate::dpop::normalized_htu_for_token_endpoint(state, &scope);
+    let expected = DpopExpectations {
+        htm: DPOP_HTM_POST,
+        htu: &htu,
+        iat_leeway: crate::dpop::DPOP_IAT_LEEWAY,
+        iat_skew: crate::dpop::DPOP_IAT_SKEW,
+        // ath binding is the resource-server follow-up; no server-issued DPoP-Nonce
+        // yet. Both stay absent here (the core ignores an unexpected one, correctly).
+        ath: None,
+        nonce: None,
+    };
+    let proof = validate_dpop_proof(proof_jws, &expected, now).map_err(|error| {
+        // Log the granular variant (value-free) for diagnostics; the client sees only
+        // the uniform error, so it cannot probe which check failed.
+        tracing::warn!(%error, "rejecting an invalid DPoP proof at the token endpoint");
+        TokenError::InvalidDpopProof
+    })?;
+
+    // Replay: a (jkt, jti) already recorded inside the freshness window is refused,
+    // the same uniform error, and never rebinds.
+    if !state
+        .dpop_replay()
+        .check_and_record(&proof.jkt, &proof.jti, now)
+    {
+        tracing::warn!("rejecting a replayed DPoP proof jti at the token endpoint");
+        return Err(TokenError::InvalidDpopProof);
+    }
+    Ok(Some(Confirmation::Jkt(proof.jkt)))
 }
 
 /// Re-check the `redirect_uri` and PKCE bindings the code carries against the
@@ -587,6 +691,7 @@ async fn mint_tokens(
     bindings: &CodeBindings,
     extra_claims: &serde_json::Map<String, serde_json::Value>,
     target: &AccessTokenTarget,
+    confirmation: Option<&Confirmation>,
 ) -> Result<IssuedTokens, TokenError> {
     // Resolve the per-client `sid` (issue #32) from the code's authenticating SSO
     // session BEFORE signing, so the ID token carries a `sid` that is stable per
@@ -649,6 +754,10 @@ async fn mint_tokens(
             c_hash: None,
             extra_claims,
             id_token_signer,
+            // Bind the at+jwt to the DPoP proof key when one accompanied the exchange
+            // (issue #368): the `cnf` claim is issuer-set only, so a client cannot
+            // self-assert it. None leaves a plain bearer access token.
+            confirmation,
         },
         target,
     )
@@ -991,6 +1100,7 @@ async fn issue_refresh_for_code(
     state: &OidcState,
     scope: Scope,
     bindings: &CodeBindings,
+    dpop_jkt: Option<&str>,
 ) -> Result<Option<String>, TokenError> {
     if !state.issue_refresh_tokens() {
         return Ok(None);
@@ -1034,6 +1144,10 @@ async fn issue_refresh_for_code(
                 created_at_unix_micros: created,
                 idle_expires_at_unix_micros: idle_expires,
                 absolute_expires_at_unix_micros: absolute_expires,
+                // Bind the refresh family to the DPoP proof key when the exchange was
+                // bound (issue #368), so PR3 can require a matching proof to rotate
+                // it. None leaves an unbound (bearer) family, unchanged.
+                dpop_jkt,
             },
         )
         .await;
@@ -1368,6 +1482,10 @@ async fn mint_refresh_access(
             // per-client id_token signer (#30) is inert here; mint_access_token
             // never reads it.
             id_token_signer: None,
+            // Re-binding a rotated refresh token's access token to the family's DPoP
+            // key is the refresh-grant enforcement change (issue #368, PR3); this
+            // issuance path leaves the refreshed token unbound for now.
+            confirmation: None,
         },
         target,
     )
@@ -1443,6 +1561,11 @@ fn refresh_access_records<'a>(
                 scope: resolution.scope.as_deref(),
                 jti,
                 expires_at_unix_micros: *expires_at_unix_micros,
+                // The refresh-grant rebinding (requiring a matching DPoP proof to
+                // rotate a bound family, and re-binding the rotated access token) is
+                // a separate change; this issuance path leaves the refreshed opaque
+                // token unbound for now.
+                dpop_jkt: None,
             }),
         ),
     }
