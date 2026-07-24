@@ -198,13 +198,19 @@ pub enum ResourceType {
     /// pointers and group / scope names, never values): a config snapshot carries it and a
     /// promotion replays it, so it is Promotable.
     FlowVersion,
+    /// A per-organization named role (issue #97): one entry in an organization's role
+    /// set. A role in M10 is a NAME only (what it grants is issue #98). It is scoped to
+    /// an ORGANIZATION, and organizations are themselves Runtime and never travel in a
+    /// config snapshot, so a role is Runtime too: a promoted role would reference a
+    /// target-environment organization that may not exist.
+    OrgRole,
 }
 
 impl ResourceType {
     /// Every resource type, in a stable order. The classification lint and the
     /// metadata endpoint both iterate this; a variant missing here is caught by
     /// the `all_lists_every_variant` test and by `scripts/classification-lint.sh`.
-    pub const ALL: [ResourceType; 28] = [
+    pub const ALL: [ResourceType; 29] = [
         ResourceType::Operator,
         ResourceType::Tenant,
         ResourceType::Environment,
@@ -233,6 +239,7 @@ impl ResourceType {
         ResourceType::LocaleBundle,
         ResourceType::SignupForm,
         ResourceType::FlowVersion,
+        ResourceType::OrgRole,
     ];
 
     /// The stable wire name of this resource type (for example `organization`).
@@ -267,6 +274,7 @@ impl ResourceType {
             ResourceType::LocaleBundle => "locale_bundle",
             ResourceType::SignupForm => "signup_form",
             ResourceType::FlowVersion => "flow_version",
+            ResourceType::OrgRole => "org_role",
         }
     }
 
@@ -302,7 +310,8 @@ impl ResourceType {
             | ResourceType::Brand
             | ResourceType::LocaleBundle
             | ResourceType::SignupForm
-            | ResourceType::FlowVersion => ResourceLevel::Environment,
+            | ResourceType::FlowVersion
+            | ResourceType::OrgRole => ResourceLevel::Environment,
         }
     }
 
@@ -414,7 +423,12 @@ pub fn classify(resource: ResourceType) -> ResourceClassification {
         // A headless flow (issue #84) is dynamic per-environment data bound to a
         // specific environment's users and short lived: it STRUCTURALLY never enters a
         // config snapshot, so it is Runtime.
-        | ResourceType::Flow => Runtime,
+        | ResourceType::Flow
+        // A per-organization role (issue #97) is dynamic per-environment data: it hangs
+        // off an organization, and organizations are Runtime and never travel in a config
+        // snapshot, so a promotable role would reference a target-environment organization
+        // that may not exist. It STRUCTURALLY never enters a snapshot, so it is Runtime.
+        | ResourceType::OrgRole => Runtime,
     }
 }
 

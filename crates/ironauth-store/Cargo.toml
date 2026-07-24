@@ -510,6 +510,17 @@ name = "org_memberships"
 path = "tests/org_memberships.rs"
 required-features = ["testing"]
 
+# Organization roles (issue #97, store PR 1): the role half of the M10 role model.
+# Create/get/list/rename/delete with its audit vocabulary, the live-vs-deleted slug
+# uniqueness, the uniform not-found across absent / deleted / foreign-org /
+# foreign-scope, forced RLS under the control role, the least-privilege grants
+# (data plane read only; slug immutable by GRANT on both roles), and the covenant
+# that a role set is uncapped. Needs a real database (DATABASE_URL).
+[[test]]
+name = "org_roles"
+path = "tests/org_roles.rs"
+required-features = ["testing"]
+
 # The tenant lifecycle state machine, residency attributes, data-plane fence, and
 # crypto-shredding offboarding (#46). Needs a real database (DATABASE_URL).
 [[test]]

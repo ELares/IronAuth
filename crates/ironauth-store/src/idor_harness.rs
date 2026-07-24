@@ -138,7 +138,9 @@ impl IdorHarness {
     /// environment-scoped management-credential repository
     /// (`management_credentials.get`, `management_credentials.delete`) and the
     /// environment-scoped organization repository (`organizations.get`,
-    /// `organizations.delete`), the two-thirds of the four-level resource model
+    /// `organizations.delete`), its membership join (`org_memberships.get`,
+    /// `org_memberships.remove`), and its role set (`org_roles.get`,
+    /// `org_roles.delete`), the two-thirds of the four-level resource model
     /// that is tenant-and-environment scoped (operators, tenants, and environments
     /// are LEVEL tables whose isolation is exercised by the management-plane tests
     /// directly, not through the scope-embedding IDOR harness).
@@ -155,6 +157,8 @@ impl IdorHarness {
         self.register(Box::new(OrganizationDeleteProbe));
         self.register(Box::new(OrgMembershipGetProbe));
         self.register(Box::new(OrgMembershipRemoveProbe));
+        self.register(Box::new(OrgRoleGetProbe));
+        self.register(Box::new(OrgRoleDeleteProbe));
         self
     }
 
@@ -605,6 +609,70 @@ impl IsolationProbe for OrgMembershipRemoveProbe {
                 .acting(actor, correlation)
                 .org_memberships(caller);
             match memberships.remove(&env, &id).await {
+                Ok(()) => ProbeOutcome::Leaked,
+                Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `OrgRoleRepo::get` (issue #97). `store` must authenticate as
+/// `ironauth_control`. A role defined in another scope must resolve as the uniform
+/// not-found under the caller's scope, indistinguishable from an absent one.
+struct OrgRoleGetProbe;
+
+impl IsolationProbe for OrgRoleGetProbe {
+    fn name(&self) -> &'static str {
+        "org_roles.get"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            let roles = store.management().org_roles(caller);
+            let Ok(id) = roles.parse_id(foreign_id) else {
+                return ProbeOutcome::Denied;
+            };
+            match roles.get(&id).await {
+                Ok(_) => ProbeOutcome::Leaked,
+                Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `ActingOrgRoleRepo::delete` (issue #97). `store` must
+/// authenticate as `ironauth_control`. Deleting another scope's role would be a
+/// cross-scope mutation, so it must be the uniform not-found.
+struct OrgRoleDeleteProbe;
+
+impl IsolationProbe for OrgRoleDeleteProbe {
+    fn name(&self) -> &'static str {
+        "org_roles.delete"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            let env = Env::system();
+            let Ok(id) = store.management().org_roles(caller).parse_id(foreign_id) else {
+                return ProbeOutcome::Denied;
+            };
+            let actor = ActorRef::service(ServiceId::generate(&env));
+            let correlation = CorrelationId::generate(&env);
+            let roles = store
+                .management()
+                .acting(actor, correlation)
+                .org_roles(caller);
+            match roles.delete(&env, &id).await {
                 Ok(()) => ProbeOutcome::Leaked,
                 Err(_) => ProbeOutcome::Denied,
             }
