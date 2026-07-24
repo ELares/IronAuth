@@ -722,17 +722,20 @@ fn step_projection(
             reached: outcome.step_up_needed && !outcome.blocked,
             methods: vec![PRIMARY_METHOD.to_owned()],
         },
-        // The enroll step depends on the subject's enrolled factors, and progressive profiling
-        // depends on the client's configured signup form and the subject's existing traits;
-        // a pure dry run reads none of these, so both are projected as not reached with only the
-        // primary factor proven.
-        FlowStateTag::MfaEnroll | FlowStateTag::ProgressiveProfiling => StepProjection {
-            policy: None,
-            step_up: None,
-            risk: None,
-            reached: false,
-            methods: vec![PRIMARY_METHOD.to_owned()],
-        },
+        // The enroll step depends on the subject's enrolled factors, progressive profiling depends
+        // on the client's configured signup form and the subject's existing traits, and the org
+        // picker depends on the subject's organization memberships; a pure dry run reads none of
+        // these, so all three are projected as not reached with only the primary factor proven
+        // (they are post-primary render-or-skip steps, so the primary method is already proven).
+        FlowStateTag::MfaEnroll | FlowStateTag::ProgressiveProfiling | FlowStateTag::OrgPicker => {
+            StepProjection {
+                policy: None,
+                step_up: None,
+                risk: None,
+                reached: false,
+                methods: vec![PRIMARY_METHOD.to_owned()],
+            }
+        }
         FlowStateTag::Completed => {
             // The completion is reached unless the scenario blocks. The proven methods gain
             // the second factor token when a step up was threaded.
@@ -946,7 +949,8 @@ mod tests {
     fn login_plan_projection_pins_the_static_list() {
         // The projection pin (issue #92, PR 8b): the EMBEDDED login artifact, driven through the
         // table engine, projects to the SAME ordered plan the static `Journey::Login.plan()` lists,
-        // `[IdentifierPassword, MfaChallenge, MfaEnroll, ProgressiveProfiling, Completed]`. This
+        // `[IdentifierPassword, MfaChallenge, MfaEnroll, ProgressiveProfiling, OrgPicker, Completed]`.
+        // This
         // locks the load-bearing edge order (the `primary -> mfa_chal` edge before `primary ->
         // mfa_enrl`) that makes BOTH the engine's routing priority and this BFS plan match the
         // imperative login journey. It is the "one-time assertion pins the projection equals the old
@@ -1078,6 +1082,38 @@ mod tests {
             "the challenge is reached"
         );
         assert_eq!(projection.terminal, FlowStateTag::Completed);
+    }
+
+    #[test]
+    fn dry_run_projects_the_org_picker_as_a_post_primary_render_or_skip_step() {
+        // Issue #94 PR-B2: the org_picker is a post-primary render-or-skip step (like
+        // progressive_profiling), so a pure dry run projects it NOT reached with only the primary
+        // factor proven. This pins the projection so the step_projection match stays exhaustive
+        // for OrgPicker: a wildcard fall-through wrongly reported reached=true with no methods.
+        let now = 2_000_000_000_000_000_i64;
+        let input = DryRunInput {
+            journey: Journey::Login,
+            subject: Some("usr_dryrun".to_owned()),
+            required_acr: None,
+            achieved_acr: PWD.to_owned(),
+            max_auth_age_secs: None,
+            auth_time_micros: Some(now),
+            now_micros: now,
+            order: Some(order()),
+            risk: None,
+        };
+        let projection = dry_run(&input);
+        let picker = projection
+            .steps
+            .iter()
+            .find(|s| s.step == FlowStateTag::OrgPicker)
+            .expect("the login plan includes the org_picker step");
+        assert!(!picker.reached, "a pure dry run does not reach the picker");
+        assert_eq!(
+            picker.context.methods,
+            vec![PRIMARY_METHOD.to_owned()],
+            "the primary factor is proven at the post-primary picker step"
+        );
     }
 
     #[test]
