@@ -1019,5 +1019,15 @@ name = "dpop_token"
 path = "tests/dpop_token.rs"
 required-features = ["testing"]
 
+# DPoP sender-constrained refresh-grant enforcement (RFC 9449 section 5, issue #368 PR3, redemption
+# side): a DPoP-bound refresh family can ONLY rotate with a valid proof for its bound key; no proof, a
+# wrong-key proof, a replayed jti, or a stale htu is the uniform invalid_dpop_proof that neither
+# rotates nor revokes the family; the rotated access token re-binds (cnf) and the family stays bound;
+# an unbound family is unchanged bearer and ignores any presented proof. Over a real database.
+[[test]]
+name = "dpop_refresh"
+path = "tests/dpop_refresh.rs"
+required-features = ["testing"]
+
 [lints]
 workspace = true

@@ -530,6 +530,55 @@ fn resolve_dpop_binding(
     Ok(Some(Confirmation::Jkt(proof.jkt)))
 }
 
+/// Enforce a refresh-token family's `DPoP` binding (RFC 9449 section 5, issue #368
+/// PR3) before it is rotated. `family_jkt` is the thumbprint recorded on the family
+/// at issuance (`refresh_families.dpop_jkt`), or [`None`] for an unbound (bearer)
+/// family.
+///
+/// The asymmetry vs the code-exchange path is deliberate. At the code exchange
+/// ([`resolve_dpop_binding`]) a present proof is OPPORTUNISTIC: no header means a
+/// plain bearer token. Here, on a BOUND family, a valid proof for the SAME key is
+/// REQUIRED to rotate: a bound family is already sender-constrained, so an absent
+/// header, a proof for a different key, or a replayed `jti` must all be refused. The
+/// core proof validation and the `jti` replay record are the same
+/// [`resolve_dpop_binding`] helper; only the treatment of its `Ok(None)` (no-header)
+/// result differs (there it falls through to bearer, here it is the uniform error).
+///
+/// Returns:
+/// - `Ok(None)` for an unbound family: the `DPoP` header is NOT consulted and the
+///   rotated tokens stay bearer, so a presented proof can never retroactively bind a
+///   family whose earlier tokens were bearer.
+/// - `Ok(Some(conf))` for a bound family that presented a valid proof for the exact
+///   bound key: the caller re-binds the rotated access token to it (`cnf`).
+/// - `Err(TokenError::InvalidDpopProof)` for a bound family with no proof, a proof
+///   for a different key, or an otherwise invalid or replayed proof. Uniform, no
+///   oracle. The rejection happens BEFORE the atomic redeem, so it neither rotates
+///   nor revokes the family: a legitimate holder retries with a proper proof.
+fn enforce_refresh_dpop(
+    state: &OidcState,
+    headers: &HeaderMap,
+    family_jkt: Option<&str>,
+) -> Result<Option<Confirmation>, TokenError> {
+    let Some(expected) = family_jkt else {
+        // Unbound family: bearer path, do not consult the DPoP header and do not bind.
+        return Ok(None);
+    };
+    // Bound family: a valid proof is REQUIRED (no header is the same uniform error,
+    // not a bearer fall through). resolve_dpop_binding validates htm/htu/iat and
+    // records the jti in the replay cache.
+    let Some(conf) = resolve_dpop_binding(state, headers)? else {
+        tracing::warn!("rejecting a bound refresh with no DPoP proof");
+        return Err(TokenError::InvalidDpopProof);
+    };
+    // The proof must prove possession of the SAME key the family is bound to; a valid
+    // proof for a different key is refused.
+    if conf.value() != expected {
+        tracing::warn!("rejecting a bound refresh whose DPoP proof key does not match the family");
+        return Err(TokenError::InvalidDpopProof);
+    }
+    Ok(Some(conf))
+}
+
 /// Re-check the `redirect_uri` and PKCE bindings the code carries against the
 /// presented request. All mismatches collapse to a single boolean, so the caller
 /// returns the uniform `invalid_grant` without revealing which binding failed. The
@@ -1264,6 +1313,15 @@ async fn refresh_token_grant(
     //     closed (including on a store fault); a normal active user is unaffected.
     ensure_subject_can_authenticate(state, scope, &resolution.subject).await?;
 
+    // 4c. Enforce the family's DPoP binding (RFC 9449 section 5, issue #368 PR3)
+    //     BEFORE minting or the atomic redeem. A family issued DPoP-bound can ONLY be
+    //     rotated by a request carrying a valid proof for the SAME key; an unbound
+    //     family stays bearer (its DPoP header, if any, is ignored). A bound family
+    //     with no proof, a wrong-key proof, or a replayed jti is the uniform
+    //     invalid_dpop_proof, and because this runs before the redeem it neither
+    //     rotates nor revokes the family (no DoS on a legitimate holder).
+    let dpop_confirmation = enforce_refresh_dpop(state, headers, resolution.dpop_jkt.as_deref())?;
+
     // 5. Resolve the client's posture and rotation override to decide whether a live
     //    token rotates (public/unbound: always; confidential/bound: past the TTL
     //    threshold).
@@ -1307,8 +1365,17 @@ async fn refresh_token_grant(
     }
 
     // 6. Mint the refreshed access token. No ID token is re-minted: no new
-    //    authentication happened, so the ID token stays with the code exchange.
-    let (minted, expires_in) = mint_refresh_access(state, scope, &resolution, &target).await?;
+    //    authentication happened, so the ID token stays with the code exchange. A
+    //    bound family re-binds the rotated access token to the SAME DPoP key (cnf),
+    //    so the binding is never lost across a rotation.
+    let (minted, expires_in) = mint_refresh_access(
+        state,
+        scope,
+        &resolution,
+        &target,
+        dpop_confirmation.as_ref(),
+    )
+    .await?;
 
     // 7. Pre-generate the successor refresh token, used when rotating or on a
     //    within-grace concurrent refresh.
@@ -1320,8 +1387,11 @@ async fn refresh_token_grant(
     );
     let next_gen = i32::try_from(resolution.generation.saturating_add(1)).unwrap_or(i32::MAX);
 
-    // 8. Build the access-token records to persist against the grant.
-    let (access_records, opaque) = refresh_access_records(&minted, &resolution);
+    // 8. Build the access-token records to persist against the grant. A bound family
+    //    re-records the DPoP thumbprint on an opaque rotated token, exactly as the
+    //    code exchange does, so an opaque access token stays sender-constrained too.
+    let dpop_jkt = dpop_confirmation.as_ref().map(Confirmation::value);
+    let (access_records, opaque) = refresh_access_records(&minted, &resolution, dpop_jkt);
 
     // 9. Atomically redeem: the authoritative single-use, rotation, and reuse gate.
     let actor = client_actor(state, scope, &resolution.client_id);
@@ -1357,6 +1427,7 @@ async fn refresh_token_grant(
             expires_in,
             resolution.scope.as_deref(),
             Some(&successor.token),
+            dpop_confirmation.is_some(),
         )),
         // A within-grace benign concurrent refresh (a loser of the atomic rotate, a
         // multi-tab retry, or a lost rotation response): return ONLY a fresh access
@@ -1372,6 +1443,7 @@ async fn refresh_token_grant(
             expires_in,
             resolution.scope.as_deref(),
             None,
+            dpop_confirmation.is_some(),
         )),
         // Not rotated (a confidential/bound client under the threshold): a fresh
         // access token and the SAME refresh token.
@@ -1380,6 +1452,7 @@ async fn refresh_token_grant(
             expires_in,
             resolution.scope.as_deref(),
             Some(presented),
+            dpop_confirmation.is_some(),
         )),
         // A genuine reuse revoked the whole family (audited once in the redeem
         // transaction). Meter it and return the uniform invalid_grant.
@@ -1459,6 +1532,7 @@ async fn mint_refresh_access(
     scope: Scope,
     resolution: &RefreshTokenResolution,
     target: &AccessTokenTarget,
+    confirmation: Option<&Confirmation>,
 ) -> Result<(MintedAccessToken, i64), TokenError> {
     let entry = state
         .issuer_entry(&scope)
@@ -1491,10 +1565,11 @@ async fn mint_refresh_access(
             // per-client id_token signer (#30) is inert here; mint_access_token
             // never reads it.
             id_token_signer: None,
-            // Re-binding a rotated refresh token's access token to the family's DPoP
-            // key is the refresh-grant enforcement change (issue #368, PR3); this
-            // issuance path leaves the refreshed token unbound for now.
-            confirmation: None,
+            // Re-bind the rotated access token to the family's DPoP key (RFC 9449,
+            // issue #368 PR3). [`Some`] only when the family is bound and a matching
+            // proof was presented (enforced in [`enforce_refresh_dpop`]); [`None`]
+            // leaves an unbound family's rotated token bearer, byte identical.
+            confirmation,
         },
         target,
     )
@@ -1541,6 +1616,7 @@ async fn resolve_refresh_target(
 fn refresh_access_records<'a>(
     minted: &'a MintedAccessToken,
     resolution: &'a RefreshTokenResolution,
+    dpop_jkt: Option<&'a str>,
 ) -> (Vec<IssuedTokenRecord>, Option<NewOpaqueAccessToken<'a>>) {
     match minted {
         MintedAccessToken::Jwt { jti, .. } => (
@@ -1570,11 +1646,10 @@ fn refresh_access_records<'a>(
                 scope: resolution.scope.as_deref(),
                 jti,
                 expires_at_unix_micros: *expires_at_unix_micros,
-                // The refresh-grant rebinding (requiring a matching DPoP proof to
-                // rotate a bound family, and re-binding the rotated access token) is
-                // a separate change; this issuance path leaves the refreshed opaque
-                // token unbound for now.
-                dpop_jkt: None,
+                // Re-record the family's DPoP thumbprint on the rotated opaque token
+                // (RFC 9449, issue #368 PR3) so it stays sender-constrained across
+                // rotations; [`None`] for an unbound family leaves it bearer.
+                dpop_jkt,
             }),
         ),
     }
@@ -1591,10 +1666,15 @@ fn refresh_response(
     expires_in: i64,
     scope: Option<&str>,
     refresh_token: Option<&str>,
+    dpop_bound: bool,
 ) -> Response {
+    // RFC 9449 section 5: a refresh of a DPoP-bound family re-binds the rotated access
+    // token to the same key, so the response advertises `DPoP` and the client presents
+    // the token with a fresh proof. An unbound family stays `Bearer`, byte identical.
+    let token_type = if dpop_bound { "DPoP" } else { "Bearer" };
     let mut body = serde_json::json!({
         "access_token": minted.token(),
-        "token_type": "Bearer",
+        "token_type": token_type,
         "expires_in": expires_in,
     });
     if let Some(refresh_token) = refresh_token {

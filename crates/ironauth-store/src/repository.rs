@@ -11410,6 +11410,11 @@ pub struct RefreshTokenResolution {
     /// Whether the family and its grant are both live (not revoked). A revoked
     /// family or grant makes every token in it inactive.
     pub active: bool,
+    /// The RFC 9449 `DPoP` key thumbprint the family is sender-constrained to (issue
+    /// #368), or [`None`] for an unbound (bearer) family. A bound family can ONLY be
+    /// rotated by a request carrying a valid `DPoP` proof for this exact key; the token
+    /// endpoint enforces the match before minting.
+    pub dpop_jkt: Option<String>,
 }
 
 impl fmt::Debug for RefreshTokenResolution {
@@ -11598,7 +11603,7 @@ impl RefreshRepo<'_> {
              (EXTRACT(EPOCH FROM rt.idle_expires_at) * 1000000)::bigint AS idle_us, \
              f.grant_id AS grant_id, f.subject AS subject, f.client_id AS client_id, \
              f.scope AS scope, f.auth_methods AS auth_methods, \
-             f.auth_time AS auth_time, f.offline AS offline, \
+             f.auth_time AS auth_time, f.offline AS offline, f.dpop_jkt AS dpop_jkt, \
              g.granted_resources AS granted_resources, \
              (EXTRACT(EPOCH FROM f.absolute_expires_at) * 1000000)::bigint AS abs_us, \
              (f.revoked_at IS NULL) AS family_live, (g.revoked_at IS NULL) AS grant_live \
@@ -12430,6 +12435,7 @@ fn refresh_resolution_from_row(
         family_absolute_expires_at_unix_micros: row.get("abs_us"),
         rotated: row.get("rotated"),
         active: row.get::<bool, _>("family_live") && row.get::<bool, _>("grant_live"),
+        dpop_jkt: row.get("dpop_jkt"),
     })
 }
 
