@@ -20,6 +20,10 @@ use ironauth_store::{
 const FAR_FUTURE_MICROS: i64 = 4_102_444_800_000_000;
 
 #[tokio::test]
+// The end-to-end IDOR probe plants a full code + grant + token and re-checks the
+// victims afterward; the added org_id binding (issue #94) tips it one line over the
+// default budget without any way to split it without obscuring the single scenario.
+#[allow(clippy::too_many_lines)]
 async fn oidc_probes_deny_cross_scope_redeem_and_token_status() {
     let harness = Harness::start().await;
     let env = harness.env().clone();
@@ -61,6 +65,7 @@ async fn oidc_probes_deny_cross_scope_redeem_and_token_status() {
                 auth_methods: "pwd",
                 auth_time_micros: None,
                 session_ref: None,
+                org_id: None,
                 consent_ref: None,
                 claims_request: None,
                 granted_resources: &[],
@@ -87,9 +92,6 @@ async fn oidc_probes_deny_cross_scope_redeem_and_token_status() {
         .await
         .expect("plant victim token");
 
-    // A well-formed but absent code in the caller's own scope A.
-    let absent_in_a = AuthorizationCodeId::generate(&env, &scope_a).to_string();
-
     let mut idor = IdorHarness::new();
     idor.register_oidc_probes();
     assert_eq!(
@@ -102,6 +104,8 @@ async fn oidc_probes_deny_cross_scope_redeem_and_token_status() {
         "every OIDC resolve-by-id operation is registered",
     );
 
+    // The third reference is a well-formed but absent code in the caller's own scope A.
+    let absent_in_a = AuthorizationCodeId::generate(&env, &scope_a).to_string();
     let foreign = [code_b.to_string(), token_b.to_string(), absent_in_a];
     let refs: Vec<&str> = foreign.iter().map(String::as_str).collect();
     let leaks = idor.run(harness.store(), scope_a, &refs).await;

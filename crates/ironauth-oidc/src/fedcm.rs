@@ -679,6 +679,9 @@ async fn mint_assertion(
         auth_methods: &session.auth_methods,
         auth_time_unix_micros,
         sid: Some(sid.as_str()),
+        // FedCM does not carry an organization context in PR-B1 (issue #94 covers the
+        // browser code grant): no org_id claim.
+        org_id: None,
         at_hash: None,
         c_hash: None,
         extra_claims: &extra_claims,

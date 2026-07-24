@@ -685,6 +685,7 @@ async fn seed_opaque_token_with_audience(
                 auth_methods: "pwd",
                 auth_time_micros: None,
                 session_ref: None,
+                org_id: None,
                 consent_ref: None,
                 claims_request: None,
                 granted_resources: &[],
