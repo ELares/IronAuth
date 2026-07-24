@@ -802,6 +802,21 @@ impl<'a> ScopedStore<'a> {
         }
     }
 
+    /// The cross-node `DPoP` proof `jti` replay store for this scope (issue #368,
+    /// resource-server verify). Records a presented proof's `(jkt, jti)`; a second
+    /// use of the same `(jkt, jti)` inside the freshness window is a REPLAY, which the
+    /// shared database enforces ACROSS nodes (unlike the token endpoint's per-instance
+    /// cache, since at a resource server a proof rides a reusable access token). It is
+    /// a replay-prevention cache, not a business mutation, so (like `idempotency_keys`)
+    /// it is deliberately off the audited-write path and needs no acting context.
+    #[must_use]
+    pub fn dpop_replay(&self) -> DpopProofReplayRepo<'a> {
+        DpopProofReplayRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
     /// The out-of-band client-authentication diagnostics sink for this scope (issue
     /// #25). Records the rich, structured detail of a failed client authentication
     /// for the future M9 admin view; it is a diagnostic log, not a business
@@ -7676,7 +7691,7 @@ impl AuthorizationRepo<'_> {
         // #22's introspection response consumes carries the token's `exp` and `iat`.
         let row = sqlx::query(
             "SELECT t.subject AS subject, t.client_id AS client_id, t.audience AS audience, \
-             t.audiences AS audiences, t.scope AS scope, t.jti AS jti, \
+             t.audiences AS audiences, t.scope AS scope, t.jti AS jti, t.dpop_jkt AS dpop_jkt, \
              (EXTRACT(EPOCH FROM t.expires_at) * 1000000)::bigint AS expires_us, \
              (EXTRACT(EPOCH FROM t.created_at) * 1000000)::bigint AS issued_us \
              FROM opaque_access_tokens t \
@@ -7710,6 +7725,7 @@ impl AuthorizationRepo<'_> {
                 audiences,
                 scope: row.get("scope"),
                 jti: row.get("jti"),
+                dpop_jkt: row.get("dpop_jkt"),
                 expires_at_unix_micros: row.get("expires_us"),
                 issued_at_unix_micros: row.get("issued_us"),
             }
@@ -9615,6 +9631,86 @@ impl ClientAssertionJtiRepo<'_> {
     }
 }
 
+/// The cross-node `DPoP` proof `jti` replay store (issue #368, resource-server
+/// verify).
+///
+/// A `DPoP` proof presented at a protected resource carries a `jti` the server must
+/// not accept twice inside the proof freshness window (RFC 9449 section 11.1). At a
+/// resource server the proof rides a REUSABLE access token presented across every
+/// instance, so a per-instance in-memory cache cannot catch a replay against a
+/// different instance; this shared table is the cross-instance single-use latch.
+/// Keyed by `(tenant, environment, jkt, jti)` so a `jti` is only ever a replay under
+/// the SAME proof key. Off the audited-write path (a replay cache, not a business
+/// mutation), like `client_assertion_jtis`.
+pub struct DpopProofReplayRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl DpopProofReplayRepo<'_> {
+    /// Check `(jkt, jti)` for a replay AND record it in one atomic step for this
+    /// scope, first pruning any already-expired rows.
+    ///
+    /// Returns `true` when the `(jkt, jti)` is FRESH (recorded for the first time, or
+    /// a stale prior entry whose freshness window has lapsed was reclaimed), and
+    /// `false` when it is a REPLAY (already present and still within its window, from
+    /// this or any other node). This mirrors the in-memory cache's `check_and_record`
+    /// contract at the shared database.
+    ///
+    /// `expires_at_micros` is the last instant the proof carrying this `jti` could
+    /// still pass the freshness window (its window edge PLUS a cushion), so a pruned
+    /// row can never remove a `jti` whose proof is still acceptable. Both the prune's
+    /// `now` and `expires_at` come from the application clock seam (`env`), never the
+    /// database clock, so the store is deterministic under a manual clock in tests.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn check_and_record(
+        &self,
+        env: &Env,
+        jkt: &str,
+        jti: &str,
+        expires_at_micros: i64,
+    ) -> Result<bool, StoreError> {
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        // Prune rows whose freshness window (plus cushion) has passed. Only these are
+        // removed, so a still-fresh proof's jti is never dropped.
+        sqlx::query(
+            "DELETE FROM dpop_proof_replay \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+             AND expires_at <= TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(now_micros)
+        .execute(&mut *tx)
+        .await?;
+        // The guarded insert: ON CONFLICT DO NOTHING makes a replay a zero-row insert
+        // rather than an error, so exactly one concurrent request records the jti and
+        // any other sees it already present.
+        let result = sqlx::query(
+            "INSERT INTO dpop_proof_replay \
+             (tenant_id, environment_id, jkt, jti, expires_at) \
+             VALUES ($1, $2, $3, $4, \
+                     TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval) \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(jkt)
+        .bind(jti)
+        .bind(expires_at_micros)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        // One row inserted => fresh; zero rows (a primary-key conflict absorbed by ON
+        // CONFLICT DO NOTHING) => a replay.
+        Ok(result.rows_affected() == 1)
+    }
+}
+
 /// A bounded-cardinality reason a client authentication OR a JWT bearer assertion
 /// grant validation failed (issues #25 and #26), recorded in the diagnostics sink.
 /// No attacker-controlled free text, so it is safe as a metric-like dimension and
@@ -11157,6 +11253,11 @@ pub struct ActiveOpaqueToken {
     pub scope: Option<String>,
     /// The token's logical identifier (a `tok_` id string).
     pub jti: String,
+    /// The RFC 7638 thumbprint (`jkt`) of the `DPoP` proof key this token is BOUND
+    /// to (RFC 9449, issue #368), or [`None`] for a plain bearer token. When set, a
+    /// resource server verifying this token requires a `DPoP` proof whose key
+    /// thumbprint equals this value.
+    pub dpop_jkt: Option<String>,
     /// The token's expiry, in microseconds since the Unix epoch (the clock seam
     /// value the row was written with). The RFC 7662 introspection response (issue
     /// #22) reports this as `exp`. Reading it does NOT change the resolve semantics:

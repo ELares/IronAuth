@@ -764,6 +764,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0082_dpop_binding.sql"),
         },
+        Migration {
+            version: 83,
+            name: "dpop_proof_replay",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0083_dpop_proof_replay.sql"),
+        },
     ]
 }
 

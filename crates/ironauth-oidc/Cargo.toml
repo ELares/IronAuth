@@ -1029,5 +1029,17 @@ name = "dpop_refresh"
 path = "tests/dpop_refresh.rs"
 required-features = ["testing"]
 
+# DPoP proof-of-possession at the resource server (RFC 9449 sections 7.1 and 4.3, issue #368
+# resource-server verify): a bound access token at userinfo MUST carry a valid DPoP proof over the
+# userinfo htu, the request method, and the ath of that token, whose key matches the token binding and
+# whose jti is fresh (cross-node DB replay store); presented as a bearer, with no proof, a wrong
+# key/ath/htu/htm, a stale iat, or a replayed jti is the uniform 401 invalid_token with a DPoP
+# challenge. An unbound token is unchanged bearer and refused under the DPoP scheme. Both at+jwt and
+# opaque formats. Over a real database (DATABASE_URL).
+[[test]]
+name = "dpop_userinfo"
+path = "tests/dpop_userinfo.rs"
+required-features = ["testing"]
+
 [lints]
 workspace = true

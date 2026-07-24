@@ -73,10 +73,12 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use ironauth_jose::Confirmation;
 use ironauth_store::{AccessTokenResolution, IssuedTokenId, Scope};
 use serde_json::{Map, Value};
 
 use crate::claims_request::ClaimsRequest;
+use crate::dpop::PresentedScheme;
 use crate::scope_claims::{assemble_claims, parse_scope_set};
 use crate::state::OidcState;
 use crate::tokens::{OPAQUE_ACCESS_TOKEN_DELIMITER, OPAQUE_ACCESS_TOKEN_PREFIX};
@@ -88,6 +90,17 @@ const REALM: &str = "ironauth";
 /// token issued without `openid` is not a `UserInfo` credential.
 const REQUIRED_SCOPE: &str = "openid";
 
+/// The `DPoP` request header carrying the proof (RFC 9449). `HeaderMap` lookups are
+/// case-insensitive, so this matches any header-name casing.
+const DPOP_HEADER: &str = "dpop";
+
+/// The `htm` value a `DPoP` proof must carry for a `GET /userinfo` (RFC 9449 uses the
+/// uppercase HTTP method token).
+const DPOP_HTM_GET: &str = "GET";
+
+/// The `htm` value a `DPoP` proof must carry for a `POST /userinfo`.
+const DPOP_HTM_POST: &str = "POST";
+
 /// A defensive cap on the raw token size before the unverified `jti` peek. The
 /// hardened verify path caps again; this bounds the cheap pre-parse.
 const MAX_TOKEN_BYTES: usize = 16 * 1024;
@@ -98,7 +111,7 @@ pub async fn userinfo_get(
     headers: HeaderMap,
     RawQuery(query): RawQuery,
 ) -> Response {
-    respond(&state, &headers, query.as_deref()).await
+    respond(&state, &headers, DPOP_HTM_GET, query.as_deref()).await
 }
 
 /// `POST /userinfo`. The body is ignored: the access token is taken only from the
@@ -108,7 +121,7 @@ pub async fn userinfo_post(
     headers: HeaderMap,
     RawQuery(query): RawQuery,
 ) -> Response {
-    respond(&state, &headers, query.as_deref()).await
+    respond(&state, &headers, DPOP_HTM_POST, query.as_deref()).await
 }
 
 /// `OPTIONS /userinfo`: the CORS preflight a browser SPA sends before a
@@ -139,8 +152,13 @@ pub async fn userinfo_preflight(State(state): State<OidcState>, headers: HeaderM
 /// Run the request and layer CORS on the result. CORS is applied to EVERY outcome
 /// (success or challenge) for a registered origin, so a browser SPA can read the
 /// response and its challenge; the authorization endpoint never calls this.
-async fn respond(state: &OidcState, headers: &HeaderMap, query: Option<&str>) -> Response {
-    let mut response = match resolve(state, headers, query).await {
+async fn respond(
+    state: &OidcState,
+    headers: &HeaderMap,
+    method: &str,
+    query: Option<&str>,
+) -> Response {
+    let mut response = match resolve(state, headers, method, query).await {
         Ok(claims) => success(&claims),
         Err(error) => error.into_response(),
     };
@@ -156,6 +174,7 @@ async fn respond(state: &OidcState, headers: &HeaderMap, query: Option<&str>) ->
 async fn resolve(
     state: &OidcState,
     headers: &HeaderMap,
+    method: &str,
     query: Option<&str>,
 ) -> Result<Map<String, Value>, UserInfoError> {
     // A token in the query string is refused outright (RFC 6750 2.3 is discouraged
@@ -166,8 +185,10 @@ async fn resolve(
         ));
     }
 
-    // The access token, taken ONLY from the Authorization header.
-    let token = bearer_token(headers)?;
+    // The access token AND how it was presented (Bearer or DPoP, plus the single DPoP
+    // proof header for a DPoP presentation), taken ONLY from the request headers.
+    let presented = presented_credential(headers)?;
+    let token = presented.token.as_str();
 
     // Branch on the token FORMAT (issue #29). An opaque reference token is told
     // apart by its `ira_at_` prefix and validated ONLY by the internal store
@@ -175,13 +196,13 @@ async fn resolve(
     // store. Both fail the SAME uniform invalid_token, so the branch reveals
     // nothing about which format a rejected token was.
     if token.starts_with(OPAQUE_ACCESS_TOKEN_PREFIX) {
-        return resolve_opaque(state, &token).await;
+        return resolve_opaque(state, &presented, method).await;
     }
 
     // 1. Read the jti (an opaque handle) and recover its embedded scope. A token
     //    whose payload is unreadable, or whose jti is not a scoped token id, is a
     //    uniform invalid_token.
-    let jti_raw = peek_jti(&token).ok_or(UserInfoError::InvalidToken)?;
+    let jti_raw = peek_jti(token).ok_or(UserInfoError::InvalidToken)?;
     let jti =
         IssuedTokenId::parse_declared_scope(&jti_raw).map_err(|_| UserInfoError::InvalidToken)?;
     let scope = jti.scope();
@@ -206,9 +227,25 @@ async fn resolve(
     //    and the resolved client as the audience: signature, exp, iss, aud. This
     //    is where an expired, tampered, or forged token is rejected.
     let verified = state
-        .verify_access_token(&scope, &resolution.client_id, &token)
+        .verify_access_token(&scope, &resolution.client_id, token)
         .await
         .map_err(|()| UserInfoError::InvalidToken)?;
+
+    // 4. DPoP (RFC 9449, issue #368): a token BOUND to a proof key (its cnf.jkt) MUST
+    //    be presented under the DPoP scheme with a valid proof over the userinfo htu,
+    //    this request method, and the ath of THIS token; an UNBOUND token MUST be a
+    //    plain bearer. Every failure is the uniform invalid_token (no oracle).
+    let cnf =
+        Confirmation::from_claims(verified.claims()).map_err(|_| UserInfoError::InvalidToken)?;
+    enforce_dpop(
+        state,
+        &scope,
+        cnf_jkt(cnf.as_ref()),
+        &presented,
+        method,
+        token,
+    )
+    .await?;
 
     // The granted scope drives which claim sets are released (Core 5.4). UserInfo
     // requires the openid scope (Core 5.3.1); its absence is insufficient_scope.
@@ -246,8 +283,10 @@ async fn resolve(
 /// uniform failures as the at+jwt path.
 async fn resolve_opaque(
     state: &OidcState,
-    token: &str,
+    presented: &Presented,
+    method: &str,
 ) -> Result<Map<String, Value>, UserInfoError> {
+    let token = presented.token.as_str();
     // Recover the scope the token declares in its routing handle. An unreadable
     // handle is a uniform invalid_token; the scope is only a lookup key and is
     // CONFIRMED by the scope-bound resolve (forced row-level security beneath), so
@@ -265,6 +304,20 @@ async fn resolve_opaque(
         .await
         .map_err(|_| UserInfoError::ServerError)?
         .ok_or(UserInfoError::InvalidToken)?;
+
+    // DPoP (RFC 9449, issue #368): an opaque token carries its binding on its stored
+    // row (dpop_jkt), not in claims. A bound token MUST be presented under the DPoP
+    // scheme with a valid proof (over the userinfo htu, this method, and the ath of
+    // THIS token); an unbound token MUST be a plain bearer. Uniform invalid_token.
+    enforce_dpop(
+        state,
+        &scope,
+        active.dpop_jkt.as_deref(),
+        presented,
+        method,
+        token,
+    )
+    .await?;
 
     // Confused-deputy: the token must have been minted for the CLIENT itself
     // (aud == client), not for a resource server. A resource-server opaque token is
@@ -356,16 +409,28 @@ fn query_carries_access_token(query: Option<&str>) -> bool {
     })
 }
 
-/// Extract the Bearer access token from the `Authorization` header, ONLY.
+/// An access token as PRESENTED at `UserInfo`: the token, the HTTP authentication
+/// scheme it came under (`Bearer` or `DPoP`), and the single `DPoP` proof header
+/// value (present only for a `DPoP`-scheme presentation).
+struct Presented {
+    token: String,
+    scheme: PresentedScheme,
+    proof: Option<String>,
+}
+
+/// Extract the presented access token, its scheme, and (for a `DPoP` presentation)
+/// its proof header, from the request headers ONLY.
 ///
-/// Returns [`UserInfoError::MissingToken`] (a bare `401` with no error code) when
-/// there is no usable Bearer credential: no `Authorization` header at all, an
-/// unsupported scheme (e.g. `Basic`), or an empty `Bearer` value. RFC 6750 3 says a
-/// request that "attempted using an unsupported authentication method" gets the
-/// bare challenge, not an error code, so the client is told to retry with a Bearer
-/// token rather than handed a `400`. A genuinely malformed header (non-visible
-/// bytes) or more than one `Authorization` header is [`UserInfoError::InvalidRequest`].
-fn bearer_token(headers: &HeaderMap) -> Result<String, UserInfoError> {
+/// The `Authorization` scheme is case-insensitive (RFC 7235). `Bearer` and `DPoP` are
+/// the two accepted schemes; the token itself is not decoded here. Returns
+/// [`UserInfoError::MissingToken`] (a bare `401` with no error code) when there is no
+/// usable credential: no `Authorization` header, an unsupported scheme (e.g. `Basic`),
+/// or an empty scheme value. RFC 6750 3 gives an unsupported method the bare
+/// challenge, not an error code. A genuinely malformed header (non-visible bytes),
+/// more than one `Authorization` header, or (for a `DPoP` presentation) more than one
+/// `DPoP` header, is [`UserInfoError::InvalidRequest`]. The `DPoP` header is read ONLY
+/// for a `DPoP`-scheme presentation; a bearer presentation ignores it.
+fn presented_credential(headers: &HeaderMap) -> Result<Presented, UserInfoError> {
     let mut values = headers.get_all(header::AUTHORIZATION).iter();
     let Some(first) = values.next() else {
         return Err(UserInfoError::MissingToken);
@@ -378,16 +443,98 @@ fn bearer_token(headers: &HeaderMap) -> Result<String, UserInfoError> {
     let value = first
         .to_str()
         .map_err(|_| UserInfoError::InvalidRequest("malformed Authorization header"))?;
-    // The scheme is case-insensitive (RFC 7235); the token itself is not decoded. A
-    // non-Bearer scheme or an empty Bearer value is "no usable authentication
-    // information", so it maps to the bare challenge (MissingToken), not an error.
-    let token = value
-        .strip_prefix("Bearer ")
-        .or_else(|| value.strip_prefix("bearer "))
-        .map(str::trim)
-        .filter(|token| !token.is_empty())
-        .ok_or(UserInfoError::MissingToken)?;
-    Ok(token.to_owned())
+    // A non-Bearer, non-DPoP scheme or an empty scheme value is "no usable
+    // authentication information", so it maps to the bare challenge (MissingToken).
+    let (scheme, raw) = parse_scheme(value).ok_or(UserInfoError::MissingToken)?;
+    let token = raw.trim();
+    if token.is_empty() {
+        return Err(UserInfoError::MissingToken);
+    }
+    let proof = match scheme {
+        PresentedScheme::Bearer => None,
+        PresentedScheme::Dpop => read_single_dpop_header(headers)?,
+    };
+    Ok(Presented {
+        token: token.to_owned(),
+        scheme,
+        proof,
+    })
+}
+
+/// Case-insensitively split an `Authorization` header value into its scheme and the
+/// remainder after the single separating space, for the two accepted schemes.
+fn parse_scheme(value: &str) -> Option<(PresentedScheme, &str)> {
+    if let Some(rest) = strip_ci_prefix(value, "Bearer ") {
+        return Some((PresentedScheme::Bearer, rest));
+    }
+    if let Some(rest) = strip_ci_prefix(value, "DPoP ") {
+        return Some((PresentedScheme::Dpop, rest));
+    }
+    None
+}
+
+/// Strip an ASCII `prefix` from `value` case-insensitively, returning the remainder,
+/// or [`None`] if `value` does not begin with it. `prefix` is ASCII, so byte-length
+/// slicing lands on a character boundary.
+fn strip_ci_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = value.get(..prefix.len())?;
+    if head.eq_ignore_ascii_case(prefix) {
+        Some(&value[prefix.len()..])
+    } else {
+        None
+    }
+}
+
+/// Read the single `DPoP` proof header for a `DPoP`-scheme presentation. Zero headers
+/// is [`None`] (the caller rejects a bound token with no proof as `invalid_token`);
+/// more than one, or a non-visible-byte value, is [`UserInfoError::InvalidRequest`].
+fn read_single_dpop_header(headers: &HeaderMap) -> Result<Option<String>, UserInfoError> {
+    let mut proofs = headers.get_all(DPOP_HEADER).iter();
+    let Some(first) = proofs.next() else {
+        return Ok(None);
+    };
+    if proofs.next().is_some() {
+        return Err(UserInfoError::InvalidRequest("more than one DPoP header"));
+    }
+    let proof = first
+        .to_str()
+        .map_err(|_| UserInfoError::InvalidRequest("malformed DPoP header"))?;
+    Ok(Some(proof.to_owned()))
+}
+
+/// The `DPoP` key thumbprint a token is bound to, if its `cnf` is a `jkt`
+/// confirmation. A non-`jkt` confirmation (e.g. a future mTLS `x5t#S256`) is not a
+/// `DPoP` binding, so it reads as unbound for the `DPoP` presentation rules.
+fn cnf_jkt(confirmation: Option<&Confirmation>) -> Option<&str> {
+    match confirmation {
+        Some(Confirmation::Jkt(jkt)) => Some(jkt.as_str()),
+        _ => None,
+    }
+}
+
+/// Enforce the `DPoP` presentation rules for a token whose binding is `expected_jkt`
+/// (its `cnf.jkt` or opaque `dpop_jkt`, or [`None`] when unbound), collapsing every
+/// `DPoP` failure to the uniform [`UserInfoError::InvalidToken`] (RFC 9449 7.1). The
+/// granular reason is logged server-side by the state helper, never surfaced.
+async fn enforce_dpop(
+    state: &OidcState,
+    scope: &Scope,
+    expected_jkt: Option<&str>,
+    presented: &Presented,
+    method: &str,
+    token: &str,
+) -> Result<(), UserInfoError> {
+    state
+        .verify_dpop_presentation(
+            scope,
+            expected_jkt,
+            presented.scheme,
+            presented.proof.as_deref(),
+            method,
+            token,
+        )
+        .await
+        .map_err(|()| UserInfoError::InvalidTokenDpop)
 }
 
 /// Read the `jti` from a compact JWS payload WITHOUT verifying it, as a lookup
@@ -456,6 +603,12 @@ enum UserInfoError {
     MissingToken,
     /// The token is invalid, expired, revoked, or unknown: `401` `invalid_token`.
     InvalidToken,
+    /// A `DPoP` proof-of-possession requirement failed (RFC 9449, issue #368): a
+    /// bound token presented as a bearer, a missing / invalid / replayed proof, a
+    /// thumbprint mismatch, or a `DPoP`-scheme presentation of an unbound token. The
+    /// uniform `401` `invalid_token` (no oracle), but the challenge advertises the
+    /// `DPoP` scheme so a compliant client retries with a proof.
+    InvalidTokenDpop,
     /// The token is valid but lacks the `openid` scope: `403` `insufficient_scope`
     /// carrying the required `scope` attribute.
     InsufficientScope,
@@ -480,6 +633,16 @@ impl IntoResponse for UserInfoError {
                 Some(format!(
                     "Bearer realm=\"{REALM}\", error=\"invalid_token\", \
                      error_description=\"the access token is invalid, expired, or revoked\""
+                )),
+            ),
+            // RFC 9449 7.1: a DPoP failure carries the DPoP-scheme challenge so a
+            // compliant client retries the presentation with a proof. The error code
+            // stays the uniform invalid_token (no oracle on which check failed).
+            UserInfoError::InvalidTokenDpop => (
+                StatusCode::UNAUTHORIZED,
+                Some(format!(
+                    "DPoP realm=\"{REALM}\", error=\"invalid_token\", \
+                     error_description=\"the access token requires a valid DPoP proof\""
                 )),
             ),
             UserInfoError::InsufficientScope => (
@@ -526,35 +689,91 @@ mod tests {
     }
 
     #[test]
-    fn bearer_token_requires_a_single_bearer_header() {
+    fn presented_credential_requires_a_single_authorization_header() {
         let mut headers = HeaderMap::new();
-        assert_eq!(bearer_token(&headers), Err(UserInfoError::MissingToken));
+        assert!(matches!(
+            presented_credential(&headers),
+            Err(UserInfoError::MissingToken)
+        ));
 
         headers.insert(
             header::AUTHORIZATION,
             HeaderValue::from_static("Bearer tok-123"),
         );
-        assert_eq!(bearer_token(&headers).as_deref(), Ok("tok-123"));
+        let bearer = presented_credential(&headers).expect("bearer parses");
+        assert_eq!(bearer.token, "tok-123");
+        assert_eq!(bearer.scheme, PresentedScheme::Bearer);
+        assert!(bearer.proof.is_none());
 
-        // A non-Bearer scheme is an unsupported authentication method, so it gets
-        // the bare challenge (MissingToken), not an error code (RFC 6750 3).
+        // A non-Bearer, non-DPoP scheme is an unsupported authentication method, so it
+        // gets the bare challenge (MissingToken), not an error code (RFC 6750 3).
         headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Basic abc"));
-        assert_eq!(bearer_token(&headers), Err(UserInfoError::MissingToken));
+        assert!(matches!(
+            presented_credential(&headers),
+            Err(UserInfoError::MissingToken)
+        ));
 
-        // An empty Bearer value carries no usable credential, so likewise the bare
+        // An empty scheme value carries no usable credential, so likewise the bare
         // challenge rather than a 400.
         headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer "));
-        assert_eq!(bearer_token(&headers), Err(UserInfoError::MissingToken));
+        assert!(matches!(
+            presented_credential(&headers),
+            Err(UserInfoError::MissingToken)
+        ));
 
         // Two Authorization headers are ambiguous: a genuinely malformed request.
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer tok-123"),
+        );
         headers.append(
             header::AUTHORIZATION,
             HeaderValue::from_static("Bearer other"),
         );
         assert!(matches!(
-            bearer_token(&headers),
+            presented_credential(&headers),
             Err(UserInfoError::InvalidRequest(_))
         ));
+    }
+
+    #[test]
+    fn presented_credential_reads_the_dpop_scheme_and_proof() {
+        // The DPoP scheme is case-insensitive (RFC 7235) and reads the single DPoP
+        // proof header alongside the token.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("dpop tok-xyz"),
+        );
+        headers.insert(DPOP_HEADER, HeaderValue::from_static("proof-jws"));
+        let presented = presented_credential(&headers).expect("dpop parses");
+        assert_eq!(presented.token, "tok-xyz");
+        assert_eq!(presented.scheme, PresentedScheme::Dpop);
+        assert_eq!(presented.proof.as_deref(), Some("proof-jws"));
+
+        // A DPoP scheme with NO proof header parses (the bind check later rejects a
+        // bound token that lacks a proof).
+        headers.remove(DPOP_HEADER);
+        let no_proof = presented_credential(&headers).expect("dpop without proof parses");
+        assert!(no_proof.proof.is_none());
+
+        // More than one DPoP header is a malformed request.
+        headers.insert(DPOP_HEADER, HeaderValue::from_static("proof-a"));
+        headers.append(DPOP_HEADER, HeaderValue::from_static("proof-b"));
+        assert!(matches!(
+            presented_credential(&headers),
+            Err(UserInfoError::InvalidRequest(_))
+        ));
+
+        // A Bearer presentation ignores any DPoP header (it is not read).
+        let mut bearer_headers = HeaderMap::new();
+        bearer_headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer tok-abc"),
+        );
+        bearer_headers.insert(DPOP_HEADER, HeaderValue::from_static("ignored"));
+        let bearer = presented_credential(&bearer_headers).expect("bearer parses");
+        assert!(bearer.proof.is_none());
     }
 
     #[test]
@@ -593,6 +812,15 @@ mod tests {
                 .contains("error=\"invalid_token\"")
         );
 
+        // A DPoP failure is the uniform invalid_token but advertises the DPoP scheme
+        // (RFC 9449 7.1) so a compliant client retries with a proof.
+        let dpop = www(UserInfoError::InvalidTokenDpop).unwrap();
+        assert!(
+            dpop.starts_with("DPoP "),
+            "advertises the DPoP scheme: {dpop}"
+        );
+        assert!(dpop.contains("error=\"invalid_token\""));
+
         let scope = www(UserInfoError::InsufficientScope).unwrap();
         assert!(scope.contains("error=\"insufficient_scope\""));
         assert!(
@@ -618,6 +846,10 @@ mod tests {
         );
         assert_eq!(
             UserInfoError::InvalidToken.into_response().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            UserInfoError::InvalidTokenDpop.into_response().status(),
             StatusCode::UNAUTHORIZED
         );
         assert_eq!(

@@ -184,6 +184,18 @@ pub fn jwk_thumbprint(jwk: &Jwk) -> Result<String, DpopError> {
     Ok(URL_SAFE_NO_PAD.encode(crypto::sha256(json.as_bytes())))
 }
 
+/// The access-token hash (`ath`) a `DPoP` proof presented at a resource server must
+/// carry (RFC 9449 section 4.3): the base64url-nopad SHA-256 of the ASCII access
+/// token string, exactly as the token was presented in the `Authorization` header.
+///
+/// The single canonical routine for the value, so the resource server computes the
+/// expectation and (in a downstream test) a proof's `ath` through one function that
+/// can never disagree. `ring` stays contained in this crate.
+#[must_use]
+pub fn access_token_hash(access_token: &str) -> String {
+    URL_SAFE_NO_PAD.encode(crypto::sha256(access_token.as_bytes()))
+}
+
 /// Read a required string JWK member, or [`DpopError::MalformedKey`] if it is
 /// absent or not a string.
 fn required_str<'a>(jwk: &'a Jwk, member: &str) -> Result<&'a str, DpopError> {
@@ -534,6 +546,39 @@ pub mod test_util {
             "htu": htu,
             "iat": iat_secs,
             "jti": jti,
+        });
+        sign_compact(key, &header, &payload)
+    }
+
+    /// Build and sign a well-formed compact `DPoP` proof JWS that ALSO carries the
+    /// access-token hash (`ath`), for a resource-server presentation (RFC 9449
+    /// section 4.3). Identical to [`sign_proof`] but with the `ath` claim added, so a
+    /// downstream test can present a proof bound to a specific access token.
+    ///
+    /// # Panics
+    ///
+    /// Panics if serialization or signing fails, which does not happen for a
+    /// well-formed key and JSON claims.
+    #[must_use]
+    pub fn sign_proof_with_ath(
+        key: &SigningKey,
+        htm: &str,
+        htu: &str,
+        iat_secs: u64,
+        jti: &str,
+        ath: &str,
+    ) -> String {
+        let header = json!({
+            "typ": DPOP_TYP,
+            "alg": key.algorithm().as_jose_name(),
+            "jwk": public_jwk(key),
+        });
+        let payload = json!({
+            "htm": htm,
+            "htu": htu,
+            "iat": iat_secs,
+            "jti": jti,
+            "ath": ath,
         });
         sign_compact(key, &header, &payload)
     }

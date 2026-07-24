@@ -43,7 +43,7 @@ pub(crate) const DPOP_IAT_SKEW: Duration = Duration::from_secs(5);
 /// freshness check. The extra second also absorbs the whole-second flooring the core
 /// applies to `now`, closing the boundary where a proof could otherwise be replayed
 /// once just as its freshness lapses.
-const DPOP_REPLAY_TTL: Duration =
+pub(crate) const DPOP_REPLAY_TTL: Duration =
     Duration::from_secs(DPOP_IAT_LEEWAY.as_secs() + DPOP_IAT_SKEW.as_secs() + 1);
 
 /// An upper bound on the replay cache size. At the cap the map is cleared wholesale
@@ -136,6 +136,18 @@ impl Default for DpopReplayCache {
     }
 }
 
+/// The HTTP authentication scheme an access token was presented under at a resource
+/// server (RFC 9449 section 7.1, RFC 6750). A `DPoP`-bound token MUST be presented
+/// with the `DPoP` scheme and a proof; an unbound token is presented as `Bearer`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PresentedScheme {
+    /// `Authorization: Bearer <token>`: the plain bearer presentation.
+    Bearer,
+    /// `Authorization: DPoP <token>`: a sender-constrained presentation that MUST be
+    /// accompanied by a `DPoP` proof header.
+    Dpop,
+}
+
 /// The normalized token-endpoint `htu` a `DPoP` proof must match (RFC 9449 section
 /// 4.3): scheme, authority, and path, with NO query or fragment.
 ///
@@ -155,6 +167,23 @@ impl Default for DpopReplayCache {
 #[must_use]
 pub fn normalized_htu_for_token_endpoint(state: &OidcState) -> String {
     format!("{}/token", state.issuer_base().trim_end_matches('/'))
+}
+
+/// The normalized `userinfo` `htu` a `DPoP` proof presented at the resource server
+/// must match (RFC 9449 section 4.3): scheme, authority, and path with NO query or
+/// fragment.
+///
+/// Like the token endpoint, `userinfo` is mounted flat at the DEPLOYMENT ROOT
+/// (`{issuer_base}/userinfo`) and shared across environments, NOT under the
+/// per-environment issuer path. The scope travels with the presented access token,
+/// not the URL, so this MUST be the deployment-root URL a compliant client posts to,
+/// not the per-environment issuer (the PR2 `htu` lesson). The issuer base is
+/// server-configured (never client-supplied), so no request header can spoof it. The
+/// PR1 core does EXACT string-equality on `htu` with no normalization of its own, so
+/// this string is the whole contract.
+#[must_use]
+pub fn normalized_htu_for_userinfo(state: &OidcState) -> String {
+    format!("{}/userinfo", state.issuer_base().trim_end_matches('/'))
 }
 
 #[cfg(test)]
