@@ -448,11 +448,19 @@ pub(crate) fn build_id_token_claims(
 
     // Extra standard claims (issue #15): the claims-parameter `id_token` member,
     // and (only under the non-conform conformIdTokenClaims override) the
-    // scope-derived claims. Protocol/REQUIRED claims always win, so an extra claim
-    // whose name is already set is never overwritten (it cannot shadow sub, iss,
-    // aud, exp, iat, nonce, acr, amr, or auth_time).
+    // scope-derived claims. A PROTECTED (protocol) claim is set ONLY by the
+    // protocol above, NEVER from the client-influenced extra bag: insertion-order
+    // "protocol wins" is no protection for a claim the protocol did NOT set on THIS
+    // token (for example `org_id` on a no-org session, or `cnf` on a no-binding
+    // session), so the reserved set is filtered explicitly here, exactly as the
+    // access-token and client-credentials builders do (issue #94). A user claim
+    // released through this bag can never be named `org_id`, `sub`, `cnf`, and the
+    // rest, so it can never forge one.
     if let serde_json::Value::Object(claims_object) = &mut claims {
         for (name, value) in request.extra_claims {
+            if PROTECTED_ACCESS_TOKEN_CLAIMS.contains(&name.as_str()) {
+                continue;
+            }
             claims_object
                 .entry(name.clone())
                 .or_insert_with(|| value.clone());
@@ -1128,22 +1136,24 @@ mod tests {
             "org_id is a protected access-token claim"
         );
 
-        // With no resolved org the claim is absent on both tokens (a no-org login is
-        // byte-identical to before the feature). The access token merges no client
-        // custom claims at all on the code flow, so its org_id can only ever come from
-        // the issuer; the ID token's protocol-claim-wins fold protects a SET org_id,
-        // and in practice a client can never place `org_id` into the ID token's
-        // extra-claims bag (assembled only from the subject's stored claims and the
-        // scope-derived standard claims, never a protocol-namespace claim like org_id).
-        let empty = serde_json::Map::new();
+        // With no resolved org, the claim is absent on both tokens (a no-org login is
+        // byte-identical to before the feature) EVEN when a hostile `org_id` is planted
+        // in the extra-claims bag: for a no-org session the protocol sets no org_id, so
+        // insertion-order "protocol wins" would be no protection; the id-token fold
+        // filters PROTECTED_ACCESS_TOKEN_CLAIMS explicitly, so a forged org_id from the
+        // bag (or the claims-request parameter) is dropped, not stamped. The access
+        // token merges no client custom claims at all on the code flow.
         req.org_id = None;
-        req.extra_claims = &empty;
+        req.extra_claims = &extra; // still { "org_id": "org_forged" }
         let id_none = build_id_token_claims(&req, 1, 2, "tok").expect("claims");
-        assert!(id_none.get("org_id").is_none(), "no org, no id-token claim");
+        assert!(
+            id_none.get("org_id").is_none(),
+            "a no-org id token drops a forged org_id from the extra-claims bag"
+        );
         let at_none = build_access_token_claims(&req, 1, 2, "tok", &json!("cli_example"));
         assert!(
             at_none.get("org_id").is_none(),
-            "no org, no access-token claim"
+            "a no-org access token never carries org_id"
         );
     }
 
