@@ -31542,6 +31542,12 @@ pub struct OrgGroupRecord {
     /// The parent group, or `None` for a root. Always a group of the SAME
     /// organization: the repository enforces that on every write, because the
     /// row-level-security policy fences `(tenant, environment)` only.
+    ///
+    /// It may name a DELETED group. A delete detaches rather than cascades, so a
+    /// child keeps pointing at its dead parent and every walk treats it as a root
+    /// by filtering `deleted_at IS NULL`. A consumer must therefore never assume a
+    /// non-null value here resolves to a live row, and must apply that filter
+    /// itself; see [`ActingOrgGroupRepo::delete`] for what is and is not acyclic.
     pub parent_id: Option<OrgGroupId>,
     /// The IMMUTABLE stable name. A rename changes `display_name`, never this, so
     /// a name a later authorization or routing decision keys on cannot move under
@@ -34570,23 +34576,38 @@ impl ActingOrgGroupRepo<'_> {
     /// nothing like them. The group's `slug` is not writable here and is not even
     /// granted to the control role.
     ///
+    /// # Containment
+    ///
+    /// `organization_id` is part of the ADDRESS of the group, not a hint, and the
+    /// statement carries it as a predicate exactly as [`ActingOrgGroupRepo::delete`]
+    /// and [`ActingOrgGroupRepo::reparent`] do. All three group mutations therefore
+    /// share ONE addressing key, so a nested management route can never rename a
+    /// group of a SIBLING organization by naming its own organization in the path.
+    /// Row-level security fences `(tenant, environment)` and nothing finer, so
+    /// without this predicate the statement would happily write across
+    /// organizations inside one environment; the uniform not-found is the only
+    /// answer a caller may distinguish, whether the group is absent, soft-deleted,
+    /// in another organization of the same scope, or in another scope entirely.
+    ///
     /// # Errors
     ///
-    /// [`StoreError::NotFound`] if the id is not in this scope, or no live group
-    /// matched;
+    /// [`StoreError::NotFound`] if either id is not in this scope, or no live group
+    /// of `organization_id` matched;
     /// [`StoreError::Database`] on a persistence failure (including an empty display
     /// name, which the CHECK refuses).
     pub async fn update(
         &self,
         env: &Env,
+        organization_id: &OrganizationId,
         id: &OrgGroupId,
         display_name: Option<&str>,
         metadata: Option<&serde_json::Value>,
     ) -> Result<(), StoreError> {
-        if id.scope() != self.scope {
+        if organization_id.scope() != self.scope || id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
         let scope = self.scope;
+        let organization_id = *organization_id;
         let now_micros = epoch_micros(env.clock().now_utc());
         let metadata_opt = metadata_json_opt(metadata)?;
         let display_name = display_name.map(str::to_owned);
@@ -34607,7 +34628,7 @@ impl ActingOrgGroupRepo<'_> {
                          updated_at = \
                              TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval \
                      WHERE id = $4 AND tenant_id = $5 AND environment_id = $6 \
-                     AND deleted_at IS NULL",
+                     AND organization_id = $7 AND deleted_at IS NULL",
                 )
                 .bind(display_name.as_deref())
                 .bind(metadata_opt.as_deref())
@@ -34615,6 +34636,7 @@ impl ActingOrgGroupRepo<'_> {
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
                 .bind(scope.environment().to_string())
+                .bind(organization_id.to_string())
                 .execute(&mut **tx)
                 .await?;
                 if result.rows_affected() == 0 {
@@ -34822,6 +34844,38 @@ impl ActingOrgGroupRepo<'_> {
     /// unreachable state or cascading a delete the operator did not ask for.
     /// Detaching can only ever DECREASE a descendant's depth, so no stored
     /// hierarchy can be pushed past the bound by a delete.
+    ///
+    /// # What is acyclic, and what is not (read this before "fixing" the detach)
+    ///
+    /// "Depth can only decrease" is the whole safety argument for the LIVE graph and
+    /// is NOT the whole truth about the STORED rows. State both, precisely, because
+    /// the effective-role resolution a later PR of this issue adds walks the same
+    /// table:
+    ///
+    ///   * **The LIVE graph is acyclic and bounded.** Every walk in this module (the
+    ///     two hierarchy-check walks, and the resolution walk that follows) filters
+    ///     `deleted_at IS NULL` in EVERY arm, seed and recursive alike. That filter
+    ///     is what makes the guarantee true, so it is load-bearing, not hygiene: a
+    ///     walk that dropped it would be walking a different graph than the one the
+    ///     write path validates.
+    ///   * **The STORED graph may contain a CYCLE, through a dead node.** Take a live
+    ///     root `r`, its child `a`, and `a`'s child `b`. Delete `a`, then reparent
+    ///     `r` under `b`. The check sees `b` as a root, because its parent `a` is
+    ///     dead and therefore invisible to every arm of the walk, and admits the
+    ///     move. Reading each stored `parent_id` as an arrow to the parent, the
+    ///     pointers are now `r` to `b`, `b` to `a`, and `a` back to `r`: a cycle.
+    ///     The LIVE graph is just `r` hanging under the root `b`, and is a forest.
+    ///     Nothing is wrong: the write path refuses cycles in the graph it and every
+    ///     reader actually traverse.
+    ///   * **`parent_id` may name a DELETED group.** A consumer must never assume a
+    ///     non-null `parent_id` resolves to a live row, and must never resolve one
+    ///     without the liveness filter.
+    ///
+    /// The consequence for a future edit: turning this delete into a CASCADE, or
+    /// rewriting orphaned children to null, is not a local cleanup. It changes which
+    /// graph the invariants are stated over, and a walk that stops filtering dead
+    /// rows would no longer terminate on the cycle above. Any such change has to
+    /// re-argue this section, not merely preserve the tests.
     ///
     /// The delete runs under the same per-organization advisory lock as a reparent,
     /// so "at most one transaction reshapes one organization's group forest at a

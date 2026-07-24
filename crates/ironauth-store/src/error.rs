@@ -203,7 +203,9 @@ pub enum StoreError {
     OrgGroupDepthExceeded {
         /// The configured maximum nesting depth, in edges from a root.
         max: u32,
-        /// The depth the refused write would have produced.
+        /// A FLOOR on the depth the refused write would have produced, equal to it
+        /// unless a walk saturated (see the variant doc). Never an exact value to be
+        /// arithmetic on.
         attempted: i64,
     },
 }
@@ -250,7 +252,7 @@ impl fmt::Display for StoreError {
             }
             StoreError::OrgGroupDepthExceeded { max, attempted } => write!(
                 f,
-                "the requested parent would nest groups {attempted} levels deep, \
+                "the requested parent would nest groups at least {attempted} levels deep, \
                  exceeding the configured maximum of {max}"
             ),
         }

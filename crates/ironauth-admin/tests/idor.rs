@@ -49,9 +49,10 @@ async fn management_probes_deny_cross_tenant_and_cross_environment_uniformly() {
     let victim_role_a2 = plant_role(control, &env, scope_a2, &victim_org_a2).await;
 
     // Organization groups (issue #97): plant a victim group in each foreign scope so
-    // the group probes have a real cross-scope target, including for the reparent
-    // probe, whose refusal must be the uniform not-found and never a typed cycle or
-    // depth error (either would be an oracle over a foreign group graph).
+    // the group probes have a real cross-scope target, including for the update probe
+    // (a rename is a cross-scope mutation too) and for the reparent probe, whose
+    // refusal must be the uniform not-found and never a typed cycle or depth error
+    // (either would be an oracle over a foreign group graph).
     let victim_group_b = plant_group(control, &env, scope_b, &victim_org_b).await;
     let victim_group_a2 = plant_group(control, &env, scope_a2, &victim_org_a2).await;
 
@@ -82,6 +83,7 @@ async fn management_probes_deny_cross_tenant_and_cross_environment_uniformly() {
             "org_roles.get",
             "org_roles.delete",
             "org_groups.get",
+            "org_groups.update",
             "org_groups.delete",
             "org_groups.reparent",
         ],
@@ -186,16 +188,22 @@ async fn management_probes_deny_cross_tenant_and_cross_environment_uniformly() {
         "environment A2's role must survive the delete probe"
     );
 
-    // The victim groups must survive both the delete and the reparent probe, and
-    // must still be ROOTS: a cross-scope reparent that silently cleared a parent
-    // would leave the read intact while having mutated the foreign hierarchy.
+    // The victim groups must survive the update, delete, and reparent probes, must
+    // still carry their OWN display name, and must still be ROOTS: a cross-scope
+    // rename or reparent that landed would leave the read intact while having
+    // mutated the foreign organization's group, which is exactly the leak a
+    // liveness-only assertion would miss.
     for (scope, group) in [(scope_b, &victim_group_b), (scope_a2, &victim_group_a2)] {
         let record = control
             .management()
             .org_groups(scope)
             .get(group)
             .await
-            .expect("the victim group must survive the delete and reparent probes");
+            .expect("the victim group must survive the update, delete, and reparent probes");
+        assert_eq!(
+            record.display_name, "victim group",
+            "the victim group's display name must be untouched by the update probe"
+        );
         assert_eq!(
             record.parent_id, None,
             "the victim group's position in its own hierarchy must be untouched"

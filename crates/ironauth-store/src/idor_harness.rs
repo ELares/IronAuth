@@ -141,8 +141,8 @@ impl IdorHarness {
     /// `organizations.delete`), its membership join (`org_memberships.get`,
     /// `org_memberships.remove`), its role set (`org_roles.get`,
     /// `org_roles.delete`), and its group forest (`org_groups.get`,
-    /// `org_groups.delete`, `org_groups.reparent`), the two-thirds of the four-level
-    /// resource model
+    /// `org_groups.update`, `org_groups.delete`, `org_groups.reparent`), the
+    /// two-thirds of the four-level resource model
     /// that is tenant-and-environment scoped (operators, tenants, and environments
     /// are LEVEL tables whose isolation is exercised by the management-plane tests
     /// directly, not through the scope-embedding IDOR harness).
@@ -162,6 +162,7 @@ impl IdorHarness {
         self.register(Box::new(OrgRoleGetProbe));
         self.register(Box::new(OrgRoleDeleteProbe));
         self.register(Box::new(OrgGroupGetProbe));
+        self.register(Box::new(OrgGroupUpdateProbe));
         self.register(Box::new(OrgGroupDeleteProbe));
         self.register(Box::new(OrgGroupReparentProbe));
         self
@@ -713,6 +714,59 @@ impl IsolationProbe for OrgGroupGetProbe {
         })
     }
 }
+
+/// Built-in probe for `ActingOrgGroupRepo::update` (issue #97). `store` must
+/// authenticate as `ironauth_control`. Renaming another scope's group would be a
+/// cross-scope mutation, so it must be the uniform not-found.
+///
+/// Registered alongside the delete and reparent probes because `update` addresses a
+/// group by the SAME key they do (scope, organization, id), and a rename is not a
+/// lesser mutation than a delete: it rewrites the label the console and every
+/// operator reads. The organization the probe names is a fresh id in the CALLER's
+/// own scope, so the refusal must not depend on the caller guessing the group's real
+/// organization; the SAME-SCOPE cross-organization case, which this harness's
+/// tenant-and-environment axis cannot express, is pinned directly in the group store
+/// tests.
+struct OrgGroupUpdateProbe;
+
+impl IsolationProbe for OrgGroupUpdateProbe {
+    fn name(&self) -> &'static str {
+        "org_groups.update"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            let env = Env::system();
+            let Ok(id) = store.management().org_groups(caller).parse_id(foreign_id) else {
+                return ProbeOutcome::Denied;
+            };
+            let organization = OrganizationId::generate(&env, &caller);
+            let actor = ActorRef::service(ServiceId::generate(&env));
+            let correlation = CorrelationId::generate(&env);
+            let groups = store
+                .management()
+                .acting(actor, correlation)
+                .org_groups(caller);
+            match groups
+                .update(&env, &organization, &id, Some(PROBE_RENAME), None)
+                .await
+            {
+                Ok(()) => ProbeOutcome::Leaked,
+                Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// The display name the group update probe would write if it leaked. Distinctive so
+/// the planted victim's surviving name is an assertion the probe really was refused,
+/// not a coincidence.
+const PROBE_RENAME: &str = "leaked by the idor probe";
 
 /// Built-in probe for `ActingOrgGroupRepo::delete` (issue #97). `store` must
 /// authenticate as `ironauth_control`. Deleting another scope's group would be a

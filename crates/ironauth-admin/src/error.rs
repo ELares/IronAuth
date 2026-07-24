@@ -303,9 +303,16 @@ impl From<StoreError> for ApiError {
             StoreError::OrgGroupCycle => ApiError::Unprocessable(
                 "the requested parent would create a cycle in the group hierarchy".to_owned(),
             ),
+            // "AT LEAST" is exact, not hedging. Both recursive walks stop one level
+            // past the bound, so the depth they report SATURATES: against an
+            // already-over-deep hierarchy the number here is a FLOOR on the depth the
+            // write would have produced, never necessarily the depth itself. Wording
+            // it as an exact value would have an operator resolve a request that is
+            // "3 levels" over by raising the bound by 3 and watch it be refused
+            // again.
             StoreError::OrgGroupDepthExceeded { max, attempted } => {
                 ApiError::Unprocessable(format!(
-                    "the requested parent would nest groups {attempted} levels deep, \
+                    "the requested parent would nest groups at least {attempted} levels deep, \
                      exceeding the configured maximum of {max}"
                 ))
             }

@@ -13,7 +13,9 @@
 //!   * the configurable DEPTH bound is exact at the boundary and is measured over
 //!     the WHOLE moved subtree, not just the new edge;
 //!   * CONCURRENT reparents that would jointly close a cycle no single transaction
-//!     could observe cannot both commit (the advisory lock);
+//!     could observe cannot both commit, and a concurrent CREATE and reparent that
+//!     would jointly breach the depth bound cannot both commit either (the advisory
+//!     lock, on both the reparent's own acquisition and the shared placement gate's);
 //!   * every resolve-by-id surface is a uniform not-found for an absent, a deleted,
 //!     a foreign-organization, and a foreign-scope group alike, and the typed cycle
 //!     and depth errors are never an existence oracle for a group the caller cannot
@@ -267,6 +269,50 @@ async fn assert_acyclic(db: &TestDatabase, scope: Scope, org: &OrganizationId) {
     }
 }
 
+/// Assert no LIVE group of `org` sits more than `bound` edges below its root, and
+/// return how many nodes were measured.
+///
+/// The depth bound is the property the whole hierarchy check exists to hold, and it
+/// is a property of the STORED rows, so this reads them raw through the owner pool
+/// rather than trusting any repository projection. A parent that is not itself live
+/// terminates the chain, because that is exactly what every hierarchy walk does with
+/// a deleted parent.
+async fn assert_no_live_group_deeper_than(
+    db: &TestDatabase,
+    scope: Scope,
+    org: &OrganizationId,
+    bound: usize,
+) -> usize {
+    let edges = stored_edges(db, scope, org).await;
+    let live_parent_of = |id: &str| -> Option<String> {
+        edges
+            .iter()
+            .find(|(node, _)| node == id)
+            .and_then(|(_, parent)| parent.clone())
+            // A parent absent from the LIVE rows is a deleted one, which every walk
+            // treats as no parent at all.
+            .filter(|parent| edges.iter().any(|(node, _)| node == parent))
+    };
+    for (start, _) in &edges {
+        let mut current = start.clone();
+        let mut depth = 0_usize;
+        while let Some(parent) = live_parent_of(&current) {
+            current = parent;
+            depth += 1;
+            assert!(
+                depth <= edges.len(),
+                "the stored group graph contains a CYCLE reachable from {start}: {edges:?}"
+            );
+        }
+        assert!(
+            depth <= bound,
+            "the live group {start} is stored at depth {depth}, past the bound of \
+             {bound}: {edges:?}"
+        );
+    }
+    edges.len()
+}
+
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn group_create_get_list_rename_reparent_delete_round_trip_and_audits() {
@@ -328,7 +374,7 @@ async fn group_create_get_list_rename_reparent_delete_round_trip_and_audits() {
         .management()
         .acting(actor(&env), CorrelationId::generate(&env))
         .org_groups(scope)
-        .update(&env, &child, Some("Engineering"), None)
+        .update(&env, &org, &child, Some("Engineering"), None)
         .await
         .expect("rename group");
     let renamed = control
@@ -404,7 +450,7 @@ async fn group_create_get_list_rename_reparent_delete_round_trip_and_audits() {
             .management()
             .acting(actor(&env), CorrelationId::generate(&env))
             .org_groups(scope)
-            .update(&env, &child, Some("resurrected"), None)
+            .update(&env, &org, &child, Some("resurrected"), None)
             .await,
         Err(StoreError::NotFound)
     ));
@@ -964,9 +1010,21 @@ async fn absent_deleted_foreign_org_and_foreign_scope_groups_are_all_the_same_no
     let live = create_group(&db, &env, scope_a, &org_a, "engineering", None)
         .await
         .expect("live group");
-    let sibling = create_group(&db, &env, scope_a, &org_a, "sales", None)
+    // The parent that every unusable-SUBJECT probe below names, and it is
+    // deliberately the TAIL OF A CHAIN sitting at exactly `DEFAULT_DEPTH` rather than
+    // a fresh root. With a root, the depth verdict for any subject is `Ok` and the
+    // refusal falls through to the reparent statement's own `rows_affected() == 0`,
+    // so the loop would stay green even with the subject's anti-oracle resolution
+    // deleted. At the bound, a reparent that skipped that resolution would reach the
+    // hierarchy check and answer `OrgGroupDepthExceeded`, which names the configured
+    // bound and the attempted depth for a group the caller cannot even see. That is
+    // the failure the loop exists to catch, so the fixture has to be able to produce
+    // it.
+    let chain_length = usize::try_from(DEFAULT_DEPTH).expect("the default depth fits usize") + 1;
+    let sibling = *build_chain(&db, &env, scope_a, &org_a, chain_length)
         .await
-        .expect("sibling group");
+        .last()
+        .expect("a chain of at least one group has a tail");
     let deleted = create_group(&db, &env, scope_a, &org_a, "retired", None)
         .await
         .expect("group to delete");
@@ -1107,6 +1165,60 @@ async fn absent_deleted_foreign_org_and_foreign_scope_groups_are_all_the_same_no
     assert!(
         groups_a.get(&live).await.is_ok(),
         "a cross-organization delete attempt must not touch the victim"
+    );
+    // A RENAME under the wrong organization is the same containment question asked
+    // of the third group mutation, and it is asked here because `update` is the one
+    // that could plausibly have been written without it: a rename touches no
+    // hierarchy and needs no organization to do its job, so the organization is
+    // carried purely as the ADDRESS of the group. All three mutations therefore share
+    // one addressing key, and a nested management route built on any of them inherits
+    // the same guard rather than depending on the handler to re-derive it. Both
+    // mutable columns are named in the attempt, so a landed write shows up whichever
+    // one leaked.
+    assert!(matches!(
+        control
+            .management()
+            .acting(actor(&env), CorrelationId::generate(&env))
+            .org_groups(scope_a)
+            .update(
+                &env,
+                &other_org_a,
+                &live,
+                Some("renamed from a sibling organization"),
+                Some(&serde_json::json!({"owner": "the sibling organization"})),
+            )
+            .await,
+        Err(StoreError::NotFound)
+    ));
+    let untouched = groups_a
+        .get(&live)
+        .await
+        .expect("a cross-organization rename attempt must not touch the victim");
+    assert_eq!(
+        untouched.display_name, "Group",
+        "a cross-organization rename must not land on the victim's label"
+    );
+    assert_eq!(
+        untouched.metadata,
+        serde_json::json!({}),
+        "a cross-organization rename must not land on the victim's metadata"
+    );
+    // And the rename DOES land under the group's own organization, so the assertion
+    // above is about containment and not about the update being inert.
+    control
+        .management()
+        .acting(actor(&env), CorrelationId::generate(&env))
+        .org_groups(scope_a)
+        .update(&env, &org_a, &live, Some("Engineering"), None)
+        .await
+        .expect("a rename under the group's OWN organization is admitted");
+    assert_eq!(
+        groups_a
+            .get(&live)
+            .await
+            .expect("get after the in-organization rename")
+            .display_name,
+        "Engineering"
     );
     // Tenant B's group survives every probe above.
     assert!(
@@ -1257,6 +1369,171 @@ async fn concurrent_reparents_that_would_close_a_cycle_never_both_commit() {
     assert!(
         wins_total >= ROUNDS,
         "the storm never admitted a reparent, so it is not exercising the winning path"
+    );
+}
+
+/// A CREATE with a parent, racing a REPARENT that deepens that same parent, cannot
+/// jointly push a live group past the depth bound.
+///
+/// This is the second thing the advisory lock exists for and the only test that can
+/// observe the CREATE side of it. The storm above races reparent against reparent,
+/// and a reparent takes the lock itself, OUTSIDE the shared gate; it is therefore
+/// structurally incapable of noticing whether the gate takes one too. Remove the
+/// lock from `check_group_placement` and every other test in this file, and every
+/// unit test in the crate, stays green while this interleaving ships:
+///
+///   bound 1, two roots `R` and `P`. `T1` creates `G` under `P`, reads
+///   `parent_depth(P) = 0` and passes (`0 + 1 + 0 <= 1`). `T2` reparents `P` under
+///   `R`, reads `parent_depth(R) = 0` and `subtree_height(P) = 0` (because `G` is
+///   not committed yet) and passes. Both commit, leaving `R -> P -> G`: a LIVE node
+///   at depth 2 against a bound of 1, which no single transaction could observe.
+///
+/// The bound is not cosmetic. It is what makes the read-side ancestor walk on the
+/// token-issuance path terminate, so a graph that is quietly over-deep is a defect
+/// that surfaces later, somewhere else, as a truncated role set.
+///
+/// Serialized, exactly ONE of the two can be admitted whichever order they land in,
+/// so the outcome pair is asserted too: it is the same defect stated as a
+/// permission rather than as a stored depth. WHICH one wins is left to the
+/// scheduler and never asserted, because that would be a timing assertion; measured
+/// over three runs the split was 21/39, 24/36, and 31/29, so both orders are really
+/// being taken, and either order catches the defect on its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[allow(clippy::too_many_lines)]
+async fn a_concurrent_create_and_reparent_cannot_jointly_breach_the_depth_bound() {
+    const ROUNDS: usize = 60;
+    // The tightest bound that still admits a parent-child edge, so the joint effect
+    // of the two writes is over it by exactly one level and neither write is over it
+    // alone. A wider bound would need a deeper fixture to say the same thing.
+    const BOUND: u32 = 1;
+
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    // One shared, wide CONTROL pool so the two writers actually overlap rather than
+    // queueing on connections, which would hide the interleaving this test is for.
+    let store: Store = db.control_store_with_pool(8).await;
+
+    let org = create_org(&db, &env, scope, "Initech").await;
+
+    let mut creates_won = 0_usize;
+    let mut reparents_won = 0_usize;
+    for round in 0..ROUNDS {
+        // Two independent roots. `parent` is the group both writers reason about:
+        // the create reads its DEPTH, the reparent changes it.
+        let root = create_group_with(
+            &db,
+            &env,
+            scope,
+            &org,
+            &format!("root-{round}"),
+            None,
+            BOUND,
+        )
+        .await
+        .expect("root");
+        let parent = create_group_with(
+            &db,
+            &env,
+            scope,
+            &org,
+            &format!("parent-{round}"),
+            None,
+            BOUND,
+        )
+        .await
+        .expect("parent root");
+
+        let child_id = OrgGroupId::generate(&env, &scope);
+        let child_slug = format!("child-{round}");
+        let created_at = now_micros(&env);
+
+        let creating = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                let env = Env::system();
+                store
+                    .management()
+                    .acting(
+                        ActorRef::service(ServiceId::generate(&env)),
+                        CorrelationId::generate(&env),
+                    )
+                    .org_groups(scope)
+                    .create(
+                        &env,
+                        NewOrgGroup {
+                            id: &child_id,
+                            organization_id: &org,
+                            parent_id: Some(&parent),
+                            slug: &child_slug,
+                            display_name: "Group",
+                            metadata: None,
+                        },
+                        created_at,
+                        BOUND,
+                        None,
+                    )
+                    .await
+            })
+        };
+        let reparenting = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                let env = Env::system();
+                store
+                    .management()
+                    .acting(
+                        ActorRef::service(ServiceId::generate(&env)),
+                        CorrelationId::generate(&env),
+                    )
+                    .org_groups(scope)
+                    .reparent(&env, &org, &parent, Some(&root), BOUND)
+                    .await
+            })
+        };
+        let create_outcome = creating.await.expect("the create task panicked");
+        let reparent_outcome = reparenting.await.expect("the reparent task panicked");
+
+        // The invariant, on the RAW stored rows and over EVERY round's groups, not
+        // just this one: whatever the interleaving, nothing live is stored past the
+        // bound the writers were both given.
+        let measured = assert_no_live_group_deeper_than(
+            &db,
+            scope,
+            &org,
+            usize::try_from(BOUND).expect("the bound fits usize"),
+        )
+        .await;
+        assert!(
+            measured >= 2,
+            "round {round}: the fixture did not persist its roots, so the invariant \
+             above is vacuous"
+        );
+
+        // And the same defect stated as a permission. Serialized, the loser sees the
+        // winner's committed change and is refused for DEPTH; both admitted means the
+        // two checks each ran against a graph the other had already invalidated.
+        match (&create_outcome, &reparent_outcome) {
+            (Ok(()), Err(StoreError::OrgGroupDepthExceeded { .. })) => creates_won += 1,
+            (Err(StoreError::OrgGroupDepthExceeded { .. }), Ok(())) => reparents_won += 1,
+            (Ok(()), Ok(())) => panic!(
+                "round {round}: the create and the reparent BOTH committed, which puts \
+                 a live group one level past the bound of {BOUND} and is a state no \
+                 single transaction could observe"
+            ),
+            (create, reparent) => panic!(
+                "round {round}: expected exactly one of the two writes to be admitted \
+                 and the other refused for depth, got create={create:?} \
+                 reparent={reparent:?}"
+            ),
+        }
+    }
+    // Non-vacuity: every round admitted exactly one write, so the fixture really is
+    // exercising the winning path and not merely refusing everything.
+    assert_eq!(
+        creates_won + reparents_won,
+        ROUNDS,
+        "every round must admit exactly one of the two writes"
     );
 }
 
