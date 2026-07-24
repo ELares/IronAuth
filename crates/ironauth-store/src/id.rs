@@ -2049,25 +2049,48 @@ mod tests {
         // registry is read back out of this file's own source: a new kind is
         // covered the moment it is written, with no list to keep in sync.
         //
-        // The needle carries an ESCAPED quote in this file's bytes, so the scanner
-        // never matches its own source line.
+        // Two things keep the scanner honest about what it cannot read. The needle
+        // is assembled from fragments, so the scanner never matches its own source
+        // lines; and it matches the declaration in ANY spelling, taking the first
+        // quoted literal that follows it on the line. Keying on the fully written
+        // `&'static str` form would miss the elided form (which is what clippy
+        // prefers on an associated constant and what rustfmt leaves alone), and a
+        // declaration the scanner cannot see is a duplicate prefix free to ship.
+        //
+        // What makes the miss LOUD rather than silent is the count: the number of
+        // declarations read is compared for EQUALITY against the number of kind
+        // implementations found in the SAME source text, so an unreadable
+        // declaration trips a mismatch here instead of vanishing from the
+        // duplicate check below. A hand-set floor could not do that.
         let source = include_str!("id.rs");
-        let needle = "const PREFIX: &'static str = \"";
+        let needle = concat!("const ", "PREFIX");
         let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut declarations = 0_usize;
         for line in source.lines() {
             let Some(rest) = line.split_once(needle).map(|(_, rest)| rest) else {
                 continue;
             };
-            let Some((prefix, _)) = rest.split_once('"') else {
+            // The trait's own required-constant lines carry no literal: skip them.
+            let Some((_, after_quote)) = rest.split_once('"') else {
                 continue;
             };
+            let Some((prefix, _)) = after_quote.split_once('"') else {
+                continue;
+            };
+            declarations += 1;
             *seen.entry(prefix).or_default() += 1;
         }
-        assert!(
-            seen.len() >= 88,
-            "the prefix scanner found only {} declarations; it has stopped matching \
-             the declaration form and is no longer guarding anything",
-            seen.len()
+        let kinds = source
+            .lines()
+            .filter(|line| {
+                line.starts_with("impl ScopedKind for ") || line.starts_with("impl LevelKind for ")
+            })
+            .count();
+        assert_eq!(
+            declarations, kinds,
+            "the scanner read {declarations} prefix declarations but this file implements \
+             {kinds} identifier kinds; a declaration written in a spelling the scanner \
+             cannot read would carry a duplicate prefix past the check below"
         );
         let duplicates: Vec<&str> = seen
             .iter()

@@ -72,6 +72,22 @@ async fn create_role(
     slug: &str,
     display_name: &str,
 ) -> Result<OrgRoleId, StoreError> {
+    create_role_at(db, env, scope, org, slug, display_name, now_micros(env)).await
+}
+
+/// Define a role with an EXPLICIT creation time, so a test can pin several roles
+/// to the SAME `created_at` and exercise the `(created_at, id)` cursor tiebreak.
+/// The time still originates at the caller's env clock seam; nothing here reads a
+/// wall clock of its own.
+async fn create_role_at(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    org: &OrganizationId,
+    slug: &str,
+    display_name: &str,
+    created_at_micros: i64,
+) -> Result<OrgRoleId, StoreError> {
     let id = OrgRoleId::generate(env, &scope);
     db.control_store()
         .management()
@@ -86,7 +102,7 @@ async fn create_role(
                 display_name,
                 metadata: None,
             },
-            now_micros(env),
+            created_at_micros,
             None,
         )
         .await
@@ -367,6 +383,145 @@ async fn an_organization_may_hold_unlimited_roles_and_the_list_pages_them() {
     seen.sort();
     seen.dedup();
     assert_eq!(seen.len(), total, "no role is dropped or double counted");
+}
+
+#[tokio::test]
+async fn the_role_list_is_confined_to_one_organization_within_a_shared_scope() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let control = db.control_store();
+
+    // TWO organizations in the SAME scope, both holding live roles. Row-level
+    // security cannot fence these from each other (both sit in the caller's bound
+    // scope), so the organization predicate in the list statement is the ONLY
+    // thing separating them, and it needs a second organization present to be
+    // observable at all. With just one organization in the fixture the predicate
+    // could be dropped outright and every other assertion in this file would stay
+    // green while the nested "roles in this organization" list served every role
+    // in the environment: a cross-organization read leak.
+    let globex = create_org(&db, &env, scope, "Globex").await;
+    let initech = create_org(&db, &env, scope, "Initech").await;
+
+    let globex_slugs = ["billing.admin", "billing.viewer"];
+    let initech_slugs = ["auditor"];
+    for slug in globex_slugs {
+        create_role(&db, &env, scope, &globex, slug, "Role")
+            .await
+            .expect("role in Globex");
+    }
+    for slug in initech_slugs {
+        create_role(&db, &env, scope, &initech, slug, "Role")
+            .await
+            .expect("role in Initech");
+    }
+
+    // Each organization's list is EXACTLY its own set: not a superset carrying the
+    // sibling's roles, and not empty.
+    for (org, expected) in [
+        (&globex, globex_slugs.as_slice()),
+        (&initech, initech_slugs.as_slice()),
+    ] {
+        let listed = control
+            .management()
+            .org_roles(scope)
+            .list_for_org(org, 50, None)
+            .await
+            .expect("list roles for one organization");
+        let mut slugs: Vec<&str> = listed.iter().map(|role| role.slug.as_str()).collect();
+        slugs.sort_unstable();
+        let mut want: Vec<&str> = expected.to_vec();
+        want.sort_unstable();
+        assert_eq!(
+            slugs, want,
+            "an organization's role list must hold exactly its own roles"
+        );
+        assert!(
+            listed.iter().all(|role| &role.organization_id == org),
+            "every listed role must belong to the organization that was asked for"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_list_cursor_stays_total_and_stable_across_a_tied_created_at() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let control = db.control_store();
+
+    let org = create_org(&db, &env, scope, "Globex").await;
+
+    // Every role shares ONE creation instant, so `created_at` alone cannot order
+    // them and the id half of the (created_at, id) pagination key is the only
+    // thing making the order total. A tie is exactly where a cursor loses
+    // determinism: the boundary row is served twice, or skipped. Determinism of
+    // listing is an acceptance criterion of issue #97, so it is pinned here rather
+    // than left to the accident of distinct clock readings. The instant is taken
+    // once from the env clock seam and reused, never re-read per row.
+    let tied = now_micros(&env);
+    let total = 9_usize;
+    for index in 0..total {
+        create_role_at(
+            &db,
+            &env,
+            scope,
+            &org,
+            &format!("tied-{index}"),
+            &format!("Tied {index}"),
+            tied,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("role {index} must be creatable: {error:?}"));
+    }
+
+    // The whole set in one unpaged read: the reference order, in the database's
+    // own terms rather than any assumption about how Rust would sort the ids.
+    let whole = control
+        .management()
+        .org_roles(scope)
+        .list_for_org(&org, 50, None)
+        .await
+        .expect("unpaged list of the tied set");
+    let reference: Vec<String> = whole.iter().map(|role| role.id.to_string()).collect();
+    assert_eq!(reference.len(), total, "the whole tied set is listed");
+    let mut distinct = reference.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(distinct.len(), total, "the listed ids are distinct");
+    assert!(
+        whole.iter().all(|role| role.created_at_unix_micros == tied),
+        "the tie is real: every row shares one creation time"
+    );
+
+    // Walk the same set in pages of four, TWICE. A page boundary lands inside the
+    // tie, which is where a cursor keyed on created_at alone would repeat or drop
+    // a row.
+    for attempt in 0..2 {
+        let mut walked: Vec<String> = Vec::new();
+        let mut cursor: Option<CursorPosition> = None;
+        loop {
+            let page = control
+                .management()
+                .org_roles(scope)
+                .list_for_org(&org, 4, cursor.as_ref())
+                .await
+                .expect("page of the tied set");
+            let Some(last) = page.last() else {
+                break;
+            };
+            cursor = Some(CursorPosition {
+                created_at_unix_micros: last.created_at_unix_micros,
+                id: last.id.to_string(),
+            });
+            walked.extend(page.iter().map(|role| role.id.to_string()));
+        }
+        assert_eq!(
+            walked, reference,
+            "walk {attempt}: paging a tied set must reproduce the unpaged order exactly, \
+             with no row skipped and none served twice at a page boundary"
+        );
+    }
 }
 
 #[tokio::test]
@@ -665,11 +820,12 @@ async fn the_data_plane_can_read_a_role_but_never_write_one() {
 
     // Every MUTATING statement is refused as insufficient privilege: the data plane
     // can look a role up but never define, rename, delete, or hard-remove one.
-    assert_denied_in_scope(pool, &tenant, &environment, "DELETE FROM org_roles").await;
+    assert_denied_in_scope(pool, &tenant, &environment, &org, "DELETE FROM org_roles").await;
     assert_denied_in_scope(
         pool,
         &tenant,
         &environment,
+        &org,
         "UPDATE org_roles SET display_name = 'tampered'",
     )
     .await;
@@ -677,15 +833,23 @@ async fn the_data_plane_can_read_a_role_but_never_write_one() {
         pool,
         &tenant,
         &environment,
+        &org,
         "UPDATE org_roles SET deleted_at = now()",
     )
     .await;
+    // The forge probe writes a row that is valid in EVERY respect but the grant:
+    // the session's own scope, a real organization of that scope, and a slug and
+    // display name the CHECKs accept. If the data plane ever gained INSERT, whether
+    // table-wide or column-scoped, this statement would SUCCEED rather than fail
+    // with a different error, so the assertion cannot be satisfied by a refusal
+    // that has nothing to do with privilege.
     assert_denied_in_scope(
         pool,
         &tenant,
         &environment,
+        &org,
         "INSERT INTO org_roles (id, tenant_id, environment_id, organization_id, slug, \
-         display_name) VALUES ('rol_probe', 'probe', 'probe', 'probe', 'probe', 'probe')",
+         display_name) VALUES ('rol_probe', $1, $2, $3, 'probe', 'probe')",
     )
     .await;
 
@@ -695,6 +859,7 @@ async fn the_data_plane_can_read_a_role_but_never_write_one() {
         db.control_pool(),
         &tenant,
         &environment,
+        &org,
         "UPDATE org_roles SET slug = 'tampered'",
     )
     .await;
@@ -751,15 +916,32 @@ async fn the_slug_charset_check_refuses_a_malformed_slug() {
 
 /// Run `statement` in a scoped transaction on `pool` and assert it is refused as
 /// insufficient privilege.
+///
+/// A statement carrying placeholders binds `$1` and `$2` to the session's OWN
+/// (tenant, environment) and `$3` to `organization`, so a probe INSERT writes a
+/// row that SATISFIES the row-level-security WITH CHECK (and the organization
+/// foreign key), leaving the missing GRANT as the only thing that can refuse it.
+/// That distinction is the whole point of the probe: Postgres reports a policy
+/// refusal and a privilege refusal under the SAME SQLSTATE (42501), so a probe
+/// writing literal foreign scope values would be rejected by the policy no matter
+/// how far the grant was widened, and could never observe the grant at all.
 async fn assert_denied_in_scope(
     pool: &sqlx::PgPool,
     tenant: &str,
     environment: &str,
+    organization: &OrganizationId,
     statement: &str,
 ) {
     let mut tx = pool.begin().await.expect("begin denied-statement tx");
     bind_scope(&mut tx, tenant, environment).await;
-    let result = sqlx::query(statement).execute(&mut *tx).await;
+    let mut query = sqlx::query(statement);
+    if statement.contains("$1") {
+        query = query
+            .bind(tenant)
+            .bind(environment)
+            .bind(organization.to_string());
+    }
+    let result = query.execute(&mut *tx).await;
     assert!(
         result.as_ref().err().is_some_and(|error| error
             .as_database_error()

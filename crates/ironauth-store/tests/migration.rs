@@ -132,6 +132,35 @@ async fn role_has_column_privilege(
         .get("present")
 }
 
+/// Whether `role` holds `privilege` on ANY live column of `table`, swept over the
+/// catalog rather than a hand-written column list (so a column added later is
+/// covered the moment it exists).
+///
+/// This is the only way to prove a role holds NO write grant of any shape:
+/// `has_table_privilege` does NOT see a COLUMN-scoped grant, so
+/// `GRANT INSERT (id, ...) ON t TO r` leaves the table-wide probe reading false
+/// while genuinely allowing the write.
+async fn role_has_any_column_privilege(
+    pool: &sqlx::PgPool,
+    role: &str,
+    table: &str,
+    privilege: &str,
+) -> bool {
+    sqlx::query(
+        "SELECT COALESCE(bool_or(has_column_privilege($1, c.oid, a.attnum, $3)), false) \
+         AS present \
+         FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid \
+         WHERE c.relname::text = $2 AND a.attnum > 0 AND NOT a.attisdropped",
+    )
+    .bind(role)
+    .bind(table)
+    .bind(privilege)
+    .fetch_one(pool)
+    .await
+    .expect("column privilege sweep")
+    .get("present")
+}
+
 /// Whether the VIEW `view` exposes an output column named `column` (`pg_class` relkind `v`).
 /// Used to prove the scope-forced guardrail projection actually SURFACES a column to the data
 /// plane, not merely that the base table carries it.
@@ -4769,6 +4798,53 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
             "the data-plane grant on org_roles must be SELECT only (no {privilege})"
         );
     }
+    // Those table-wide probes cannot see a COLUMN-scoped grant, which is a real way
+    // for the data plane to gain a write on org_roles while every assertion here
+    // stays green. That half of the least-privilege argument is closed by
+    // `the_data_plane_holds_no_column_scoped_write_grant_on_org_roles` below.
+}
+
+/// The data plane holds NO write grant of any shape on `org_roles` (issue #97, 0086).
+///
+/// The table-wide `has_table_privilege` probes in the production-chain assertions
+/// above cannot see a COLUMN-scoped grant: `GRANT INSERT (id, tenant_id,
+/// environment_id, organization_id, slug, display_name) ON org_roles TO
+/// ironauth_app` leaves every one of them reading false while genuinely letting the
+/// token-issuance data plane forge a role in its own scope, which is precisely the
+/// least-privilege invariant issue #97 states (nothing on the data plane ever
+/// writes a role) and which the token seam later in the issue depends on. Sweeping
+/// every column closes that gap, so the invariant is a physical property of the
+/// schema rather than a claim about which code paths happen to exist.
+///
+/// This is its own test rather than more lines in the production-chain test: that
+/// function's future is already at the stack budget of a default test thread, and
+/// anything added to its body aborts the process on a stack overflow.
+#[tokio::test]
+async fn the_data_plane_holds_no_column_scoped_write_grant_on_org_roles() {
+    let db = TestDatabase::start().await;
+    let pool = db.owner_pool();
+
+    // INSERT, UPDATE, and REFERENCES are the write-shaped privileges Postgres can
+    // grant per column (DELETE has no column form and is asserted table-wide with
+    // the rest of the 0086 grants).
+    for privilege in ["INSERT", "UPDATE", "REFERENCES"] {
+        assert!(
+            !role_has_any_column_privilege(pool, "ironauth_app", "org_roles", privilege).await,
+            "the data plane must hold NO column-scoped {privilege} on org_roles"
+        );
+    }
+    // A positive control, so a sweep that simply answered "no" to everything could
+    // not pass this test: the data plane DOES hold the column-scoped SELECT that
+    // the token-issuance role read needs, and the control plane DOES hold the
+    // column-scoped UPDATE that a rename needs.
+    assert!(
+        role_has_any_column_privilege(pool, "ironauth_app", "org_roles", "SELECT").await,
+        "the data plane holds SELECT on org_roles (the token-issuance read)"
+    );
+    assert!(
+        role_has_any_column_privilege(pool, "ironauth_control", "org_roles", "UPDATE").await,
+        "the control plane holds the column-scoped UPDATE a rename needs"
+    );
 }
 
 #[tokio::test]
