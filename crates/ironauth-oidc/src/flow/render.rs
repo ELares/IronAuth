@@ -321,6 +321,7 @@ fn flow_title(flow: &Flow) -> message::MessageId {
         // The generic node renderer draws the actual form from `ui.nodes`.
         FlowStateTag::IdentifierPassword
         | FlowStateTag::ProgressiveProfiling
+        | FlowStateTag::OrgPicker
         | FlowStateTag::Custom
         | FlowStateTag::Completed => message::LOGIN_TITLE,
     }

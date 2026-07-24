@@ -755,6 +755,7 @@ fn route_hop(compiled: &CompiledJourney, start: &str, base: &EvalContext) -> Hop
             | StepKind::MfaChallenge
             | StepKind::MfaEnroll
             | StepKind::ProgressiveProfiling
+            | StepKind::OrgPicker
             | StepKind::Registration
             | StepKind::RecoveryStart
             | StepKind::RecoveryVerify => {

@@ -177,6 +177,15 @@ pub enum StepKind {
     MfaEnroll,
     /// A progressive-profiling step that collects held later-login fields.
     ProgressiveProfiling,
+    /// An organization-picker step (issue #94, PR-B2): a multi-organization subject with no
+    /// `organization` request parameter chooses which of their live-and-active memberships this
+    /// login binds as its DURABLE org context. It READS the already-established subject to list
+    /// their memberships (so it is a [`StepKind::requires_subject`] kind), RENDERS the choice only
+    /// for a multi-org, no-parameter subject, and SKIPS (rendering nothing, so the flow auto-
+    /// advances) when the org context is already determined (a parameter was supplied, or the
+    /// subject has at most one active membership). It is NOT built-in-only (a custom journey may
+    /// use it, exactly like [`StepKind::ProgressiveProfiling`]).
+    OrgPicker,
     /// A pure routing hub: it renders nothing and runs no executor, and the engine routes
     /// onward through this step's own guarded transitions (the transition guards carry the
     /// branching predicates). Its `decision` attachment is OPTIONAL (issue #351): when ABSENT the
@@ -210,15 +219,16 @@ pub enum StepKind {
 }
 
 impl StepKind {
-    /// The ten built-in kind wire strings, in declaration order. This is the closed set the
+    /// The eleven built-in kind wire strings, in declaration order. This is the closed set the
     /// published JSON Schema enumerates and the load-time validator accepts. The three
     /// mint-family kinds ([`StepKind::Registration`], [`StepKind::RecoveryStart`],
     /// [`StepKind::RecoveryVerify`]) are BUILT-IN-ONLY (see [`StepKind::is_builtin_only`]).
-    pub const BUILT_IN: [&'static str; 10] = [
+    pub const BUILT_IN: [&'static str; 11] = [
         "identifier_password",
         "mfa_challenge",
         "mfa_enroll",
         "progressive_profiling",
+        "org_picker",
         "decision",
         "subflow_call",
         "terminal",
@@ -236,6 +246,7 @@ impl StepKind {
             StepKind::MfaChallenge => "mfa_challenge",
             StepKind::MfaEnroll => "mfa_enroll",
             StepKind::ProgressiveProfiling => "progressive_profiling",
+            StepKind::OrgPicker => "org_picker",
             StepKind::Decision => "decision",
             StepKind::SubflowCall => "subflow_call",
             StepKind::Terminal => "terminal",
@@ -255,6 +266,7 @@ impl StepKind {
             "mfa_challenge" => StepKind::MfaChallenge,
             "mfa_enroll" => StepKind::MfaEnroll,
             "progressive_profiling" => StepKind::ProgressiveProfiling,
+            "org_picker" => StepKind::OrgPicker,
             "decision" => StepKind::Decision,
             "subflow_call" => StepKind::SubflowCall,
             "terminal" => StepKind::Terminal,
@@ -280,12 +292,12 @@ impl StepKind {
     /// [`crate::compile_builtin`] admits them for the embedded built-in journeys that converge onto
     /// the compiled table.
     ///
-    /// The pre-existing kinds ([`StepKind::IdentifierPassword`], the MFA kinds, and
-    /// [`StepKind::ProgressiveProfiling`]) STAY custom-usable exactly as before: although
-    /// `identifier_password` and the MFA kinds also prove factors, they authenticate an EXISTING
-    /// subject the primary factor established and never create an account, and the AC1 custom
-    /// fixture composes them, so they are not built-in-only. Only the account-creating and
-    /// recovery-minting kinds are gated.
+    /// The pre-existing kinds ([`StepKind::IdentifierPassword`], the MFA kinds,
+    /// [`StepKind::ProgressiveProfiling`], and [`StepKind::OrgPicker`]) STAY custom-usable exactly
+    /// as before: although `identifier_password` and the MFA kinds also prove factors, they
+    /// authenticate an EXISTING subject the primary factor established and never create an account,
+    /// and `org_picker` (issue #94, PR-B2) only selects an already-owned organization context, so
+    /// none is built-in-only. Only the account-creating and recovery-minting kinds are gated.
     #[must_use]
     pub fn is_builtin_only(&self) -> bool {
         matches!(
@@ -301,17 +313,21 @@ impl StepKind {
     }
 
     /// Whether this kind READS an already-established subject and so cannot run before one exists
-    /// (issue #351): the second-factor kinds ([`StepKind::MfaChallenge`], [`StepKind::MfaEnroll`])
-    /// and [`StepKind::ProgressiveProfiling`] all resolve the flow's subject (through the engine's
-    /// `mfa_context`) before they render, so a journey that routes into one with no preceding
-    /// subject-establishing step is permanently broken. The load-time validator's
-    /// `check_subject_establishment` uses this to refuse such an artifact. Disjoint from
-    /// [`StepKind::establishes_subject`].
+    /// (issue #351): the second-factor kinds ([`StepKind::MfaChallenge`], [`StepKind::MfaEnroll`]),
+    /// [`StepKind::ProgressiveProfiling`], and [`StepKind::OrgPicker`] all resolve the flow's
+    /// subject (through the engine's `mfa_context`) before they render, so a journey that routes
+    /// into one with no preceding subject-establishing step is permanently broken. The
+    /// load-time validator's `check_subject_establishment` uses this to refuse such an artifact.
+    /// Disjoint from [`StepKind::establishes_subject`]. [`StepKind::OrgPicker`] (issue #94, PR-B2)
+    /// reads the subject to list their organization memberships, so it joins this set.
     #[must_use]
     pub fn requires_subject(&self) -> bool {
         matches!(
             self,
-            StepKind::MfaChallenge | StepKind::MfaEnroll | StepKind::ProgressiveProfiling
+            StepKind::MfaChallenge
+                | StepKind::MfaEnroll
+                | StepKind::ProgressiveProfiling
+                | StepKind::OrgPicker
         )
     }
 
@@ -704,6 +720,7 @@ mod tests {
             "mfa_challenge",
             "mfa_enroll",
             "progressive_profiling",
+            "org_picker",
             "decision",
             "subflow_call",
             "terminal",
@@ -713,15 +730,21 @@ mod tests {
                 "{wire} stays custom-usable"
             );
         }
-        // The closed built-in set grew from seven to ten.
-        assert_eq!(StepKind::BUILT_IN.len(), 10);
+        // The closed built-in set grew from seven to ten, then to eleven with org_picker.
+        assert_eq!(StepKind::BUILT_IN.len(), 11);
     }
 
     #[test]
     fn the_subject_taxonomy_is_disjoint_and_correct() {
-        // Issue #351: requires_subject and establishes_subject are disjoint. The second-factor and
-        // profiling kinds read a subject; identifier_password and the two minting kinds establish one.
-        for wire in ["mfa_challenge", "mfa_enroll", "progressive_profiling"] {
+        // Issue #351: requires_subject and establishes_subject are disjoint. The second-factor,
+        // profiling, and org-picker kinds read a subject; identifier_password and the two minting
+        // kinds establish one.
+        for wire in [
+            "mfa_challenge",
+            "mfa_enroll",
+            "progressive_profiling",
+            "org_picker",
+        ] {
             let kind = StepKind::from_wire(wire);
             assert!(kind.requires_subject(), "{wire} reads a subject");
             assert!(!kind.establishes_subject(), "{wire} does not establish one");

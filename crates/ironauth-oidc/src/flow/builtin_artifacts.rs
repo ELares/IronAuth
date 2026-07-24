@@ -130,21 +130,30 @@ fn login_artifact() -> JourneyDoc {
             step("mfa_chal", StepKind::MfaChallenge, Some("totp")),
             step("mfa_enrl", StepKind::MfaEnroll, Some("totp")),
             step("profiling", StepKind::ProgressiveProfiling, Some("profile")),
+            step("org_picker", StepKind::OrgPicker, None),
             step("done", StepKind::Terminal, None),
         ],
         // Document order is load-bearing (see the doc comment above): the primary router priority
-        // is Challenge (edge 1) > Enroll (edge 2) > profiling (edge 3) > direct mint (edge 4), and
-        // after a second factor the priority is profiling (edges 5, 7) > mint (edges 6, 8).
+        // is Challenge (edge 1) > Enroll (edge 2) > profiling (edge 3) > org picker (edge 4), and
+        // after a second factor the priority is profiling (edges 5, 7) > org picker (edges 6, 8).
+        //
+        // The organization picker (issue #94, PR-B2) is the SINGLE pre-terminal choke every login
+        // path funnels through: each formerly-direct `-> done` fallback now routes to `org_picker`,
+        // and the one unguarded `org_picker -> done` edge closes the walk. The picker RENDERS the
+        // choice only for a multi-org, no-parameter subject and SKIPS otherwise (auto-advancing
+        // in-call to the terminal), so a single-org / no-membership / parameter login mints in the
+        // SAME drive call with no rendered picker, byte-identical to before this step existed.
         transitions: vec![
             signal_edge("primary", "mfa_chal", "/mfa_required"),
             signal_edge("primary", "mfa_enrl", "/enroll_required"),
             signal_edge("primary", "profiling", "/profiling_pending"),
-            edge("primary", "done"),
+            edge("primary", "org_picker"),
             signal_edge("mfa_chal", "profiling", "/profiling_pending"),
-            edge("mfa_chal", "done"),
+            edge("mfa_chal", "org_picker"),
             signal_edge("mfa_enrl", "profiling", "/profiling_pending"),
-            edge("mfa_enrl", "done"),
-            edge("profiling", "done"),
+            edge("mfa_enrl", "org_picker"),
+            edge("profiling", "org_picker"),
+            edge("org_picker", "done"),
         ],
         subflows: None,
         subflow_definitions: None,
@@ -266,18 +275,28 @@ mod tests {
         // five-step machine PR 8b flips the imperative login journey onto.
         let compiled = login_compiled();
         assert_eq!(compiled.entry, "primary");
-        assert_eq!(compiled.steps.len(), 5);
+        // The five-step login machine gained the organization picker (issue #94, PR-B2).
+        assert_eq!(compiled.steps.len(), 6);
         // The document-order priority the routing depends on: from `primary`, challenge before
-        // enroll before profiling before the unguarded direct mint.
+        // enroll before profiling before the unguarded fallback to the organization picker.
         let primary_edges = compiled.edges("primary");
         assert_eq!(primary_edges.len(), 4);
         assert_eq!(primary_edges[0].to, "mfa_chal");
         assert_eq!(primary_edges[1].to, "mfa_enrl");
         assert_eq!(primary_edges[2].to, "profiling");
-        assert_eq!(primary_edges[3].to, "done");
+        assert_eq!(primary_edges[3].to, "org_picker");
         assert!(
             primary_edges[3].guard.is_none(),
-            "the direct-mint fallback edge is unguarded"
+            "the fallback edge to the organization picker is unguarded"
+        );
+        // The organization picker has one unguarded forward edge to the terminal (issue #94,
+        // PR-B2): the picker skips-or-renders, and an accepted pick advances straight to the mint.
+        let picker_edges = compiled.edges("org_picker");
+        assert_eq!(picker_edges.len(), 1);
+        assert_eq!(picker_edges[0].to, "done");
+        assert!(
+            picker_edges[0].guard.is_none(),
+            "the org_picker -> done edge is unguarded"
         );
         // Every step is reachable and a completion is reachable (liveness).
         assert!(compiled.reachable().contains("done"));

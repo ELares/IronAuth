@@ -25,6 +25,7 @@ use serde_json::{Value, json};
 use super::consent::{self, ConsentClient};
 use super::message::{self, Message};
 use super::model::{CONTRACT_VERSION, Flow, FlowStateTag, Journey, Node, Transport, Ui};
+use super::org_picker::{self, ActiveOrg};
 use super::submit_action_for;
 use super::{federation, login, mfa, recovery, registration};
 use crate::totp::FlowEnrollBegin;
@@ -251,6 +252,10 @@ fn push_transport_goldens(
         Some(GOLDEN_RESUME),
     ));
 
+    // Organization picker (issue #94, PR-B2): the multi-org login choice (see
+    // [`push_org_picker_golden`]).
+    push_org_picker_golden(corpus, transport, id);
+
     // Consent (issue #88): the prompt state (see [`push_consent_golden`]).
     push_consent_golden(corpus, transport, id);
 
@@ -273,6 +278,35 @@ fn push_custom_golden(corpus: &mut Vec<GoldenFlow>, transport: Transport, id: &s
         Journey::Custom,
         FlowStateTag::Custom,
         login::start_nodes(transport, id),
+        Vec::new(),
+        None,
+    ));
+}
+
+/// Push the organization picker golden for one transport (issue #94, PR-B2): a fixed pair of active
+/// organizations rendered as the multi-org login choice on the `OrgPicker` wire state. The nodes
+/// come from the SAME `org_picker::picker_nodes` builder the live engine calls (the picker's
+/// render-or-skip decision and its store reads live in the engine; the golden pins only the RENDER
+/// shape), so a breaking change to the picker's node set trips this golden. Additive: it never
+/// touches the existing goldens.
+fn push_org_picker_golden(corpus: &mut Vec<GoldenFlow>, transport: Transport, id: &str) {
+    let suffix = transport.as_str();
+    let orgs = [
+        ActiveOrg {
+            id: "org_golden0000000000000000000a".to_owned(),
+            display_name: "Acme Corp".to_owned(),
+        },
+        ActiveOrg {
+            id: "org_golden0000000000000000000b".to_owned(),
+            display_name: "Globex".to_owned(),
+        },
+    ];
+    corpus.push(golden(
+        leaked(format!("login_org_picker_{suffix}")),
+        transport,
+        Journey::Login,
+        FlowStateTag::OrgPicker,
+        org_picker::picker_nodes(transport, id, &orgs),
         Vec::new(),
         None,
     ));

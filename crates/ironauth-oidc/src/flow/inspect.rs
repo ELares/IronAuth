@@ -206,6 +206,7 @@ fn projected_state(journey: Journey, kind: &StepKind) -> Option<FlowStateTag> {
         | StepKind::MfaChallenge
         | StepKind::MfaEnroll
         | StepKind::ProgressiveProfiling
+        | StepKind::OrgPicker
         | StepKind::Registration
         | StepKind::RecoveryStart
         | StepKind::RecoveryVerify => Some(wire_state_for(journey, kind)),
@@ -342,8 +343,12 @@ fn canonical_nodes(
         // builder, which the pure inspector (no compiled table, no store handle) cannot
         // synthesize, so it projects an empty node set like the progressive profiling and consent
         // states.
+        // The organization picker (issue #94, PR-B2) renders DYNAMIC nodes from the subject's LIVE
+        // organization memberships, which the pure inspector (no store handle) cannot synthesize, so
+        // it too projects an empty node set.
         FlowStateTag::Completed
         | FlowStateTag::ProgressiveProfiling
+        | FlowStateTag::OrgPicker
         | FlowStateTag::ConsentPrompt
         | FlowStateTag::Custom => Vec::new(),
     }
@@ -1208,6 +1213,7 @@ mod tests {
             identifier: Some("RECOVERYIDENTIFIERPIISENTINEL".to_owned()),
             connector: Some("acme-oidc".to_owned()),
             custom_step: None,
+            org_context: None,
         };
         let context = FlowContextView::from_state(&persisted);
         write!(

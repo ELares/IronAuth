@@ -127,7 +127,8 @@ impl Journey {
     pub fn plan(self) -> &'static [FlowStateTag] {
         use FlowStateTag::{
             Completed, ConsentPrompt, FederationStart, IdentifierPassword, MfaChallenge, MfaEnroll,
-            ProgressiveProfiling, RecoveryAck, RecoveryStart, RegistrationAck, RegistrationDetails,
+            OrgPicker, ProgressiveProfiling, RecoveryAck, RecoveryStart, RegistrationAck,
+            RegistrationDetails,
         };
         match self {
             Journey::Login => &[
@@ -135,6 +136,7 @@ impl Journey {
                 MfaChallenge,
                 MfaEnroll,
                 ProgressiveProfiling,
+                OrgPicker,
                 Completed,
             ],
             Journey::Registration => &[RegistrationDetails, RegistrationAck, Completed],
@@ -202,6 +204,13 @@ pub enum FlowStateTag {
     /// (a missing required later-login field prompts but never blocks the mint), so the flow
     /// stays OPEN on a re-render and mints on a skip or a valid submission.
     ProgressiveProfiling,
+    /// The organization picker (issue #94, PR-B2): a HELD login step where a multi-organization
+    /// subject with no `organization` request parameter chooses which of their live-and-active
+    /// memberships this login binds as its DURABLE org context. Reached FROM a login flow after the
+    /// auth factors, it renders ONLY for a multi-org, no-parameter subject and SKIPS (auto-advances
+    /// to the mint) otherwise, so the frozen pick flows to the session and, through PR-B1's relay,
+    /// onto the tokens' `org_id`. The flow stays OPEN until a valid pick mints the session.
+    OrgPicker,
     /// The recovery identifier entry (the recovery start state).
     RecoveryStart,
     /// The uniform recovery acknowledgment plus one-time-code entry: the #64 anti-enumeration

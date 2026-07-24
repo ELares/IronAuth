@@ -1,0 +1,22 @@
+{
+  "journey_id": "login_org_picker",
+  "engine_version": 2,
+  "description": "Multi-organization pick golden path: the primary factor establishes the subject, the walk enters the organization picker (which renders the choice for a multi-org, no-parameter subject), and an accepted pick advances straight to the terminal mint.",
+  "steps": [
+    {
+      "comment": "At the primary factor, the subject is verified; the walk enters the organization picker.",
+      "signals": [
+        "primary_verified"
+      ],
+      "expect": {
+        "step": "picker"
+      }
+    },
+    {
+      "comment": "A valid organization pick advances the picker straight to the terminal mint.",
+      "expect": {
+        "terminal": "done"
+      }
+    }
+  ]
+}

@@ -136,6 +136,11 @@
           "type": "string"
         },
         {
+          "const": "org_picker",
+          "description": "The organization picker (issue #94, PR-B2): a HELD login step where a multi-organization\nsubject with no `organization` request parameter chooses which of their live-and-active\nmemberships this login binds as its DURABLE org context. Reached FROM a login flow after the\nauth factors, it renders ONLY for a multi-org, no-parameter subject and SKIPS (auto-advances\nto the mint) otherwise, so the frozen pick flows to the session and, through PR-B1's relay,\nonto the tokens' `org_id`. The flow stays OPEN until a valid pick mints the session.",
+          "type": "string"
+        },
+        {
           "const": "recovery_start",
           "description": "The recovery identifier entry (the recovery start state).",
           "type": "string"

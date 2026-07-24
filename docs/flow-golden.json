@@ -708,6 +708,154 @@
         ]
       }
     },
+    "login_org_picker_api": {
+      "contract_version": 2,
+      "expires_at": 900,
+      "id": "flw_golden00000000000000000000",
+      "journey": "login",
+      "state": "org_picker",
+      "transport": "api",
+      "ui": {
+        "action": "/t/tnt_golden/e/env_golden/flow/api/login/submit",
+        "messages": [],
+        "method": "POST",
+        "nodes": [
+          {
+            "attributes": {
+              "message": {
+                "context": {},
+                "id": 1090001,
+                "kind": "info",
+                "text": "Choose the organization to continue as."
+              },
+              "node_type": "text"
+            },
+            "group": "default",
+            "messages": []
+          },
+          {
+            "attributes": {
+              "disabled": false,
+              "input_type": "submit",
+              "name": "organization",
+              "node_type": "input",
+              "required": false,
+              "value": "org_golden0000000000000000000a"
+            },
+            "group": "submit",
+            "label": {
+              "context": {
+                "name": "Acme Corp"
+              },
+              "id": 1090002,
+              "kind": "info",
+              "text": "Continue"
+            },
+            "messages": []
+          },
+          {
+            "attributes": {
+              "disabled": false,
+              "input_type": "submit",
+              "name": "organization",
+              "node_type": "input",
+              "required": false,
+              "value": "org_golden0000000000000000000b"
+            },
+            "group": "submit",
+            "label": {
+              "context": {
+                "name": "Globex"
+              },
+              "id": 1090002,
+              "kind": "info",
+              "text": "Continue"
+            },
+            "messages": []
+          }
+        ]
+      }
+    },
+    "login_org_picker_browser": {
+      "contract_version": 2,
+      "expires_at": 900,
+      "id": "flw_golden00000000000000000000",
+      "journey": "login",
+      "state": "org_picker",
+      "transport": "browser",
+      "ui": {
+        "action": "/t/tnt_golden/e/env_golden/flow/login",
+        "messages": [],
+        "method": "POST",
+        "nodes": [
+          {
+            "attributes": {
+              "message": {
+                "context": {},
+                "id": 1090001,
+                "kind": "info",
+                "text": "Choose the organization to continue as."
+              },
+              "node_type": "text"
+            },
+            "group": "default",
+            "messages": []
+          },
+          {
+            "attributes": {
+              "disabled": false,
+              "input_type": "hidden",
+              "name": "flow",
+              "node_type": "input",
+              "required": true,
+              "value": "flw_golden00000000000000000000"
+            },
+            "group": "default",
+            "messages": []
+          },
+          {
+            "attributes": {
+              "disabled": false,
+              "input_type": "submit",
+              "name": "organization",
+              "node_type": "input",
+              "required": false,
+              "value": "org_golden0000000000000000000a"
+            },
+            "group": "submit",
+            "label": {
+              "context": {
+                "name": "Acme Corp"
+              },
+              "id": 1090002,
+              "kind": "info",
+              "text": "Continue"
+            },
+            "messages": []
+          },
+          {
+            "attributes": {
+              "disabled": false,
+              "input_type": "submit",
+              "name": "organization",
+              "node_type": "input",
+              "required": false,
+              "value": "org_golden0000000000000000000b"
+            },
+            "group": "submit",
+            "label": {
+              "context": {
+                "name": "Globex"
+              },
+              "id": 1090002,
+              "kind": "info",
+              "text": "Continue"
+            },
+            "messages": []
+          }
+        ]
+      }
+    },
     "login_start_api": {
       "contract_version": 2,
       "expires_at": 900,

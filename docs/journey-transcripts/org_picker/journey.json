@@ -1,0 +1,37 @@
+{
+  "schema_version": "ironauth.journey/v1",
+  "id": "login_org_picker",
+  "engine_version": 2,
+  "entry": "primary",
+  "comment": "Identifier plus password, then the organization picker (issue #94, PR-B2): a multi-organization subject with no organization parameter chooses which live-and-active membership this login binds as its durable org context. The picker's render-or-skip decision and its authoritative membership reads live in the engine; the routing this transcript replays is the plain forward walk (the accepted pick advances the picker straight to the terminal). The self-contained artifact the transcripts in this directory replay against.",
+  "steps": [
+    {
+      "id": "primary",
+      "kind": "identifier_password",
+      "node_group": "password",
+      "comment": "The first factor establishes the subject the picker then reads memberships for."
+    },
+    {
+      "id": "picker",
+      "kind": "org_picker",
+      "comment": "The organization picker: it renders the choice for a multi-org, no-parameter subject and holds until a valid pick, then advances to the terminal."
+    },
+    {
+      "id": "done",
+      "kind": "terminal",
+      "comment": "The session is minted and the picked organization is frozen onto it (issue #94, PR-B2)."
+    }
+  ],
+  "transitions": [
+    {
+      "from": "primary",
+      "to": "picker",
+      "comment": "After the primary factor, the walk enters the organization picker."
+    },
+    {
+      "from": "picker",
+      "to": "done",
+      "comment": "An accepted pick advances the picker straight to the terminal mint (the single unguarded forward edge)."
+    }
+  ]
+}

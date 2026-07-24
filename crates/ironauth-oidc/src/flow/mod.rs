@@ -49,6 +49,7 @@ mod federation;
 mod login;
 mod mfa;
 mod orchestration;
+mod org_picker;
 mod profiling;
 mod recovery;
 mod registration;
@@ -79,7 +80,7 @@ use std::time::Duration;
 use axum::http::StatusCode;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use ironauth_store::{FlowId, FlowRecord, NewFlow, Scope};
+use ironauth_store::{FlowId, FlowRecord, NewFlow, OrganizationId, Scope, UserId};
 use serde::{Deserialize, Serialize};
 
 use self::message::{Message, MessageId};
@@ -255,6 +256,16 @@ struct PersistedState {
     /// never sets it), so the default path is unperturbed and the flow goldens are unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     custom_step: Option<String>,
+    /// The organization the [`StepKind::OrgPicker`](ironauth_journey::StepKind::OrgPicker) step
+    /// chose (an `org_` id string), for the multi-organization login pick (issue #94, PR-B2). The
+    /// picker's advance writes it after re-validating the pick is a live-and-active membership of
+    /// the subject (a server value, NEVER a client-controlled one), and the login completion binds
+    /// it onto the session so PR-B1's relay carries it to the tokens' `org_id`. It is set ONLY on
+    /// the completing drive call (the pick advance walks straight to the terminal in the same call),
+    /// so it is never persisted with a value; `skip_serializing_if` keeps a no-pick built-in row's
+    /// serialized `state` BYTE-IDENTICAL, so the flow goldens for the skip path are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    org_context: Option<String>,
 }
 
 impl PersistedState {
@@ -268,6 +279,7 @@ impl PersistedState {
             identifier: None,
             connector: None,
             custom_step: None,
+            org_context: None,
         }
     }
 }
@@ -878,10 +890,42 @@ async fn consume_and_complete(
     subject: &str,
     actor: ironauth_store::ActorRef,
     event: &crate::authn::AuthenticationEvent,
+    org_context: Option<&str>,
     fenced_nodes: Vec<Node>,
     headers: &axum::http::HeaderMap,
     now_micros: i64,
 ) -> Result<Continuation, FlowError> {
+    // The organization picker's frozen pick (issue #94, PR-B2), re-enforced ONE more time BEFORE the
+    // mint (defense in depth): a pick disabled or removed between the picker advance and here is
+    // refused UNIFORMLY, flow OPEN (NOT consumed), so the client re-renders and re-picks from the
+    // now-current set rather than minting with a stale org. [`None`] (every non-picker completion)
+    // is byte-identical to before. The re-validated id is bound onto the just-minted session below.
+    let bind_org = match org_context {
+        Some(raw) => {
+            let subject_id =
+                UserId::parse_in_scope(subject, &scope).map_err(|_| FlowError::Store)?;
+            let org = OrganizationId::parse_in_scope(raw, &scope).map_err(|_| FlowError::Store)?;
+            if org_picker::is_active_membership(state, scope, &subject_id, &org).await? {
+                Some(org)
+            } else {
+                // Uniform refusal: re-render the fenced picker nodes, flow OPEN (not consumed).
+                let flow = build_flow(
+                    scope,
+                    record,
+                    transport,
+                    journey,
+                    persisted_step_for(&record.state),
+                    fenced_nodes,
+                    Vec::new(),
+                );
+                return Ok(Continuation::Render {
+                    flow: Box::new(flow),
+                    submit_token: record.submit_token.clone(),
+                });
+            }
+        }
+        None => None,
+    };
     let consumed = state
         .store()
         .scoped(scope)
@@ -893,10 +937,24 @@ async fn consume_and_complete(
         return Err(FlowError::AlreadyCompleted);
     }
     match interaction::establish_session(state, scope, subject, event, actor, headers).await {
-        Ok(session) => Ok(Continuation::Complete {
-            session: Box::new(session),
-            return_to: record.return_to.clone(),
-        }),
+        Ok(session) => {
+            // Freeze the picked org onto the just-minted session (issue #94, PR-B2), first write
+            // wins, so PR-B1's `resolve_org_context` frozen-session-wins branch returns it at
+            // code-issue with NO change to `resolve_org_context`. A store fault fails CLOSED.
+            if let Some(org) = bind_org {
+                state
+                    .store()
+                    .scoped(scope)
+                    .sessions()
+                    .bind_org(session.session_id(), &org)
+                    .await
+                    .map_err(|_| FlowError::Store)?;
+            }
+            Ok(Continuation::Complete {
+                session: Box::new(session),
+                return_to: record.return_to.clone(),
+            })
+        }
         Err(interaction::EstablishSessionError::NotAuthenticatable) => {
             // The central lifecycle fence refused the mint after the latch tripped (a rare
             // TOCTOU). The response stays the UNIFORM failure; the flow is consumed (the latch
