@@ -272,6 +272,37 @@ impl<'a> ScopedStore<'a> {
         }
     }
 
+    /// The read-only organization repository for this scope on the DATA plane
+    /// (issue #94, PR-B1). PR-A re-granted the data-plane SELECT on `organizations`,
+    /// so the login/authorize path can read an organization's lifecycle state
+    /// authoritatively (to REFUSE an org-context request that names a disabled org)
+    /// without the control role. The same [`OrganizationRepo`] the control plane
+    /// reaches through [`ManagementStore::organizations`]: every statement is
+    /// scope-filtered under this scope's forced row-level security.
+    #[must_use]
+    pub fn organizations(&self) -> OrganizationRepo<'a> {
+        OrganizationRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only organization-membership repository for this scope on the DATA
+    /// plane (issue #94, PR-B1). PR-A granted the data-plane SELECT on
+    /// `org_memberships`, so the login/authorize path can resolve the authenticated
+    /// subject's memberships authoritatively (to RESOLVE the effective org context
+    /// and to REFUSE an org-context request naming an org the subject is not a member
+    /// of) without the control role. The same [`OrgMembershipRepo`] the control plane
+    /// reaches through [`ManagementStore::org_memberships`]: every read is
+    /// scope-fenced under this scope's forced row-level security.
+    #[must_use]
+    pub fn org_memberships(&self) -> OrgMembershipRepo<'a> {
+        OrgMembershipRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
     /// The read-only flexible-identifier repository for this scope (issue #54):
     /// identifier-first login resolution (canonicalize a submitted identifier and
     /// return the applicable authentication methods), a user's identifier list, and
@@ -7374,6 +7405,13 @@ pub struct IssueCode<'a> {
     pub auth_time_micros: Option<i64>,
     /// The authenticating session handle (a seam for later M2 issues).
     pub session_ref: Option<&'a str>,
+    /// The DURABLE organization context frozen onto the grant (issue #94, PR-B1): an
+    /// `org_` id when the session resolved an org (a named-and-authorized membership,
+    /// or the sole membership of a single-org subject), [`None`] otherwise. The token
+    /// endpoint reads it back from the grant and emits the `org_id` claim. Frozen on
+    /// the GRANT (like `session_ref`), so the refresh path (which reads the grant)
+    /// keeps the same `org_id` on a refreshed access token.
+    pub org_id: Option<&'a str>,
     /// The recorded consent handle (a seam for later M2 issues).
     pub consent_ref: Option<&'a str>,
     /// The canonical JSON form of the `claims` request parameter (OIDC Core 5.5),
@@ -7465,6 +7503,12 @@ pub struct CodeBindings {
     /// session) and distinct across clients. [`None`] when no session backed the
     /// grant (no `sid` is then emitted).
     pub session_ref: Option<String>,
+    /// The DURABLE organization context (an `org_` id) frozen onto the grant this
+    /// code belongs to (issue #94, PR-B1), read back at the token endpoint. The ID
+    /// token and access token carry it as the `org_id` claim. [`None`] when the
+    /// session resolved no org (a member-less user, a multi-org user who named none,
+    /// or a machine grant); no `org_id` claim is then emitted.
+    pub org_id: Option<String>,
 }
 
 impl fmt::Debug for CodeBindings {
@@ -7555,7 +7599,7 @@ impl AuthorizationRepo<'_> {
              ac.code_challenge_method, ac.subject, ac.oauth_scope, ac.auth_methods, \
              ac.claims_request, ac.granted_resources, \
              (EXTRACT(EPOCH FROM ac.auth_time) * 1000000)::bigint AS auth_time_us, \
-             g.session_ref AS session_ref \
+             g.session_ref AS session_ref, g.org_id AS org_id \
              FROM authorization_codes ac \
              JOIN grants g \
                ON g.id = ac.grant_id \
@@ -7876,9 +7920,9 @@ impl ActingAuthorizationRepo<'_> {
                 sqlx::query(
                     "INSERT INTO grants \
                      (id, tenant_id, environment_id, client_id, subject, session_ref, \
-                      consent_ref, claims_request, granted_resources, created_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
-                             TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval)",
+                      org_id, consent_ref, claims_request, granted_resources, created_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
+                             TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval)",
                 )
                 .bind(code.grant_id.to_string())
                 .bind(scope.tenant().to_string())
@@ -7886,6 +7930,7 @@ impl ActingAuthorizationRepo<'_> {
                 .bind(code.client_id.to_string())
                 .bind(code.subject)
                 .bind(code.session_ref)
+                .bind(code.org_id)
                 .bind(code.consent_ref)
                 .bind(code.claims_request)
                 .bind(granted_resources.as_deref())
@@ -11321,6 +11366,7 @@ fn bindings_from_row(row: &PgRow, scope: &Scope) -> Result<CodeBindings, StoreEr
             row.get::<Option<String>, _>("granted_resources").as_deref(),
         ),
         session_ref: row.get::<Option<String>, _>("session_ref"),
+        org_id: row.get::<Option<String>, _>("org_id"),
     })
 }
 
@@ -11516,6 +11562,12 @@ pub struct RefreshTokenResolution {
     /// rotated by a request carrying a valid `DPoP` proof for this exact key; the token
     /// endpoint enforces the match before minting.
     pub dpop_jkt: Option<String>,
+    /// The DURABLE organization context (an `org_` id) frozen onto the family's grant
+    /// (issue #94, PR-B1), read from the grant exactly as `granted_resources` is. The
+    /// refresh path emits it as the refreshed access token's `org_id` claim, so a
+    /// refreshed token keeps the same org context the code exchange minted. [`None`]
+    /// when the grant carried no org.
+    pub org_id: Option<String>,
 }
 
 impl fmt::Debug for RefreshTokenResolution {
@@ -11705,7 +11757,7 @@ impl RefreshRepo<'_> {
              f.grant_id AS grant_id, f.subject AS subject, f.client_id AS client_id, \
              f.scope AS scope, f.auth_methods AS auth_methods, \
              f.auth_time AS auth_time, f.offline AS offline, f.dpop_jkt AS dpop_jkt, \
-             g.granted_resources AS granted_resources, \
+             g.granted_resources AS granted_resources, g.org_id AS org_id, \
              (EXTRACT(EPOCH FROM f.absolute_expires_at) * 1000000)::bigint AS abs_us, \
              (f.revoked_at IS NULL) AS family_live, (g.revoked_at IS NULL) AS grant_live \
              FROM refresh_tokens rt \
@@ -12537,6 +12589,7 @@ fn refresh_resolution_from_row(
         rotated: row.get("rotated"),
         active: row.get::<bool, _>("family_live") && row.get::<bool, _>("grant_live"),
         dpop_jkt: row.get("dpop_jkt"),
+        org_id: row.get::<Option<String>, _>("org_id"),
     })
 }
 
@@ -15913,6 +15966,103 @@ impl SessionRepo<'_> {
             peer_ip: row.get("peer_ip"),
         }))
     }
+
+    /// The organization context FROZEN onto this session (issue #94, PR-B1), or
+    /// [`None`] when the session carries no org context (a member-less user, a
+    /// multi-org user who named no organization, or a not-yet-resolved session). Read
+    /// under this scope's forced row-level security; a session out of scope or a
+    /// column value that does not parse in scope both read as [`None`] (fail closed
+    /// to no org context rather than a cross-scope leak).
+    ///
+    /// The authorize path reads this BEFORE it resolves an org parameter, so an
+    /// already-bound session keeps its frozen org (first write wins): a later
+    /// conflicting `organization` parameter never re-binds it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn org_context(&self, id: &SessionId) -> Result<Option<OrganizationId>, StoreError> {
+        if id.scope() != self.scope {
+            return Ok(None);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT org_id FROM sessions \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.and_then(|row| parse_session_org(&row, &self.scope)))
+    }
+
+    /// FREEZE `org` onto this session as its durable org context, first write wins,
+    /// and return the EFFECTIVE frozen org (issue #94, PR-B1). The UPDATE is guarded
+    /// on `org_id IS NULL`, so the FIRST resolver to write a session wins and no later
+    /// call can re-bind it; the follow-up read returns whatever is now stored, which
+    /// is the winner even under concurrent authorize requests that resolved different
+    /// orgs. The caller has already enforced authoritatively (a live membership, an
+    /// active org) that `org` is a legitimate context for this session's subject; this
+    /// only persists the frozen value.
+    ///
+    /// Returns the effective frozen org (normally `org`, or the concurrent winner), or
+    /// [`None`] if the session vanished or its stored value does not parse in scope.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `id` or `org` is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn bind_org(
+        &self,
+        id: &SessionId,
+        org: &OrganizationId,
+    ) -> Result<Option<OrganizationId>, StoreError> {
+        if id.scope() != self.scope || org.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let id_text = id.to_string();
+        let tenant = self.scope.tenant().to_string();
+        let environment = self.scope.environment().to_string();
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        // First write wins: only an as-yet-unbound session takes the new org. An
+        // already-bound session keeps its frozen value (zero rows affected), so a later
+        // conflicting resolver never re-binds it.
+        sqlx::query(
+            "UPDATE sessions SET org_id = $1 \
+             WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 AND org_id IS NULL",
+        )
+        .bind(org.to_string())
+        .bind(&id_text)
+        .bind(&tenant)
+        .bind(&environment)
+        .execute(&mut *tx)
+        .await?;
+        // Read back the effective frozen org in the SAME transaction, so the returned
+        // value is authoritative even when a concurrent resolver won the write.
+        let row = sqlx::query(
+            "SELECT org_id FROM sessions \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(&id_text)
+        .bind(&tenant)
+        .bind(&environment)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.and_then(|row| parse_session_org(&row, &self.scope)))
+    }
+}
+
+/// Parse the `org_id` column of a session row into a scoped [`OrganizationId`],
+/// or [`None`] when the column is NULL or its value does not parse in `scope`
+/// (fail closed to no org context, never a cross-scope value). One place so the
+/// two session org-context reads cannot disagree on the parse.
+fn parse_session_org(row: &PgRow, scope: &Scope) -> Option<OrganizationId> {
+    let raw = row.get::<Option<String>, _>("org_id")?;
+    OrganizationId::parse_in_scope(&raw, scope).ok()
 }
 
 /// The mutating bootstrap session repository (issue #20).

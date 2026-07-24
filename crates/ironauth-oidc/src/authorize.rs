@@ -31,8 +31,8 @@ use axum::response::{IntoResponse, Response};
 use ironauth_config::QuarantineConfig;
 use ironauth_store::{
     AuthorizationCodeId, ClientId, ClientRecord, ConsumePushedRequest, CorrelationId, GrantId,
-    GrantedConsent, IssueCode, PushedRequestId, Scope, SessionId, StoreError, UserId,
-    admin_grant_covers_scope, redirect_uri_is_registrable, redirect_uri_matches,
+    GrantedConsent, IssueCode, OrganizationId, PushedRequestId, Scope, SessionId, StoreError,
+    UserId, admin_grant_covers_scope, redirect_uri_is_registrable, redirect_uri_matches,
 };
 use serde::{Deserialize, Serialize};
 
@@ -184,6 +184,15 @@ pub struct AuthorizeParams {
     /// handles the sequence), so a pushed request replays its resources verbatim.
     #[serde(default)]
     pub resources: Vec<String>,
+    /// The organization context the client requests for this authorization (issue #94,
+    /// PR-B1): an `org_` id the RESOLVED, authorized org context is derived from. It is
+    /// shape-validated as an `org_` id in the request's scope at validation (a
+    /// malformed or cross-scope value is `invalid_request`), but membership is NEVER
+    /// trusted from it: after the subject authenticates, the login path reads the
+    /// store authoritatively (a live membership of the subject AND an active org) and
+    /// REFUSES a not-a-member or disabled org uniformly. It round-trips through PAR
+    /// storage verbatim like every other field.
+    pub organization: Option<String>,
 }
 
 /// `GET /authorize`.
@@ -525,6 +534,7 @@ async fn issue_code(
         prompt,
         max_age_secs,
         hints,
+        requested_organization,
     } = validated;
 
     // From here on, client_id and redirect_uri are validated, so every error is
@@ -626,6 +636,37 @@ async fn issue_code(
         } => (session, consent_ref, bound_scope),
     };
 
+    // 6a-bis. Resolve the DURABLE organization context (issue #94, PR-B1) now that the
+    //     subject is authenticated (memberships need the subject). FIRST WRITE WINS:
+    //     an already-bound session keeps its frozen org, so a later conflicting
+    //     `organization` parameter never re-binds it; an unbound session resolves the
+    //     org AUTHORITATIVELY from the store (a named-and-authorized membership, or the
+    //     sole membership of a single-org subject) and freezes it onto the session. A
+    //     parameter naming an org the subject is not a live member of, or a disabled
+    //     org, is REFUSED with a UNIFORM `access_denied` (no exists/not-member/disabled
+    //     oracle). The resolved org (if any) is frozen onto the code below and emitted
+    //     as the `org_id` claim; a no-org login resolves to `None` and is unaffected.
+    let org_context = resolve_org_context(
+        state,
+        scope,
+        &session.session_id,
+        &session.subject,
+        requested_organization.as_ref(),
+    )
+    .await
+    .map_err(|error| match error {
+        OrgContextError::Refused => redirect_error(
+            AuthzErrorCode::AccessDenied,
+            "the requested organization context is not available",
+        ),
+        OrgContextError::Store => redirect_error(
+            AuthzErrorCode::ServerError,
+            "the authorization request could not be processed",
+        ),
+    })?;
+    // The frozen org id as an owned string, borrowed into the code binding below.
+    let org_id_frozen = org_context.as_ref().map(ToString::to_string);
+
     // 6b. Step-up authentication (RFC 9470, issue #72). Assemble the effective
     //     authentication requirement from the request `acr_values`/`max_age`, the
     //     per-client floor, the per-scope tenant policy, and any ESSENTIAL `acr` in
@@ -698,6 +739,7 @@ async fn issue_code(
         auth_methods: frozen_auth_methods,
         auth_time_micros,
         session_ref: &session_ref,
+        org_id: org_id_frozen.as_deref(),
         consent_ref: consent_ref.as_deref(),
         claims_request: claims_canonical.as_deref(),
         granted_resources: &params.resources,
@@ -914,6 +956,11 @@ async fn mint_front_channel_id_token(
         auth_methods: resolved.auth_methods,
         auth_time_unix_micros: resolved.auth_time_micros,
         sid: Some(sid.as_str()),
+        // The DURABLE organization context (issue #94, PR-B1) resolved for this
+        // authorization and frozen onto the session: a front-channel (implicit/hybrid)
+        // ID token minted in the same request carries the SAME org_id the code flow
+        // would. None when the session resolved no org.
+        org_id: resolved.org_id,
         at_hash: None,
         c_hash: c_hash.as_deref(),
         extra_claims: &extra_claims,
@@ -995,6 +1042,11 @@ pub(crate) struct ValidatedRequest<'a> {
     pub(crate) max_age_secs: Option<u64>,
     /// The typed interaction-hint seam (login/logout hints, locales, display).
     pub(crate) hints: InteractionHints,
+    /// The shape-validated requested organization context (issue #94, PR-B1): the
+    /// parsed `org_` id when the `organization` parameter named a well-formed id in
+    /// this scope, [`None`] when the parameter was absent. Membership is resolved and
+    /// enforced later (after the subject authenticates), never here.
+    pub(crate) requested_organization: Option<OrganizationId>,
 }
 
 /// An error from the shared authorization-request validation, in a NEUTRAL form
@@ -1224,6 +1276,27 @@ fn validate_request_tail<'a>(
         params.display.as_deref(),
     );
 
+    // 5e. The requested organization context (issue #94, PR-B1). SHAPE only: an `org_`
+    //     id well formed in THIS request's scope (the client id declares the scope).
+    //     A malformed or cross-scope value is `invalid_request` through the negotiated
+    //     mode, uniform with the other parameter-shape errors. Membership is NOT
+    //     resolved here (the subject is unknown until authentication): the authorize
+    //     code-issue path reads the store authoritatively and enforces it. An absent
+    //     parameter is simply `None`. A cross-scope id fails parse exactly as a
+    //     malformed one does, so this reveals nothing about any organization.
+    let requested_organization = match params
+        .organization
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(raw) => Some(
+            OrganizationId::parse_in_scope(raw, &client.id.scope())
+                .map_err(|_| invalid("the organization parameter is malformed"))?,
+        ),
+        None => None,
+    };
+
     Ok(ValidatedRequest {
         redirect_uri,
         response_type,
@@ -1236,6 +1309,7 @@ fn validate_request_tail<'a>(
         prompt,
         max_age_secs,
         hints,
+        requested_organization,
     })
 }
 
@@ -2579,6 +2653,11 @@ struct Resolved<'a> {
     auth_time_micros: Option<i64>,
     /// The authenticating session handle recorded on the grant.
     session_ref: &'a str,
+    /// The DURABLE organization context (an `org_` id) resolved for this
+    /// authorization and frozen onto the session and grant (issue #94, PR-B1), or
+    /// [`None`] when the session resolved no org. Every code (and token) from the
+    /// session carries the SAME value.
+    org_id: Option<&'a str>,
     /// The recorded consent handle recorded on the grant, or [`None`] when a
     /// skipped consent was not stored (issue #21).
     consent_ref: Option<&'a str>,
@@ -2589,6 +2668,130 @@ struct Resolved<'a> {
     /// frozen onto the grant and code as the downscope ceiling. Empty when no
     /// resource was requested.
     granted_resources: &'a [String],
+}
+
+/// Why resolving the organization context refused or failed (issue #94, PR-B1).
+///
+/// The two variants map to DIFFERENT responses at the call site, exactly like
+/// [`EstablishSessionError`](interaction::EstablishSessionError): a
+/// [`Refused`](OrgContextError::Refused) is the org-context authorization fence and
+/// renders as a UNIFORM `access_denied` (never an exists/not-member/disabled oracle),
+/// while a [`Store`](OrgContextError::Store) fault is the neutral `server_error`.
+enum OrgContextError {
+    /// The requested organization context is not available to the authenticated
+    /// subject: the subject is not a live member, the org does not exist in scope, or
+    /// the org is disabled. Every case is refused IDENTICALLY (no oracle).
+    Refused,
+    /// A persistence fault while resolving or freezing the org context. The caller
+    /// returns a neutral `server_error` (fail closed).
+    Store,
+}
+
+/// Resolve the DURABLE organization context for this authorization (issue #94, PR-B1),
+/// AFTER the subject has authenticated, and freeze it onto the session (first write
+/// wins). Returns the effective frozen org, or [`None`] when the session resolved no
+/// org.
+///
+/// The resolution order is param, then auto-select-single, then none:
+///
+///   1. If the session is ALREADY bound (a prior authorize froze an org), that frozen
+///      org stands and the `organization` parameter is IGNORED (first write wins): a
+///      later conflicting parameter never re-binds the session, so every code from the
+///      session carries the SAME `org_id` across a silent re-authorize.
+///   2. Otherwise, if the request named an `organization`, it MUST name a LIVE
+///      membership of the authenticated subject AND an ACTIVE org, both read
+///      AUTHORITATIVELY from the store (the parameter's claim of membership is never
+///      trusted). Any failure is a uniform [`OrgContextError::Refused`].
+///   3. Otherwise, if the subject has EXACTLY ONE live membership and that org is
+///      active, it is auto-selected. A multi-org subject with no parameter resolves to
+///      [`None`] in PR-B1 (the multi-org `OrgPicker` is PR-B2); a member-less subject,
+///      and a sole membership to a disabled org, also resolve to [`None`] (login
+///      proceeds with no org context, never refused: the subject named nothing).
+///
+/// A resolved org is frozen onto the session with a first-write-wins UPDATE; the
+/// returned value is the effective frozen org (the concurrent winner under a race).
+async fn resolve_org_context(
+    state: &OidcState,
+    scope: Scope,
+    session_id: &SessionId,
+    subject: &str,
+    requested: Option<&OrganizationId>,
+) -> Result<Option<OrganizationId>, OrgContextError> {
+    // 1. First write wins: an already-bound session keeps its frozen org (ignore param).
+    if let Some(frozen) = state
+        .store()
+        .scoped(scope)
+        .sessions()
+        .org_context(session_id)
+        .await
+        .map_err(|_| OrgContextError::Store)?
+    {
+        return Ok(Some(frozen));
+    }
+    // The subject must parse in scope to have any resolvable membership; a subject that
+    // will not parse has no org context (fail closed to none, never a refusal).
+    let Ok(user_id) = UserId::parse_in_scope(subject, &scope) else {
+        return Ok(None);
+    };
+    let resolved = if let Some(org) = requested {
+        // 2. A named org: an AUTHORITATIVE live-membership AND active-org check. Every
+        //    failure mode (not a member, org absent/soft-deleted, org disabled) is the
+        //    SAME uniform refusal, so it is never an exists/not-member/disabled oracle.
+        if !state
+            .store()
+            .scoped(scope)
+            .org_memberships()
+            .exists(org, &user_id)
+            .await
+            .map_err(|_| OrgContextError::Store)?
+        {
+            return Err(OrgContextError::Refused);
+        }
+        match state.store().scoped(scope).organizations().get(org).await {
+            Ok(record) if record.state.is_active() => Some(*org),
+            // A disabled org and an absent/soft-deleted org refuse IDENTICALLY.
+            Ok(_) | Err(StoreError::NotFound) => return Err(OrgContextError::Refused),
+            Err(_) => return Err(OrgContextError::Store),
+        }
+    } else {
+        // 3. No parameter: auto-select the sole ACTIVE membership; else none.
+        let memberships = state
+            .store()
+            .scoped(scope)
+            .org_memberships()
+            .list_for_user(&user_id)
+            .await
+            .map_err(|_| OrgContextError::Store)?;
+        if let [only] = memberships.as_slice() {
+            match state
+                .store()
+                .scoped(scope)
+                .organizations()
+                .get(&only.organization_id)
+                .await
+            {
+                Ok(record) if record.state.is_active() => Some(only.organization_id),
+                // A sole membership to a disabled or vanished org yields NO org context
+                // (login proceeds; the subject named nothing to refuse).
+                Ok(_) | Err(StoreError::NotFound) => None,
+                Err(_) => return Err(OrgContextError::Store),
+            }
+        } else {
+            None
+        }
+    };
+    // Freeze first write wins and return the effective org (the concurrent winner).
+    if let Some(org) = resolved {
+        state
+            .store()
+            .scoped(scope)
+            .sessions()
+            .bind_org(session_id, &org)
+            .await
+            .map_err(|_| OrgContextError::Store)
+    } else {
+        Ok(None)
+    }
 }
 
 /// Validate the RFC 8707 resource indicators on an authorization request (issue #28).
@@ -2702,6 +2905,7 @@ async fn issue_code_core(
         auth_methods: resolved.auth_methods,
         auth_time_micros: resolved.auth_time_micros,
         session_ref: Some(resolved.session_ref),
+        org_id: resolved.org_id,
         consent_ref: resolved.consent_ref,
         claims_request: resolved.claims_request,
         granted_resources: resolved.granted_resources,
@@ -2818,6 +3022,9 @@ pub(crate) async fn mint_challenge_code(
         auth_methods: context.auth_methods,
         auth_time_micros: context.auth_time_micros,
         session_ref: context.session_ref,
+        // A browserless first-party challenge code carries no organization context in
+        // PR-B1 (issue #94 covers the browser code grant): no org_id claim.
+        org_id: None,
         consent_ref: consent_ref.as_deref(),
         claims_request: None,
         granted_resources: &[],

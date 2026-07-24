@@ -800,6 +800,10 @@ async fn mint_tokens(
             // session through the per-client session store: stable per (client,
             // session), distinct across clients.
             sid,
+            // The DURABLE organization context (issue #94, PR-B1) frozen onto the
+            // grant at authorization and read back here, emitted as the `org_id` claim
+            // on both tokens. None when the session resolved no org.
+            org_id: bindings.org_id.as_deref(),
             // A token-endpoint ID token never carries at_hash, and the code flow
             // never carries c_hash; the front-channel/hybrid path (#17) supplies
             // them. Both are absent here by construction.
@@ -1558,6 +1562,10 @@ async fn mint_refresh_access(
             // The refresh path mints only an access token (no ID token), so `sid`
             // (issue #32, an ID-token claim) is inert here.
             sid: None,
+            // The DURABLE organization context (issue #94, PR-B1), read from the
+            // family's grant, so a refreshed access token keeps the same `org_id` the
+            // code exchange minted. None when the grant carried no org.
+            org_id: resolution.org_id.as_deref(),
             at_hash: None,
             c_hash: None,
             extra_claims: &extra_claims,

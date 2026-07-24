@@ -113,6 +113,10 @@ pub struct ParParams {
     pub claims_locales: Option<String>,
     /// The OIDC `display`.
     pub display: Option<String>,
+    /// The requested organization context (issue #94, PR-B1): pushed, stored, and
+    /// replayed verbatim, so a pushed request resolves the SAME org context as an
+    /// inline one.
+    pub organization: Option<String>,
     /// A `request_uri` presented at the PAR endpoint is REJECTED (RFC 9126 section
     /// 2.1): a pushed request cannot itself reference another pushed request.
     pub request_uri: Option<String>,
@@ -150,6 +154,9 @@ impl ParParams {
             ui_locales: self.ui_locales,
             claims_locales: self.claims_locales,
             display: self.display,
+            // The requested organization context (issue #94, PR-B1): replayed verbatim
+            // so a pushed request resolves the same org as an inline one.
+            organization: self.organization,
             emit_auth_time: None,
             par_resume: None,
             // The internal consent-denied marker (issue #88) is never stored: a pushed request

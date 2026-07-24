@@ -1041,5 +1041,16 @@ name = "dpop_userinfo"
 path = "tests/dpop_userinfo.rs"
 required-features = ["testing"]
 
+# The DURABLE organization token context (issue #94, PR-B1): the organization parameter
+# binds a live-and-active org onto the session and both tokens (org_id claim), a
+# single-org subject auto-selects, a multi-org subject with no parameter gets none, a
+# non-member and a disabled org are refused uniformly (no oracle), the frozen org is
+# per-session stable (first write wins), a no-org login is unaffected, and org_id
+# survives a refresh. Over a real database (DATABASE_URL).
+[[test]]
+name = "org_context"
+path = "tests/org_context.rs"
+required-features = ["testing"]
+
 [lints]
 workspace = true

@@ -156,6 +156,10 @@ pub(crate) const PROTECTED_ACCESS_TOKEN_CLAIMS: &[&str] = &[
     "at_hash",
     "c_hash",
     "sid",
+    // Organization context (issue #94): the DURABLE org_id is resolved from an
+    // authoritative membership check and issuer-set only; a client custom claim must
+    // never self-assert an organization context.
+    "org_id",
 ];
 
 /// The resolved target for an access token: the audience(s) it is minted for, the
@@ -288,6 +292,15 @@ pub struct MintRequest<'a> {
     /// blocklisted; see [`PROTECTED_ACCESS_TOKEN_CLAIMS`]). [`None`] when no session
     /// backed the exchange (no `sid` is then emitted).
     pub sid: Option<&'a str>,
+    /// The DURABLE organization context (an `org_` id) frozen onto the session and
+    /// grant (issue #94, PR-B1): the token endpoint reads it back from the grant and
+    /// emits it as the `org_id` claim on BOTH the ID token and the access token. It is
+    /// a PROTECTED, issuer-only claim (see [`PROTECTED_ACCESS_TOKEN_CLAIMS`]) resolved
+    /// from an AUTHORITATIVE membership check, never from a client parameter's claim of
+    /// membership, so a client can never self-assert it. [`None`] when the session
+    /// resolved no org (a member-less user, a multi-org user who named none, or a
+    /// machine token, which asserts no human org context); no claim is then emitted.
+    pub org_id: Option<&'a str>,
     /// The access-token hash for a front-channel ID token (issue #17). The token
     /// endpoint always passes [`None`]: a token-endpoint ID token never carries
     /// `at_hash`.
@@ -409,6 +422,16 @@ pub(crate) fn build_id_token_claims(
         claims["sid"] = json!(sid);
     }
 
+    // org_id (issue #94, PR-B1): the DURABLE organization context frozen onto the
+    // session and grant, resolved from an authoritative membership check at
+    // authorization, emitted here as a legitimate issuer claim. It is set BEFORE the
+    // extra-claims fold below and is a PROTECTED access-token claim, so a client
+    // custom claim named `org_id` can never shadow or forge it. Absent when the
+    // session resolved no org.
+    if let Some(org_id) = request.org_id {
+        claims["org_id"] = json!(org_id);
+    }
+
     // at_hash / c_hash: dormant seams for the front-channel/hybrid path (#17).
     // The token endpoint passes None for both, so a token-endpoint ID token
     // carries neither.
@@ -425,11 +448,19 @@ pub(crate) fn build_id_token_claims(
 
     // Extra standard claims (issue #15): the claims-parameter `id_token` member,
     // and (only under the non-conform conformIdTokenClaims override) the
-    // scope-derived claims. Protocol/REQUIRED claims always win, so an extra claim
-    // whose name is already set is never overwritten (it cannot shadow sub, iss,
-    // aud, exp, iat, nonce, acr, amr, or auth_time).
+    // scope-derived claims. A PROTECTED (protocol) claim is set ONLY by the
+    // protocol above, NEVER from the client-influenced extra bag: insertion-order
+    // "protocol wins" is no protection for a claim the protocol did NOT set on THIS
+    // token (for example `org_id` on a no-org session, or `cnf` on a no-binding
+    // session), so the reserved set is filtered explicitly here, exactly as the
+    // access-token and client-credentials builders do (issue #94). A user claim
+    // released through this bag can never be named `org_id`, `sub`, `cnf`, and the
+    // rest, so it can never forge one.
     if let serde_json::Value::Object(claims_object) = &mut claims {
         for (name, value) in request.extra_claims {
+            if PROTECTED_ACCESS_TOKEN_CLAIMS.contains(&name.as_str()) {
+                continue;
+            }
             claims_object
                 .entry(name.clone())
                 .or_insert_with(|| value.clone());
@@ -480,6 +511,14 @@ pub(crate) fn build_access_token_claims(
     // in epoch SECONDS, exactly as the ID token emits it.
     if let Some(auth_micros) = request.auth_time_unix_micros {
         claims["auth_time"] = json!(auth_micros.div_euclid(1_000_000));
+    }
+    // org_id (issue #94, PR-B1): the DURABLE organization context frozen onto the
+    // grant, emitted as a legitimate issuer claim (it is in PROTECTED_ACCESS_TOKEN_CLAIMS,
+    // so a client custom claim can never self-assert it). Absent when the session
+    // resolved no org; a client-credentials (M2M) token never sets it (no human org
+    // context), which its distinct builder guarantees by omission.
+    if let Some(org_id) = request.org_id {
+        claims["org_id"] = json!(org_id);
     }
     // cnf (RFC 7800 / RFC 9449, issue #368): bind the access token to the DPoP proof
     // key when a valid proof accompanied issuance. `cnf` is issuer-reserved (it is in
@@ -951,6 +990,7 @@ mod tests {
             auth_methods,
             auth_time_unix_micros: None,
             sid: None,
+            org_id: None,
             at_hash: None,
             c_hash: None,
             extra_claims: empty_extra(),
@@ -1065,6 +1105,56 @@ mod tests {
         let claims = build_id_token_claims(&req, 1, 2, "tok").expect("claims");
         assert_eq!(claims["email"], "ada@example.test", "extra claim lands");
         assert_eq!(claims["sub"], "usr_abc", "protocol sub is never shadowed");
+    }
+
+    #[test]
+    fn org_id_is_emitted_and_a_client_custom_claim_can_never_forge_it() {
+        // Issue #94, PR-B1: org_id is a PROTECTED, issuer-set claim. When the session
+        // resolved an org it is emitted on both tokens, and it is set BEFORE the
+        // extra-claims fold, so a hostile custom claim named `org_id` can never shadow
+        // or forge it (the id-token protocol-claim-wins fold), and it is in
+        // PROTECTED_ACCESS_TOKEN_CLAIMS (the access-token custom-claim guard).
+        let extra = json!({ "org_id": "org_forged" })
+            .as_object()
+            .cloned()
+            .expect("object");
+        let mut req = request("usr_abc", "pwd");
+        req.org_id = Some("org_real");
+        req.extra_claims = &extra;
+        let id_claims = build_id_token_claims(&req, 1, 2, "tok").expect("claims");
+        assert_eq!(
+            id_claims["org_id"], "org_real",
+            "the protocol org_id wins over a forged custom claim"
+        );
+        let at_claims = build_access_token_claims(&req, 1, 2, "tok", &json!("cli_example"));
+        assert_eq!(
+            at_claims["org_id"], "org_real",
+            "access token carries org_id"
+        );
+        assert!(
+            PROTECTED_ACCESS_TOKEN_CLAIMS.contains(&"org_id"),
+            "org_id is a protected access-token claim"
+        );
+
+        // With no resolved org, the claim is absent on both tokens (a no-org login is
+        // byte-identical to before the feature) EVEN when a hostile `org_id` is planted
+        // in the extra-claims bag: for a no-org session the protocol sets no org_id, so
+        // insertion-order "protocol wins" would be no protection; the id-token fold
+        // filters PROTECTED_ACCESS_TOKEN_CLAIMS explicitly, so a forged org_id from the
+        // bag (or the claims-request parameter) is dropped, not stamped. The access
+        // token merges no client custom claims at all on the code flow.
+        req.org_id = None;
+        req.extra_claims = &extra; // still { "org_id": "org_forged" }
+        let id_none = build_id_token_claims(&req, 1, 2, "tok").expect("claims");
+        assert!(
+            id_none.get("org_id").is_none(),
+            "a no-org id token drops a forged org_id from the extra-claims bag"
+        );
+        let at_none = build_access_token_claims(&req, 1, 2, "tok", &json!("cli_example"));
+        assert!(
+            at_none.get("org_id").is_none(),
+            "a no-org access token never carries org_id"
+        );
     }
 
     #[test]
@@ -1262,6 +1352,8 @@ mod tests {
             "at_hash": "evil-at-hash",
             "c_hash": "evil-c-hash",
             "sid": "evil-session",
+            // Organization context (issue #94): a machine token asserts no human org.
+            "org_id": "org_evil",
             // A benign business claim, which is admitted.
             "department": "payments"
         })
@@ -1305,6 +1397,7 @@ mod tests {
             "at_hash",
             "c_hash",
             "sid",
+            "org_id",
         ] {
             assert!(
                 claims.get(reserved_absent).is_none(),
