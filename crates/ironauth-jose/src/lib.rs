@@ -148,7 +148,9 @@ pub use cnf::{CnfError, Confirmation};
 /// The `dpop` module itself stays private; only this helper surface is exposed.
 #[cfg(feature = "test-util")]
 pub use dpop::test_util as dpop_test_util;
-pub use dpop::{DpopError, DpopExpectations, DpopProof, jwk_thumbprint, validate_dpop_proof};
+pub use dpop::{
+    DpopError, DpopExpectations, DpopProof, access_token_hash, jwk_thumbprint, validate_dpop_proof,
+};
 pub use envelope::{
     Aad, AadBuilder, BlindIndex, Dek, EnvelopeError, KEY_LEN, Kek, MasterKey, NONCE_BYTES, Sealed,
 };

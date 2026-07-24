@@ -494,8 +494,8 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
     );
     assert_eq!(
         report.already_applied(),
-        82,
-        "the production chain is exactly eighty-two migrations (isolation, audit log, management \
+        83,
+        "the production chain is exactly eighty-three migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -516,17 +516,17 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
          locale bundles, brand assets, diagnostic reason detail, diagnostics control read, \
          policy decision traces, flows control read, signup forms, consent lockdown, client admin \
          grants, consent control grants, flow version pin, flow versions, first-party challenge \
-         codes, DPoP binding)"
+         codes, DPoP binding, DPoP proof replay)"
     );
 
-    // The ledger holds exactly versions 1 through 82.
+    // The ledger holds exactly versions 1 through 83.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
             46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67,
-            68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82
+            68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83
         ]
     );
     let phase_of = |version: i64| async move {
@@ -796,6 +796,33 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
     assert!(
         !column_is_not_null(pool, "fedcm_assertion_nonces", "consumed_at").await,
         "fedcm_assertion_nonces.consumed_at must be nullable (the single-use latch)"
+    );
+
+    // The cross-node DPoP proof jti replay store (issue #368, 0083) is a NEW
+    // tenant-scoped table, so it must ENABLE and FORCE row-level security, carry the
+    // (tenant, environment) isolation policy, and pin the nonempty-scope CHECK, exactly
+    // like every other scoped table.
+    assert!(
+        rls_enabled_and_forced(pool, "dpop_proof_replay").await,
+        "dpop_proof_replay must ENABLE and FORCE row-level security"
+    );
+    assert!(
+        policy_exists(
+            pool,
+            "dpop_proof_replay",
+            "dpop_proof_replay_tenant_isolation"
+        )
+        .await,
+        "dpop_proof_replay must carry the (tenant, environment) isolation policy"
+    );
+    assert!(
+        check_constraint_exists(
+            pool,
+            "dpop_proof_replay",
+            "dpop_proof_replay_scope_nonempty"
+        )
+        .await,
+        "dpop_proof_replay must carry the nonempty-scope CHECK"
     );
 
     // The third-party risk-signal store (issue #82, PR 1) is a NEW tenant-scoped table, so

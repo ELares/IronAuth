@@ -341,6 +341,14 @@ name = "client_auth_suite"
 path = "tests/client_auth_suite.rs"
 required-features = ["testing"]
 
+# The cross-node DPoP proof jti replay store (issue #368, resource-server verify):
+# check-and-record single use, the safe on-insert prune, and cross-scope isolation.
+# Over a real database (DATABASE_URL).
+[[test]]
+name = "dpop_replay"
+path = "tests/dpop_replay.rs"
+required-features = ["testing"]
+
 # Refresh-token rotation, families, reuse detection, offline_access, and the
 # digest-only storage guarantee (issue #21): the authoritative single-use and reuse
 # gate, grace-window classification, exactly-once reuse event, offline-vs

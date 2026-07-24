@@ -30,7 +30,8 @@ use ironauth_config::{
 };
 use ironauth_env::Env;
 use ironauth_jose::{
-    JwsAlgorithm, SigningKey, TrustedKey, VerificationPolicy, VerifiedToken, verify,
+    DpopExpectations, JwsAlgorithm, SigningKey, TrustedKey, VerificationPolicy, VerifiedToken,
+    access_token_hash, validate_dpop_proof, verify,
 };
 use ironauth_quota::QuotaEnforcer;
 use ironauth_store::{
@@ -3225,6 +3226,121 @@ impl OidcState {
         let policy = VerificationPolicy::new(algorithms, trusted, issuer, audience.to_owned())
             .map_err(|_| ())?;
         verify(token, &policy, self.inner.env.clock()).map_err(|_| ())
+    }
+
+    /// Enforce the `DPoP` proof-of-possession binding of an access token PRESENTED at a
+    /// resource-server endpoint (RFC 9449 sections 7.1 and 4.3, issue #368). This is
+    /// the resource-server counterpart to the issuance-side `resolve_dpop_binding`, and
+    /// is shared by both access-token formats (`at+jwt` and opaque) so the enforcement
+    /// cannot diverge between them. Scope: the `userinfo` endpoint. Introspection is
+    /// deliberately OUT of scope: it is a CLIENT-facing endpoint where the token rides
+    /// the request body under client authentication, not as a presented `DPoP`
+    /// credential.
+    ///
+    /// `expected_jkt` is the token's own binding (its `cnf.jkt` for an `at+jwt`, or the
+    /// `dpop_jkt` column for an opaque token), or [`None`] for an unbound bearer token.
+    /// `scheme` is how the caller presented the token, `proof` is the single `DPoP`
+    /// header value (present only for the `DPoP` scheme), and `htm` is the request
+    /// method the proof must cover.
+    ///
+    /// The rules, every failure collapsing to a uniform `Err(())` the caller maps to a
+    /// single `invalid_token` (no oracle; the granular reason is logged server-side):
+    /// - a BOUND token MUST be presented with the `DPoP` scheme (a `Bearer`
+    ///   presentation of a bound token is refused, RFC 9449 7.1: no bearer downgrade), a
+    ///   proof MUST be present, the proof MUST validate against the `userinfo` `htu`,
+    ///   the request method, the freshness window, and the `ath` of the EXACT presented
+    ///   token, the proof key thumbprint MUST equal `expected_jkt`, and the proof `jti`
+    ///   MUST be fresh in the cross-node replay store;
+    /// - an UNBOUND token MUST be presented as `Bearer` (a `DPoP`-scheme presentation of
+    ///   an unbound token is refused, since the `DPoP` scheme requires a bound token).
+    ///
+    /// # Errors
+    ///
+    /// `Err(())` for every rejection above (uniform, no oracle).
+    pub(crate) async fn verify_dpop_presentation(
+        &self,
+        scope: &Scope,
+        expected_jkt: Option<&str>,
+        scheme: crate::dpop::PresentedScheme,
+        proof: Option<&str>,
+        htm: &str,
+        token: &str,
+    ) -> Result<(), ()> {
+        use crate::dpop::PresentedScheme;
+        let Some(expected_jkt) = expected_jkt else {
+            // An UNBOUND token: it must be a plain bearer. A DPoP-scheme presentation of
+            // an unbound token is refused (the DPoP scheme requires a bound token).
+            return match scheme {
+                PresentedScheme::Bearer => Ok(()),
+                PresentedScheme::Dpop => {
+                    tracing::warn!(
+                        "rejecting a DPoP-scheme presentation of an unbound access token"
+                    );
+                    Err(())
+                }
+            };
+        };
+
+        // A BOUND token must never be accepted as a bearer (RFC 9449 7.1): no downgrade.
+        if scheme != PresentedScheme::Dpop {
+            tracing::warn!("rejecting a DPoP-bound access token presented as a bearer token");
+            return Err(());
+        }
+        // The DPoP scheme requires exactly one proof header.
+        let Some(proof) = proof else {
+            tracing::warn!("rejecting a DPoP-bound access token presented with no DPoP proof");
+            return Err(());
+        };
+
+        // The proof must carry the ath of the EXACT presented token string, and match
+        // the userinfo htu, the request method, and the freshness window. The htu is the
+        // deployment-root userinfo URL (never the per-environment issuer).
+        let now = self.now();
+        let htu = crate::dpop::normalized_htu_for_userinfo(self);
+        let ath = access_token_hash(token);
+        let expected = DpopExpectations {
+            htm,
+            htu: &htu,
+            iat_leeway: crate::dpop::DPOP_IAT_LEEWAY,
+            iat_skew: crate::dpop::DPOP_IAT_SKEW,
+            ath: Some(&ath),
+            nonce: None,
+        };
+        let validated = validate_dpop_proof(proof, &expected, now).map_err(|error| {
+            tracing::warn!(%error, "rejecting an invalid DPoP proof at userinfo");
+        })?;
+
+        // The proof key MUST be the key the token was bound to (its cnf.jkt / dpop_jkt).
+        if validated.jkt != expected_jkt {
+            tracing::warn!(
+                "rejecting a DPoP proof whose key thumbprint does not match the token binding"
+            );
+            return Err(());
+        }
+
+        // Cross-node replay: a (jkt, jti) already recorded inside the freshness window
+        // is refused. The store is RLS-scoped and self-cleans; expires_at is the window
+        // edge plus the replay cushion, from the clock seam.
+        let expires_at_micros = epoch_micros(now + crate::dpop::DPOP_REPLAY_TTL);
+        let fresh = self
+            .store()
+            .scoped(*scope)
+            .dpop_replay()
+            .check_and_record(
+                self.env(),
+                &validated.jkt,
+                &validated.jti,
+                expires_at_micros,
+            )
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "the DPoP proof replay store failed at userinfo");
+            })?;
+        if !fresh {
+            tracing::warn!("rejecting a replayed DPoP proof jti at userinfo");
+            return Err(());
+        }
+        Ok(())
     }
 
     /// Verify an RP-Initiated Logout `id_token_hint` (issue #33): an id token THIS OP
