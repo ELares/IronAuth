@@ -246,7 +246,7 @@ metrics-exporter-prometheus = { version = "0.16", default-features = false }
 # OpenTelemetry OTLP trace export, compiled only behind the non-default `otlp`
 # feature so the default build and the musl static lane stay lean and
 # protoc-free (grpc-tonic ships pre-generated protobuf code).
-opentelemetry = "0.27"
+opentelemetry = "0.32"
 opentelemetry_sdk = "0.27"
 opentelemetry-otlp = { version = "0.27", default-features = false }
 tracing-opentelemetry = "0.28"
