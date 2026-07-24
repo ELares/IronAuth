@@ -98,20 +98,28 @@ impl CompiledJourney {
     /// engine's `drive_via_table` walk and the replay harness's `route_hop` walk share (issue
     /// #355 item 2), so the drift-detection harness cannot itself drift from the engine.
     ///
-    /// An evaluation error (only the depth guard, which a type-checked predicate never hits) is
-    /// treated as a non-match, never fail-open. SAFETY INVARIANT for a built-in artifact: a
-    /// POSITIVE guard whose false skips a security requirement (for example `/mfa_required` gating
-    /// the challenge edge) must never be able to error, or "false on error" would relax that
-    /// requirement. Today the built-in login guards are depth 1 Cmp predicates that only ever error
-    /// on `MAX_PREDICATE_DEPTH`, which they cannot hit, so this holds; a future built-in guard must
-    /// preserve it (issue #359).
+    /// A guard that ERRORS at evaluation fails the drive CLOSED: `choose_edge` routes NOWHERE
+    /// (returns [`None`], which the engine's `drive_via_table` maps to a not-found and the replay
+    /// harness to a dead end), rather than skipping the erroring edge. SAFETY INVARIANT (issue
+    /// #359): treating an eval error as "this guard is false, try the next edge" would let a
+    /// POSITIVE guard that gates a security requirement (for example `/mfa_required` gating the
+    /// challenge edge) fall through to a later unguarded edge and RELAX that requirement whenever
+    /// the guard errored. Failing closed on the FIRST error forecloses that class entirely: an
+    /// errorable guard can never route past a security gate, only deny. The only eval error is a
+    /// predicate deeper than `MAX_PREDICATE_DEPTH`, which the load-time type check already rejects,
+    /// so this is unreachable for a validated journey and is defense in depth against a future
+    /// errorable guard kind or a validation bypass.
     #[must_use]
     pub fn choose_edge(&self, from: &str, ctx: &EvalContext) -> Option<StepId> {
         for edge in self.edges(from) {
-            // An eval error counts as "guard did not match" so a corrupt guard cannot force a route.
             let taken = match &edge.guard {
                 None => true,
-                Some(guard) => evaluate(guard, ctx).unwrap_or(false),
+                // Fail closed on an eval error: route nowhere rather than skip to a later edge,
+                // so an errorable guard can never fall through and relax a security gate.
+                Some(guard) => match evaluate(guard, ctx) {
+                    Ok(taken) => taken,
+                    Err(_) => return None,
+                },
             };
             if taken {
                 return Some(edge.to.clone());
@@ -544,6 +552,50 @@ mod tests {
         assert_eq!(compiled.choose_edge("fork", &ctx).as_deref(), Some("first"));
         // With the signal absent, neither guard holds, so the step routes nowhere.
         assert_eq!(compiled.choose_edge("fork", &EvalContext::default()), None);
+    }
+
+    #[test]
+    fn choose_edge_fails_closed_when_a_guard_errors_instead_of_falling_through() {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        use crate::eval::{EvalContext, MAX_PREDICATE_DEPTH};
+
+        // A guard nested deeper than MAX_PREDICATE_DEPTH ERRORS at evaluation. The load-time type
+        // check rejects such a predicate, so it cannot arise from a validated journey; the compiled
+        // table is built DIRECTLY here to pin the routing primitive's fail-closed contract on the
+        // one eval error that exists (issue #359).
+        let mut deep = Predicate::Always;
+        for _ in 0..(MAX_PREDICATE_DEPTH + 8) {
+            deep = Predicate::Not {
+                operand: Box::new(deep),
+            };
+        }
+        // `start` has a POSITIVE security guard (the deep, erroring one) to `secured`, then an
+        // UNGUARDED fallthrough to `bypass`. If an eval error were treated as "guard is false", the
+        // walk would fall through to `bypass` and SKIP `secured`. Failing closed forbids that.
+        let mut transitions: BTreeMap<StepId, Vec<GuardedEdge>> = BTreeMap::new();
+        transitions.insert(
+            "start".to_owned(),
+            vec![
+                GuardedEdge {
+                    to: "secured".to_owned(),
+                    guard: Some(deep),
+                },
+                GuardedEdge {
+                    to: "bypass".to_owned(),
+                    guard: None,
+                },
+            ],
+        );
+        let compiled = CompiledJourney {
+            entry: "start".to_owned(),
+            steps: BTreeMap::new(),
+            transitions,
+            reachable: BTreeSet::new(),
+        };
+
+        // The erroring guard fails the drive CLOSED: no route, and NEVER the unguarded bypass.
+        assert_eq!(compiled.choose_edge("start", &EvalContext::default()), None);
     }
 
     #[test]
