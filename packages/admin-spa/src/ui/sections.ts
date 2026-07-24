@@ -21,5 +21,7 @@ export const SECTIONS: ReadonlyArray<Section> = [
   { href: "/clients", label: "Clients" },
   { href: "/users", label: "Users" },
   { href: "/connectors", label: "Connectors" },
+  { href: "/organizations", label: "Organizations" },
+  { href: "/invitations", label: "Invitations" },
   { href: "/diagnostics", label: "Diagnostics" },
 ];
