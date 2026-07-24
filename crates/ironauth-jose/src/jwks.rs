@@ -29,6 +29,14 @@ use crate::signing_key::{PublicComponents, SigningKey, SigningKeyError};
 pub struct Jwk(Map<String, Value>);
 
 impl Jwk {
+    /// Wrap a raw JSON object as a [`Jwk`], for a JWK read from somewhere other
+    /// than a [`SigningKey`] (an inbound JWKS entry, or the `jwk` protected
+    /// header of a `DPoP` proof). No validation happens here; the accessors and the
+    /// [`trusted_key_from_jwk`] mapping do the checking.
+    pub(crate) fn from_object(object: Map<String, Value>) -> Self {
+        Self(object)
+    }
+
     /// Build the public JWK for a signing key.
     fn from_signing_key(key: &SigningKey) -> Result<Self, SigningKeyError> {
         let mut jwk = Map::new();
@@ -185,14 +193,22 @@ pub fn trusted_keys_from_jwks(json: &[u8]) -> Vec<TrustedKey> {
     let Some(keys) = value.get("keys").and_then(Value::as_array) else {
         return Vec::new();
     };
-    keys.iter().filter_map(trusted_key_from_jwk).collect()
+    keys.iter()
+        .filter_map(Value::as_object)
+        .filter_map(|object| trusted_key_from_jwk(&Jwk::from_object(object.clone())))
+        .collect()
 }
 
-/// Turn one JWK object into a [`TrustedKey`], or [`None`] for a type, curve, or
+/// Turn one [`Jwk`] into a [`TrustedKey`], or [`None`] for a type, curve, or
 /// material this core cannot represent (so it is never trusted).
-fn trusted_key_from_jwk(jwk: &Value) -> Option<TrustedKey> {
-    let kid = jwk.get("kid").and_then(Value::as_str).map(str::to_owned);
-    match jwk.get("kty").and_then(Value::as_str)? {
+///
+/// This is the ONE JWK to verifying-key mapping shared by the inbound JWKS parser
+/// ([`trusted_keys_from_jwks`]) and the `DPoP` proof path
+/// (`crate::dpop::validate_dpop_proof`), so a key admitted by one path is admitted
+/// by the other under identical rules.
+pub(crate) fn trusted_key_from_jwk(jwk: &Jwk) -> Option<TrustedKey> {
+    let kid = jwk.kid().map(str::to_owned);
+    match jwk.kty()? {
         "OKP" => {
             // Only Ed25519 among OKP curves; Ed448/X25519/X448 are not represented.
             if jwk.get("crv").and_then(Value::as_str)? != "Ed25519" {
@@ -223,7 +239,7 @@ fn trusted_key_from_jwk(jwk: &Value) -> Option<TrustedKey> {
 }
 
 /// Read and base64url-decode a JWK member, or [`None`] if absent or malformed.
-fn jwk_b64(jwk: &Value, member: &str) -> Option<Vec<u8>> {
+fn jwk_b64(jwk: &Jwk, member: &str) -> Option<Vec<u8>> {
     let encoded = jwk.get(member)?.as_str()?;
     URL_SAFE_NO_PAD.decode(encoded.as_bytes()).ok()
 }

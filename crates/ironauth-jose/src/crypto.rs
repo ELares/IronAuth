@@ -14,9 +14,22 @@
 //! signature verifies, and nothing else. The algorithm and key come from the
 //! caller's policy; this module never inspects the token.
 
+use ring::digest;
 use ring::signature::{self, RsaPublicKeyComponents, UnparsedPublicKey, VerificationAlgorithm};
 
 use crate::policy::{JwsAlgorithm, KeyMaterial};
+
+/// The SHA-256 digest of `bytes`, as the raw 32-byte hash.
+///
+/// This is the one place SHA-256 is computed, so the "only `crypto.rs` touches
+/// `ring`" invariant holds: the RFC 7638 JWK thumbprint (`dpop::jwk_thumbprint`)
+/// hashes its canonical JWK through here rather than reaching for `ring` itself.
+pub(crate) fn sha256(bytes: &[u8]) -> [u8; 32] {
+    let digest = digest::digest(&digest::SHA256, bytes);
+    let mut out = [0_u8; 32];
+    out.copy_from_slice(digest.as_ref());
+    out
+}
 
 /// Verify `signature` over `signing_input` with `key` under `alg`.
 ///

@@ -163,7 +163,7 @@ pub fn compact_jws_kid(token: &str) -> Option<String> {
 /// Returns `None` for any other shape (two segments, four, five as in a JWE, an
 /// empty segment, or a trailing dot). An `alg: none` unsecured JWS has an empty
 /// third segment and is rejected here as well as at the header stage.
-fn split_segments(token: &str) -> Option<(&str, &str, &str)> {
+pub(crate) fn split_segments(token: &str) -> Option<(&str, &str, &str)> {
     let mut parts = token.split('.');
     let header = parts.next()?;
     let payload = parts.next()?;
@@ -179,7 +179,7 @@ fn split_segments(token: &str) -> Option<(&str, &str, &str)> {
 
 /// The maximum base64url length that decodes to at most `decoded_bytes` bytes,
 /// plus a small slack. Unpadded base64url uses 4 characters per 3 bytes.
-fn max_b64_len(decoded_bytes: usize) -> usize {
+pub(crate) fn max_b64_len(decoded_bytes: usize) -> usize {
     decoded_bytes
         .saturating_mul(4)
         .saturating_div(3)

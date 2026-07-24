@@ -121,6 +121,7 @@
 mod claims;
 mod cnf;
 mod crypto;
+mod dpop;
 pub mod envelope;
 mod error;
 mod header;
@@ -142,6 +143,7 @@ pub mod seams;
 
 pub use claims::VerifiedClaims;
 pub use cnf::{CnfError, Confirmation};
+pub use dpop::{DpopError, DpopExpectations, DpopProof, jwk_thumbprint, validate_dpop_proof};
 pub use envelope::{
     Aad, AadBuilder, BlindIndex, Dek, EnvelopeError, KEY_LEN, Kek, MasterKey, NONCE_BYTES, Sealed,
 };
