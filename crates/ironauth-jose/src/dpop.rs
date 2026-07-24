@@ -12,8 +12,8 @@
 //! pitfalls before it verifies anything.
 //!
 //! The module is PURE and sans-IO. Every time-dependent decision is taken against
-//! the `now` argument the caller threads in; there is no `SystemTime::now` here,
-//! so the freshness window is testable with fixed instants. The stateful pieces
+//! the `now` argument the caller threads in; this core never reads the wall clock
+//! itself, so the freshness window is testable with fixed instants. The stateful pieces
 //! of `DPoP` (the `jti` replay cache, server-issued nonce) are the caller's, above
 //! this layer.
 //!
@@ -51,9 +51,11 @@ use crate::verify::{max_b64_len, split_segments};
 /// The required `typ` of a `DPoP` proof JWT (RFC 9449 section 4.2).
 const DPOP_TYP: &str = "dpop+jwt";
 
-/// The private JWK members a PUBLIC proof key must never carry. Their presence is
-/// treated as malformed (or an attempt to smuggle a private key), never ignored.
-const PRIVATE_JWK_MEMBERS: &[&str] = &["d", "p", "q", "dp", "dq", "qi"];
+/// The private JWK members a PUBLIC proof key must never carry (RFC 7518): the EC/OKP
+/// private key `d`, the RSA private primes and CRT values, and the multi-prime `oth`
+/// array. Their presence is treated as malformed (or an attempt to smuggle a private
+/// key), never ignored.
+const PRIVATE_JWK_MEMBERS: &[&str] = &["d", "p", "q", "dp", "dq", "qi", "oth"];
 
 /// An upper bound on the accepted `jti` length, so an unbounded identifier cannot
 /// bloat the caller's replay cache. Generous for any realistic unique id.
@@ -672,18 +674,24 @@ mod tests {
 
     #[test]
     fn embedded_private_key_is_rejected() {
-        let key = ed25519_key();
-        let mut jwk = public_jwk(&key);
-        jwk.as_object_mut()
-            .expect("object")
-            .insert("d".to_owned(), json!("c2VjcmV0"));
-        let header = json!({ "typ": DPOP_TYP, "alg": "EdDSA", "jwk": jwk });
-        let payload = json!({ "htm": "POST", "htu": "https://issuer.example.test/token", "iat": 1_700_000_000_u64, "jti": "id" });
-        let proof = sign_proof(&key, &header, &payload);
-        assert_eq!(
-            validate_dpop_proof(&proof, &default_expectations(), fixed_now()),
-            Err(DpopError::PrivateKeyInProof)
-        );
+        // Every private member, including the multi-prime `oth` array, is refused; the
+        // proof is otherwise valid (signed by the real key), so only the private-member
+        // guard can reject it.
+        for member in ["d", "p", "q", "dp", "dq", "qi", "oth"] {
+            let key = ed25519_key();
+            let mut jwk = public_jwk(&key);
+            jwk.as_object_mut()
+                .expect("object")
+                .insert(member.to_owned(), json!("c2VjcmV0"));
+            let header = json!({ "typ": DPOP_TYP, "alg": "EdDSA", "jwk": jwk });
+            let payload = json!({ "htm": "POST", "htu": "https://issuer.example.test/token", "iat": 1_700_000_000_u64, "jti": "id" });
+            let proof = sign_proof(&key, &header, &payload);
+            assert_eq!(
+                validate_dpop_proof(&proof, &default_expectations(), fixed_now()),
+                Err(DpopError::PrivateKeyInProof),
+                "member {member} must be rejected as private material"
+            );
+        }
     }
 
     #[test]
