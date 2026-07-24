@@ -237,15 +237,8 @@ async fn resolve(
     //    plain bearer. Every failure is the uniform invalid_token (no oracle).
     let cnf =
         Confirmation::from_claims(verified.claims()).map_err(|_| UserInfoError::InvalidToken)?;
-    enforce_dpop(
-        state,
-        &scope,
-        cnf_jkt(cnf.as_ref()),
-        &presented,
-        method,
-        token,
-    )
-    .await?;
+    let expected_jkt = confirmation_jkt(cnf.as_ref())?;
+    enforce_dpop(state, &scope, expected_jkt, &presented, method, token).await?;
 
     // The granted scope drives which claim sets are released (Core 5.4). UserInfo
     // requires the openid scope (Core 5.3.1); its absence is insufficient_scope.
@@ -502,13 +495,20 @@ fn read_single_dpop_header(headers: &HeaderMap) -> Result<Option<String>, UserIn
     Ok(Some(proof.to_owned()))
 }
 
-/// The `DPoP` key thumbprint a token is bound to, if its `cnf` is a `jkt`
-/// confirmation. A non-`jkt` confirmation (e.g. a future mTLS `x5t#S256`) is not a
-/// `DPoP` binding, so it reads as unbound for the `DPoP` presentation rules.
-fn cnf_jkt(confirmation: Option<&Confirmation>) -> Option<&str> {
+/// The `DPoP` key thumbprint a token is bound to: `Some(jkt)` for a `jkt`
+/// confirmation, `None` for no `cnf` (an unbound token that may be a plain bearer).
+///
+/// A token that carries a RECOGNIZED but non-`jkt` confirmation (a future mTLS
+/// `x5t#S256` sender-constraint this `DPoP` resource-server path cannot verify) FAILS
+/// CLOSED to [`UserInfoError::InvalidToken`]: reading it as unbound would accept a
+/// sender-constrained token as a plain bearer, downgrading its binding. Inert today
+/// (nothing mints a non-`jkt`-bound access token), a fail-closed guard for when mTLS
+/// binding lands.
+fn confirmation_jkt(confirmation: Option<&Confirmation>) -> Result<Option<&str>, UserInfoError> {
     match confirmation {
-        Some(Confirmation::Jkt(jkt)) => Some(jkt.as_str()),
-        _ => None,
+        None => Ok(None),
+        Some(Confirmation::Jkt(jkt)) => Ok(Some(jkt.as_str())),
+        Some(_) => Err(UserInfoError::InvalidToken),
     }
 }
 
@@ -774,6 +774,22 @@ mod tests {
         bearer_headers.insert(DPOP_HEADER, HeaderValue::from_static("ignored"));
         let bearer = presented_credential(&bearer_headers).expect("bearer parses");
         assert!(bearer.proof.is_none());
+    }
+
+    #[test]
+    fn confirmation_jkt_fails_closed_on_a_non_jkt_binding() {
+        // No cnf: unbound (a plain bearer is allowed).
+        assert!(matches!(confirmation_jkt(None), Ok(None)));
+        // A jkt binding: the thumbprint to enforce.
+        let jkt = Confirmation::Jkt("thumb".to_owned());
+        assert!(matches!(confirmation_jkt(Some(&jkt)), Ok(Some("thumb"))));
+        // A recognized non-jkt binding (mTLS x5t#S256) this path cannot verify MUST
+        // fail closed, never read as unbound bearer.
+        let x5t = Confirmation::X5tS256("cert-thumb".to_owned());
+        assert!(matches!(
+            confirmation_jkt(Some(&x5t)),
+            Err(UserInfoError::InvalidToken)
+        ));
     }
 
     #[test]
