@@ -140,8 +140,10 @@ impl IdorHarness {
     /// environment-scoped organization repository (`organizations.get`,
     /// `organizations.delete`), its membership join (`org_memberships.get`,
     /// `org_memberships.remove`), its role set (`org_roles.get`,
-    /// `org_roles.delete`), and its group forest (`org_groups.get`,
-    /// `org_groups.update`, `org_groups.delete`, `org_groups.reparent`), the
+    /// `org_roles.delete`), its group forest (`org_groups.get`,
+    /// `org_groups.update`, `org_groups.delete`, `org_groups.reparent`), and the
+    /// three join surfaces that bind those together (`org_group_members.remove`,
+    /// `org_group_roles.unassign`, `org_membership_roles.unassign`), the
     /// two-thirds of the four-level resource model
     /// that is tenant-and-environment scoped (operators, tenants, and environments
     /// are LEVEL tables whose isolation is exercised by the management-plane tests
@@ -165,6 +167,9 @@ impl IdorHarness {
         self.register(Box::new(OrgGroupUpdateProbe));
         self.register(Box::new(OrgGroupDeleteProbe));
         self.register(Box::new(OrgGroupReparentProbe));
+        self.register(Box::new(OrgGroupMemberRemoveProbe));
+        self.register(Box::new(OrgGroupRoleUnassignProbe));
+        self.register(Box::new(OrgMembershipRoleUnassignProbe));
         self
     }
 
@@ -862,6 +867,129 @@ impl IsolationProbe for OrgGroupReparentProbe {
 /// reaches a hierarchy check (it clears the parent), so the value is immaterial;
 /// it mirrors the config default so the probe reads like a real caller.
 const DEFAULT_PROBE_GROUP_DEPTH: u32 = 8;
+
+/// Built-in probe for `ActingOrgGroupMemberRepo::remove` (issue #97). `store` must
+/// authenticate as `ironauth_control`. Unbinding another scope's group member would
+/// be a cross-scope mutation, so it must be the uniform not-found: the same answer an
+/// absent, a soft-deleted, and a foreign-organization binding give.
+struct OrgGroupMemberRemoveProbe;
+
+impl IsolationProbe for OrgGroupMemberRemoveProbe {
+    fn name(&self) -> &'static str {
+        "org_group_members.remove"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            let env = Env::system();
+            let Ok(id) = store
+                .management()
+                .org_group_members(caller)
+                .parse_id(foreign_id)
+            else {
+                return ProbeOutcome::Denied;
+            };
+            let organization = OrganizationId::generate(&env, &caller);
+            let actor = ActorRef::service(ServiceId::generate(&env));
+            let correlation = CorrelationId::generate(&env);
+            let members = store
+                .management()
+                .acting(actor, correlation)
+                .org_group_members(caller);
+            match members.remove(&env, &organization, &id).await {
+                Ok(()) => ProbeOutcome::Leaked,
+                Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `ActingOrgGroupRoleRepo::unassign` (issue #97). `store` must
+/// authenticate as `ironauth_control`. Withdrawing another scope's group role
+/// assignment would be a cross-scope mutation with a real authorization effect (every
+/// member of that group and its descendants would lose the role), so it must be the
+/// uniform not-found.
+struct OrgGroupRoleUnassignProbe;
+
+impl IsolationProbe for OrgGroupRoleUnassignProbe {
+    fn name(&self) -> &'static str {
+        "org_group_roles.unassign"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            let env = Env::system();
+            let Ok(id) = store
+                .management()
+                .org_group_roles(caller)
+                .parse_id(foreign_id)
+            else {
+                return ProbeOutcome::Denied;
+            };
+            let organization = OrganizationId::generate(&env, &caller);
+            let actor = ActorRef::service(ServiceId::generate(&env));
+            let correlation = CorrelationId::generate(&env);
+            let assignments = store
+                .management()
+                .acting(actor, correlation)
+                .org_group_roles(caller);
+            match assignments.unassign(&env, &organization, &id).await {
+                Ok(()) => ProbeOutcome::Leaked,
+                Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `ActingOrgMembershipRoleRepo::unassign` (issue #97). `store`
+/// must authenticate as `ironauth_control`. Withdrawing another scope's direct role
+/// grant would be a cross-scope mutation, so it must be the uniform not-found.
+struct OrgMembershipRoleUnassignProbe;
+
+impl IsolationProbe for OrgMembershipRoleUnassignProbe {
+    fn name(&self) -> &'static str {
+        "org_membership_roles.unassign"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            let env = Env::system();
+            let Ok(id) = store
+                .management()
+                .org_membership_roles(caller)
+                .parse_id(foreign_id)
+            else {
+                return ProbeOutcome::Denied;
+            };
+            let organization = OrganizationId::generate(&env, &caller);
+            let actor = ActorRef::service(ServiceId::generate(&env));
+            let correlation = CorrelationId::generate(&env);
+            let assignments = store
+                .management()
+                .acting(actor, correlation)
+                .org_membership_roles(caller);
+            match assignments.unassign(&env, &organization, &id).await {
+                Ok(()) => ProbeOutcome::Leaked,
+                Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
 
 /// Built-in probe for `ActingAuthorizationRepo::redeem` (issue #12). A code
 /// minted in another scope must never be consumable under the caller's scope.

@@ -143,6 +143,45 @@ impl ScopedKind for OrgGroupKind {
     const PREFIX: &'static str = "grp";
 }
 
+/// Marker for an organization group MEMBER (`gmb_`), the tenant-scoped join row
+/// binding one organization MEMBERSHIP into one group of the same organization
+/// (issue #97). The subject is a membership (`omb_`), never a bare user, so being
+/// in a group presupposes being in the organization structurally. Scoped like
+/// every other resource so an id minted in one scope parses as a uniform
+/// not-found under another. Not a bearer secret (it is the binding's stable
+/// handle), so its debug form stays legible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OrgGroupMemberKind;
+impl ScopedKind for OrgGroupMemberKind {
+    const PREFIX: &'static str = "gmb";
+}
+
+/// Marker for an organization group ROLE assignment (`grl_`), the tenant-scoped
+/// join row granting one role to one group (issue #97). Every live member of that
+/// group holds the role, and so does every member of every DESCENDANT of it:
+/// roles flow DOWN the group forest, so this is the one inheriting surface in the
+/// model. Scoped like every other resource so an id minted in one scope parses as
+/// a uniform not-found under another. Not a bearer secret, so its debug form stays
+/// legible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OrgGroupRoleKind;
+impl ScopedKind for OrgGroupRoleKind {
+    const PREFIX: &'static str = "grl";
+}
+
+/// Marker for a DIRECT organization membership role assignment (`mrl_`), the
+/// tenant-scoped join row granting one role to exactly one membership with no
+/// group involved (issue #97). Distinct from the group assignment (`grl_`)
+/// because the two inherit differently: a direct grant reaches one membership and
+/// stops. Scoped like every other resource so an id minted in one scope parses as
+/// a uniform not-found under another. Not a bearer secret, so its debug form stays
+/// legible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OrgMembershipRoleKind;
+impl ScopedKind for OrgMembershipRoleKind {
+    const PREFIX: &'static str = "mrl";
+}
+
 /// Marker for an audit-log event, the tenant-scoped record the audit log writes
 /// in the same transaction as every mutation. Scoped like any other resource so
 /// audit rows are themselves subject to the tenant-isolation policies.
@@ -1293,6 +1332,15 @@ pub type OrgRoleId = ScopedId<OrgRoleKind>;
 /// organization and holding a position in that organization's group forest
 /// (issue #97).
 pub type OrgGroupId = ScopedId<OrgGroupKind>;
+/// An organization group-member identifier (`gmb_...`), the join row binding one
+/// organization membership into one group (issue #97).
+pub type OrgGroupMemberId = ScopedId<OrgGroupMemberKind>;
+/// An organization group-role identifier (`grl_...`), the join row granting one
+/// role to one group and, by inheritance, to that group's descendants (issue #97).
+pub type OrgGroupRoleId = ScopedId<OrgGroupRoleKind>;
+/// A direct organization membership-role identifier (`mrl_...`), the join row
+/// granting one role to exactly one membership (issue #97).
+pub type OrgMembershipRoleId = ScopedId<OrgMembershipRoleKind>;
 /// An audit-log event identifier (`aud_...`).
 pub type AuditId = ScopedId<AuditKind>;
 /// A management API key identifier (`mak_...`), environment-scoped (issue #11).
@@ -2113,6 +2161,109 @@ mod tests {
     }
 
     #[test]
+    fn property_org_assignment_ids_round_trip_and_never_cross_kinds() {
+        // A property sweep over the three JOIN levels issue #97 adds (a group
+        // member, a group role assignment, and a direct membership role
+        // assignment). All three are addressed by the SAME nested management
+        // routes and all three are removed by an id in a path segment, so a kind
+        // confusion between any pair would let a request meant for one table
+        // unassign a row in another. The sweep therefore asserts each round-trips
+        // in its own scope, none parses in a foreign scope, and NO id of any of
+        // these kinds parses as any OTHER kind of the same issue.
+        let env = test_env();
+        let tenant_a = TenantId::generate(&env);
+        let tenant_b = TenantId::generate(&env);
+        let env_1 = EnvironmentId::generate(&env);
+        let env_2 = EnvironmentId::generate(&env);
+        let scope_a = Scope::new(tenant_a, env_1);
+        let cross_tenant = Scope::new(tenant_b, env_1);
+        let cross_env = Scope::new(tenant_a, env_2);
+
+        for _ in 0..1_000 {
+            let member = OrgGroupMemberId::generate(&env, &scope_a);
+            let group_role = OrgGroupRoleId::generate(&env, &scope_a);
+            let direct_role = OrgMembershipRoleId::generate(&env, &scope_a);
+            let member_text = member.to_string();
+            let group_role_text = group_role.to_string();
+            let direct_role_text = direct_role.to_string();
+            assert!(member_text.starts_with("gmb_"));
+            assert!(group_role_text.starts_with("grl_"));
+            assert!(direct_role_text.starts_with("mrl_"));
+            assert_eq!(
+                OrgGroupMemberId::parse_in_scope(&member_text, &scope_a).expect("in scope"),
+                member
+            );
+            assert_eq!(
+                OrgGroupRoleId::parse_in_scope(&group_role_text, &scope_a).expect("in scope"),
+                group_role
+            );
+            assert_eq!(
+                OrgMembershipRoleId::parse_in_scope(&direct_role_text, &scope_a).expect("in scope"),
+                direct_role
+            );
+            for foreign in [cross_tenant, cross_env] {
+                assert_eq!(
+                    OrgGroupMemberId::parse_in_scope(&member_text, &foreign),
+                    Err(NotInScope)
+                );
+                assert_eq!(
+                    OrgGroupRoleId::parse_in_scope(&group_role_text, &foreign),
+                    Err(NotInScope)
+                );
+                assert_eq!(
+                    OrgMembershipRoleId::parse_in_scope(&direct_role_text, &foreign),
+                    Err(NotInScope)
+                );
+            }
+            // No cross-kind confusion, in either direction, within the scope where
+            // every one of these ids is otherwise perfectly valid. `grl_` and
+            // `gmb_` share a leading letter with each other and with `grp_`, which
+            // is exactly the family a prefix typo would collapse.
+            assert_eq!(
+                OrgGroupMemberId::parse_in_scope(&group_role_text, &scope_a),
+                Err(NotInScope),
+                "a group-role id is not a group-member id"
+            );
+            assert_eq!(
+                OrgGroupRoleId::parse_in_scope(&member_text, &scope_a),
+                Err(NotInScope),
+                "a group-member id is not a group-role id"
+            );
+            assert_eq!(
+                OrgMembershipRoleId::parse_in_scope(&group_role_text, &scope_a),
+                Err(NotInScope),
+                "a group-role id is not a direct membership-role id"
+            );
+            assert_eq!(
+                OrgGroupRoleId::parse_in_scope(&direct_role_text, &scope_a),
+                Err(NotInScope),
+                "a direct membership-role id is not a group-role id"
+            );
+            assert_eq!(
+                OrgGroupMemberId::parse_in_scope(
+                    &OrgGroupId::generate(&env, &scope_a).to_string(),
+                    &scope_a
+                ),
+                Err(NotInScope),
+                "a group id is not a group-member id"
+            );
+        }
+
+        assert_eq!(
+            OrgGroupMemberId::parse_in_scope("gmb_not-base64-!!", &scope_a),
+            Err(NotInScope)
+        );
+        assert_eq!(
+            OrgGroupRoleId::parse_in_scope("grl_not-base64-!!", &scope_a),
+            Err(NotInScope)
+        );
+        assert_eq!(
+            OrgMembershipRoleId::parse_in_scope("mrl_not-base64-!!", &scope_a),
+            Err(NotInScope)
+        );
+    }
+
+    #[test]
     fn every_declared_prefix_is_mutually_distinct() {
         // Every identifier kind in this module declares a `PREFIX`, and the whole
         // anti-oracle contract rests on those prefixes being a SET: two kinds
@@ -2181,6 +2332,18 @@ mod tests {
         // one of them without tripping the duplicate check above.
         assert!(seen.contains_key("rol"), "the org-role prefix is declared");
         assert!(seen.contains_key("grp"), "the org-group prefix is declared");
+        assert!(
+            seen.contains_key("gmb"),
+            "the org-group-member prefix is declared"
+        );
+        assert!(
+            seen.contains_key("grl"),
+            "the org-group-role prefix is declared"
+        );
+        assert!(
+            seen.contains_key("mrl"),
+            "the org-membership-role prefix is declared"
+        );
     }
 
     #[test]

@@ -536,6 +536,24 @@ name = "org_groups"
 path = "tests/org_groups.rs"
 required-features = ["testing"]
 
+# Organization group members, role assignments, the membership cascade, and the
+# deterministic resolution engine (issue #97, store PR 3): the audited add/remove and
+# assign/unassign vocabulary on all three join tables, organization containment on
+# every list and every mutation (proved against a second organization in the SAME
+# scope), the uniform not-found across absent / removed / foreign-org / foreign-scope
+# and across a cross-organization PAIRING, effective-role resolution as the exact
+# union of direct, group, and ancestor-inherited roles with byte-stable order,
+# resolution against an independent in-memory model over randomized forests,
+# TERMINATION on a stored cycle through a soft-deleted node, read-side truncation at
+# the depth bound, the membership-attachment cascade from all three of its call sites,
+# the least-privilege grants (the data plane is read only and no endpoint column is
+# writable by anybody), and the covenant that members, groups, and assignments are
+# uncapped. Needs a real database (DATABASE_URL).
+[[test]]
+name = "org_assignments"
+path = "tests/org_assignments.rs"
+required-features = ["testing"]
+
 # The tenant lifecycle state machine, residency attributes, data-plane fence, and
 # crypto-shredding offboarding (#46). Needs a real database (DATABASE_URL).
 [[test]]

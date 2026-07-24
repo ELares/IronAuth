@@ -574,8 +574,8 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
     );
     assert_eq!(
         report.already_applied(),
-        87,
-        "the production chain is exactly eighty-seven migrations (isolation, audit log, management \
+        89,
+        "the production chain is exactly eighty-nine migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -597,17 +597,18 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
          policy decision traces, flows control read, signup forms, consent lockdown, client admin \
          grants, consent control grants, flow version pin, flow versions, first-party challenge \
          codes, DPoP binding, DPoP proof replay, organization membership, organization token \
-         context, organization roles, organization groups)"
+         context, organization roles, organization groups, organization group members, \
+         organization role assignments)"
     );
 
-    // The ledger holds exactly versions 1 through 87.
+    // The ledger holds exactly versions 1 through 89.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
             46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67,
-            68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87
+            68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89
         ]
     );
     let phase_of = |version: i64| async move {
@@ -5242,4 +5243,278 @@ async fn applied_versions(pool: &sqlx::PgPool) -> Vec<i64> {
         .iter()
         .map(|row| row.get::<i64, _>("version"))
         .collect()
+}
+
+/// The three JOIN tables' schema, policies, indexes, and grants (issue #97,
+/// migrations 0088 and 0089).
+///
+/// One test over all three because they are one structural contract stated three
+/// times: the same scope columns, the same organization denormalization, the same
+/// soft delete, the same partial uniqueness over live rows, the same read-only data
+/// plane. A per-table copy would let one of the three drift while the other two kept
+/// the suite green, which is exactly the defect this shape rules out. Its own test
+/// rather than more lines in the production-chain assertions, whose future is already
+/// at the stack budget of a default test thread.
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "three tables' whole structural contract (phase, columns, constraints, \
+              policies, index shapes, and the full grant matrix on both roles) read \
+              as one unit, precisely so the three cannot drift apart"
+)]
+async fn the_org_join_tables_carry_their_isolation_indexes_and_least_privilege_grants() {
+    let db = TestDatabase::start().await;
+    let pool = db.owner_pool();
+
+    // EXPAND on both: new tenant-scoped tables with their indexes, policies, and
+    // grants. Nothing existing is altered or dropped.
+    for version in [88_i64, 89] {
+        let phase: String = sqlx::query("SELECT phase FROM _schema_migrations WHERE version = $1")
+            .bind(version)
+            .fetch_one(pool)
+            .await
+            .unwrap_or_else(|_| panic!("{version:04} is in the ledger"))
+            .get("phase");
+        assert_eq!(phase, "expand", "migration {version:04} must be an EXPAND");
+    }
+
+    // The shape every one of the three shares: RLS enabled AND forced, the isolation
+    // policy, the nonempty-scope CHECK, NOT NULL on the scope and organization
+    // columns, and a foreign key into organizations.
+    for table in [
+        "org_group_members",
+        "org_group_roles",
+        "org_membership_roles",
+    ] {
+        assert!(table_exists(pool, table).await, "{table} exists");
+        assert!(
+            rls_enabled_and_forced(pool, table).await,
+            "{table} must ENABLE and FORCE row-level security"
+        );
+        assert!(
+            policy_exists(pool, table, &format!("{table}_tenant_isolation")).await,
+            "{table} must carry the (tenant, environment) isolation policy"
+        );
+        assert!(
+            check_constraint_exists(pool, table, &format!("{table}_scope_nonempty")).await,
+            "{table} must carry the nonempty-scope CHECK"
+        );
+        for column in ["tenant_id", "environment_id", "organization_id"] {
+            assert!(
+                column_is_not_null(pool, table, column).await,
+                "{table}.{column} must be NOT NULL"
+            );
+        }
+        assert!(
+            fk_references(pool, table, "organization_id").await,
+            "{table}.organization_id must be a FOREIGN KEY into organizations"
+        );
+        // A soft-delete column, and no DELETE grant on either plane to go with it.
+        assert!(
+            column_exists(pool, table, "deleted_at").await,
+            "{table}.deleted_at exists (removal is a soft delete)"
+        );
+    }
+
+    // The per-table endpoint columns and their foreign keys. This is what makes
+    // "you cannot be in a group of an organization you do not belong to" a schema
+    // property rather than a convention: the subject of a group binding and of a
+    // direct role grant is an org MEMBERSHIP, not a bare user.
+    for (table, endpoints) in [
+        ("org_group_members", ["group_id", "membership_id"]),
+        ("org_group_roles", ["group_id", "role_id"]),
+        ("org_membership_roles", ["membership_id", "role_id"]),
+    ] {
+        for column in endpoints {
+            assert!(
+                column_is_not_null(pool, table, column).await,
+                "{table}.{column} must be NOT NULL"
+            );
+            assert!(
+                fk_references(pool, table, column).await,
+                "{table}.{column} must be a FOREIGN KEY"
+            );
+        }
+    }
+
+    // Uniqueness is PARTIAL over LIVE rows on all three, so removing a binding or
+    // withdrawing an assignment frees the pair immediately instead of occupying it
+    // forever, and every read (which filters deleted_at IS NULL) agrees with the
+    // uniqueness invariant on exactly the live set.
+    for index in [
+        (
+            "org_group_members",
+            "org_group_members_group_membership_live_uniq",
+        ),
+        ("org_group_roles", "org_group_roles_group_role_live_uniq"),
+        (
+            "org_membership_roles",
+            "org_membership_roles_membership_role_live_uniq",
+        ),
+    ] {
+        assert!(
+            partial_unique_index_exists(pool, index.0, index.1).await,
+            "{} must carry the {} partial unique index over live rows",
+            index.0,
+            index.1
+        );
+    }
+
+    // The lookup indexes, and their COLUMN ORDER. Order is the whole point: an index
+    // present but ordered wrongly leaves the token-issuance reads on a sequential
+    // scan while every functional assertion in the suite stays green. The membership
+    // index of org_group_members is the SEED of effective-role resolution and the
+    // membership index of org_membership_roles is its DIRECT half, so both are on the
+    // mint path.
+    for (table, index, leading) in [
+        (
+            "org_group_members",
+            "org_group_members_membership_idx",
+            "membership_id",
+        ),
+        (
+            "org_group_members",
+            "org_group_members_group_idx",
+            "group_id",
+        ),
+        ("org_group_roles", "org_group_roles_group_idx", "group_id"),
+        ("org_group_roles", "org_group_roles_role_idx", "role_id"),
+        (
+            "org_membership_roles",
+            "org_membership_roles_membership_idx",
+            "membership_id",
+        ),
+        (
+            "org_membership_roles",
+            "org_membership_roles_role_idx",
+            "role_id",
+        ),
+    ] {
+        assert_eq!(
+            index_columns(pool, table, index).await,
+            vec![
+                "tenant_id".to_owned(),
+                "environment_id".to_owned(),
+                leading.to_owned(),
+                "created_at".to_owned(),
+                "id".to_owned(),
+            ],
+            "{index} must be (tenant, environment, {leading}, created_at, id): the scope, \
+             the filter, then the stable pagination key"
+        );
+    }
+
+    // Least-privilege grants (the #31 lesson), identical on all three. The CONTROL
+    // plane owns the lifecycle: SELECT, INSERT, and a COLUMN-scoped UPDATE of ONLY
+    // the soft-delete pair. Nothing may REPOINT an existing row at a different
+    // endpoint, organization, or scope, which is what makes the containment checked
+    // at write time durable rather than momentary.
+    for table in [
+        "org_group_members",
+        "org_group_roles",
+        "org_membership_roles",
+    ] {
+        for privilege in ["SELECT", "INSERT"] {
+            assert!(
+                role_has_table_privilege(pool, "ironauth_control", table, privilege).await,
+                "ironauth_control must hold {privilege} on {table}"
+            );
+        }
+        for column in ["updated_at", "deleted_at"] {
+            assert!(
+                role_has_column_privilege(pool, "ironauth_control", table, column, "UPDATE").await,
+                "ironauth_control must hold column-scoped UPDATE on {table}.{column}"
+            );
+        }
+        for role in ["ironauth_control", "ironauth_app"] {
+            for column in [
+                "id",
+                "tenant_id",
+                "environment_id",
+                "organization_id",
+                "created_at",
+            ] {
+                assert!(
+                    !role_has_column_privilege(pool, role, table, column, "UPDATE").await,
+                    "the {table} UPDATE grant must stay column-scoped: {role} must NOT \
+                     gain UPDATE on {table}.{column}"
+                );
+            }
+            assert!(
+                !role_has_table_privilege(pool, role, table, "DELETE").await,
+                "{role} must NOT hold DELETE on {table} (removal is a soft delete)"
+            );
+        }
+        // The endpoint columns specifically: repointing a live binding or assignment
+        // would move authorization between subjects with no audit row naming either.
+        for column in ["group_id", "membership_id", "role_id"] {
+            if !column_exists(pool, table, column).await {
+                continue;
+            }
+            for role in ["ironauth_control", "ironauth_app"] {
+                assert!(
+                    !role_has_column_privilege(pool, role, table, column, "UPDATE").await,
+                    "{table}.{column} must be immutable by GRANT: {role} must NOT hold \
+                     UPDATE on it"
+                );
+            }
+        }
+        // Effective-role resolution reads all three at token issuance, so the data
+        // plane holds SELECT on all three.
+        assert!(
+            role_has_table_privilege(pool, "ironauth_app", table, "SELECT").await,
+            "the data-plane role must hold SELECT on {table} (the resolution read)"
+        );
+        // It never CREATES or REPOINTS a row on any of them, in any grant shape. The
+        // table-wide probe cannot see a COLUMN-scoped grant, which is a real way for
+        // the data plane to gain a write while every table-wide assertion stays
+        // green, so every column is swept too.
+        for privilege in ["INSERT", "REFERENCES"] {
+            assert!(
+                !role_has_table_privilege(pool, "ironauth_app", table, privilege).await,
+                "the data plane must hold no {privilege} on {table}"
+            );
+            assert!(
+                !role_has_any_column_privilege(pool, "ironauth_app", table, privilege).await,
+                "the data plane must hold NO column-scoped {privilege} on {table}"
+            );
+        }
+        // UPDATE is where the three tables deliberately DIFFER, and the asymmetry is
+        // the security statement. The invitation-accept side effect runs on the DATA
+        // plane and REVIVES a previously removed membership, which must come back
+        // holding no groups and no direct roles, so the data plane holds the
+        // COLUMN-scoped soft-delete pair on the two MEMBERSHIP-keyed tables and
+        // nothing else. `org_group_roles` is keyed on a GROUP, no membership
+        // lifecycle reaches it, and the data plane stays strictly READ ONLY there.
+        // Asserted in BOTH directions so neither a widening nor a narrowing passes.
+        let data_plane_may_revoke = table != "org_group_roles";
+        assert!(
+            !role_has_table_privilege(pool, "ironauth_app", table, "UPDATE").await,
+            "the data-plane UPDATE on {table} must never be table-wide"
+        );
+        for column in ["updated_at", "deleted_at"] {
+            assert_eq!(
+                role_has_column_privilege(pool, "ironauth_app", table, column, "UPDATE").await,
+                data_plane_may_revoke,
+                "the data plane's UPDATE on {table}.{column} must be present exactly \
+                 when the membership cascade can reach that table"
+            );
+        }
+        // Positive controls, so a sweep that answered "no" to everything could not
+        // pass.
+        assert!(
+            role_has_any_column_privilege(pool, "ironauth_app", table, "SELECT").await,
+            "the data plane holds SELECT on {table}"
+        );
+        assert_eq!(
+            role_has_any_column_privilege(pool, "ironauth_app", table, "UPDATE").await,
+            data_plane_may_revoke,
+            "the data plane's column-scoped UPDATE on {table} exists exactly when the \
+             membership cascade can reach that table"
+        );
+        assert!(
+            role_has_any_column_privilege(pool, "ironauth_control", table, "UPDATE").await,
+            "the control plane holds the column-scoped UPDATE a removal needs on {table}"
+        );
+    }
 }
