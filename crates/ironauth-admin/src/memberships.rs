@@ -264,12 +264,17 @@ pub async fn delete_membership(
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     // The parent organization must resolve in scope (a cross-scope org path segment is
     // the uniform not-found), keeping the nested resource consistent.
-    let _org_id = resolve_live_org(&state, scope, &organization_id).await?;
-    let id = state
-        .store()
-        .management()
-        .org_memberships(scope)
-        .parse_id(&membership_id)?;
+    let org_id = resolve_live_org(&state, scope, &organization_id).await?;
+    let memberships = state.store().management().org_memberships(scope);
+    let id = memberships.parse_id(&membership_id)?;
+    // Enforce the NESTED resource: the membership must belong to THIS organization. A
+    // membership of a DIFFERENT organization (even in the same scope) presented under
+    // this org's path is the uniform not-found, so a wrong-org path can never remove
+    // another organization's membership.
+    let record = memberships.get(&id).await?;
+    if record.organization_id != org_id {
+        return Err(ApiError::NotFound);
+    }
     state
         .store()
         .management()

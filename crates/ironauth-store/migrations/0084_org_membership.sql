@@ -110,12 +110,6 @@ CREATE TABLE org_memberships (
     -- The closed lifecycle set: an unknown state can never be written.
     CONSTRAINT org_memberships_state_valid
         CHECK (state IN ('active')),
-    -- At most one membership per (organization, user) in a scope: a duplicate add is
-    -- a storage-engine conflict, not an application check. This spans soft-deleted
-    -- rows too, so re-adding a removed membership is out of scope for PR-A (a later
-    -- PR can make this a partial index over the live rows if re-add is ever needed).
-    CONSTRAINT org_memberships_org_user_uniq
-        UNIQUE (tenant_id, environment_id, organization_id, user_id),
     FOREIGN KEY (tenant_id) REFERENCES tenants (id),
     FOREIGN KEY (environment_id, tenant_id) REFERENCES environments (id, tenant_id),
     -- The membership's organization must exist (the organization id is globally
@@ -127,6 +121,17 @@ CREATE TABLE org_memberships (
     -- are soft-deleted, so a membership is never hard-deleted out from under a scope.
     FOREIGN KEY (user_id) REFERENCES users (id)
 );
+
+-- At most one LIVE membership per (organization, user) in a scope: a duplicate add
+-- of a user already a live member is a storage-engine conflict, not an application
+-- check. The index is PARTIAL over live rows (WHERE deleted_at IS NULL), so a
+-- soft-deleted (removed) membership does NOT occupy the key: re-adding a removed
+-- user REVIVES the dead row (create sets deleted_at back to NULL) rather than
+-- tripping a permanent conflict, and every read (which filters deleted_at IS NULL)
+-- and this uniqueness invariant agree on exactly the live set.
+CREATE UNIQUE INDEX org_memberships_org_user_live_uniq
+    ON org_memberships (tenant_id, environment_id, organization_id, user_id)
+    WHERE deleted_at IS NULL;
 
 -- The admin "who is in this organization" list reads a scope's memberships for one
 -- organization ordered by the stable (created_at, id) key.
@@ -160,11 +165,18 @@ GRANT SELECT, INSERT ON org_memberships TO ironauth_control;
 GRANT UPDATE (state, metadata, updated_at, deleted_at)
     ON org_memberships TO ironauth_control;
 
--- The DATA plane creates a membership on the invitation-accept path (the invitee
--- redeems a token that carried an org-context, and the accept binds them into the
--- organization in the SAME transaction as the pending -> accepted flip), so it holds
--- SELECT and INSERT. It is deliberately NOT granted UPDATE or DELETE: the data plane
--- never removes a membership (only the admin does), so it can add and read one but
--- never soft-delete or rewrite one. SELECT also serves a later PR's membership
--- resolution at login.
+-- The DATA plane binds a member on the invitation-accept path (the invitee redeems a
+-- token that carried an org-context, and the accept binds them into the organization
+-- in the SAME transaction as the pending -> accepted flip). That bind is a
+-- revive-or-insert: a fresh member is an INSERT, and a member the admin previously
+-- removed is REVIVED through a COLUMN-scoped UPDATE of exactly the same mutable
+-- columns the control plane may write (state, metadata, updated_at, deleted_at back to
+-- NULL), so a removed member re-accepting is re-bound rather than blocked. The grant
+-- is COLUMN-scoped (never a table-wide UPDATE that could rewrite the scope, the
+-- organization, or the user of a row, the #31 lesson), and DELETE is never granted:
+-- the data plane can bind and read a membership, but the row is only ever hard-removed
+-- by nobody (soft delete is the admin's remove). SELECT also serves a later PR's
+-- membership resolution at login.
 GRANT SELECT, INSERT ON org_memberships TO ironauth_app;
+GRANT UPDATE (state, metadata, updated_at, deleted_at)
+    ON org_memberships TO ironauth_app;

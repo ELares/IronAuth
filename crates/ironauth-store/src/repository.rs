@@ -28941,8 +28941,10 @@ pub struct AcceptedInvitation {
     /// The primary-login credential the invitation enrolled.
     pub credential_type: InvitationCredentialType,
     /// The organization the accept bound the user into (issue #94), or [`None`] when
-    /// the invitation carried no org-context. Present so the caller can see whether a
-    /// membership was created as part of the accept.
+    /// the invitation carried no org-context. When [`Some`], a LIVE membership for this
+    /// user in that organization is guaranteed to exist after the accept (freshly
+    /// created, revived from a prior removal, or already present), so the caller can
+    /// rely on it as the truthful post-accept membership state.
     pub organization_id: Option<OrganizationId>,
 }
 
@@ -29524,48 +29526,46 @@ impl ActingInvitationRepo<'_> {
                 // Bind the user into the organization the invitation carried (issue
                 // #94), in the SAME transaction as the pending -> accepted flip and the
                 // activation. The organization foreign key is the existence backstop.
-                // Idempotent on the (organization, user) UNIQUE key: if the user is
-                // already a member (added out of band), the insert is a no-op and no
-                // membership-add audit row is written, so an accept never double-binds.
+                // Revive-or-insert: a previously REMOVED membership is revived, a fresh
+                // one is inserted, and a user who is ALREADY a live member is a clean
+                // no-op. In every one of those cases a LIVE membership exists after this
+                // returns, so `AcceptedInvitation.organization_id = Some(org)` is
+                // truthful. A revive or a fresh insert appends the membership's OWN
+                // `organization.membership.add` audit row (the second audit row on the
+                // accept path); the already-a-live-member no-op writes no second row, so
+                // an accept never double-binds or double-audits.
                 if let Some(org_id) = membership_org {
-                    let membership_id = OrgMembershipId::generate(env, &scope);
-                    let inserted = sqlx::query(
-                        "INSERT INTO org_memberships \
-                         (id, tenant_id, environment_id, organization_id, user_id, \
-                          state, metadata, created_at, updated_at) \
-                         VALUES ($1, $2, $3, $4, $5, 'active', '{}'::jsonb, \
-                                 TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval, \
-                                 TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval) \
-                         ON CONFLICT (tenant_id, environment_id, organization_id, user_id) \
-                         DO NOTHING",
+                    let new_membership_id = OrgMembershipId::generate(env, &scope);
+                    match insert_or_revive_membership(
+                        tx,
+                        scope,
+                        &new_membership_id,
+                        &org_id,
+                        &user_id,
+                        None,
+                        now_micros,
                     )
-                    .bind(membership_id.to_string())
-                    .bind(scope.tenant().to_string())
-                    .bind(scope.environment().to_string())
-                    .bind(org_id.to_string())
-                    .bind(user_text.as_str())
-                    .bind(now_micros)
-                    .execute(&mut **tx)
-                    .await?;
-                    if inserted.rows_affected() > 0 {
-                        // A membership was created: append its OWN audit row (targeting
-                        // the new membership) in this transaction, so the accept path
-                        // records TWO audit rows (the invitation.redeem targeting the
-                        // invitation, and this organization.membership.add). A no-op
-                        // (already a member) writes no second row.
-                        insert_audit_row(
-                            tx,
-                            &AuditedWrite {
-                                store,
-                                scope,
-                                acting: &acting,
-                                env,
-                                action: Action::OrganizationMembershipAdd,
-                                target: &membership_id,
-                            },
-                            None,
-                        )
-                        .await?;
+                    .await
+                    {
+                        Ok(live_id) => {
+                            insert_audit_row(
+                                tx,
+                                &AuditedWrite {
+                                    store,
+                                    scope,
+                                    acting: &acting,
+                                    env,
+                                    action: Action::OrganizationMembershipAdd,
+                                    target: &live_id,
+                                },
+                                None,
+                            )
+                            .await?;
+                        }
+                        // Already a live member (added out of band): the live membership
+                        // already exists, so no new binding and no second audit row.
+                        Err(StoreError::Conflict) => {}
+                        Err(error) => return Err(error),
                     }
                 }
                 Ok(())
@@ -33463,14 +33463,19 @@ impl ActingOrgMembershipRepo<'_> {
     /// organization, and the `user_id` foreign key rejects a nonexistent user. The
     /// caller passes the organization and user ids already parsed in this scope.
     ///
-    /// Idempotent on the `(organization, user)` UNIQUE key: a duplicate add of a
-    /// user already a member of the organization is refused as [`StoreError::Conflict`]
-    /// (a typed already-member), never a silent double-write.
+    /// A duplicate add of a user who is ALREADY a live member is refused as
+    /// [`StoreError::Conflict`] (a typed already-member). A user who was previously
+    /// REMOVED (a soft-deleted row) is REVIVED rather than conflicting: the create
+    /// sets `deleted_at` back to `NULL` and the state to `active` on the existing row,
+    /// so remove is reversible and the returned id is that revived row's id. The
+    /// invariant is: create either produces (a fresh row) or revives (a dead row)
+    /// EXACTLY ONE live membership, or returns [`StoreError::Conflict`] when a live one
+    /// already exists. The partial unique index over live rows makes that structural.
     ///
     /// # Errors
     ///
     /// [`StoreError::NotFound`] if any id is not in this scope;
-    /// [`StoreError::Conflict`] if the user is already a member of the organization;
+    /// [`StoreError::Conflict`] if the user is already a live member of the organization;
     /// [`StoreError::IdempotencyConflict`] on a concurrent Idempotency-Key race;
     /// [`StoreError::Database`] on a persistence failure (including a nonexistent
     /// organization or user, which surfaces as the foreign-key violation).
@@ -33488,47 +33493,42 @@ impl ActingOrgMembershipRepo<'_> {
             return Err(StoreError::NotFound);
         }
         let scope = self.scope;
-        let id = *spec.id;
-        let metadata_json = membership_metadata_json(spec.metadata)?;
-        write_audited(
-            AuditedWrite {
+        let new_id = *spec.id;
+        // `None` metadata binds SQL NULL so a revive keeps the existing metadata
+        // (COALESCE), while an explicit value overwrites it; a fresh insert defaults
+        // to the empty object.
+        let metadata_opt = membership_metadata_opt(spec.metadata)?;
+        // The membership add is audited against the resulting LIVE membership (the
+        // fresh id on an insert, the existing id on a revive). Because that target is
+        // only known after the revive-or-insert runs, this inlines its own audited
+        // transaction rather than using the target-up-front `write_audited` helper.
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let live_id = insert_or_revive_membership(
+            &mut tx,
+            scope,
+            &new_id,
+            spec.organization_id,
+            spec.user_id,
+            metadata_opt.as_deref(),
+            created_at_micros,
+        )
+        .await?;
+        insert_audit_row(
+            &mut tx,
+            &AuditedWrite {
                 store: self.store,
                 scope,
                 acting: &self.acting,
                 env,
                 action: Action::OrganizationMembershipAdd,
-                target: &id,
+                target: &live_id,
             },
-            async move |tx| {
-                let result = sqlx::query(
-                    "INSERT INTO org_memberships \
-                     (id, tenant_id, environment_id, organization_id, user_id, \
-                      state, metadata, created_at, updated_at) \
-                     VALUES ($1, $2, $3, $4, $5, 'active', $6::jsonb, \
-                             TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval, \
-                             TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval)",
-                )
-                .bind(id.to_string())
-                .bind(scope.tenant().to_string())
-                .bind(scope.environment().to_string())
-                .bind(spec.organization_id.to_string())
-                .bind(spec.user_id.to_string())
-                .bind(&metadata_json)
-                .bind(created_at_micros)
-                .execute(&mut **tx)
-                .await;
-                match result {
-                    Ok(_) => {}
-                    Err(error) if is_unique_violation(&error) => return Err(StoreError::Conflict),
-                    Err(error) => return Err(error.into()),
-                }
-                insert_idempotency(tx, idempotency).await?;
-                Ok(())
-            },
-            false,
+            None,
         )
         .await?;
-        Ok(id)
+        insert_idempotency(&mut tx, idempotency).await?;
+        tx.commit().await?;
+        Ok(live_id)
     }
 
     /// Remove a membership (soft delete) in this scope and audit
@@ -33582,16 +33582,101 @@ impl ActingOrgMembershipRepo<'_> {
 }
 
 /// Serialize optional membership metadata to the JSON text bound with a `::jsonb`
-/// cast, defaulting to the empty object. A serialization failure is an internal
-/// fault (a [`serde_json::Value`] always serializes), reported as a decode error.
-fn membership_metadata_json(metadata: Option<&serde_json::Value>) -> Result<String, StoreError> {
+/// cast, or `None` when the caller supplied no metadata. `None` binds SQL NULL so a
+/// REVIVE keeps the existing row's metadata (COALESCE) and a fresh insert defaults to
+/// the empty object; a value overwrites. A serialization failure is an internal fault
+/// (a [`serde_json::Value`] always serializes), reported as a decode error.
+fn membership_metadata_opt(
+    metadata: Option<&serde_json::Value>,
+) -> Result<Option<String>, StoreError> {
     match metadata {
-        Some(value) => serde_json::to_string(value).map_err(|error| {
+        Some(value) => serde_json::to_string(value).map(Some).map_err(|error| {
             StoreError::Database(sqlx::Error::Decode(
                 format!("membership metadata is not serializable: {error}").into(),
             ))
         }),
-        None => Ok("{}".to_owned()),
+        None => Ok(None),
+    }
+}
+
+/// Insert a fresh membership OR revive a soft-deleted one for `(organization, user)`
+/// in `scope`, inside the caller's open transaction, returning the resulting LIVE
+/// membership id (issue #94). Shared by the admin add and the invitation-accept side
+/// effect so both behave identically.
+///
+/// A soft-deleted row is REVIVED first (`deleted_at` back to NULL, state to active),
+/// so remove is reversible and no second row accumulates. If none is dead, a fresh
+/// row is inserted; a live row already present then trips the partial unique index
+/// over live rows and is mapped to [`StoreError::Conflict`] (a typed already-member).
+/// The invariant: exactly one LIVE membership results, or Conflict when one is already
+/// live. `metadata` is the JSON text to bind (NULL keeps existing on revive, defaults
+/// to the empty object on insert).
+async fn insert_or_revive_membership(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    new_id: &OrgMembershipId,
+    organization_id: &OrganizationId,
+    user_id: &UserId,
+    metadata: Option<&str>,
+    now_micros: i64,
+) -> Result<OrgMembershipId, StoreError> {
+    // Revive a previously removed membership if one exists. Guarded on `deleted_at IS
+    // NOT NULL`, so a concurrent create that already revived it re-reads a live row
+    // here (zero rows) and falls through to the insert, which then conflicts: exactly
+    // one create ever revives or inserts the single live row.
+    let revived = sqlx::query(
+        "UPDATE org_memberships SET deleted_at = NULL, state = 'active', \
+             metadata = COALESCE($1::jsonb, metadata), \
+             updated_at = TIMESTAMPTZ 'epoch' + ($2::text || ' microseconds')::interval \
+         WHERE tenant_id = $3 AND environment_id = $4 \
+         AND organization_id = $5 AND user_id = $6 AND deleted_at IS NOT NULL \
+         RETURNING id",
+    )
+    .bind(metadata)
+    .bind(now_micros)
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(organization_id.to_string())
+    .bind(user_id.to_string())
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(row) = revived {
+        return Ok(OrgMembershipId::parse_in_scope(
+            &row.get::<String, _>("id"),
+            &scope,
+        )?);
+    }
+    // No dead row to revive: insert a fresh membership. `ON CONFLICT ... DO NOTHING`
+    // targets the partial unique index over LIVE rows, so a user who is ALREADY a live
+    // member inserts nothing and RETURNING yields no row (mapped to the typed
+    // already-member conflict). Using ON CONFLICT rather than catching a raw unique
+    // violation keeps the surrounding transaction USABLE (a raw constraint error would
+    // abort it), which the accept path relies on to continue after a no-op.
+    let inserted = sqlx::query(
+        "INSERT INTO org_memberships \
+         (id, tenant_id, environment_id, organization_id, user_id, \
+          state, metadata, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, 'active', COALESCE($6::jsonb, '{}'::jsonb), \
+                 TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval, \
+                 TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval) \
+         ON CONFLICT (tenant_id, environment_id, organization_id, user_id) \
+             WHERE deleted_at IS NULL \
+         DO NOTHING \
+         RETURNING id",
+    )
+    .bind(new_id.to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(organization_id.to_string())
+    .bind(user_id.to_string())
+    .bind(metadata)
+    .bind(now_micros)
+    .fetch_optional(&mut **tx)
+    .await?;
+    match inserted {
+        Some(_) => Ok(*new_id),
+        // A live membership already exists (the insert conflicted and did nothing).
+        None => Err(StoreError::Conflict),
     }
 }
 

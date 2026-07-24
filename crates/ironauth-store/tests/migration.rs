@@ -4601,11 +4601,19 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
             "org_memberships must carry the {constraint} CHECK constraint"
         );
     }
-    // The (organization, user) UNIQUE constraint is the structural at-most-one-member
-    // invariant: a duplicate add is a storage-engine conflict, not an application check.
+    // The (organization, user) uniqueness is a PARTIAL unique index over LIVE rows
+    // (WHERE deleted_at IS NULL), not a table-wide constraint: at most one LIVE
+    // membership per (organization, user), so a duplicate add of a live member is a
+    // storage-engine conflict, while a removed (soft-deleted) membership does NOT
+    // occupy the key and can be revived on re-add.
     assert!(
-        unique_constraint_exists(pool, "org_memberships", "org_memberships_org_user_uniq").await,
-        "org_memberships must carry the (organization, user) UNIQUE constraint"
+        partial_unique_index_exists(
+            pool,
+            "org_memberships",
+            "org_memberships_org_user_live_uniq"
+        )
+        .await,
+        "org_memberships must carry the (organization, user) partial unique index over live rows"
     );
     // Both foreign keys are plain (no ON DELETE CASCADE): the organization and the user
     // are soft-deleted, so a membership is never hard-deleted out from under a scope.
@@ -4618,56 +4626,40 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
         "org_memberships.user_id must be a FOREIGN KEY into users"
     );
 
-    // Least-privilege grants (the #31 lesson). The control plane owns the admin surface
-    // (SELECT, INSERT, and a COLUMN-scoped UPDATE of only the mutable columns); the data
-    // plane creates a membership on the accept path (SELECT, INSERT) but is never granted
-    // UPDATE or DELETE (only the admin removes one).
-    for privilege in ["SELECT", "INSERT"] {
+    // Least-privilege grants (the #31 lesson). BOTH planes bind a membership: the
+    // control plane owns the admin surface (add + soft-delete remove), and the data
+    // plane binds on the invitation-accept path (a revive-or-insert). Both therefore
+    // hold SELECT, INSERT, and a COLUMN-scoped UPDATE of ONLY the mutable columns
+    // (state, metadata, updated_at, deleted_at) so a removed member can be revived; the
+    // grant never reaches the identity columns and neither plane holds table-wide
+    // UPDATE or DELETE.
+    for role in ["ironauth_control", "ironauth_app"] {
+        for privilege in ["SELECT", "INSERT"] {
+            assert!(
+                role_has_table_privilege(pool, role, "org_memberships", privilege).await,
+                "{role} must hold {privilege} on org_memberships"
+            );
+        }
+        for column in ["state", "metadata", "updated_at", "deleted_at"] {
+            assert!(
+                role_has_column_privilege(pool, role, "org_memberships", column, "UPDATE").await,
+                "{role} must hold column-scoped UPDATE on org_memberships.{column} (the revive)"
+            );
+        }
+        // The UPDATE grant stays column-scoped: it must NOT reach the identity columns
+        // (a membership's organization or user can never be rewritten in place).
         assert!(
-            role_has_table_privilege(pool, "ironauth_control", "org_memberships", privilege).await,
-            "the control role must hold {privilege} on org_memberships"
+            !role_has_column_privilege(pool, role, "org_memberships", "organization_id", "UPDATE")
+                .await,
+            "the membership UPDATE grant must stay column-scoped: {role} must NOT gain UPDATE on \
+             org_memberships.organization_id"
         );
+        // Neither plane may hard-DELETE a membership: removal is a soft delete only.
         assert!(
-            role_has_table_privilege(pool, "ironauth_app", "org_memberships", privilege).await,
-            "the data-plane role must hold {privilege} on org_memberships (the accept path)"
+            !role_has_table_privilege(pool, role, "org_memberships", "DELETE").await,
+            "{role} must NOT hold DELETE on org_memberships (removal is a soft delete)"
         );
     }
-    for column in ["state", "metadata", "updated_at", "deleted_at"] {
-        assert!(
-            role_has_column_privilege(
-                pool,
-                "ironauth_control",
-                "org_memberships",
-                column,
-                "UPDATE"
-            )
-            .await,
-            "the control role must hold column-scoped UPDATE on org_memberships.{column}"
-        );
-    }
-    // The control UPDATE grant stays column-scoped: it must NOT reach the identity
-    // columns (a membership's organization or user can never be rewritten in place).
-    assert!(
-        !role_has_column_privilege(
-            pool,
-            "ironauth_control",
-            "org_memberships",
-            "organization_id",
-            "UPDATE"
-        )
-        .await,
-        "the membership UPDATE grant must stay column-scoped: control must NOT gain UPDATE on \
-         org_memberships.organization_id"
-    );
-    // The data plane never removes a membership: no UPDATE (soft-delete) and no DELETE.
-    assert!(
-        !role_has_table_privilege(pool, "ironauth_app", "org_memberships", "UPDATE").await,
-        "the data-plane role must NOT hold UPDATE on org_memberships (only the admin removes one)"
-    );
-    assert!(
-        !role_has_table_privilege(pool, "ironauth_app", "org_memberships", "DELETE").await,
-        "the data-plane role must NOT hold DELETE on org_memberships"
-    );
 }
 
 #[tokio::test]

@@ -918,6 +918,78 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/disable": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Disable an organization (issue #94). The organization stays readable (this is not
+         *     a soft delete) but is marked disabled; the login-time enforcement is a later PR.
+         */
+        post: operations["disableOrganization"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/enable": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Re-enable a disabled organization (issue #94). */
+        post: operations["enableOrganization"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List the members of an organization (cursor paginated). */
+        get: operations["listMemberships"];
+        put?: never;
+        /** Add a user to an organization. */
+        post: operations["createMembership"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships/{membership_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Remove a user from an organization (soft delete; idempotent in effect). */
+        delete: operations["deleteMembership"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/password-hashing/probe": {
         parameters: {
             query?: never;
@@ -1917,6 +1989,16 @@ export interface components {
              */
             display_name: string;
         };
+        /** @description The body to add a user to an organization. */
+        CreateMembershipRequest: {
+            /** @description Optional free-form membership metadata; the empty object when omitted. */
+            metadata?: unknown;
+            /**
+             * @description The user to add to the organization (a `usr_` id in this environment).
+             * @example usr_...
+             */
+            user_id: string;
+        };
         /** @description The body to create an organization in an environment. */
         CreateOrganizationRequest: {
             /**
@@ -2536,6 +2618,34 @@ export interface components {
              */
             verified_at_unix_micros?: number | null;
         };
+        /** @description A page of organization memberships. */
+        MembershipList: {
+            /** @description The memberships on this page, oldest first. */
+            items: components["schemas"]["MembershipView"][];
+            /** @description The opaque cursor for the next page, or null if this is the last page. */
+            next_cursor?: string | null;
+        };
+        /**
+         * @description An organization membership, as returned by the management API (issue #94): one
+         *     user's binding into one organization.
+         */
+        MembershipView: {
+            /**
+             * Format: int64
+             * @description Creation time, milliseconds since the Unix epoch.
+             */
+            created_at_unix_ms: number;
+            /** @description The membership identifier (`omb_...`, embeds its scope). */
+            id: string;
+            /** @description Free-form membership metadata (the empty object when none was set). */
+            metadata: unknown;
+            /** @description The organization the user is a member of (`org_...`). */
+            organization_id: string;
+            /** @description The membership lifecycle state (`active`). */
+            state: string;
+            /** @description The member user (`usr_...`). */
+            user_id: string;
+        };
         /** @description An environment's lazy-migration progress (issue #56). */
         MigrationProgressView: {
             /**
@@ -2718,9 +2828,10 @@ export interface components {
          */
         OrganizationView: {
             /**
-             * @description Whether the organization is active. Always true on a read (a deactivated
-             *     organization reads as not-found); present so the wire shape carries the
-             *     active-state field the resource model declares.
+             * @description Whether the organization is active (issue #94). A soft-deleted organization
+             *     reads as not-found, so a returned organization is always LIVE; this flag now
+             *     reflects the lifecycle STATE: `true` for an active organization and `false`
+             *     for one an admin disabled (still readable, merely disabled).
              */
             active: boolean;
             /**
@@ -8166,6 +8277,330 @@ export interface operations {
                 };
             };
             /** @description Not found (absent, or already deactivated: a repeat delete) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    disableOrganization: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The disabled organization */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrganizationView"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    enableOrganization: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The enabled organization */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrganizationView"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listMemberships: {
+        parameters: {
+            query?: {
+                /**
+                 * @description The desired page size, a positive integer. Clamped to
+                 *     `[1, max_page_size]`; defaults to the configured default when absent.
+                 */
+                limit?: number;
+                /**
+                 * @description The opaque cursor from a previous page's `next_cursor`. Absent for the
+                 *     first page (keyset pagination; there is no offset).
+                 */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A page of memberships */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MembershipList"];
+                };
+            };
+            /** @description Malformed cursor */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Organization not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    createMembership: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Required. Replaying a POST with the same key returns the original response without re-executing. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateMembershipRequest"];
+            };
+        };
+        responses: {
+            /** @description Created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MembershipView"];
+                };
+            };
+            /** @description Malformed request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Organization or user not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The user is already a member */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Idempotency-Key reused with a different request */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    deleteMembership: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+                /** @description The membership identifier */
+                membership_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Removed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found (absent, or already removed: a repeat delete) */
             404: {
                 headers: {
                     [name: string]: unknown;

@@ -107,6 +107,77 @@ async fn duplicate_add_is_a_conflict() {
 }
 
 #[tokio::test]
+async fn remove_then_readd_revives_the_membership() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = tenant_env(&h).await;
+    let org = create_org(&h, &tenant, &environment, "k-org").await;
+    let user = create_user(&h, &tenant, &environment, "revive@x.test", "k-user").await;
+    let base =
+        format!("/v1/tenants/{tenant}/environments/{environment}/organizations/{org}/memberships");
+    let body = serde_json::json!({ "user_id": user }).to_string();
+
+    // Add, then remove.
+    let (status, _, response) = h.post(&base, "k-add-1", &body).await;
+    assert_eq!(status, StatusCode::CREATED, "first add: {response}");
+    let membership = serde_json::from_str::<Value>(&response).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    let (status, _, _) = h.delete(&format!("{base}/{membership}")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // Re-add the SAME user: this REVIVES the removed membership, a 201 (not a 409),
+    // and the org roster has one live member again.
+    let (status, _, response) = h.post(&base, "k-add-2", &body).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "re-add revives, not 409: {response}"
+    );
+    let (_, _, response) = h.get(&base).await;
+    let value: Value = serde_json::from_str(&response).expect("json");
+    assert_eq!(value["items"].as_array().expect("items").len(), 1);
+}
+
+#[tokio::test]
+async fn delete_via_the_wrong_organization_path_is_not_found_and_does_not_remove() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = tenant_env(&h).await;
+    let org_a = create_org(&h, &tenant, &environment, "k-org-a").await;
+    let org_b = create_org(&h, &tenant, &environment, "k-org-b").await;
+    let user = create_user(&h, &tenant, &environment, "nested@x.test", "k-user").await;
+
+    // Add the user to org A.
+    let base_a = format!(
+        "/v1/tenants/{tenant}/environments/{environment}/organizations/{org_a}/memberships"
+    );
+    let body = serde_json::json!({ "user_id": user }).to_string();
+    let (status, _, response) = h.post(&base_a, "k-add", &body).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let membership = serde_json::from_str::<Value>(&response).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    // Deleting org A's membership via org B's path is the uniform 404 (the nested
+    // resource does not belong to org B), and does NOT remove it.
+    let base_b = format!(
+        "/v1/tenants/{tenant}/environments/{environment}/organizations/{org_b}/memberships"
+    );
+    let (status, _, _) = h.delete(&format!("{base_b}/{membership}")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "wrong-org delete is 404");
+
+    // The membership is untouched: org A still lists its one live member.
+    let (_, _, response) = h.get(&base_a).await;
+    let value: Value = serde_json::from_str(&response).expect("json");
+    assert_eq!(
+        value["items"].as_array().expect("items").len(),
+        1,
+        "the wrong-org delete must not have removed org A's membership"
+    );
+}
+
+#[tokio::test]
 async fn add_to_an_unknown_user_is_not_found() {
     let h = Harness::start(50).await;
     let (tenant, environment) = tenant_env(&h).await;

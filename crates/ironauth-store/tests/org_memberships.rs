@@ -603,3 +603,246 @@ async fn invitation_create_rejects_an_out_of_scope_org_context() {
         .await;
     assert!(matches!(result, Err(StoreError::InvalidOrgContext)));
 }
+
+/// Soft-delete a membership via the control store.
+async fn remove_member(db: &TestDatabase, env: &Env, scope: Scope, membership: &OrgMembershipId) {
+    db.control_store()
+        .management()
+        .acting(actor(env), CorrelationId::generate(env))
+        .org_memberships(scope)
+        .remove(env, membership)
+        .await
+        .expect("remove member");
+}
+
+/// Provision a pending user and an org invitation carrying `org` as its org-context,
+/// returning the one-time token and the pending user id.
+async fn create_org_invitation(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    org: &OrganizationId,
+    identifier: &str,
+) -> (String, UserId) {
+    let created = now_micros(env);
+    let MintedInvitationToken { token, digest, id } = mint_invitation_token(env, &scope);
+    let user_id = db
+        .control_store()
+        .scoped(scope)
+        .acting(actor(env), CorrelationId::generate(env))
+        .users()
+        .admin_create(
+            env,
+            NewAdminUser {
+                id: None,
+                identifier,
+                password_hash: None,
+                claims_json: None,
+                external_id: None,
+                state: UserState::PendingVerification,
+                foreign_password_hash: None,
+                foreign_password_algo: None,
+                traits_json: None,
+                traits_schema_version: None,
+            },
+            created,
+            None,
+        )
+        .await
+        .expect("create pending user");
+    let org_context = org.to_string();
+    db.control_store()
+        .scoped(scope)
+        .acting(actor(env), CorrelationId::generate(env))
+        .invitations()
+        .create(
+            env,
+            NewInvitation {
+                id: &id,
+                user_id: &user_id,
+                target_identifier: identifier,
+                token_digest: &digest,
+                credential_type: InvitationCredentialType::Password,
+                org_context: Some(&org_context),
+                expires_at_unix_micros: created.saturating_add(3_600_000_000),
+            },
+            created,
+            None,
+        )
+        .await
+        .expect("create org invitation");
+    (token, user_id)
+}
+
+/// The count of `organization.membership.add` audit rows in `scope`.
+async fn membership_add_count(db: &TestDatabase, scope: Scope) -> i64 {
+    sqlx::query(
+        "SELECT COUNT(*) AS n FROM audit_log \
+         WHERE tenant_id = $1 AND environment_id = $2 \
+         AND action = 'organization.membership.add'",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("count add audits")
+    .get::<i64, _>("n")
+}
+
+#[tokio::test]
+async fn admin_remove_then_readd_revives_the_membership() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let control = db.control_store();
+
+    let org = create_org(&db, &env, scope, "Revive").await;
+    let user = create_active_user(&db, &env, scope, "revive@example.test").await;
+
+    // Add, then remove: the (org, user) key is now held only by a soft-deleted row.
+    let first = add_member(&db, &env, scope, &org, &user)
+        .await
+        .expect("first add");
+    remove_member(&db, &env, scope, &first).await;
+    assert!(
+        !control
+            .management()
+            .org_memberships(scope)
+            .exists(&org, &user)
+            .await
+            .expect("exists after remove")
+    );
+
+    // Re-add: this REVIVES the dead row (not a 409), reusing its id, and a live
+    // membership exists again.
+    let second = add_member(&db, &env, scope, &org, &user)
+        .await
+        .expect("re-add revives, not conflicts");
+    assert_eq!(
+        second, first,
+        "the revived membership reuses the original id"
+    );
+    assert!(
+        control
+            .management()
+            .org_memberships(scope)
+            .exists(&org, &user)
+            .await
+            .expect("exists after re-add")
+    );
+    let live = control
+        .management()
+        .org_memberships(scope)
+        .get(&second)
+        .await
+        .expect("the revived membership is live");
+    assert_eq!(live.state, "active");
+
+    // A SECOND add while it is live is still the typed already-member conflict.
+    assert!(matches!(
+        add_member(&db, &env, scope, &org, &user).await,
+        Err(StoreError::Conflict)
+    ));
+
+    // add, remove, add(revive) all audited against the one membership id.
+    assert_eq!(
+        audit_actions(&db, scope, &first.to_string()).await,
+        vec![
+            "organization.membership.add",
+            "organization.membership.remove",
+            "organization.membership.add"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn accept_revives_a_previously_removed_membership() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let org = create_org(&db, &env, scope, "Onboarder").await;
+    let (token, user_id) =
+        create_org_invitation(&db, &env, scope, &org, "revive@example.test").await;
+
+    // Before the accept, add then remove a membership for this (org, user), so a
+    // soft-deleted row already occupies the key the accept will revive.
+    let membership = add_member(&db, &env, scope, &org, &user_id)
+        .await
+        .expect("pre-add");
+    remove_member(&db, &env, scope, &membership).await;
+    let adds_before = membership_add_count(&db, scope).await;
+
+    // Accept: the org-context membership is REVIVED (not a fresh insert), so a live
+    // membership exists again and AcceptedInvitation.organization_id is truthful.
+    let accepted = db
+        .store()
+        .scoped(scope)
+        .acting(actor(&env), CorrelationId::generate(&env))
+        .invitations()
+        .accept(&env, &token, Some(PASSWORD_HASH), now_micros(&env))
+        .await
+        .expect("accept");
+    assert_eq!(accepted.organization_id, Some(org));
+    assert!(
+        db.control_store()
+            .management()
+            .org_memberships(scope)
+            .exists(&org, &user_id)
+            .await
+            .expect("exists")
+    );
+    // The revive wrote exactly one NEW membership-add audit row, against the revived id.
+    assert_eq!(membership_add_count(&db, scope).await, adds_before + 1);
+    assert!(
+        audit_actions(&db, scope, &membership.to_string())
+            .await
+            .iter()
+            .filter(|a| *a == "organization.membership.add")
+            .count()
+            == 2,
+        "the revived membership carries its original add plus the accept revive add"
+    );
+}
+
+#[tokio::test]
+async fn accept_when_already_a_live_member_writes_no_second_add_audit() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let org = create_org(&db, &env, scope, "Onboarder").await;
+    let (token, user_id) =
+        create_org_invitation(&db, &env, scope, &org, "already@example.test").await;
+
+    // The user is ALREADY a live member before the accept.
+    add_member(&db, &env, scope, &org, &user_id)
+        .await
+        .expect("pre-add live");
+    let adds_before = membership_add_count(&db, scope).await;
+
+    let accepted = db
+        .store()
+        .scoped(scope)
+        .acting(actor(&env), CorrelationId::generate(&env))
+        .invitations()
+        .accept(&env, &token, Some(PASSWORD_HASH), now_micros(&env))
+        .await
+        .expect("accept");
+    // A live membership still exists (organization_id truthful), but the accept was a
+    // no-op on the membership: no SECOND membership-add audit row.
+    assert_eq!(accepted.organization_id, Some(org));
+    assert!(
+        db.control_store()
+            .management()
+            .org_memberships(scope)
+            .exists(&org, &user_id)
+            .await
+            .expect("exists")
+    );
+    assert_eq!(
+        membership_add_count(&db, scope).await,
+        adds_before,
+        "an accept for an already-live member writes no second membership-add audit"
+    );
+}
