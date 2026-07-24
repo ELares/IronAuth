@@ -8,8 +8,8 @@ use ironauth_env::Env;
 use ironauth_store::idor_harness::IdorHarness;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
-    ActorRef, CorrelationId, ManagementKeyId, NewAdminUser, NewMembership, OrgMembershipId,
-    OrganizationId, Scope, ServiceId, StoreError, UserState,
+    ActorRef, CorrelationId, ManagementKeyId, NewAdminUser, NewMembership, NewOrgRole,
+    OrgMembershipId, OrgRoleId, OrganizationId, Scope, ServiceId, StoreError, UserState,
 };
 
 /// A stand-in key hash for a planted victim (the probes resolve by id, not hash).
@@ -42,6 +42,11 @@ async fn management_probes_deny_cross_tenant_and_cross_environment_uniformly() {
     let victim_member_b = plant_membership(control, &env, scope_b, &victim_org_b).await;
     let victim_member_a2 = plant_membership(control, &env, scope_a2, &victim_org_a2).await;
 
+    // Organization roles (issue #97): plant a victim role in each foreign scope so
+    // the role probes have a real cross-scope target.
+    let victim_role_b = plant_role(control, &env, scope_b, &victim_org_b).await;
+    let victim_role_a2 = plant_role(control, &env, scope_a2, &victim_org_a2).await;
+
     // A well-formed key id in the caller's OWN scope that was never stored.
     let absent_in_a = ManagementKeyId::generate(&env, &scope_a).to_string();
 
@@ -66,6 +71,8 @@ async fn management_probes_deny_cross_tenant_and_cross_environment_uniformly() {
             "organizations.delete",
             "org_memberships.get",
             "org_memberships.remove",
+            "org_roles.get",
+            "org_roles.delete",
         ],
         "every management resolve-by-id operation is registered",
     );
@@ -77,6 +84,8 @@ async fn management_probes_deny_cross_tenant_and_cross_environment_uniformly() {
         victim_org_a2.to_string(),
         victim_member_b.to_string(),
         victim_member_a2.to_string(),
+        victim_role_b.to_string(),
+        victim_role_a2.to_string(),
         absent_in_a.clone(),
     ];
     let foreign_refs: Vec<&str> = foreign.iter().map(String::as_str).collect();
@@ -143,6 +152,57 @@ async fn management_probes_deny_cross_tenant_and_cross_environment_uniformly() {
             .is_ok(),
         "environment A2's membership must survive the remove probe"
     );
+
+    // The victim roles must likewise survive the delete probe.
+    assert!(
+        control
+            .management()
+            .org_roles(scope_b)
+            .get(&victim_role_b)
+            .await
+            .is_ok(),
+        "tenant B's role must survive the delete probe"
+    );
+    assert!(
+        control
+            .management()
+            .org_roles(scope_a2)
+            .get(&victim_role_a2)
+            .await
+            .is_ok(),
+        "environment A2's role must survive the delete probe"
+    );
+}
+
+/// Plant a live role in `org` within `scope` via the control store, returning the
+/// role id.
+async fn plant_role(
+    control: &ironauth_store::Store,
+    env: &Env,
+    scope: Scope,
+    org: &OrganizationId,
+) -> OrgRoleId {
+    let id = OrgRoleId::generate(env, &scope);
+    let actor = ActorRef::service(ServiceId::generate(env));
+    control
+        .management()
+        .acting(actor, CorrelationId::generate(env))
+        .org_roles(scope)
+        .create(
+            env,
+            NewOrgRole {
+                id: &id,
+                organization_id: org,
+                slug: "victim-role",
+                display_name: "victim role",
+                metadata: None,
+            },
+            1_000_000,
+            None,
+        )
+        .await
+        .expect("plant victim role");
+    id
 }
 
 /// Plant a live membership (a fresh active user bound into `org`) in `scope` via the

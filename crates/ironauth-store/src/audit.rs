@@ -208,6 +208,18 @@ pub enum Action {
     /// soft-deleted through the admin surface, so the audit foreign key to it stays
     /// satisfiable. The target is the removed membership.
     OrganizationMembershipRemove,
+    /// A named role was DEFINED in an organization (issue #97). The target is the
+    /// new role. A role in M10 is a name only; what it grants is issue #98.
+    OrganizationRoleCreate,
+    /// An organization role's MUTABLE fields were changed (issue #97): its
+    /// display name, its metadata, or both. The role's `slug` (the stable name)
+    /// is immutable by GRANT, so this action never means the role's identity
+    /// changed. The target is the renamed role.
+    OrganizationRoleUpdate,
+    /// An organization role was DELETED (issue #97): a soft delete that retains
+    /// the row, so the audit foreign key to it stays satisfiable and the slug is
+    /// freed for a new role. The target is the deleted role.
+    OrganizationRoleDelete,
     /// An authorization code and its grant were issued (issue #12).
     AuthorizationCodeIssue,
     /// An authorization code was redeemed at the token endpoint (issue #12).
@@ -1003,6 +1015,9 @@ impl Action {
             Action::OrganizationStateChange => "organization.state_change",
             Action::OrganizationMembershipAdd => "organization.membership.add",
             Action::OrganizationMembershipRemove => "organization.membership.remove",
+            Action::OrganizationRoleCreate => "organization.role.create",
+            Action::OrganizationRoleUpdate => "organization.role.update",
+            Action::OrganizationRoleDelete => "organization.role.delete",
             Action::AuthorizationCodeIssue => "authorization_code.issue",
             Action::AuthorizationCodeRedeem => "authorization_code.redeem",
             Action::AuthorizationCodeReuse => "authorization_code.reuse",

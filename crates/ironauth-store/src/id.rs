@@ -118,6 +118,18 @@ impl ScopedKind for OrgMembershipKind {
     const PREFIX: &'static str = "omb";
 }
 
+/// Marker for an organization role (`rol_`), the tenant-scoped named role
+/// belonging to one organization (issue #97). A role in M10 is a NAME ONLY: it
+/// carries no permissions and no scopes (those are issue #98). Scoped like every
+/// other resource so a role id minted in one scope parses as a uniform not-found
+/// under another. Not a bearer secret (a role id names configuration, never
+/// end-user data), so its debug form stays legible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OrgRoleKind;
+impl ScopedKind for OrgRoleKind {
+    const PREFIX: &'static str = "rol";
+}
+
 /// Marker for an audit-log event, the tenant-scoped record the audit log writes
 /// in the same transaction as every mutation. Scoped like any other resource so
 /// audit rows are themselves subject to the tenant-isolation policies.
@@ -1261,6 +1273,9 @@ pub type OrganizationId = ScopedId<OrganizationKind>;
 /// An organization-membership identifier (`omb_...`), the join row binding a user
 /// into an organization (issue #94).
 pub type OrgMembershipId = ScopedId<OrgMembershipKind>;
+/// An organization-role identifier (`rol_...`), one named role belonging to one
+/// organization (issue #97).
+pub type OrgRoleId = ScopedId<OrgRoleKind>;
 /// An audit-log event identifier (`aud_...`).
 pub type AuditId = ScopedId<AuditKind>;
 /// A management API key identifier (`mak_...`), environment-scoped (issue #11).
@@ -1778,7 +1793,7 @@ impl std::error::Error for NotInScope {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
+    use std::collections::{BTreeMap, HashSet};
     use std::time::SystemTime;
 
     fn test_env() -> Env {
@@ -1972,6 +1987,124 @@ mod tests {
             Err(NotInScope),
             "an organization id is not a membership id even in the right scope"
         );
+    }
+
+    #[test]
+    fn property_org_role_ids_round_trip_and_deny_cross_scope() {
+        // A property sweep over the organization-role level (issue #97): every
+        // freshly minted id round-trips in its own scope, and NONE parses in a
+        // foreign tenant or environment. Malformed and wrong-prefix inputs fail
+        // identically (no oracle), exactly as the membership exemplar does.
+        let env = test_env();
+        let tenant_a = TenantId::generate(&env);
+        let tenant_b = TenantId::generate(&env);
+        let env_1 = EnvironmentId::generate(&env);
+        let env_2 = EnvironmentId::generate(&env);
+        let scope_a = Scope::new(tenant_a, env_1);
+        let cross_tenant = Scope::new(tenant_b, env_1);
+        let cross_env = Scope::new(tenant_a, env_2);
+
+        for _ in 0..1_000 {
+            let id = OrgRoleId::generate(&env, &scope_a);
+            let text = id.to_string();
+            assert!(text.starts_with("rol_"));
+            // Round-trips in its own scope.
+            assert_eq!(
+                OrgRoleId::parse_in_scope(&text, &scope_a).expect("in scope"),
+                id
+            );
+            // Denied uniformly in a foreign tenant and a foreign environment.
+            assert_eq!(
+                OrgRoleId::parse_in_scope(&text, &cross_tenant),
+                Err(NotInScope)
+            );
+            assert_eq!(
+                OrgRoleId::parse_in_scope(&text, &cross_env),
+                Err(NotInScope)
+            );
+        }
+
+        // Malformed and wrong-prefix inputs fail with the same NotInScope.
+        assert_eq!(
+            OrgRoleId::parse_in_scope("rol_not-base64-!!", &scope_a),
+            Err(NotInScope)
+        );
+        let a_membership = OrgMembershipId::generate(&env, &scope_a).to_string();
+        assert_eq!(
+            OrgRoleId::parse_in_scope(&a_membership, &scope_a),
+            Err(NotInScope),
+            "a membership id is not a role id even in the right scope"
+        );
+    }
+
+    #[test]
+    fn every_declared_prefix_is_mutually_distinct() {
+        // Every identifier kind in this module declares a `PREFIX`, and the whole
+        // anti-oracle contract rests on those prefixes being a SET: two kinds
+        // sharing one prefix would make a resource of the wrong type parse
+        // successfully under the other's type, so a `parse_in_scope` that is meant
+        // to refuse (the "a client id is not an organization id" property asserted
+        // per kind above) would silently accept. Nothing in the type system pins
+        // this, and adding a kind is a hand edit far from every other kind, so the
+        // registry is read back out of this file's own source: a new kind is
+        // covered the moment it is written, with no list to keep in sync.
+        //
+        // Two things keep the scanner honest about what it cannot read. The needle
+        // is assembled from fragments, so the scanner never matches its own source
+        // lines; and it matches the declaration in ANY spelling, taking the first
+        // quoted literal that follows it on the line. Keying on the fully written
+        // `&'static str` form would miss the elided form (which is what clippy
+        // prefers on an associated constant and what rustfmt leaves alone), and a
+        // declaration the scanner cannot see is a duplicate prefix free to ship.
+        //
+        // What makes the miss LOUD rather than silent is the count: the number of
+        // declarations read is compared for EQUALITY against the number of kind
+        // implementations found in the SAME source text, so an unreadable
+        // declaration trips a mismatch here instead of vanishing from the
+        // duplicate check below. A hand-set floor could not do that.
+        let source = include_str!("id.rs");
+        let needle = concat!("const ", "PREFIX");
+        let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut declarations = 0_usize;
+        for line in source.lines() {
+            let Some(rest) = line.split_once(needle).map(|(_, rest)| rest) else {
+                continue;
+            };
+            // The trait's own required-constant lines carry no literal: skip them.
+            let Some((_, after_quote)) = rest.split_once('"') else {
+                continue;
+            };
+            let Some((prefix, _)) = after_quote.split_once('"') else {
+                continue;
+            };
+            declarations += 1;
+            *seen.entry(prefix).or_default() += 1;
+        }
+        let kinds = source
+            .lines()
+            .filter(|line| {
+                line.starts_with("impl ScopedKind for ") || line.starts_with("impl LevelKind for ")
+            })
+            .count();
+        assert_eq!(
+            declarations, kinds,
+            "the scanner read {declarations} prefix declarations but this file implements \
+             {kinds} identifier kinds; a declaration written in a spelling the scanner \
+             cannot read would carry a duplicate prefix past the check below"
+        );
+        let duplicates: Vec<&str> = seen
+            .iter()
+            .filter(|(_, count)| **count > 1)
+            .map(|(prefix, _)| *prefix)
+            .collect();
+        assert!(
+            duplicates.is_empty(),
+            "identifier prefixes must be mutually distinct; these are declared more \
+             than once: {duplicates:?}"
+        );
+        // The prefixes issue #97 claims are present, so a later kind cannot take
+        // one of them without tripping the duplicate check above.
+        assert!(seen.contains_key("rol"), "the org-role prefix is declared");
     }
 
     #[test]

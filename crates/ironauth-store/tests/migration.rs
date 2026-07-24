@@ -132,6 +132,35 @@ async fn role_has_column_privilege(
         .get("present")
 }
 
+/// Whether `role` holds `privilege` on ANY live column of `table`, swept over the
+/// catalog rather than a hand-written column list (so a column added later is
+/// covered the moment it exists).
+///
+/// This is the only way to prove a role holds NO write grant of any shape:
+/// `has_table_privilege` does NOT see a COLUMN-scoped grant, so
+/// `GRANT INSERT (id, ...) ON t TO r` leaves the table-wide probe reading false
+/// while genuinely allowing the write.
+async fn role_has_any_column_privilege(
+    pool: &sqlx::PgPool,
+    role: &str,
+    table: &str,
+    privilege: &str,
+) -> bool {
+    sqlx::query(
+        "SELECT COALESCE(bool_or(has_column_privilege($1, c.oid, a.attnum, $3)), false) \
+         AS present \
+         FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid \
+         WHERE c.relname::text = $2 AND a.attnum > 0 AND NOT a.attisdropped",
+    )
+    .bind(role)
+    .bind(table)
+    .bind(privilege)
+    .fetch_one(pool)
+    .await
+    .expect("column privilege sweep")
+    .get("present")
+}
+
 /// Whether the VIEW `view` exposes an output column named `column` (`pg_class` relkind `v`).
 /// Used to prove the scope-forced guardrail projection actually SURFACES a column to the data
 /// plane, not merely that the base table carries it.
@@ -494,8 +523,8 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
     );
     assert_eq!(
         report.already_applied(),
-        85,
-        "the production chain is exactly eighty-five migrations (isolation, audit log, management \
+        86,
+        "the production chain is exactly eighty-six migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -517,17 +546,17 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
          policy decision traces, flows control read, signup forms, consent lockdown, client admin \
          grants, consent control grants, flow version pin, flow versions, first-party challenge \
          codes, DPoP binding, DPoP proof replay, organization membership, organization token \
-         context)"
+         context, organization roles)"
     );
 
-    // The ledger holds exactly versions 1 through 85.
+    // The ledger holds exactly versions 1 through 86.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
             46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67,
-            68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85
+            68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86
         ]
     );
     let phase_of = |version: i64| async move {
@@ -4661,6 +4690,161 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
             "{role} must NOT hold DELETE on org_memberships (removal is a soft delete)"
         );
     }
+
+    // ---------------------------------------------------------------------------
+    // Organization roles (issue #97, 0086).
+    //
+    // A NEW tenant-scoped table: RLS ENABLEd and FORCEd, the (tenant, environment)
+    // isolation policy, the nonempty-scope CHECK, the slug and display-name CHECKs,
+    // the partial unique index over live rows, the organization foreign key, and
+    // least-privilege COLUMN-scoped grants that leave `slug` immutable.
+
+    // EXPAND (issue #97): one new tenant-scoped table with its indexes, policy, and
+    // grants. Nothing existing is altered or dropped.
+    assert_eq!(phase_of(86).await, "expand");
+    assert!(
+        table_exists(pool, "org_roles").await,
+        "org_roles exists after 0086"
+    );
+    assert!(
+        rls_enabled_and_forced(pool, "org_roles").await,
+        "org_roles must ENABLE and FORCE row-level security"
+    );
+    assert!(
+        policy_exists(pool, "org_roles", "org_roles_tenant_isolation").await,
+        "org_roles must carry the (tenant, environment) isolation policy"
+    );
+    for constraint in [
+        "org_roles_scope_nonempty",
+        "org_roles_slug_valid",
+        "org_roles_display_name_nonempty",
+    ] {
+        assert!(
+            check_constraint_exists(pool, "org_roles", constraint).await,
+            "org_roles must carry the {constraint} CHECK constraint"
+        );
+    }
+    for column in ["tenant_id", "environment_id", "organization_id", "slug"] {
+        assert!(
+            column_is_not_null(pool, "org_roles", column).await,
+            "org_roles.{column} must be NOT NULL"
+        );
+    }
+    // The (organization, slug) uniqueness is a PARTIAL unique index over LIVE rows
+    // (WHERE deleted_at IS NULL), so a deleted role frees its slug for a NEW role
+    // rather than occupying it forever, and every read (which filters deleted_at IS
+    // NULL) agrees with the uniqueness invariant on exactly the live set.
+    assert!(
+        partial_unique_index_exists(pool, "org_roles", "org_roles_org_slug_live_uniq").await,
+        "org_roles must carry the (organization, slug) partial unique index over live rows"
+    );
+    // The organization foreign key is the backstop that makes a role in a
+    // nonexistent or cross-scope organization impossible.
+    assert!(
+        fk_references(pool, "org_roles", "organization_id").await,
+        "org_roles.organization_id must be a FOREIGN KEY into organizations"
+    );
+
+    // Least-privilege grants (the #31 lesson). The CONTROL plane owns the whole role
+    // lifecycle: SELECT, INSERT, and a COLUMN-scoped UPDATE of ONLY the mutable
+    // columns. The DATA plane holds SELECT and nothing else (a later PR resolves
+    // effective roles at token issuance under the app role; nothing on that plane
+    // ever writes a role).
+    for privilege in ["SELECT", "INSERT"] {
+        assert!(
+            role_has_table_privilege(pool, "ironauth_control", "org_roles", privilege).await,
+            "ironauth_control must hold {privilege} on org_roles"
+        );
+    }
+    for column in ["display_name", "metadata", "updated_at", "deleted_at"] {
+        assert!(
+            role_has_column_privilege(pool, "ironauth_control", "org_roles", column, "UPDATE")
+                .await,
+            "ironauth_control must hold column-scoped UPDATE on org_roles.{column}"
+        );
+    }
+    // The slug is immutable by GRANT, not merely by convention: NEITHER role may
+    // ever UPDATE it, so the stable name a later authorization decision keys on
+    // cannot be rewritten by any code path.
+    for role in ["ironauth_control", "ironauth_app"] {
+        assert!(
+            !role_has_column_privilege(pool, role, "org_roles", "slug", "UPDATE").await,
+            "org_roles.slug must be immutable by GRANT: {role} must NOT hold UPDATE on it"
+        );
+        // Nor may the UPDATE grant reach the identity columns: a role can never be
+        // moved between organizations or between scopes in place.
+        for column in ["organization_id", "tenant_id", "environment_id", "id"] {
+            assert!(
+                !role_has_column_privilege(pool, role, "org_roles", column, "UPDATE").await,
+                "the role UPDATE grant must stay column-scoped: {role} must NOT gain UPDATE \
+                 on org_roles.{column}"
+            );
+        }
+        // Removal is a soft delete: neither plane may hard-DELETE a role, which
+        // would break the retention the append-only audit_log foreign key needs.
+        assert!(
+            !role_has_table_privilege(pool, role, "org_roles", "DELETE").await,
+            "{role} must NOT hold DELETE on org_roles (deletion is a soft delete)"
+        );
+    }
+    // The data plane is READ ONLY on roles.
+    assert!(
+        role_has_table_privilege(pool, "ironauth_app", "org_roles", "SELECT").await,
+        "the data-plane role must hold SELECT on org_roles (the token-issuance read)"
+    );
+    for privilege in ["INSERT", "UPDATE"] {
+        assert!(
+            !role_has_table_privilege(pool, "ironauth_app", "org_roles", privilege).await,
+            "the data-plane grant on org_roles must be SELECT only (no {privilege})"
+        );
+    }
+    // Those table-wide probes cannot see a COLUMN-scoped grant, which is a real way
+    // for the data plane to gain a write on org_roles while every assertion here
+    // stays green. That half of the least-privilege argument is closed by
+    // `the_data_plane_holds_no_column_scoped_write_grant_on_org_roles` below.
+}
+
+/// The data plane holds NO write grant of any shape on `org_roles` (issue #97, 0086).
+///
+/// The table-wide `has_table_privilege` probes in the production-chain assertions
+/// above cannot see a COLUMN-scoped grant: `GRANT INSERT (id, tenant_id,
+/// environment_id, organization_id, slug, display_name) ON org_roles TO
+/// ironauth_app` leaves every one of them reading false while genuinely letting the
+/// token-issuance data plane forge a role in its own scope, which is precisely the
+/// least-privilege invariant issue #97 states (nothing on the data plane ever
+/// writes a role) and which the token seam later in the issue depends on. Sweeping
+/// every column closes that gap, so the invariant is a physical property of the
+/// schema rather than a claim about which code paths happen to exist.
+///
+/// This is its own test rather than more lines in the production-chain test: that
+/// function's future is already at the stack budget of a default test thread, and
+/// anything added to its body aborts the process on a stack overflow.
+#[tokio::test]
+async fn the_data_plane_holds_no_column_scoped_write_grant_on_org_roles() {
+    let db = TestDatabase::start().await;
+    let pool = db.owner_pool();
+
+    // INSERT, UPDATE, and REFERENCES are the write-shaped privileges Postgres can
+    // grant per column (DELETE has no column form and is asserted table-wide with
+    // the rest of the 0086 grants).
+    for privilege in ["INSERT", "UPDATE", "REFERENCES"] {
+        assert!(
+            !role_has_any_column_privilege(pool, "ironauth_app", "org_roles", privilege).await,
+            "the data plane must hold NO column-scoped {privilege} on org_roles"
+        );
+    }
+    // A positive control, so a sweep that simply answered "no" to everything could
+    // not pass this test: the data plane DOES hold the column-scoped SELECT that
+    // the token-issuance role read needs, and the control plane DOES hold the
+    // column-scoped UPDATE that a rename needs.
+    assert!(
+        role_has_any_column_privilege(pool, "ironauth_app", "org_roles", "SELECT").await,
+        "the data plane holds SELECT on org_roles (the token-issuance read)"
+    );
+    assert!(
+        role_has_any_column_privilege(pool, "ironauth_control", "org_roles", "UPDATE").await,
+        "the control plane holds the column-scoped UPDATE a rename needs"
+    );
 }
 
 #[tokio::test]

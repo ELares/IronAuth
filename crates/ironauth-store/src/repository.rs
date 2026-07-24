@@ -85,7 +85,7 @@ use crate::id::{
     ExternalIssuerId, FedcmNonceId, FederationLoginStateId, FlowId, FlowVersionId,
     FlowVersionPinId, GrantId, InitialAccessTokenId, InvitationId, IssuedTokenId, KekId,
     LocaleBundleId, MagicLinkTokenId, ManagementKeyId, Mds3BlobCacheId, MigrationRunId,
-    MigrationRunRecordId, OperatorId, OrgConnectionId, OrgMembershipId, OrganizationId,
+    MigrationRunRecordId, OperatorId, OrgConnectionId, OrgMembershipId, OrgRoleId, OrganizationId,
     PowChallengeId, PushedRequestId, RecoveryApprovalId, RecoveryCodeId,
     RecoveryContactConfirmationId, RecoveryFlowId, RecoveryIdvSessionId, RecoveryTrustedContactId,
     RefreshFamilyId, RefreshTokenId, ResourceServerId, RiskDecisionId, RiskDisavowalId,
@@ -298,6 +298,22 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn org_memberships(&self) -> OrgMembershipRepo<'a> {
         OrgMembershipRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only organization-role repository for this scope on the DATA plane
+    /// (issue #97). Migration 0086 grants the data-plane SELECT on `org_roles` (and
+    /// nothing else), so the token-issuance path can read a subject's roles
+    /// authoritatively without the control role. The same [`OrgRoleRepo`] the
+    /// control plane reaches through [`ManagementStore::org_roles`]: every read is
+    /// scope-fenced under this scope's forced row-level security. There is
+    /// deliberately no MUTATING data-plane counterpart: nothing on the data plane
+    /// ever writes a role.
+    #[must_use]
+    pub fn org_roles(&self) -> OrgRoleRepo<'a> {
+        OrgRoleRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -31455,6 +31471,48 @@ pub struct NewMembership<'a> {
     pub metadata: Option<&'a serde_json::Value>,
 }
 
+/// An organization-role row (issue #97): one named role belonging to one
+/// organization within a scope. A role in M10 is a NAME only; what it grants is
+/// issue #98. Only LIVE (not soft-deleted) roles are ever reconstructed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgRoleRecord {
+    /// The role identifier (`rol_...`, embeds its `(tenant, environment)`).
+    pub id: OrgRoleId,
+    /// The organization the role belongs to (`org_...`).
+    pub organization_id: OrganizationId,
+    /// The IMMUTABLE stable name. A rename changes `display_name`, never this, so
+    /// a name a later authorization decision keys on cannot move under it.
+    pub slug: String,
+    /// The mutable human-facing label the admin console shows.
+    pub display_name: String,
+    /// Free-form role metadata, as stored JSON. Never interpreted by the auth core.
+    pub metadata: serde_json::Value,
+    /// Creation time in microseconds since the Unix epoch (the pagination key).
+    pub created_at_unix_micros: i64,
+    /// Last-modification time in microseconds since the Unix epoch.
+    pub updated_at_unix_micros: i64,
+}
+
+/// Everything an organization-role create needs, bundled so the repository method
+/// stays within the readable-argument-count lint (issue #97).
+#[derive(Debug, Clone, Copy)]
+pub struct NewOrgRole<'a> {
+    /// The role id (minted by the caller, embeds this scope).
+    pub id: &'a OrgRoleId,
+    /// The organization the role belongs to (an `org_` id in this scope).
+    pub organization_id: &'a OrganizationId,
+    /// The IMMUTABLE stable name, unique per organization over LIVE rows. Its
+    /// charset (`^[a-z0-9][a-z0-9._-]{0,62}$`, no case folding) is enforced by the
+    /// `org_roles_slug_valid` CHECK; the management edge validates it up front and
+    /// reports it, so a value that reaches here and is refused by the CHECK is a
+    /// caller that bypassed the edge and surfaces as [`StoreError::Database`].
+    pub slug: &'a str,
+    /// The mutable human-facing label; must be nonempty (a CHECK).
+    pub display_name: &'a str,
+    /// Optional free-form role metadata; `None` stores the empty object.
+    pub metadata: Option<&'a serde_json::Value>,
+}
+
 /// The control-plane entry point: reads and the acting door for writes.
 ///
 /// Reached through [`Store::management`]. Its pool must authenticate as
@@ -31515,6 +31573,18 @@ impl<'a> ManagementStore<'a> {
     #[must_use]
     pub fn org_memberships(&self, scope: Scope) -> OrgMembershipRepo<'a> {
         OrgMembershipRepo {
+            store: self.store,
+            scope,
+        }
+    }
+
+    /// The read-only organization-role repository for `scope` (issue #97). Roles
+    /// are environment-scoped, so the repository is constructible only from a
+    /// `(tenant, environment)` scope and binds row-level security to it before
+    /// every statement.
+    #[must_use]
+    pub fn org_roles(&self, scope: Scope) -> OrgRoleRepo<'a> {
+        OrgRoleRepo {
             store: self.store,
             scope,
         }
@@ -31628,6 +31698,17 @@ impl<'a> ActingManagementStore<'a> {
     #[must_use]
     pub fn org_memberships(&self, scope: Scope) -> ActingOrgMembershipRepo<'a> {
         ActingOrgMembershipRepo {
+            store: self.store,
+            acting: self.acting,
+            scope,
+        }
+    }
+
+    /// The mutating organization-role repository for `scope` (issue #97): define a
+    /// role in an organization, rename it, and delete it, each audited.
+    #[must_use]
+    pub fn org_roles(&self, scope: Scope) -> ActingOrgRoleRepo<'a> {
+        ActingOrgRoleRepo {
             store: self.store,
             acting: self.acting,
             scope,
@@ -32082,6 +32163,134 @@ impl OrgMembershipRepo<'_> {
         .await?;
         tx.commit().await?;
         Ok(row.get("present"))
+    }
+}
+
+/// The projection every organization-role read selects from `org_roles` (the two
+/// timestamps as epoch microseconds, the metadata as JSON text). One constant so
+/// the get and list projections cannot drift.
+const ORG_ROLE_SELECT_COLUMNS: &str = "id, organization_id, slug, display_name, \
+     metadata::text AS metadata_text, \
+     (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us, \
+     (EXTRACT(EPOCH FROM updated_at) * 1000000)::bigint AS updated_us";
+
+/// Read-only organization roles for one scope (issue #97).
+///
+/// Reached by the control plane through [`ManagementStore::org_roles`] and by the
+/// data plane through [`ScopedStore::org_roles`]. Every read is scope-fenced and
+/// filters `deleted_at IS NULL`, so a deleted role reads as absent, exactly like a
+/// role of another scope and like one that never existed: the four cases (absent,
+/// soft-deleted, foreign scope, foreign organization) are indistinguishable to a
+/// caller. The typed [`OrgRoleId`] embeds its scope, so a cross-scope id fails to
+/// parse in scope before any query runs.
+pub struct OrgRoleRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl OrgRoleRepo<'_> {
+    /// Parse an untrusted role identifier under this scope. A malformed id and one
+    /// minted in another scope both return the uniform not-found.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if malformed or out of scope.
+    pub fn parse_id(&self, raw: &str) -> Result<OrgRoleId, StoreError> {
+        Ok(OrgRoleId::parse_in_scope(raw, &self.scope)?)
+    }
+
+    /// Fetch a live role by id, within scope.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no such live role is visible in this scope.
+    pub async fn get(&self, id: &OrgRoleId) -> Result<OrgRoleRecord, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(&format!(
+            "SELECT {ORG_ROLE_SELECT_COLUMNS} FROM org_roles \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND deleted_at IS NULL"
+        ))
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        org_role_from_row(&row, &self.scope)
+    }
+
+    /// Fetch a live role by id, requiring it to belong to `org_id`: the read a
+    /// nested `/organizations/{org}/roles/{role}` surface performs. A role of
+    /// ANOTHER organization in the same scope is the uniform not-found, exactly
+    /// like an absent one, so the nested path can never be used to read across
+    /// organizations.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if either id is out of scope, or no such live role
+    /// exists in that organization.
+    pub async fn get_in_org(
+        &self,
+        org_id: &OrganizationId,
+        id: &OrgRoleId,
+    ) -> Result<OrgRoleRecord, StoreError> {
+        if org_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let record = self.get(id).await?;
+        if &record.organization_id == org_id {
+            Ok(record)
+        } else {
+            Err(StoreError::NotFound)
+        }
+    }
+
+    /// One page of live roles for one organization, ordered by `(created_at, id)`.
+    /// The "roles in this organization" list. A cross-scope `org_id` matches
+    /// nothing (its scope columns cannot match the bound scope), so the result is
+    /// empty rather than an error.
+    ///
+    /// This list is PAGE-size clamped like every management list; there is no cap
+    /// on how many roles an organization may hold.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_for_org(
+        &self,
+        org_id: &OrganizationId,
+        limit: i64,
+        after: Option<&CursorPosition>,
+    ) -> Result<Vec<OrgRoleRecord>, StoreError> {
+        if org_id.scope() != self.scope {
+            return Ok(Vec::new());
+        }
+        let (after_micros, after_id) = split_cursor(after);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {ORG_ROLE_SELECT_COLUMNS} FROM org_roles \
+             WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
+             AND deleted_at IS NULL \
+             AND ($4::bigint IS NULL OR (created_at, id) > \
+                  (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval, $5::text)) \
+             ORDER BY created_at, id LIMIT $6"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(org_id.to_string())
+        .bind(after_micros)
+        .bind(after_id)
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| org_role_from_row(row, &self.scope))
+            .collect()
     }
 }
 
@@ -33647,7 +33856,7 @@ impl ActingOrgMembershipRepo<'_> {
         // `None` metadata binds SQL NULL so a revive keeps the existing metadata
         // (COALESCE), while an explicit value overwrites it; a fresh insert defaults
         // to the empty object.
-        let metadata_opt = membership_metadata_opt(spec.metadata)?;
+        let metadata_opt = metadata_json_opt(spec.metadata)?;
         // The membership add is audited against the resulting LIVE membership (the
         // fresh id on an insert, the existing id on a revive). Because that target is
         // only known after the revive-or-insert runs, this inlines its own audited
@@ -33731,18 +33940,239 @@ impl ActingOrgMembershipRepo<'_> {
     }
 }
 
-/// Serialize optional membership metadata to the JSON text bound with a `::jsonb`
-/// cast, or `None` when the caller supplied no metadata. `None` binds SQL NULL so a
-/// REVIVE keeps the existing row's metadata (COALESCE) and a fresh insert defaults to
-/// the empty object; a value overwrites. A serialization failure is an internal fault
-/// (a [`serde_json::Value`] always serializes), reported as a decode error.
-fn membership_metadata_opt(
-    metadata: Option<&serde_json::Value>,
-) -> Result<Option<String>, StoreError> {
+/// The mutating organization-role repository (issue #97): define a role in an
+/// organization, rename it, and delete it, each audited in the same transaction as
+/// the write.
+///
+/// There is no count cap, quota, or paywall gate on roles anywhere in this
+/// repository or in migration 0086. An organization may define as many roles as it
+/// likes: the advisory-lock-plus-COUNT registration gate used elsewhere in this
+/// module is deliberately NOT replicated here (a project covenant).
+pub struct ActingOrgRoleRepo<'a> {
+    store: &'a Store,
+    acting: ActingContext,
+    scope: Scope,
+}
+
+impl ActingOrgRoleRepo<'_> {
+    /// Define a role in an organization and audit `organization.role.create` in
+    /// the same transaction, scoped to `(tenant, environment)`.
+    ///
+    /// Containment is enforced structurally on three layers: the typed
+    /// [`OrgRoleId`] and [`OrganizationId`] embed this scope (a foreign id never
+    /// reaches the statement), the forced row-level-security WITH CHECK rejects any
+    /// row whose scope is not the bound one, and the `organization_id` foreign key
+    /// rejects a nonexistent organization.
+    ///
+    /// A slug already taken by a LIVE role of the same organization is refused as
+    /// [`StoreError::Conflict`] on the partial unique index. A slug freed by a
+    /// DELETED role is available again, and re-using it inserts a FRESH row with a
+    /// fresh id: unlike a membership, a deleted role is never revived, so deleting
+    /// a role can never be quietly undone in its authorization effects.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if any id is not in this scope;
+    /// [`StoreError::Conflict`] if a live role of that organization already holds
+    /// the slug;
+    /// [`StoreError::IdempotencyConflict`] on a concurrent Idempotency-Key race;
+    /// [`StoreError::Database`] on a persistence failure (including a nonexistent
+    /// organization, or a slug or display name the CHECK constraints refuse, both
+    /// of which the management edge validates and reports up front).
+    pub async fn create(
+        &self,
+        env: &Env,
+        spec: NewOrgRole<'_>,
+        created_at_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        if spec.id.scope() != self.scope || spec.organization_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        // `None` metadata binds SQL NULL, which COALESCEs to the empty object.
+        let metadata_opt = metadata_json_opt(spec.metadata)?;
+        let id = *spec.id;
+        let organization_id = *spec.organization_id;
+        let slug = spec.slug.to_owned();
+        let display_name = spec.display_name.to_owned();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::OrganizationRoleCreate,
+                target: &id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "INSERT INTO org_roles \
+                     (id, tenant_id, environment_id, organization_id, slug, display_name, \
+                      metadata, created_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7::jsonb, '{}'::jsonb), \
+                             TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(organization_id.to_string())
+                .bind(&slug)
+                .bind(&display_name)
+                .bind(metadata_opt.as_deref())
+                .bind(created_at_micros)
+                .execute(&mut **tx)
+                .await;
+                match result {
+                    Ok(_) => {}
+                    // A live role of this organization already holds the slug.
+                    Err(error) if is_unique_violation(&error) => {
+                        return Err(StoreError::Conflict);
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+                insert_idempotency(tx, idempotency).await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Rename a role (and optionally replace its metadata) and audit
+    /// `organization.role.update` in the same transaction. A `None` argument leaves
+    /// that column unchanged.
+    ///
+    /// This is a COLUMN-scoped UPDATE of exactly the mutable columns (the #31
+    /// lesson), guarded on the row being live, so a deleted or foreign role is the
+    /// uniform not-found. The role's `slug` is NOT writable here and is not even
+    /// granted to the control role, so the stable name a later authorization
+    /// decision keys on cannot move under a rename.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id is not in this scope, or no live role
+    /// matched;
+    /// [`StoreError::Database`] on a persistence failure (including an empty
+    /// display name, which the CHECK refuses).
+    pub async fn update(
+        &self,
+        env: &Env,
+        id: &OrgRoleId,
+        display_name: Option<&str>,
+        metadata: Option<&serde_json::Value>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let metadata_opt = metadata_json_opt(metadata)?;
+        let display_name = display_name.map(str::to_owned);
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::OrganizationRoleUpdate,
+                target: id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "UPDATE org_roles SET \
+                         display_name = COALESCE($1, display_name), \
+                         metadata = COALESCE($2::jsonb, metadata), \
+                         updated_at = \
+                             TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval \
+                     WHERE id = $4 AND tenant_id = $5 AND environment_id = $6 \
+                     AND deleted_at IS NULL",
+                )
+                .bind(display_name.as_deref())
+                .bind(metadata_opt.as_deref())
+                .bind(now_micros)
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Delete a role (soft delete) in this scope and audit
+    /// `organization.role.delete` in the same transaction. The row is retained
+    /// (only the column-scoped `deleted_at` and `updated_at` are written), so the
+    /// audit foreign key to it stays satisfiable; because the uniqueness index is
+    /// partial over live rows, the deleted role's slug is immediately available to
+    /// a new role. A repeat delete of an already deleted role matches no live row
+    /// and is the uniform not-found.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id is not in this scope, or no live role
+    /// matched.
+    pub async fn delete(&self, env: &Env, id: &OrgRoleId) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::OrganizationRoleDelete,
+                target: id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "UPDATE org_roles SET \
+                         deleted_at = \
+                             TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval, \
+                         updated_at = \
+                             TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+                     WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 \
+                     AND deleted_at IS NULL",
+                )
+                .bind(now_micros)
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+}
+
+/// Serialize an optional free-form metadata object to the JSON text bound with a
+/// `::jsonb` cast, or `None` when the caller supplied no metadata. Shared by the
+/// organization-membership (issue #94) and organization-role (issue #97) writes, whose
+/// `metadata` columns have identical semantics. `None` binds SQL NULL so an UPDATE
+/// keeps the existing row's metadata (COALESCE) and a fresh insert defaults to the
+/// empty object; a value overwrites. A serialization failure is an internal fault (a
+/// [`serde_json::Value`] always serializes), reported as a decode error.
+fn metadata_json_opt(metadata: Option<&serde_json::Value>) -> Result<Option<String>, StoreError> {
     match metadata {
         Some(value) => serde_json::to_string(value).map(Some).map_err(|error| {
             StoreError::Database(sqlx::Error::Decode(
-                format!("membership metadata is not serializable: {error}").into(),
+                format!("metadata is not serializable: {error}").into(),
             ))
         }),
         None => Ok(None),
@@ -33992,6 +34422,32 @@ fn org_membership_from_row(row: &PgRow, scope: &Scope) -> Result<OrgMembershipRe
         state: row.get("state"),
         metadata,
         created_at_unix_micros: row.get("created_us"),
+    })
+}
+
+/// Reconstruct an [`OrgRoleRecord`] from a row read within scope. The stored ids
+/// are parsed back UNDER the scope, so a corrupt cross-scope row fails to decode
+/// rather than being returned; the metadata is parsed from its JSON text.
+fn org_role_from_row(row: &PgRow, scope: &Scope) -> Result<OrgRoleRecord, StoreError> {
+    let id = OrgRoleId::parse_in_scope(&row.get::<String, _>("id"), scope)?;
+    let organization_id =
+        OrganizationId::parse_in_scope(&row.get::<String, _>("organization_id"), scope)?;
+    let metadata_text: String = row.get("metadata_text");
+    // The metadata passed a `::jsonb` cast on write, so a parse failure here is an
+    // internal invariant violation; surface it as a decode error, not a silent empty.
+    let metadata: serde_json::Value = serde_json::from_str(&metadata_text).map_err(|error| {
+        StoreError::Database(sqlx::Error::Decode(
+            format!("org_roles.metadata is not valid JSON: {error}").into(),
+        ))
+    })?;
+    Ok(OrgRoleRecord {
+        id,
+        organization_id,
+        slug: row.get("slug"),
+        display_name: row.get("display_name"),
+        metadata,
+        created_at_unix_micros: row.get("created_us"),
+        updated_at_unix_micros: row.get("updated_us"),
     })
 }
 
