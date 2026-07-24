@@ -155,6 +155,59 @@ pub enum StoreError {
     /// 6901 pointer and reason, so the management surface can report exactly what is invalid. The
     /// write is refused before anything is persisted.
     JourneyInvalid(Vec<ironauth_journey::JourneyError>),
+    /// A group create or reparent would close a CYCLE in the organization's group
+    /// forest (issue #97): the group being placed IS the proposed parent, or is an
+    /// ancestor of it, so the new edge would make the group its own ancestor.
+    /// NOTHING is written. The check runs inside the audited write transaction and
+    /// under a per-organization advisory lock, so returning this rolls the
+    /// attempted write AND its audit row back together, and no concurrent reparent
+    /// can have slipped a second half of the same cycle past it.
+    ///
+    /// Deliberately distinct from [`NotFound`], and NOT an existence oracle: both
+    /// endpoints are resolved as LIVE rows in the caller's own scope AND in the
+    /// same organization BEFORE any cycle reasoning runs, so a caller who sees
+    /// this has already proven they can see both groups. An absent, soft-deleted,
+    /// foreign-scope, or cross-organization group id is refused earlier and
+    /// uniformly as [`NotFound`].
+    ///
+    /// Carries no ids and no tenant data: the offending pair is the caller's own
+    /// request, so naming it back adds nothing and keeps the Display arm data
+    /// free.
+    ///
+    /// [`NotFound`]: StoreError::NotFound
+    OrgGroupCycle,
+    /// A group create or reparent would produce a nesting depth greater than the
+    /// configured maximum (issue #97). The bound is over the WHOLE affected
+    /// subtree (the proposed parent's own depth, plus the new edge, plus the
+    /// height of the moved group's subtree), so it fires even when neither the
+    /// parent nor the moved group individually exceeded it. NOTHING is written.
+    ///
+    /// Deliberately distinct from [`NotFound`] for the same reason as
+    /// [`OrgGroupCycle`], and distinct from that variant because it is a different
+    /// operator problem with a different remedy: a cycle is a malformed request,
+    /// an over-deep tree is a structural limit an operator can raise.
+    ///
+    /// This is NOT a cap on the NUMBER of groups, which is uncapped by covenant.
+    /// It bounds tree DEPTH only, because the depth is what makes the ancestor
+    /// walk on the token-issuance path terminate.
+    ///
+    /// `max` is the configured bound and `attempted` the depth the write would
+    /// have produced. Both are operator-supplied or structural numbers, never
+    /// tenant data. `attempted` may report a SATURATED value when the walk hit its
+    /// bound (the walk observes one level past the bound and stops), which is
+    /// deliberate: it is a floor on how deep the result would have been, and the
+    /// refusal is correct either way.
+    ///
+    /// [`NotFound`]: StoreError::NotFound
+    /// [`OrgGroupCycle`]: StoreError::OrgGroupCycle
+    OrgGroupDepthExceeded {
+        /// The configured maximum nesting depth, in edges from a root.
+        max: u32,
+        /// A FLOOR on the depth the refused write would have produced, equal to it
+        /// unless a walk saturated (see the variant doc). Never an exact value to be
+        /// arithmetic on.
+        attempted: i64,
+    },
 }
 
 impl fmt::Display for StoreError {
@@ -194,6 +247,14 @@ impl fmt::Display for StoreError {
                     errors.len()
                 )
             }
+            StoreError::OrgGroupCycle => {
+                f.write_str("the requested parent would create a cycle in the group hierarchy")
+            }
+            StoreError::OrgGroupDepthExceeded { max, attempted } => write!(
+                f,
+                "the requested parent would nest groups at least {attempted} levels deep, \
+                 exceeding the configured maximum of {max}"
+            ),
         }
     }
 }
@@ -216,7 +277,9 @@ impl std::error::Error for StoreError {
             | StoreError::CutoverBlocked { .. }
             | StoreError::NoActiveTraitSchema
             | StoreError::IllegalMigrationTransition { .. }
-            | StoreError::JourneyInvalid(_) => None,
+            | StoreError::JourneyInvalid(_)
+            | StoreError::OrgGroupCycle
+            | StoreError::OrgGroupDepthExceeded { .. } => None,
             StoreError::Database(source) => Some(source),
             StoreError::Migration(source) => Some(source),
             StoreError::SchemaMalformed(source) => Some(source),

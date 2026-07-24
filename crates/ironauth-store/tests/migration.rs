@@ -285,6 +285,57 @@ async fn unique_constraint_exists(pool: &sqlx::PgPool, table: &str, constraint_n
     .get("present")
 }
 
+/// Whether a PARTIAL non-unique index named `index` exists on `table` (an index
+/// with a `WHERE` predicate that does NOT enforce uniqueness).
+///
+/// Used to prove a TRAVERSAL index really is present. A missing traversal index is
+/// invisible to every functional assertion (the query still returns the right rows)
+/// and shows up only as a sequential scan per recursion level, so it has to be
+/// asserted structurally or not at all.
+async fn partial_index_exists(pool: &sqlx::PgPool, table: &str, index: &str) -> bool {
+    sqlx::query(
+        "SELECT EXISTS ( \
+            SELECT 1 FROM pg_catalog.pg_index i \
+            JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid \
+            WHERE i.indrelid = $1::regclass AND c.relname = $2 \
+              AND NOT i.indisunique AND i.indpred IS NOT NULL \
+         ) AS present",
+    )
+    .bind(table)
+    .bind(index)
+    .fetch_one(pool)
+    .await
+    .expect("partial index lookup")
+    .get("present")
+}
+
+/// The leading column names of `index`, in index order.
+///
+/// The recursive descendant walk joins each child's `parent_id` against the current
+/// frontier, so `parent_id` must lead the index after the scope columns. An index
+/// with the right NAME and the wrong COLUMN ORDER serves the walk no better than no
+/// index at all, and nothing else in the suite can tell the difference.
+async fn index_columns(pool: &sqlx::PgPool, table: &str, index: &str) -> Vec<String> {
+    sqlx::query(
+        "SELECT a.attname::text AS column_name \
+           FROM pg_catalog.pg_index i \
+           JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid \
+           JOIN generate_subscripts(i.indkey, 1) AS k(position) ON true \
+           JOIN pg_catalog.pg_attribute a \
+             ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k.position] \
+          WHERE i.indrelid = $1::regclass AND c.relname = $2 \
+          ORDER BY k.position",
+    )
+    .bind(table)
+    .bind(index)
+    .fetch_all(pool)
+    .await
+    .expect("index column lookup")
+    .iter()
+    .map(|row| row.get::<String, _>("column_name"))
+    .collect()
+}
+
 /// Whether a PARTIAL UNIQUE index named `index` exists on `table` (unique with a
 /// `WHERE` predicate).
 async fn partial_unique_index_exists(pool: &sqlx::PgPool, table: &str, index: &str) -> bool {
@@ -523,8 +574,8 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
     );
     assert_eq!(
         report.already_applied(),
-        86,
-        "the production chain is exactly eighty-six migrations (isolation, audit log, management \
+        87,
+        "the production chain is exactly eighty-seven migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -546,17 +597,17 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
          policy decision traces, flows control read, signup forms, consent lockdown, client admin \
          grants, consent control grants, flow version pin, flow versions, first-party challenge \
          codes, DPoP binding, DPoP proof replay, organization membership, organization token \
-         context, organization roles)"
+         context, organization roles, organization groups)"
     );
 
-    // The ledger holds exactly versions 1 through 86.
+    // The ledger holds exactly versions 1 through 87.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
             46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67,
-            68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86
+            68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87
         ]
     );
     let phase_of = |version: i64| async move {
@@ -4844,6 +4895,189 @@ async fn the_data_plane_holds_no_column_scoped_write_grant_on_org_roles() {
     assert!(
         role_has_any_column_privilege(pool, "ironauth_control", "org_roles", "UPDATE").await,
         "the control plane holds the column-scoped UPDATE a rename needs"
+    );
+}
+
+/// The `org_groups` schema, policy, indexes, and grants (issue #97, migration 0087).
+///
+/// Its own test rather than more lines in the production-chain assertions: that
+/// function's future is already at the stack budget of a default test thread, and
+/// anything added to its body aborts the process on a stack overflow.
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one table's whole structural contract (phase, columns, constraints, \
+              policy, both index shapes, and the full grant matrix on both roles) \
+              read as one unit"
+)]
+async fn org_groups_carries_its_isolation_indexes_and_least_privilege_grants() {
+    let db = TestDatabase::start().await;
+    let pool = db.owner_pool();
+
+    // EXPAND: one new tenant-scoped table with its indexes, policy, and grants.
+    // Nothing existing is altered or dropped.
+    let phase: String = sqlx::query("SELECT phase FROM _schema_migrations WHERE version = 87")
+        .fetch_one(pool)
+        .await
+        .expect("0087 is in the ledger")
+        .get("phase");
+    assert_eq!(phase, "expand");
+
+    assert!(
+        table_exists(pool, "org_groups").await,
+        "org_groups exists after 0087"
+    );
+    assert!(
+        rls_enabled_and_forced(pool, "org_groups").await,
+        "org_groups must ENABLE and FORCE row-level security"
+    );
+    assert!(
+        policy_exists(pool, "org_groups", "org_groups_tenant_isolation").await,
+        "org_groups must carry the (tenant, environment) isolation policy"
+    );
+    for constraint in [
+        "org_groups_scope_nonempty",
+        "org_groups_slug_valid",
+        "org_groups_display_name_nonempty",
+        // The one-node cycle guard, enforced by the storage engine. Longer cycles
+        // are not expressible as a CHECK and are the repository's job.
+        "org_groups_parent_not_self",
+    ] {
+        assert!(
+            check_constraint_exists(pool, "org_groups", constraint).await,
+            "org_groups must carry the {constraint} CHECK constraint"
+        );
+    }
+    for column in ["tenant_id", "environment_id", "organization_id", "slug"] {
+        assert!(
+            column_is_not_null(pool, "org_groups", column).await,
+            "org_groups.{column} must be NOT NULL"
+        );
+    }
+    // `parent_id` is NULLABLE and that is load-bearing: NULL is what makes a group a
+    // ROOT. A NOT NULL parent would make a forest impossible to express.
+    assert!(
+        column_exists(pool, "org_groups", "parent_id").await,
+        "org_groups.parent_id exists"
+    );
+    assert!(
+        !column_is_not_null(pool, "org_groups", "parent_id").await,
+        "org_groups.parent_id must be NULLABLE: NULL is how a root group is expressed"
+    );
+    // Both foreign keys: the organization (so a group in a nonexistent or
+    // cross-scope organization is impossible) and the SELF key on parent_id (so a
+    // parent pointer can never dangle).
+    assert!(
+        fk_references(pool, "org_groups", "organization_id").await,
+        "org_groups.organization_id must be a FOREIGN KEY into organizations"
+    );
+    assert!(
+        fk_references(pool, "org_groups", "parent_id").await,
+        "org_groups.parent_id must be a self-referential FOREIGN KEY"
+    );
+    // The (organization, slug) uniqueness is PARTIAL over LIVE rows, so a deleted
+    // group frees its slug for a new group rather than occupying it forever.
+    assert!(
+        partial_unique_index_exists(pool, "org_groups", "org_groups_org_slug_live_uniq").await,
+        "org_groups must carry the (organization, slug) partial unique index over live rows"
+    );
+    // The DOWNWARD traversal index the recursive descendant walk depends on. Its
+    // column ORDER is what makes it usable: the walk joins each child's parent_id
+    // against the frontier, so parent_id must lead after the scope columns. An index
+    // present but ordered wrongly leaves the walk on a sequential scan per level
+    // while every functional assertion in the suite stays green.
+    assert!(
+        partial_index_exists(pool, "org_groups", "org_groups_parent_idx").await,
+        "org_groups must carry the downward traversal index over live rows"
+    );
+    assert_eq!(
+        index_columns(pool, "org_groups", "org_groups_parent_idx").await,
+        vec![
+            "tenant_id".to_owned(),
+            "environment_id".to_owned(),
+            "parent_id".to_owned()
+        ],
+        "the descendant walk needs parent_id leading immediately after the scope columns"
+    );
+
+    // Least-privilege grants (the #31 lesson). The CONTROL plane owns the whole
+    // group lifecycle: SELECT, INSERT, and a COLUMN-scoped UPDATE of ONLY the
+    // mutable columns, which for groups INCLUDES parent_id (reparenting is an admin
+    // operation). The DATA plane holds SELECT and nothing else.
+    for privilege in ["SELECT", "INSERT"] {
+        assert!(
+            role_has_table_privilege(pool, "ironauth_control", "org_groups", privilege).await,
+            "ironauth_control must hold {privilege} on org_groups"
+        );
+    }
+    for column in [
+        "display_name",
+        "metadata",
+        "parent_id",
+        "updated_at",
+        "deleted_at",
+    ] {
+        assert!(
+            role_has_column_privilege(pool, "ironauth_control", "org_groups", column, "UPDATE")
+                .await,
+            "ironauth_control must hold column-scoped UPDATE on org_groups.{column}"
+        );
+    }
+    for role in ["ironauth_control", "ironauth_app"] {
+        // The slug is immutable by GRANT, not merely by convention.
+        assert!(
+            !role_has_column_privilege(pool, role, "org_groups", "slug", "UPDATE").await,
+            "org_groups.slug must be immutable by GRANT: {role} must NOT hold UPDATE on it"
+        );
+        // Nor may the UPDATE grant reach the identity columns. This is what makes
+        // "a group's organization never changes" a schema property: without it, the
+        // same-organization containment the hierarchy check enforces on every write
+        // could be undone afterwards by a plain UPDATE.
+        for column in ["organization_id", "tenant_id", "environment_id", "id"] {
+            assert!(
+                !role_has_column_privilege(pool, role, "org_groups", column, "UPDATE").await,
+                "the group UPDATE grant must stay column-scoped: {role} must NOT gain \
+                 UPDATE on org_groups.{column}"
+            );
+        }
+        // Removal is a soft delete on both planes.
+        assert!(
+            !role_has_table_privilege(pool, role, "org_groups", "DELETE").await,
+            "{role} must NOT hold DELETE on org_groups (deletion is a soft delete)"
+        );
+    }
+    // The data plane is READ ONLY on groups: the ancestor walk that resolves
+    // effective roles at token issuance runs there, and nothing on that plane ever
+    // writes a group.
+    assert!(
+        role_has_table_privilege(pool, "ironauth_app", "org_groups", "SELECT").await,
+        "the data-plane role must hold SELECT on org_groups (the ancestor walk)"
+    );
+    for privilege in ["INSERT", "UPDATE"] {
+        assert!(
+            !role_has_table_privilege(pool, "ironauth_app", "org_groups", privilege).await,
+            "the data-plane grant on org_groups must be SELECT only (no {privilege})"
+        );
+    }
+    // The table-wide probes above cannot see a COLUMN-scoped grant, which is a real
+    // way for the data plane to gain a write while every one of them stays green.
+    // Sweeping every column closes that, so "nothing on the data plane writes a
+    // group" is a physical property of the schema rather than a claim about which
+    // code paths happen to exist today.
+    for privilege in ["INSERT", "UPDATE", "REFERENCES"] {
+        assert!(
+            !role_has_any_column_privilege(pool, "ironauth_app", "org_groups", privilege).await,
+            "the data plane must hold NO column-scoped {privilege} on org_groups"
+        );
+    }
+    // Positive controls, so a sweep that answered "no" to everything could not pass.
+    assert!(
+        role_has_any_column_privilege(pool, "ironauth_app", "org_groups", "SELECT").await,
+        "the data plane holds SELECT on org_groups"
+    );
+    assert!(
+        role_has_any_column_privilege(pool, "ironauth_control", "org_groups", "UPDATE").await,
+        "the control plane holds the column-scoped UPDATE a rename and a reparent need"
     );
 }
 

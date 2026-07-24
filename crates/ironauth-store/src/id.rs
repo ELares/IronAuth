@@ -130,6 +130,19 @@ impl ScopedKind for OrgRoleKind {
     const PREFIX: &'static str = "rol";
 }
 
+/// Marker for an organization group (`grp_`), the tenant-scoped named group
+/// belonging to one organization and carrying a position in that organization's
+/// group FOREST (issue #97). A group in M10 is a NAME and a parent pointer only:
+/// binding a membership into it and assigning a role to it are later PRs of the
+/// same issue. Scoped like every other resource so a group id minted in one scope
+/// parses as a uniform not-found under another. Not a bearer secret (a group id
+/// names configuration, never end-user data), so its debug form stays legible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OrgGroupKind;
+impl ScopedKind for OrgGroupKind {
+    const PREFIX: &'static str = "grp";
+}
+
 /// Marker for an audit-log event, the tenant-scoped record the audit log writes
 /// in the same transaction as every mutation. Scoped like any other resource so
 /// audit rows are themselves subject to the tenant-isolation policies.
@@ -1276,6 +1289,10 @@ pub type OrgMembershipId = ScopedId<OrgMembershipKind>;
 /// An organization-role identifier (`rol_...`), one named role belonging to one
 /// organization (issue #97).
 pub type OrgRoleId = ScopedId<OrgRoleKind>;
+/// An organization-group identifier (`grp_...`), one named group belonging to one
+/// organization and holding a position in that organization's group forest
+/// (issue #97).
+pub type OrgGroupId = ScopedId<OrgGroupKind>;
 /// An audit-log event identifier (`aud_...`).
 pub type AuditId = ScopedId<AuditKind>;
 /// A management API key identifier (`mak_...`), environment-scoped (issue #11).
@@ -2038,6 +2055,64 @@ mod tests {
     }
 
     #[test]
+    fn property_org_group_ids_round_trip_and_deny_cross_scope() {
+        // A property sweep over the organization-group level (issue #97): every
+        // freshly minted id round-trips in its own scope, and NONE parses in a
+        // foreign tenant or environment. This matters more here than for a leaf
+        // resource: a group id is also a PARENT POINTER, so a cross-scope id that
+        // parsed would let one environment's forest reference another's.
+        let env = test_env();
+        let tenant_a = TenantId::generate(&env);
+        let tenant_b = TenantId::generate(&env);
+        let env_1 = EnvironmentId::generate(&env);
+        let env_2 = EnvironmentId::generate(&env);
+        let scope_a = Scope::new(tenant_a, env_1);
+        let cross_tenant = Scope::new(tenant_b, env_1);
+        let cross_env = Scope::new(tenant_a, env_2);
+
+        for _ in 0..1_000 {
+            let id = OrgGroupId::generate(&env, &scope_a);
+            let text = id.to_string();
+            assert!(text.starts_with("grp_"));
+            // Round-trips in its own scope.
+            assert_eq!(
+                OrgGroupId::parse_in_scope(&text, &scope_a).expect("in scope"),
+                id
+            );
+            // Denied uniformly in a foreign tenant and a foreign environment.
+            assert_eq!(
+                OrgGroupId::parse_in_scope(&text, &cross_tenant),
+                Err(NotInScope)
+            );
+            assert_eq!(
+                OrgGroupId::parse_in_scope(&text, &cross_env),
+                Err(NotInScope)
+            );
+        }
+
+        // Malformed and wrong-prefix inputs fail with the same NotInScope. A ROLE
+        // id is the sharpest wrong-prefix case: roles and groups are siblings of
+        // one issue, both organization-scoped, and a reparent that accepted a role
+        // id as a parent would be a type confusion inside the hierarchy itself.
+        assert_eq!(
+            OrgGroupId::parse_in_scope("grp_not-base64-!!", &scope_a),
+            Err(NotInScope)
+        );
+        let a_role = OrgRoleId::generate(&env, &scope_a).to_string();
+        assert_eq!(
+            OrgGroupId::parse_in_scope(&a_role, &scope_a),
+            Err(NotInScope),
+            "a role id is not a group id even in the right scope"
+        );
+        let a_group = OrgGroupId::generate(&env, &scope_a).to_string();
+        assert_eq!(
+            OrgRoleId::parse_in_scope(&a_group, &scope_a),
+            Err(NotInScope),
+            "a group id is not a role id even in the right scope"
+        );
+    }
+
+    #[test]
     fn every_declared_prefix_is_mutually_distinct() {
         // Every identifier kind in this module declares a `PREFIX`, and the whole
         // anti-oracle contract rests on those prefixes being a SET: two kinds
@@ -2105,6 +2180,7 @@ mod tests {
         // The prefixes issue #97 claims are present, so a later kind cannot take
         // one of them without tripping the duplicate check above.
         assert!(seen.contains_key("rol"), "the org-role prefix is declared");
+        assert!(seen.contains_key("grp"), "the org-group prefix is declared");
     }
 
     #[test]

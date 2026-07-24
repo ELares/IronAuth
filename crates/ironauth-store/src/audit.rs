@@ -220,6 +220,30 @@ pub enum Action {
     /// the row, so the audit foreign key to it stays satisfiable and the slug is
     /// freed for a new role. The target is the deleted role.
     OrganizationRoleDelete,
+    /// A named group was DEFINED in an organization (issue #97), possibly directly
+    /// under a parent group. The target is the new group. A group in M10 is a name
+    /// and a position in the organization's group forest; who is IN it and what it
+    /// grants are later PRs of the same issue.
+    OrganizationGroupCreate,
+    /// An organization group's MUTABLE fields were changed (issue #97): its
+    /// display name, its metadata, or both. The group's `slug` (the stable name)
+    /// is immutable by GRANT and its PARENT is changed only under the separate
+    /// reparent action, so this action never means the group's identity or its
+    /// position in the hierarchy changed. The target is the renamed group.
+    OrganizationGroupUpdate,
+    /// An organization group was DELETED (issue #97): a soft delete that retains
+    /// the row, so the audit foreign key to it stays satisfiable and the slug is
+    /// freed for a new group. The target is the deleted group.
+    OrganizationGroupDelete,
+    /// An organization group was MOVED within its organization's group forest
+    /// (issue #97): given a new parent, or promoted to a root. Deliberately its
+    /// own action rather than a flavor of the update: a reparent silently changes
+    /// the inherited roles of every DESCENDANT of the moved group, so it is the
+    /// one group mutation whose blast radius is not the target row, and the audit
+    /// history has to be able to say so. The target is the moved group, and the
+    /// audit row's operator-safe `detail` records the new parent (or its absence),
+    /// so the whole shape of the tree is reconstructable from the audit log alone.
+    OrganizationGroupReparent,
     /// An authorization code and its grant were issued (issue #12).
     AuthorizationCodeIssue,
     /// An authorization code was redeemed at the token endpoint (issue #12).
@@ -1018,6 +1042,10 @@ impl Action {
             Action::OrganizationRoleCreate => "organization.role.create",
             Action::OrganizationRoleUpdate => "organization.role.update",
             Action::OrganizationRoleDelete => "organization.role.delete",
+            Action::OrganizationGroupCreate => "organization.group.create",
+            Action::OrganizationGroupUpdate => "organization.group.update",
+            Action::OrganizationGroupDelete => "organization.group.delete",
+            Action::OrganizationGroupReparent => "organization.group.reparent",
             Action::AuthorizationCodeIssue => "authorization_code.issue",
             Action::AuthorizationCodeRedeem => "authorization_code.redeem",
             Action::AuthorizationCodeReuse => "authorization_code.reuse",

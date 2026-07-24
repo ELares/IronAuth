@@ -1526,6 +1526,20 @@
       },
       "type": "object"
     },
+    "OrganizationsConfig": {
+      "additionalProperties": false,
+      "description": "Organization settings (issue #97).\n\nOrganizations own two first-class per-organization resources in M10: named\nroles, and named groups that NEST. Nesting is the part that needs a knob: the\nancestor walk that turns a subject's group memberships into an effective role\nset runs on the token-issuance path, so its termination has to be bounded by\nsomething an operator can see and set, not by a constant compiled into the\nstore.\n\nNothing in this section caps a COUNT. An organization may define unlimited\nroles and unlimited groups, and may hold unlimited groups at any single depth\nlevel; there is no quota, count constraint, or paywall gate anywhere in the\nrole and group model.",
+      "properties": {
+        "max_group_depth": {
+          "default": 8,
+          "description": "The largest group nesting depth an organization's group hierarchy may\nreach, measured in EDGES from a root: a root group has depth 0 and its\nchild depth 1. `0` therefore means FLAT GROUPS ONLY (no nesting), never\n\"unlimited\"; this setting has no unlimited value, because the bound is\nwhat makes the ancestor walk on the token-issuance path terminate.\n\nThis is a STRUCTURAL SAFETY bound, not a cap on the NUMBER of groups,\nroles, members, or assignments. Those are deliberately uncapped and no\ncount check exists anywhere in the schema or the code.\n\nThe bound is enforced at WRITE time over the whole affected subtree (a\ncreate or reparent that would nest deeper is refused with a typed error\nand writes nothing) AND as a hard guard on the READ walk, so a hierarchy\nleft over-deep by a lowered bound or an import can never stall\neffective-role resolution.\n\nLowering this on a populated environment GRANDFATHERS existing trees: no\nstored hierarchy is rewritten and no read is refused, but any new write\nthat would leave a subtree over the new bound is rejected until an\noperator flattens it.\n\nDefault [`ORGANIZATIONS_DEFAULT_MAX_GROUP_DEPTH`]; config load REJECTS a\nvalue above [`ORGANIZATIONS_MAX_GROUP_DEPTH_CEILING`]. This is a\npromotable per-environment setting in spirit; the process value is the\ndeployment default until per-environment overrides ride the M5 promotion\npipeline.\n\nNamed for GROUP depth specifically, not hierarchy depth generally: the\norganization hierarchy (`organizations.parent_id`, issue #103) is a\nSEPARATE tree, and one shared knob would couple two milestones that are\notherwise independent.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "PasswordHashingConfig": {
       "additionalProperties": false,
       "description": "Password-hashing settings (issue #62): the Argon2id parameters for NEWLY set\npasswords and the dedicated, admission-controlled hashing worker pool.\n\nPassword hashing is the hottest and most denial-of-service-prone operation an\nidentity provider performs, so it runs in a bounded worker pool kept OFF the\nasync request threads, fronted by the per-tenant fair-share admission of the\n[`QuotaConfig`] layer (issue #50): one tenant's credential-stuffing storm\ndegrades only that tenant, never the instance.\n\nThe Argon2id parameters are per-environment in spirit (dev/staging/prod may\ndiffer) and safe by default (the OWASP recommendation: `m = 19456` KiB,\n`t = 2`, `p = 1`); a parameter change applies to NEW hashes, and an existing\nhash upgrades transparently through the rehash-on-successful-login path,\nbecause the parameters are stored per hash in the PHC string. The process\nvalue is the deployment default until per-environment overrides ride the M5\npromotion pipeline, mirroring the other promotable settings.\n\nThe pool sizing and queue depth are host infrastructure, not a per-environment\nconcern: they bound the whole process. The `ironauth hash-probe` CLI (and the\nin-admin tuning helper) run a measured probe on the actual host and recommend\nparameters that meet `probe_target_latency_ms`.",
@@ -2658,6 +2672,13 @@
         "webauthn_signal_api_enabled": false
       },
       "description": "OIDC provider settings (issue #12)."
+    },
+    "organizations": {
+      "$ref": "#/$defs/OrganizationsConfig",
+      "default": {
+        "max_group_depth": 8
+      },
+      "description": "Organization settings (issue #97): the structural safety bound on how deep\nan organization's group hierarchy may nest. A top-level section rather than\na field on `[admin]` deliberately, because the bound is consumed on BOTH\nplanes: the management API enforces it at write time and the token-issuance\npath uses it as the hard termination guard on the ancestor walk that\nresolves a subject's effective roles."
     },
     "password_hashing": {
       "$ref": "#/$defs/PasswordHashingConfig",
