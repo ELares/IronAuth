@@ -107,6 +107,17 @@ impl ScopedKind for OrganizationKind {
     const PREFIX: &'static str = "org";
 }
 
+/// Marker for an organization membership (`omb_`), the tenant-scoped join row
+/// binding a user into an organization (issue #94). Scoped like every other
+/// resource so a membership id minted in one scope parses as a uniform not-found
+/// under another. Not a bearer secret (it is the membership's stable handle, like
+/// an organization id), so its debug form stays legible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OrgMembershipKind;
+impl ScopedKind for OrgMembershipKind {
+    const PREFIX: &'static str = "omb";
+}
+
 /// Marker for an audit-log event, the tenant-scoped record the audit log writes
 /// in the same transaction as every mutation. Scoped like any other resource so
 /// audit rows are themselves subject to the tenant-isolation policies.
@@ -1247,6 +1258,9 @@ pub struct ScopedId<K: ScopedKind> {
 pub type ClientId = ScopedId<ClientKind>;
 /// An organization identifier (`org_...`); schema slot only in M1.
 pub type OrganizationId = ScopedId<OrganizationKind>;
+/// An organization-membership identifier (`omb_...`), the join row binding a user
+/// into an organization (issue #94).
+pub type OrgMembershipId = ScopedId<OrgMembershipKind>;
 /// An audit-log event identifier (`aud_...`).
 pub type AuditId = ScopedId<AuditKind>;
 /// A management API key identifier (`mak_...`), environment-scoped (issue #11).
@@ -1909,6 +1923,54 @@ mod tests {
             OrganizationId::parse_in_scope(&a_client, &scope_a),
             Err(NotInScope),
             "a client id is not an organization id even in the right scope"
+        );
+    }
+
+    #[test]
+    fn property_org_membership_ids_round_trip_and_deny_cross_scope() {
+        // A property sweep over the organization-membership level (issue #94):
+        // every freshly minted id round-trips in its own scope, and NONE parses in
+        // a foreign tenant or environment. Malformed and wrong-prefix inputs fail
+        // identically (no oracle), exactly as the organization exemplar does.
+        let env = test_env();
+        let tenant_a = TenantId::generate(&env);
+        let tenant_b = TenantId::generate(&env);
+        let env_1 = EnvironmentId::generate(&env);
+        let env_2 = EnvironmentId::generate(&env);
+        let scope_a = Scope::new(tenant_a, env_1);
+        let cross_tenant = Scope::new(tenant_b, env_1);
+        let cross_env = Scope::new(tenant_a, env_2);
+
+        for _ in 0..1_000 {
+            let id = OrgMembershipId::generate(&env, &scope_a);
+            let text = id.to_string();
+            assert!(text.starts_with("omb_"));
+            // Round-trips in its own scope.
+            assert_eq!(
+                OrgMembershipId::parse_in_scope(&text, &scope_a).expect("in scope"),
+                id
+            );
+            // Denied uniformly in a foreign tenant and a foreign environment.
+            assert_eq!(
+                OrgMembershipId::parse_in_scope(&text, &cross_tenant),
+                Err(NotInScope)
+            );
+            assert_eq!(
+                OrgMembershipId::parse_in_scope(&text, &cross_env),
+                Err(NotInScope)
+            );
+        }
+
+        // Malformed and wrong-prefix inputs fail with the same NotInScope.
+        assert_eq!(
+            OrgMembershipId::parse_in_scope("omb_not-base64-!!", &scope_a),
+            Err(NotInScope)
+        );
+        let an_org = OrganizationId::generate(&env, &scope_a).to_string();
+        assert_eq!(
+            OrgMembershipId::parse_in_scope(&an_org, &scope_a),
+            Err(NotInScope),
+            "an organization id is not a membership id even in the right scope"
         );
     }
 

@@ -1,17 +1,19 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Least-privilege enforcement of the data-plane role on `organizations` (issue
-//! #41, applying the #31 lesson to the other role).
+//! #41 and #94, applying the #31 lesson to the other role).
 //!
-//! The organization lifecycle is entirely a control-plane operation: no data-plane
-//! or OIDC path creates, mutates, or reads organizations. Migration 0027 therefore
-//! REVOKES the over-broad grant the isolation root (0001) gave the low-privilege
-//! `ironauth_app` role when the level was a schema slot only. This proves the
-//! revoke: as `ironauth_app`, every statement on `organizations` is refused as
-//! insufficient privilege, so the role can neither HARD DELETE a row (which would
+//! The organization LIFECYCLE is entirely a control-plane operation: no data-plane
+//! path creates, mutates, or soft-deletes organizations. Migration 0027 REVOKED the
+//! over-broad grant the isolation root (0001) gave the low-privilege `ironauth_app`
+//! role when the level was a schema slot only; migration 0084 (M10) re-grants ONLY
+//! the data-plane SELECT (membership resolution and org-context validation READ an
+//! organization). This proves the shape: as `ironauth_app`, SELECT is now allowed
+//! (and still RLS-scoped), but every MUTATING statement on `organizations` is refused
+//! as insufficient privilege, so the role can neither HARD DELETE a row (which would
 //! break the soft-delete retention the append-only `audit_log` foreign key depends
-//! on) nor UPDATE any column. The positive control confirms the control role
-//! `ironauth_control` keeps its column-scoped soft delete.
+//! on) nor INSERT or UPDATE any column. The positive control confirms the control
+//! role `ironauth_control` keeps its column-scoped soft delete.
 
 use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
@@ -28,7 +30,7 @@ fn is_permission_denied(err: &sqlx::Error) -> bool {
 }
 
 #[tokio::test]
-async fn app_role_has_no_grant_on_organizations_while_control_soft_deletes() {
+async fn app_role_has_read_only_grant_on_organizations_while_control_soft_deletes() {
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
@@ -84,8 +86,8 @@ async fn app_role_has_no_grant_on_organizations_while_control_soft_deletes() {
     )
     .await;
 
-    // INSERT and SELECT are revoked too: the data plane never reads or writes
-    // organizations, so the revoke is total, not merely of the mutating verbs.
+    // INSERT is revoked too: the data plane never WRITES organizations, so the
+    // revoke covers the create verb as well as the mutating ones.
     assert_denied_in_scope(
         pool,
         &tenant,
@@ -94,13 +96,23 @@ async fn app_role_has_no_grant_on_organizations_while_control_soft_deletes() {
          VALUES ('org_probe', 'probe', 'probe', 'probe')",
     )
     .await;
-    assert_denied_in_scope(
-        pool,
-        &tenant,
-        &environment,
-        "SELECT count(*) FROM organizations",
-    )
-    .await;
+
+    // SELECT, however, is re-granted in M10 (0084): the data plane READS an
+    // organization to validate an org-context and to resolve a membership. It is
+    // allowed AND still RLS-scoped, so bound to this scope it sees exactly the one
+    // live row and never a foreign-scope organization.
+    let mut tx = pool.begin().await.expect("begin select tx");
+    bind_scope(&mut tx, &tenant, &environment).await;
+    let in_scope: i64 = sqlx::query("SELECT count(*) AS n FROM organizations")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("the data-plane SELECT on organizations is re-granted in M10")
+        .get("n");
+    assert_eq!(
+        in_scope, 1,
+        "the app SELECT is RLS-scoped to this scope's row"
+    );
+    let _ = tx.rollback().await;
 
     // Positive control: the control role's column-scoped soft delete succeeds, and
     // the organization then reads as absent through the control plane.

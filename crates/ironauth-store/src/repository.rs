@@ -85,15 +85,15 @@ use crate::id::{
     ExternalIssuerId, FedcmNonceId, FederationLoginStateId, FlowId, FlowVersionId,
     FlowVersionPinId, GrantId, InitialAccessTokenId, InvitationId, IssuedTokenId, KekId,
     LocaleBundleId, MagicLinkTokenId, ManagementKeyId, Mds3BlobCacheId, MigrationRunId,
-    MigrationRunRecordId, OperatorId, OrgConnectionId, OrganizationId, PowChallengeId,
-    PushedRequestId, RecoveryApprovalId, RecoveryCodeId, RecoveryContactConfirmationId,
-    RecoveryFlowId, RecoveryIdvSessionId, RecoveryTrustedContactId, RefreshFamilyId,
-    RefreshTokenId, ResourceServerId, RiskDecisionId, RiskDisavowalId, RiskLoginGeoId,
-    RiskSignalId, RoutingRuleId, ScopeStepUpPolicyId, ServiceAccountId, SessionEventId, SessionId,
-    SigningKeyId, SignupFormId, SignupQuarantineId, SmsOtpCodeId, SmsRouteStatId, TenantId,
-    TotpCredentialId, TraitMigrationJobId, TraitSchemaId, TrustedDeviceId, UpstreamTokenGrantId,
-    UpstreamTokenId, UserId, UserIdentifierId, VariableId, WebauthnChallengeId,
-    WebauthnCredentialId,
+    MigrationRunRecordId, OperatorId, OrgConnectionId, OrgMembershipId, OrganizationId,
+    PowChallengeId, PushedRequestId, RecoveryApprovalId, RecoveryCodeId,
+    RecoveryContactConfirmationId, RecoveryFlowId, RecoveryIdvSessionId, RecoveryTrustedContactId,
+    RefreshFamilyId, RefreshTokenId, ResourceServerId, RiskDecisionId, RiskDisavowalId,
+    RiskLoginGeoId, RiskSignalId, RoutingRuleId, ScopeStepUpPolicyId, ServiceAccountId,
+    SessionEventId, SessionId, SigningKeyId, SignupFormId, SignupQuarantineId, SmsOtpCodeId,
+    SmsRouteStatId, TenantId, TotpCredentialId, TraitMigrationJobId, TraitSchemaId,
+    TrustedDeviceId, UpstreamTokenGrantId, UpstreamTokenId, UserId, UserIdentifierId, VariableId,
+    WebauthnChallengeId, WebauthnCredentialId,
 };
 use crate::identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
@@ -28940,6 +28940,12 @@ pub struct AcceptedInvitation {
     pub user_id: UserId,
     /// The primary-login credential the invitation enrolled.
     pub credential_type: InvitationCredentialType,
+    /// The organization the accept bound the user into (issue #94), or [`None`] when
+    /// the invitation carried no org-context. When [`Some`], a LIVE membership for this
+    /// user in that organization is guaranteed to exist after the accept (freshly
+    /// created, revived from a prior removal, or already present), so the caller can
+    /// rely on it as the truthful post-accept membership state.
+    pub organization_id: Option<OrganizationId>,
 }
 
 /// Reconstruct an [`InvitationAdminRecord`] from a `user_invitations` row, opening the
@@ -29187,6 +29193,16 @@ impl ActingInvitationRepo<'_> {
         if spec.id.scope() != self.scope || spec.user_id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
+        // Validate the org-context (issue #94): when present it MUST parse as an
+        // organization id in THIS scope, so a malformed or cross-scope handle is a
+        // clean early error rather than a foreign-key surprise at accept. A malformed
+        // value and a foreign-scope value are rejected identically (never an existence
+        // oracle). Existence and the active-state check are the admin layer's job; the
+        // membership foreign key is the ultimate existence backstop at accept.
+        if let Some(org_context) = spec.org_context {
+            OrganizationId::parse_in_scope(org_context, &self.scope)
+                .map_err(|_| StoreError::InvalidOrgContext)?;
+        }
         let master = self.store.master().ok_or(StoreError::Encryption)?;
         self.ensure_scope_keys(env, master).await?;
         let scope = self.scope;
@@ -29394,6 +29410,9 @@ impl ActingInvitationRepo<'_> {
     /// in this scope; [`StoreError::Conflict`] if it lost a concurrent double-accept or
     /// the user was not in `pending_verification`; [`StoreError::Database`] on a
     /// persistence failure.
+    // The accept is one linear guarded transaction (redeem, activate, optionally bind
+    // the membership); splitting it would obscure that it is a single atomic unit.
+    #[allow(clippy::too_many_lines)]
     pub async fn accept(
         &self,
         env: &Env,
@@ -29409,7 +29428,7 @@ impl ActingInvitationRepo<'_> {
         // concurrent accept or an expiry between here and there cannot slip through.
         let mut pre = begin_scoped(self.store, scope).await?;
         let row = sqlx::query(
-            "SELECT id, user_id, credential_type FROM user_invitations \
+            "SELECT id, user_id, credential_type, org_context FROM user_invitations \
              WHERE token_digest = $1 AND tenant_id = $2 AND environment_id = $3 \
              AND state = 'pending' \
              AND expires_at > TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval",
@@ -29429,9 +29448,24 @@ impl ActingInvitationRepo<'_> {
         let credential_type =
             InvitationCredentialType::parse(&row.get::<String, _>("credential_type"))
                 .ok_or(StoreError::NotFound)?;
+        // The org-context an org invitation carried (issue #94): parse it as an
+        // organization id IN THIS SCOPE. It was validated at CREATE, so a value that
+        // no longer parses in scope is a corrupt invariant; fail the whole accept
+        // CLOSED (the uniform not-found) rather than complete an accept that cannot
+        // bind the intended membership. A membership is added ONLY when this is Some.
+        let membership_org: Option<OrganizationId> = match row
+            .get::<Option<String>, _>("org_context")
+        {
+            Some(text) => Some(
+                OrganizationId::parse_in_scope(&text, &scope).map_err(|_| StoreError::NotFound)?,
+            ),
+            None => None,
+        };
         let id_text = id.to_string();
         let user_text = user_id.to_string();
         let detail = format!("credential_type={}", credential_type.as_str());
+        let store = self.store;
+        let acting = self.acting;
         write_audited_detailed(
             AuditedWrite {
                 store: self.store,
@@ -29489,6 +29523,51 @@ impl ActingInvitationRepo<'_> {
                     // always corresponds to an activation.
                     return Err(StoreError::Conflict);
                 }
+                // Bind the user into the organization the invitation carried (issue
+                // #94), in the SAME transaction as the pending -> accepted flip and the
+                // activation. The organization foreign key is the existence backstop.
+                // Revive-or-insert: a previously REMOVED membership is revived, a fresh
+                // one is inserted, and a user who is ALREADY a live member is a clean
+                // no-op. In every one of those cases a LIVE membership exists after this
+                // returns, so `AcceptedInvitation.organization_id = Some(org)` is
+                // truthful. A revive or a fresh insert appends the membership's OWN
+                // `organization.membership.add` audit row (the second audit row on the
+                // accept path); the already-a-live-member no-op writes no second row, so
+                // an accept never double-binds or double-audits.
+                if let Some(org_id) = membership_org {
+                    let new_membership_id = OrgMembershipId::generate(env, &scope);
+                    match insert_or_revive_membership(
+                        tx,
+                        scope,
+                        &new_membership_id,
+                        &org_id,
+                        &user_id,
+                        None,
+                        now_micros,
+                    )
+                    .await
+                    {
+                        Ok(live_id) => {
+                            insert_audit_row(
+                                tx,
+                                &AuditedWrite {
+                                    store,
+                                    scope,
+                                    acting: &acting,
+                                    env,
+                                    action: Action::OrganizationMembershipAdd,
+                                    target: &live_id,
+                                },
+                                None,
+                            )
+                            .await?;
+                        }
+                        // Already a live member (added out of band): the live membership
+                        // already exists, so no new binding and no second audit row.
+                        Err(StoreError::Conflict) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
                 Ok(())
             },
             false,
@@ -29499,6 +29578,7 @@ impl ActingInvitationRepo<'_> {
             id,
             user_id,
             credential_type,
+            organization_id: membership_org,
         })
     }
 }
@@ -31135,17 +31215,94 @@ pub struct OperatorRecord {
     pub created_at_unix_micros: i64,
 }
 
-/// An organization row (management plane, issue #41): the minimal M5 shell.
-/// Organizations live inside environments, so the identifier embeds both the
-/// tenant and the environment. M10 extends this shell with membership.
+/// The organization lifecycle state (issue #94): active until an admin disables
+/// it. Distinct from a soft delete (`deleted_at`) and from M5 tenant / environment
+/// suspension. The disabled STATE lands here; the login-time ENFORCEMENT is a later
+/// PR. A disabled organization still EXISTS and is readable (get and list return
+/// it), it is merely marked disabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrganizationState {
+    /// The default: the organization is usable.
+    Active,
+    /// Disabled by an admin. Readable, but marked disabled (enforcement is later).
+    Disabled,
+}
+
+impl OrganizationState {
+    /// The stable wire string, matching the migration's `state` CHECK.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OrganizationState::Active => "active",
+            OrganizationState::Disabled => "disabled",
+        }
+    }
+
+    /// Reconstruct a state from its wire string; [`None`] for an unknown tag.
+    #[must_use]
+    pub fn from_wire(raw: &str) -> Option<Self> {
+        match raw {
+            "active" => Some(OrganizationState::Active),
+            "disabled" => Some(OrganizationState::Disabled),
+            _ => None,
+        }
+    }
+
+    /// Whether this is the active state (the admin view's `active` flag).
+    #[must_use]
+    pub fn is_active(self) -> bool {
+        matches!(self, OrganizationState::Active)
+    }
+}
+
+/// An organization row (management plane, issue #41): the minimal M5 shell,
+/// extended by M10 (issue #94) with a lifecycle state. Organizations live inside
+/// environments, so the identifier embeds both the tenant and the environment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrganizationRecord {
     /// The organization identifier (`org_...`, embeds its `(tenant, environment)`).
     pub id: OrganizationId,
     /// The human-facing display name.
     pub display_name: String,
+    /// The lifecycle state (issue #94): active or disabled.
+    pub state: OrganizationState,
     /// Creation time in microseconds since the Unix epoch (the pagination key).
     pub created_at_unix_micros: i64,
+}
+
+/// An organization-membership row (issue #94): one user's binding into one
+/// organization within a scope. Multi-org is native, so a user may hold many of
+/// these across organizations and an organization many across users. Only LIVE
+/// (not soft-deleted) memberships are ever reconstructed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgMembershipRecord {
+    /// The membership identifier (`omb_...`, embeds its `(tenant, environment)`).
+    pub id: OrgMembershipId,
+    /// The organization the user is bound into (`org_...`).
+    pub organization_id: OrganizationId,
+    /// The user bound into the organization (`usr_...`).
+    pub user_id: UserId,
+    /// The membership lifecycle state (a closed set; `active` for now).
+    pub state: String,
+    /// Free-form membership metadata (the issue's "state and metadata"), as stored
+    /// JSON. Never interpreted by the auth core.
+    pub metadata: serde_json::Value,
+    /// Creation time in microseconds since the Unix epoch (the pagination key).
+    pub created_at_unix_micros: i64,
+}
+
+/// Everything an organization-membership create needs, bundled so the repository
+/// method stays within the readable-argument-count lint (issue #94).
+#[derive(Debug, Clone, Copy)]
+pub struct NewMembership<'a> {
+    /// The membership id (minted by the caller, embeds this scope).
+    pub id: &'a OrgMembershipId,
+    /// The organization the user is bound into (an `org_` id in this scope).
+    pub organization_id: &'a OrganizationId,
+    /// The user bound into the organization (a `usr_` id in this scope).
+    pub user_id: &'a UserId,
+    /// Optional free-form membership metadata; `None` stores the empty object.
+    pub metadata: Option<&'a serde_json::Value>,
 }
 
 /// The control-plane entry point: reads and the acting door for writes.
@@ -31196,6 +31353,18 @@ impl<'a> ManagementStore<'a> {
     #[must_use]
     pub fn organizations(&self, scope: Scope) -> OrganizationRepo<'a> {
         OrganizationRepo {
+            store: self.store,
+            scope,
+        }
+    }
+
+    /// The read-only organization-membership repository for `scope` (issue #94).
+    /// Memberships are environment-scoped, so the repository is constructible only
+    /// from a `(tenant, environment)` scope and binds row-level security to it
+    /// before every statement.
+    #[must_use]
+    pub fn org_memberships(&self, scope: Scope) -> OrgMembershipRepo<'a> {
+        OrgMembershipRepo {
             store: self.store,
             scope,
         }
@@ -31298,6 +31467,17 @@ impl<'a> ActingManagementStore<'a> {
     #[must_use]
     pub fn organizations(&self, scope: Scope) -> ActingOrganizationRepo<'a> {
         ActingOrganizationRepo {
+            store: self.store,
+            acting: self.acting,
+            scope,
+        }
+    }
+
+    /// The mutating organization-membership repository for `scope` (issue #94):
+    /// add a user to an organization and remove one, each audited.
+    #[must_use]
+    pub fn org_memberships(&self, scope: Scope) -> ActingOrgMembershipRepo<'a> {
+        ActingOrgMembershipRepo {
             store: self.store,
             acting: self.acting,
             scope,
@@ -31548,7 +31728,7 @@ impl OrganizationRepo<'_> {
         }
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
-            "SELECT id, display_name, \
+            "SELECT id, display_name, state, \
              (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us \
              FROM organizations \
              WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND deleted_at IS NULL",
@@ -31577,7 +31757,7 @@ impl OrganizationRepo<'_> {
         let (after_micros, after_id) = split_cursor(after);
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let rows = sqlx::query(
-            "SELECT id, display_name, \
+            "SELECT id, display_name, state, \
              (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us \
              FROM organizations \
              WHERE tenant_id = $1 AND environment_id = $2 AND deleted_at IS NULL \
@@ -31596,6 +31776,162 @@ impl OrganizationRepo<'_> {
         rows.iter()
             .map(|row| organization_from_row(row, &self.scope))
             .collect()
+    }
+}
+
+/// The projection every organization-membership read selects from `org_memberships`
+/// (the timestamp as epoch microseconds, the metadata as JSON text). One constant so
+/// the get and list projections cannot drift.
+const ORG_MEMBERSHIP_SELECT_COLUMNS: &str = "id, organization_id, user_id, state, \
+     metadata::text AS metadata_text, \
+     (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us";
+
+/// Read-only organization memberships for one scope (issue #94). Every read is
+/// scope-fenced and filters `deleted_at IS NULL` (a removed membership reads as
+/// absent, exactly like a soft-deleted organization).
+pub struct OrgMembershipRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl OrgMembershipRepo<'_> {
+    /// Parse an untrusted membership identifier under this scope. A malformed id and
+    /// one minted in another scope both return the uniform not-found.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if malformed or out of scope.
+    pub fn parse_id(&self, raw: &str) -> Result<OrgMembershipId, StoreError> {
+        Ok(OrgMembershipId::parse_in_scope(raw, &self.scope)?)
+    }
+
+    /// Fetch a live membership by id, within scope.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no such live membership is visible in this scope.
+    pub async fn get(&self, id: &OrgMembershipId) -> Result<OrgMembershipRecord, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(&format!(
+            "SELECT {ORG_MEMBERSHIP_SELECT_COLUMNS} FROM org_memberships \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND deleted_at IS NULL"
+        ))
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        org_membership_from_row(&row, &self.scope)
+    }
+
+    /// One page of live memberships for one organization, ordered by `(created_at,
+    /// id)`. The "who is in this organization" list. A cross-scope `org_id` fails to
+    /// match (its scope columns cannot match the bound scope), so the result is empty.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_for_org(
+        &self,
+        org_id: &OrganizationId,
+        limit: i64,
+        after: Option<&CursorPosition>,
+    ) -> Result<Vec<OrgMembershipRecord>, StoreError> {
+        if org_id.scope() != self.scope {
+            return Ok(Vec::new());
+        }
+        let (after_micros, after_id) = split_cursor(after);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {ORG_MEMBERSHIP_SELECT_COLUMNS} FROM org_memberships \
+             WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
+             AND deleted_at IS NULL \
+             AND ($4::bigint IS NULL OR (created_at, id) > \
+                  (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval, $5::text)) \
+             ORDER BY created_at, id LIMIT $6"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(org_id.to_string())
+        .bind(after_micros)
+        .bind(after_id)
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| org_membership_from_row(row, &self.scope))
+            .collect()
+    }
+
+    /// Every live membership for one user (multi-org): the "which organizations is
+    /// this user in" list, ordered by `(created_at, id)` and capped at the management
+    /// hard cap. A cross-scope `user_id` matches nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_for_user(
+        &self,
+        user_id: &UserId,
+    ) -> Result<Vec<OrgMembershipRecord>, StoreError> {
+        if user_id.scope() != self.scope {
+            return Ok(Vec::new());
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {ORG_MEMBERSHIP_SELECT_COLUMNS} FROM org_memberships \
+             WHERE tenant_id = $1 AND environment_id = $2 AND user_id = $3 \
+             AND deleted_at IS NULL \
+             ORDER BY created_at, id LIMIT $4"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(user_id.to_string())
+        .bind(MANAGEMENT_LIST_HARD_CAP)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| org_membership_from_row(row, &self.scope))
+            .collect()
+    }
+
+    /// Whether a live membership binds `user_id` into `org_id` in this scope. Both
+    /// ids must be in scope (a foreign id is simply "not a member").
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn exists(
+        &self,
+        org_id: &OrganizationId,
+        user_id: &UserId,
+    ) -> Result<bool, StoreError> {
+        if org_id.scope() != self.scope || user_id.scope() != self.scope {
+            return Ok(false);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT EXISTS ( \
+                SELECT 1 FROM org_memberships \
+                WHERE tenant_id = $1 AND environment_id = $2 \
+                AND organization_id = $3 AND user_id = $4 AND deleted_at IS NULL \
+             ) AS present",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(org_id.to_string())
+        .bind(user_id.to_string())
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.get("present"))
     }
 }
 
@@ -33050,6 +33386,298 @@ impl ActingOrganizationRepo<'_> {
         )
         .await
     }
+
+    /// Set an organization's lifecycle state (issue #94): the enable and disable
+    /// actions flip `state` between active and disabled, auditing
+    /// `organization.state_change` in the same transaction (the target state on the
+    /// row's operator-safe `detail`). A COLUMN-scoped UPDATE of exactly `state` (the
+    /// #31 lesson), guarded on the row being live, so a soft-deleted or foreign
+    /// organization is the uniform not-found. Disabling is idempotent in effect: a
+    /// repeat disable of an already-disabled org still matches the live row and
+    /// re-audits the (unchanged) target state.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id is not in this scope, or no live
+    /// organization matched.
+    pub async fn set_state(
+        &self,
+        env: &Env,
+        id: &OrganizationId,
+        state: OrganizationState,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let detail = format!("state={}", state.as_str());
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::OrganizationStateChange,
+                target: id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "UPDATE organizations SET state = $1 \
+                     WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 \
+                     AND deleted_at IS NULL",
+                )
+                .bind(state.as_str())
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+            Some(&detail),
+        )
+        .await
+    }
+}
+
+/// The mutating organization-membership repository (issue #94): add a user to an
+/// organization and remove one, each audited in the same transaction as the write.
+pub struct ActingOrgMembershipRepo<'a> {
+    store: &'a Store,
+    acting: ActingContext,
+    scope: Scope,
+}
+
+impl ActingOrgMembershipRepo<'_> {
+    /// Add a user to an organization and audit `organization.membership.add` in the
+    /// same transaction, scoped to `(tenant, environment)`.
+    ///
+    /// Containment is enforced structurally on four layers: the typed
+    /// [`OrgMembershipId`] embeds this scope (a foreign id never reaches here), the
+    /// forced row-level-security WITH CHECK rejects any row whose scope is not the
+    /// bound one, the `organization_id` foreign key rejects a nonexistent
+    /// organization, and the `user_id` foreign key rejects a nonexistent user. The
+    /// caller passes the organization and user ids already parsed in this scope.
+    ///
+    /// A duplicate add of a user who is ALREADY a live member is refused as
+    /// [`StoreError::Conflict`] (a typed already-member). A user who was previously
+    /// REMOVED (a soft-deleted row) is REVIVED rather than conflicting: the create
+    /// sets `deleted_at` back to `NULL` and the state to `active` on the existing row,
+    /// so remove is reversible and the returned id is that revived row's id. The
+    /// invariant is: create either produces (a fresh row) or revives (a dead row)
+    /// EXACTLY ONE live membership, or returns [`StoreError::Conflict`] when a live one
+    /// already exists. The partial unique index over live rows makes that structural.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if any id is not in this scope;
+    /// [`StoreError::Conflict`] if the user is already a live member of the organization;
+    /// [`StoreError::IdempotencyConflict`] on a concurrent Idempotency-Key race;
+    /// [`StoreError::Database`] on a persistence failure (including a nonexistent
+    /// organization or user, which surfaces as the foreign-key violation).
+    pub async fn create(
+        &self,
+        env: &Env,
+        spec: NewMembership<'_>,
+        created_at_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<OrgMembershipId, StoreError> {
+        if spec.id.scope() != self.scope
+            || spec.organization_id.scope() != self.scope
+            || spec.user_id.scope() != self.scope
+        {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let new_id = *spec.id;
+        // `None` metadata binds SQL NULL so a revive keeps the existing metadata
+        // (COALESCE), while an explicit value overwrites it; a fresh insert defaults
+        // to the empty object.
+        let metadata_opt = membership_metadata_opt(spec.metadata)?;
+        // The membership add is audited against the resulting LIVE membership (the
+        // fresh id on an insert, the existing id on a revive). Because that target is
+        // only known after the revive-or-insert runs, this inlines its own audited
+        // transaction rather than using the target-up-front `write_audited` helper.
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let live_id = insert_or_revive_membership(
+            &mut tx,
+            scope,
+            &new_id,
+            spec.organization_id,
+            spec.user_id,
+            metadata_opt.as_deref(),
+            created_at_micros,
+        )
+        .await?;
+        insert_audit_row(
+            &mut tx,
+            &AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::OrganizationMembershipAdd,
+                target: &live_id,
+            },
+            None,
+        )
+        .await?;
+        insert_idempotency(&mut tx, idempotency).await?;
+        tx.commit().await?;
+        Ok(live_id)
+    }
+
+    /// Remove a membership (soft delete) in this scope and audit
+    /// `organization.membership.remove` in the same transaction. The row is retained
+    /// (only the column-scoped `deleted_at` and `updated_at` are written), so the
+    /// audit foreign key to it stays satisfiable. A repeat remove of an already
+    /// removed membership matches no live row and is the uniform not-found.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id is not in this scope, or no live membership
+    /// matched.
+    pub async fn remove(&self, env: &Env, id: &OrgMembershipId) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::OrganizationMembershipRemove,
+                target: id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "UPDATE org_memberships SET \
+                         deleted_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval, \
+                         updated_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+                     WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 \
+                     AND deleted_at IS NULL",
+                )
+                .bind(now_micros)
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+}
+
+/// Serialize optional membership metadata to the JSON text bound with a `::jsonb`
+/// cast, or `None` when the caller supplied no metadata. `None` binds SQL NULL so a
+/// REVIVE keeps the existing row's metadata (COALESCE) and a fresh insert defaults to
+/// the empty object; a value overwrites. A serialization failure is an internal fault
+/// (a [`serde_json::Value`] always serializes), reported as a decode error.
+fn membership_metadata_opt(
+    metadata: Option<&serde_json::Value>,
+) -> Result<Option<String>, StoreError> {
+    match metadata {
+        Some(value) => serde_json::to_string(value).map(Some).map_err(|error| {
+            StoreError::Database(sqlx::Error::Decode(
+                format!("membership metadata is not serializable: {error}").into(),
+            ))
+        }),
+        None => Ok(None),
+    }
+}
+
+/// Insert a fresh membership OR revive a soft-deleted one for `(organization, user)`
+/// in `scope`, inside the caller's open transaction, returning the resulting LIVE
+/// membership id (issue #94). Shared by the admin add and the invitation-accept side
+/// effect so both behave identically.
+///
+/// A soft-deleted row is REVIVED first (`deleted_at` back to NULL, state to active),
+/// so remove is reversible and no second row accumulates. If none is dead, a fresh
+/// row is inserted; a live row already present then trips the partial unique index
+/// over live rows and is mapped to [`StoreError::Conflict`] (a typed already-member).
+/// The invariant: exactly one LIVE membership results, or Conflict when one is already
+/// live. `metadata` is the JSON text to bind (NULL keeps existing on revive, defaults
+/// to the empty object on insert).
+async fn insert_or_revive_membership(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    new_id: &OrgMembershipId,
+    organization_id: &OrganizationId,
+    user_id: &UserId,
+    metadata: Option<&str>,
+    now_micros: i64,
+) -> Result<OrgMembershipId, StoreError> {
+    // Revive a previously removed membership if one exists. Guarded on `deleted_at IS
+    // NOT NULL`, so a concurrent create that already revived it re-reads a live row
+    // here (zero rows) and falls through to the insert, which then conflicts: exactly
+    // one create ever revives or inserts the single live row.
+    let revived = sqlx::query(
+        "UPDATE org_memberships SET deleted_at = NULL, state = 'active', \
+             metadata = COALESCE($1::jsonb, metadata), \
+             updated_at = TIMESTAMPTZ 'epoch' + ($2::text || ' microseconds')::interval \
+         WHERE tenant_id = $3 AND environment_id = $4 \
+         AND organization_id = $5 AND user_id = $6 AND deleted_at IS NOT NULL \
+         RETURNING id",
+    )
+    .bind(metadata)
+    .bind(now_micros)
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(organization_id.to_string())
+    .bind(user_id.to_string())
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(row) = revived {
+        return Ok(OrgMembershipId::parse_in_scope(
+            &row.get::<String, _>("id"),
+            &scope,
+        )?);
+    }
+    // No dead row to revive: insert a fresh membership. `ON CONFLICT ... DO NOTHING`
+    // targets the partial unique index over LIVE rows, so a user who is ALREADY a live
+    // member inserts nothing and RETURNING yields no row (mapped to the typed
+    // already-member conflict). Using ON CONFLICT rather than catching a raw unique
+    // violation keeps the surrounding transaction USABLE (a raw constraint error would
+    // abort it), which the accept path relies on to continue after a no-op.
+    let inserted = sqlx::query(
+        "INSERT INTO org_memberships \
+         (id, tenant_id, environment_id, organization_id, user_id, \
+          state, metadata, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, 'active', COALESCE($6::jsonb, '{}'::jsonb), \
+                 TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval, \
+                 TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval) \
+         ON CONFLICT (tenant_id, environment_id, organization_id, user_id) \
+             WHERE deleted_at IS NULL \
+         DO NOTHING \
+         RETURNING id",
+    )
+    .bind(new_id.to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(organization_id.to_string())
+    .bind(user_id.to_string())
+    .bind(metadata)
+    .bind(now_micros)
+    .fetch_optional(&mut **tx)
+    .await?;
+    match inserted {
+        Some(_) => Ok(*new_id),
+        // A live membership already exists (the insert conflicted and did nothing).
+        None => Err(StoreError::Conflict),
+    }
 }
 
 /// Insert a pending idempotency row, if the caller supplied one. A primary-key
@@ -33175,9 +33803,44 @@ fn operator_from_row(row: &PgRow) -> Result<OperatorRecord, StoreError> {
 fn organization_from_row(row: &PgRow, scope: &Scope) -> Result<OrganizationRecord, StoreError> {
     let id_text: String = row.get("id");
     let id = OrganizationId::parse_in_scope(&id_text, scope)?;
+    let state_text: String = row.get("state");
+    let state = OrganizationState::from_wire(&state_text).ok_or_else(|| {
+        // A stored state outside the CHECK set is a corrupt row; surface it as a
+        // decode error rather than silently defaulting.
+        StoreError::Database(sqlx::Error::Decode(
+            format!("unknown organization state {state_text:?}").into(),
+        ))
+    })?;
     Ok(OrganizationRecord {
         id,
         display_name: row.get("display_name"),
+        state,
+        created_at_unix_micros: row.get("created_us"),
+    })
+}
+
+/// Reconstruct an [`OrgMembershipRecord`] from a row read within scope. The stored
+/// ids are parsed back UNDER the scope, so a corrupt cross-scope row fails to decode
+/// rather than being returned; the metadata is parsed from its JSON text.
+fn org_membership_from_row(row: &PgRow, scope: &Scope) -> Result<OrgMembershipRecord, StoreError> {
+    let id = OrgMembershipId::parse_in_scope(&row.get::<String, _>("id"), scope)?;
+    let organization_id =
+        OrganizationId::parse_in_scope(&row.get::<String, _>("organization_id"), scope)?;
+    let user_id = UserId::parse_in_scope(&row.get::<String, _>("user_id"), scope)?;
+    let metadata_text: String = row.get("metadata_text");
+    // The metadata passed a `::jsonb` cast on write, so a parse failure here is an
+    // internal invariant violation; surface it as a decode error, not a silent empty.
+    let metadata: serde_json::Value = serde_json::from_str(&metadata_text).map_err(|error| {
+        StoreError::Database(sqlx::Error::Decode(
+            format!("org_memberships.metadata is not valid JSON: {error}").into(),
+        ))
+    })?;
+    Ok(OrgMembershipRecord {
+        id,
+        organization_id,
+        user_id,
+        state: row.get("state"),
+        metadata,
         created_at_unix_micros: row.get("created_us"),
     })
 }

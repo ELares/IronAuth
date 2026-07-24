@@ -194,6 +194,20 @@ pub enum Action {
     /// An organization was deactivated (management plane, issue #41): a soft
     /// delete that retains the row so the audit foreign key to it stays intact.
     OrganizationDelete,
+    /// An organization's lifecycle STATE was changed (management plane, issue #94):
+    /// the enable or disable action toggled the org between 'active' and 'disabled'.
+    /// The disabled STATE lands here; the login-time ENFORCEMENT is a later PR. The
+    /// audit row's operator-safe `detail` records the target state.
+    OrganizationStateChange,
+    /// A user was ADDED to an organization (issue #94): a new membership row was
+    /// written binding the user into the organization, either through the admin
+    /// membership surface or as the invitation-accept side effect of redeeming an
+    /// invitation that carried an org-context. The target is the new membership.
+    OrganizationMembershipAdd,
+    /// A user was REMOVED from an organization (issue #94): the membership was
+    /// soft-deleted through the admin surface, so the audit foreign key to it stays
+    /// satisfiable. The target is the removed membership.
+    OrganizationMembershipRemove,
     /// An authorization code and its grant were issued (issue #12).
     AuthorizationCodeIssue,
     /// An authorization code was redeemed at the token endpoint (issue #12).
@@ -986,6 +1000,9 @@ impl Action {
             Action::ManagementKeyDelete => "management_key.delete",
             Action::OrganizationCreate => "organization.create",
             Action::OrganizationDelete => "organization.delete",
+            Action::OrganizationStateChange => "organization.state_change",
+            Action::OrganizationMembershipAdd => "organization.membership.add",
+            Action::OrganizationMembershipRemove => "organization.membership.remove",
             Action::AuthorizationCodeIssue => "authorization_code.issue",
             Action::AuthorizationCodeRedeem => "authorization_code.redeem",
             Action::AuthorizationCodeReuse => "authorization_code.reuse",

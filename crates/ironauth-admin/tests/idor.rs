@@ -8,13 +8,15 @@ use ironauth_env::Env;
 use ironauth_store::idor_harness::IdorHarness;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
-    ActorRef, CorrelationId, ManagementKeyId, OrganizationId, Scope, ServiceId, StoreError,
+    ActorRef, CorrelationId, ManagementKeyId, NewAdminUser, NewMembership, OrgMembershipId,
+    OrganizationId, Scope, ServiceId, StoreError, UserState,
 };
 
 /// A stand-in key hash for a planted victim (the probes resolve by id, not hash).
 const VICTIM_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn management_probes_deny_cross_tenant_and_cross_environment_uniformly() {
     let db = TestDatabase::start().await;
     let env = Env::system();
@@ -34,6 +36,11 @@ async fn management_probes_deny_cross_tenant_and_cross_environment_uniformly() {
     // foreign scope so the organization probes have a real cross-scope target.
     let victim_org_b = plant_org(control, &env, scope_b).await;
     let victim_org_a2 = plant_org(control, &env, scope_a2).await;
+
+    // Organization memberships (issue #94): plant a victim membership in each
+    // foreign scope so the membership probes have a real cross-scope target.
+    let victim_member_b = plant_membership(control, &env, scope_b, &victim_org_b).await;
+    let victim_member_a2 = plant_membership(control, &env, scope_a2, &victim_org_a2).await;
 
     // A well-formed key id in the caller's OWN scope that was never stored.
     let absent_in_a = ManagementKeyId::generate(&env, &scope_a).to_string();
@@ -57,6 +64,8 @@ async fn management_probes_deny_cross_tenant_and_cross_environment_uniformly() {
             "management_credentials.delete",
             "organizations.get",
             "organizations.delete",
+            "org_memberships.get",
+            "org_memberships.remove",
         ],
         "every management resolve-by-id operation is registered",
     );
@@ -66,6 +75,8 @@ async fn management_probes_deny_cross_tenant_and_cross_environment_uniformly() {
         victim_a2.to_string(),
         victim_org_b.to_string(),
         victim_org_a2.to_string(),
+        victim_member_b.to_string(),
+        victim_member_a2.to_string(),
         absent_in_a.clone(),
     ];
     let foreign_refs: Vec<&str> = foreign.iter().map(String::as_str).collect();
@@ -112,6 +123,79 @@ async fn management_probes_deny_cross_tenant_and_cross_environment_uniformly() {
             .is_ok(),
         "environment A2's organization must survive the delete probe"
     );
+
+    // The victim memberships must likewise survive the remove probe.
+    assert!(
+        control
+            .management()
+            .org_memberships(scope_b)
+            .get(&victim_member_b)
+            .await
+            .is_ok(),
+        "tenant B's membership must survive the remove probe"
+    );
+    assert!(
+        control
+            .management()
+            .org_memberships(scope_a2)
+            .get(&victim_member_a2)
+            .await
+            .is_ok(),
+        "environment A2's membership must survive the remove probe"
+    );
+}
+
+/// Plant a live membership (a fresh active user bound into `org`) in `scope` via the
+/// control store, returning the membership id.
+async fn plant_membership(
+    control: &ironauth_store::Store,
+    env: &Env,
+    scope: Scope,
+    org: &OrganizationId,
+) -> OrgMembershipId {
+    let actor = ActorRef::service(ServiceId::generate(env));
+    let user = control
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(env))
+        .users()
+        .admin_create(
+            env,
+            NewAdminUser {
+                id: None,
+                identifier: "victim-member@example.test",
+                password_hash: None,
+                claims_json: None,
+                external_id: None,
+                state: UserState::Active,
+                foreign_password_hash: None,
+                foreign_password_algo: None,
+                traits_json: None,
+                traits_schema_version: None,
+            },
+            1_000_000,
+            None,
+        )
+        .await
+        .expect("plant victim user");
+    let id = OrgMembershipId::generate(env, &scope);
+    control
+        .management()
+        .acting(actor, CorrelationId::generate(env))
+        .org_memberships(scope)
+        .create(
+            env,
+            NewMembership {
+                id: &id,
+                organization_id: org,
+                user_id: &user,
+                metadata: None,
+            },
+            1_000_000,
+            None,
+        )
+        .await
+        .expect("plant victim membership");
+    id
 }
 
 /// Plant a live organization in `scope` via the control store.

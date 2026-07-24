@@ -153,6 +153,8 @@ impl IdorHarness {
         self.register(Box::new(ManagementCredentialDeleteProbe));
         self.register(Box::new(OrganizationGetProbe));
         self.register(Box::new(OrganizationDeleteProbe));
+        self.register(Box::new(OrgMembershipGetProbe));
+        self.register(Box::new(OrgMembershipRemoveProbe));
         self
     }
 
@@ -535,6 +537,74 @@ impl IsolationProbe for OrganizationDeleteProbe {
                 .acting(actor, correlation)
                 .organizations(caller);
             match organizations.delete(&env, &id).await {
+                Ok(()) => ProbeOutcome::Leaked,
+                Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `OrgMembershipRepo::get` (issue #94). `store` must
+/// authenticate as `ironauth_control`. A membership minted in another scope must
+/// resolve as the uniform not-found under the caller's scope.
+struct OrgMembershipGetProbe;
+
+impl IsolationProbe for OrgMembershipGetProbe {
+    fn name(&self) -> &'static str {
+        "org_memberships.get"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            let memberships = store.management().org_memberships(caller);
+            let Ok(id) = memberships.parse_id(foreign_id) else {
+                return ProbeOutcome::Denied;
+            };
+            match memberships.get(&id).await {
+                Ok(_) => ProbeOutcome::Leaked,
+                Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `ActingOrgMembershipRepo::remove` (issue #94). `store` must
+/// authenticate as `ironauth_control`. Removing another scope's membership would be
+/// a cross-scope mutation, so it must be the uniform not-found.
+struct OrgMembershipRemoveProbe;
+
+impl IsolationProbe for OrgMembershipRemoveProbe {
+    fn name(&self) -> &'static str {
+        "org_memberships.remove"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            let env = Env::system();
+            let Ok(id) = store
+                .management()
+                .org_memberships(caller)
+                .parse_id(foreign_id)
+            else {
+                return ProbeOutcome::Denied;
+            };
+            let actor = ActorRef::service(ServiceId::generate(&env));
+            let correlation = CorrelationId::generate(&env);
+            let memberships = store
+                .management()
+                .acting(actor, correlation)
+                .org_memberships(caller);
+            match memberships.remove(&env, &id).await {
                 Ok(()) => ProbeOutcome::Leaked,
                 Err(_) => ProbeOutcome::Denied,
             }

@@ -62,6 +62,7 @@ mod invitations;
 mod keys;
 mod locales;
 mod mds3_health;
+mod memberships;
 mod migration;
 mod migration_runs;
 mod migration_status;
@@ -91,7 +92,7 @@ use axum::Router;
 use axum::http::StatusCode;
 use axum::middleware::from_fn;
 use axum::response::Response;
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 
 pub use auth::Principal;
 pub use backfill::{BackfillError, BackfillReport, backfill_signing_algorithms};
@@ -298,6 +299,25 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}",
             get(organizations::get_organization).delete(organizations::delete_organization),
+        )
+        // Organization lifecycle actions (issue #94): disable and re-enable. Static
+        // suffixes, matched before the parameterized membership routes below.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/disable",
+            post(organizations::disable_organization),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/enable",
+            post(organizations::enable_organization),
+        )
+        // Organization membership (issue #94): the M10 user-to-organization join.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships",
+            post(memberships::create_membership).get(memberships::list_memberships),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships/{membership_id}",
+            delete(memberships::delete_membership),
         )
         // Dynamic Client Registration abuse controls (issue #31).
         .route(

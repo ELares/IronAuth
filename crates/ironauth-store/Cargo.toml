@@ -501,6 +501,15 @@ name = "organization_grants"
 path = "tests/organization_grants.rs"
 required-features = ["testing"]
 
+# Organization membership and lifecycle state (issue #94, PR-A): the M10 data model
+# foundation. Membership add/list/remove and multi-org, the invitation-accept side
+# effect that creates a membership, org disable/enable, and the org-context guard.
+# Needs a real database (DATABASE_URL).
+[[test]]
+name = "org_memberships"
+path = "tests/org_memberships.rs"
+required-features = ["testing"]
+
 # The tenant lifecycle state machine, residency attributes, data-plane fence, and
 # crypto-shredding offboarding (#46). Needs a real database (DATABASE_URL).
 [[test]]
