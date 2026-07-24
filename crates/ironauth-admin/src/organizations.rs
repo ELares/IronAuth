@@ -24,7 +24,9 @@ use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::Response;
-use ironauth_store::{CorrelationId, IdempotencyWrite, OrganizationId, Scope, StoreError};
+use ironauth_store::{
+    CorrelationId, IdempotencyWrite, OrganizationId, OrganizationState, Scope, StoreError,
+};
 
 use crate::auth::Principal;
 use crate::error::{ApiError, ErrorBody};
@@ -280,4 +282,112 @@ pub async fn delete_organization(
         .delete(state.env(), &id)
         .await?;
     Ok(no_content())
+}
+
+/// Set an organization's lifecycle state (issue #94): the shared body of the enable
+/// and disable actions. Resolves and authorizes the scope, gates on fresh privilege,
+/// parses the organization id in scope, and audits the state change.
+async fn set_organization_state(
+    state: &AdminState,
+    principal: &Principal,
+    tenant_id: &str,
+    environment_id: &str,
+    organization_id: &str,
+    target: OrganizationState,
+) -> Result<Response, ApiError> {
+    let (scope, actor) = resolve_scope(state, principal, tenant_id, environment_id)?;
+    crate::sudo::require_fresh_privilege(state, scope, actor).await?;
+    let id = state
+        .store()
+        .management()
+        .organizations(scope)
+        .parse_id(organization_id)?;
+    state
+        .store()
+        .management()
+        .acting(actor, CorrelationId::generate(state.env()))
+        .organizations(scope)
+        .set_state(state.env(), &id, target)
+        .await?;
+    // Return the now-updated organization so the caller sees the new active flag.
+    let record = state
+        .store()
+        .management()
+        .organizations(scope)
+        .get(&id)
+        .await?;
+    let body = serde_json::to_string(&OrganizationView::from_record(record))
+        .map_err(|_| ApiError::Internal)?;
+    Ok(json(StatusCode::OK, body))
+}
+
+/// Disable an organization (issue #94). The organization stays readable (this is not
+/// a soft delete) but is marked disabled; the login-time enforcement is a later PR.
+#[utoipa::path(
+    post,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/disable",
+    operation_id = "disableOrganization",
+    tag = "organizations",
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("organization_id" = String, Path, description = "The organization identifier")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "The disabled organization", body = OrganizationView),
+        (status = 401, description = "Missing or invalid credential", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "Not found", body = ErrorBody)
+    )
+)]
+pub async fn disable_organization(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, organization_id)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    set_organization_state(
+        &state,
+        &principal,
+        &tenant_id,
+        &environment_id,
+        &organization_id,
+        OrganizationState::Disabled,
+    )
+    .await
+}
+
+/// Re-enable a disabled organization (issue #94).
+#[utoipa::path(
+    post,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/enable",
+    operation_id = "enableOrganization",
+    tag = "organizations",
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("organization_id" = String, Path, description = "The organization identifier")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "The enabled organization", body = OrganizationView),
+        (status = 401, description = "Missing or invalid credential", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "Not found", body = ErrorBody)
+    )
+)]
+pub async fn enable_organization(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, organization_id)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    set_organization_state(
+        &state,
+        &principal,
+        &tenant_id,
+        &environment_id,
+        &organization_id,
+        OrganizationState::Active,
+    )
+    .await
 }

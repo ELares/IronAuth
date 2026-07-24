@@ -78,6 +78,16 @@ pub enum StoreError {
     ///
     /// [`NotFound`]: StoreError::NotFound
     Encryption,
+    /// An invitation was created with an `org_context` that is not a usable
+    /// organization reference in this scope (issue #94): a value that is not a
+    /// parseable `org_` id, or one minted in another scope. A clean early error at
+    /// invitation CREATE, distinct from [`NotFound`] so the management surface can
+    /// tell the caller the org-context is the problem (never a cross-scope existence
+    /// probe: a malformed value and a foreign-scope value are rejected identically).
+    /// The membership foreign key is the ultimate backstop at accept.
+    ///
+    /// [`NotFound`]: StoreError::NotFound
+    InvalidOrgContext,
     /// A custom-domain registration submitted a value that is not a plain
     /// registrable hostname (issue #47): an IP literal, an internal single-label
     /// name, or a value carrying a scheme, port, path, or whitespace. Rejected
@@ -161,6 +171,7 @@ impl fmt::Display for StoreError {
             }
             StoreError::QuotaExceeded => f.write_str("registration quota exceeded"),
             StoreError::Encryption => f.write_str("envelope decryption failed"),
+            StoreError::InvalidOrgContext => f.write_str("invalid organization context"),
             StoreError::InvalidCustomDomain => f.write_str("invalid custom domain"),
             StoreError::InvalidName => f.write_str("invalid secret or variable name"),
             StoreError::InvalidIdentifier => f.write_str("invalid login identifier"),
@@ -197,6 +208,7 @@ impl std::error::Error for StoreError {
             | StoreError::GuardrailViolation(_)
             | StoreError::QuotaExceeded
             | StoreError::Encryption
+            | StoreError::InvalidOrgContext
             | StoreError::InvalidCustomDomain
             | StoreError::InvalidName
             | StoreError::InvalidIdentifier

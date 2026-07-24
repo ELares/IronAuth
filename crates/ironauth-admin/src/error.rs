@@ -282,6 +282,12 @@ impl From<StoreError> for ApiError {
         match error {
             // The uniform not-found is preserved across the boundary.
             StoreError::NotFound => ApiError::NotFound,
+            // An invalid invitation org-context (issue #94) is a caller-facing bad
+            // request (the admin layer validates it richly up front; this is the
+            // store's defense-in-depth guard surfacing).
+            StoreError::InvalidOrgContext => {
+                ApiError::BadRequest("org_context is not a valid organization id".to_owned())
+            }
             // Anything else (a database fault, or an idempotency conflict that
             // did not funnel through the re-read path) is an opaque internal
             // error; the detail is logged, never returned. `StoreError` is

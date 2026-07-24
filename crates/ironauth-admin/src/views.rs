@@ -12,10 +12,10 @@ use std::fmt;
 
 use ironauth_store::{
     EnvironmentRecord, GuardrailSet, InvitationAdminRecord, InvitationCredentialType,
-    InvitationState, ManagementCredentialRecord, OperatorRecord, OrganizationRecord,
-    RecoveryApprovalState, RecoveryApprovalView, RefreshFamilySummary, ResourceType,
-    SessionSummary, SignupQuarantineReason, SignupQuarantineState, SignupQuarantineView,
-    TenantRecord, UserAdminRecord, UserState,
+    InvitationState, ManagementCredentialRecord, OperatorRecord, OrgMembershipRecord,
+    OrganizationRecord, RecoveryApprovalState, RecoveryApprovalView, RefreshFamilySummary,
+    ResourceType, SessionSummary, SignupQuarantineReason, SignupQuarantineState,
+    SignupQuarantineView, TenantRecord, UserAdminRecord, UserState,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -367,17 +367,19 @@ pub struct OrganizationView {
     pub environment_id: String,
     /// The human-facing display name.
     pub display_name: String,
-    /// Whether the organization is active. Always true on a read (a deactivated
-    /// organization reads as not-found); present so the wire shape carries the
-    /// active-state field the resource model declares.
+    /// Whether the organization is active (issue #94). A soft-deleted organization
+    /// reads as not-found, so a returned organization is always LIVE; this flag now
+    /// reflects the lifecycle STATE: `true` for an active organization and `false`
+    /// for one an admin disabled (still readable, merely disabled).
     pub active: bool,
     /// Creation time, milliseconds since the Unix epoch.
     pub created_at_unix_ms: i64,
 }
 
 impl OrganizationView {
-    /// Build a view from a stored record. `active` is always true here: the
-    /// repository only returns live organizations.
+    /// Build a view from a stored record. The repository only returns LIVE (not
+    /// soft-deleted) organizations, so `active` reflects the lifecycle state: an
+    /// active organization is `true`, a disabled one is `false`.
     #[must_use]
     pub fn from_record(record: OrganizationRecord) -> Self {
         Self {
@@ -385,7 +387,7 @@ impl OrganizationView {
             tenant_id: record.id.scope().tenant().to_string(),
             environment_id: record.id.scope().environment().to_string(),
             display_name: record.display_name,
-            active: true,
+            active: record.state.is_active(),
             created_at_unix_ms: ms(record.created_at_unix_micros),
         }
     }
@@ -404,6 +406,60 @@ pub struct CreateOrganizationRequest {
 pub struct OrganizationList {
     /// The organizations on this page, oldest first.
     pub items: Vec<OrganizationView>,
+    /// The opaque cursor for the next page, or null if this is the last page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// An organization membership, as returned by the management API (issue #94): one
+/// user's binding into one organization.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct MembershipView {
+    /// The membership identifier (`omb_...`, embeds its scope).
+    pub id: String,
+    /// The organization the user is a member of (`org_...`).
+    pub organization_id: String,
+    /// The member user (`usr_...`).
+    pub user_id: String,
+    /// The membership lifecycle state (`active`).
+    pub state: String,
+    /// Free-form membership metadata (the empty object when none was set).
+    pub metadata: serde_json::Value,
+    /// Creation time, milliseconds since the Unix epoch.
+    pub created_at_unix_ms: i64,
+}
+
+impl MembershipView {
+    /// Build a view from a stored membership record.
+    #[must_use]
+    pub fn from_record(record: OrgMembershipRecord) -> Self {
+        Self {
+            id: record.id.to_string(),
+            organization_id: record.organization_id.to_string(),
+            user_id: record.user_id.to_string(),
+            state: record.state,
+            metadata: record.metadata,
+            created_at_unix_ms: ms(record.created_at_unix_micros),
+        }
+    }
+}
+
+/// The body to add a user to an organization.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct CreateMembershipRequest {
+    /// The user to add to the organization (a `usr_` id in this environment).
+    #[schema(example = "usr_...")]
+    pub user_id: String,
+    /// Optional free-form membership metadata; the empty object when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// A page of organization memberships.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct MembershipList {
+    /// The memberships on this page, oldest first.
+    pub items: Vec<MembershipView>,
     /// The opaque cursor for the next page, or null if this is the last page.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,

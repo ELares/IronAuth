@@ -176,6 +176,14 @@ name = "resource_model"
 path = "tests/resource_model.rs"
 required-features = ["testing"]
 
+# Organization membership and lifecycle over HTTP (issue #94, PR-A): membership
+# add/list/remove, duplicate-add conflict, org disable/enable, and the org-invitation
+# create org-context validation. Needs a real database (DATABASE_URL).
+[[test]]
+name = "memberships"
+path = "tests/memberships.rs"
+required-features = ["testing"]
+
 # DCR abuse-control management surface (issue #31): authoring a reusable policy
 # (create/list/replay/conflict/invalid-primitive), minting an initial access token
 # carrying a policy-chain snapshot (plaintext once, idempotent replay, unknown policy

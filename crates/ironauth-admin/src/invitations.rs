@@ -185,6 +185,32 @@ pub async fn create_invitation(
         Some(value) => Some(require_non_empty(value, "org_context")?),
         None => None,
     };
+    // Validate the org-context (issue #94) BEFORE provisioning the pending user, so a
+    // bad handle is a clean early error rather than an orphaned pending account. It
+    // must be a parseable organization id in THIS scope that names a LIVE, ACTIVE
+    // organization; a disabled or absent org is refused here. The store re-checks the
+    // parse as defense in depth and the membership foreign key is the accept-time
+    // backstop.
+    if let Some(org_context) = org_context.as_deref() {
+        let organizations = state.store().management().organizations(scope);
+        let org_id = organizations.parse_id(org_context).map_err(|_| {
+            ApiError::BadRequest("org_context is not a valid organization id".to_owned())
+        })?;
+        let record = organizations
+            .get(&org_id)
+            .await
+            .map_err(|error| match error {
+                StoreError::NotFound => ApiError::BadRequest(
+                    "org_context references an unknown organization".to_owned(),
+                ),
+                other => other.into(),
+            })?;
+        if !record.state.is_active() {
+            return Err(ApiError::Conflict(
+                "org_context references a disabled organization".to_owned(),
+            ));
+        }
+    }
     let ttl_secs = request
         .expires_in_secs
         .unwrap_or(DEFAULT_TTL_SECS)
