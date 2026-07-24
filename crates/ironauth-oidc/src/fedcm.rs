@@ -685,6 +685,8 @@ async fn mint_assertion(
         // Signs with the environment default (FedCM never negotiates a per-client
         // id_token algorithm), exactly as the front channel does.
         id_token_signer: None,
+        // FedCM mints an ID token only, never a DPoP-bound access token (issue #368).
+        confirmation: None,
     };
     tokens::mint_id_token(state, signer, entry.policy(), &request)
         .ok()

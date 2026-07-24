@@ -143,6 +143,11 @@ pub mod seams;
 
 pub use claims::VerifiedClaims;
 pub use cnf::{CnfError, Confirmation};
+/// Test-only `DPoP` proof-minting helpers (the `test-util` feature), for a
+/// downstream crate to exercise the token endpoint's issuance path end to end.
+/// The `dpop` module itself stays private; only this helper surface is exposed.
+#[cfg(feature = "test-util")]
+pub use dpop::test_util as dpop_test_util;
 pub use dpop::{DpopError, DpopExpectations, DpopProof, jwk_thumbprint, validate_dpop_proof};
 pub use envelope::{
     Aad, AadBuilder, BlindIndex, Dek, EnvelopeError, KEY_LEN, Kek, MasterKey, NONCE_BYTES, Sealed,

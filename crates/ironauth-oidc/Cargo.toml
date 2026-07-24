@@ -1009,5 +1009,15 @@ name = "first_party_challenge"
 path = "tests/first_party_challenge.rs"
 required-features = ["testing"]
 
+# DPoP sender-constrained token binding at the token endpoint (RFC 9449, issue #368 PR2, issuance
+# side): a valid proof binds the at+jwt cnf.jkt, the opaque access token row, and the refresh
+# family to the proof key; no proof leaves a plain bearer token; a present-but-invalid proof (wrong
+# htu, bad signature, future iat), a replayed jti, and more than one DPoP header each map to the
+# uniform invalid_dpop_proof without burning the one-time code. Over a real database (DATABASE_URL).
+[[test]]
+name = "dpop_token"
+path = "tests/dpop_token.rs"
+required-features = ["testing"]
+
 [lints]
 workspace = true

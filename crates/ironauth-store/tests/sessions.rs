@@ -141,6 +141,7 @@ async fn open_family(
                 created_at_unix_micros: 0,
                 idle_expires_at_unix_micros: FAR_FUTURE_MICROS,
                 absolute_expires_at_unix_micros: FAR_FUTURE_MICROS,
+                dpop_jkt: None,
             },
         )
         .await
@@ -1280,6 +1281,7 @@ async fn a_storm_of_session_bound_opens_never_orphans_a_family_onto_a_revoked_se
                             created_at_unix_micros: 0,
                             idle_expires_at_unix_micros: FAR_FUTURE_MICROS,
                             absolute_expires_at_unix_micros: FAR_FUTURE_MICROS,
+                            dpop_jkt: None,
                         },
                     )
                     .await

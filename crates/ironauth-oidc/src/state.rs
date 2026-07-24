@@ -334,6 +334,13 @@ pub struct OidcState {
     // the six built-in journeys are the only live flow surface until an operator installs a
     // journey store (the ADDITIVE custom path is inert until then).
     custom_journey_source: Option<Arc<dyn crate::flow::CompiledJourneySource>>,
+    // The token endpoint's per-instance DPoP jti-replay cache (RFC 9449, issue
+    // #368). Kept OUTSIDE `Inner` because it is per-process runtime state, not
+    // config: it is built fresh per state and shared across every request thread
+    // behind one `Arc`, exactly like the abuse counters. A proof's (jkt, jti) is
+    // recorded here for the freshness window so a replay inside that window is
+    // refused; a robust cross-instance jti store is the resource-server follow-up.
+    dpop_replay: Arc<crate::dpop::DpopReplayCache>,
     // The in-process L1 counter store for the fast request-shaping layer (issue #64).
     // Kept OUTSIDE `Inner` so it is swappable with a cheap builder: the optional
     // IronCache L2 installs its `CounterStore` impl here later, and a test wires a
@@ -883,6 +890,7 @@ impl OidcState {
             migration_hook: None,
             hashing_pool: None,
             custom_journey_source: None,
+            dpop_replay: Arc::new(crate::dpop::DpopReplayCache::new()),
             abuse_counters: Arc::new(crate::abuse::MemoryCounterStore::new()),
             geoip_provider: Arc::new(crate::risk::NullGeoIpProvider),
             ip_reputation_provider: Arc::new(crate::risk::NullIpReputationProvider),
@@ -2427,6 +2435,14 @@ impl OidcState {
     #[must_use]
     pub fn now(&self) -> SystemTime {
         self.inner.env.clock().now_utc()
+    }
+
+    /// The token endpoint's per-instance `DPoP` `jti`-replay cache (RFC 9449, issue
+    /// #368). The code-exchange grant records a validated proof's `(jkt, jti)` here
+    /// and refuses a replay inside the freshness window.
+    #[must_use]
+    pub(crate) fn dpop_replay(&self) -> &crate::dpop::DpopReplayCache {
+        &self.dpop_replay
     }
 
     /// The per-environment issuer for `scope`. Two environments never share an

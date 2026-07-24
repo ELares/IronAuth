@@ -533,6 +533,8 @@ async fn mint_and_persist(
             scope: requested_scope,
             jti,
             expires_at_unix_micros: *expires_at_unix_micros,
+            // The JWT bearer assertion grant carries no DPoP proof: a bearer token.
+            dpop_jkt: None,
         }),
     };
     state

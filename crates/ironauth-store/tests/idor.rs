@@ -502,6 +502,7 @@ async fn plant_refresh_family(
                 created_at_unix_micros: 0,
                 idle_expires_at_unix_micros: FAR_FUTURE_MICROS,
                 absolute_expires_at_unix_micros: FAR_FUTURE_MICROS,
+                dpop_jkt: None,
             },
         )
         .await
