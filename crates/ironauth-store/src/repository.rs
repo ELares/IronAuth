@@ -32967,7 +32967,13 @@ impl OrgGroupRepo<'_> {
 ///      The first two sit above the forced row-level-security policy (belt and
 ///      braces, the module-wide convention); the third has no policy behind it at
 ///      all and is the only thing keeping one organization's walk out of a sibling
-///      organization's groups inside one environment.
+///      organization's groups inside one environment. On the RECURSIVE arm that
+///      third predicate is LOAD BEARING rather than defense in depth, because
+///      `parent_id` is an untrusted stored pointer: deleting it really does change an
+///      answer, and
+///      `the_read_walk_never_crosses_organization_via_a_corrupt_parent` is the test
+///      that says so. [`EFFECTIVE_ROLE_SLUGS_TAIL`] carries the full census of which
+///      organization predicates around here are redundant and which are not.
 ///
 /// Binds: `$1` tenant, `$2` environment, `$3` organization, `$4` user, `$5` the walk
 /// bound (`max_group_depth`, one LOWER than the write walks use; see
@@ -33009,17 +33015,49 @@ const EFFECTIVE_CLOSURE_CTE: &str = "WITH RECURSIVE membership AS ( \
 /// on a set operator to deduplicate. `DISTINCT` plus `ORDER BY r.slug` makes the
 /// result already sorted and deduplicated before the [`BTreeSet`] sees it.
 ///
-/// The outer `r.organization_id = $3` is REDUNDANT and is retained deliberately, so
-/// nobody removes it as dead weight. Both `IN` subqueries already fence the
-/// organization on the ASSIGNMENT row, and the write path resolves both endpoints of
-/// every assignment as live rows of one organization, so no assignment of this
-/// organization can name a role of another one and no test can distinguish the
-/// predicate's presence. It is the second layer under that write-time invariant: if a
-/// future write path ever admitted a cross-organization assignment, this is what
-/// would keep the resulting role out of a token instead of quietly emitting it. The
-/// liveness filter beside it, by contrast, is NOT redundant: a role can be
-/// soft-deleted while its assignment rows stay live, which is the ordinary state
-/// after a role delete.
+/// # The organization predicates: FIVE mutually redundant survivors, and one that is not
+///
+/// This statement and the closure it runs over repeat `organization_id` in six places,
+/// and FIVE of them are redundant WITH RESPECT TO EACH OTHER: deleting any one of them
+/// ALONE changes no answer and no test can distinguish its presence, because the
+/// others still fence the same rows under the write path's invariant that every
+/// assignment resolves BOTH of its endpoints as live rows of ONE organization. All
+/// five are retained deliberately and are named here in full, so that nobody removes
+/// one as dead weight and so that this note cannot be read as covering only the first:
+///
+///   * `r.organization_id` below, on the role row itself;
+///   * `gm.organization_id` and `g.organization_id` in the SEED arm of
+///     [`EFFECTIVE_CLOSURE_CTE`];
+///   * `mr.organization_id` in the direct-grant subquery below;
+///   * `gr.organization_id` in the group-grant subquery below.
+///
+/// Together they are the layer under that write-time invariant: if a future write path
+/// ever admitted a cross-organization assignment, these are what would keep the
+/// resulting role out of a token instead of quietly emitting it.
+///
+/// The SIXTH is NOT of this kind and must not be filed with them. `g.organization_id`
+/// in the RECURSIVE arm of [`EFFECTIVE_CLOSURE_CTE`] is the only thing fencing the
+/// organization on the ancestor walk, and `parent_id` is an UNTRUSTED stored pointer
+/// (a group delete DETACHES, so a stored parent may name a row the live invariant
+/// never re-validated, and the column's foreign key is id only). Removing it lets a
+/// sibling organization's group into the closure, and therefore its name into the
+/// group set a token carries;
+/// `the_read_walk_never_crosses_organization_via_a_corrupt_parent` is the test that
+/// holds it in place.
+///
+/// # The liveness filters are not redundant either
+///
+/// `r.deleted_at IS NULL` here: a role can be soft-deleted while its assignment rows
+/// stay live, which is the ordinary state after a role delete.
+///
+/// `gr.deleted_at IS NULL` in the group-grant subquery has no second layer behind it
+/// at all, and its removal is observable in an entirely ordinary state rather than in
+/// a corrupt one. Without it an operator who withdraws a role from a group sees the
+/// `organization.group.role.unassign` audit row and sees the grant leave
+/// `list_for_group`, while every live member of that group AND of every DESCENDANT
+/// keeps receiving the role in `effective_roles`, and therefore in the access token,
+/// forever. Rules 2 and 3 of
+/// `resolution_excludes_every_soft_deleted_row_on_the_path` are what say so.
 const EFFECTIVE_ROLE_SLUGS_TAIL: &str = "SELECT DISTINCT r.slug AS slug \
        FROM org_roles r \
       WHERE r.tenant_id = $1 AND r.environment_id = $2 \
@@ -36583,6 +36621,16 @@ async fn revoke_membership_attachments(
     // Both statements are COLUMN-scoped soft deletes of exactly the pair migration
     // 0088 and 0089 grant, guarded on the row being live so a second cascade over the
     // same membership is a no-op rather than a re-dating of already-dead rows.
+    //
+    // That guard is not housekeeping, and an ordinary remove, re-add, remove, re-add
+    // cycle is enough to show it. Without it every later cascade REWRITES the
+    // `deleted_at` of rows that were already revoked, destroying the record of WHEN
+    // the removed account's authorization actually stopped, which is the forensic
+    // value the soft delete exists to preserve; and because the audit row is written
+    // only when something was actually revoked, the rewritten rows also make each
+    // later revive emit a PHANTOM
+    // `organization.membership.attachments.revoke` claiming counts it did not strip.
+    // `a_second_revive_revokes_nothing_and_writes_no_phantom_audit_row` pins both.
     //
     // Neither statement carries an `organization_id` predicate, and that is correct
     // rather than an omission: a membership belongs to exactly ONE organization, and

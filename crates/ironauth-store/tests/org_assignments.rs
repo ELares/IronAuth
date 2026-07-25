@@ -20,10 +20,15 @@
 //!     evaluations, and matches an independent in-memory model over randomized
 //!     forests;
 //!   * resolution TERMINATES and stays correct on a STORED CYCLE through a
-//!     soft-deleted node, which the live graph's acyclicity does not rule out;
+//!     soft-deleted node, which the live graph's acyclicity does not rule out, and
+//!     never leaves the caller's organization (or scope) through a CORRUPT stored
+//!     parent pointer, which the repository refuses to write and the table's id-only
+//!     foreign key permits;
 //!   * removing an org membership REVOKES its group bindings and direct role grants,
 //!     and a membership revived by an admin re-add OR by an invitation accept comes
-//!     back with none of either;
+//!     back with none of either, while a SECOND cascade over the same membership is a
+//!     no-op that neither re-dates the already-revoked rows nor writes a phantom
+//!     audit row;
 //!   * the grants are least-privilege: the data plane may never CREATE or REPOINT a
 //!     row on any of the three, may only REVOKE on the two the accept-path cascade
 //!     has to reach, and stays strictly read only on the third; and no endpoint
@@ -430,6 +435,77 @@ async fn live_attachment_count(
         .await
         .expect("count live attachments")
         .get("n")
+}
+
+/// Every attachment row of `membership` on `table`, LIVE AND DEAD alike, as
+/// `id -> deleted_at` (epoch microseconds), read through the OWNER pool.
+///
+/// The stamp and not merely the count, because the two failure modes differ: a cascade
+/// that revoked nothing is visible in a liveness count, but a cascade that RE-DATED an
+/// already-revoked row is not. That timestamp is the record of WHEN a removed account's
+/// authorization actually stopped, which is the forensic value the soft delete exists
+/// to preserve.
+async fn attachment_stamps(
+    db: &TestDatabase,
+    scope: Scope,
+    table: &str,
+    membership: &OrgMembershipId,
+) -> BTreeMap<String, Option<i64>> {
+    let sql = format!(
+        "SELECT id, (EXTRACT(EPOCH FROM deleted_at) * 1000000)::bigint AS deleted_us \
+         FROM {table} \
+         WHERE tenant_id = $1 AND environment_id = $2 AND membership_id = $3"
+    );
+    sqlx::query(&sql)
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(membership.to_string())
+        .fetch_all(db.owner_pool())
+        .await
+        .expect("read attachment stamps")
+        .iter()
+        .map(|row| {
+            (
+                row.get::<String, _>("id"),
+                row.get::<Option<i64>, _>("deleted_us"),
+            )
+        })
+        .collect()
+}
+
+/// Repoint one group's `parent_id` DIRECTLY, bypassing the repository (and therefore
+/// its same-organization containment check), through the owner pool.
+///
+/// The repository refuses to WRITE a parent outside the group's own organization, so
+/// this is the only way to build the row the READ walk's organization fence exists
+/// for. That row is reachable rather than hypothetical: `parent_id` is an UNTRUSTED
+/// stored pointer, because a group delete DETACHES rather than cascades and the live
+/// invariant is therefore never re-validated against a stored parent; the table's
+/// foreign key on the column is id only, so nothing below the application layer stops
+/// one organization's group (or one scope's) from naming another's; and an import or a
+/// restore writes these rows without passing the repository at all.
+async fn repoint_parent_row(
+    db: &TestDatabase,
+    scope: Scope,
+    group: &OrgGroupId,
+    parent: &OrgGroupId,
+) {
+    let affected = sqlx::query(
+        "UPDATE org_groups SET parent_id = $4 \
+         WHERE tenant_id = $1 AND environment_id = $2 AND id = $3",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(group.to_string())
+    .bind(parent.to_string())
+    .execute(db.owner_pool())
+    .await
+    .expect("repoint the parent pointer out of band")
+    .rows_affected();
+    assert_eq!(
+        affected, 1,
+        "the corruption really landed on exactly one row"
+    );
 }
 
 /// Soft-delete a membership row DIRECTLY, bypassing the repository (and therefore the
@@ -1300,8 +1376,8 @@ async fn resolution_is_the_union_of_direct_group_and_ancestor_roles() {
 #[allow(
     clippy::too_many_lines,
     reason = "one exclusion rule per soft-deletable row on the resolution path, \
-              asserted against ONE fixture so the five rules cannot be tested \
-              against five different graphs"
+              asserted against ONE fixture so the seven rules cannot be tested \
+              against seven different graphs"
 )]
 async fn resolution_excludes_every_soft_deleted_row_on_the_path() {
     let db = TestDatabase::start().await;
@@ -1352,7 +1428,62 @@ async fn resolution_excludes_every_soft_deleted_row_on_the_path() {
         set(&["engineer", "staff"])
     );
 
-    // 2. A soft-deleted ROLE drops out even while its assignment row is still live.
+    // 2. A withdrawn GROUP GRANT stops applying to the group's OWN members. This is
+    // the ordinary post-`unassign` state: the role row and the binding are both still
+    // live, and only the assignment's own liveness filter can exclude it. Unlike the
+    // organization predicates in the same statement, that filter has no second layer
+    // behind it, so without this step the withdrawn role would keep reaching every
+    // member of the group and every member of its descendants.
+    acting
+        .org_group_roles(scope)
+        .unassign(&env, &org, &child_grant)
+        .await
+        .expect("withdraw the child's group grant");
+    assert_eq!(
+        roles_of(&db, &env, scope, &org, &user, DEFAULT_DEPTH).await,
+        set(&["staff"]),
+        "a withdrawn group grant stops applying, even though the role and the binding \
+         are both still live"
+    );
+    // Restore the baseline with a FRESH grant, so every rule below is still measured
+    // against the same three-role fixture and none of them becomes vacuous.
+    let child_regrant = grant_group_role(&db, &env, scope, &org, &child, &child_role)
+        .await
+        .expect("re-grant to the child");
+    assert_ne!(
+        child_regrant, child_grant,
+        "a re-grant inserts a FRESH row; it does not revive the withdrawn one"
+    );
+    assert_eq!(
+        roles_of(&db, &env, scope, &org, &user, DEFAULT_DEPTH).await,
+        set(&["engineer", "staff"])
+    );
+
+    // 3. A withdrawn ANCESTOR grant stops being INHERITED, which is the same rule one
+    // hop further away and the reason it is stated separately: the ancestor arm reaches
+    // the grant through the recursive closure rather than through the seed, so a walk
+    // that filtered the assignment only at the seed would still leak this one.
+    acting
+        .org_group_roles(scope)
+        .unassign(&env, &org, &parent_grant)
+        .await
+        .expect("withdraw the ancestor's group grant");
+    assert_eq!(
+        roles_of(&db, &env, scope, &org, &user, DEFAULT_DEPTH).await,
+        set(&["engineer"]),
+        "a withdrawn ancestor grant stops being inherited by the descendant's members"
+    );
+    let parent_regrant = grant_group_role(&db, &env, scope, &org, &parent, &parent_role)
+        .await
+        .expect("re-grant to the ancestor");
+    assert_ne!(parent_regrant, parent_grant);
+    assert_eq!(
+        roles_of(&db, &env, scope, &org, &user, DEFAULT_DEPTH).await,
+        set(&["engineer", "staff"]),
+        "the baseline is restored, so rules 4 and 5 below are about the rows they name"
+    );
+
+    // 4. A soft-deleted ROLE drops out even while its assignment row is still live.
     acting
         .org_roles(scope)
         .delete(&env, &child_role)
@@ -1364,7 +1495,7 @@ async fn resolution_excludes_every_soft_deleted_row_on_the_path() {
         "a deleted role is excluded even though org_group_roles still names it"
     );
 
-    // 3. A soft-deleted ANCESTOR GROUP detaches, so its role stops being inherited.
+    // 5. A soft-deleted ANCESTOR GROUP detaches, so its role stops being inherited.
     acting
         .org_groups(scope)
         .delete(&env, &org, &parent)
@@ -1382,8 +1513,7 @@ async fn resolution_excludes_every_soft_deleted_row_on_the_path() {
         "the child survives as a ROOT: a delete DETACHES, it does not cascade"
     );
 
-    // 4. A soft-deleted BINDING empties the closure entirely.
-    let _ = (parent_grant, child_grant);
+    // 6. A soft-deleted BINDING empties the closure entirely.
     acting
         .org_group_members(scope)
         .remove(&env, &org, &binding)
@@ -1395,7 +1525,7 @@ async fn resolution_excludes_every_soft_deleted_row_on_the_path() {
             .is_empty()
     );
 
-    // 5. A soft-deleted MEMBERSHIP resolves to the empty set, not an error. Rebuild a
+    // 7. A soft-deleted MEMBERSHIP resolves to the empty set, not an error. Rebuild a
     // live grant first so the assertion is about the membership and not about there
     // being nothing left to find.
     let fresh_role = create_role(&db, &env, scope, &org, "auditor").await;
@@ -1590,6 +1720,99 @@ async fn resolution_terminates_and_stays_correct_on_a_stored_cycle_through_a_dea
             set(&["b", "r"])
         );
     }
+}
+
+#[tokio::test]
+async fn the_read_walk_never_crosses_organization_via_a_corrupt_parent() {
+    // The companion to the stored-cycle test, one fence over. `parent_id` is an
+    // UNTRUSTED stored pointer, and on the ANCESTOR arm of the resolution walk the
+    // organization predicate is the ONLY thing keeping this organization's closure out
+    // of a sibling organization's groups: row-level security fences (tenant,
+    // environment) and nothing finer, so inside ONE environment there is nothing else
+    // behind it. A sibling's group name entering the closure is a group name entering
+    // the token, and the group set is an authorization input.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let other_scope = db.seed_scope(&env).await;
+
+    let alpha = create_org(&db, &env, scope, "Alpha").await;
+    let beta = create_org(&db, &env, scope, "Beta").await;
+
+    let leaf = create_group(&db, &env, scope, &alpha, "leaf", None).await;
+    let alpha_role = create_role(&db, &env, scope, &alpha, "alpha.member").await;
+    grant_group_role(&db, &env, scope, &alpha, &leaf, &alpha_role)
+        .await
+        .expect("grant alpha's role to alpha's group");
+
+    // Beta's own tree, with a role of its own attached, so a walk that escaped has
+    // something real to carry back rather than an empty group.
+    let beta_root = create_group(&db, &env, scope, &beta, "broot", None).await;
+    let beta_role = create_role(&db, &env, scope, &beta, "beta.admin").await;
+    grant_group_role(&db, &env, scope, &beta, &beta_root, &beta_role)
+        .await
+        .expect("grant beta's role to beta's group");
+
+    let (user, membership) = create_member(&db, &env, scope, &alpha, "a@example.test").await;
+    bind_member(&db, &env, scope, &alpha, &leaf, &membership)
+        .await
+        .expect("bind alpha's member into alpha's group");
+
+    let expected_roles = set(&["alpha.member"]);
+    let expected_groups = set(&["leaf"]);
+    assert_eq!(
+        roles_of(&db, &env, scope, &alpha, &user, DEFAULT_DEPTH).await,
+        expected_roles,
+        "the baseline both corruptions below are measured against"
+    );
+    assert_eq!(
+        groups_of(&db, scope, &alpha, &user, DEFAULT_DEPTH).await,
+        expected_groups
+    );
+
+    // The corruption: alpha's group now names BETA's group as its parent. The
+    // repository refuses to WRITE this and the table's id-only foreign key accepts it,
+    // which is exactly the gap the read-side organization predicate covers.
+    repoint_parent_row(&db, scope, &leaf, &beta_root).await;
+    assert_eq!(
+        groups_of(&db, scope, &alpha, &user, DEFAULT_DEPTH).await,
+        expected_groups,
+        "the ancestor walk stops at the organization boundary: a sibling organization's \
+         group must never enter alpha's closure"
+    );
+    assert_eq!(
+        roles_of(&db, &env, scope, &alpha, &user, DEFAULT_DEPTH).await,
+        expected_roles,
+        "and nothing reachable only through that sibling group is inherited"
+    );
+
+    // The cross-SCOPE twin, stated beside it so the two fences are never reasoned about
+    // separately. This one is covered twice over (every arm repeats tenant_id and
+    // environment_id ABOVE the forced row-level-security policy), which is precisely
+    // why the organization case above cannot be inferred from it.
+    let foreign_org = create_org(&db, &env, other_scope, "Foreign").await;
+    let foreign_root = create_group(&db, &env, other_scope, &foreign_org, "froot", None).await;
+    let foreign_role = create_role(&db, &env, other_scope, &foreign_org, "foreign.admin").await;
+    grant_group_role(
+        &db,
+        &env,
+        other_scope,
+        &foreign_org,
+        &foreign_root,
+        &foreign_role,
+    )
+    .await
+    .expect("grant in the foreign scope");
+    repoint_parent_row(&db, scope, &leaf, &foreign_root).await;
+    assert_eq!(
+        groups_of(&db, scope, &alpha, &user, DEFAULT_DEPTH).await,
+        expected_groups,
+        "a parent pointer into another SCOPE is not walked either"
+    );
+    assert_eq!(
+        roles_of(&db, &env, scope, &alpha, &user, DEFAULT_DEPTH).await,
+        expected_roles
+    );
 }
 
 #[tokio::test]
@@ -2175,6 +2398,134 @@ async fn a_fresh_membership_add_writes_no_empty_cascade_row() {
         audit_actions(&db, scope, &membership.to_string()).await,
         vec!["organization.membership.add".to_owned()],
         "a first-time add writes exactly one audit row"
+    );
+}
+
+#[tokio::test]
+async fn a_second_revive_revokes_nothing_and_writes_no_phantom_audit_row() {
+    // The cascade is IDEMPOTENT over the ordinary remove, re-add, remove, re-add cycle,
+    // and the `deleted_at IS NULL` guard on both of its statements is what makes it so.
+    // Two things break without that guard, on nothing more exotic than an operator
+    // changing their mind twice:
+    //
+    //   1. Every later cascade RE-DATES rows that were already revoked, destroying the
+    //      record of WHEN the removed account's authorization actually stopped. That
+    //      record is the entire forensic value of the soft delete.
+    //   2. The revoked-anything flag turns true for a membership with nothing live, so
+    //      every later revive writes a PHANTOM
+    //      `organization.membership.attachments.revoke` row claiming counts it did not
+    //      strip. An audit log that reports authorization being stripped four times
+    //      when it was stripped once is worse than one that reports nothing.
+    //
+    // The three cascade-site tests each stop at the FIRST cascade, so this is the one
+    // that reads the state back after the ones that must be no-ops.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let org = create_org(&db, &env, scope, "Globex").await;
+    let group = create_group(&db, &env, scope, &org, "engineering", None).await;
+    let role = create_role(&db, &env, scope, &org, "founder").await;
+    let (user, membership) = create_member(&db, &env, scope, &org, "dev@example.test").await;
+    bind_member(&db, &env, scope, &org, &group, &membership)
+        .await
+        .expect("bind");
+    grant_direct_role(&db, &env, scope, &org, &membership, &role)
+        .await
+        .expect("direct grant");
+
+    // The FIRST removal is the only cascade in the whole cycle with anything to strip.
+    db.control_store()
+        .management()
+        .acting(actor(&env), CorrelationId::generate(&env))
+        .org_memberships(scope)
+        .remove(&env, &membership)
+        .await
+        .expect("remove the membership");
+    let groups_after_first = attachment_stamps(&db, scope, "org_group_members", &membership).await;
+    let roles_after_first =
+        attachment_stamps(&db, scope, "org_membership_roles", &membership).await;
+    assert_eq!(groups_after_first.len(), 1);
+    assert_eq!(roles_after_first.len(), 1);
+    assert!(
+        groups_after_first
+            .values()
+            .chain(roles_after_first.values())
+            .all(Option::is_some),
+        "the first cascade really did revoke both attachments, so the stamps below are \
+         a comparison against real timestamps"
+    );
+
+    // Re-add, remove, re-add: three more cascades over the SAME membership, none of
+    // which has anything live left to find.
+    let revived = add_membership(&db, &env, scope, &org, &user)
+        .await
+        .expect("re-add");
+    assert_eq!(
+        revived, membership,
+        "the membership row is revived, not recreated, which is why the cascade runs \
+         again at all"
+    );
+    db.control_store()
+        .management()
+        .acting(actor(&env), CorrelationId::generate(&env))
+        .org_memberships(scope)
+        .remove(&env, &membership)
+        .await
+        .expect("remove a second time");
+    assert_eq!(
+        add_membership(&db, &env, scope, &org, &user)
+            .await
+            .expect("re-add a second time"),
+        membership
+    );
+
+    assert_eq!(
+        attachment_stamps(&db, scope, "org_group_members", &membership).await,
+        groups_after_first,
+        "a later cascade must not RE-DATE an already-revoked binding: the timestamp is \
+         the record of when the authorization stopped"
+    );
+    assert_eq!(
+        attachment_stamps(&db, scope, "org_membership_roles", &membership).await,
+        roles_after_first,
+        "and the same for the direct role grant"
+    );
+    assert_eq!(
+        audit_details_for(
+            &db,
+            scope,
+            &membership.to_string(),
+            "organization.membership.attachments.revoke"
+        )
+        .await,
+        vec![Some("groups=1,roles=1".to_owned())],
+        "exactly ONE revoke row, written by the ONE cascade that revoked something"
+    );
+    assert_eq!(
+        audit_actions(&db, scope, &membership.to_string()).await,
+        vec![
+            "organization.membership.add".to_owned(),
+            "organization.membership.add".to_owned(),
+            "organization.membership.add".to_owned(),
+            "organization.membership.attachments.revoke".to_owned(),
+            "organization.membership.remove".to_owned(),
+            "organization.membership.remove".to_owned(),
+        ],
+        "three adds and two removes across the cycle, and ONE cascade row among them"
+    );
+
+    // And the membership is live again holding nothing, which is the security property
+    // the cascade exists for in the first place.
+    assert!(
+        roles_of(&db, &env, scope, &org, &user, DEFAULT_DEPTH)
+            .await
+            .is_empty()
+    );
+    assert!(
+        groups_of(&db, scope, &org, &user, DEFAULT_DEPTH)
+            .await
+            .is_empty()
     );
 }
 
