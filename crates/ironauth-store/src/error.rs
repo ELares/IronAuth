@@ -208,6 +208,40 @@ pub enum StoreError {
         /// arithmetic on.
         attempted: i64,
     },
+    /// A submitted per-organization authentication policy DOCUMENT is malformed or
+    /// self-contradictory (issue #95): an unknown factor token, an explicitly empty
+    /// allowlist, a session lifetime above the deployment ceiling, an idle window
+    /// longer than the absolute one, an unregistrable email domain, or the one that
+    /// matters most, a document requiring MFA whose factor list permits no method
+    /// able to carry a genuine second factor. NOTHING is written: the pure validator
+    /// runs inside the audited write transaction, so returning this rolls the
+    /// attempted mutation and its audit row back together.
+    ///
+    /// Deliberately distinct from [`NotFound`]: the caller submitted a well-formed
+    /// request naming an organization they can see, and the DOCUMENT is what is
+    /// wrong, so telling them which dimension is wrong is the whole point. It is
+    /// distinct from [`Conflict`] too, because nothing collided; this is a
+    /// structural refusal of a value.
+    ///
+    /// NOT an existence oracle. The organization is resolved as a LIVE, in-scope row
+    /// BEFORE any document reasoning runs, so a caller who sees this has already
+    /// proven they can see the organization. An absent, soft-deleted, foreign-scope,
+    /// or foreign-tenant organization is refused earlier and uniformly as
+    /// [`NotFound`].
+    ///
+    /// The carried errors are VALUE FREE by construction: each names a DIMENSION and
+    /// never the offending value, so nothing here can report anything the caller did
+    /// not already send. The list is sorted and deduplicated, so the rendered form is
+    /// a deterministic function of the submitted document.
+    ///
+    /// This refusal is INTRA-DOCUMENT ONLY and deliberately does not claim more: a
+    /// contradiction that arises only from the intersection ACROSS levels is not
+    /// decidable at any single write and is carried instead on the resolved policy
+    /// (`org_policy::Satisfiability`), where it fails closed at authentication.
+    ///
+    /// [`NotFound`]: StoreError::NotFound
+    /// [`Conflict`]: StoreError::Conflict
+    OrgAuthPolicyInvalid(Vec<crate::org_policy::AuthPolicyError>),
 }
 
 impl fmt::Display for StoreError {
@@ -255,6 +289,20 @@ impl fmt::Display for StoreError {
                 "the requested parent would nest groups at least {attempted} levels deep, \
                  exceeding the configured maximum of {max}"
             ),
+            StoreError::OrgAuthPolicyInvalid(errors) => {
+                // Every carried error is value free, so naming them all is safe and
+                // is what makes the refusal actionable in ONE round trip. The list is
+                // already sorted and deduplicated by the validator, so this render is
+                // a deterministic function of the submitted document.
+                f.write_str("the organization authentication policy is invalid: ")?;
+                for (index, error) in errors.iter().enumerate() {
+                    if index > 0 {
+                        f.write_str("; ")?;
+                    }
+                    write!(f, "{error}")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -279,7 +327,10 @@ impl std::error::Error for StoreError {
             | StoreError::IllegalMigrationTransition { .. }
             | StoreError::JourneyInvalid(_)
             | StoreError::OrgGroupCycle
-            | StoreError::OrgGroupDepthExceeded { .. } => None,
+            | StoreError::OrgGroupDepthExceeded { .. }
+            // The carried refusals are a LIST, so there is no single source to
+            // return; every one of them is already rendered by the Display arm.
+            | StoreError::OrgAuthPolicyInvalid(_) => None,
             StoreError::Database(source) => Some(source),
             StoreError::Migration(source) => Some(source),
             StoreError::SchemaMalformed(source) => Some(source),

@@ -574,8 +574,8 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
     );
     assert_eq!(
         report.already_applied(),
-        89,
-        "the production chain is exactly eighty-nine migrations (isolation, audit log, management \
+        90,
+        "the production chain is exactly ninety migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -598,17 +598,18 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
          grants, consent control grants, flow version pin, flow versions, first-party challenge \
          codes, DPoP binding, DPoP proof replay, organization membership, organization token \
          context, organization roles, organization groups, organization group members, \
-         organization role assignments)"
+         organization role assignments, organization authentication policies)"
     );
 
-    // The ledger holds exactly versions 1 through 89.
+    // The ledger holds exactly versions 1 through 90.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
             46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67,
-            68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89
+            68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89,
+            90
         ]
     );
     let phase_of = |version: i64| async move {
@@ -5517,4 +5518,251 @@ async fn the_org_join_tables_carry_their_isolation_indexes_and_least_privilege_g
             "the control plane holds the column-scoped UPDATE a removal needs on {table}"
         );
     }
+}
+
+/// The `org_auth_policies` schema, policy, indexes, and grants (issue #95,
+/// migration 0090).
+///
+/// Its own test rather than more lines in the production-chain assertions: that
+/// function's future is already at the stack budget of a default test thread, and
+/// anything added to its body aborts the process on a stack overflow.
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one table's whole structural contract (phase, columns, constraints, \
+              policy, both index shapes, and the full grant matrix on both roles) \
+              read as one unit"
+)]
+async fn org_auth_policies_carries_its_isolation_indexes_and_least_privilege_grants() {
+    let db = TestDatabase::start().await;
+    let pool = db.owner_pool();
+
+    // EXPAND: one new tenant-scoped table with its indexes, policy, and grants.
+    // Nothing existing is altered or dropped.
+    let phase: String = sqlx::query("SELECT phase FROM _schema_migrations WHERE version = 90")
+        .fetch_one(pool)
+        .await
+        .expect("0090 is in the ledger")
+        .get("phase");
+    assert_eq!(phase, "expand");
+
+    assert!(
+        table_exists(pool, "org_auth_policies").await,
+        "org_auth_policies exists after 0090"
+    );
+    assert!(
+        rls_enabled_and_forced(pool, "org_auth_policies").await,
+        "org_auth_policies must ENABLE and FORCE row-level security"
+    );
+    assert!(
+        policy_exists(
+            pool,
+            "org_auth_policies",
+            "org_auth_policies_tenant_isolation"
+        )
+        .await,
+        "org_auth_policies must carry the (tenant, environment) isolation policy"
+    );
+
+    // Every CHECK is asserted BY NAME, which is why none of them may be anonymous:
+    // an anonymous constraint cannot be pinned, so a later migration could drop or
+    // weaken it with nothing failing.
+    for constraint in [
+        "org_auth_policies_scope_nonempty",
+        "org_auth_policies_factors_nonempty",
+        "org_auth_policies_domains_nonempty",
+        "org_auth_policies_factors_known",
+        "org_auth_policies_mfa_reachable",
+        "org_auth_policies_session_ttl_positive",
+        "org_auth_policies_session_idle_positive",
+        "org_auth_policies_idle_within_absolute",
+    ] {
+        assert!(
+            check_constraint_exists(pool, "org_auth_policies", constraint).await,
+            "org_auth_policies must carry the {constraint} CHECK constraint"
+        );
+    }
+
+    // The identity columns are NOT NULL.
+    for column in [
+        "id",
+        "tenant_id",
+        "environment_id",
+        "organization_id",
+        "metadata",
+    ] {
+        assert!(
+            column_is_not_null(pool, "org_auth_policies", column).await,
+            "org_auth_policies.{column} must be NOT NULL"
+        );
+    }
+    // EVERY policy dimension is NULLABLE, and that is the whole storage model: NULL
+    // means UNSET, which the resolution engine reads as "inherit the next level up
+    // unchanged". A dimension that acquired a NOT NULL (or a DEFAULT) would turn an
+    // empty policy object into one that RESTRICTS, which is the exact opposite of
+    // what the issue requires.
+    for column in [
+        "mfa_required",
+        "allowed_factors",
+        "allowed_email_domains",
+        "jit_provisioning",
+        "invitations_enabled",
+        "session_ttl_secs",
+        "session_idle_ttl_secs",
+        "deleted_at",
+    ] {
+        assert!(
+            column_exists(pool, "org_auth_policies", column).await,
+            "org_auth_policies.{column} exists"
+        );
+        assert!(
+            !column_is_not_null(pool, "org_auth_policies", column).await,
+            "org_auth_policies.{column} must be NULLABLE (NULL means inherit)"
+        );
+        assert_eq!(
+            column_default(pool, "org_auth_policies", column).await,
+            None,
+            "org_auth_policies.{column} must carry NO default: a default would make an \
+             empty policy object restrict something"
+        );
+    }
+
+    // At most one LIVE policy per organization. PARTIAL over live rows, so a removed
+    // policy does not occupy its organization; it is also the conflict target the
+    // `set` upsert names, so it must be partial in exactly the shape the reads filter.
+    assert!(
+        partial_unique_index_exists(pool, "org_auth_policies", "org_auth_policies_org_live_uniq")
+            .await,
+        "org_auth_policies must carry the per-organization partial unique index over live rows"
+    );
+    assert_eq!(
+        index_columns(pool, "org_auth_policies", "org_auth_policies_org_live_uniq").await,
+        vec![
+            "tenant_id".to_owned(),
+            "environment_id".to_owned(),
+            "organization_id".to_owned()
+        ],
+        "the live uniqueness key is (tenant, environment, organization) and nothing finer"
+    );
+    assert_eq!(
+        index_columns(pool, "org_auth_policies", "org_auth_policies_scope_idx").await,
+        vec![
+            "tenant_id".to_owned(),
+            "environment_id".to_owned(),
+            "created_at".to_owned(),
+            "id".to_owned()
+        ],
+        "the scope list index must lead with the scope and then the (created_at, id) \
+         pagination key"
+    );
+
+    // The organization foreign key is the backstop that makes a policy on a
+    // nonexistent or cross-scope organization impossible.
+    assert!(
+        fk_references(pool, "org_auth_policies", "organization_id").await,
+        "org_auth_policies.organization_id must be a FOREIGN KEY into organizations"
+    );
+    assert!(fk_references(pool, "org_auth_policies", "tenant_id").await);
+
+    // Grants: the control plane owns the surface.
+    for privilege in ["SELECT", "INSERT"] {
+        assert!(
+            role_has_table_privilege(pool, "ironauth_control", "org_auth_policies", privilege)
+                .await,
+            "ironauth_control must hold {privilege} on org_auth_policies"
+        );
+    }
+    for column in [
+        "mfa_required",
+        "allowed_factors",
+        "allowed_email_domains",
+        "jit_provisioning",
+        "invitations_enabled",
+        "session_ttl_secs",
+        "session_idle_ttl_secs",
+        "metadata",
+        "updated_at",
+        "deleted_at",
+    ] {
+        assert!(
+            role_has_column_privilege(
+                pool,
+                "ironauth_control",
+                "org_auth_policies",
+                column,
+                "UPDATE"
+            )
+            .await,
+            "ironauth_control must hold column-scoped UPDATE on org_auth_policies.{column}"
+        );
+    }
+    // The scope and organization columns are immutable by GRANT on BOTH roles, which
+    // is what keeps the containment invariant from being defeatable by an UPDATE
+    // after the fact: a policy row can never be moved between scopes or between
+    // organizations.
+    for role in ["ironauth_control", "ironauth_app"] {
+        for column in ["id", "tenant_id", "environment_id", "organization_id"] {
+            assert!(
+                !role_has_column_privilege(pool, role, "org_auth_policies", column, "UPDATE").await,
+                "org_auth_policies.{column} must be immutable by GRANT: {role} must NOT hold \
+                 UPDATE on it"
+            );
+        }
+        // DELETE is granted to nobody on either plane: removal is the soft delete.
+        assert!(
+            !role_has_table_privilege(pool, role, "org_auth_policies", "DELETE").await,
+            "{role} must NOT hold DELETE on org_auth_policies (removal is a soft delete)"
+        );
+    }
+
+    // The data plane reads and NOTHING else. A data plane able to rewrite its own MFA
+    // requirement is the whole threat this table's grants exist to prevent.
+    assert!(
+        role_has_table_privilege(pool, "ironauth_app", "org_auth_policies", "SELECT").await,
+        "the data-plane role must hold SELECT on org_auth_policies (the resolution read)"
+    );
+    for privilege in ["INSERT", "UPDATE", "DELETE"] {
+        assert!(
+            !role_has_table_privilege(pool, "ironauth_app", "org_auth_policies", privilege).await,
+            "the data-plane grant on org_auth_policies must be SELECT only (no {privilege})"
+        );
+    }
+}
+
+/// The data plane holds NO write grant of any shape on `org_auth_policies`
+/// (issue #95, 0090).
+///
+/// The table-wide `has_table_privilege` probes above CANNOT see a COLUMN-scoped
+/// grant: `GRANT UPDATE (mfa_required) ON org_auth_policies TO ironauth_app` leaves
+/// every one of them reading false while genuinely letting the authorization path
+/// rewrite the requirement it is about to evaluate against itself. Sweeping every
+/// column through `pg_attribute` closes that gap, so the least-privilege invariant is
+/// a PHYSICAL property of the schema rather than a claim about which code paths
+/// happen to exist.
+#[tokio::test]
+async fn the_data_plane_holds_no_column_scoped_write_grant_on_org_auth_policies() {
+    let db = TestDatabase::start().await;
+    let pool = db.owner_pool();
+
+    // INSERT, UPDATE, and REFERENCES are the write-shaped privileges Postgres can
+    // grant per column (DELETE has no column form and is asserted table-wide with the
+    // rest of the 0090 grants).
+    for privilege in ["INSERT", "UPDATE", "REFERENCES"] {
+        assert!(
+            !role_has_any_column_privilege(pool, "ironauth_app", "org_auth_policies", privilege)
+                .await,
+            "the data plane must hold NO column-scoped {privilege} on org_auth_policies"
+        );
+    }
+    // Positive controls, so a sweep that simply answered "no" to everything could not
+    // pass this test.
+    assert!(
+        role_has_any_column_privilege(pool, "ironauth_app", "org_auth_policies", "SELECT").await,
+        "the data plane holds SELECT on org_auth_policies (the resolution read)"
+    );
+    assert!(
+        role_has_any_column_privilege(pool, "ironauth_control", "org_auth_policies", "UPDATE")
+            .await,
+        "the control plane holds the column-scoped UPDATE a change and a removal need"
+    );
 }

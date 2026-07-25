@@ -316,6 +316,30 @@ impl From<StoreError> for ApiError {
                      exceeding the configured maximum of {max}"
                 ))
             }
+            // A per-organization authentication policy document the store refused
+            // (issue #95). 422 for the same reason as the group refusals above: the
+            // values are well formed and in set, and this is a structural refusal of
+            // a document rather than a uniqueness collision.
+            //
+            // This arm lands AHEAD of issue #95's admin routes, exactly as the two
+            // group arms above landed ahead of theirs. It adds no type, no route, and
+            // no schema, so the served management spec cannot drift; and omitting it
+            // would NOT be neutral, because the wildcard below would turn this
+            // variant into an opaque 500 on every route that can produce it, with
+            // nothing failing to say so.
+            //
+            // Every carried refusal is value free by construction (each names a
+            // DIMENSION, never the offending value), so rendering them all is safe
+            // and is what makes the response actionable in one round trip. The list
+            // is already sorted and deduplicated by the store's validator, so the
+            // message is a deterministic function of the submitted document.
+            StoreError::OrgAuthPolicyInvalid(ref errors) => {
+                let dimensions: Vec<&str> = errors.iter().map(|failure| failure.as_str()).collect();
+                ApiError::Unprocessable(format!(
+                    "the organization authentication policy is invalid: {}",
+                    dimensions.join("; ")
+                ))
+            }
             // Anything else (a database fault, or an idempotency conflict that
             // did not funnel through the re-read path) is an opaque internal
             // error; the detail is logged, never returned. `StoreError` is
@@ -331,7 +355,7 @@ impl From<StoreError> for ApiError {
 #[cfg(test)]
 mod tests {
     use super::{ApiError, StatusCode};
-    use ironauth_store::StoreError;
+    use ironauth_store::{AuthPolicyError, StoreError};
 
     #[test]
     fn the_group_hierarchy_refusals_render_as_unprocessable_and_never_as_internal() {
@@ -363,6 +387,63 @@ mod tests {
                     if message.contains("11") && message.contains('8')
             ),
             "the depth refusal must report both the attempted depth and the bound: {depth:?}"
+        );
+    }
+
+    #[test]
+    fn the_org_auth_policy_refusal_renders_as_unprocessable_and_names_every_dimension() {
+        // The same guard as the group refusals above, for issue #95: an unmapped
+        // variant is a SILENT 500 on every route that can produce it. This arm and
+        // this test are what make the policy refusal a caller-facing 422 instead.
+        let refusal: ApiError = StoreError::OrgAuthPolicyInvalid(vec![
+            AuthPolicyError::UnknownFactor,
+            AuthPolicyError::MfaRequiredWithNoSecondFactor,
+        ])
+        .into();
+        assert_eq!(refusal.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let ApiError::Unprocessable(ref message) = refusal else {
+            panic!("the policy refusal must render as unprocessable: {refusal:?}");
+        };
+        // EVERY carried failure reaches the caller, so an operator fixes all of them
+        // in one round trip rather than discovering them one write at a time.
+        assert!(
+            message.contains("allowed_factors") && message.contains("mfa_required"),
+            "the refusal must name every failed dimension: {message}"
+        );
+        // And nothing that was not sent: each variant is value free, so no submitted
+        // factor token or email domain can appear in the response.
+        assert!(
+            !message.contains("email_otp") && !message.contains('@'),
+            "a refusal must never echo a submitted value: {message}"
+        );
+
+        // An empty list is not reachable from the validator (it returns Ok when
+        // nothing failed), but the arm must stay total and must never become a 500.
+        let empty: ApiError = StoreError::OrgAuthPolicyInvalid(Vec::new()).into();
+        assert_eq!(empty.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn the_config_and_store_session_ttl_ceilings_agree() {
+        // The store clamps a submitted policy lifetime against its OWN mirror of the
+        // ceiling, because `ironauth-store` deliberately has no dependency on the
+        // config crate. If the two drifted, an operator could state a policy lifetime
+        // the deployment itself refuses to load, or the store could reject one the
+        // deployment would have accepted. This crate is the only one that can see
+        // both, so the agreement is pinned here, exactly as the group depth ceiling
+        // is below.
+        assert_eq!(
+            u64::from(ironauth_store::ORG_POLICY_MAX_SESSION_TTL_SECS),
+            ironauth_config::OIDC_MAX_SESSION_TTL_SECS
+        );
+        // And the shipped defaults land within it, so a deployment that never touches
+        // the setting can state any policy lifetime the store will accept.
+        let shipped = ironauth_config::Config::from_toml_str("", "<inline>")
+            .expect("the shipped defaults must load")
+            .config;
+        assert!(
+            shipped.oidc.session_ttl_secs <= ironauth_config::OIDC_MAX_SESSION_TTL_SECS,
+            "the shipped default session lifetime must be within the ceiling"
         );
     }
 

@@ -554,6 +554,24 @@ name = "org_assignments"
 path = "tests/org_assignments.rs"
 required-features = ["testing"]
 
+# Per-organization authentication policies (issue #95, store layer): the audited
+# set/remove vocabulary and its closed-token detail dimension, the whole-document
+# upsert that keeps ONE live policy per organization (and mints a FRESH id after a
+# remove rather than reviving), the typed intra-document refusal and the proof that a
+# refusal writes NEITHER the row nor its audit row, the anti-oracle ORDERING (a
+# contradictory document against an organization the caller cannot see is the uniform
+# not-found, never the informative refusal), organization containment proved against a
+# SECOND organization in the same scope, the uniform not-found across absent / removed
+# / foreign-org / foreign-scope, the CHECK-versus-validator agreement over a seeded
+# corpus (so the storage latch and the Rust guard cannot drift), forced RLS under both
+# roles, the least-privilege grants (the data plane is read only and no scope or
+# organization column is writable by anybody), and the covenant that policies, allowed
+# domains, and allowed factors are uncapped. Needs a real database (DATABASE_URL).
+[[test]]
+name = "org_auth_policies"
+path = "tests/org_auth_policies.rs"
+required-features = ["testing"]
+
 # The tenant lifecycle state machine, residency attributes, data-plane fence, and
 # crypto-shredding offboarding (#46). Needs a real database (DATABASE_URL).
 [[test]]

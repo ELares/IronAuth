@@ -293,6 +293,27 @@ pub enum Action {
     /// actually revoked something, so an ordinary add of a never-before-seen member
     /// does not pollute the log with an empty cascade.
     OrganizationMembershipAttachmentsRevoke,
+    /// An organization's authentication policy was created or changed (issue #95).
+    /// Target: the `oap_` policy row.
+    ///
+    /// The policy is 1:1 with its organization and the write is a whole-document
+    /// upsert, so a create and a change are ONE operation and ONE action, matching
+    /// [`Action::CredentialClassPolicySet`]. The audit row's operator-safe `detail`
+    /// carries a compact CLOSED-TOKEN summary of the dimensions the write states
+    /// (never a domain string and never a factor token list), because turning on
+    /// `mfa_required` for an organization forces enrollment for every member: its
+    /// blast radius is not the target row, so the audit row alone would otherwise
+    /// not let an operator reconstruct what happened.
+    ///
+    /// It does NOT mean the organization itself changed.
+    OrganizationPolicySet,
+    /// An organization's authentication policy was removed (issue #95): the soft
+    /// delete. Target: the `oap_` policy row.
+    ///
+    /// After this the organization inherits the environment result unchanged. It
+    /// does NOT mean the organization was deleted, and it does NOT mean any
+    /// member's session was terminated.
+    OrganizationPolicyRemove,
     /// An authorization code and its grant were issued (issue #12).
     AuthorizationCodeIssue,
     /// An authorization code was redeemed at the token endpoint (issue #12).
@@ -1104,6 +1125,8 @@ impl Action {
             Action::OrganizationMembershipAttachmentsRevoke => {
                 "organization.membership.attachments.revoke"
             }
+            Action::OrganizationPolicySet => "organization.policy.set",
+            Action::OrganizationPolicyRemove => "organization.policy.remove",
             Action::AuthorizationCodeIssue => "authorization_code.issue",
             Action::AuthorizationCodeRedeem => "authorization_code.redeem",
             Action::AuthorizationCodeReuse => "authorization_code.reuse",
@@ -1315,5 +1338,94 @@ impl ActingContext {
     #[must_use]
     pub fn correlation(&self) -> CorrelationId {
         self.correlation
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Action;
+    use std::collections::BTreeMap;
+
+    /// Every action wire string is DISTINCT, swept out of this file's own source
+    /// rather than a hand-written list.
+    ///
+    /// The audit layer's sharpest asymmetry: [`crate::classification::ResourceType`]
+    /// has `ALL`, a fixed-size array type, an in-crate uniqueness test, AND a shell
+    /// lint. [`Action`] has none of the four. There is no `Action::ALL` to iterate,
+    /// so a duplicated or misspelled action string would ship silently and two
+    /// distinct mutations would become indistinguishable in the audit log and in
+    /// the milestone-11 delta contract that reads it.
+    ///
+    /// The scan is over [`Action::as_str`]'s body, which is a flat match returning
+    /// only string literals, so every quoted literal in it IS an action wire
+    /// string. Two things keep the scanner honest about what it cannot read: the
+    /// function-header needle is assembled from fragments so the scanner never
+    /// matches its own source lines, and the number of literals found is asserted
+    /// to be a plausible floor, so a scan that silently read NOTHING (an edit that
+    /// renames the function or reflows the match) fails here instead of passing
+    /// vacuously.
+    #[test]
+    fn every_audit_action_wire_string_is_distinct_and_a_snake_case_dotted_token() {
+        let source = include_str!("audit.rs");
+        let needle = concat!("pub fn ", "as_str(&self) -> &'static str {");
+        let body = source
+            .split_once(needle)
+            .map(|(_, rest)| rest)
+            .expect("the as_str body is readable");
+        // The match ends at the first line that is exactly four spaces and a close
+        // brace, which is the function's own closing brace.
+        let body = body
+            .split_once("\n    }\n")
+            .map(|(inside, _)| inside)
+            .expect("the as_str body is terminated");
+
+        let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
+        for line in body.lines() {
+            let Some((_, after_quote)) = line.split_once('"') else {
+                continue;
+            };
+            let Some((wire, _)) = after_quote.split_once('"') else {
+                continue;
+            };
+            *seen.entry(wire).or_default() += 1;
+        }
+
+        assert!(
+            seen.len() > 100,
+            "the scanner read only {} action wire strings; it is not reading the \
+             match body any more",
+            seen.len()
+        );
+        let duplicates: Vec<&str> = seen
+            .iter()
+            .filter(|(_, count)| **count > 1)
+            .map(|(wire, _)| *wire)
+            .collect();
+        assert!(
+            duplicates.is_empty(),
+            "audit action wire strings must be mutually distinct; these appear more \
+             than once: {duplicates:?}"
+        );
+        for wire in seen.keys() {
+            assert!(
+                wire.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '.'),
+                "the action wire string {wire} must be a dotted snake_case token"
+            );
+        }
+
+        // Issue #95's two actions are present under exactly the spellings the
+        // migration header records as the policy delta contract, so a rename here
+        // fails rather than silently breaking that contract.
+        assert_eq!(
+            Action::OrganizationPolicySet.as_str(),
+            "organization.policy.set"
+        );
+        assert_eq!(
+            Action::OrganizationPolicyRemove.as_str(),
+            "organization.policy.remove"
+        );
+        assert!(seen.contains_key("organization.policy.set"));
+        assert!(seen.contains_key("organization.policy.remove"));
     }
 }

@@ -86,9 +86,9 @@ use crate::id::{
     ExternalIssuerId, FedcmNonceId, FederationLoginStateId, FlowId, FlowVersionId,
     FlowVersionPinId, GrantId, InitialAccessTokenId, InvitationId, IssuedTokenId, KekId,
     LocaleBundleId, MagicLinkTokenId, ManagementKeyId, Mds3BlobCacheId, MigrationRunId,
-    MigrationRunRecordId, OperatorId, OrgConnectionId, OrgGroupId, OrgGroupMemberId,
-    OrgGroupRoleId, OrgMembershipId, OrgMembershipRoleId, OrgRoleId, OrganizationId,
-    PowChallengeId, PushedRequestId, RecoveryApprovalId, RecoveryCodeId,
+    MigrationRunRecordId, OperatorId, OrgAuthPolicyId, OrgConnectionId, OrgGroupId,
+    OrgGroupMemberId, OrgGroupRoleId, OrgMembershipId, OrgMembershipRoleId, OrgRoleId,
+    OrganizationId, PowChallengeId, PushedRequestId, RecoveryApprovalId, RecoveryCodeId,
     RecoveryContactConfirmationId, RecoveryFlowId, RecoveryIdvSessionId, RecoveryTrustedContactId,
     RefreshFamilyId, RefreshTokenId, ResourceServerId, RiskDecisionId, RiskDisavowalId,
     RiskLoginGeoId, RiskSignalId, RoutingRuleId, ScopeStepUpPolicyId, ServiceAccountId,
@@ -101,6 +101,7 @@ use crate::identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
 };
 use crate::locale_bundle::{LocaleBundleRecord, NewLocaleBundle};
+use crate::org_policy::AuthPolicy;
 use crate::pow_challenge::{NewPowChallenge, PowChallengeView};
 use crate::recovery::{
     NewRecoveryFlow, RecoveryCancelReason, RecoveryEntryPoint, RecoveryFlowRecord, RecoveryMethod,
@@ -316,6 +317,21 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn org_roles(&self) -> OrgRoleRepo<'a> {
         OrgRoleRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only per-organization authentication policy repository for this
+    /// scope on the DATA plane (issue #95). Migration 0090 grants the data-plane
+    /// SELECT on `org_auth_policies` (and nothing else), because the resolution
+    /// engine runs on the AUTHORIZATION path under the low-privilege app role. A
+    /// data plane able to rewrite its own MFA requirement is the whole threat, so
+    /// there is deliberately no MUTATING data-plane counterpart and no INSERT,
+    /// UPDATE, or DELETE grant of any shape.
+    #[must_use]
+    pub fn org_auth_policies(&self) -> OrgAuthPolicyRepo<'a> {
+        OrgAuthPolicyRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -3022,6 +3038,107 @@ impl CredentialClassPolicyRepo<'_> {
         )
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| {
+                let id_text: String = row.get("id");
+                let id = CredentialClassPolicyId::parse_in_scope(&id_text, &self.scope)?;
+                Ok(CredentialClassPolicy {
+                    id,
+                    subject_kind: row.get("subject_kind"),
+                    subject_ref: row.get("subject_ref"),
+                    min_class: row.get("min_class"),
+                })
+            })
+            .collect()
+    }
+
+    /// Every credential-class policy row APPLICABLE to one login, oldest first: the
+    /// scope-wide row, the acting organization's row, and the row of every group the
+    /// subject effectively belongs to.
+    ///
+    /// # The 0049 attachment seam is LIVE as of issue #95
+    ///
+    /// Migration 0049 shipped `subject_kind IN ('tenant', 'group', 'org')` with the
+    /// group and org rows as "the inert attachment seam (end-to-end group/org
+    /// attachment lands with the M10 organization model)", and the composition
+    /// currently discards everything but the `tenant` rows. Issue #95 IS that
+    /// unlock, and issue #97 shipped the real `grp_` groups and the bounded ancestor
+    /// closure the group rows need, so BOTH become live together. This read is the
+    /// store-layer half; lifting the composition's `subject_kind == "tenant"` filter
+    /// is issue #95's enforcement PR, so nothing at the authentication gate changes
+    /// yet.
+    ///
+    /// The organization's minimum credential class lives HERE and deliberately NOT
+    /// in `org_auth_policies` (migration 0090 carries no `min_class` and records
+    /// why): two tables that could each state a floor for one organization, with no
+    /// defined precedence between them, would be two sources of truth for one
+    /// authorization decision. The fold stays `authn::required_class`, unchanged.
+    ///
+    /// # What `subject_ref` holds, per kind
+    ///
+    /// For `org` it is the `org_` ID. For `group` it is the group's SLUG, NOT its
+    /// `grp_` id, which is a deliberate reading of 0049's prose ("the group / org id
+    /// it names") rather than a contradiction of it: nothing has ever written a group
+    /// row, so no stored data is reinterpreted. Three reasons. Issue #97's ONE
+    /// bounded ancestor closure yields slugs, and both of its projections share that
+    /// closure precisely so ancestry cannot acquire a second definition; the slug is
+    /// the stable name an authorization decision already keys on and is immutable by
+    /// GRANT, whereas a rename moves only the display name; and re-creating a deleted
+    /// group mints a FRESH id, so an id-keyed floor would silently DETACH on a
+    /// delete-and-recreate, whereas a slug-keyed one follows the name the operator
+    /// wrote the policy about. The converse (a new group reusing a freed slug
+    /// inheriting the floor) is the same tradeoff the partial live-slug uniqueness
+    /// index already makes, and it errs toward MORE constraint.
+    ///
+    /// `organization_id` of `None` and an empty `group_slugs` are both ordinary: the
+    /// result is then just the scope-wide row, exactly what the composition reads
+    /// today.
+    ///
+    /// # Index note, because a later cleanup silently breaks it
+    ///
+    /// `credential_class_policies_subject_uk` is an EXPRESSION index on
+    /// `(tenant_id, environment_id, subject_kind, COALESCE(subject_ref, ''))`. The
+    /// predicates below are written in the `COALESCE(subject_ref, '') = $n` form on
+    /// purpose: rewriting them as `subject_ref = $n` would not match the expression
+    /// index and would turn this into a scan of the environment's whole policy set on
+    /// the token-issuance path. No new index is needed.
+    ///
+    /// A cross-scope `organization_id` matches nothing (its scope columns cannot
+    /// match the bound scope), so the result simply omits the organization row rather
+    /// than becoming an error or an oracle.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn applicable(
+        &self,
+        organization_id: Option<&OrganizationId>,
+        group_slugs: &BTreeSet<String>,
+    ) -> Result<Vec<CredentialClassPolicy>, StoreError> {
+        // The empty string is UNMATCHABLE for an org or group row: the
+        // `credential_class_policies_subject_ref_presence` CHECK requires a NONEMPTY
+        // subject_ref for both kinds, so binding it is a total, allocation-free way
+        // to express "no organization in context" without a second statement.
+        let org_ref = organization_id.map_or_else(String::new, ToString::to_string);
+        let slugs: Vec<String> = group_slugs.iter().cloned().collect();
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, subject_kind, subject_ref, min_class FROM credential_class_policies \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+               AND ( \
+                     (subject_kind = 'tenant' AND COALESCE(subject_ref, '') = '') \
+                  OR (subject_kind = 'org' AND COALESCE(subject_ref, '') = $3) \
+                  OR (subject_kind = 'group' AND COALESCE(subject_ref, '') = ANY($4::text[])) \
+               ) \
+             ORDER BY created_at, id",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(&org_ref)
+        .bind(&slugs)
         .fetch_all(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -31829,6 +31946,18 @@ impl<'a> ManagementStore<'a> {
         }
     }
 
+    /// The read-only per-organization authentication policy repository for `scope`
+    /// (issue #95). Policies are environment-scoped, so the repository is
+    /// constructible only from a `(tenant, environment)` scope and binds row-level
+    /// security to it before every statement.
+    #[must_use]
+    pub fn org_auth_policies(&self, scope: Scope) -> OrgAuthPolicyRepo<'a> {
+        OrgAuthPolicyRepo {
+            store: self.store,
+            scope,
+        }
+    }
+
     /// The read-only organization-group repository for `scope` (issue #97). Groups
     /// are environment-scoped, so the repository is constructible only from a
     /// `(tenant, environment)` scope and binds row-level security to it before
@@ -31990,6 +32119,18 @@ impl<'a> ActingManagementStore<'a> {
     #[must_use]
     pub fn org_roles(&self, scope: Scope) -> ActingOrgRoleRepo<'a> {
         ActingOrgRoleRepo {
+            store: self.store,
+            acting: self.acting,
+            scope,
+        }
+    }
+
+    /// The mutating per-organization authentication policy repository for `scope`
+    /// (issue #95): state an organization's authentication policy and remove it,
+    /// each audited.
+    #[must_use]
+    pub fn org_auth_policies(&self, scope: Scope) -> ActingOrgAuthPolicyRepo<'a> {
+        ActingOrgAuthPolicyRepo {
             store: self.store,
             acting: self.acting,
             scope,
@@ -35280,6 +35421,407 @@ impl ActingOrgMembershipRepo<'_> {
     }
 }
 
+/// The projection every organization-auth-policy read selects from
+/// `org_auth_policies` (the two timestamps as epoch microseconds, the metadata as
+/// JSON text). One constant so the get, the list, and the login-path lookup cannot
+/// drift.
+const ORG_AUTH_POLICY_SELECT_COLUMNS: &str = "id, organization_id, mfa_required, \
+     allowed_factors, allowed_email_domains, jit_provisioning, invitations_enabled, \
+     session_ttl_secs, session_idle_ttl_secs, \
+     metadata::text AS metadata_text, \
+     (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us, \
+     (EXTRACT(EPOCH FROM updated_at) * 1000000)::bigint AS updated_us";
+
+/// A per-organization authentication policy row (issue #95): the single LIVE policy
+/// document governing one organization. Only live (not soft-deleted) policies are
+/// ever reconstructed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgAuthPolicyRecord {
+    /// The policy identifier (`oap_...`, embeds its `(tenant, environment)`).
+    pub id: OrgAuthPolicyId,
+    /// The organization this policy governs (`org_...`). It is also the row's
+    /// IDENTITY: at most one live policy exists per organization, which is why every
+    /// mutation addresses the policy by organization alone.
+    pub organization_id: OrganizationId,
+    /// The policy DOCUMENT. Every dimension is optional and `None` means UNSET,
+    /// which resolution reads as "inherit the next level up unchanged".
+    pub document: AuthPolicy,
+    /// Free-form policy metadata, as stored JSON. Never interpreted by the auth core.
+    pub metadata: serde_json::Value,
+    /// Creation time in microseconds since the Unix epoch (the pagination key).
+    pub created_at_unix_micros: i64,
+    /// Last-modification time in microseconds since the Unix epoch.
+    pub updated_at_unix_micros: i64,
+}
+
+/// Read-only per-organization authentication policies for one scope (issue #95).
+///
+/// Reached by the control plane through [`ManagementStore::org_auth_policies`] and
+/// by the data plane through [`ScopedStore::org_auth_policies`]. Every read is
+/// scope-fenced and filters `deleted_at IS NULL`, so a removed policy reads as
+/// absent, exactly like a policy of another scope and like one that never existed:
+/// the four cases (absent, soft-deleted, foreign scope, foreign organization) are
+/// indistinguishable to a caller. The typed [`OrgAuthPolicyId`] embeds its scope, so
+/// a cross-scope id fails to parse in scope before any query runs.
+///
+/// There is deliberately NO cache here. Nothing in this process caches any policy
+/// read, which is precisely what makes "policy changes take effect at the next
+/// authentication" true by construction rather than by convention. Do not add one in
+/// issue #95; if a later benchmark justifies one, copy the issuer registry's bounded
+/// TTL plus bounded negative-cache shape, never a plain map.
+pub struct OrgAuthPolicyRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl OrgAuthPolicyRepo<'_> {
+    /// Parse an untrusted policy identifier under this scope. A malformed id and one
+    /// minted in another scope both return the uniform not-found.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if malformed or out of scope.
+    pub fn parse_id(&self, raw: &str) -> Result<OrgAuthPolicyId, StoreError> {
+        Ok(OrgAuthPolicyId::parse_in_scope(raw, &self.scope)?)
+    }
+
+    /// The LIVE policy row governing `organization_id`, or the uniform not-found.
+    ///
+    /// The management read. A policy of ANOTHER organization can never be reached
+    /// through it, because the organization IS the address; there is no second key
+    /// to get wrong.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id is out of scope, or the organization has
+    /// no live policy.
+    pub async fn get_for_org(
+        &self,
+        organization_id: &OrganizationId,
+    ) -> Result<OrgAuthPolicyRecord, StoreError> {
+        self.read_for_org(organization_id)
+            .await?
+            .ok_or(StoreError::NotFound)
+    }
+
+    /// The policy DOCUMENT governing `organization_id`, or `None` when it has none.
+    ///
+    /// This is the login-path read, and the ONE additional scoped SELECT issue #95
+    /// costs an authorization, covered exactly by `org_auth_policies_org_live_uniq`.
+    /// The other levels are not additional reads: the environment level is the
+    /// credential-class and step-up rows already read on that path, and the client
+    /// level is columns already on the loaded client record.
+    ///
+    /// `None` is the NORMAL case and is deliberately NOT an error: an organization
+    /// with no policy inherits the next level up unchanged, which is exactly the
+    /// identity element of every combinator in
+    /// [`crate::org_policy::resolve`]. An OUT-OF-SCOPE organization id is a caller
+    /// wiring bug rather than a normal outcome, so it is a LOUD
+    /// [`StoreError::NotFound`] the gate fails closed on, never a silent `None` that
+    /// would drop the organization's tightening and fail OPEN.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the organization id is not in this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn document_for_org(
+        &self,
+        organization_id: &OrganizationId,
+    ) -> Result<Option<AuthPolicy>, StoreError> {
+        Ok(self
+            .read_for_org(organization_id)
+            .await?
+            .map(|record| record.document))
+    }
+
+    /// The shared single-row read both public lookups run.
+    async fn read_for_org(
+        &self,
+        organization_id: &OrganizationId,
+    ) -> Result<Option<OrgAuthPolicyRecord>, StoreError> {
+        if organization_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(&format!(
+            "SELECT {ORG_AUTH_POLICY_SELECT_COLUMNS} FROM org_auth_policies \
+             WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
+             AND deleted_at IS NULL"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(organization_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        row.as_ref()
+            .map(|row| org_auth_policy_from_row(row, &self.scope))
+            .transpose()
+    }
+
+    /// One page of live policies in this scope, ordered by `(created_at, id)`: the
+    /// "policies in this environment" list.
+    ///
+    /// PAGE-size clamped like every management list; there is no cap on how many
+    /// policies an environment may hold.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list(
+        &self,
+        limit: i64,
+        after: Option<&CursorPosition>,
+    ) -> Result<Vec<OrgAuthPolicyRecord>, StoreError> {
+        let (after_micros, after_id) = split_cursor(after);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {ORG_AUTH_POLICY_SELECT_COLUMNS} FROM org_auth_policies \
+             WHERE tenant_id = $1 AND environment_id = $2 AND deleted_at IS NULL \
+             AND ($3::bigint IS NULL OR (created_at, id) > \
+                  (TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval, $4::text)) \
+             ORDER BY created_at, id LIMIT $5"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(after_micros)
+        .bind(after_id)
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| org_auth_policy_from_row(row, &self.scope))
+            .collect()
+    }
+}
+
+/// The mutating per-organization authentication policy repository (issue #95): state
+/// an organization's policy and remove it, each audited in the same transaction as
+/// the write.
+///
+/// # Addressing
+///
+/// The policy is 1:1 with its organization, so BOTH mutations address it by
+/// `organization_id` ALONE and `set` is an upsert on the live partial unique index.
+/// That STRUCTURALLY eliminates the cross-organization bug class rather than
+/// defending against it with predicate discipline: there is no second key to get
+/// wrong, and no request shape in which one organization's policy id could be
+/// combined with another organization's path segment.
+///
+/// # No advisory lock
+///
+/// Unlike the issue #97 group forest this repository takes none, and the absence is
+/// deliberate rather than an omission: there is no tree here, no multi-row invariant,
+/// and nothing a concurrent writer could jointly break that the live partial unique
+/// index does not already serialize. The covenant additionally forbids the
+/// advisory-lock-plus-COUNT gate a lock here would superficially resemble.
+///
+/// There is no count cap, quota, or paywall gate on policies, allowed domains, or
+/// allowed factors anywhere in this repository or in migration 0090.
+pub struct ActingOrgAuthPolicyRepo<'a> {
+    store: &'a Store,
+    acting: ActingContext,
+    scope: Scope,
+}
+
+impl ActingOrgAuthPolicyRepo<'_> {
+    /// State an organization's authentication policy and audit
+    /// `organization.policy.set` in the same transaction, returning the id of the
+    /// LIVE policy row (a freshly minted one on the first write, the existing one on
+    /// a change).
+    ///
+    /// The write is a WHOLE-DOCUMENT replace, not a patch: every dimension is
+    /// written from `document`, so an unset dimension means "inherit" and there is
+    /// no partial-update shape in which a caller could leave a stale value behind
+    /// without naming it.
+    ///
+    /// # Ordering (the anti-oracle rule)
+    ///
+    /// The organization is resolved as a LIVE row in the caller's OWN scope FIRST,
+    /// and absent, soft-deleted, foreign-scope, and foreign-tenant all collapse to a
+    /// uniform [`StoreError::NotFound`]. NO document reasoning happens before that.
+    /// The ordering is load-bearing, not stylistic:
+    /// [`StoreError::OrgAuthPolicyInvalid`] is an INFORMATIVE error, so if it could
+    /// be returned for an organization the caller cannot see, it would become an
+    /// existence oracle over another tenant's organizations.
+    ///
+    /// # Why the Rust guard must win the race against the CHECK
+    ///
+    /// Migration 0090 carries `org_auth_policies_mfa_reachable` as a latch behind
+    /// this validation, and the application path must never reach it: a CHECK raised
+    /// MID-transaction poisons the transaction (SQLSTATE 25P02 thereafter), and every
+    /// mutation here writes its audit row AFTER the mutation and BEFORE the commit,
+    /// so a database-raised refusal would make that audit insert impossible. The pure
+    /// validator therefore refuses first, with a typed error, and rolls the attempted
+    /// write and its audit row back together.
+    ///
+    /// # What this validation does NOT claim
+    ///
+    /// It is INTRA-DOCUMENT ONLY. A contradiction that arises only from the
+    /// intersection ACROSS levels is not decidable at any single write (an ancestor
+    /// can change after the child is written), so it is carried instead as a typed
+    /// value on the resolved policy and fails closed at authentication. See
+    /// [`crate::org_policy::validate`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if either id is not in this scope, or no live
+    /// organization matched;
+    /// [`StoreError::OrgAuthPolicyInvalid`] if the submitted document is malformed or
+    /// self-contradictory (nothing is written, including the audit row);
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn set(
+        &self,
+        env: &Env,
+        organization_id: &OrganizationId,
+        document: &AuthPolicy,
+        session_ttl_ceiling_secs: u32,
+    ) -> Result<OrgAuthPolicyId, StoreError> {
+        if organization_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let candidate_id = OrgAuthPolicyId::generate(env, &scope);
+        let now_micros = epoch_micros(env.clock().now_utc());
+
+        // The audit target is known only AFTER the upsert (a change keeps the
+        // EXISTING row's id), so this write inlines its own audited transaction
+        // rather than using the write_audited primitive, exactly as the other
+        // returning-write paths in this module do. The audit row is still inserted
+        // after the mutation and before the commit, in the same transaction.
+        let mut tx = begin_scoped(self.store, scope).await?;
+        require_live_organization(&mut tx, scope, organization_id).await?;
+
+        // Normalization first, so validation and the stored row agree on exactly one
+        // form of every domain, and so the audit detail describes what was stored.
+        let document = crate::org_policy::normalize(document);
+        crate::org_policy::validate(&document, session_ttl_ceiling_secs)
+            .map_err(StoreError::OrgAuthPolicyInvalid)?;
+        let detail = crate::org_policy::audit_detail(&document);
+
+        let factors = document
+            .allowed_factors
+            .as_ref()
+            .map(|set| set.iter().cloned().collect::<Vec<String>>());
+        let domains = document
+            .allowed_email_domains
+            .as_ref()
+            .map(|set| set.iter().cloned().collect::<Vec<String>>());
+
+        let row = sqlx::query(
+            "INSERT INTO org_auth_policies \
+             (id, tenant_id, environment_id, organization_id, mfa_required, allowed_factors, \
+              allowed_email_domains, jit_provisioning, invitations_enabled, session_ttl_secs, \
+              session_idle_ttl_secs, metadata, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
+                     COALESCE($12::jsonb, '{}'::jsonb), \
+                     TIMESTAMPTZ 'epoch' + ($13::text || ' microseconds')::interval, \
+                     TIMESTAMPTZ 'epoch' + ($13::text || ' microseconds')::interval) \
+             ON CONFLICT (tenant_id, environment_id, organization_id) WHERE deleted_at IS NULL \
+             DO UPDATE SET mfa_required = EXCLUDED.mfa_required, \
+                           allowed_factors = EXCLUDED.allowed_factors, \
+                           allowed_email_domains = EXCLUDED.allowed_email_domains, \
+                           jit_provisioning = EXCLUDED.jit_provisioning, \
+                           invitations_enabled = EXCLUDED.invitations_enabled, \
+                           session_ttl_secs = EXCLUDED.session_ttl_secs, \
+                           session_idle_ttl_secs = EXCLUDED.session_idle_ttl_secs, \
+                           metadata = EXCLUDED.metadata, \
+                           updated_at = EXCLUDED.updated_at \
+             RETURNING id",
+        )
+        .bind(candidate_id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(organization_id.to_string())
+        .bind(document.mfa_required)
+        .bind(factors.as_deref())
+        .bind(domains.as_deref())
+        .bind(document.jit_provisioning)
+        .bind(document.invitations_enabled)
+        .bind(document.session_ttl_secs.map(secs_to_i32))
+        .bind(document.session_idle_ttl_secs.map(secs_to_i32))
+        .bind(None::<&str>)
+        .bind(now_micros)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        let live_id = OrgAuthPolicyId::parse_in_scope(&row.get::<String, _>("id"), &scope)?;
+        let spec = AuditedWrite {
+            store: self.store,
+            scope,
+            acting: &self.acting,
+            env,
+            action: Action::OrganizationPolicySet,
+            target: &live_id,
+        };
+        insert_audit_row(&mut tx, &spec, Some(detail.as_str())).await?;
+        tx.commit().await?;
+        Ok(live_id)
+    }
+
+    /// Remove an organization's authentication policy (soft delete) and audit
+    /// `organization.policy.remove` in the same transaction. After this the
+    /// organization inherits the environment result unchanged.
+    ///
+    /// The row is RETAINED (only the column-scoped `deleted_at` and `updated_at` are
+    /// written), so the audit foreign key to it stays satisfiable; because the
+    /// uniqueness index is partial over live rows, the organization is immediately
+    /// free to receive a NEW policy, which inserts a FRESH row with a FRESH id rather
+    /// than reviving this one. Removing a policy is a security operation and must not
+    /// be quietly reversible.
+    ///
+    /// A repeat remove matches no live row and is the uniform not-found.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id is not in this scope, or the organization
+    /// has no live policy.
+    pub async fn remove(
+        &self,
+        env: &Env,
+        organization_id: &OrganizationId,
+    ) -> Result<OrgAuthPolicyId, StoreError> {
+        if organization_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let now_micros = epoch_micros(env.clock().now_utc());
+
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "UPDATE org_auth_policies SET \
+                 deleted_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval, \
+                 updated_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+             WHERE tenant_id = $2 AND environment_id = $3 AND organization_id = $4 \
+             AND deleted_at IS NULL \
+             RETURNING id",
+        )
+        .bind(now_micros)
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(organization_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        // The uniform not-found covers an absent policy, an already-removed one, an
+        // organization of another scope, and an organization that never existed: the
+        // predicate that finds nothing is the same one in every case.
+        let row = row.ok_or(StoreError::NotFound)?;
+        let removed_id = OrgAuthPolicyId::parse_in_scope(&row.get::<String, _>("id"), &scope)?;
+        let spec = AuditedWrite {
+            store: self.store,
+            scope,
+            acting: &self.acting,
+            env,
+            action: Action::OrganizationPolicyRemove,
+            target: &removed_id,
+        };
+        insert_audit_row(&mut tx, &spec, None).await?;
+        tx.commit().await?;
+        Ok(removed_id)
+    }
+}
+
 /// The mutating organization-role repository (issue #97): define a role in an
 /// organization, rename it, and delete it, each audited in the same transaction as
 /// the write.
@@ -36790,6 +37332,45 @@ async fn lock_group_hierarchy(
     Ok(())
 }
 
+/// Resolve `organization_id` as a LIVE organization within `scope`, or the uniform
+/// [`StoreError::NotFound`] (issue #95).
+///
+/// The anti-oracle gate every per-organization policy write passes through FIRST.
+/// Absent, soft-deleted, another tenant's, and another environment's all collapse to
+/// one error here, BEFORE any document reasoning runs, so the informative
+/// [`StoreError::OrgAuthPolicyInvalid`] can only ever be seen by a caller who has
+/// already proven they can see the organization.
+///
+/// The `organization_id` foreign key on `org_auth_policies` would refuse a
+/// NONEXISTENT organization on its own, but it would do so as a raw database error
+/// rather than the uniform not-found, and it cannot see a SOFT-DELETED one at all
+/// (the row is retained). Both gaps are exactly what this resolution closes.
+///
+/// It deliberately does NOT filter on the organization's lifecycle `state`: a
+/// DISABLED organization must still be administrable, and whether a disabled
+/// organization can be authenticated into is already decided on the login path
+/// rather than here.
+async fn require_live_organization(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    organization_id: &OrganizationId,
+) -> Result<(), StoreError> {
+    let found = sqlx::query(
+        "SELECT 1 AS present FROM organizations \
+         WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND deleted_at IS NULL",
+    )
+    .bind(organization_id.to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_optional(&mut **tx)
+    .await?;
+    if found.is_some() {
+        Ok(())
+    } else {
+        Err(StoreError::NotFound)
+    }
+}
+
 /// Resolve `group_id` as a LIVE group of `organization_id` within `scope`, or the
 /// uniform [`StoreError::NotFound`] (issue #97).
 ///
@@ -37819,6 +38400,73 @@ fn org_membership_from_row(row: &PgRow, scope: &Scope) -> Result<OrgMembershipRe
 /// Reconstruct an [`OrgRoleRecord`] from a row read within scope. The stored ids
 /// are parsed back UNDER the scope, so a corrupt cross-scope row fails to decode
 /// rather than being returned; the metadata is parsed from its JSON text.
+/// A policy duration in seconds, as the `integer` the column stores.
+///
+/// SATURATING rather than fallible: every value that reaches a write has already
+/// passed `org_policy::validate` against the deployment ceiling (well under
+/// `i32::MAX`), and saturating can only ever produce a LONGER stored value than the
+/// caller asked for, which the resolved MIN then clamps back down. There is no input
+/// for which this widens what a login is actually granted.
+fn secs_to_i32(seconds: u32) -> i32 {
+    i32::try_from(seconds).unwrap_or(i32::MAX)
+}
+
+/// A stored policy duration back as seconds.
+///
+/// A negative value is unwritable (the `..._positive` CHECKs), so this is
+/// unreachable for a row the platform wrote; if it ever fires it degrades to ONE
+/// SECOND, the strictest possible value, so a corrupt row fails CLOSED rather than
+/// silently reading as "no limit".
+fn secs_from_i32(seconds: i32) -> u32 {
+    u32::try_from(seconds).unwrap_or(1)
+}
+
+/// Reconstruct an [`OrgAuthPolicyRecord`] from a row read within scope (issue #95).
+/// The stored ids are parsed back UNDER the scope, so a corrupt cross-scope row
+/// fails to decode rather than being returned.
+///
+/// The two list columns become [`BTreeSet`]s: byte-stable order, and the
+/// deduplication a resolution intersection depends on becomes structural rather than
+/// a property of what was written.
+fn org_auth_policy_from_row(row: &PgRow, scope: &Scope) -> Result<OrgAuthPolicyRecord, StoreError> {
+    let id = OrgAuthPolicyId::parse_in_scope(&row.get::<String, _>("id"), scope)?;
+    let organization_id =
+        OrganizationId::parse_in_scope(&row.get::<String, _>("organization_id"), scope)?;
+    let metadata_text: String = row.get("metadata_text");
+    // The metadata passed a `::jsonb` cast on write, so a parse failure here is an
+    // internal invariant violation; surface it as a decode error, not a silent empty.
+    let metadata: serde_json::Value = serde_json::from_str(&metadata_text).map_err(|error| {
+        StoreError::Database(sqlx::Error::Decode(
+            format!("org_auth_policies.metadata is not valid JSON: {error}").into(),
+        ))
+    })?;
+    let document = AuthPolicy {
+        mfa_required: row.get("mfa_required"),
+        allowed_factors: row
+            .get::<Option<Vec<String>>, _>("allowed_factors")
+            .map(|values| values.into_iter().collect()),
+        allowed_email_domains: row
+            .get::<Option<Vec<String>>, _>("allowed_email_domains")
+            .map(|values| values.into_iter().collect()),
+        jit_provisioning: row.get("jit_provisioning"),
+        invitations_enabled: row.get("invitations_enabled"),
+        session_ttl_secs: row
+            .get::<Option<i32>, _>("session_ttl_secs")
+            .map(secs_from_i32),
+        session_idle_ttl_secs: row
+            .get::<Option<i32>, _>("session_idle_ttl_secs")
+            .map(secs_from_i32),
+    };
+    Ok(OrgAuthPolicyRecord {
+        id,
+        organization_id,
+        document,
+        metadata,
+        created_at_unix_micros: row.get("created_us"),
+        updated_at_unix_micros: row.get("updated_us"),
+    })
+}
+
 fn org_role_from_row(row: &PgRow, scope: &Scope) -> Result<OrgRoleRecord, StoreError> {
     let id = OrgRoleId::parse_in_scope(&row.get::<String, _>("id"), scope)?;
     let organization_id =

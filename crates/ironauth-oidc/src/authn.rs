@@ -1127,6 +1127,62 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_org_policy_factor_registries_agree_with_the_live_auth_method_registry() {
+        // The highest-value agreement test issue #95 has, because it is EXHAUSTIVE
+        // over the registry rather than over examples. `ironauth-oidc` is the only
+        // crate that can see both `AuthMethod` and the store's policy vocabulary, so
+        // the agreement is pinned here.
+        //
+        // Two properties, and the second is the one that matters.
+        //
+        //   1. The store's CLOSED vocabulary is exactly the set of live persistence
+        //      tokens, so an organization can name every method the deployment knows
+        //      and nothing it does not. Migration 0090's
+        //      `org_auth_policies_factors_known` CHECK carries the same list.
+        //   2. Membership in the store's SECOND-FACTOR set equals
+        //      `performed_second_factor` for that method ALONE. A new `AuthMethod`
+        //      therefore FAILS THIS TEST until it is classified, which is what keeps
+        //      the two from drifting.
+        //
+        // Getting (2) wrong is not a cosmetic drift: the store refuses a policy that
+        // requires MFA while permitting no genuine second factor, and a set that
+        // wrongly INCLUDED a single primary factor would let that unsatisfiable
+        // policy through, which is the precise defect the validation exists to
+        // prevent. `email_otp` and `sms` are the two that look like second factors
+        // and are not (their amr is `["otp"]` and `["sms"]`, with no `mfa`).
+        let known: std::collections::BTreeSet<&str> = AuthMethod::ALL
+            .into_iter()
+            .map(AuthMethod::as_token)
+            .collect();
+        let declared: std::collections::BTreeSet<&str> = ironauth_store::KNOWN_FACTOR_TOKENS
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(
+            known, declared,
+            "the store's closed factor vocabulary must be exactly the live AuthMethod              persistence tokens; migration 0090's CHECK carries the same list"
+        );
+
+        for method in AuthMethod::ALL {
+            let token = method.as_token();
+            assert_eq!(
+                ironauth_store::is_second_factor_token(token),
+                performed_second_factor(&[method]),
+                "{token}: the store's second-factor set and performed_second_factor                  must agree for EVERY method, or an unsatisfiable policy becomes                  writable"
+            );
+        }
+
+        // The two that are the trap, asserted by name so the reason survives a
+        // refactor of the sweep above.
+        for token in ["email_otp", "sms", "trusted_device"] {
+            assert!(
+                !ironauth_store::is_second_factor_token(token),
+                "{token} performs no genuine second factor: its amr carries no `mfa`"
+            );
+        }
+    }
+
+    #[test]
     fn password_maps_to_pwd_amr_and_the_password_acr() {
         let methods = parse_methods("pwd");
         assert_eq!(methods, vec![AuthMethod::Password]);

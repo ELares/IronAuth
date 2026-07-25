@@ -182,6 +182,22 @@ impl ScopedKind for OrgMembershipRoleKind {
     const PREFIX: &'static str = "mrl";
 }
 
+/// Marker for a per-organization authentication policy (`oap_`), the tenant-scoped
+/// policy document governing one organization's authentication requirements (issue
+/// #95, milestone M10). At most one LIVE policy exists per organization, so the
+/// organization is the row's identity and this id is the handle an operator reads
+/// back and the audit log names as a target. Scoped like every other resource so an
+/// id minted in one scope parses as a uniform not-found under another. Not a bearer
+/// secret (a policy id names configuration, never end-user data), so its debug form
+/// stays legible.
+///
+/// The prefix is `oap` and not `pol`, which is already taken by [`DcrPolicyKind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OrgAuthPolicyKind;
+impl ScopedKind for OrgAuthPolicyKind {
+    const PREFIX: &'static str = "oap";
+}
+
 /// Marker for an audit-log event, the tenant-scoped record the audit log writes
 /// in the same transaction as every mutation. Scoped like any other resource so
 /// audit rows are themselves subject to the tenant-isolation policies.
@@ -1341,6 +1357,10 @@ pub type OrgGroupRoleId = ScopedId<OrgGroupRoleKind>;
 /// A direct organization membership-role identifier (`mrl_...`), the join row
 /// granting one role to exactly one membership (issue #97).
 pub type OrgMembershipRoleId = ScopedId<OrgMembershipRoleKind>;
+/// A per-organization authentication policy identifier (`oap_...`), the single live
+/// policy document governing one organization's authentication requirements
+/// (issue #95).
+pub type OrgAuthPolicyId = ScopedId<OrgAuthPolicyKind>;
 /// An audit-log event identifier (`aud_...`).
 pub type AuditId = ScopedId<AuditKind>;
 /// A management API key identifier (`mak_...`), environment-scoped (issue #11).
@@ -2103,6 +2123,62 @@ mod tests {
     }
 
     #[test]
+    fn property_org_auth_policy_ids_round_trip_and_deny_cross_scope() {
+        // A property sweep over the per-organization authentication policy (issue
+        // #95): every freshly minted id round-trips in its own scope and NONE
+        // parses in a foreign tenant or environment, so a policy id minted
+        // elsewhere is a uniform not-found rather than an existence oracle over
+        // which organizations another environment governs.
+        let env = test_env();
+        let tenant_a = TenantId::generate(&env);
+        let tenant_b = TenantId::generate(&env);
+        let env_1 = EnvironmentId::generate(&env);
+        let env_2 = EnvironmentId::generate(&env);
+        let scope_a = Scope::new(tenant_a, env_1);
+        let cross_tenant = Scope::new(tenant_b, env_1);
+        let cross_env = Scope::new(tenant_a, env_2);
+
+        for _ in 0..1_000 {
+            let id = OrgAuthPolicyId::generate(&env, &scope_a);
+            let text = id.to_string();
+            assert!(text.starts_with("oap_"));
+            assert_eq!(
+                OrgAuthPolicyId::parse_in_scope(&text, &scope_a).expect("in scope"),
+                id
+            );
+            assert_eq!(
+                OrgAuthPolicyId::parse_in_scope(&text, &cross_tenant),
+                Err(NotInScope)
+            );
+            assert_eq!(
+                OrgAuthPolicyId::parse_in_scope(&text, &cross_env),
+                Err(NotInScope)
+            );
+        }
+
+        // Malformed and wrong-prefix inputs fail with the same NotInScope. The
+        // DCR policy id is the sharpest wrong-prefix case: both are called a
+        // "policy", they are the two kinds a reader is most likely to conflate,
+        // and `pol` is exactly the prefix this kind could not have.
+        assert_eq!(
+            OrgAuthPolicyId::parse_in_scope("oap_not-base64-!!", &scope_a),
+            Err(NotInScope)
+        );
+        let a_dcr_policy = DcrPolicyId::generate(&env, &scope_a).to_string();
+        assert_eq!(
+            OrgAuthPolicyId::parse_in_scope(&a_dcr_policy, &scope_a),
+            Err(NotInScope),
+            "a dcr-policy id is not an org-auth-policy id even in the right scope"
+        );
+        let an_org = OrganizationId::generate(&env, &scope_a).to_string();
+        assert_eq!(
+            OrgAuthPolicyId::parse_in_scope(&an_org, &scope_a),
+            Err(NotInScope),
+            "an organization id is not its policy id even in the right scope"
+        );
+    }
+
+    #[test]
     fn property_org_group_ids_round_trip_and_deny_cross_scope() {
         // A property sweep over the organization-group level (issue #97): every
         // freshly minted id round-trips in its own scope, and NONE parses in a
@@ -2343,6 +2419,14 @@ mod tests {
         assert!(
             seen.contains_key("mrl"),
             "the org-membership-role prefix is declared"
+        );
+        // Issue #95's per-organization authentication policy. Pinned here for the
+        // same reason as the #97 family, plus one of its own: `pol` was already
+        // taken by the dynamic-registration policy, so this kind had to pick a
+        // second spelling and a later kind must not take it back.
+        assert!(
+            seen.contains_key("oap"),
+            "the org-auth-policy prefix is declared"
         );
     }
 
