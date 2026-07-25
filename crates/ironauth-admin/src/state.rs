@@ -170,6 +170,12 @@ struct Inner {
     // records into). `None` when federation is disabled or on a node that does not run the data
     // plane; the health read then reports every connector as never-exercised.
     federation: Option<Arc<ironauth_oidc::FederationRuntime>>,
+    // The deployment-wide organization group nesting bound (issue #97), installed by
+    // the boot path from `organizations.max_group_depth` and passed to every group
+    // create and reparent. Defaults to the shipped default so a directly-built state
+    // behaves like a default deployment. Bounds tree DEPTH only; nothing counted is
+    // capped.
+    max_group_depth: u32,
     // Admin sudo mode (session privilege separation, issue #73): whether admin
     // mutations require a recent recorded re-authentication, and the freshness window in
     // seconds. Off by default; when off the mutation guard is a no-op and the admin
@@ -288,6 +294,7 @@ impl AdminState {
                     .filter(|value| !value.trim().is_empty()),
                 migration_hook: None,
                 federation: None,
+                max_group_depth: ironauth_config::ORGANIZATIONS_DEFAULT_MAX_GROUP_DEPTH,
                 sudo_mode_enabled: config.sudo_mode_enabled,
                 sudo_mode_window_secs: config.sudo_mode_window_secs,
                 signup_quarantine_enabled: false,
@@ -510,6 +517,40 @@ impl AdminState {
     #[must_use]
     pub fn advanced_recovery_enabled(&self) -> bool {
         self.inner.advanced_recovery_enabled
+    }
+
+    /// Install the deployment-wide organization group nesting bound (issue #97).
+    ///
+    /// The boot path is the only caller and passes `organizations.max_group_depth`
+    /// straight from the loaded config. A BUILDER rather than an [`AdminConfig`] field
+    /// because the setting lives in the `[organizations]` section, not `[admin]`:
+    /// duplicating it under `[admin]` would give one bound two operator-visible names
+    /// that could disagree. The value is clamped to
+    /// [`ironauth_config::ORGANIZATIONS_MAX_GROUP_DEPTH_CEILING`] here as defense in
+    /// depth (config load already refuses a larger one, and the store clamps its own
+    /// parameter again regardless of what this passes).
+    ///
+    /// This bounds tree DEPTH, which is what makes the ancestor walk on the
+    /// token-issuance path terminate. It caps nothing that is counted: the number of
+    /// groups, roles, members, and assignments an organization may hold is uncapped by
+    /// covenant.
+    #[must_use]
+    pub fn with_max_group_depth(mut self, max_group_depth: u32) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.max_group_depth =
+                max_group_depth.min(ironauth_config::ORGANIZATIONS_MAX_GROUP_DEPTH_CEILING);
+        }
+        self
+    }
+
+    /// The configured organization group nesting bound (issue #97), passed to every
+    /// group create and reparent. Defaults to
+    /// [`ironauth_config::ORGANIZATIONS_DEFAULT_MAX_GROUP_DEPTH`] when the boot path
+    /// installed nothing, so a state built directly (for example in a test) matches
+    /// the shipped default rather than zero.
+    #[must_use]
+    pub fn max_group_depth(&self) -> u32 {
+        self.inner.max_group_depth
     }
 
     /// Share the inbound lazy-migration hook (issue #56) with the management plane, so the
