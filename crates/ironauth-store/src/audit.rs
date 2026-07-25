@@ -244,6 +244,55 @@ pub enum Action {
     /// audit row's operator-safe `detail` records the new parent (or its absence),
     /// so the whole shape of the tree is reconstructable from the audit log alone.
     OrganizationGroupReparent,
+    /// An organization MEMBERSHIP was bound into a GROUP (issue #97). The target
+    /// is the new binding. The subject is a membership, never a bare user, so this
+    /// action can only ever appear for someone who is already in the organization.
+    OrganizationGroupMemberAdd,
+    /// An organization membership was UNBOUND from a group (issue #97): a soft
+    /// delete that retains the row, so the audit foreign key to it stays
+    /// satisfiable and the (group, member) pair is free again. The target is the
+    /// removed binding. A binding removed as part of the membership cascade is NOT
+    /// reported here (it is not individually addressed by the request that caused
+    /// it); see [`Action::OrganizationMembershipAttachmentsRevoke`].
+    OrganizationGroupMemberRemove,
+    /// A role was GRANTED to a group (issue #97). The target is the new
+    /// assignment. Its blast radius is not the target row: every live member of
+    /// that group and of every DESCENDANT of it gains the role at their next token
+    /// issuance, because roles flow down the group forest.
+    OrganizationGroupRoleAssign,
+    /// A role was WITHDRAWN from a group (issue #97): a soft delete that retains
+    /// the row, so the audit foreign key to it stays satisfiable and the (group,
+    /// role) pair is free again. The target is the withdrawn assignment. Its blast
+    /// radius is the same descendant set the assignment had.
+    OrganizationGroupRoleUnassign,
+    /// A role was GRANTED DIRECTLY to one organization membership, with no group
+    /// involved (issue #97). The target is the new assignment, and its blast
+    /// radius really is just that one membership.
+    OrganizationMembershipRoleAssign,
+    /// A direct role grant was WITHDRAWN from an organization membership (issue
+    /// #97): a soft delete that retains the row, so the audit foreign key to it
+    /// stays satisfiable and the (membership, role) pair is free again. The target
+    /// is the withdrawn assignment. A grant withdrawn as part of the membership
+    /// cascade is NOT reported here; see
+    /// [`Action::OrganizationMembershipAttachmentsRevoke`].
+    OrganizationMembershipRoleUnassign,
+    /// A membership's group bindings and DIRECT role grants were revoked wholesale
+    /// as a side effect of the membership itself changing hands (issue #97): the
+    /// membership was removed, or a previously removed membership was REVIVED by a
+    /// re-add or by an invitation accept.
+    ///
+    /// Its own action rather than a burst of per-row remove and unassign events,
+    /// deliberately. The revoked rows are not individually addressed by the request
+    /// that caused them to disappear, so reporting them as ordinary removals would
+    /// claim an operator asked for each one; and an organization may hold unlimited
+    /// groups and assignments by covenant, so a per-row burst would make one
+    /// membership removal write an unbounded number of audit rows. The target is
+    /// the MEMBERSHIP, and the audit row's operator-safe `detail` carries the
+    /// COUNTS of what was stripped (`groups=<n>,roles=<n>`), which are structural
+    /// numbers and never tenant data. The row is written only when the cascade
+    /// actually revoked something, so an ordinary add of a never-before-seen member
+    /// does not pollute the log with an empty cascade.
+    OrganizationMembershipAttachmentsRevoke,
     /// An authorization code and its grant were issued (issue #12).
     AuthorizationCodeIssue,
     /// An authorization code was redeemed at the token endpoint (issue #12).
@@ -1046,6 +1095,15 @@ impl Action {
             Action::OrganizationGroupUpdate => "organization.group.update",
             Action::OrganizationGroupDelete => "organization.group.delete",
             Action::OrganizationGroupReparent => "organization.group.reparent",
+            Action::OrganizationGroupMemberAdd => "organization.group.member.add",
+            Action::OrganizationGroupMemberRemove => "organization.group.member.remove",
+            Action::OrganizationGroupRoleAssign => "organization.group.role.assign",
+            Action::OrganizationGroupRoleUnassign => "organization.group.role.unassign",
+            Action::OrganizationMembershipRoleAssign => "organization.membership.role.assign",
+            Action::OrganizationMembershipRoleUnassign => "organization.membership.role.unassign",
+            Action::OrganizationMembershipAttachmentsRevoke => {
+                "organization.membership.attachments.revoke"
+            }
             Action::AuthorizationCodeIssue => "authorization_code.issue",
             Action::AuthorizationCodeRedeem => "authorization_code.redeem",
             Action::AuthorizationCodeReuse => "authorization_code.reuse",

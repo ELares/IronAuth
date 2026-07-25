@@ -45,6 +45,7 @@
 //! audit. This is enforcement by construction at the module boundary, not
 //! handler discipline spread across the codebase.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::time::{Duration, SystemTime};
 
@@ -85,8 +86,9 @@ use crate::id::{
     ExternalIssuerId, FedcmNonceId, FederationLoginStateId, FlowId, FlowVersionId,
     FlowVersionPinId, GrantId, InitialAccessTokenId, InvitationId, IssuedTokenId, KekId,
     LocaleBundleId, MagicLinkTokenId, ManagementKeyId, Mds3BlobCacheId, MigrationRunId,
-    MigrationRunRecordId, OperatorId, OrgConnectionId, OrgGroupId, OrgMembershipId, OrgRoleId,
-    OrganizationId, PowChallengeId, PushedRequestId, RecoveryApprovalId, RecoveryCodeId,
+    MigrationRunRecordId, OperatorId, OrgConnectionId, OrgGroupId, OrgGroupMemberId,
+    OrgGroupRoleId, OrgMembershipId, OrgMembershipRoleId, OrgRoleId, OrganizationId,
+    PowChallengeId, PushedRequestId, RecoveryApprovalId, RecoveryCodeId,
     RecoveryContactConfirmationId, RecoveryFlowId, RecoveryIdvSessionId, RecoveryTrustedContactId,
     RefreshFamilyId, RefreshTokenId, ResourceServerId, RiskDecisionId, RiskDisavowalId,
     RiskLoginGeoId, RiskSignalId, RoutingRuleId, ScopeStepUpPolicyId, ServiceAccountId,
@@ -331,6 +333,46 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn org_groups(&self) -> OrgGroupRepo<'a> {
         OrgGroupRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only organization group-member repository for this scope on the
+    /// DATA plane (issue #97). Migration 0088 grants the data-plane SELECT on
+    /// `org_group_members` (and nothing else), because this table is the SEED of
+    /// effective-role resolution on the token-issuance path. There is deliberately
+    /// no MUTATING data-plane counterpart: nothing on the data plane ever binds a
+    /// membership into a group.
+    #[must_use]
+    pub fn org_group_members(&self) -> OrgGroupMemberRepo<'a> {
+        OrgGroupMemberRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only organization group-role repository for this scope on the DATA
+    /// plane (issue #97). Migration 0089 grants the data-plane SELECT on
+    /// `org_group_roles` (and nothing else): it is the INHERITED half of the
+    /// effective-role answer. There is deliberately no MUTATING data-plane
+    /// counterpart.
+    #[must_use]
+    pub fn org_group_roles(&self) -> OrgGroupRoleRepo<'a> {
+        OrgGroupRoleRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only DIRECT membership-role repository for this scope on the DATA
+    /// plane (issue #97). Migration 0089 grants the data-plane SELECT on
+    /// `org_membership_roles` (and nothing else): it is the DIRECT half of the
+    /// effective-role answer. There is deliberately no MUTATING data-plane
+    /// counterpart.
+    #[must_use]
+    pub fn org_membership_roles(&self) -> OrgMembershipRoleRepo<'a> {
+        OrgMembershipRoleRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -29730,7 +29772,21 @@ impl ActingInvitationRepo<'_> {
                     )
                     .await
                     {
-                        Ok(live_id) => {
+                        Ok(live) => {
+                            // CASCADE SITE 3 of 3 (issue #97), and the one a change
+                            // wired only into the admin path would miss. A REVIVED
+                            // membership keeps its original id, so without this an
+                            // administrator could remove a compromised user and the
+                            // user could restore every group binding and every direct
+                            // role grant simply by redeeming an invitation they were
+                            // sent earlier, with nobody performing a grant. See
+                            // `revoke_membership_attachments`.
+                            if live.revived {
+                                revoke_membership_attachments_audited(
+                                    tx, store, scope, &acting, env, &live.id, now_micros,
+                                )
+                                .await?;
+                            }
                             insert_audit_row(
                                 tx,
                                 &AuditedWrite {
@@ -29739,7 +29795,7 @@ impl ActingInvitationRepo<'_> {
                                     acting: &acting,
                                     env,
                                     action: Action::OrganizationMembershipAdd,
-                                    target: &live_id,
+                                    target: &live.id,
                                 },
                                 None,
                             )
@@ -31589,6 +31645,113 @@ pub struct NewOrgGroup<'a> {
     pub metadata: Option<&'a serde_json::Value>,
 }
 
+/// An organization group-member row (issue #97): one organization MEMBERSHIP bound
+/// into one group of the same organization. Only LIVE (not soft-deleted) bindings
+/// are ever reconstructed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgGroupMemberRecord {
+    /// The binding identifier (`gmb_...`, embeds its `(tenant, environment)`).
+    pub id: OrgGroupMemberId,
+    /// The organization both endpoints belong to (`org_...`).
+    pub organization_id: OrganizationId,
+    /// The group the membership is bound into (`grp_...`).
+    pub group_id: OrgGroupId,
+    /// The organization membership bound into the group (`omb_...`), never a bare
+    /// user id: being in a group presupposes being in the organization.
+    pub membership_id: OrgMembershipId,
+    /// Creation time in microseconds since the Unix epoch (the pagination key).
+    pub created_at_unix_micros: i64,
+    /// Last-modification time in microseconds since the Unix epoch.
+    pub updated_at_unix_micros: i64,
+}
+
+/// Everything a group-member add needs, bundled so the repository method stays
+/// within the readable-argument-count lint (issue #97).
+#[derive(Debug, Clone, Copy)]
+pub struct NewOrgGroupMember<'a> {
+    /// The binding id (minted by the caller, embeds this scope).
+    pub id: &'a OrgGroupMemberId,
+    /// The organization both endpoints must belong to (an `org_` id in this scope).
+    pub organization_id: &'a OrganizationId,
+    /// The group to bind into. Must be a LIVE group of `organization_id`; anything
+    /// else (absent, soft-deleted, foreign scope, foreign organization) is the
+    /// uniform [`StoreError::NotFound`].
+    pub group_id: &'a OrgGroupId,
+    /// The membership to bind. Must be a LIVE membership of `organization_id`,
+    /// under the same uniform not-found.
+    pub membership_id: &'a OrgMembershipId,
+}
+
+/// An organization group-role row (issue #97): one role granted to one group, and
+/// through the group forest to every member of every DESCENDANT of that group. Only
+/// LIVE (not soft-deleted) assignments are ever reconstructed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgGroupRoleRecord {
+    /// The assignment identifier (`grl_...`, embeds its `(tenant, environment)`).
+    pub id: OrgGroupRoleId,
+    /// The organization both endpoints belong to (`org_...`).
+    pub organization_id: OrganizationId,
+    /// The group the role is granted to (`grp_...`).
+    pub group_id: OrgGroupId,
+    /// The role granted (`rol_...`).
+    pub role_id: OrgRoleId,
+    /// Creation time in microseconds since the Unix epoch (the pagination key).
+    pub created_at_unix_micros: i64,
+    /// Last-modification time in microseconds since the Unix epoch.
+    pub updated_at_unix_micros: i64,
+}
+
+/// Everything a group-role assignment needs, bundled so the repository method stays
+/// within the readable-argument-count lint (issue #97).
+#[derive(Debug, Clone, Copy)]
+pub struct NewOrgGroupRole<'a> {
+    /// The assignment id (minted by the caller, embeds this scope).
+    pub id: &'a OrgGroupRoleId,
+    /// The organization both endpoints must belong to (an `org_` id in this scope).
+    pub organization_id: &'a OrganizationId,
+    /// The group to grant to. Must be a LIVE group of `organization_id`; anything
+    /// else is the uniform [`StoreError::NotFound`].
+    pub group_id: &'a OrgGroupId,
+    /// The role to grant. Must be a LIVE role of `organization_id`, under the same
+    /// uniform not-found.
+    pub role_id: &'a OrgRoleId,
+}
+
+/// A direct organization membership-role row (issue #97): one role granted to
+/// exactly one membership, with no group involved. Only LIVE (not soft-deleted)
+/// assignments are ever reconstructed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgMembershipRoleRecord {
+    /// The assignment identifier (`mrl_...`, embeds its `(tenant, environment)`).
+    pub id: OrgMembershipRoleId,
+    /// The organization both endpoints belong to (`org_...`).
+    pub organization_id: OrganizationId,
+    /// The membership the role is granted to (`omb_...`).
+    pub membership_id: OrgMembershipId,
+    /// The role granted (`rol_...`).
+    pub role_id: OrgRoleId,
+    /// Creation time in microseconds since the Unix epoch (the pagination key).
+    pub created_at_unix_micros: i64,
+    /// Last-modification time in microseconds since the Unix epoch.
+    pub updated_at_unix_micros: i64,
+}
+
+/// Everything a direct membership-role assignment needs, bundled so the repository
+/// method stays within the readable-argument-count lint (issue #97).
+#[derive(Debug, Clone, Copy)]
+pub struct NewOrgMembershipRole<'a> {
+    /// The assignment id (minted by the caller, embeds this scope).
+    pub id: &'a OrgMembershipRoleId,
+    /// The organization both endpoints must belong to (an `org_` id in this scope).
+    pub organization_id: &'a OrganizationId,
+    /// The membership to grant to. Must be a LIVE membership of `organization_id`;
+    /// anything else is the uniform [`StoreError::NotFound`].
+    pub membership_id: &'a OrgMembershipId,
+    /// The role to grant. Must be a LIVE role of `organization_id`, under the same
+    /// uniform not-found.
+    pub role_id: &'a OrgRoleId,
+}
+
 /// The control-plane entry point: reads and the acting door for writes.
 ///
 /// Reached through [`Store::management`]. Its pool must authenticate as
@@ -31673,6 +31836,36 @@ impl<'a> ManagementStore<'a> {
     #[must_use]
     pub fn org_groups(&self, scope: Scope) -> OrgGroupRepo<'a> {
         OrgGroupRepo {
+            store: self.store,
+            scope,
+        }
+    }
+
+    /// The read-only organization group-member repository for `scope` (issue #97):
+    /// who is in a group, and which groups a membership belongs to.
+    #[must_use]
+    pub fn org_group_members(&self, scope: Scope) -> OrgGroupMemberRepo<'a> {
+        OrgGroupMemberRepo {
+            store: self.store,
+            scope,
+        }
+    }
+
+    /// The read-only organization group-role repository for `scope` (issue #97):
+    /// which roles a group grants, and which groups grant a role.
+    #[must_use]
+    pub fn org_group_roles(&self, scope: Scope) -> OrgGroupRoleRepo<'a> {
+        OrgGroupRoleRepo {
+            store: self.store,
+            scope,
+        }
+    }
+
+    /// The read-only DIRECT membership-role repository for `scope` (issue #97):
+    /// which roles a membership holds directly, and which memberships hold a role.
+    #[must_use]
+    pub fn org_membership_roles(&self, scope: Scope) -> OrgMembershipRoleRepo<'a> {
+        OrgMembershipRoleRepo {
             store: self.store,
             scope,
         }
@@ -31809,6 +32002,39 @@ impl<'a> ActingManagementStore<'a> {
     #[must_use]
     pub fn org_groups(&self, scope: Scope) -> ActingOrgGroupRepo<'a> {
         ActingOrgGroupRepo {
+            store: self.store,
+            acting: self.acting,
+            scope,
+        }
+    }
+
+    /// The mutating organization group-member repository for `scope` (issue #97):
+    /// bind a membership into a group and unbind it, each audited.
+    #[must_use]
+    pub fn org_group_members(&self, scope: Scope) -> ActingOrgGroupMemberRepo<'a> {
+        ActingOrgGroupMemberRepo {
+            store: self.store,
+            acting: self.acting,
+            scope,
+        }
+    }
+
+    /// The mutating organization group-role repository for `scope` (issue #97):
+    /// grant a role to a group and withdraw it, each audited.
+    #[must_use]
+    pub fn org_group_roles(&self, scope: Scope) -> ActingOrgGroupRoleRepo<'a> {
+        ActingOrgGroupRoleRepo {
+            store: self.store,
+            acting: self.acting,
+            scope,
+        }
+    }
+
+    /// The mutating DIRECT membership-role repository for `scope` (issue #97):
+    /// grant a role straight to one membership and withdraw it, each audited.
+    #[must_use]
+    pub fn org_membership_roles(&self, scope: Scope) -> ActingOrgMembershipRoleRepo<'a> {
+        ActingOrgMembershipRoleRepo {
             store: self.store,
             acting: self.acting,
             scope,
@@ -32536,6 +32762,831 @@ impl OrgGroupRepo<'_> {
         tx.commit().await?;
         rows.iter()
             .map(|row| org_group_from_row(row, &self.scope))
+            .collect()
+    }
+
+    /// The deterministic EFFECTIVE ROLE SET for one user in one organization
+    /// (issue #97): the union of the roles assigned DIRECTLY to their membership,
+    /// the roles assigned to every group they are a live member of, and the roles
+    /// assigned to every ANCESTOR of those groups, up to `max_group_depth`.
+    ///
+    /// This is the read the token-issuance path performs, so read the whole
+    /// contract before changing it.
+    ///
+    /// # Determinism
+    ///
+    /// Returns role SLUGS, not ids: a slug is immutable by GRANT and stable across
+    /// a rename, so an authorization decision never changes because an operator
+    /// edited a display name, and a slug survives a promotion between environments
+    /// where an id would not. The result is a [`BTreeSet`], and the query itself is
+    /// `SELECT DISTINCT ... ORDER BY`, so the order is total and two evaluations
+    /// against identical stored state produce BYTE-IDENTICAL output. A later PR
+    /// emits this set into a token claim, so that stability is load-bearing rather
+    /// than cosmetic: tests assert equality of the whole set, not membership.
+    ///
+    /// # Fails closed, and quietly
+    ///
+    /// A user with no LIVE, ACTIVE membership in `organization_id` resolves to the
+    /// EMPTY set, never an error and never a partial set. Soft-deleted roles,
+    /// groups, group bindings, and assignments are all excluded: every table in the
+    /// query carries `deleted_at IS NULL`. A store fault is a genuine `Err` that the
+    /// caller must NOT swallow into an empty set, because on the mint path an empty
+    /// set is a silent authorization DOWNGRADE that looks exactly like a user who
+    /// legitimately holds nothing.
+    ///
+    /// The organization's own lifecycle STATE is deliberately not re-checked here:
+    /// the mint path refuses a disabled organization before it ever reaches
+    /// resolution, and duplicating that check would put two answers to one question
+    /// in two places.
+    ///
+    /// # Termination
+    ///
+    /// The ancestor walk carries a hard `depth < max_group_depth` guard AND
+    /// filters `deleted_at IS NULL` in EVERY arm, seed and recursive alike. Both are
+    /// load-bearing. The LIVE graph the write path validates is acyclic, but the
+    /// STORED rows may contain a cycle THROUGH A SOFT-DELETED NODE (delete DETACHES
+    /// rather than cascades, so a `parent_id` may name a dead group; see
+    /// [`ActingOrgGroupRepo::delete`] for the worked example). A walk that dropped
+    /// the liveness filter would traverse that cycle, and without the depth guard it
+    /// would not terminate. On the token-issuance path that is an outage, not a bug
+    /// report.
+    ///
+    /// The seed itself is depth 0, so the walk reaches the member's own groups plus
+    /// `max_group_depth` levels of ancestor above them: exactly the whole of any
+    /// chain the write path would have allowed, and no more.
+    ///
+    /// Reads TRUNCATE where writes REFUSE, deliberately and asymmetrically. A write
+    /// that would breach the bound is rejected; a read that meets an over-deep or
+    /// cyclic graph (which an import, or an operator LOWERING the bound, can leave
+    /// behind) stops at the bound and returns what it found. Refusing here would
+    /// turn a data defect into a total authentication outage, and truncation is safe
+    /// in the direction that matters: it can only ever omit roles, never invent one.
+    ///
+    /// # Scope and organization fencing
+    ///
+    /// Every arm repeats `tenant_id` and `environment_id` above the forced
+    /// row-level-security policy, so the recursive walk cannot leave this tenant
+    /// even if a corrupt `parent_id` pointed outside it; and every arm repeats
+    /// `organization_id`, which is the ONLY thing fencing the organization, because
+    /// the policy fences `(tenant, environment)` and nothing finer.
+    ///
+    /// `max_group_depth` is clamped to [`ORG_GROUP_MAX_DEPTH_CEILING`] regardless of
+    /// what the caller passed, so even a miswired caller cannot put an unbounded
+    /// walk on the mint path.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if either id is out of this repository's scope (a
+    /// programming error on the mint path, where both ids come from the bound scope,
+    /// so it is reported LOUDLY rather than as an empty set);
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn effective_roles(
+        &self,
+        organization_id: &OrganizationId,
+        user_id: &UserId,
+        max_group_depth: u32,
+    ) -> Result<BTreeSet<String>, StoreError> {
+        let rows = self
+            .resolve_effective(
+                organization_id,
+                user_id,
+                max_group_depth,
+                EFFECTIVE_ROLE_SLUGS_TAIL,
+            )
+            .await?;
+        Ok(rows)
+    }
+
+    /// The deterministic EFFECTIVE GROUP SET for one user in one organization
+    /// (issue #97): the slugs of every group they are a live member of, UNION every
+    /// ANCESTOR of those groups up to `max_group_depth`.
+    ///
+    /// The transitive closure FLATTENED, deliberately, and shared with
+    /// [`OrgGroupRepo::effective_roles`] down to the same recursive CTE so the two
+    /// can never disagree about what "ancestor" means. A consumer that tested only
+    /// direct membership would have to walk parent pointers itself, and a consumer
+    /// that walked parent pointers itself would be the second definition of
+    /// ancestry in the codebase.
+    ///
+    /// Everything said about [`OrgGroupRepo::effective_roles`] applies here
+    /// unchanged: slugs not ids, a [`BTreeSet`] for byte-stable order, the empty set
+    /// for a user with no live active membership, soft-deleted rows excluded, the
+    /// bounded walk that truncates rather than looping, and the tenant, environment,
+    /// and organization fencing repeated in every arm.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if either id is out of this repository's scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn effective_group_slugs(
+        &self,
+        organization_id: &OrganizationId,
+        user_id: &UserId,
+        max_group_depth: u32,
+    ) -> Result<BTreeSet<String>, StoreError> {
+        self.resolve_effective(
+            organization_id,
+            user_id,
+            max_group_depth,
+            EFFECTIVE_GROUP_SLUGS_TAIL,
+        )
+        .await
+    }
+
+    /// Run one effective-resolution statement: the shared bounded closure CTE
+    /// ([`EFFECTIVE_CLOSURE_CTE`]) followed by `tail`, and collect its single `slug`
+    /// column into a [`BTreeSet`].
+    ///
+    /// One private entry point so both public resolutions share ONE definition of
+    /// the membership seed, the ancestor walk, and the depth bound. `tail` selects
+    /// which projection runs over that closure and is a `&'static str` chosen from
+    /// two module constants, never anything a caller supplies, so no part of this
+    /// statement is caller-authored SQL.
+    async fn resolve_effective(
+        &self,
+        organization_id: &OrganizationId,
+        user_id: &UserId,
+        max_group_depth: u32,
+        tail: &'static str,
+    ) -> Result<BTreeSet<String>, StoreError> {
+        if organization_id.scope() != self.scope || user_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        // The read bound is `max_group_depth`, NOT the `max_group_depth + 1` the two
+        // WRITE walks use, and the one-level difference is deliberate in both
+        // directions. A write must SEE one level past the bound so a saturated walk
+        // always yields a refusal; a read must never GRANT past it, because whatever
+        // it reaches becomes an authorization decision. Bounded this way the two
+        // agree on every well-formed tree: a legal chain of depth `max_group_depth`
+        // is walked to its root, and `max_group_depth = 0` means FLAT GROUPS ONLY,
+        // which is exactly what the setting's documentation promises and what a
+        // read bound of `+ 1` would quietly break by inheriting one level anyway.
+        //
+        // The clamp is defense in depth against a miswired caller.
+        let walk_bound = i64::from(max_group_depth.min(ORG_GROUP_MAX_DEPTH_CEILING));
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(&format!("{EFFECTIVE_CLOSURE_CTE}{tail}"))
+            .bind(self.scope.tenant().to_string())
+            .bind(self.scope.environment().to_string())
+            .bind(organization_id.to_string())
+            .bind(user_id.to_string())
+            .bind(walk_bound)
+            .fetch_all(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        // A BTreeSet rather than the Vec the ORDER BY already sorted: the SQL order
+        // and the collection order must agree even if a future edit to either drifts,
+        // and a set makes the deduplication of a role reachable by several paths
+        // structural rather than a property of DISTINCT.
+        Ok(rows
+            .iter()
+            .map(|row| row.get::<String, _>("slug"))
+            .collect())
+    }
+}
+
+/// The shared bounded closure both effective-resolution reads run (issue #97): the
+/// caller's LIVE ACTIVE membership in the organization, and the transitive ANCESTOR
+/// closure of every group that membership is a live member of.
+///
+/// This is the read side of the group hierarchy, and it runs on the TOKEN-ISSUANCE
+/// path, so three properties are load-bearing rather than stylistic.
+///
+///   1. `deleted_at IS NULL` in EVERY arm, seed and recursive alike. The LIVE graph
+///      is a forest; the STORED rows are not necessarily, because a group delete
+///      DETACHES rather than cascades and a `parent_id` may therefore name a dead
+///      group that itself points back down into the live set. Filtering dead rows is
+///      what makes this walk traverse the same graph the write path validates.
+///   2. The explicit `c.depth < $5` guard. `UNION ALL` is used rather than `UNION`
+///      (whose set semantics would also terminate a cycle) so the work bound is an
+///      explicit, testable predicate rather than an emergent property. With the
+///      filter in point 1 the guard is redundant on well-formed data and is kept
+///      precisely for the data that is not well-formed: an import, or an operator
+///      lowering the bound under a populated environment.
+///   3. `tenant_id`, `environment_id`, AND `organization_id` repeated in every arm.
+///      The first two sit above the forced row-level-security policy (belt and
+///      braces, the module-wide convention); the third has no policy behind it at
+///      all and is the only thing keeping one organization's walk out of a sibling
+///      organization's groups inside one environment. On the RECURSIVE arm that
+///      third predicate is LOAD BEARING rather than defense in depth, because
+///      `parent_id` is an untrusted stored pointer: deleting it really does change an
+///      answer, and
+///      `the_read_walk_never_crosses_organization_via_a_corrupt_parent` is the test
+///      that says so. [`EFFECTIVE_ROLE_SLUGS_TAIL`] carries the full census of which
+///      organization predicates around here are redundant and which are not.
+///
+/// Binds: `$1` tenant, `$2` environment, `$3` organization, `$4` user, `$5` the walk
+/// bound (`max_group_depth`, one LOWER than the write walks use; see
+/// [`OrgGroupRepo::effective_roles`] for why a read must not reach a level a write
+/// would refuse). A runtime `sqlx::query` string, never a compile-time macro, so the
+/// database-free lanes stay database-free.
+const EFFECTIVE_CLOSURE_CTE: &str = "WITH RECURSIVE membership AS ( \
+         SELECT m.id \
+           FROM org_memberships m \
+          WHERE m.tenant_id = $1 AND m.environment_id = $2 \
+            AND m.organization_id = $3 AND m.user_id = $4 \
+            AND m.state = 'active' AND m.deleted_at IS NULL \
+     ), \
+     closure AS ( \
+         SELECT g.id, g.parent_id, g.slug, 0::bigint AS depth \
+           FROM org_groups g \
+           JOIN org_group_members gm ON gm.group_id = g.id \
+           JOIN membership mb ON mb.id = gm.membership_id \
+          WHERE gm.tenant_id = $1 AND gm.environment_id = $2 \
+            AND gm.organization_id = $3 AND gm.deleted_at IS NULL \
+            AND g.tenant_id = $1 AND g.environment_id = $2 \
+            AND g.organization_id = $3 AND g.deleted_at IS NULL \
+         UNION ALL \
+         SELECT g.id, g.parent_id, g.slug, c.depth + 1 \
+           FROM org_groups g \
+           JOIN closure c ON g.id = c.parent_id \
+          WHERE g.tenant_id = $1 AND g.environment_id = $2 \
+            AND g.organization_id = $3 AND g.deleted_at IS NULL \
+            AND c.depth < $5 \
+     ) ";
+
+/// The projection [`OrgGroupRepo::effective_roles`] runs over
+/// [`EFFECTIVE_CLOSURE_CTE`]: every LIVE role of the organization granted either
+/// DIRECTLY to the membership or to any group in the ancestor closure.
+///
+/// The union is expressed as two `IN` subqueries over one `org_roles` scan rather
+/// than as a `UNION` of two role sets, so a role reachable by SEVERAL paths (direct
+/// AND via two different groups, say) collapses to exactly one row without relying
+/// on a set operator to deduplicate. `DISTINCT` plus `ORDER BY r.slug` makes the
+/// result already sorted and deduplicated before the [`BTreeSet`] sees it.
+///
+/// # The organization predicates: FIVE mutually redundant survivors, and one that is not
+///
+/// This statement and the closure it runs over repeat `organization_id` in six places,
+/// and FIVE of them are redundant WITH RESPECT TO EACH OTHER: deleting any one of them
+/// ALONE changes no answer and no test can distinguish its presence, because the
+/// others still fence the same rows under the write path's invariant that every
+/// assignment resolves BOTH of its endpoints as live rows of ONE organization. All
+/// five are retained deliberately and are named here in full, so that nobody removes
+/// one as dead weight and so that this note cannot be read as covering only the first:
+///
+///   * `r.organization_id` below, on the role row itself;
+///   * `gm.organization_id` and `g.organization_id` in the SEED arm of
+///     [`EFFECTIVE_CLOSURE_CTE`];
+///   * `mr.organization_id` in the direct-grant subquery below;
+///   * `gr.organization_id` in the group-grant subquery below.
+///
+/// Together they are the layer under that write-time invariant: if a future write path
+/// ever admitted a cross-organization assignment, these are what would keep the
+/// resulting role out of a token instead of quietly emitting it.
+///
+/// The SIXTH is NOT of this kind and must not be filed with them. `g.organization_id`
+/// in the RECURSIVE arm of [`EFFECTIVE_CLOSURE_CTE`] is the only thing fencing the
+/// organization on the ancestor walk, and `parent_id` is an UNTRUSTED stored pointer
+/// (a group delete DETACHES, so a stored parent may name a row the live invariant
+/// never re-validated, and the column's foreign key is id only). Removing it lets a
+/// sibling organization's group into the closure, and therefore its name into the
+/// group set a token carries;
+/// `the_read_walk_never_crosses_organization_via_a_corrupt_parent` is the test that
+/// holds it in place.
+///
+/// # The liveness filters are not redundant either
+///
+/// `r.deleted_at IS NULL` here: a role can be soft-deleted while its assignment rows
+/// stay live, which is the ordinary state after a role delete.
+///
+/// `gr.deleted_at IS NULL` in the group-grant subquery has no second layer behind it
+/// at all, and its removal is observable in an entirely ordinary state rather than in
+/// a corrupt one. Without it an operator who withdraws a role from a group sees the
+/// `organization.group.role.unassign` audit row and sees the grant leave
+/// `list_for_group`, while every live member of that group AND of every DESCENDANT
+/// keeps receiving the role in `effective_roles`, and therefore in the access token,
+/// forever. Rules 2 and 3 of
+/// `resolution_excludes_every_soft_deleted_row_on_the_path` are what say so.
+const EFFECTIVE_ROLE_SLUGS_TAIL: &str = "SELECT DISTINCT r.slug AS slug \
+       FROM org_roles r \
+      WHERE r.tenant_id = $1 AND r.environment_id = $2 \
+        AND r.organization_id = $3 AND r.deleted_at IS NULL \
+        AND ( \
+             r.id IN ( \
+                 SELECT mr.role_id \
+                   FROM org_membership_roles mr \
+                   JOIN membership mb ON mb.id = mr.membership_id \
+                  WHERE mr.tenant_id = $1 AND mr.environment_id = $2 \
+                    AND mr.organization_id = $3 AND mr.deleted_at IS NULL \
+             ) \
+          OR r.id IN ( \
+                 SELECT gr.role_id \
+                   FROM org_group_roles gr \
+                  WHERE gr.tenant_id = $1 AND gr.environment_id = $2 \
+                    AND gr.organization_id = $3 AND gr.deleted_at IS NULL \
+                    AND gr.group_id IN (SELECT id FROM closure) \
+             ) \
+        ) \
+      ORDER BY r.slug";
+
+/// The projection [`OrgGroupRepo::effective_group_slugs`] runs over
+/// [`EFFECTIVE_CLOSURE_CTE`]: the FLATTENED closure itself.
+///
+/// The closure already carries each group's slug and is already fenced to live rows
+/// of this organization, so this needs no second visit to `org_groups`. `DISTINCT`
+/// collapses a group reached by several paths, which `UNION ALL` in the closure can
+/// legitimately produce.
+const EFFECTIVE_GROUP_SLUGS_TAIL: &str = "SELECT DISTINCT slug AS slug FROM closure ORDER BY slug";
+
+/// The projection every group-member read selects from `org_group_members` (the two
+/// timestamps as epoch microseconds). One constant so the get and list projections
+/// cannot drift.
+const ORG_GROUP_MEMBER_SELECT_COLUMNS: &str = "id, organization_id, group_id, membership_id, \
+     (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us, \
+     (EXTRACT(EPOCH FROM updated_at) * 1000000)::bigint AS updated_us";
+
+/// Read-only organization group members for one scope (issue #97).
+///
+/// Reached by the control plane through [`ManagementStore::org_group_members`] and
+/// by the data plane through [`ScopedStore::org_group_members`]. Every read is
+/// scope-fenced and filters `deleted_at IS NULL`, so a removed binding reads as
+/// absent, exactly like a binding of another scope, one of another organization, and
+/// one that never existed: the four cases are indistinguishable to a caller.
+pub struct OrgGroupMemberRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl OrgGroupMemberRepo<'_> {
+    /// Parse an untrusted group-member identifier under this scope. A malformed id
+    /// and one minted in another scope both return the uniform not-found.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if malformed or out of scope.
+    pub fn parse_id(&self, raw: &str) -> Result<OrgGroupMemberId, StoreError> {
+        Ok(OrgGroupMemberId::parse_in_scope(raw, &self.scope)?)
+    }
+
+    /// Fetch a live group binding by id, within scope.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no such live binding is visible in this scope.
+    pub async fn get(&self, id: &OrgGroupMemberId) -> Result<OrgGroupMemberRecord, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(&format!(
+            "SELECT {ORG_GROUP_MEMBER_SELECT_COLUMNS} FROM org_group_members \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND deleted_at IS NULL"
+        ))
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        org_group_member_from_row(&row, &self.scope)
+    }
+
+    /// Fetch a live group binding by id, requiring it to belong to `org_id`: the
+    /// read a nested management surface performs. A binding of ANOTHER organization
+    /// in the same scope is the uniform not-found, exactly like an absent one.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if either id is out of scope, or no such live
+    /// binding exists in that organization.
+    pub async fn get_in_org(
+        &self,
+        org_id: &OrganizationId,
+        id: &OrgGroupMemberId,
+    ) -> Result<OrgGroupMemberRecord, StoreError> {
+        if org_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let record = self.get(id).await?;
+        if &record.organization_id == org_id {
+            Ok(record)
+        } else {
+            Err(StoreError::NotFound)
+        }
+    }
+
+    /// One page of live bindings for one group, ordered by `(created_at, id)`: the
+    /// "who is in this group" list.
+    ///
+    /// `org_id` is part of the ADDRESS, not a hint: a group of a SIBLING
+    /// organization named under this organization's path matches nothing, so the
+    /// list can never be used to enumerate across organizations. A cross-scope id
+    /// matches nothing either, so the result is empty rather than an error.
+    ///
+    /// This list is PAGE-size clamped like every management list; there is no cap on
+    /// how many members a group may hold.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_for_group(
+        &self,
+        org_id: &OrganizationId,
+        group_id: &OrgGroupId,
+        limit: i64,
+        after: Option<&CursorPosition>,
+    ) -> Result<Vec<OrgGroupMemberRecord>, StoreError> {
+        if org_id.scope() != self.scope || group_id.scope() != self.scope {
+            return Ok(Vec::new());
+        }
+        self.list_by("group_id", org_id, &group_id.to_string(), limit, after)
+            .await
+    }
+
+    /// One page of live bindings for one membership, ordered by `(created_at, id)`:
+    /// the "which groups is this member in" list, and the same first hop
+    /// [`OrgGroupRepo::effective_roles`] seeds its ancestor walk from.
+    ///
+    /// `org_id` fences the organization exactly as it does for
+    /// [`OrgGroupMemberRepo::list_for_group`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_for_membership(
+        &self,
+        org_id: &OrganizationId,
+        membership_id: &OrgMembershipId,
+        limit: i64,
+        after: Option<&CursorPosition>,
+    ) -> Result<Vec<OrgGroupMemberRecord>, StoreError> {
+        if org_id.scope() != self.scope || membership_id.scope() != self.scope {
+            return Ok(Vec::new());
+        }
+        self.list_by(
+            "membership_id",
+            org_id,
+            &membership_id.to_string(),
+            limit,
+            after,
+        )
+        .await
+    }
+
+    /// The shared body of both group-member lists: one page of live bindings of
+    /// `org_id` whose `column` equals `value`.
+    ///
+    /// `column` is a `&'static str` chosen from two literals in this module, never
+    /// anything a caller supplies, so no part of this statement is caller-authored
+    /// SQL. One body rather than two so the pagination key, the organization
+    /// predicate, the liveness filter, and the page clamp cannot drift between the
+    /// two lists.
+    async fn list_by(
+        &self,
+        column: &'static str,
+        org_id: &OrganizationId,
+        value: &str,
+        limit: i64,
+        after: Option<&CursorPosition>,
+    ) -> Result<Vec<OrgGroupMemberRecord>, StoreError> {
+        let (after_micros, after_id) = split_cursor(after);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {ORG_GROUP_MEMBER_SELECT_COLUMNS} FROM org_group_members \
+             WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
+             AND {column} = $4 AND deleted_at IS NULL \
+             AND ($5::bigint IS NULL OR (created_at, id) > \
+                  (TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval, $6::text)) \
+             ORDER BY created_at, id LIMIT $7"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(org_id.to_string())
+        .bind(value)
+        .bind(after_micros)
+        .bind(after_id)
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| org_group_member_from_row(row, &self.scope))
+            .collect()
+    }
+}
+
+/// The projection every group-role read selects from `org_group_roles`. One constant
+/// so the get and list projections cannot drift.
+const ORG_GROUP_ROLE_SELECT_COLUMNS: &str = "id, organization_id, group_id, role_id, \
+     (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us, \
+     (EXTRACT(EPOCH FROM updated_at) * 1000000)::bigint AS updated_us";
+
+/// Read-only organization group-role assignments for one scope (issue #97).
+///
+/// Reached by the control plane through [`ManagementStore::org_group_roles`] and by
+/// the data plane through [`ScopedStore::org_group_roles`]. Every read is
+/// scope-fenced and filters `deleted_at IS NULL`, so a withdrawn assignment reads as
+/// absent, exactly like one of another scope, one of another organization, and one
+/// that never existed.
+pub struct OrgGroupRoleRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl OrgGroupRoleRepo<'_> {
+    /// Parse an untrusted group-role identifier under this scope. A malformed id and
+    /// one minted in another scope both return the uniform not-found.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if malformed or out of scope.
+    pub fn parse_id(&self, raw: &str) -> Result<OrgGroupRoleId, StoreError> {
+        Ok(OrgGroupRoleId::parse_in_scope(raw, &self.scope)?)
+    }
+
+    /// Fetch a live group-role assignment by id, within scope.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no such live assignment is visible in this scope.
+    pub async fn get(&self, id: &OrgGroupRoleId) -> Result<OrgGroupRoleRecord, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(&format!(
+            "SELECT {ORG_GROUP_ROLE_SELECT_COLUMNS} FROM org_group_roles \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND deleted_at IS NULL"
+        ))
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        org_group_role_from_row(&row, &self.scope)
+    }
+
+    /// Fetch a live group-role assignment by id, requiring it to belong to `org_id`.
+    /// An assignment of ANOTHER organization in the same scope is the uniform
+    /// not-found, exactly like an absent one.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if either id is out of scope, or no such live
+    /// assignment exists in that organization.
+    pub async fn get_in_org(
+        &self,
+        org_id: &OrganizationId,
+        id: &OrgGroupRoleId,
+    ) -> Result<OrgGroupRoleRecord, StoreError> {
+        if org_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let record = self.get(id).await?;
+        if &record.organization_id == org_id {
+            Ok(record)
+        } else {
+            Err(StoreError::NotFound)
+        }
+    }
+
+    /// One page of live assignments for one group: the "which roles does this group
+    /// grant" list. `org_id` fences the organization, so a group of a sibling
+    /// organization matches nothing.
+    ///
+    /// There is no cap on how many roles a group may hold; the page size is clamped
+    /// like every management list.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_for_group(
+        &self,
+        org_id: &OrganizationId,
+        group_id: &OrgGroupId,
+        limit: i64,
+        after: Option<&CursorPosition>,
+    ) -> Result<Vec<OrgGroupRoleRecord>, StoreError> {
+        if org_id.scope() != self.scope || group_id.scope() != self.scope {
+            return Ok(Vec::new());
+        }
+        self.list_by("group_id", org_id, &group_id.to_string(), limit, after)
+            .await
+    }
+
+    /// One page of live assignments for one role: the "which groups grant this role"
+    /// list, and the blast-radius answer an operator wants BEFORE deleting a role.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_for_role(
+        &self,
+        org_id: &OrganizationId,
+        role_id: &OrgRoleId,
+        limit: i64,
+        after: Option<&CursorPosition>,
+    ) -> Result<Vec<OrgGroupRoleRecord>, StoreError> {
+        if org_id.scope() != self.scope || role_id.scope() != self.scope {
+            return Ok(Vec::new());
+        }
+        self.list_by("role_id", org_id, &role_id.to_string(), limit, after)
+            .await
+    }
+
+    /// The shared body of both group-role lists. `column` is a `&'static str` chosen
+    /// from two literals in this module, never caller-supplied.
+    async fn list_by(
+        &self,
+        column: &'static str,
+        org_id: &OrganizationId,
+        value: &str,
+        limit: i64,
+        after: Option<&CursorPosition>,
+    ) -> Result<Vec<OrgGroupRoleRecord>, StoreError> {
+        let (after_micros, after_id) = split_cursor(after);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {ORG_GROUP_ROLE_SELECT_COLUMNS} FROM org_group_roles \
+             WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
+             AND {column} = $4 AND deleted_at IS NULL \
+             AND ($5::bigint IS NULL OR (created_at, id) > \
+                  (TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval, $6::text)) \
+             ORDER BY created_at, id LIMIT $7"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(org_id.to_string())
+        .bind(value)
+        .bind(after_micros)
+        .bind(after_id)
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| org_group_role_from_row(row, &self.scope))
+            .collect()
+    }
+}
+
+/// The projection every direct membership-role read selects from
+/// `org_membership_roles`. One constant so the get and list projections cannot drift.
+const ORG_MEMBERSHIP_ROLE_SELECT_COLUMNS: &str = "id, organization_id, membership_id, role_id, \
+     (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us, \
+     (EXTRACT(EPOCH FROM updated_at) * 1000000)::bigint AS updated_us";
+
+/// Read-only DIRECT organization membership-role assignments for one scope (issue
+/// #97).
+///
+/// Reached by the control plane through [`ManagementStore::org_membership_roles`]
+/// and by the data plane through [`ScopedStore::org_membership_roles`]. Every read is
+/// scope-fenced and filters `deleted_at IS NULL`, so a withdrawn assignment reads as
+/// absent, exactly like one of another scope, one of another organization, and one
+/// that never existed.
+pub struct OrgMembershipRoleRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl OrgMembershipRoleRepo<'_> {
+    /// Parse an untrusted membership-role identifier under this scope. A malformed
+    /// id and one minted in another scope both return the uniform not-found.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if malformed or out of scope.
+    pub fn parse_id(&self, raw: &str) -> Result<OrgMembershipRoleId, StoreError> {
+        Ok(OrgMembershipRoleId::parse_in_scope(raw, &self.scope)?)
+    }
+
+    /// Fetch a live direct assignment by id, within scope.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no such live assignment is visible in this scope.
+    pub async fn get(
+        &self,
+        id: &OrgMembershipRoleId,
+    ) -> Result<OrgMembershipRoleRecord, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(&format!(
+            "SELECT {ORG_MEMBERSHIP_ROLE_SELECT_COLUMNS} FROM org_membership_roles \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND deleted_at IS NULL"
+        ))
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        org_membership_role_from_row(&row, &self.scope)
+    }
+
+    /// Fetch a live direct assignment by id, requiring it to belong to `org_id`. An
+    /// assignment of ANOTHER organization in the same scope is the uniform
+    /// not-found, exactly like an absent one.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if either id is out of scope, or no such live
+    /// assignment exists in that organization.
+    pub async fn get_in_org(
+        &self,
+        org_id: &OrganizationId,
+        id: &OrgMembershipRoleId,
+    ) -> Result<OrgMembershipRoleRecord, StoreError> {
+        if org_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let record = self.get(id).await?;
+        if &record.organization_id == org_id {
+            Ok(record)
+        } else {
+            Err(StoreError::NotFound)
+        }
+    }
+
+    /// One page of live direct assignments for one membership: the "which roles does
+    /// this member hold directly" list. `org_id` fences the organization.
+    ///
+    /// There is no cap on how many roles a membership may hold directly; the page
+    /// size is clamped like every management list.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_for_membership(
+        &self,
+        org_id: &OrganizationId,
+        membership_id: &OrgMembershipId,
+        limit: i64,
+        after: Option<&CursorPosition>,
+    ) -> Result<Vec<OrgMembershipRoleRecord>, StoreError> {
+        if org_id.scope() != self.scope || membership_id.scope() != self.scope {
+            return Ok(Vec::new());
+        }
+        self.list_by(
+            "membership_id",
+            org_id,
+            &membership_id.to_string(),
+            limit,
+            after,
+        )
+        .await
+    }
+
+    /// One page of live direct assignments for one role: the "which members hold
+    /// this role directly" list, and the other half of the blast-radius answer
+    /// before a role is deleted.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_for_role(
+        &self,
+        org_id: &OrganizationId,
+        role_id: &OrgRoleId,
+        limit: i64,
+        after: Option<&CursorPosition>,
+    ) -> Result<Vec<OrgMembershipRoleRecord>, StoreError> {
+        if org_id.scope() != self.scope || role_id.scope() != self.scope {
+            return Ok(Vec::new());
+        }
+        self.list_by("role_id", org_id, &role_id.to_string(), limit, after)
+            .await
+    }
+
+    /// The shared body of both direct-assignment lists. `column` is a `&'static str`
+    /// chosen from two literals in this module, never caller-supplied.
+    async fn list_by(
+        &self,
+        column: &'static str,
+        org_id: &OrganizationId,
+        value: &str,
+        limit: i64,
+        after: Option<&CursorPosition>,
+    ) -> Result<Vec<OrgMembershipRoleRecord>, StoreError> {
+        let (after_micros, after_id) = split_cursor(after);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {ORG_MEMBERSHIP_ROLE_SELECT_COLUMNS} FROM org_membership_roles \
+             WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
+             AND {column} = $4 AND deleted_at IS NULL \
+             AND ($5::bigint IS NULL OR (created_at, id) > \
+                  (TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval, $6::text)) \
+             ORDER BY created_at, id LIMIT $7"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(org_id.to_string())
+        .bind(value)
+        .bind(after_micros)
+        .bind(after_id)
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| org_membership_role_from_row(row, &self.scope))
             .collect()
     }
 }
@@ -34108,7 +35159,7 @@ impl ActingOrgMembershipRepo<'_> {
         // only known after the revive-or-insert runs, this inlines its own audited
         // transaction rather than using the target-up-front `write_audited` helper.
         let mut tx = begin_scoped(self.store, scope).await?;
-        let live_id = insert_or_revive_membership(
+        let live = insert_or_revive_membership(
             &mut tx,
             scope,
             &new_id,
@@ -34118,6 +35169,24 @@ impl ActingOrgMembershipRepo<'_> {
             created_at_micros,
         )
         .await?;
+        // CASCADE SITE 2 of 3 (issue #97): the admin re-add. A revived membership
+        // keeps its original id, so it would otherwise come back holding every group
+        // binding and direct role grant it held when it was removed. See
+        // `revoke_membership_attachments` for the whole argument and for why this is
+        // wired at each site rather than inside the revive-or-insert primitive.
+        // Skipped on a fresh insert, whose brand-new id nothing can reference yet.
+        if live.revived {
+            revoke_membership_attachments_audited(
+                &mut tx,
+                self.store,
+                scope,
+                &self.acting,
+                env,
+                &live.id,
+                created_at_micros,
+            )
+            .await?;
+        }
         insert_audit_row(
             &mut tx,
             &AuditedWrite {
@@ -34126,14 +35195,14 @@ impl ActingOrgMembershipRepo<'_> {
                 acting: &self.acting,
                 env,
                 action: Action::OrganizationMembershipAdd,
-                target: &live_id,
+                target: &live.id,
             },
             None,
         )
         .await?;
         insert_idempotency(&mut tx, idempotency).await?;
         tx.commit().await?;
-        Ok(live_id)
+        Ok(live.id)
     }
 
     /// Remove a membership (soft delete) in this scope and audit
@@ -34141,6 +35210,21 @@ impl ActingOrgMembershipRepo<'_> {
     /// (only the column-scoped `deleted_at` and `updated_at` are written), so the
     /// audit foreign key to it stays satisfiable. A repeat remove of an already
     /// removed membership matches no live row and is the uniform not-found.
+    ///
+    /// # The attachment cascade (issue #97)
+    ///
+    /// Removing a membership also REVOKES, in this same transaction, every live
+    /// group binding and every live DIRECT role grant that membership holds. An
+    /// administrator removing a compromised account expects its group memberships
+    /// and its roles to stop applying at that moment, not to linger until something
+    /// else notices; and because a membership row is REVIVED (keeping its id) when
+    /// the user is added back, attachments left behind would silently return with
+    /// it. When anything is revoked the cascade appends its own
+    /// `organization.membership.attachments.revoke` audit row carrying the counts,
+    /// so the removal's blast radius is legible from the audit log alone.
+    ///
+    /// This is one of THREE cascade sites; see [`revoke_membership_attachments`] for
+    /// the other two and for why a cascade wired only here would leave a hole.
     ///
     /// # Errors
     ///
@@ -34152,6 +35236,8 @@ impl ActingOrgMembershipRepo<'_> {
         }
         let scope = self.scope;
         let now_micros = epoch_micros(env.clock().now_utc());
+        let store = self.store;
+        let acting = self.acting;
         write_audited(
             AuditedWrite {
                 store: self.store,
@@ -34178,6 +35264,14 @@ impl ActingOrgMembershipRepo<'_> {
                 if result.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // CASCADE SITE 1 of 3 (issue #97): the admin removal. Guarded behind
+                // the row having actually been removed, so a repeat remove of an
+                // already-removed membership revokes nothing and stays the uniform
+                // not-found rather than becoming a second, unaudited stripping path.
+                revoke_membership_attachments_audited(
+                    tx, store, scope, &acting, env, id, now_micros,
+                )
+                .await?;
                 Ok(())
             },
             false,
@@ -34937,6 +36031,687 @@ impl ActingOrgGroupRepo<'_> {
     }
 }
 
+/// The mutating organization group-member repository (issue #97): bind an existing
+/// org membership into a group of the same organization, and unbind it, each audited
+/// in the same transaction as the write.
+///
+/// There is no count cap, quota, or paywall gate on group membership anywhere in
+/// this repository or in migration 0088. A group may hold unlimited members and a
+/// member may belong to unlimited groups (a project covenant).
+pub struct ActingOrgGroupMemberRepo<'a> {
+    store: &'a Store,
+    acting: ActingContext,
+    scope: Scope,
+}
+
+impl ActingOrgGroupMemberRepo<'_> {
+    /// Bind a membership into a group and audit `organization.group.member.add` in
+    /// the same transaction, scoped to `(tenant, environment)`.
+    ///
+    /// # Ordering (the anti-oracle rule)
+    ///
+    /// BOTH endpoints are resolved as LIVE rows of `spec.organization_id` FIRST, and
+    /// every failure (absent, soft-deleted, foreign scope, foreign organization) is
+    /// the uniform [`StoreError::NotFound`]. No conflict reasoning happens before
+    /// that, so [`StoreError::Conflict`] can only ever be seen by a caller who has
+    /// already proven they can see both endpoints; otherwise a duplicate-add probe
+    /// would report which foreign groups a foreign member is already in.
+    ///
+    /// # Containment
+    ///
+    /// The foreign keys prove the group and the membership EXIST; they prove nothing
+    /// about which organization either belongs to, because row-level security fences
+    /// `(tenant, environment)` and nothing finer. The two explicit resolutions are
+    /// what make "you cannot be in a group of an organization you do not belong to"
+    /// true, and migration 0088 grants no UPDATE on `group_id`, `membership_id`, or
+    /// `organization_id`, so the check cannot be undone after the fact.
+    ///
+    /// A pair already bound LIVE is [`StoreError::Conflict`] on the partial unique
+    /// index. A pair freed by a REMOVE is available again, and re-adding inserts a
+    /// FRESH row with a fresh id: a removed binding is never revived, so the audit
+    /// history of the removal is never overwritten.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if any id is not in this scope, or either endpoint is
+    /// not a live row of that organization;
+    /// [`StoreError::Conflict`] if the membership is already a live member of the
+    /// group;
+    /// [`StoreError::IdempotencyConflict`] on a concurrent Idempotency-Key race;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn add(
+        &self,
+        env: &Env,
+        spec: NewOrgGroupMember<'_>,
+        created_at_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        if spec.id.scope() != self.scope
+            || spec.organization_id.scope() != self.scope
+            || spec.group_id.scope() != self.scope
+            || spec.membership_id.scope() != self.scope
+        {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let id = *spec.id;
+        let organization_id = *spec.organization_id;
+        let group_id = *spec.group_id;
+        let membership_id = *spec.membership_id;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::OrganizationGroupMemberAdd,
+                target: &id,
+            },
+            async move |tx| {
+                require_live_group_in_org(tx, scope, &organization_id, &group_id).await?;
+                require_live_membership_in_org(tx, scope, &organization_id, &membership_id).await?;
+                let result = sqlx::query(
+                    "INSERT INTO org_group_members \
+                     (id, tenant_id, environment_id, organization_id, group_id, membership_id, \
+                      created_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, \
+                             TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(organization_id.to_string())
+                .bind(group_id.to_string())
+                .bind(membership_id.to_string())
+                .bind(created_at_micros)
+                .execute(&mut **tx)
+                .await;
+                match result {
+                    Ok(_) => {}
+                    // The membership is already a live member of this group.
+                    Err(error) if is_unique_violation(&error) => {
+                        return Err(StoreError::Conflict);
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+                insert_idempotency(tx, idempotency).await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Unbind a membership from a group (soft delete) and audit
+    /// `organization.group.member.remove` in the same transaction.
+    ///
+    /// The row is retained (only the column-scoped `deleted_at` and `updated_at` are
+    /// written), so the audit foreign key to it stays satisfiable; because the
+    /// uniqueness index is partial over live rows, the pair is immediately available
+    /// again. A repeat remove matches no live row and is the uniform not-found.
+    ///
+    /// # Containment
+    ///
+    /// `organization_id` is part of the ADDRESS of the binding, not a hint, and the
+    /// statement carries it as a predicate: row-level security fences `(tenant,
+    /// environment)` and nothing finer, so without it a nested management route
+    /// could unbind a member of a SIBLING organization by naming its own
+    /// organization in the path.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if either id is not in this scope, or no live binding
+    /// of `organization_id` matched.
+    pub async fn remove(
+        &self,
+        env: &Env,
+        organization_id: &OrganizationId,
+        id: &OrgGroupMemberId,
+    ) -> Result<(), StoreError> {
+        if organization_id.scope() != self.scope || id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let organization_id = *organization_id;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::OrganizationGroupMemberRemove,
+                target: id,
+            },
+            async move |tx| {
+                soft_delete_assignment_row(
+                    tx,
+                    "org_group_members",
+                    scope,
+                    &organization_id,
+                    &id.to_string(),
+                    now_micros,
+                )
+                .await
+            },
+            false,
+        )
+        .await
+    }
+}
+
+/// The mutating organization group-role repository (issue #97): grant a role to a
+/// group of the same organization, and withdraw it, each audited in the same
+/// transaction as the write.
+///
+/// This is the INHERITING surface: a role granted here reaches every live member of
+/// the group AND of every descendant of it, so its blast radius is not the row it
+/// writes. There is no count cap, quota, or paywall gate on assignments (a project
+/// covenant).
+pub struct ActingOrgGroupRoleRepo<'a> {
+    store: &'a Store,
+    acting: ActingContext,
+    scope: Scope,
+}
+
+impl ActingOrgGroupRoleRepo<'_> {
+    /// Grant a role to a group and audit `organization.group.role.assign` in the
+    /// same transaction, scoped to `(tenant, environment)`.
+    ///
+    /// Both endpoints are resolved as LIVE rows of `spec.organization_id` BEFORE any
+    /// conflict reasoning, under the uniform [`StoreError::NotFound`], for the
+    /// anti-oracle reason spelled out on [`ActingOrgGroupMemberRepo::add`]. The
+    /// explicit resolutions are also what enforce same-organization containment: the
+    /// foreign keys prove existence only, and migration 0089 grants no UPDATE on
+    /// `group_id`, `role_id`, or `organization_id`, so the check cannot be undone
+    /// afterwards.
+    ///
+    /// A pair already granted LIVE is [`StoreError::Conflict`]. A pair freed by an
+    /// UNASSIGN is available again, and re-granting inserts a FRESH row with a fresh
+    /// id rather than reviving the withdrawn one.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if any id is not in this scope, or either endpoint is
+    /// not a live row of that organization;
+    /// [`StoreError::Conflict`] if the group already holds the role;
+    /// [`StoreError::IdempotencyConflict`] on a concurrent Idempotency-Key race;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn assign(
+        &self,
+        env: &Env,
+        spec: NewOrgGroupRole<'_>,
+        created_at_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        if spec.id.scope() != self.scope
+            || spec.organization_id.scope() != self.scope
+            || spec.group_id.scope() != self.scope
+            || spec.role_id.scope() != self.scope
+        {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let id = *spec.id;
+        let organization_id = *spec.organization_id;
+        let group_id = *spec.group_id;
+        let role_id = *spec.role_id;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::OrganizationGroupRoleAssign,
+                target: &id,
+            },
+            async move |tx| {
+                require_live_group_in_org(tx, scope, &organization_id, &group_id).await?;
+                require_live_role_in_org(tx, scope, &organization_id, &role_id).await?;
+                let result = sqlx::query(
+                    "INSERT INTO org_group_roles \
+                     (id, tenant_id, environment_id, organization_id, group_id, role_id, \
+                      created_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, \
+                             TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(organization_id.to_string())
+                .bind(group_id.to_string())
+                .bind(role_id.to_string())
+                .bind(created_at_micros)
+                .execute(&mut **tx)
+                .await;
+                match result {
+                    Ok(_) => {}
+                    // The group already holds this role.
+                    Err(error) if is_unique_violation(&error) => {
+                        return Err(StoreError::Conflict);
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+                insert_idempotency(tx, idempotency).await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Withdraw a role from a group (soft delete) and audit
+    /// `organization.group.role.unassign` in the same transaction.
+    ///
+    /// The row is retained so the audit foreign key to it stays satisfiable, and the
+    /// (group, role) pair is immediately available again. A repeat unassign matches
+    /// no live row and is the uniform not-found. `organization_id` is part of the
+    /// ADDRESS and is carried as a predicate, for the containment reason spelled out
+    /// on [`ActingOrgGroupMemberRepo::remove`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if either id is not in this scope, or no live
+    /// assignment of `organization_id` matched.
+    pub async fn unassign(
+        &self,
+        env: &Env,
+        organization_id: &OrganizationId,
+        id: &OrgGroupRoleId,
+    ) -> Result<(), StoreError> {
+        if organization_id.scope() != self.scope || id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let organization_id = *organization_id;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::OrganizationGroupRoleUnassign,
+                target: id,
+            },
+            async move |tx| {
+                soft_delete_assignment_row(
+                    tx,
+                    "org_group_roles",
+                    scope,
+                    &organization_id,
+                    &id.to_string(),
+                    now_micros,
+                )
+                .await
+            },
+            false,
+        )
+        .await
+    }
+}
+
+/// The mutating DIRECT membership-role repository (issue #97): grant a role straight
+/// to one org membership, and withdraw it, each audited in the same transaction as
+/// the write.
+///
+/// The non-inheriting counterpart of [`ActingOrgGroupRoleRepo`]: a grant here reaches
+/// exactly one membership and stops. There is no count cap, quota, or paywall gate on
+/// assignments (a project covenant).
+pub struct ActingOrgMembershipRoleRepo<'a> {
+    store: &'a Store,
+    acting: ActingContext,
+    scope: Scope,
+}
+
+impl ActingOrgMembershipRoleRepo<'_> {
+    /// Grant a role directly to a membership and audit
+    /// `organization.membership.role.assign` in the same transaction, scoped to
+    /// `(tenant, environment)`.
+    ///
+    /// Both endpoints are resolved as LIVE rows of `spec.organization_id` BEFORE any
+    /// conflict reasoning, under the uniform [`StoreError::NotFound`], for the
+    /// anti-oracle reason spelled out on [`ActingOrgGroupMemberRepo::add`], and those
+    /// resolutions are what enforce same-organization containment.
+    ///
+    /// A pair already granted LIVE is [`StoreError::Conflict`]. A pair freed by an
+    /// UNASSIGN is available again, and re-granting inserts a FRESH row.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if any id is not in this scope, or either endpoint is
+    /// not a live row of that organization;
+    /// [`StoreError::Conflict`] if the membership already holds the role directly;
+    /// [`StoreError::IdempotencyConflict`] on a concurrent Idempotency-Key race;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn assign(
+        &self,
+        env: &Env,
+        spec: NewOrgMembershipRole<'_>,
+        created_at_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        if spec.id.scope() != self.scope
+            || spec.organization_id.scope() != self.scope
+            || spec.membership_id.scope() != self.scope
+            || spec.role_id.scope() != self.scope
+        {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let id = *spec.id;
+        let organization_id = *spec.organization_id;
+        let membership_id = *spec.membership_id;
+        let role_id = *spec.role_id;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::OrganizationMembershipRoleAssign,
+                target: &id,
+            },
+            async move |tx| {
+                require_live_membership_in_org(tx, scope, &organization_id, &membership_id).await?;
+                require_live_role_in_org(tx, scope, &organization_id, &role_id).await?;
+                let result = sqlx::query(
+                    "INSERT INTO org_membership_roles \
+                     (id, tenant_id, environment_id, organization_id, membership_id, role_id, \
+                      created_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, \
+                             TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(organization_id.to_string())
+                .bind(membership_id.to_string())
+                .bind(role_id.to_string())
+                .bind(created_at_micros)
+                .execute(&mut **tx)
+                .await;
+                match result {
+                    Ok(_) => {}
+                    // The membership already holds this role directly.
+                    Err(error) if is_unique_violation(&error) => {
+                        return Err(StoreError::Conflict);
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+                insert_idempotency(tx, idempotency).await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Withdraw a direct role grant from a membership (soft delete) and audit
+    /// `organization.membership.role.unassign` in the same transaction.
+    ///
+    /// The row is retained so the audit foreign key to it stays satisfiable, and the
+    /// (membership, role) pair is immediately available again. A repeat unassign
+    /// matches no live row and is the uniform not-found. `organization_id` is part of
+    /// the ADDRESS and is carried as a predicate, for the containment reason spelled
+    /// out on [`ActingOrgGroupMemberRepo::remove`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if either id is not in this scope, or no live
+    /// assignment of `organization_id` matched.
+    pub async fn unassign(
+        &self,
+        env: &Env,
+        organization_id: &OrganizationId,
+        id: &OrgMembershipRoleId,
+    ) -> Result<(), StoreError> {
+        if organization_id.scope() != self.scope || id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let organization_id = *organization_id;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::OrganizationMembershipRoleUnassign,
+                target: id,
+            },
+            async move |tx| {
+                soft_delete_assignment_row(
+                    tx,
+                    "org_membership_roles",
+                    scope,
+                    &organization_id,
+                    &id.to_string(),
+                    now_micros,
+                )
+                .await
+            },
+            false,
+        )
+        .await
+    }
+}
+
+/// Soft-delete ONE live join row of `table` addressed by `(scope, organization_id,
+/// id)`, or the uniform [`StoreError::NotFound`] (issue #97).
+///
+/// The shared body of all three join-table removals. `table` is a `&'static str`
+/// chosen from three literals in this module, never anything a caller supplies, so no
+/// part of this statement is caller-authored SQL.
+///
+/// One body rather than three copies because the three removals must agree on
+/// EXACTLY the addressing key. `organization_id` in the predicate is the whole
+/// containment guard: row-level security fences `(tenant, environment)` and nothing
+/// finer, so a copy that dropped it would silently let a nested management route
+/// remove a sibling organization's row. Three copies of a predicate whose absence is
+/// invisible in testing is precisely the shape of defect this collapses.
+async fn soft_delete_assignment_row(
+    tx: &mut Transaction<'_, Postgres>,
+    table: &'static str,
+    scope: Scope,
+    organization_id: &OrganizationId,
+    id: &str,
+    now_micros: i64,
+) -> Result<(), StoreError> {
+    let result = sqlx::query(&format!(
+        "UPDATE {table} SET \
+             deleted_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval, \
+             updated_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+         WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 \
+         AND organization_id = $5 AND deleted_at IS NULL"
+    ))
+    .bind(now_micros)
+    .bind(id)
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(organization_id.to_string())
+    .execute(&mut **tx)
+    .await?;
+    if result.rows_affected() == 0 {
+        return Err(StoreError::NotFound);
+    }
+    Ok(())
+}
+
+/// What one membership-attachment cascade revoked (issue #97): how many group
+/// bindings and how many DIRECT role grants it soft-deleted.
+///
+/// Counts only. They are structural numbers, never tenant data, so they are safe to
+/// put in the audit row's operator-safe `detail` dimension, and they are what tells
+/// an operator reading the audit log alone how much authorization one membership
+/// change actually stripped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RevokedAttachments {
+    /// Group bindings soft-deleted.
+    groups: u64,
+    /// Direct role grants soft-deleted.
+    roles: u64,
+}
+
+impl RevokedAttachments {
+    /// Whether anything was actually revoked. The cascade audits only when this is
+    /// true, so an ordinary add of a never-before-seen member does not write an empty
+    /// cascade row on every call.
+    fn any(self) -> bool {
+        self.groups > 0 || self.roles > 0
+    }
+}
+
+/// Revoke every LIVE group binding and DIRECT role grant of one org membership
+/// (issue #97), inside the caller's transaction, and report what was revoked.
+///
+/// # Why this exists
+///
+/// An `org_memberships` row is REVIVED rather than recreated when a removed user is
+/// added back (`insert_or_revive_membership`): the row keeps its original id, its
+/// `deleted_at` goes back to NULL. Because `org_group_members` and
+/// `org_membership_roles` reference that id, a revived membership would otherwise
+/// silently regain EVERY group and EVERY direct role it held at the moment it was
+/// removed. Removing someone from an organization is a security operation and must
+/// not be quietly reversible in its authorization effects, so removal strips the
+/// attachments and every revival strips them again.
+///
+/// # Where it is wired, and why in three places rather than one
+///
+/// Three call sites, each of which independently makes a membership live-with-history
+/// or ends one:
+///
+///   1. `ActingOrgMembershipRepo::remove`, the admin removal. This is the primary
+///      one: an administrator removing a compromised account expects the account's
+///      group memberships and direct roles to stop applying at that moment, not at
+///      some later re-add.
+///   2. `ActingOrgMembershipRepo::create`, on the REVIVE branch, the admin re-add.
+///   3. The invitation-accept side effect, on the REVIVE branch. This is the one a
+///      change wired only into the admin path would miss, and missing it is a silent
+///      hole with a concrete exploit: an administrator removes a compromised user,
+///      the user redeems an invitation they were sent earlier, and every group and
+///      role returns without anybody performing a grant.
+///
+/// Sites 2 and 3 are NOT redundant with site 1. They are what makes the invariant
+/// hold over rows that site 1 never saw: attachments written by an older binary,
+/// left by a membership soft-deleted through any future path, or restored out of
+/// band. The invariant they enforce is the strong one ("a revived membership starts
+/// with nothing"), not the weak one ("a removal cleaned up after itself").
+///
+/// Deliberately NOT folded into `insert_or_revive_membership` itself, even though
+/// that would cover sites 2 and 3 in one edit: the cascade emits an AUDIT row, and
+/// audit emission belongs to the audited write that owns the transaction, not to a
+/// shared SQL primitive that does not know which action it is serving. Folding it in
+/// would also make the two revive sites impossible to exercise, or to break,
+/// independently.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] on a persistence failure.
+async fn revoke_membership_attachments(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    membership_id: &OrgMembershipId,
+    now_micros: i64,
+) -> Result<RevokedAttachments, StoreError> {
+    // Both statements are COLUMN-scoped soft deletes of exactly the pair migration
+    // 0088 and 0089 grant, guarded on the row being live so a second cascade over the
+    // same membership is a no-op rather than a re-dating of already-dead rows.
+    //
+    // That guard is not housekeeping, and an ordinary remove, re-add, remove, re-add
+    // cycle is enough to show it. Without it every later cascade REWRITES the
+    // `deleted_at` of rows that were already revoked, destroying the record of WHEN
+    // the removed account's authorization actually stopped, which is the forensic
+    // value the soft delete exists to preserve; and because the audit row is written
+    // only when something was actually revoked, the rewritten rows also make each
+    // later revive emit a PHANTOM
+    // `organization.membership.attachments.revoke` claiming counts it did not strip.
+    // `a_second_revive_revokes_nothing_and_writes_no_phantom_audit_row` pins both.
+    //
+    // Neither statement carries an `organization_id` predicate, and that is correct
+    // rather than an omission: a membership belongs to exactly ONE organization, and
+    // every attachment row's organization is copied from that membership, so the
+    // membership id already names the organization. Adding the predicate would
+    // require the caller to supply an organization it has no independent reason to
+    // know, and getting it WRONG would silently under-revoke. The scope predicates
+    // above row-level security are still carried, as everywhere else in this module.
+    let groups = sqlx::query(
+        "UPDATE org_group_members SET \
+             deleted_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval, \
+             updated_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+         WHERE tenant_id = $2 AND environment_id = $3 \
+         AND membership_id = $4 AND deleted_at IS NULL",
+    )
+    .bind(now_micros)
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(membership_id.to_string())
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    let roles = sqlx::query(
+        "UPDATE org_membership_roles SET \
+             deleted_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval, \
+             updated_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+         WHERE tenant_id = $2 AND environment_id = $3 \
+         AND membership_id = $4 AND deleted_at IS NULL",
+    )
+    .bind(now_micros)
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(membership_id.to_string())
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    Ok(RevokedAttachments { groups, roles })
+}
+
+/// Run [`revoke_membership_attachments`] and, if it revoked anything, append its
+/// `organization.membership.attachments.revoke` audit row to the SAME transaction
+/// (issue #97).
+///
+/// The pairing is the point: the cascade and its audit row are inseparable, so no
+/// call site can strip a member's authorization without saying so. The audit row is
+/// written only when something was actually revoked (see
+/// [`Action::OrganizationMembershipAttachmentsRevoke`]), and its operator-safe
+/// `detail` carries the two counts.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] on a persistence failure.
+async fn revoke_membership_attachments_audited(
+    tx: &mut Transaction<'_, Postgres>,
+    store: &Store,
+    scope: Scope,
+    acting: &ActingContext,
+    env: &Env,
+    membership_id: &OrgMembershipId,
+    now_micros: i64,
+) -> Result<RevokedAttachments, StoreError> {
+    let revoked = revoke_membership_attachments(tx, scope, membership_id, now_micros).await?;
+    if revoked.any() {
+        let detail = format!("groups={},roles={}", revoked.groups, revoked.roles);
+        insert_audit_row(
+            tx,
+            &AuditedWrite {
+                store,
+                scope,
+                acting,
+                env,
+                action: Action::OrganizationMembershipAttachmentsRevoke,
+                target: membership_id,
+            },
+            Some(detail.as_str()),
+        )
+        .await?;
+    }
+    Ok(revoked)
+}
+
 /// Everything one hierarchy-safety check needs, bundled so the helper stays within
 /// the readable-argument-count lint (issue #97).
 struct GroupPlacement<'a> {
@@ -35035,6 +36810,82 @@ async fn require_live_group_in_org(
          AND organization_id = $4 AND deleted_at IS NULL",
     )
     .bind(group_id.to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(organization_id.to_string())
+    .fetch_optional(&mut **tx)
+    .await?;
+    if found.is_some() {
+        Ok(())
+    } else {
+        Err(StoreError::NotFound)
+    }
+}
+
+/// Resolve `role_id` as a LIVE role of `organization_id` within `scope`, or the
+/// uniform [`StoreError::NotFound`] (issue #97).
+///
+/// The role-side counterpart of [`require_live_group_in_org`], and the same
+/// anti-oracle gate: absent, soft-deleted, another scope's, and another
+/// organization's all collapse to one error, BEFORE any conflict reasoning runs, so a
+/// duplicate-assignment [`StoreError::Conflict`] can only ever be seen by a caller who
+/// has already proven they can see the role.
+///
+/// It is also the ONLY thing that makes same-organization containment true for an
+/// assignment: the `role_id` foreign key is id-only, so nothing in the database would
+/// stop a group of one organization from being granted a role of a sibling
+/// organization in the same environment.
+async fn require_live_role_in_org(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    organization_id: &OrganizationId,
+    role_id: &OrgRoleId,
+) -> Result<(), StoreError> {
+    let found = sqlx::query(
+        "SELECT 1 AS present FROM org_roles \
+         WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
+         AND organization_id = $4 AND deleted_at IS NULL",
+    )
+    .bind(role_id.to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(organization_id.to_string())
+    .fetch_optional(&mut **tx)
+    .await?;
+    if found.is_some() {
+        Ok(())
+    } else {
+        Err(StoreError::NotFound)
+    }
+}
+
+/// Resolve `membership_id` as a LIVE membership of `organization_id` within `scope`,
+/// or the uniform [`StoreError::NotFound`] (issue #97).
+///
+/// The membership-side counterpart of [`require_live_group_in_org`], with the same
+/// anti-oracle and containment roles. This is the gate that makes "you cannot be in a
+/// group of an organization you do not belong to" true at write time: the schema
+/// makes group membership reference an ORG MEMBERSHIP rather than a user, and this
+/// resolution is what pins that membership to the organization the request named.
+///
+/// It deliberately does NOT filter on the membership's lifecycle `state`. A
+/// membership's state set is `active` only today, and gating writes on it here would
+/// put a second, silently diverging answer to "is this membership usable" next to the
+/// one effective-role resolution already applies on the READ path, which is where it
+/// belongs (an unusable membership resolves to no roles rather than being un-editable
+/// by an administrator).
+async fn require_live_membership_in_org(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    organization_id: &OrganizationId,
+    membership_id: &OrgMembershipId,
+) -> Result<(), StoreError> {
+    let found = sqlx::query(
+        "SELECT 1 AS present FROM org_memberships \
+         WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
+         AND organization_id = $4 AND deleted_at IS NULL",
+    )
+    .bind(membership_id.to_string())
     .bind(scope.tenant().to_string())
     .bind(scope.environment().to_string())
     .bind(organization_id.to_string())
@@ -35714,7 +37565,7 @@ async fn insert_or_revive_membership(
     user_id: &UserId,
     metadata: Option<&str>,
     now_micros: i64,
-) -> Result<OrgMembershipId, StoreError> {
+) -> Result<LiveMembership, StoreError> {
     // Revive a previously removed membership if one exists. Guarded on `deleted_at IS
     // NOT NULL`, so a concurrent create that already revived it re-reads a live row
     // here (zero rows) and falls through to the insert, which then conflicts: exactly
@@ -35736,10 +37587,10 @@ async fn insert_or_revive_membership(
     .fetch_optional(&mut **tx)
     .await?;
     if let Some(row) = revived {
-        return Ok(OrgMembershipId::parse_in_scope(
-            &row.get::<String, _>("id"),
-            &scope,
-        )?);
+        return Ok(LiveMembership {
+            id: OrgMembershipId::parse_in_scope(&row.get::<String, _>("id"), &scope)?,
+            revived: true,
+        });
     }
     // No dead row to revive: insert a fresh membership. `ON CONFLICT ... DO NOTHING`
     // targets the partial unique index over LIVE rows, so a user who is ALREADY a live
@@ -35769,10 +37620,35 @@ async fn insert_or_revive_membership(
     .fetch_optional(&mut **tx)
     .await?;
     match inserted {
-        Some(_) => Ok(*new_id),
+        Some(_) => Ok(LiveMembership {
+            id: *new_id,
+            revived: false,
+        }),
         // A live membership already exists (the insert conflicted and did nothing).
         None => Err(StoreError::Conflict),
     }
+}
+
+/// The outcome of one revive-or-insert of an org membership (issue #94, extended by
+/// issue #97).
+///
+/// `revived` is the whole reason this is a struct rather than a bare id. A REVIVED
+/// membership keeps its ORIGINAL id, so the group bindings and direct role grants
+/// that referenced it before it was removed still point at it and would come back
+/// with it; a freshly INSERTED membership carries a brand-new id that nothing can
+/// reference yet. Every caller therefore has to decide what to do about the
+/// difference, and returning it as a named field makes that decision a visible one
+/// rather than something a caller can silently not make. See
+/// [`revoke_membership_attachments`] for what the callers do with it and why all of
+/// them must.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LiveMembership {
+    /// The id of the LIVE membership that now exists: the revived row's original id,
+    /// or the freshly inserted one.
+    id: OrgMembershipId,
+    /// Whether an existing soft-deleted row was brought back (as opposed to a fresh
+    /// row being inserted).
+    revived: bool,
 }
 
 /// Insert a pending idempotency row, if the caller supplied one. A primary-key
@@ -35996,6 +37872,69 @@ fn org_group_from_row(row: &PgRow, scope: &Scope) -> Result<OrgGroupRecord, Stor
         slug: row.get("slug"),
         display_name: row.get("display_name"),
         metadata,
+        created_at_unix_micros: row.get("created_us"),
+        updated_at_unix_micros: row.get("updated_us"),
+    })
+}
+
+/// Reconstruct an [`OrgGroupMemberRecord`] from a row read within scope. Every
+/// stored id is parsed back UNDER the scope, so a corrupt cross-scope row fails to
+/// decode rather than being returned.
+fn org_group_member_from_row(
+    row: &PgRow,
+    scope: &Scope,
+) -> Result<OrgGroupMemberRecord, StoreError> {
+    Ok(OrgGroupMemberRecord {
+        id: OrgGroupMemberId::parse_in_scope(&row.get::<String, _>("id"), scope)?,
+        organization_id: OrganizationId::parse_in_scope(
+            &row.get::<String, _>("organization_id"),
+            scope,
+        )?,
+        group_id: OrgGroupId::parse_in_scope(&row.get::<String, _>("group_id"), scope)?,
+        membership_id: OrgMembershipId::parse_in_scope(
+            &row.get::<String, _>("membership_id"),
+            scope,
+        )?,
+        created_at_unix_micros: row.get("created_us"),
+        updated_at_unix_micros: row.get("updated_us"),
+    })
+}
+
+/// Reconstruct an [`OrgGroupRoleRecord`] from a row read within scope. Every stored
+/// id is parsed back UNDER the scope, so a corrupt cross-scope row fails to decode
+/// rather than being returned.
+fn org_group_role_from_row(row: &PgRow, scope: &Scope) -> Result<OrgGroupRoleRecord, StoreError> {
+    Ok(OrgGroupRoleRecord {
+        id: OrgGroupRoleId::parse_in_scope(&row.get::<String, _>("id"), scope)?,
+        organization_id: OrganizationId::parse_in_scope(
+            &row.get::<String, _>("organization_id"),
+            scope,
+        )?,
+        group_id: OrgGroupId::parse_in_scope(&row.get::<String, _>("group_id"), scope)?,
+        role_id: OrgRoleId::parse_in_scope(&row.get::<String, _>("role_id"), scope)?,
+        created_at_unix_micros: row.get("created_us"),
+        updated_at_unix_micros: row.get("updated_us"),
+    })
+}
+
+/// Reconstruct an [`OrgMembershipRoleRecord`] from a row read within scope. Every
+/// stored id is parsed back UNDER the scope, so a corrupt cross-scope row fails to
+/// decode rather than being returned.
+fn org_membership_role_from_row(
+    row: &PgRow,
+    scope: &Scope,
+) -> Result<OrgMembershipRoleRecord, StoreError> {
+    Ok(OrgMembershipRoleRecord {
+        id: OrgMembershipRoleId::parse_in_scope(&row.get::<String, _>("id"), scope)?,
+        organization_id: OrganizationId::parse_in_scope(
+            &row.get::<String, _>("organization_id"),
+            scope,
+        )?,
+        membership_id: OrgMembershipId::parse_in_scope(
+            &row.get::<String, _>("membership_id"),
+            scope,
+        )?,
+        role_id: OrgRoleId::parse_in_scope(&row.get::<String, _>("role_id"), scope)?,
         created_at_unix_micros: row.get("created_us"),
         updated_at_unix_micros: row.get("updated_us"),
     })
