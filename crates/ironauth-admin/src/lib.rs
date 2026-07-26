@@ -341,10 +341,17 @@ pub fn management_router(state: AdminState) -> Router {
             "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups",
             post(org_groups::create_org_group).get(org_groups::list_org_groups),
         )
-        // The static `/parent` suffix is registered BEFORE the parameterized group
-        // item route, matching the convention used for the organization lifecycle
-        // actions above; PR 5 adds `/members` and `/roles` siblings under the same
-        // prefix, so the ordering is load-bearing from here on.
+        // The static `/parent` suffix sits next to the group routes for READABILITY.
+        // Registration order selects nothing here: axum ranks a static segment above a
+        // parameter whichever was registered first, and this pair cannot even compete,
+        // because `.../groups/{group_id}/parent` carries one more path segment than
+        // `.../groups/{group_id}`. (The organization lifecycle actions above are in
+        // fact registered AFTER their parameterized item route and match for the same
+        // reason.) So what PR 5 has to respect when it lands `/members` and `/roles`
+        // siblings under this prefix is not an ordering: a static suffix is always
+        // safe, and the one real hazard, a SECOND parameter at a position that already
+        // has one, is refused at router construction with a panic naming both routes
+        // rather than silently shadowed by whichever came first.
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/parent",
             put(org_groups::set_org_group_parent),

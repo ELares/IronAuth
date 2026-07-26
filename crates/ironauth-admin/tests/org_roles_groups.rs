@@ -20,6 +20,8 @@
 
 mod common;
 
+use std::collections::HashSet;
+
 use axum::http::StatusCode;
 use common::Harness;
 use serde_json::Value;
@@ -102,6 +104,71 @@ async fn field(h: &Harness, path: &str, name: &str) -> Value {
     let (status, _, response) = h.get(path).await;
     assert_eq!(status, StatusCode::OK, "get {path}: {response}");
     serde_json::from_str::<Value>(&response).expect("json")[name].clone()
+}
+
+/// A role or group create body (both families take the same two required fields).
+fn create_body(slug: &str) -> String {
+    serde_json::json!({ "slug": slug, "display_name": "Label" }).to_string()
+}
+
+/// A rename body.
+fn rename_body(display_name: &str) -> String {
+    serde_json::json!({ "display_name": display_name }).to_string()
+}
+
+/// A `PUT .../parent` body: `None` promotes the group to a root.
+fn parent_body(parent: Option<&str>) -> String {
+    match parent {
+        Some(id) => serde_json::json!({ "parent_id": id }).to_string(),
+        None => serde_json::json!({ "parent_id": Value::Null }).to_string(),
+    }
+}
+
+/// Assert a response is the LOUD wrong-scope refusal: a 403 whose body names the
+/// error. It must be neither a success NOR the uniform not-found, because a
+/// credential presented against an environment it is not authorized for is the
+/// (b) LOUD case, not the (a) anti-oracle case.
+fn assert_wrong_scope(label: &str, status: StatusCode, body: &str) {
+    assert_eq!(status, StatusCode::FORBIDDEN, "{label}: {body}");
+    assert_eq!(
+        serde_json::from_str::<Value>(body).expect("json")["error"],
+        "wrong_scope",
+        "{label} must be the LOUD wrong-scope refusal: {body}"
+    );
+}
+
+/// Walk a list endpoint at `limit` rows per page, returning every id seen and the
+/// number of pages. Asserts on the way that no page exceeds the limit, that no row
+/// is returned twice, and that the walk terminates.
+async fn walk_pages(h: &Harness, base: &str, limit: usize) -> (HashSet<String>, usize) {
+    let mut seen = HashSet::new();
+    let mut cursor: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        let path = match &cursor {
+            Some(value) => format!("{base}?limit={limit}&cursor={value}"),
+            None => format!("{base}?limit={limit}"),
+        };
+        let (status, _, response) = h.get(&path).await;
+        assert_eq!(status, StatusCode::OK, "page {pages}: {response}");
+        let value: Value = serde_json::from_str(&response).expect("json");
+        let items = value["items"].as_array().expect("items");
+        assert!(
+            items.len() <= limit,
+            "a page never exceeds the requested limit: {response}"
+        );
+        for item in items {
+            let id = item["id"].as_str().expect("id").to_owned();
+            assert!(seen.insert(id), "no row appears on two pages: {response}");
+        }
+        pages += 1;
+        assert!(pages <= 20, "the walk did not terminate");
+        match value["next_cursor"].as_str() {
+            Some(next) => cursor = Some(next.to_owned()),
+            None => break,
+        }
+    }
+    (seen, pages)
 }
 
 // ---------------------------------------------------------------- roles ------
@@ -265,6 +332,117 @@ async fn a_replayed_role_create_returns_the_original_and_writes_no_second_role()
 }
 
 #[tokio::test]
+async fn an_idempotency_key_replay_cannot_cross_an_organization_environment_or_credential() {
+    // An idempotency key is namespaced by the ACTING CREDENTIAL alone: the stored
+    // rows carry no scope column, and the OPERATOR is one credential across every
+    // tenant and environment. So the only thing keeping one credential's stored
+    // response from being served for a DIFFERENT resource is that the fingerprint
+    // covers the concrete request PATH. These three cases pin that.
+    let h = Harness::start(50).await;
+    let (tenant, env_one) = tenant_env(&h).await;
+    let env_two = h.create_environment(&tenant, "second", "k-env-2").await;
+    let org_a = create_org(&h, &tenant, &env_one, "k-org-a").await;
+    let org_b = create_org(&h, &tenant, &env_one, "k-org-b").await;
+    let org_c = create_org(&h, &tenant, &env_two, "k-org-c").await;
+    let base_a = roles_base(&tenant, &env_one, &org_a);
+    let base_b = roles_base(&tenant, &env_one, &org_b);
+    let base_c = roles_base(&tenant, &env_two, &org_c);
+    let body = create_body("admin");
+
+    let (status, _, first) = h.post(&base_a, "shared-key", &body).await;
+    assert_eq!(status, StatusCode::CREATED, "{first}");
+    let role_a = id_of(&first);
+
+    // 1. The same key and the same body under a SIBLING ORGANIZATION. The path is part
+    //    of the fingerprint, so this is the key-reuse 422; it must never be a replay
+    //    handing organization A's role back as organization B's create response.
+    let (status, _, response) = h.post(&base_b, "shared-key", &body).await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "cross-organization replay: {response}"
+    );
+    assert!(
+        !response.contains(&role_a),
+        "the refusal must not echo organization A's role: {response}"
+    );
+    assert!(
+        list_ids(&h, &base_b).await.is_empty(),
+        "and it created nothing in organization B"
+    );
+
+    // 2. The same key and the same body in ANOTHER ENVIRONMENT, under the same operator
+    //    credential. This is the case the credential-only namespace makes possible, so
+    //    it is asserted directly rather than inferred from the organization case.
+    let (status, _, response) = h.post(&base_c, "shared-key", &body).await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "cross-environment replay: {response}"
+    );
+    assert!(
+        !response.contains(&role_a),
+        "the refusal must not echo environment one's role: {response}"
+    );
+    assert!(
+        list_ids(&h, &base_c).await.is_empty(),
+        "and it created nothing in environment two"
+    );
+
+    // 3. A DIFFERENT CREDENTIAL replaying the same key against the SAME path and body
+    //    EXECUTES rather than reading the operator's stored response. It reaches the
+    //    store and collides with the live slug, and a 409 is only reachable from the
+    //    write, so it is the proof that no replay happened.
+    let key = h.create_key(&tenant, &env_one, "ci", "k-key").await;
+    let (status, _, response) = h.post_as(&base_a, &key, "shared-key", &body).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "another credential executes rather than replaying: {response}"
+    );
+    assert_eq!(
+        list_ids(&h, &base_a).await,
+        vec![role_a],
+        "and it created no second role"
+    );
+}
+
+#[tokio::test]
+async fn a_role_list_pages_across_a_cursor_including_a_row_a_rename_touched() {
+    // The cursor key must be the SORT key. The list orders by `(created_at, id)`, so a
+    // cursor built from any other timestamp column points at a position the ordering
+    // does not use. The rename below is what makes that observable: it moves ONLY
+    // `updated_at`, and moves it PAST every remaining row's `created_at`, so a cursor
+    // keyed on `updated_at` lands beyond the rest of the list and the walk stops two
+    // rows in, returning a truncated list with no error anywhere.
+    let h = Harness::start(50).await;
+    let (tenant, environment) = tenant_env(&h).await;
+    let org = create_org(&h, &tenant, &environment, "k-org").await;
+    let base = roles_base(&tenant, &environment, &org);
+
+    let mut created = HashSet::new();
+    let mut ordered = Vec::new();
+    for index in 0..5 {
+        let id = create_role(&h, &base, &format!("role{index}"), &format!("k-{index}")).await;
+        assert!(created.insert(id.clone()), "each role id is unique");
+        ordered.push(id);
+    }
+
+    // Rename the row that ENDS page one at limit 2, after every other row exists.
+    let (status, _, response) = h
+        .patch(&format!("{base}/{}", ordered[1]), &rename_body("Renamed"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "rename: {response}");
+
+    let (seen, pages) = walk_pages(&h, &base, 2).await;
+    assert_eq!(
+        seen, created,
+        "every role is returned exactly once across the walk"
+    );
+    assert_eq!(pages, 3, "5 rows at 2 per page is exactly three pages");
+}
+
+#[tokio::test]
 async fn roles_are_partitioned_by_organization_on_every_endpoint() {
     // TWO organizations in ONE environment, each holding its own role. Row-level
     // security fences the environment and nothing finer, so `organization_id` is the
@@ -328,6 +506,91 @@ async fn roles_are_partitioned_by_organization_on_every_endpoint() {
 }
 
 // --------------------------------------------------------------- groups ------
+
+#[tokio::test]
+async fn a_live_group_slug_collides_and_a_deleted_one_is_free_again() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = tenant_env(&h).await;
+    let org = create_org(&h, &tenant, &environment, "k-org").await;
+    let base = groups_base(&tenant, &environment, &org);
+
+    let first = create_group(&h, &base, "engineering", None, "k-1").await;
+    // A distinct second create (a different Idempotency-Key) of the same slug is the
+    // documented 409. Without the handler's conflict arm the unique index surfaces as
+    // an opaque 500 that says nothing a caller can act on.
+    let body = create_body("engineering");
+    let (status, _, response) = h.post(&base, "k-2", &body).await;
+    assert_eq!(status, StatusCode::CONFLICT, "duplicate slug: {response}");
+
+    // The slug is unique per ORGANIZATION, not per parent: a different position in the
+    // tree does not free it, so this is the same 409.
+    let nested = serde_json::json!({
+        "slug": "engineering",
+        "display_name": "Label",
+        "parent_id": first,
+    })
+    .to_string();
+    let (status, _, response) = h.post(&base, "k-3", &nested).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "duplicate slug under a parent: {response}"
+    );
+    assert_eq!(
+        list_ids(&h, &base).await,
+        vec![first.clone()],
+        "neither refused create wrote a row"
+    );
+
+    // Deleting frees the slug, and re-using it mints a FRESH id: a deleted group is
+    // never revived, so the memberships and assignments that will hang off a group id
+    // cannot be quietly restored with it.
+    let (status, _, _) = h.delete(&format!("{base}/{first}")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _, response) = h.post(&base, "k-4", &body).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "slug freed by delete: {response}"
+    );
+    assert_ne!(id_of(&response), first, "the revived slug gets a fresh id");
+}
+
+#[tokio::test]
+async fn a_group_list_pages_across_a_cursor_including_a_row_a_rename_touched() {
+    // The same cursor-key property as the role list, on the other paginated endpoint.
+    let h = Harness::start(50).await;
+    let (tenant, environment) = tenant_env(&h).await;
+    let org = create_org(&h, &tenant, &environment, "k-org").await;
+    let base = groups_base(&tenant, &environment, &org);
+
+    let mut created = HashSet::new();
+    let mut ordered = Vec::new();
+    for index in 0..5 {
+        let id = create_group(
+            &h,
+            &base,
+            &format!("group{index}"),
+            None,
+            &format!("k-{index}"),
+        )
+        .await;
+        assert!(created.insert(id.clone()), "each group id is unique");
+        ordered.push(id);
+    }
+
+    let (status, _, response) = h
+        .patch(&format!("{base}/{}", ordered[1]), &rename_body("Renamed"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "rename: {response}");
+
+    let (seen, pages) = walk_pages(&h, &base, 2).await;
+    assert_eq!(
+        seen, created,
+        "every group is returned exactly once across the walk"
+    );
+    assert_eq!(pages, 3, "5 rows at 2 per page is exactly three pages");
+}
 
 #[tokio::test]
 async fn group_create_nest_get_list_rename_and_delete_round_trip() {
@@ -867,6 +1130,177 @@ async fn a_second_scope_cannot_reach_the_first_scopes_roles_or_groups() {
     );
     assert_eq!(list_ids(&h, &roles_one).await, vec![role]);
     assert_eq!(list_ids(&h, &groups_one).await, vec![group]);
+}
+
+// The parallel `*_one` / `*_two` names track the two environments and are clearer
+// here than contrived distinct ones; the test is one indivisible proof over eleven
+// endpoints, so it is not split.
+#[allow(clippy::similar_names, clippy::too_many_lines)]
+#[tokio::test]
+async fn an_environment_scoped_key_reaches_only_its_own_environments_roles_and_groups() {
+    // The test above drives the OPERATOR, which passes every scope check by design, so
+    // it proves containment of IDs and nothing about the CREDENTIAL. This one drives a
+    // real `mak_` management key, the credential class whose confinement rests entirely
+    // on `Principal::require_environment` in the private `resolve_scope` of each module.
+    // docs/THREAT-MODEL.md names that call as the control for exactly this surface, so
+    // it is exercised here on all ELEVEN endpoints rather than assumed.
+    //
+    // Each endpoint is driven TWICE with the SAME key: once inside the environment the
+    // key was minted for, which must succeed, and once against a sibling environment,
+    // which must be the LOUD 403. The positive half is what makes the negative half
+    // attributable to the scope check alone rather than to a broken credential.
+    let h = Harness::start(50).await;
+    let (tenant, env_one) = tenant_env(&h).await;
+    let env_two = h.create_environment(&tenant, "second", "k-env-2").await;
+    let org_one = create_org(&h, &tenant, &env_one, "k-org-1").await;
+    let org_two = create_org(&h, &tenant, &env_two, "k-org-2").await;
+    let key = h.create_key(&tenant, &env_one, "ci", "k-key").await;
+
+    let roles_one = roles_base(&tenant, &env_one, &org_one);
+    let groups_one = groups_base(&tenant, &env_one, &org_one);
+    let roles_two = roles_base(&tenant, &env_two, &org_two);
+    let groups_two = groups_base(&tenant, &env_two, &org_two);
+
+    // Environment two is seeded BY THE OPERATOR, so every id-addressed probe below
+    // names a row that genuinely exists there: with the scope check gone the reads
+    // answer 200 and the mutations execute, rather than collapsing to a 404 that could
+    // be mistaken for containment.
+    let role_two = create_role(&h, &roles_two, "seeded", "k-r2").await;
+    let group_two = create_group(&h, &groups_two, "seeded", None, "k-g2").await;
+    let sibling_two = create_group(&h, &groups_two, "sibling", None, "k-g2b").await;
+    let role_two_path = format!("{roles_two}/{role_two}");
+    let group_two_path = format!("{groups_two}/{group_two}");
+
+    // --- The key is authorized on all eleven endpoints INSIDE environment one. ---
+    let (status, _, body) = h
+        .post_as(&roles_one, &key, "mk-1", &create_body("own"))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "own-environment role create: {body}"
+    );
+    let role_one_path = format!("{roles_one}/{}", id_of(&body));
+    let (status, _, body) = h.get_as(&roles_one, &key).await;
+    assert_eq!(status, StatusCode::OK, "own-environment role list: {body}");
+    let (status, _, body) = h.get_as(&role_one_path, &key).await;
+    assert_eq!(status, StatusCode::OK, "own-environment role get: {body}");
+    let (status, _, body) = h
+        .patch_as(&role_one_path, &key, &rename_body("Renamed"))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "own-environment role rename: {body}"
+    );
+
+    let (status, _, body) = h
+        .post_as(&groups_one, &key, "mk-2", &create_body("own"))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "own-environment group create: {body}"
+    );
+    let group_one_path = format!("{groups_one}/{}", id_of(&body));
+    let (status, _, body) = h.get_as(&groups_one, &key).await;
+    assert_eq!(status, StatusCode::OK, "own-environment group list: {body}");
+    let (status, _, body) = h.get_as(&group_one_path, &key).await;
+    assert_eq!(status, StatusCode::OK, "own-environment group get: {body}");
+    let (status, _, body) = h
+        .patch_as(&group_one_path, &key, &rename_body("Renamed"))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "own-environment group rename: {body}"
+    );
+    let (status, _, body) = h
+        .put_as(
+            &format!("{group_one_path}/parent"),
+            &key,
+            &parent_body(None),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "own-environment group reparent: {body}"
+    );
+    let (status, _, body) = h.delete_as(&group_one_path, &key).await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "own-environment group delete: {body}"
+    );
+    let (status, _, body) = h.delete_as(&role_one_path, &key).await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "own-environment role delete: {body}"
+    );
+
+    // --- The SAME key against environment two: the LOUD 403 on every one. ---
+    let (status, _, body) = h
+        .post_as(&roles_two, &key, "mk-x1", &create_body("pwned"))
+        .await;
+    assert_wrong_scope("cross-environment role create", status, &body);
+    let (status, _, body) = h.get_as(&roles_two, &key).await;
+    assert_wrong_scope("cross-environment role list", status, &body);
+    let (status, _, body) = h.get_as(&role_two_path, &key).await;
+    assert_wrong_scope("cross-environment role get", status, &body);
+    let (status, _, body) = h
+        .patch_as(&role_two_path, &key, &rename_body("Pwned"))
+        .await;
+    assert_wrong_scope("cross-environment role rename", status, &body);
+    let (status, _, body) = h.delete_as(&role_two_path, &key).await;
+    assert_wrong_scope("cross-environment role delete", status, &body);
+
+    let (status, _, body) = h
+        .post_as(&groups_two, &key, "mk-x2", &create_body("pwned"))
+        .await;
+    assert_wrong_scope("cross-environment group create", status, &body);
+    let (status, _, body) = h.get_as(&groups_two, &key).await;
+    assert_wrong_scope("cross-environment group list", status, &body);
+    let (status, _, body) = h.get_as(&group_two_path, &key).await;
+    assert_wrong_scope("cross-environment group get", status, &body);
+    let (status, _, body) = h
+        .patch_as(&group_two_path, &key, &rename_body("Pwned"))
+        .await;
+    assert_wrong_scope("cross-environment group rename", status, &body);
+    let (status, _, body) = h
+        .put_as(
+            &format!("{group_two_path}/parent"),
+            &key,
+            &parent_body(Some(&sibling_two)),
+        )
+        .await;
+    assert_wrong_scope("cross-environment group reparent", status, &body);
+    let (status, _, body) = h.delete_as(&group_two_path, &key).await;
+    assert_wrong_scope("cross-environment group delete", status, &body);
+
+    // Environment two is exactly as the operator left it: the refused creates added no
+    // row (so the key's environment-two lists gained nothing), the refused deletes
+    // removed none, and the refused rename and reparent moved nothing.
+    assert_eq!(
+        list_ids(&h, &roles_two).await,
+        vec![role_two],
+        "no refused role request touched environment two"
+    );
+    let mut expected = vec![group_two.clone(), sibling_two];
+    expected.sort();
+    assert_eq!(
+        list_ids(&h, &groups_two).await,
+        expected,
+        "no refused group request touched environment two"
+    );
+    assert_eq!(field(&h, &role_two_path, "display_name").await, "Label");
+    assert_eq!(field(&h, &group_two_path, "display_name").await, "Label");
+    assert_eq!(
+        field(&h, &group_two_path, "parent_id").await,
+        Value::Null,
+        "the refused reparent left the group a root"
+    );
 }
 
 #[tokio::test]

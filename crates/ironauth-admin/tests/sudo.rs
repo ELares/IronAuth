@@ -59,6 +59,35 @@ fn signup_form_path(tenant: &str, environment: &str, client: &str) -> String {
     format!("/v1/tenants/{tenant}/environments/{environment}/applications/{client}/signup-form")
 }
 
+fn organizations_path(tenant: &str, environment: &str) -> String {
+    format!("/v1/tenants/{tenant}/environments/{environment}/organizations")
+}
+
+fn org_roles_path(tenant: &str, environment: &str, org: &str) -> String {
+    format!("/v1/tenants/{tenant}/environments/{environment}/organizations/{org}/roles")
+}
+
+fn org_groups_path(tenant: &str, environment: &str, org: &str) -> String {
+    format!("/v1/tenants/{tenant}/environments/{environment}/organizations/{org}/groups")
+}
+
+/// The `id` of a JSON response body.
+fn id_of(response: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(response).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned()
+}
+
+/// Create a role or group (both take the same two required fields), asserting a 201,
+/// and return its id. Used only inside an open elevation window.
+async fn create_named(harness: &Harness, base: &str, slug: &str, key: &str) -> String {
+    let body = serde_json::json!({ "slug": slug, "display_name": "Label" }).to_string();
+    let (status, _, response) = harness.post(base, key, &body).await;
+    assert_eq!(status, StatusCode::CREATED, "create {slug}: {response}");
+    id_of(&response)
+}
+
 async fn audit_actions(harness: &Harness, scope: Scope) -> Vec<String> {
     harness
         .control_store()
@@ -228,6 +257,172 @@ async fn a_signup_form_write_is_sudo_gated() {
         "the elevated signup form write succeeds: {stored}"
     );
     assert!(stored.contains(&client), "the write persisted: {stored}");
+}
+
+/// The organization ROLE and GROUP mutations (issue #97, PR 4) are sudo gated exactly
+/// like every other environment-scoped mutator. Five route entries carry SEVEN mutating
+/// handlers (role create, rename, delete; group create, rename, reparent, delete), so
+/// there are seven `require_fresh_privilege` call sites, and every one is challenged
+/// here with the elevation window lapsed, writes nothing, and succeeds after a fresh
+/// elevation. Without this row a refactor could drop the gate from `delete_org_role` and
+/// let the stolen-cookie case this file calls acceptance-critical delete an
+/// organization's roles with no re-authentication, with CI still green.
+///
+/// One test rather than five: the challenged half and the elevated half have to run
+/// against the SAME seeded rows for "wrote nothing" to mean anything.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn an_org_role_or_group_write_is_sudo_gated() {
+    let (harness, clock) = Harness::start_with_sudo(600).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k1").await;
+    let elevate = elevate_path(&tenant, &env);
+
+    // The fixture itself needs an open window: creating the organization is a gated
+    // mutation too. Seed inside one, then let it lapse so the probes below run against
+    // the exact state the gate is supposed to protect.
+    let (status, _, body) = harness.post(&elevate, "e1", "{}").await;
+    assert_eq!(status, StatusCode::OK, "elevate: {body}");
+    let (status, _, response) = harness
+        .post(
+            &organizations_path(&tenant, &env),
+            "org-1",
+            &serde_json::json!({ "display_name": "Globex" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "create org: {response}");
+    let org = id_of(&response);
+    let roles = org_roles_path(&tenant, &env, &org);
+    let groups = org_groups_path(&tenant, &env, &org);
+    let role = create_named(&harness, &roles, "seeded", "r-seed").await;
+    let group = create_named(&harness, &groups, "seeded", "g-seed").await;
+    let sibling = create_named(&harness, &groups, "sibling", "g-sib").await;
+    let role_path = format!("{roles}/{role}");
+    let group_path = format!("{groups}/{group}");
+
+    clock.advance(Duration::from_secs(601));
+
+    let create_body = serde_json::json!({ "slug": "fresh", "display_name": "Label" }).to_string();
+    let rename_body = serde_json::json!({ "display_name": "Pwned" }).to_string();
+    let reparent_body = serde_json::json!({ "parent_id": sibling }).to_string();
+
+    // --- With the window lapsed, every mutating endpoint is challenged. ---
+    for (label, path, key, body) in [
+        ("create_org_role", roles.clone(), "r-1", create_body.clone()),
+        (
+            "create_org_group",
+            groups.clone(),
+            "g-1",
+            create_body.clone(),
+        ),
+    ] {
+        let (status, _, resp) = harness.post(&path, key, &body).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{label} is challenged without an elevation: {resp}"
+        );
+        assert!(
+            resp.contains("insufficient_user_authentication"),
+            "{label} carries the RFC 9470 challenge: {resp}"
+        );
+    }
+    for (label, path, body) in [
+        ("update_org_role", role_path.clone(), rename_body.clone()),
+        ("update_org_group", group_path.clone(), rename_body.clone()),
+    ] {
+        let (status, _, resp) = harness.patch(&path, &body).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{label} is challenged without an elevation: {resp}"
+        );
+        assert!(
+            resp.contains("insufficient_user_authentication"),
+            "{label} carries the RFC 9470 challenge: {resp}"
+        );
+    }
+    let (status, _, resp) = harness
+        .put(&format!("{group_path}/parent"), &reparent_body)
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "set_org_group_parent is challenged without an elevation: {resp}"
+    );
+    assert!(resp.contains("insufficient_user_authentication"), "{resp}");
+    for (label, path) in [
+        ("delete_org_role", role_path.clone()),
+        ("delete_org_group", group_path.clone()),
+    ] {
+        let (status, _, resp) = harness.delete(&path).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{label} is challenged without an elevation: {resp}"
+        );
+        assert!(
+            resp.contains("insufficient_user_authentication"),
+            "{label} carries the RFC 9470 challenge: {resp}"
+        );
+    }
+
+    // Nothing executed: no row was added, none removed, none renamed, none moved.
+    // Reads are ungated, so this is observable without elevating first.
+    let (_, _, listed_roles) = harness.get(&roles).await;
+    assert_eq!(
+        item_count(&listed_roles),
+        1,
+        "the challenged role create and delete wrote nothing: {listed_roles}"
+    );
+    let (_, _, listed_groups) = harness.get(&groups).await;
+    assert_eq!(
+        item_count(&listed_groups),
+        2,
+        "the challenged group create and delete wrote nothing: {listed_groups}"
+    );
+    let (_, _, stored_role) = harness.get(&role_path).await;
+    assert!(
+        stored_role.contains("\"display_name\":\"Label\""),
+        "the challenged role rename wrote nothing: {stored_role}"
+    );
+    let (_, _, stored_group) = harness.get(&group_path).await;
+    assert!(
+        stored_group.contains("\"display_name\":\"Label\""),
+        "the challenged group rename wrote nothing: {stored_group}"
+    );
+    assert!(
+        stored_group.contains("\"parent_id\":null"),
+        "the challenged reparent left the group a root: {stored_group}"
+    );
+
+    // --- After a fresh elevation, every one of the same requests succeeds. ---
+    let (status, _, body) = harness.post(&elevate, "e2", "{}").await;
+    assert_eq!(status, StatusCode::OK, "re-elevate: {body}");
+
+    let (status, _, resp) = harness.post(&roles, "r-2", &create_body).await;
+    assert_eq!(status, StatusCode::CREATED, "elevated role create: {resp}");
+    let (status, _, resp) = harness.post(&groups, "g-2", &create_body).await;
+    assert_eq!(status, StatusCode::CREATED, "elevated group create: {resp}");
+    let (status, _, resp) = harness.patch(&role_path, &rename_body).await;
+    assert_eq!(status, StatusCode::OK, "elevated role rename: {resp}");
+    let (status, _, resp) = harness.patch(&group_path, &rename_body).await;
+    assert_eq!(status, StatusCode::OK, "elevated group rename: {resp}");
+    let (status, _, resp) = harness
+        .put(&format!("{group_path}/parent"), &reparent_body)
+        .await;
+    assert_eq!(status, StatusCode::OK, "elevated group reparent: {resp}");
+    let (status, _, resp) = harness.delete(&group_path).await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "elevated group delete: {resp}"
+    );
+    let (status, _, resp) = harness.delete(&role_path).await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "elevated role delete: {resp}"
+    );
 }
 
 /// The acceptance-critical adversarial case: a valid credential whose recorded elevation

@@ -632,6 +632,53 @@ impl Harness {
         self.send(request).await
     }
 
+    /// A PATCH with an arbitrary bearer token, for driving the environment-scoped
+    /// MUTATION surface as a management key (the credential-scope tests).
+    pub async fn patch_as(
+        &self,
+        path: &str,
+        token: &str,
+        body: &str,
+    ) -> (StatusCode, HeaderMap, String) {
+        let request = Request::builder()
+            .method("PATCH")
+            .uri(path)
+            .header(header::AUTHORIZATION, bearer(token))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_owned()))
+            .expect("request builds");
+        self.send(request).await
+    }
+
+    /// A PUT with an arbitrary bearer token (no Idempotency-Key: PUT is the
+    /// idempotent replace).
+    pub async fn put_as(
+        &self,
+        path: &str,
+        token: &str,
+        body: &str,
+    ) -> (StatusCode, HeaderMap, String) {
+        let request = Request::builder()
+            .method("PUT")
+            .uri(path)
+            .header(header::AUTHORIZATION, bearer(token))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_owned()))
+            .expect("request builds");
+        self.send(request).await
+    }
+
+    /// A DELETE with an arbitrary bearer token.
+    pub async fn delete_as(&self, path: &str, token: &str) -> (StatusCode, HeaderMap, String) {
+        let request = Request::builder()
+            .method("DELETE")
+            .uri(path)
+            .header(header::AUTHORIZATION, bearer(token))
+            .body(Body::empty())
+            .expect("request builds");
+        self.send(request).await
+    }
+
     /// A POST carrying NO Authorization header, for the enablement-gate-before-bearer
     /// test (issue #58): a disabled endpoint must be a uniform 404 even to an
     /// unauthenticated probe, never a 401 that reveals the route exists.
