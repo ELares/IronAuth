@@ -212,13 +212,20 @@ pub enum ResourceType {
     /// organization that may not exist, and its parent pointer would reference a
     /// target-environment group id that certainly does not.
     OrgGroup,
+    /// A per-organization authentication policy (issue #95): the single live policy
+    /// document stating the authentication requirements one organization TIGHTENS
+    /// for its own members. Like a role and a group it is scoped to an
+    /// ORGANIZATION, and organizations are themselves Runtime and never travel in a
+    /// config snapshot, so a policy is Runtime too: a promoted policy would
+    /// reference a target-environment organization that may not exist.
+    OrgAuthPolicy,
 }
 
 impl ResourceType {
     /// Every resource type, in a stable order. The classification lint and the
     /// metadata endpoint both iterate this; a variant missing here is caught by
     /// the `all_lists_every_variant` test and by `scripts/classification-lint.sh`.
-    pub const ALL: [ResourceType; 30] = [
+    pub const ALL: [ResourceType; 31] = [
         ResourceType::Operator,
         ResourceType::Tenant,
         ResourceType::Environment,
@@ -249,6 +256,7 @@ impl ResourceType {
         ResourceType::FlowVersion,
         ResourceType::OrgRole,
         ResourceType::OrgGroup,
+        ResourceType::OrgAuthPolicy,
     ];
 
     /// The stable wire name of this resource type (for example `organization`).
@@ -285,6 +293,7 @@ impl ResourceType {
             ResourceType::FlowVersion => "flow_version",
             ResourceType::OrgRole => "org_role",
             ResourceType::OrgGroup => "org_group",
+            ResourceType::OrgAuthPolicy => "org_auth_policy",
         }
     }
 
@@ -322,7 +331,8 @@ impl ResourceType {
             | ResourceType::SignupForm
             | ResourceType::FlowVersion
             | ResourceType::OrgRole
-            | ResourceType::OrgGroup => ResourceLevel::Environment,
+            | ResourceType::OrgGroup
+            | ResourceType::OrgAuthPolicy => ResourceLevel::Environment,
         }
     }
 
@@ -444,7 +454,16 @@ pub fn classify(resource: ResourceType) -> ResourceClassification {
         // same reasons as a role, plus one of its own: its parent pointer names another
         // group id, and an id is environment specific, so a promoted group tree would
         // carry dangling edges into an environment that never held those groups.
-        | ResourceType::OrgGroup => Runtime,
+        | ResourceType::OrgGroup
+        // A per-organization authentication policy (issue #95) is dynamic
+        // per-environment data for the same reason as a role: it hangs off an
+        // organization, so a promoted policy would govern a target-environment
+        // organization that may not exist. It STRUCTURALLY never enters a snapshot,
+        // so it is Runtime. Note the asymmetry a future ENVIRONMENT-level policy row
+        // would create: that row would be Promotable and would land on the other side
+        // of the promotion boundary from this one, which is a real decision rather
+        // than a formality.
+        | ResourceType::OrgAuthPolicy => Runtime,
     }
 }
 

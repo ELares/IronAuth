@@ -48,6 +48,7 @@ use crate::id::{
     ConnectorId, CorrelationId, CredentialId, GrantId, IssuedTokenId, OrganizationId, ServiceId,
     SessionId, SigningKeyId, UserId,
 };
+use crate::org_policy::{AuthPolicy, ORG_POLICY_MAX_SESSION_TTL_SECS};
 use crate::repository::{
     CredentialRemoveOutcome, RedeemOutcome, RefreshFamilyFleetFilter, SessionEndCause,
     SessionFleetFilter, TokenStatus, UserListFilter, UserState,
@@ -141,9 +142,12 @@ impl IdorHarness {
     /// `organizations.delete`), its membership join (`org_memberships.get`,
     /// `org_memberships.remove`), its role set (`org_roles.get`,
     /// `org_roles.delete`), its group forest (`org_groups.get`,
-    /// `org_groups.update`, `org_groups.delete`, `org_groups.reparent`), and the
+    /// `org_groups.update`, `org_groups.delete`, `org_groups.reparent`), the
     /// three join surfaces that bind those together (`org_group_members.remove`,
-    /// `org_group_roles.unassign`, `org_membership_roles.unassign`), the
+    /// `org_group_roles.unassign`, `org_membership_roles.unassign`), its
+    /// per-organization authentication policy (`org_auth_policies.set`,
+    /// `org_auth_policies.remove`, both addressed by ORGANIZATION id rather than by
+    /// the policy's own id, because the organization IS the policy's identity), the
     /// two-thirds of the four-level resource model
     /// that is tenant-and-environment scoped (operators, tenants, and environments
     /// are LEVEL tables whose isolation is exercised by the management-plane tests
@@ -170,6 +174,8 @@ impl IdorHarness {
         self.register(Box::new(OrgGroupMemberRemoveProbe));
         self.register(Box::new(OrgGroupRoleUnassignProbe));
         self.register(Box::new(OrgMembershipRoleUnassignProbe));
+        self.register(Box::new(OrgAuthPolicySetProbe));
+        self.register(Box::new(OrgAuthPolicyRemoveProbe));
         self
     }
 
@@ -649,6 +655,107 @@ impl IsolationProbe for OrgRoleGetProbe {
                 return ProbeOutcome::Denied;
             };
             match roles.get(&id).await {
+                Ok(_) => ProbeOutcome::Leaked,
+                Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `ActingOrgAuthPolicyRepo::set` (issue #95). `store` must
+/// authenticate as `ironauth_control`.
+///
+/// Unlike every other probe in this module the untrusted identifier here is an
+/// ORGANIZATION id, not the resource's own id, because a policy is 1:1 with its
+/// organization and both mutations address it that way. That makes this the probe
+/// for the whole addressing scheme: if a foreign organization id could be used to
+/// STATE a policy, one tenant could impose an authentication requirement on another
+/// tenant's members, or lift one.
+///
+/// The submitted document is EMPTY, which is valid in every respect (it restricts
+/// nothing, so no validator can refuse it) and therefore leaves the cross-scope
+/// resolution as the only thing that can deny the write. A probe submitting an
+/// INVALID document would be refused for the wrong reason and would prove nothing.
+struct OrgAuthPolicySetProbe;
+
+impl IsolationProbe for OrgAuthPolicySetProbe {
+    fn name(&self) -> &'static str {
+        "org_auth_policies.set"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            let env = Env::system();
+            let Ok(organization) = store
+                .management()
+                .organizations(caller)
+                .parse_id(foreign_id)
+            else {
+                return ProbeOutcome::Denied;
+            };
+            let actor = ActorRef::service(ServiceId::generate(&env));
+            let correlation = CorrelationId::generate(&env);
+            let policies = store
+                .management()
+                .acting(actor, correlation)
+                .org_auth_policies(caller);
+            match policies
+                .set(
+                    &env,
+                    &organization,
+                    &AuthPolicy::default(),
+                    ORG_POLICY_MAX_SESSION_TTL_SECS,
+                )
+                .await
+            {
+                Ok(_) => ProbeOutcome::Leaked,
+                Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `ActingOrgAuthPolicyRepo::remove` (issue #95). `store` must
+/// authenticate as `ironauth_control`.
+///
+/// The mutation with the larger blast radius of the two: removing a foreign
+/// organization's policy would silently LIFT whatever that organization had
+/// tightened (an MFA requirement, a factor allowlist), so it must be the uniform
+/// not-found. Addressed by organization id, like `set`.
+struct OrgAuthPolicyRemoveProbe;
+
+impl IsolationProbe for OrgAuthPolicyRemoveProbe {
+    fn name(&self) -> &'static str {
+        "org_auth_policies.remove"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            let env = Env::system();
+            let Ok(organization) = store
+                .management()
+                .organizations(caller)
+                .parse_id(foreign_id)
+            else {
+                return ProbeOutcome::Denied;
+            };
+            let actor = ActorRef::service(ServiceId::generate(&env));
+            let correlation = CorrelationId::generate(&env);
+            let policies = store
+                .management()
+                .acting(actor, correlation)
+                .org_auth_policies(caller);
+            match policies.remove(&env, &organization).await {
                 Ok(_) => ProbeOutcome::Leaked,
                 Err(_) => ProbeOutcome::Denied,
             }

@@ -8,10 +8,10 @@ use ironauth_env::Env;
 use ironauth_store::idor_harness::IdorHarness;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
-    ActorRef, CorrelationId, ManagementKeyId, NewAdminUser, NewMembership, NewOrgGroup,
-    NewOrgGroupMember, NewOrgGroupRole, NewOrgMembershipRole, NewOrgRole, OrgGroupId,
-    OrgGroupMemberId, OrgGroupRoleId, OrgMembershipId, OrgMembershipRoleId, OrgRoleId,
-    OrganizationId, Scope, ServiceId, StoreError, UserState,
+    ActorRef, AuthPolicy, CorrelationId, ManagementKeyId, NewAdminUser, NewMembership, NewOrgGroup,
+    NewOrgGroupMember, NewOrgGroupRole, NewOrgMembershipRole, NewOrgRole,
+    ORG_POLICY_MAX_SESSION_TTL_SECS, OrgGroupId, OrgGroupMemberId, OrgGroupRoleId, OrgMembershipId,
+    OrgMembershipRoleId, OrgRoleId, OrganizationId, Scope, ServiceId, StoreError, UserState,
 };
 
 /// A stand-in key hash for a planted victim (the probes resolve by id, not hash).
@@ -103,6 +103,33 @@ async fn management_probes_deny_cross_tenant_and_cross_environment_uniformly() {
     )
     .await;
 
+    // Per-organization authentication policies (issue #95): plant a victim policy on
+    // each foreign organization so the REMOVE probe has a real target. Without one it
+    // would be denied simply because nothing was there, passing for the wrong reason.
+    // The document tightens something real (an MFA requirement), so a leak would be a
+    // cross-tenant WEAKENING rather than a no-op.
+    let victim_policy_document = AuthPolicy {
+        mfa_required: Some(true),
+        ..AuthPolicy::default()
+    };
+    for (scope, org) in [(scope_b, &victim_org_b), (scope_a2, &victim_org_a2)] {
+        control
+            .management()
+            .acting(
+                ActorRef::service(ServiceId::generate(&env)),
+                CorrelationId::generate(&env),
+            )
+            .org_auth_policies(scope)
+            .set(
+                &env,
+                org,
+                &victim_policy_document,
+                ORG_POLICY_MAX_SESSION_TTL_SECS,
+            )
+            .await
+            .expect("plant the victim policy");
+    }
+
     // A well-formed key id in the caller's OWN scope that was never stored.
     let absent_in_a = ManagementKeyId::generate(&env, &scope_a).to_string();
 
@@ -136,6 +163,8 @@ async fn management_probes_deny_cross_tenant_and_cross_environment_uniformly() {
             "org_group_members.remove",
             "org_group_roles.unassign",
             "org_membership_roles.unassign",
+            "org_auth_policies.set",
+            "org_auth_policies.remove",
         ],
         "every management resolve-by-id operation is registered",
     );
@@ -311,6 +340,24 @@ async fn management_probes_deny_cross_tenant_and_cross_environment_uniformly() {
                 .await
                 .is_ok(),
             "the victim direct role grant must survive the unassign probe"
+        );
+    }
+
+    // The victim POLICIES must survive both probes AND still carry their own
+    // document. A liveness-only assertion would miss the sharper leak: a cross-scope
+    // `set` that landed would leave the policy readable while having REPLACED the
+    // foreign organization's MFA requirement with an empty document, which is
+    // precisely the weakening the probe exists to catch.
+    for (scope, org) in [(scope_b, &victim_org_b), (scope_a2, &victim_org_a2)] {
+        let record = control
+            .management()
+            .org_auth_policies(scope)
+            .get_for_org(org)
+            .await
+            .expect("the victim policy must survive the set and remove probes");
+        assert_eq!(
+            record.document, victim_policy_document,
+            "the victim policy's document must be untouched by the set probe"
         );
     }
 }
