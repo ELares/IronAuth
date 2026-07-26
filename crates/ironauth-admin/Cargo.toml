@@ -195,6 +195,19 @@ name = "org_roles_groups"
 path = "tests/org_roles_groups.rs"
 required-features = ["testing"]
 
+# Organization group members, role assignments, and the effective-role view over
+# HTTP (issue #97, PR 5): the three pair-addressed join surfaces, the
+# cross-organization PAIRING refusal (two ids each individually visible but
+# belonging to different organizations), byte-identical anti-oracle uniformity
+# across every shape of unreachable id, the multi-page cursor walk on all three
+# lists, the environment-scoped-key confinement on all ten endpoints, and the
+# provenance-carrying effective-role resolution over direct, group, and ancestor
+# grants. Needs a real database (DATABASE_URL).
+[[test]]
+name = "org_members_assignments"
+path = "tests/org_members_assignments.rs"
+required-features = ["testing"]
+
 # DCR abuse-control management surface (issue #31): authoring a reusable policy
 # (create/list/replay/conflict/invalid-primitive), minting an initial access token
 # carrying a policy-chain snapshot (plaintext once, idempotent replay, unknown policy

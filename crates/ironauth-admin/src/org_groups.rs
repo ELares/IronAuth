@@ -65,6 +65,7 @@ use crate::auth::Principal;
 use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
 use crate::input::{parse_json, require_non_empty, require_slug};
+use crate::org_context::{parse_group_id, resolve_live_org, resolve_scope};
 use crate::pagination::{ListQuery, Pagination};
 use crate::response::{json, no_content};
 use crate::state::AdminState;
@@ -178,43 +179,6 @@ pub struct OrgGroupList {
     pub next_cursor: Option<String>,
 }
 
-/// Resolve and authorize the `(tenant, environment)` scope from the path. The
-/// operator passes; a management key must be scoped to exactly this environment
-/// (otherwise the LOUD wrong-scope error). A malformed tenant or environment id is
-/// the uniform not-found.
-fn resolve_scope(
-    state: &AdminState,
-    principal: &Principal,
-    tenant_id: &str,
-    environment_id: &str,
-) -> Result<(Scope, ironauth_store::ActorRef), ApiError> {
-    let tenant = state
-        .store()
-        .management()
-        .tenants(state.bootstrap_operator_id())
-        .parse_id(tenant_id)?;
-    let environment = state
-        .store()
-        .management()
-        .environments(tenant)
-        .parse_id(environment_id)?;
-    let actor = principal.require_environment(tenant, environment)?;
-    Ok((Scope::new(tenant, environment), actor))
-}
-
-/// Resolve the parent organization id in scope, verifying it exists and is LIVE. A
-/// foreign or soft-deleted organization reads as a uniform not-found.
-async fn resolve_live_org(
-    state: &AdminState,
-    scope: Scope,
-    organization_id: &str,
-) -> Result<OrganizationId, ApiError> {
-    let organizations = state.store().management().organizations(scope);
-    let id = organizations.parse_id(organization_id)?;
-    organizations.get(&id).await?;
-    Ok(id)
-}
-
 /// Read a group through the nested `(organization, group)` pair address.
 ///
 /// The cross-parent guard on the read side: a group of a DIFFERENT organization,
@@ -232,20 +196,6 @@ async fn read_group_in_org(
         .org_groups(scope)
         .get_in_org(org_id, group_id)
         .await?)
-}
-
-/// Parse an untrusted group id in scope. A malformed value and one minted in
-/// another `(tenant, environment)` both collapse to the uniform not-found.
-fn parse_group_id(
-    state: &AdminState,
-    scope: Scope,
-    group_id: &str,
-) -> Result<OrgGroupId, ApiError> {
-    Ok(state
-        .store()
-        .management()
-        .org_groups(scope)
-        .parse_id(group_id)?)
 }
 
 /// Parse an optional wire `parent_id` into a typed id in scope.

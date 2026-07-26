@@ -31869,6 +31869,42 @@ pub struct NewOrgMembershipRole<'a> {
     pub role_id: &'a OrgRoleId,
 }
 
+/// WHY one role is in a membership's effective set (issue #97).
+///
+/// The two variants are the two assignment surfaces and nothing else: a role is
+/// either granted straight to the membership, or granted to a group in the
+/// membership's ancestor closure. There is no third kind, and a role that is
+/// unreachable simply produces no [`EffectiveRoleGrant`] at all rather than a
+/// variant meaning "none".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffectiveRoleSource {
+    /// Granted straight to this membership (an `org_membership_roles` row). It
+    /// survives every change to the group forest.
+    Direct,
+    /// Inherited from this group (an `org_group_roles` row on a group the
+    /// membership is a live member of, or on an ANCESTOR of one). Removing the
+    /// membership from the group, or withdrawing the grant from the group, is what
+    /// takes it away.
+    Group(OrgGroupId),
+}
+
+/// ONE grant path in an effective-role resolution (issue #97): a role the
+/// membership holds, and the reason it holds it.
+///
+/// One of these per PATH, not per role: a role reachable both directly and through
+/// a group yields two. See [`OrgGroupRepo::effective_role_grants`] for why the
+/// multiset rather than a deduplicated "primary source" is the honest answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveRoleGrant {
+    /// The role's IMMUTABLE stable name, the same value the token claim carries.
+    /// Slugs rather than ids for the reason spelled out on
+    /// [`OrgGroupRepo::effective_roles`]: a slug is stable across a rename and
+    /// across a promotion between environments.
+    pub slug: String,
+    /// How this path reaches the role.
+    pub source: EffectiveRoleSource,
+}
+
 /// The control-plane entry point: reads and the acting door for writes.
 ///
 /// Reached through [`Store::management`]. Its pool must authenticate as
@@ -33050,6 +33086,113 @@ impl OrgGroupRepo<'_> {
         max_group_depth: u32,
         tail: &'static str,
     ) -> Result<BTreeSet<String>, StoreError> {
+        let rows = self
+            .run_effective(organization_id, user_id, max_group_depth, tail)
+            .await?;
+        // A BTreeSet rather than the Vec the ORDER BY already sorted: the SQL order
+        // and the collection order must agree even if a future edit to either drifts,
+        // and a set makes the deduplication of a role reachable by several paths
+        // structural rather than a property of DISTINCT.
+        Ok(rows
+            .iter()
+            .map(|row| row.get::<String, _>("slug"))
+            .collect())
+    }
+
+    /// The EFFECTIVE ROLE SET with its PROVENANCE (issue #97): one entry per GRANT
+    /// PATH rather than one per role, so a caller learns not only WHICH roles a
+    /// member holds but WHY they hold each one.
+    ///
+    /// # One closure, three projections
+    ///
+    /// This runs the SAME [`EFFECTIVE_CLOSURE_CTE`] as
+    /// [`OrgGroupRepo::effective_roles`] and [`OrgGroupRepo::effective_group_slugs`],
+    /// through the same private entry point, and differs ONLY in its projection
+    /// ([`EFFECTIVE_ROLE_GRANTS_TAIL`]). That is load-bearing rather than tidy: a
+    /// second walk with its own notion of "ancestor" could drift from the one the
+    /// token-issuance path resolves, and then an operator reading provenance in the
+    /// console would be told a role is inherited from a group that the mint path
+    /// does not agree grants it. The `slug` MULTISET this returns therefore has
+    /// exactly the [`OrgGroupRepo::effective_roles`] set as its distinct values, by
+    /// construction and not by convention.
+    ///
+    /// # The multiset, and why it is not deduplicated to one entry per role
+    ///
+    /// A role reachable by SEVERAL paths (directly AND through a group, or through
+    /// two different groups) yields SEVERAL entries, one per path. Collapsing them
+    /// to a single "primary" source would hide the operator-relevant fact: an
+    /// operator who withdraws the one grant they were shown, and sees the role
+    /// survive, has been actively misled by the endpoint that exists to explain the
+    /// role. The distinct `slug` values are the effective set; the entries are the
+    /// evidence.
+    ///
+    /// # Determinism
+    ///
+    /// Ordered by `(slug, via_group_id)` with DIRECT grants first, so two
+    /// evaluations against identical stored state produce byte-identical output.
+    /// Everything [`OrgGroupRepo::effective_roles`] documents about liveness
+    /// filtering, the bounded walk that truncates rather than looping, the empty
+    /// result for a user with no live active membership, and the tenant,
+    /// environment, and organization fencing applies here unchanged.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if either id is out of this repository's scope;
+    /// [`StoreError::Database`] on a persistence failure, or if a stored
+    /// `group_id` fails to re-parse in this scope.
+    pub async fn effective_role_grants(
+        &self,
+        organization_id: &OrganizationId,
+        user_id: &UserId,
+        max_group_depth: u32,
+    ) -> Result<Vec<EffectiveRoleGrant>, StoreError> {
+        let rows = self
+            .run_effective(
+                organization_id,
+                user_id,
+                max_group_depth,
+                EFFECTIVE_ROLE_GRANTS_TAIL,
+            )
+            .await?;
+        rows.iter()
+            .map(|row| {
+                let slug = row.get::<String, _>("slug");
+                // A NULL `via_group_id` is the DIRECT grant; anything else is the id
+                // of the group in the closure that carries it. The stored id is
+                // re-parsed IN SCOPE, exactly as every other row decode in this
+                // module does, so a corrupt value is a decode error rather than an
+                // id that silently escapes its scope.
+                let source = match row.get::<Option<String>, _>("via_group_id") {
+                    None => EffectiveRoleSource::Direct,
+                    Some(raw) => EffectiveRoleSource::Group(
+                        OrgGroupId::parse_in_scope(&raw, &self.scope).map_err(|_| {
+                            StoreError::Database(sqlx::Error::Decode(
+                                "org_group_roles.group_id is not a group id in this scope".into(),
+                            ))
+                        })?,
+                    ),
+                };
+                Ok(EffectiveRoleGrant { slug, source })
+            })
+            .collect()
+    }
+
+    /// The shared body of every effective-resolution read: the scope guard, the read
+    /// depth bound, and one statement made of [`EFFECTIVE_CLOSURE_CTE`] followed by
+    /// `tail`.
+    ///
+    /// One private entry point so all three public resolutions share ONE definition
+    /// of the membership seed, the ancestor walk, and the depth bound; only the
+    /// projection differs. `tail` is a `&'static str` chosen from three module
+    /// constants, never anything a caller supplies, so no part of this statement is
+    /// caller-authored SQL.
+    async fn run_effective(
+        &self,
+        organization_id: &OrganizationId,
+        user_id: &UserId,
+        max_group_depth: u32,
+        tail: &'static str,
+    ) -> Result<Vec<PgRow>, StoreError> {
         if organization_id.scope() != self.scope || user_id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -33075,14 +33218,7 @@ impl OrgGroupRepo<'_> {
             .fetch_all(&mut *tx)
             .await?;
         tx.commit().await?;
-        // A BTreeSet rather than the Vec the ORDER BY already sorted: the SQL order
-        // and the collection order must agree even if a future edit to either drifts,
-        // and a set makes the deduplication of a role reachable by several paths
-        // structural rather than a property of DISTINCT.
-        Ok(rows
-            .iter()
-            .map(|row| row.get::<String, _>("slug"))
-            .collect())
+        Ok(rows)
     }
 }
 
@@ -33113,8 +33249,9 @@ impl OrgGroupRepo<'_> {
 ///      `parent_id` is an untrusted stored pointer: deleting it really does change an
 ///      answer, and
 ///      `the_read_walk_never_crosses_organization_via_a_corrupt_parent` is the test
-///      that says so. [`EFFECTIVE_ROLE_SLUGS_TAIL`] carries the full census of which
-///      organization predicates around here are redundant and which are not.
+///      that says so. [`EFFECTIVE_ROLE_SLUGS_TAIL`] carries the census of which
+///      organization predicates on this closure and on that projection are redundant
+///      and which are not, and says where the third projection's copies are counted.
 ///
 /// Binds: `$1` tenant, `$2` environment, `$3` organization, `$4` user, `$5` the walk
 /// bound (`max_group_depth`, one LOWER than the write walks use; see
@@ -33176,6 +33313,15 @@ const EFFECTIVE_CLOSURE_CTE: &str = "WITH RECURSIVE membership AS ( \
 /// ever admitted a cross-organization assignment, these are what would keep the
 /// resulting role out of a token instead of quietly emitting it.
 ///
+/// The count is a tally over THIS statement and the closure, and it is worth saying so
+/// out loud, because a THIRD projection now runs over the same closure.
+/// [`EFFECTIVE_ROLE_GRANTS_TAIL`] repeats the same predicates in its own two branches
+/// (`r.organization_id` and `mr.organization_id` in the direct branch,
+/// `r.organization_id` and `gr.organization_id` in the group branch); they are the
+/// same layer, kept for the same reason, and they are simply not part of the five
+/// counted here. That tail carries its own note on the two predicates in it that are
+/// NOT of this kind.
+///
 /// The SIXTH is NOT of this kind and must not be filed with them. `g.organization_id`
 /// in the RECURSIVE arm of [`EFFECTIVE_CLOSURE_CTE`] is the only thing fencing the
 /// organization on the ancestor walk, and `parent_id` is an UNTRUSTED stored pointer
@@ -33229,6 +33375,78 @@ const EFFECTIVE_ROLE_SLUGS_TAIL: &str = "SELECT DISTINCT r.slug AS slug \
 /// collapses a group reached by several paths, which `UNION ALL` in the closure can
 /// legitimately produce.
 const EFFECTIVE_GROUP_SLUGS_TAIL: &str = "SELECT DISTINCT slug AS slug FROM closure ORDER BY slug";
+
+/// The projection [`OrgGroupRepo::effective_role_grants`] runs over
+/// [`EFFECTIVE_CLOSURE_CTE`]: the same live roles [`EFFECTIVE_ROLE_SLUGS_TAIL`]
+/// resolves, but one row per GRANT PATH and carrying which path it is.
+///
+/// # Why this is a UNION ALL of two branches rather than one scan with two `IN`s
+///
+/// [`EFFECTIVE_ROLE_SLUGS_TAIL`] deliberately collapses the two grant kinds into one
+/// `org_roles` scan under `OR`, because it answers "which roles" and a role reachable
+/// twice must appear once. This tail answers the DIFFERENT question "by which paths",
+/// so the two kinds have to stay separable and each group that carries a grant has to
+/// stay attributable. The branches are otherwise the SAME predicates over the SAME
+/// live rows, so the distinct slugs this returns are exactly the set that one returns.
+///
+/// The DIRECT branch projects a literal `NULL` group. A NULL is the encoding of
+/// "no group was involved", not of "unknown": `EffectiveRoleSource::Direct` is what
+/// the decode turns it into, so the ambiguity never escapes the store.
+///
+/// `gr.group_id IN (SELECT id FROM closure)` is a SEMI-join, so a group the closure
+/// reached by several paths (which `UNION ALL` in the closure can legitimately
+/// produce) still yields ONE row here. `DISTINCT` in each branch is the second layer
+/// under that, and under the partial unique indexes that already forbid two live
+/// assignment rows for one pair.
+///
+/// `ORDER BY slug, via_group_id NULLS FIRST` is a TOTAL order over the result (no two
+/// rows share both columns), so the output is byte-stable across evaluations, and the
+/// direct grant for a slug always precedes its inherited ones.
+///
+/// # The DIRECT branch's two selectors, and what pins each
+///
+/// Being a copy of [`EFFECTIVE_ROLE_SLUGS_TAIL`]'s direct-grant subquery is what
+/// makes this branch correct and also what makes it easy to prune wrongly, so the
+/// two predicates that carry it are named with the test that kills each.
+///
+/// `JOIN membership mb ON mb.id = mr.membership_id` is the only thing that makes
+/// this branch report THIS member's grants rather than EVERY live direct grant in
+/// the organization: two members of one organization agree on tenant, environment,
+/// and organization, so no scope or containment predicate separates their rows.
+///
+/// `r.deleted_at IS NULL` is this branch's OWN copy of the role-liveness filter. A
+/// role delete does not cascade its assignment rows, so without it a role deleted out
+/// from under a direct grant keeps being reported as held while
+/// [`OrgGroupRepo::effective_roles`] correctly drops it, and the console then tells
+/// an operator that a token will carry a role it will not.
+///
+/// Both were MUTATION SURVIVORS until step 4 of
+/// `effective_roles_is_empty_by_default_and_drops_every_withdrawn_path` in
+/// `crates/ironauth-admin/tests/org_members_assignments.rs` landed. Every test on
+/// this surface used to put at most ONE membership holding a direct grant in an
+/// organization, and every one that deleted a role reached that role through a
+/// GROUP, so the group branch's copies below were exercised and these two never
+/// were. That step now stands a SECOND membership beside the first and deletes a
+/// DIRECTLY granted role, and it is what turns red when either one goes.
+const EFFECTIVE_ROLE_GRANTS_TAIL: &str = "SELECT DISTINCT r.slug AS slug, \
+            NULL::text AS via_group_id \
+       FROM org_roles r \
+       JOIN org_membership_roles mr ON mr.role_id = r.id \
+       JOIN membership mb ON mb.id = mr.membership_id \
+      WHERE r.tenant_id = $1 AND r.environment_id = $2 \
+        AND r.organization_id = $3 AND r.deleted_at IS NULL \
+        AND mr.tenant_id = $1 AND mr.environment_id = $2 \
+        AND mr.organization_id = $3 AND mr.deleted_at IS NULL \
+      UNION ALL \
+     SELECT DISTINCT r.slug AS slug, gr.group_id AS via_group_id \
+       FROM org_roles r \
+       JOIN org_group_roles gr ON gr.role_id = r.id \
+      WHERE r.tenant_id = $1 AND r.environment_id = $2 \
+        AND r.organization_id = $3 AND r.deleted_at IS NULL \
+        AND gr.tenant_id = $1 AND gr.environment_id = $2 \
+        AND gr.organization_id = $3 AND gr.deleted_at IS NULL \
+        AND gr.group_id IN (SELECT id FROM closure) \
+      ORDER BY slug, via_group_id NULLS FIRST";
 
 /// The projection every group-member read selects from `org_group_members` (the two
 /// timestamps as epoch microseconds). One constant so the get and list projections
@@ -33306,6 +33524,107 @@ impl OrgGroupMemberRepo<'_> {
         } else {
             Err(StoreError::NotFound)
         }
+    }
+
+    /// Fetch the live binding of ONE `(group, membership)` PAIR inside `org_id`:
+    /// the read a PAIR-ADDRESSED management route performs, because the wire
+    /// address of a binding is the two endpoints a caller already holds and never
+    /// the `gmb_` id (which exists only as the audit target).
+    ///
+    /// Every miss is the SAME [`StoreError::NotFound`]: no such binding, a removed
+    /// one, either endpoint in another organization, either endpoint in another
+    /// scope, and a pair whose two halves are individually visible but belong to
+    /// DIFFERENT organizations. That last case is the one worth naming, because it
+    /// is the only one an id-only lookup would get wrong: `organization_id` is in
+    /// the predicate, so a caller cannot pair their own group with a sibling
+    /// organization's membership and have the row resolve.
+    ///
+    /// The id this returns is safe to feed straight to
+    /// [`ActingOrgGroupMemberRepo::remove`] even though that is a second statement:
+    /// migration 0088 grants the control role UPDATE on `updated_at` and
+    /// `deleted_at` and on NOTHING else, so a binding's group, membership,
+    /// organization, and scope are immutable by GRANT and the pair cannot come
+    /// apart between the read and the write. A concurrent remove makes the write
+    /// match no live row, which is the same not-found this read would have given.
+    ///
+    /// # Redundancy census (read before deleting a predicate here)
+    ///
+    /// Every claim below is a MUTATION result: the predicate was neutralized, the
+    /// whole of `crates/ironauth-admin/tests/org_members_assignments.rs` and of
+    /// `crates/ironauth-store/tests/org_assignments.rs` were run, and what turned red
+    /// is what is named. A coverage claim nobody re-ran is worse than none, because
+    /// the next reader deletes the predicate the census told them was covered.
+    ///
+    /// Exactly ONE predicate on this address survives that treatment: the
+    /// `organization_id` HERE. Every caller in the tree reads through this statement
+    /// and then removes through [`soft_delete_assignment_row`], which carries
+    /// `organization_id` too, so a removal addressed from a sibling organization is
+    /// refused by that second copy whatever this one does. It is kept anyway, and for
+    /// a directional reason rather than a symmetric one: it is the only fence a
+    /// caller that READS a binding without removing it would have, and the paragraph
+    /// above sells this lookup as the answer to the cross-organization PAIRING
+    /// question, which such a caller will reasonably rely on.
+    ///
+    /// The redundancy does NOT run the other way, and this census used to claim it
+    /// did. Neutralizing `organization_id` in [`soft_delete_assignment_row`] ALONE
+    /// turns `every_list_and_mutation_is_fenced_to_its_own_organization` and
+    /// `absent_removed_foreign_org_and_foreign_scope_rows_are_indistinguishable` in
+    /// `crates/ironauth-store/tests/org_assignments.rs` RED, because a store caller
+    /// removes by an assignment id and never passes through a pair lookup at all.
+    /// That copy is individually load-bearing and individually covered. Neutralizing
+    /// BOTH additionally reds
+    /// `every_cross_organization_pairing_is_refused_and_mutates_nothing` in
+    /// `crates/ironauth-admin/tests/org_members_assignments.rs`, which is the same
+    /// property stated at the HTTP boundary.
+    ///
+    /// `group_id` and `membership_id` are not redundant with anything: each is the
+    /// only thing that makes this the address of ONE pair, and dropping either really
+    /// does return a different row. `membership_id` is pinned three ways, by that
+    /// same cross-organization test, by the byte-for-byte uniformity test beside it,
+    /// and by the pagination walk. `group_id` was pinned by NOTHING, and this census
+    /// used to say it was pinned by both: every test on this surface kept its
+    /// membership in exactly ONE group, so a lookup that ignored the group segment
+    /// still found that one binding and still removed the right row. The closing
+    /// paragraph of `group_member_add_list_and_remove_round_trip` now stands a SECOND
+    /// group of the same organization beside the first and addresses the membership
+    /// through it, where the binding exists, both ids are of this organization, and
+    /// only the group segment says the binding is not the one the path names. Its
+    /// shape matters: TWO live bindings for one membership would NOT pin this, because
+    /// this statement has no `ORDER BY` and a lookup that ignored the group segment
+    /// can then return the row the caller meant by luck of scan order.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if any id is out of scope, or no live binding of
+    /// that pair exists in that organization.
+    pub async fn get_binding(
+        &self,
+        org_id: &OrganizationId,
+        group_id: &OrgGroupId,
+        membership_id: &OrgMembershipId,
+    ) -> Result<OrgGroupMemberRecord, StoreError> {
+        if org_id.scope() != self.scope
+            || group_id.scope() != self.scope
+            || membership_id.scope() != self.scope
+        {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(&format!(
+            "SELECT {ORG_GROUP_MEMBER_SELECT_COLUMNS} FROM org_group_members \
+             WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
+             AND group_id = $4 AND membership_id = $5 AND deleted_at IS NULL"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(org_id.to_string())
+        .bind(group_id.to_string())
+        .bind(membership_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        org_group_member_from_row(&row, &self.scope)
     }
 
     /// One page of live bindings for one group, ordered by `(created_at, id)`: the
@@ -33485,6 +33804,51 @@ impl OrgGroupRoleRepo<'_> {
         }
     }
 
+    /// Fetch the live assignment of ONE `(group, role)` PAIR inside `org_id`: the
+    /// read the pair-addressed management route performs, under the same addressing
+    /// rule and the same uniform not-found spelled out on
+    /// [`OrgGroupMemberRepo::get_binding`], including the cross-organization PAIRING
+    /// of two individually visible ids.
+    ///
+    /// The id it returns is safe to feed to [`ActingOrgGroupRoleRepo::unassign`] for
+    /// the same reason: migration 0089 grants UPDATE on `updated_at` and
+    /// `deleted_at` only, so `group_id`, `role_id`, and `organization_id` are
+    /// immutable by GRANT.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if any id is out of scope, or no live assignment of
+    /// that pair exists in that organization.
+    pub async fn get_assignment(
+        &self,
+        org_id: &OrganizationId,
+        group_id: &OrgGroupId,
+        role_id: &OrgRoleId,
+    ) -> Result<OrgGroupRoleRecord, StoreError> {
+        if org_id.scope() != self.scope
+            || group_id.scope() != self.scope
+            || role_id.scope() != self.scope
+        {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(&format!(
+            "SELECT {ORG_GROUP_ROLE_SELECT_COLUMNS} FROM org_group_roles \
+             WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
+             AND group_id = $4 AND role_id = $5 AND deleted_at IS NULL"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(org_id.to_string())
+        .bind(group_id.to_string())
+        .bind(role_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        org_group_role_from_row(&row, &self.scope)
+    }
+
     /// One page of live assignments for one group: the "which roles does this group
     /// grant" list. `org_id` fences the organization, so a group of a sibling
     /// organization matches nothing.
@@ -33644,6 +34008,51 @@ impl OrgMembershipRoleRepo<'_> {
         } else {
             Err(StoreError::NotFound)
         }
+    }
+
+    /// Fetch the live assignment of ONE `(membership, role)` PAIR inside `org_id`:
+    /// the read the pair-addressed management route performs, under the same
+    /// addressing rule and the same uniform not-found spelled out on
+    /// [`OrgGroupMemberRepo::get_binding`], including the cross-organization PAIRING
+    /// of two individually visible ids.
+    ///
+    /// The id it returns is safe to feed to [`ActingOrgMembershipRoleRepo::unassign`]
+    /// for the same reason: migration 0089 grants UPDATE on `updated_at` and
+    /// `deleted_at` only, so `membership_id`, `role_id`, and `organization_id` are
+    /// immutable by GRANT.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if any id is out of scope, or no live assignment of
+    /// that pair exists in that organization.
+    pub async fn get_assignment(
+        &self,
+        org_id: &OrganizationId,
+        membership_id: &OrgMembershipId,
+        role_id: &OrgRoleId,
+    ) -> Result<OrgMembershipRoleRecord, StoreError> {
+        if org_id.scope() != self.scope
+            || membership_id.scope() != self.scope
+            || role_id.scope() != self.scope
+        {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(&format!(
+            "SELECT {ORG_MEMBERSHIP_ROLE_SELECT_COLUMNS} FROM org_membership_roles \
+             WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
+             AND membership_id = $4 AND role_id = $5 AND deleted_at IS NULL"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(org_id.to_string())
+        .bind(membership_id.to_string())
+        .bind(role_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        org_membership_role_from_row(&row, &self.scope)
     }
 
     /// One page of live direct assignments for one membership: the "which roles does
@@ -37062,11 +37471,24 @@ impl ActingOrgMembershipRoleRepo<'_> {
 /// part of this statement is caller-authored SQL.
 ///
 /// One body rather than three copies because the three removals must agree on
-/// EXACTLY the addressing key. `organization_id` in the predicate is the whole
-/// containment guard: row-level security fences `(tenant, environment)` and nothing
-/// finer, so a copy that dropped it would silently let a nested management route
-/// remove a sibling organization's row. Three copies of a predicate whose absence is
+/// EXACTLY the addressing key. `organization_id` in the predicate is the containment
+/// guard: row-level security fences `(tenant, environment)` and nothing finer, so a
+/// copy that dropped it would silently let a nested management route remove a
+/// sibling organization's row. Three copies of a predicate whose absence is
 /// invisible in testing is precisely the shape of defect this collapses.
+///
+/// Since the pair-addressed management routes landed, this predicate has a SECOND
+/// layer in front of it: each of them resolves the row through
+/// [`OrgGroupMemberRepo::get_binding`] or one of the two `get_assignment` reads,
+/// which carry `organization_id` as well. That layering is ONE-WAY and is not a
+/// mutual redundancy. The READ's copy is the one whose removal no test can see;
+/// removing THIS one reds
+/// `every_list_and_mutation_is_fenced_to_its_own_organization` and
+/// `absent_removed_foreign_org_and_foreign_scope_rows_are_indistinguishable` in
+/// `crates/ironauth-store/tests/org_assignments.rs` on its own, because a store
+/// caller removes by an assignment id with no pair lookup in front of it. The
+/// redundancy census on [`OrgGroupMemberRepo::get_binding`] carries the full mutation
+/// table.
 async fn soft_delete_assignment_row(
     tx: &mut Transaction<'_, Postgres>,
     table: &'static str,
