@@ -998,6 +998,44 @@ export interface paths {
         patch: operations["updateOrgGroup"];
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/members": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List a group's members (cursor paginated). */
+        get: operations["listOrgGroupMembers"];
+        put?: never;
+        /** Bind an organization membership into a group. */
+        post: operations["addOrgGroupMember"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/members/{membership_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Unbind a membership from a group (soft delete; a repeat remove is the uniform
+         *     404).
+         */
+        delete: operations["removeOrgGroupMember"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/parent": {
         parameters: {
             query?: never;
@@ -1016,6 +1054,41 @@ export interface paths {
         put: operations["setOrgGroupParent"];
         post?: never;
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/roles": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List the roles a group grants (cursor paginated). */
+        get: operations["listOrgGroupRoles"];
+        put?: never;
+        /** Grant a role to a group (inherited by the group's members and descendants). */
+        post: operations["assignOrgGroupRole"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/roles/{role_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Withdraw a role from a group. */
+        delete: operations["unassignOrgGroupRole"];
         options?: never;
         head?: never;
         patch?: never;
@@ -1051,6 +1124,61 @@ export interface paths {
         post?: never;
         /** Remove a user from an organization (soft delete; idempotent in effect). */
         delete: operations["deleteMembership"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships/{membership_id}/effective-roles": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Resolve every role one organization membership effectively holds, with the
+         *     provenance of each.
+         */
+        get: operations["getOrgMembershipEffectiveRoles"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships/{membership_id}/roles": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List the roles a membership holds DIRECTLY (cursor paginated). */
+        get: operations["listOrgMembershipRoles"];
+        put?: never;
+        /** Grant a role directly to one organization membership. */
+        post: operations["assignOrgMembershipRole"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships/{membership_id}/roles/{role_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Withdraw a role granted directly to a membership. */
+        delete: operations["unassignOrgMembershipRole"];
         options?: never;
         head?: never;
         patch?: never;
@@ -1565,6 +1693,16 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** @description The body to bind a membership into a group. */
+        AddOrgGroupMemberRequest: {
+            /**
+             * @description The organization membership to bind (`omb_...`), NOT a user id. It must be a
+             *     LIVE membership of THIS organization; anything else (absent, removed,
+             *     another scope's, another organization's) is the uniform not-found.
+             * @example omb_...
+             */
+            membership_id: string;
+        };
         /**
          * @description The apply request body: the source snapshot to promote, plus the plan's captured
          *     `base_revision` precondition (issue #44).
@@ -1581,6 +1719,25 @@ export interface components {
              *     the snapshot export returns). Validated before anything is applied.
              */
             source: Record<string, never>;
+        };
+        /** @description The body to grant a role to a group. */
+        AssignOrgGroupRoleRequest: {
+            /**
+             * @description The role to grant (`rol_...`). It must be a LIVE role of THIS organization;
+             *     anything else (absent, deleted, another scope's, another organization's) is
+             *     the uniform not-found.
+             * @example rol_...
+             */
+            role_id: string;
+        };
+        /** @description The body to grant a role directly to a membership. */
+        AssignOrgMembershipRoleRequest: {
+            /**
+             * @description The role to grant (`rol_...`), under the same live-role-of-this-organization
+             *     rule as the group surface.
+             * @example rol_...
+             */
+            role_id: string;
         };
         /** @description A page of bans. */
         BanList: {
@@ -2234,6 +2391,50 @@ export interface components {
         DiagnosticsWarningsList: {
             /** @description The computed warnings, connector warnings first, then token size warnings. */
             items: components["schemas"]["WarningItemView"][];
+        };
+        /**
+         * @description How one role reaches a membership.
+         * @enum {string}
+         */
+        EffectiveRoleSourceView: "direct" | "group";
+        /**
+         * @description One role a membership effectively holds, and the ONE path by which it holds it.
+         *
+         *     A role reachable by several paths yields several of these, one per path, all
+         *     carrying the same `slug`. The effective role SET is the distinct `slug` values.
+         */
+        EffectiveRoleView: {
+            /**
+             * @description The role's IMMUTABLE stable name. Slugs rather than ids because a slug is
+             *     what an authorization decision keys on and what a token claim will carry: it
+             *     is stable across a rename and across a promotion between environments.
+             * @example billing.admin
+             */
+            slug: string;
+            /** @description Whether this path is a direct grant or an inherited one. */
+            source: components["schemas"]["EffectiveRoleSourceView"];
+            /**
+             * @description The group that carries the grant (`grp_...`). Present exactly when `source`
+             *     is `group`, and absent (rather than null) otherwise.
+             * @example grp_...
+             */
+            via_group_id?: string | null;
+        };
+        /** @description The resolved roles of one organization membership. */
+        EffectiveRolesView: {
+            /**
+             * @description Every grant path, ordered by `(slug, via_group_id)` with direct grants
+             *     first, so two reads of unchanged state are byte-identical. NOT deduplicated
+             *     by slug: a role held both directly and through a group appears twice, which
+             *     is what tells an operator that withdrawing one grant will not take it away.
+             *
+             *     An OBJECT wraps this array rather than the array being the whole body, so a
+             *     later `permissions` field (issue #98) is a pure addition.
+             *
+             *     The whole set, never a page: this is a bounded read (see the module docs),
+             *     and there is no cap on how many roles a member may hold.
+             */
+            roles: components["schemas"]["EffectiveRoleView"][];
         };
         /** @description A page of environments. */
         EnvironmentList: {
@@ -2972,6 +3173,82 @@ export interface components {
             /** @description The opaque cursor for the next page, or null if this is the last page. */
             next_cursor?: string | null;
         };
+        /** @description A page of a group's members. */
+        OrgGroupMemberList: {
+            /**
+             * @description The bindings on this page, oldest first. There is no cap on how many members
+             *     a group may hold; this page is size-clamped like every list.
+             */
+            items: components["schemas"]["OrgGroupMemberView"][];
+            /** @description The opaque cursor for the next page, or null if this is the last page. */
+            next_cursor?: string | null;
+        };
+        /** @description One membership's binding into one group, as returned by the management API. */
+        OrgGroupMemberView: {
+            /**
+             * Format: int64
+             * @description Creation time, milliseconds since the Unix epoch.
+             */
+            created_at_unix_ms: number;
+            /** @description The group the membership is bound into (`grp_...`). */
+            group_id: string;
+            /**
+             * @description The binding identifier (`gmb_...`). Carried for correlation with the audit
+             *     log, which targets it; the binding's ADDRESS on the wire is the
+             *     `(group_id, membership_id)` pair, not this.
+             */
+            id: string;
+            /**
+             * @description The organization membership bound into the group (`omb_...`), never a bare
+             *     user id.
+             */
+            membership_id: string;
+            /** @description The organization both endpoints belong to (`org_...`). */
+            organization_id: string;
+            /**
+             * Format: int64
+             * @description Last-modification time, milliseconds since the Unix epoch.
+             */
+            updated_at_unix_ms: number;
+        };
+        /** @description A page of the roles a group grants. */
+        OrgGroupRoleList: {
+            /**
+             * @description The assignments on this page, oldest first. There is no cap on how many
+             *     roles a group may grant; this page is size-clamped like every list.
+             */
+            items: components["schemas"]["OrgGroupRoleView"][];
+            /** @description The opaque cursor for the next page, or null if this is the last page. */
+            next_cursor?: string | null;
+        };
+        /** @description A role granted to a GROUP, as returned by the management API. */
+        OrgGroupRoleView: {
+            /**
+             * Format: int64
+             * @description Creation time, milliseconds since the Unix epoch.
+             */
+            created_at_unix_ms: number;
+            /**
+             * @description The group the role is granted to (`grp_...`). Every live member of this
+             *     group and of every DESCENDANT of it resolves the role.
+             */
+            group_id: string;
+            /**
+             * @description The assignment identifier (`grl_...`). Carried for correlation with the
+             *     audit log, which targets it; the assignment's ADDRESS on the wire is the
+             *     `(group_id, role_id)` pair.
+             */
+            id: string;
+            /** @description The organization both endpoints belong to (`org_...`). */
+            organization_id: string;
+            /** @description The role granted (`rol_...`). */
+            role_id: string;
+            /**
+             * Format: int64
+             * @description Last-modification time, milliseconds since the Unix epoch.
+             */
+            updated_at_unix_ms: number;
+        };
         /** @description An organization group, as returned by the management API (issue #97). */
         OrgGroupView: {
             /**
@@ -2998,6 +3275,47 @@ export interface components {
             parent_id?: string | null;
             /** @description The IMMUTABLE stable name. A rename changes `display_name`, never this. */
             slug: string;
+            /**
+             * Format: int64
+             * @description Last-modification time, milliseconds since the Unix epoch.
+             */
+            updated_at_unix_ms: number;
+        };
+        /** @description A page of the roles a membership holds DIRECTLY. */
+        OrgMembershipRoleList: {
+            /**
+             * @description The assignments on this page, oldest first. DIRECT grants ONLY: a role the
+             *     membership resolves through a group is NOT here, by design, because this
+             *     list is the set of rows an unassign on this surface can remove. The whole
+             *     resolved picture, with provenance, is
+             *     `GET .../memberships/{membership_id}/effective-roles`.
+             */
+            items: components["schemas"]["OrgMembershipRoleView"][];
+            /** @description The opaque cursor for the next page, or null if this is the last page. */
+            next_cursor?: string | null;
+        };
+        /** @description A role granted DIRECTLY to one membership, as returned by the management API. */
+        OrgMembershipRoleView: {
+            /**
+             * Format: int64
+             * @description Creation time, milliseconds since the Unix epoch.
+             */
+            created_at_unix_ms: number;
+            /**
+             * @description The assignment identifier (`mrl_...`). Carried for correlation with the
+             *     audit log; the assignment's ADDRESS on the wire is the
+             *     `(membership_id, role_id)` pair.
+             */
+            id: string;
+            /**
+             * @description The membership the role is granted to (`omb_...`). Exactly this membership
+             *     resolves the role; no group is involved and no descendant inherits it.
+             */
+            membership_id: string;
+            /** @description The organization both endpoints belong to (`org_...`). */
+            organization_id: string;
+            /** @description The role granted (`rol_...`). */
+            role_id: string;
             /**
              * Format: int64
              * @description Last-modification time, milliseconds since the Unix epoch.
@@ -9005,6 +9323,228 @@ export interface operations {
             };
         };
     };
+    listOrgGroupMembers: {
+        parameters: {
+            query?: {
+                /**
+                 * @description The desired page size, a positive integer. Clamped to
+                 *     `[1, max_page_size]`; defaults to the configured default when absent.
+                 */
+                limit?: number;
+                /**
+                 * @description The opaque cursor from a previous page's `next_cursor`. Absent for the
+                 *     first page (keyset pagination; there is no offset).
+                 */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+                /** @description The group identifier (grp_...) */
+                group_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A page of group members */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrgGroupMemberList"];
+                };
+            };
+            /** @description Malformed cursor */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found (the organization, or a group that is not a live group of it) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    addOrgGroupMember: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Required. Replaying a POST with the same key returns the original response without re-executing. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+                /** @description The group identifier (grp_...) */
+                group_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AddOrgGroupMemberRequest"];
+            };
+        };
+        responses: {
+            /** @description Bound */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrgGroupMemberView"];
+                };
+            };
+            /** @description Malformed request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found: the organization, the group, or the membership is not a live row of this organization (uniform across absent, deleted, another scope's, and another organization's) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The membership is already a live member of this group */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Idempotency-Key reused with a different request */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    removeOrgGroupMember: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+                /** @description The group identifier (grp_...) */
+                group_id: string;
+                /** @description The organization membership identifier (omb_...) */
+                membership_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Removed (the pair is immediately available again) */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found (no such live binding: absent, already removed, another scope's, another organization's, or a pair whose two halves belong to different organizations) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     setOrgGroupParent: {
         parameters: {
             query?: never;
@@ -9074,6 +9614,228 @@ export interface operations {
             };
             /** @description The move would close a cycle, or would nest the moved subtree past the configured maximum depth */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listOrgGroupRoles: {
+        parameters: {
+            query?: {
+                /**
+                 * @description The desired page size, a positive integer. Clamped to
+                 *     `[1, max_page_size]`; defaults to the configured default when absent.
+                 */
+                limit?: number;
+                /**
+                 * @description The opaque cursor from a previous page's `next_cursor`. Absent for the
+                 *     first page (keyset pagination; there is no offset).
+                 */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+                /** @description The group identifier (grp_...) */
+                group_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A page of the roles granted to this group. Roles granted to an ANCESTOR are inherited by this group's members but are NOT listed here; they are listed on the ancestor */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrgGroupRoleList"];
+                };
+            };
+            /** @description Malformed cursor */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found (the organization, or a group that is not a live group of it) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    assignOrgGroupRole: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Required. Replaying a POST with the same key returns the original response without re-executing. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+                /** @description The group identifier (grp_...) */
+                group_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AssignOrgGroupRoleRequest"];
+            };
+        };
+        responses: {
+            /** @description Granted. Every live member of the group and of every descendant of it resolves the role at the NEXT token issuance */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrgGroupRoleView"];
+                };
+            };
+            /** @description Malformed request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found: the organization, the group, or the role is not a live row of this organization (uniform across absent, deleted, another scope's, and another organization's) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The group already holds that role */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Idempotency-Key reused with a different request */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    unassignOrgGroupRole: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+                /** @description The group identifier (grp_...) */
+                group_id: string;
+                /** @description The role identifier (rol_...) */
+                role_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Withdrawn. Members of this group and its descendants stop resolving the role at the NEXT token issuance; access tokens already issued are NOT revoked (revoke the session or refresh family for that). The pair is immediately available again */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found (no such live assignment: absent, already withdrawn, another scope's, another organization's, or a pair whose two halves belong to different organizations) */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -9289,6 +10051,284 @@ export interface operations {
                 };
             };
             /** @description Not found (absent, or already removed: a repeat delete) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    getOrgMembershipEffectiveRoles: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+                /** @description The organization membership identifier (omb_...) */
+                membership_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The resolved roles, one entry per grant path. This is what the NEXT token issuance would carry; tokens already issued are NOT affected by a recent change. Not paginated: a bounded read of one membership's whole set */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EffectiveRolesView"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found (the organization, or a membership that is not a live membership of it: uniform across absent, removed, another scope's, and another organization's) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listOrgMembershipRoles: {
+        parameters: {
+            query?: {
+                /**
+                 * @description The desired page size, a positive integer. Clamped to
+                 *     `[1, max_page_size]`; defaults to the configured default when absent.
+                 */
+                limit?: number;
+                /**
+                 * @description The opaque cursor from a previous page's `next_cursor`. Absent for the
+                 *     first page (keyset pagination; there is no offset).
+                 */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+                /** @description The organization membership identifier (omb_...) */
+                membership_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A page of the roles granted DIRECTLY to this membership. Roles resolved through a group are NOT listed here; use the effective-roles view for the whole picture with provenance */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrgMembershipRoleList"];
+                };
+            };
+            /** @description Malformed cursor */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found (the organization, or a membership that is not a live membership of it) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    assignOrgMembershipRole: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Required. Replaying a POST with the same key returns the original response without re-executing. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+                /** @description The organization membership identifier (omb_...) */
+                membership_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AssignOrgMembershipRoleRequest"];
+            };
+        };
+        responses: {
+            /** @description Granted. Exactly this membership resolves the role at the NEXT token issuance; no group is involved and no other member inherits it */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrgMembershipRoleView"];
+                };
+            };
+            /** @description Malformed request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found: the organization, the membership, or the role is not a live row of this organization (uniform across absent, deleted, another scope's, and another organization's) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The membership already holds that role directly */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Idempotency-Key reused with a different request */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    unassignOrgMembershipRole: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+                /** @description The organization membership identifier (omb_...) */
+                membership_id: string;
+                /** @description The role identifier (rol_...) */
+                role_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Withdrawn. The membership stops resolving the role DIRECTLY at the NEXT token issuance, and may still resolve it through a group (check the effective-roles view); access tokens already issued are NOT revoked. The pair is immediately available again */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found (no such live assignment: absent, already withdrawn, another scope's, another organization's, or a pair whose two halves belong to different organizations) */
             404: {
                 headers: {
                     [name: string]: unknown;

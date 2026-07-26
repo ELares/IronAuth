@@ -46,9 +46,12 @@ fn operation_ids_are_the_stable_set() {
     assert_eq!(
         ids,
         vec![
+            "addOrgGroupMember",
             "applyConfigPromotion",
             "approveRecoveryApproval",
             "approveSignupQuarantine",
+            "assignOrgGroupRole",
+            "assignOrgMembershipRole",
             "bulkRevokeSessions",
             "createBan",
             "createConnector",
@@ -102,6 +105,7 @@ fn operation_ids_are_the_stable_set() {
             "getMigrationRun",
             "getOperator",
             "getOrgGroup",
+            "getOrgMembershipEffectiveRoles",
             "getOrgRole",
             "getOrganization",
             "getPolicyDecisionTraces",
@@ -124,7 +128,10 @@ fn operation_ids_are_the_stable_set() {
             "listMigrationRunViolations",
             "listMigrationRuns",
             "listOperators",
+            "listOrgGroupMembers",
+            "listOrgGroupRoles",
             "listOrgGroups",
+            "listOrgMembershipRoles",
             "listOrgRoles",
             "listOrganizations",
             "listRecoveryApprovals",
@@ -141,6 +148,7 @@ fn operation_ids_are_the_stable_set() {
             "probePasswordHashing",
             "rejectRecoveryApproval",
             "rejectSignupQuarantine",
+            "removeOrgGroupMember",
             "resendInvitation",
             "restoreTenant",
             "resumeTenant",
@@ -157,6 +165,8 @@ fn operation_ids_are_the_stable_set() {
             "setSignupForm",
             "setUserState",
             "suspendTenant",
+            "unassignOrgGroupRole",
+            "unassignOrgMembershipRole",
             "unlinkUserExternalId",
             "updateConnector",
             "updateOrgGroup",
@@ -202,6 +212,9 @@ fn every_list_endpoint_documents_cursor_pagination() {
         "listMigrationRunViolations",
         "listOrgRoles",
         "listOrgGroups",
+        "listOrgGroupMembers",
+        "listOrgGroupRoles",
+        "listOrgMembershipRoles",
     ] {
         let params = find_operation(&doc, op)["parameters"]
             .as_array()
@@ -250,6 +263,9 @@ fn every_post_documents_the_idempotency_key_header() {
         "rejectRecoveryApproval",
         "createOrgRole",
         "createOrgGroup",
+        "addOrgGroupMember",
+        "assignOrgGroupRole",
+        "assignOrgMembershipRole",
     ] {
         let params = find_operation(&doc, op)["parameters"]
             .as_array()
@@ -300,7 +316,10 @@ fn documented_paths_are_the_expected_set() {
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/locales/{locale}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}",
+            "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/members/{membership_id}",
+            "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/roles/{role_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships/{membership_id}",
+            "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships/{membership_id}/roles/{role_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/external-id",
@@ -342,7 +361,11 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/members",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/roles",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships/{membership_id}/effective-roles",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships/{membership_id}/roles",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/recovery-approvals",
@@ -381,7 +404,10 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/disable",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/enable",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/members",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/roles",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships/{membership_id}/roles",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/password-hashing/probe",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/recovery-approvals/{flow_id}/approve",
@@ -447,7 +473,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        118,
+        128,
         "the documented route count is pinned"
     );
 

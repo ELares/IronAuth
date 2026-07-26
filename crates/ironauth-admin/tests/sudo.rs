@@ -425,6 +425,243 @@ async fn an_org_role_or_group_write_is_sudo_gated() {
     );
 }
 
+/// The organization group-MEMBER and role-ASSIGNMENT mutations (issue #97, PR 5) are
+/// sudo gated exactly like the role and group mutations above. Six route entries carry
+/// six mutating handlers (bind a member and unbind one; grant a role to a group and
+/// withdraw it; grant a role to a membership and withdraw it), so there are six
+/// `require_fresh_privilege` call sites, and every one is challenged here with the
+/// elevation window lapsed, writes nothing, and succeeds after a fresh elevation.
+///
+/// This is the surface where the gate matters MOST, and the reason is worth stating: a
+/// role create is inert until it is assigned, whereas one call here is what actually
+/// grants privilege to a person. A stolen console cookie that could reach these six
+/// endpoints could add itself to a group that grants administrator and be done, with no
+/// re-authentication anywhere in the sequence.
+///
+/// The four READS on this surface (three lists and the effective-role view) are
+/// deliberately NOT gated and are exercised below with the window lapsed, because sudo
+/// gates mutations only; asserting that keeps a future "gate everything" refactor from
+/// silently breaking the console's ability to show an operator what they are about to
+/// change.
+///
+/// One test rather than six: the challenged half and the elevated half have to run
+/// against the SAME seeded rows for "wrote nothing" to mean anything.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn an_org_member_or_assignment_write_is_sudo_gated() {
+    let (harness, clock) = Harness::start_with_sudo(600).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k1").await;
+    let elevate = elevate_path(&tenant, &env);
+
+    // Seed inside an open window (every fixture write is itself a gated mutation),
+    // then let it lapse so the probes below run against the exact state the gate is
+    // supposed to protect.
+    let (status, _, body) = harness.post(&elevate, "e1", "{}").await;
+    assert_eq!(status, StatusCode::OK, "elevate: {body}");
+    let (status, _, response) = harness
+        .post(
+            &organizations_path(&tenant, &env),
+            "org-1",
+            &serde_json::json!({ "display_name": "Globex" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "create org: {response}");
+    let org = id_of(&response);
+    let org_base = format!("/v1/tenants/{tenant}/environments/{env}/organizations/{org}");
+    let group = create_named(
+        &harness,
+        &org_groups_path(&tenant, &env, &org),
+        "team",
+        "g-1",
+    )
+    .await;
+    let role = create_named(
+        &harness,
+        &org_roles_path(&tenant, &env, &org),
+        "admin",
+        "r-1",
+    )
+    .await;
+    let spare = create_named(
+        &harness,
+        &org_roles_path(&tenant, &env, &org),
+        "spare",
+        "r-2",
+    )
+    .await;
+
+    let (status, _, response) = harness
+        .post(
+            &format!("/v1/tenants/{tenant}/environments/{env}/users"),
+            "u-1",
+            &serde_json::json!({ "identifier": "member@x.test" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "create user: {response}");
+    let user = id_of(&response);
+    let (status, _, response) = harness
+        .post(
+            &format!("{org_base}/memberships"),
+            "m-1",
+            &serde_json::json!({ "user_id": user }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "add membership: {response}");
+    let membership = id_of(&response);
+
+    let members = format!("{org_base}/groups/{group}/members");
+    let group_roles = format!("{org_base}/groups/{group}/roles");
+    let membership_roles = format!("{org_base}/memberships/{membership}/roles");
+    let effective = format!("{org_base}/memberships/{membership}/effective-roles");
+
+    // Seed ONE row on each surface, so the three DELETE probes below address a row
+    // that genuinely exists: with the gate gone they would remove it, rather than
+    // 404ing for an unrelated reason.
+    let (status, _, response) = harness
+        .post(
+            &members,
+            "b-1",
+            &serde_json::json!({ "membership_id": membership }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "seed binding: {response}");
+    let (status, _, response) = harness
+        .post(
+            &group_roles,
+            "gr-1",
+            &serde_json::json!({ "role_id": role }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "seed group grant: {response}");
+    let (status, _, response) = harness
+        .post(
+            &membership_roles,
+            "mr-1",
+            &serde_json::json!({ "role_id": role }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "seed direct grant: {response}");
+
+    clock.advance(Duration::from_secs(601));
+
+    // --- With the window lapsed, every mutating endpoint is challenged. ---
+    for (label, path, key, body) in [
+        (
+            "add_org_group_member",
+            members.clone(),
+            "b-2",
+            serde_json::json!({ "membership_id": membership }).to_string(),
+        ),
+        (
+            "assign_org_group_role",
+            group_roles.clone(),
+            "gr-2",
+            serde_json::json!({ "role_id": spare }).to_string(),
+        ),
+        (
+            "assign_org_membership_role",
+            membership_roles.clone(),
+            "mr-2",
+            serde_json::json!({ "role_id": spare }).to_string(),
+        ),
+    ] {
+        let (status, _, resp) = harness.post(&path, key, &body).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{label} is challenged without an elevation: {resp}"
+        );
+        assert!(
+            resp.contains("insufficient_user_authentication"),
+            "{label} carries the RFC 9470 challenge: {resp}"
+        );
+    }
+    for (label, path) in [
+        ("remove_org_group_member", format!("{members}/{membership}")),
+        ("unassign_org_group_role", format!("{group_roles}/{role}")),
+        (
+            "unassign_org_membership_role",
+            format!("{membership_roles}/{role}"),
+        ),
+    ] {
+        let (status, _, resp) = harness.delete(&path).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{label} is challenged without an elevation: {resp}"
+        );
+        assert!(
+            resp.contains("insufficient_user_authentication"),
+            "{label} carries the RFC 9470 challenge: {resp}"
+        );
+    }
+
+    // Nothing executed. Reads are ungated, so this is observable without elevating,
+    // which is itself the assertion that the four reads stayed open.
+    for (label, path, expected) in [
+        ("group members", members.clone(), 1),
+        ("group roles", group_roles.clone(), 1),
+        ("membership roles", membership_roles.clone(), 1),
+    ] {
+        let (status, _, listed) = harness.get(&path).await;
+        assert_eq!(status, StatusCode::OK, "{label} read is ungated: {listed}");
+        assert_eq!(
+            item_count(&listed),
+            expected,
+            "{label}: the challenged write and delete changed nothing: {listed}"
+        );
+    }
+    let (status, _, resolved) = harness.get(&effective).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the effective-role view is an ungated read: {resolved}"
+    );
+    assert!(
+        resolved.contains("\"direct\"") && resolved.contains("\"group\""),
+        "and the member still resolves both seeded grants: {resolved}"
+    );
+
+    // --- After a fresh elevation, every one of the same requests succeeds. ---
+    let (status, _, body) = harness.post(&elevate, "e2", "{}").await;
+    assert_eq!(status, StatusCode::OK, "re-elevate: {body}");
+
+    let (status, _, resp) = harness
+        .post(
+            &group_roles,
+            "gr-3",
+            &serde_json::json!({ "role_id": spare }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "elevated group grant: {resp}");
+    let (status, _, resp) = harness
+        .post(
+            &membership_roles,
+            "mr-3",
+            &serde_json::json!({ "role_id": spare }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "elevated direct grant: {resp}");
+    let (status, _, resp) = harness.delete(&format!("{membership_roles}/{role}")).await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "elevated direct unassign: {resp}"
+    );
+    let (status, _, resp) = harness.delete(&format!("{group_roles}/{role}")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "elevated unassign: {resp}");
+    let (status, _, resp) = harness.delete(&format!("{members}/{membership}")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "elevated remove: {resp}");
+    let (status, _, resp) = harness
+        .post(
+            &members,
+            "b-3",
+            &serde_json::json!({ "membership_id": membership }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "elevated add: {resp}");
+}
+
 /// The acceptance-critical adversarial case: a valid credential whose recorded elevation
 /// is stale or absent CANNOT mutate once the window lapses, and NO client-supplied
 /// header can forge the elevation (it derives only from a server-recorded event), while

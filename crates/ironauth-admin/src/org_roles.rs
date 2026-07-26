@@ -56,6 +56,7 @@ use crate::auth::Principal;
 use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
 use crate::input::{parse_json, require_non_empty, require_slug};
+use crate::org_context::{resolve_live_org, resolve_scope};
 use crate::pagination::{ListQuery, Pagination};
 use crate::response::{json, no_content};
 use crate::state::AdminState;
@@ -134,43 +135,6 @@ pub struct OrgRoleList {
     /// The opaque cursor for the next page, or null if this is the last page.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
-}
-
-/// Resolve and authorize the `(tenant, environment)` scope from the path. The
-/// operator passes; a management key must be scoped to exactly this environment
-/// (otherwise the LOUD wrong-scope error). A malformed tenant or environment id is
-/// the uniform not-found.
-fn resolve_scope(
-    state: &AdminState,
-    principal: &Principal,
-    tenant_id: &str,
-    environment_id: &str,
-) -> Result<(Scope, ironauth_store::ActorRef), ApiError> {
-    let tenant = state
-        .store()
-        .management()
-        .tenants(state.bootstrap_operator_id())
-        .parse_id(tenant_id)?;
-    let environment = state
-        .store()
-        .management()
-        .environments(tenant)
-        .parse_id(environment_id)?;
-    let actor = principal.require_environment(tenant, environment)?;
-    Ok((Scope::new(tenant, environment), actor))
-}
-
-/// Resolve the parent organization id in scope, verifying it exists and is LIVE. A
-/// foreign or soft-deleted organization reads as a uniform not-found.
-async fn resolve_live_org(
-    state: &AdminState,
-    scope: Scope,
-    organization_id: &str,
-) -> Result<OrganizationId, ApiError> {
-    let organizations = state.store().management().organizations(scope);
-    let id = organizations.parse_id(organization_id)?;
-    organizations.get(&id).await?;
-    Ok(id)
 }
 
 /// Resolve the nested `(organization, role)` pair, which is the ROLE'S ADDRESS.

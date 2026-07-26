@@ -1,0 +1,354 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! Binding organization memberships into organization groups (issue #97).
+//!
+//! Three endpoints under `.../organizations/{organization_id}/groups/{group_id}/members`:
+//! add a member, list a group's members, and remove one. They inherit the
+//! authorization of every other endpoint nested under an organization (the
+//! operator, or a management key scoped to exactly that environment), resolved
+//! once in [`crate::org_context`].
+//!
+//! A binding names an org MEMBERSHIP (`omb_`), never a bare user. Being in a group
+//! therefore presupposes being in the organization, structurally rather than by
+//! convention, and there is no way to express "in a group of an organization I am
+//! not a member of".
+//!
+//! # Pair addressing, and the three ids that must agree
+//!
+//! A binding is a RELATIONSHIP, so its wire address is the pair the caller already
+//! holds (`.../groups/{group_id}/members/{membership_id}`), not the `gmb_` id the
+//! row carries for the audit log. Every request therefore names THREE ids: the
+//! organization, the group, and the membership. All three are resolved TOGETHER,
+//! never one at a time:
+//!
+//!   * the organization by [`crate::org_context::resolve_live_org`];
+//!   * the group and the membership by the store, inside ONE statement that carries
+//!     `organization_id` as a predicate
+//!     ([`ironauth_store::OrgGroupMemberRepo::get_binding`] on the read and remove
+//!     paths, and the two `require_live_*_in_org` resolutions inside the audited
+//!     write transaction on the add path).
+//!
+//! That is what refuses a cross-organization PAIRING: two ids that are each
+//! individually visible to the caller, but that belong to DIFFERENT organizations,
+//! resolve to no row and are the uniform not-found. Row-level security fences
+//! `(tenant, environment)` and nothing finer, so nothing else would.
+//!
+//! # No caps
+//!
+//! Nothing here limits how many members a group may hold or how many groups a
+//! membership may join. The list's page size is clamped like every management list,
+//! which bounds ONE RESPONSE and never the number of stored rows.
+
+use axum::body::Bytes;
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, StatusCode, Uri};
+use axum::response::Response;
+use ironauth_store::{
+    CorrelationId, IdempotencyWrite, NewOrgGroupMember, OrgGroupMemberRecord, StoreError,
+};
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
+
+use crate::auth::Principal;
+use crate::error::{ApiError, ErrorBody};
+use crate::idempotency;
+use crate::input::parse_json;
+use crate::org_context::{
+    parse_group_id, parse_membership_id, require_group_in_org, resolve_live_org, resolve_scope,
+};
+use crate::pagination::{ListQuery, Pagination};
+use crate::response::{json, no_content};
+use crate::state::AdminState;
+
+/// One membership's binding into one group, as returned by the management API.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct OrgGroupMemberView {
+    /// The binding identifier (`gmb_...`). Carried for correlation with the audit
+    /// log, which targets it; the binding's ADDRESS on the wire is the
+    /// `(group_id, membership_id)` pair, not this.
+    pub id: String,
+    /// The organization both endpoints belong to (`org_...`).
+    pub organization_id: String,
+    /// The group the membership is bound into (`grp_...`).
+    pub group_id: String,
+    /// The organization membership bound into the group (`omb_...`), never a bare
+    /// user id.
+    pub membership_id: String,
+    /// Creation time, milliseconds since the Unix epoch.
+    pub created_at_unix_ms: i64,
+    /// Last-modification time, milliseconds since the Unix epoch.
+    pub updated_at_unix_ms: i64,
+}
+
+impl OrgGroupMemberView {
+    /// Build a view from a stored record. The repository only returns LIVE (not
+    /// removed) bindings.
+    fn from_record(record: &OrgGroupMemberRecord) -> Self {
+        Self {
+            id: record.id.to_string(),
+            organization_id: record.organization_id.to_string(),
+            group_id: record.group_id.to_string(),
+            membership_id: record.membership_id.to_string(),
+            created_at_unix_ms: record.created_at_unix_micros / 1000,
+            updated_at_unix_ms: record.updated_at_unix_micros / 1000,
+        }
+    }
+}
+
+/// The body to bind a membership into a group.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct AddOrgGroupMemberRequest {
+    /// The organization membership to bind (`omb_...`), NOT a user id. It must be a
+    /// LIVE membership of THIS organization; anything else (absent, removed,
+    /// another scope's, another organization's) is the uniform not-found.
+    #[schema(example = "omb_...")]
+    pub membership_id: String,
+}
+
+/// A page of a group's members.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct OrgGroupMemberList {
+    /// The bindings on this page, oldest first. There is no cap on how many members
+    /// a group may hold; this page is size-clamped like every list.
+    pub items: Vec<OrgGroupMemberView>,
+    /// The opaque cursor for the next page, or null if this is the last page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// Bind an organization membership into a group.
+#[utoipa::path(
+    post,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/members",
+    operation_id = "addOrgGroupMember",
+    tag = "org-groups",
+    request_body = AddOrgGroupMemberRequest,
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("organization_id" = String, Path, description = "The organization identifier"),
+        ("group_id" = String, Path, description = "The group identifier (grp_...)"),
+        ("Idempotency-Key" = String, Header, description = "Required. Replaying a POST \
+         with the same key returns the original response without re-executing.")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 201, description = "Bound", body = OrgGroupMemberView),
+        (status = 400, description = "Malformed request", body = ErrorBody),
+        (status = 401, description = "Missing or invalid credential", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "Not found: the organization, the group, or the membership is not a live row of this organization (uniform across absent, deleted, another scope's, and another organization's)", body = ErrorBody),
+        (status = 409, description = "The membership is already a live member of this group", body = ErrorBody),
+        (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
+    )
+)]
+pub async fn add_org_group_member(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, organization_id, group_id)): Path<(
+        String,
+        String,
+        String,
+        String,
+    )>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
+
+    let key = idempotency::required_key(&headers)?;
+    let fingerprint = idempotency::fingerprint("POST", uri.path(), &body);
+    let credential_ref = principal.credential_ref();
+
+    // Replay BEFORE the parent-existence precondition, so a genuine replay returns
+    // the original response even if the organization was disabled meanwhile.
+    if let Some(replay) =
+        idempotency::replay_if_stored(&state, &credential_ref, &key, &fingerprint).await?
+    {
+        return Ok(replay);
+    }
+
+    let org_id = resolve_live_org(&state, scope, &organization_id).await?;
+    let group = parse_group_id(&state, scope, &group_id)?;
+
+    let request: AddOrgGroupMemberRequest = parse_json(&body)?;
+    let membership = parse_membership_id(&state, scope, &request.membership_id)?;
+
+    let created_at_micros = state.now_unix_micros();
+    let binding_id = ironauth_store::OrgGroupMemberId::generate(state.env(), &scope);
+    let view = OrgGroupMemberView {
+        id: binding_id.to_string(),
+        organization_id: org_id.to_string(),
+        group_id: group.to_string(),
+        membership_id: membership.to_string(),
+        created_at_unix_ms: created_at_micros / 1000,
+        updated_at_unix_ms: created_at_micros / 1000,
+    };
+    let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
+
+    let write = IdempotencyWrite {
+        credential_ref: &credential_ref,
+        key: &key,
+        request_fingerprint: &fingerprint,
+        response_status: 201,
+        response_body: &body_string,
+    };
+    // NEITHER endpoint is resolved here before the store. The store resolves both as
+    // live rows of THIS organization INSIDE the audited write transaction and BEFORE
+    // any conflict reasoning, so a pre-read here would be redundant, would be stale
+    // by the time the write ran, and would answer "does that group exist" a request
+    // early: the ordering is what keeps the 409 reachable only by a caller who has
+    // already proved they can see both endpoints.
+    let result = state
+        .store()
+        .management()
+        .acting(actor, CorrelationId::generate(state.env()))
+        .org_group_members(scope)
+        .add(
+            state.env(),
+            NewOrgGroupMember {
+                id: &binding_id,
+                organization_id: &org_id,
+                group_id: &group,
+                membership_id: &membership,
+            },
+            created_at_micros,
+            Some(write),
+        )
+        .await;
+
+    match result {
+        Ok(()) => Ok(json(StatusCode::CREATED, body_string)),
+        Err(StoreError::Conflict) => Err(ApiError::Conflict(
+            "that membership is already a member of this group".to_owned(),
+        )),
+        Err(StoreError::IdempotencyConflict) => {
+            idempotency::replay_after_conflict(&state, &credential_ref, &key, &fingerprint).await
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// List a group's members (cursor paginated).
+#[utoipa::path(
+    get,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/members",
+    operation_id = "listOrgGroupMembers",
+    tag = "org-groups",
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("organization_id" = String, Path, description = "The organization identifier"),
+        ("group_id" = String, Path, description = "The group identifier (grp_...)"),
+        ListQuery
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "A page of group members", body = OrgGroupMemberList),
+        (status = 400, description = "Malformed cursor", body = ErrorBody),
+        (status = 401, description = "Missing or invalid credential", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "Not found (the organization, or a group that is not a live group of it)", body = ErrorBody)
+    )
+)]
+pub async fn list_org_group_members(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, organization_id, group_id)): Path<(
+        String,
+        String,
+        String,
+        String,
+    )>,
+    Query(query): Query<ListQuery>,
+) -> Result<Response, ApiError> {
+    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let org_id = resolve_live_org(&state, scope, &organization_id).await?;
+    // The group is resolved as a LIVE group of THIS organization before the page is
+    // read, so listing the members of a group of a SIBLING organization is the same
+    // 404 that reading the group itself gives, rather than a 200 with an empty page
+    // that would assert the group exists here and is empty.
+    let group = require_group_in_org(&state, scope, &org_id, &group_id).await?;
+    let page = Pagination::resolve(&query, state.default_page_size(), state.max_page_size())?;
+    let rows = state
+        .store()
+        .management()
+        .org_group_members(scope)
+        .list_for_group(&org_id, &group, page.fetch_limit(), page.after())
+        .await?;
+    let (rows, next_cursor) = page.finish(rows, |record| {
+        (record.created_at_unix_micros, record.id.to_string())
+    });
+    let list = OrgGroupMemberList {
+        items: rows.iter().map(OrgGroupMemberView::from_record).collect(),
+        next_cursor,
+    };
+    let body = serde_json::to_string(&list).map_err(|_| ApiError::Internal)?;
+    Ok(json(StatusCode::OK, body))
+}
+
+/// Unbind a membership from a group (soft delete; a repeat remove is the uniform
+/// 404).
+#[utoipa::path(
+    delete,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/members/{membership_id}",
+    operation_id = "removeOrgGroupMember",
+    tag = "org-groups",
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("organization_id" = String, Path, description = "The organization identifier"),
+        ("group_id" = String, Path, description = "The group identifier (grp_...)"),
+        ("membership_id" = String, Path, description = "The organization membership identifier (omb_...)")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 204, description = "Removed (the pair is immediately available again)"),
+        (status = 401, description = "Missing or invalid credential", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "Not found (no such live binding: absent, already removed, another scope's, another organization's, or a pair whose two halves belong to different organizations)", body = ErrorBody)
+    )
+)]
+pub async fn remove_org_group_member(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, organization_id, group_id, membership_id)): Path<(
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
+) -> Result<Response, ApiError> {
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
+    let org_id = resolve_live_org(&state, scope, &organization_id).await?;
+    let group = parse_group_id(&state, scope, &group_id)?;
+    let membership = parse_membership_id(&state, scope, &membership_id)?;
+
+    // The PAIR is the address, and this one statement resolves all three ids
+    // together: a group of one organization paired with a membership of another
+    // matches no row and is the uniform not-found. Feeding the id it returns to the
+    // remove below is not a check-to-use window, because migration 0088 grants the
+    // control role UPDATE on `updated_at` and `deleted_at` and nothing else, so no
+    // reachable state moves a binding between groups, memberships, organizations, or
+    // scopes after this read.
+    let binding = state
+        .store()
+        .management()
+        .org_group_members(scope)
+        .get_binding(&org_id, &group, &membership)
+        .await?;
+    // The organization rides into the UPDATE as a predicate as well, so the write is
+    // fenced independently of the read that addressed it.
+    state
+        .store()
+        .management()
+        .acting(actor, CorrelationId::generate(state.env()))
+        .org_group_members(scope)
+        .remove(state.env(), &org_id, &binding.id)
+        .await?;
+    Ok(no_content())
+}

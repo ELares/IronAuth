@@ -68,7 +68,11 @@ mod migration_runs;
 mod migration_status;
 mod openapi;
 mod operators;
+mod org_context;
+mod org_effective_roles;
+mod org_group_members;
 mod org_groups;
+mod org_role_assignments;
 mod org_roles;
 mod organizations;
 mod pagination;
@@ -321,6 +325,24 @@ pub fn management_router(state: AdminState) -> Router {
             "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships/{membership_id}",
             delete(memberships::delete_membership),
         )
+        // Direct membership role assignments (issue #97): the NON-inheriting
+        // assignment surface, and the effective-role view that explains where each
+        // of a member's roles came from. Both are static suffixes below an existing
+        // parameter, so they add no ambiguity to the item route above; the
+        // pair-addressed unassign adds its parameter at a position that has none.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships/{membership_id}/roles",
+            post(org_role_assignments::assign_org_membership_role)
+                .get(org_role_assignments::list_org_membership_roles),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships/{membership_id}/roles/{role_id}",
+            delete(org_role_assignments::unassign_org_membership_role),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships/{membership_id}/effective-roles",
+            get(org_effective_roles::get_org_membership_effective_roles),
+        )
         // Organization roles (issue #97): first-class, per-organization named roles.
         // A role in M10 is a NAME only; what it grants is issue #98. There is no cap
         // on how many an organization may define.
@@ -355,6 +377,30 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/parent",
             put(org_groups::set_org_group_parent),
+        )
+        // Group membership and the INHERITING role-assignment surface (issue #97).
+        // `members` and `roles` are STATIC suffixes under `{group_id}`, exactly like
+        // `parent` above, so they are safe wherever they are registered; the two
+        // pair-addressed deletes each add their parameter at a position that has
+        // none, which is the one hazard the note above names and is what makes them
+        // safe rather than merely untested.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/members",
+            post(org_group_members::add_org_group_member)
+                .get(org_group_members::list_org_group_members),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/members/{membership_id}",
+            delete(org_group_members::remove_org_group_member),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/roles",
+            post(org_role_assignments::assign_org_group_role)
+                .get(org_role_assignments::list_org_group_roles),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/roles/{role_id}",
+            delete(org_role_assignments::unassign_org_group_role),
         )
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}",

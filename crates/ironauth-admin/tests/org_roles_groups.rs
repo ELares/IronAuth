@@ -1141,9 +1141,12 @@ async fn an_environment_scoped_key_reaches_only_its_own_environments_roles_and_g
     // The test above drives the OPERATOR, which passes every scope check by design, so
     // it proves containment of IDs and nothing about the CREDENTIAL. This one drives a
     // real `mak_` management key, the credential class whose confinement rests entirely
-    // on `Principal::require_environment` in the private `resolve_scope` of each module.
-    // docs/THREAT-MODEL.md names that call as the control for exactly this surface, so
-    // it is exercised here on all ELEVEN endpoints rather than assumed.
+    // on `Principal::require_environment` in `crate::org_context::resolve_scope`, the ONE
+    // copy every endpoint nested under an organization now calls (issue #97 PR 5 folded
+    // the per-module copies into it, so deleting that call is one edit that this test and
+    // its PR 5 twin both catch). docs/THREAT-MODEL.md names that call as the control for
+    // exactly this surface, so it is exercised here on all ELEVEN endpoints rather than
+    // assumed.
     //
     // Each endpoint is driven TWICE with the SAME key: once inside the environment the
     // key was minted for, which must succeed, and once against a sibling environment,

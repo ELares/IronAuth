@@ -7497,6 +7497,367 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/members": {
+      "get": {
+        "tags": [
+          "org-groups"
+        ],
+        "summary": "List a group's members (cursor paginated).",
+        "operationId": "listOrgGroupMembers",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "The organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "group_id",
+            "in": "path",
+            "description": "The group identifier (grp_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "The desired page size, a positive integer. Clamped to\n`[1, max_page_size]`; defaults to the configured default when absent.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "The opaque cursor from a previous page's `next_cursor`. Absent for the\nfirst page (keyset pagination; there is no offset).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of group members",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrgGroupMemberList"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed cursor",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (the organization, or a group that is not a live group of it)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "org-groups"
+        ],
+        "summary": "Bind an organization membership into a group.",
+        "operationId": "addOrgGroupMember",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "The organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "group_id",
+            "in": "path",
+            "description": "The group identifier (grp_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying a POST with the same key returns the original response without re-executing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddOrgGroupMemberRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Bound",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrgGroupMemberView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found: the organization, the group, or the membership is not a live row of this organization (uniform across absent, deleted, another scope's, and another organization's)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The membership is already a live member of this group",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency-Key reused with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/members/{membership_id}": {
+      "delete": {
+        "tags": [
+          "org-groups"
+        ],
+        "summary": "Unbind a membership from a group (soft delete; a repeat remove is the uniform\n404).",
+        "operationId": "removeOrgGroupMember",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "The organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "group_id",
+            "in": "path",
+            "description": "The group identifier (grp_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "membership_id",
+            "in": "path",
+            "description": "The organization membership identifier (omb_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed (the pair is immediately available again)"
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (no such live binding: absent, already removed, another scope's, another organization's, or a pair whose two halves belong to different organizations)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/parent": {
       "put": {
         "tags": [
@@ -7606,6 +7967,367 @@
           },
           "422": {
             "description": "The move would close a cycle, or would nest the moved subtree past the configured maximum depth",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/roles": {
+      "get": {
+        "tags": [
+          "org-roles"
+        ],
+        "summary": "List the roles a group grants (cursor paginated).",
+        "operationId": "listOrgGroupRoles",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "The organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "group_id",
+            "in": "path",
+            "description": "The group identifier (grp_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "The desired page size, a positive integer. Clamped to\n`[1, max_page_size]`; defaults to the configured default when absent.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "The opaque cursor from a previous page's `next_cursor`. Absent for the\nfirst page (keyset pagination; there is no offset).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of the roles granted to this group. Roles granted to an ANCESTOR are inherited by this group's members but are NOT listed here; they are listed on the ancestor",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrgGroupRoleList"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed cursor",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (the organization, or a group that is not a live group of it)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "org-roles"
+        ],
+        "summary": "Grant a role to a group (inherited by the group's members and descendants).",
+        "operationId": "assignOrgGroupRole",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "The organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "group_id",
+            "in": "path",
+            "description": "The group identifier (grp_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying a POST with the same key returns the original response without re-executing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AssignOrgGroupRoleRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Granted. Every live member of the group and of every descendant of it resolves the role at the NEXT token issuance",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrgGroupRoleView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found: the organization, the group, or the role is not a live row of this organization (uniform across absent, deleted, another scope's, and another organization's)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The group already holds that role",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency-Key reused with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/roles/{role_id}": {
+      "delete": {
+        "tags": [
+          "org-roles"
+        ],
+        "summary": "Withdraw a role from a group.",
+        "operationId": "unassignOrgGroupRole",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "The organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "group_id",
+            "in": "path",
+            "description": "The group identifier (grp_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "role_id",
+            "in": "path",
+            "description": "The role identifier (rol_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Withdrawn. Members of this group and its descendants stop resolving the role at the NEXT token issuance; access tokens already issued are NOT revoked (revoke the session or refresh family for that). The pair is immediately available again"
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (no such live assignment: absent, already withdrawn, another scope's, another organization's, or a pair whose two halves belong to different organizations)",
             "content": {
               "application/json": {
                 "schema": {
@@ -7940,6 +8662,461 @@
           },
           "404": {
             "description": "Not found (absent, or already removed: a repeat delete)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships/{membership_id}/effective-roles": {
+      "get": {
+        "tags": [
+          "org-roles"
+        ],
+        "summary": "Resolve every role one organization membership effectively holds, with the\nprovenance of each.",
+        "operationId": "getOrgMembershipEffectiveRoles",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "The organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "membership_id",
+            "in": "path",
+            "description": "The organization membership identifier (omb_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The resolved roles, one entry per grant path. This is what the NEXT token issuance would carry; tokens already issued are NOT affected by a recent change. Not paginated: a bounded read of one membership's whole set",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EffectiveRolesView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (the organization, or a membership that is not a live membership of it: uniform across absent, removed, another scope's, and another organization's)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships/{membership_id}/roles": {
+      "get": {
+        "tags": [
+          "org-roles"
+        ],
+        "summary": "List the roles a membership holds DIRECTLY (cursor paginated).",
+        "operationId": "listOrgMembershipRoles",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "The organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "membership_id",
+            "in": "path",
+            "description": "The organization membership identifier (omb_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "The desired page size, a positive integer. Clamped to\n`[1, max_page_size]`; defaults to the configured default when absent.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "The opaque cursor from a previous page's `next_cursor`. Absent for the\nfirst page (keyset pagination; there is no offset).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of the roles granted DIRECTLY to this membership. Roles resolved through a group are NOT listed here; use the effective-roles view for the whole picture with provenance",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrgMembershipRoleList"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed cursor",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (the organization, or a membership that is not a live membership of it)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "org-roles"
+        ],
+        "summary": "Grant a role directly to one organization membership.",
+        "operationId": "assignOrgMembershipRole",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "The organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "membership_id",
+            "in": "path",
+            "description": "The organization membership identifier (omb_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying a POST with the same key returns the original response without re-executing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AssignOrgMembershipRoleRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Granted. Exactly this membership resolves the role at the NEXT token issuance; no group is involved and no other member inherits it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrgMembershipRoleView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found: the organization, the membership, or the role is not a live row of this organization (uniform across absent, deleted, another scope's, and another organization's)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The membership already holds that role directly",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency-Key reused with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships/{membership_id}/roles/{role_id}": {
+      "delete": {
+        "tags": [
+          "org-roles"
+        ],
+        "summary": "Withdraw a role granted directly to a membership.",
+        "operationId": "unassignOrgMembershipRole",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "The organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "membership_id",
+            "in": "path",
+            "description": "The organization membership identifier (omb_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "role_id",
+            "in": "path",
+            "description": "The role identifier (rol_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Withdrawn. The membership stops resolving the role DIRECTLY at the NEXT token issuance, and may still resolve it through a group (check the effective-roles view); access tokens already issued are NOT revoked. The pair is immediately available again"
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (no such live assignment: absent, already withdrawn, another scope's, another organization's, or a pair whose two halves belong to different organizations)",
             "content": {
               "application/json": {
                 "schema": {
@@ -11503,6 +12680,20 @@
   },
   "components": {
     "schemas": {
+      "AddOrgGroupMemberRequest": {
+        "type": "object",
+        "description": "The body to bind a membership into a group.",
+        "required": [
+          "membership_id"
+        ],
+        "properties": {
+          "membership_id": {
+            "type": "string",
+            "description": "The organization membership to bind (`omb_...`), NOT a user id. It must be a\nLIVE membership of THIS organization; anything else (absent, removed,\nanother scope's, another organization's) is the uniform not-found.",
+            "example": "omb_..."
+          }
+        }
+      },
       "ApplyConfigPromotionRequest": {
         "type": "object",
         "description": "The apply request body: the source snapshot to promote, plus the plan's captured\n`base_revision` precondition (issue #44).",
@@ -11518,6 +12709,34 @@
           "source": {
             "type": "object",
             "description": "The source config snapshot document (the same canonical, secret-free shape\nthe snapshot export returns). Validated before anything is applied."
+          }
+        }
+      },
+      "AssignOrgGroupRoleRequest": {
+        "type": "object",
+        "description": "The body to grant a role to a group.",
+        "required": [
+          "role_id"
+        ],
+        "properties": {
+          "role_id": {
+            "type": "string",
+            "description": "The role to grant (`rol_...`). It must be a LIVE role of THIS organization;\nanything else (absent, deleted, another scope's, another organization's) is\nthe uniform not-found.",
+            "example": "rol_..."
+          }
+        }
+      },
+      "AssignOrgMembershipRoleRequest": {
+        "type": "object",
+        "description": "The body to grant a role directly to a membership.",
+        "required": [
+          "role_id"
+        ],
+        "properties": {
+          "role_id": {
+            "type": "string",
+            "description": "The role to grant (`rol_...`), under the same live-role-of-this-organization\nrule as the group surface.",
+            "example": "rol_..."
           }
         }
       },
@@ -12505,6 +13724,57 @@
               "$ref": "#/components/schemas/WarningItemView"
             },
             "description": "The computed warnings, connector warnings first, then token size warnings."
+          }
+        }
+      },
+      "EffectiveRoleSourceView": {
+        "type": "string",
+        "description": "How one role reaches a membership.",
+        "enum": [
+          "direct",
+          "group"
+        ]
+      },
+      "EffectiveRoleView": {
+        "type": "object",
+        "description": "One role a membership effectively holds, and the ONE path by which it holds it.\n\nA role reachable by several paths yields several of these, one per path, all\ncarrying the same `slug`. The effective role SET is the distinct `slug` values.",
+        "required": [
+          "slug",
+          "source"
+        ],
+        "properties": {
+          "slug": {
+            "type": "string",
+            "description": "The role's IMMUTABLE stable name. Slugs rather than ids because a slug is\nwhat an authorization decision keys on and what a token claim will carry: it\nis stable across a rename and across a promotion between environments.",
+            "example": "billing.admin"
+          },
+          "source": {
+            "$ref": "#/components/schemas/EffectiveRoleSourceView",
+            "description": "Whether this path is a direct grant or an inherited one."
+          },
+          "via_group_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The group that carries the grant (`grp_...`). Present exactly when `source`\nis `group`, and absent (rather than null) otherwise.",
+            "example": "grp_..."
+          }
+        }
+      },
+      "EffectiveRolesView": {
+        "type": "object",
+        "description": "The resolved roles of one organization membership.",
+        "required": [
+          "roles"
+        ],
+        "properties": {
+          "roles": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EffectiveRoleView"
+            },
+            "description": "Every grant path, ordered by `(slug, via_group_id)` with direct grants\nfirst, so two reads of unchanged state are byte-identical. NOT deduplicated\nby slug: a role held both directly and through a group appears twice, which\nis what tells an operator that withdrawing one grant will not take it away.\n\nAn OBJECT wraps this array rather than the array being the whole body, so a\nlater `permissions` field (issue #98) is a pure addition.\n\nThe whole set, never a page: this is a bounded read (see the module docs),\nand there is no cap on how many roles a member may hold."
           }
         }
       },
@@ -13890,6 +15160,132 @@
           }
         }
       },
+      "OrgGroupMemberList": {
+        "type": "object",
+        "description": "A page of a group's members.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OrgGroupMemberView"
+            },
+            "description": "The bindings on this page, oldest first. There is no cap on how many members\na group may hold; this page is size-clamped like every list."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The opaque cursor for the next page, or null if this is the last page."
+          }
+        }
+      },
+      "OrgGroupMemberView": {
+        "type": "object",
+        "description": "One membership's binding into one group, as returned by the management API.",
+        "required": [
+          "id",
+          "organization_id",
+          "group_id",
+          "membership_id",
+          "created_at_unix_ms",
+          "updated_at_unix_ms"
+        ],
+        "properties": {
+          "created_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Creation time, milliseconds since the Unix epoch."
+          },
+          "group_id": {
+            "type": "string",
+            "description": "The group the membership is bound into (`grp_...`)."
+          },
+          "id": {
+            "type": "string",
+            "description": "The binding identifier (`gmb_...`). Carried for correlation with the audit\nlog, which targets it; the binding's ADDRESS on the wire is the\n`(group_id, membership_id)` pair, not this."
+          },
+          "membership_id": {
+            "type": "string",
+            "description": "The organization membership bound into the group (`omb_...`), never a bare\nuser id."
+          },
+          "organization_id": {
+            "type": "string",
+            "description": "The organization both endpoints belong to (`org_...`)."
+          },
+          "updated_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Last-modification time, milliseconds since the Unix epoch."
+          }
+        }
+      },
+      "OrgGroupRoleList": {
+        "type": "object",
+        "description": "A page of the roles a group grants.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OrgGroupRoleView"
+            },
+            "description": "The assignments on this page, oldest first. There is no cap on how many\nroles a group may grant; this page is size-clamped like every list."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The opaque cursor for the next page, or null if this is the last page."
+          }
+        }
+      },
+      "OrgGroupRoleView": {
+        "type": "object",
+        "description": "A role granted to a GROUP, as returned by the management API.",
+        "required": [
+          "id",
+          "organization_id",
+          "group_id",
+          "role_id",
+          "created_at_unix_ms",
+          "updated_at_unix_ms"
+        ],
+        "properties": {
+          "created_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Creation time, milliseconds since the Unix epoch."
+          },
+          "group_id": {
+            "type": "string",
+            "description": "The group the role is granted to (`grp_...`). Every live member of this\ngroup and of every DESCENDANT of it resolves the role."
+          },
+          "id": {
+            "type": "string",
+            "description": "The assignment identifier (`grl_...`). Carried for correlation with the\naudit log, which targets it; the assignment's ADDRESS on the wire is the\n`(group_id, role_id)` pair."
+          },
+          "organization_id": {
+            "type": "string",
+            "description": "The organization both endpoints belong to (`org_...`)."
+          },
+          "role_id": {
+            "type": "string",
+            "description": "The role granted (`rol_...`)."
+          },
+          "updated_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Last-modification time, milliseconds since the Unix epoch."
+          }
+        }
+      },
       "OrgGroupView": {
         "type": "object",
         "description": "An organization group, as returned by the management API (issue #97).",
@@ -13933,6 +15329,69 @@
           "slug": {
             "type": "string",
             "description": "The IMMUTABLE stable name. A rename changes `display_name`, never this."
+          },
+          "updated_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Last-modification time, milliseconds since the Unix epoch."
+          }
+        }
+      },
+      "OrgMembershipRoleList": {
+        "type": "object",
+        "description": "A page of the roles a membership holds DIRECTLY.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OrgMembershipRoleView"
+            },
+            "description": "The assignments on this page, oldest first. DIRECT grants ONLY: a role the\nmembership resolves through a group is NOT here, by design, because this\nlist is the set of rows an unassign on this surface can remove. The whole\nresolved picture, with provenance, is\n`GET .../memberships/{membership_id}/effective-roles`."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The opaque cursor for the next page, or null if this is the last page."
+          }
+        }
+      },
+      "OrgMembershipRoleView": {
+        "type": "object",
+        "description": "A role granted DIRECTLY to one membership, as returned by the management API.",
+        "required": [
+          "id",
+          "organization_id",
+          "membership_id",
+          "role_id",
+          "created_at_unix_ms",
+          "updated_at_unix_ms"
+        ],
+        "properties": {
+          "created_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Creation time, milliseconds since the Unix epoch."
+          },
+          "id": {
+            "type": "string",
+            "description": "The assignment identifier (`mrl_...`). Carried for correlation with the\naudit log; the assignment's ADDRESS on the wire is the\n`(membership_id, role_id)` pair."
+          },
+          "membership_id": {
+            "type": "string",
+            "description": "The membership the role is granted to (`omb_...`). Exactly this membership\nresolves the role; no group is involved and no descendant inherits it."
+          },
+          "organization_id": {
+            "type": "string",
+            "description": "The organization both endpoints belong to (`org_...`)."
+          },
+          "role_id": {
+            "type": "string",
+            "description": "The role granted (`rol_...`)."
           },
           "updated_at_unix_ms": {
             "type": "integer",
