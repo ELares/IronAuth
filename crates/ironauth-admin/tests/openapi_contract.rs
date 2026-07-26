@@ -59,6 +59,8 @@ fn operation_ids_are_the_stable_set() {
             "createInvitation",
             "createManagementKey",
             "createMembership",
+            "createOrgGroup",
+            "createOrgRole",
             "createOrganization",
             "createTenant",
             "createUser",
@@ -70,6 +72,8 @@ fn operation_ids_are_the_stable_set() {
             "deleteLocale",
             "deleteManagementKey",
             "deleteMembership",
+            "deleteOrgGroup",
+            "deleteOrgRole",
             "deleteOrganization",
             "deleteSignupForm",
             "deleteTenant",
@@ -97,6 +101,8 @@ fn operation_ids_are_the_stable_set() {
             "getMigrationProgress",
             "getMigrationRun",
             "getOperator",
+            "getOrgGroup",
+            "getOrgRole",
             "getOrganization",
             "getPolicyDecisionTraces",
             "getRefreshFamily",
@@ -118,6 +124,8 @@ fn operation_ids_are_the_stable_set() {
             "listMigrationRunViolations",
             "listMigrationRuns",
             "listOperators",
+            "listOrgGroups",
+            "listOrgRoles",
             "listOrganizations",
             "listRecoveryApprovals",
             "listRefreshFamilies",
@@ -145,11 +153,14 @@ fn operation_ids_are_the_stable_set() {
             "setClientAdminConsent",
             "setClientSigningAlgorithm",
             "setLocale",
+            "setOrgGroupParent",
             "setSignupForm",
             "setUserState",
             "suspendTenant",
             "unlinkUserExternalId",
             "updateConnector",
+            "updateOrgGroup",
+            "updateOrgRole",
             "updateUser",
             "verifyDcrClient",
             "verifyMigrationCredential",
@@ -189,6 +200,8 @@ fn every_list_endpoint_documents_cursor_pagination() {
         "listRecoveryApprovals",
         "listMigrationRuns",
         "listMigrationRunViolations",
+        "listOrgRoles",
+        "listOrgGroups",
     ] {
         let params = find_operation(&doc, op)["parameters"]
             .as_array()
@@ -235,6 +248,8 @@ fn every_post_documents_the_idempotency_key_header() {
         "extendSignupQuarantine",
         "approveRecoveryApproval",
         "rejectRecoveryApproval",
+        "createOrgRole",
+        "createOrgGroup",
     ] {
         let params = find_operation(&doc, op)["parameters"]
             .as_array()
@@ -284,7 +299,9 @@ fn documented_paths_are_the_expected_set() {
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/keys/{key_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/locales/{locale}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}",
+            "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships/{membership_id}",
+            "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/external-id",
             "GET /v1/interop/signing-recommendations",
@@ -323,7 +340,11 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/migration/progress",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/recovery-approvals",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/refresh-families",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/refresh-families/{family_id}",
@@ -334,6 +355,8 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/consents",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/webauthn/mds3/health",
+            "PATCH /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}",
+            "PATCH /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}",
             "PATCH /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}",
             "POST /v1/tenants",
             "POST /v1/tenants/{tenant_id}/environments",
@@ -357,7 +380,9 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/disable",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/enable",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/password-hashing/probe",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/recovery-approvals/{flow_id}/approve",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/recovery-approvals/{flow_id}/reject",
@@ -380,6 +405,7 @@ fn documented_paths_are_the_expected_set() {
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/signing-algorithm",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/connectors/{connector_id}",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/locales/{locale}",
+            "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/parent",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/external-id",
         ]
     );
@@ -421,7 +447,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        107,
+        118,
         "the documented route count is pinned"
     );
 

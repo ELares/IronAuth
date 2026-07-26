@@ -71,6 +71,31 @@ impl Harness {
         }
     }
 
+    /// Start a fresh database and router with an explicit organization group nesting
+    /// bound (issue #97), so a test can drive the depth refusal with a handful of
+    /// groups instead of the shipped default's nine.
+    ///
+    /// This bounds tree DEPTH only. It caps nothing that is counted: the number of
+    /// groups an organization may hold is uncapped by covenant, at every depth level.
+    pub async fn start_with_group_depth(default_page_size: u32, max_group_depth: u32) -> Self {
+        let db = TestDatabase::start().await;
+        let config = AdminConfig {
+            bootstrap_operator_token: Some(Secret::Literal(SecretString::new(OPERATOR_TOKEN))),
+            max_page_size: 200,
+            default_page_size,
+            ..AdminConfig::default()
+        };
+        let state = AdminState::new(db.control_store().clone(), Env::system(), &config)
+            .expect("admin state builds")
+            .with_max_group_depth(max_group_depth);
+        let router = management_router(state);
+        Self {
+            db,
+            router,
+            outbound_scope: None,
+        }
+    }
+
     /// Start a fresh database and router with the experimental signup fraud-review-queue
     /// surface ARMED (issue #82, PR 2), so the review-queue endpoints answer instead of 404.
     /// `armed = false` leaves the feature off (its default), so a test can assert the
@@ -607,6 +632,53 @@ impl Harness {
         self.send(request).await
     }
 
+    /// A PATCH with an arbitrary bearer token, for driving the environment-scoped
+    /// MUTATION surface as a management key (the credential-scope tests).
+    pub async fn patch_as(
+        &self,
+        path: &str,
+        token: &str,
+        body: &str,
+    ) -> (StatusCode, HeaderMap, String) {
+        let request = Request::builder()
+            .method("PATCH")
+            .uri(path)
+            .header(header::AUTHORIZATION, bearer(token))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_owned()))
+            .expect("request builds");
+        self.send(request).await
+    }
+
+    /// A PUT with an arbitrary bearer token (no Idempotency-Key: PUT is the
+    /// idempotent replace).
+    pub async fn put_as(
+        &self,
+        path: &str,
+        token: &str,
+        body: &str,
+    ) -> (StatusCode, HeaderMap, String) {
+        let request = Request::builder()
+            .method("PUT")
+            .uri(path)
+            .header(header::AUTHORIZATION, bearer(token))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_owned()))
+            .expect("request builds");
+        self.send(request).await
+    }
+
+    /// A DELETE with an arbitrary bearer token.
+    pub async fn delete_as(&self, path: &str, token: &str) -> (StatusCode, HeaderMap, String) {
+        let request = Request::builder()
+            .method("DELETE")
+            .uri(path)
+            .header(header::AUTHORIZATION, bearer(token))
+            .body(Body::empty())
+            .expect("request builds");
+        self.send(request).await
+    }
+
     /// A POST carrying NO Authorization header, for the enablement-gate-before-bearer
     /// test (issue #58): a disabled endpoint must be a uniform 404 even to an
     /// unauthenticated probe, never a 401 that reveals the route exists.
@@ -629,6 +701,19 @@ impl Harness {
     pub async fn put(&self, path: &str, body: &str) -> (StatusCode, HeaderMap, String) {
         let request = Request::builder()
             .method("PUT")
+            .uri(path)
+            .header(header::AUTHORIZATION, bearer(OPERATOR_TOKEN))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_owned()))
+            .expect("request builds");
+        self.send(request).await
+    }
+
+    /// An authenticated operator PATCH with a JSON body (no Idempotency-Key: a PATCH
+    /// is a partial edit, not a create).
+    pub async fn patch(&self, path: &str, body: &str) -> (StatusCode, HeaderMap, String) {
+        let request = Request::builder()
+            .method("PATCH")
             .uri(path)
             .header(header::AUTHORIZATION, bearer(OPERATOR_TOKEN))
             .header(header::CONTENT_TYPE, "application/json")

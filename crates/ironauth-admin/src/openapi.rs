@@ -69,6 +69,17 @@ use crate::views::{
         (name = "environments", description = "Environment CRUD under a tenant"),
         (name = "organizations", description = "Organization CRUD under an environment: the \
                                                minimal per-environment shell (M10 adds membership)"),
+        (name = "org-roles", description = "Organization roles (issue #97): first-class, \
+                                           per-organization named roles. A role is a NAME only \
+                                           in M10 (an immutable slug an authorization decision \
+                                           keys on, plus a mutable label); what it grants is \
+                                           issue #98. Uncapped in number by covenant"),
+        (name = "org-groups", description = "Organization groups (issue #97): first-class, \
+                                            per-organization named groups holding a position in \
+                                            that organization's group forest, with a dedicated \
+                                            reparent endpoint carrying the cycle and depth \
+                                            refusals. Uncapped in number by covenant; only \
+                                            nesting DEPTH is bounded"),
         (name = "resource-model", description = "The resource-type classification catalog \
                                                 (promotable, runtime, environment-identity)"),
         (name = "config-promotion", description = "Canonical secret-free config snapshot export: \
@@ -150,6 +161,17 @@ use crate::views::{
         crate::memberships::create_membership,
         crate::memberships::list_memberships,
         crate::memberships::delete_membership,
+        crate::org_roles::create_org_role,
+        crate::org_roles::list_org_roles,
+        crate::org_roles::get_org_role,
+        crate::org_roles::update_org_role,
+        crate::org_roles::delete_org_role,
+        crate::org_groups::create_org_group,
+        crate::org_groups::list_org_groups,
+        crate::org_groups::get_org_group,
+        crate::org_groups::update_org_group,
+        crate::org_groups::set_org_group_parent,
+        crate::org_groups::delete_org_group,
         crate::keys::list_keys,
         crate::keys::create_key,
         crate::keys::get_key,
@@ -254,6 +276,15 @@ use crate::views::{
         MembershipView,
         MembershipList,
         CreateMembershipRequest,
+        crate::org_roles::OrgRoleView,
+        crate::org_roles::OrgRoleList,
+        crate::org_roles::CreateOrgRoleRequest,
+        crate::org_roles::UpdateOrgRoleRequest,
+        crate::org_groups::OrgGroupView,
+        crate::org_groups::OrgGroupList,
+        crate::org_groups::CreateOrgGroupRequest,
+        crate::org_groups::UpdateOrgGroupRequest,
+        crate::org_groups::SetOrgGroupParentRequest,
         ResourceTypeView,
         ResourceTypesList,
         ManagementKeyView,

@@ -514,6 +514,11 @@ async fn build_management_router(
             // PR 3) only when the ladder resolved the feature enabled AND acked; otherwise
             // every recovery-approval endpoint stays a uniform 404.
             let state = state.with_advanced_recovery_enabled(advanced_recovery_enabled);
+            // The organization group nesting bound (issue #97) lives in `[organizations]`,
+            // not `[admin]`, so it is installed by the builder rather than riding
+            // AdminConfig: one bound, one operator-visible name. It bounds tree DEPTH
+            // only and caps nothing that is counted.
+            let state = state.with_max_group_depth(config.organizations.max_group_depth);
             // Share a data-plane issuer registry (issue #93) so the compatibility wizard can
             // resolve an environment's actually signable ID-token algorithms and write the
             // per-client column through the data plane (the only role that can). Absent a

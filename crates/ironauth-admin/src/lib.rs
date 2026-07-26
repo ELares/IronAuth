@@ -68,6 +68,8 @@ mod migration_runs;
 mod migration_status;
 mod openapi;
 mod operators;
+mod org_groups;
+mod org_roles;
 mod organizations;
 mod pagination;
 mod password_hashing;
@@ -318,6 +320,47 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships/{membership_id}",
             delete(memberships::delete_membership),
+        )
+        // Organization roles (issue #97): first-class, per-organization named roles.
+        // A role in M10 is a NAME only; what it grants is issue #98. There is no cap
+        // on how many an organization may define.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles",
+            post(org_roles::create_org_role).get(org_roles::list_org_roles),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}",
+            get(org_roles::get_org_role)
+                .patch(org_roles::update_org_role)
+                .delete(org_roles::delete_org_role),
+        )
+        // Organization groups (issue #97): first-class, per-organization named groups
+        // holding a position in that organization's group forest. Uncapped in number,
+        // bounded only in nesting DEPTH.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups",
+            post(org_groups::create_org_group).get(org_groups::list_org_groups),
+        )
+        // The static `/parent` suffix sits next to the group routes for READABILITY.
+        // Registration order selects nothing here: axum ranks a static segment above a
+        // parameter whichever was registered first, and this pair cannot even compete,
+        // because `.../groups/{group_id}/parent` carries one more path segment than
+        // `.../groups/{group_id}`. (The organization lifecycle actions above are in
+        // fact registered AFTER their parameterized item route and match for the same
+        // reason.) So what PR 5 has to respect when it lands `/members` and `/roles`
+        // siblings under this prefix is not an ordering: a static suffix is always
+        // safe, and the one real hazard, a SECOND parameter at a position that already
+        // has one, is refused at router construction with a panic naming both routes
+        // rather than silently shadowed by whichever came first.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/parent",
+            put(org_groups::set_org_group_parent),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}",
+            get(org_groups::get_org_group)
+                .patch(org_groups::update_org_group)
+                .delete(org_groups::delete_org_group),
         )
         // Dynamic Client Registration abuse controls (issue #31).
         .route(

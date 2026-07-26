@@ -955,6 +955,72 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List an organization's groups (cursor paginated, flat with `parent_id`). */
+        get: operations["listOrgGroups"];
+        put?: never;
+        /** Define a group in an organization, optionally nested under a parent. */
+        post: operations["createOrgGroup"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get one group of an organization. */
+        get: operations["getOrgGroup"];
+        put?: never;
+        post?: never;
+        /**
+         * Delete a group (soft delete; idempotent in effect). Its children are DETACHED,
+         *     not deleted: each becomes a root.
+         */
+        delete: operations["deleteOrgGroup"];
+        options?: never;
+        head?: never;
+        /**
+         * Rename a group (or replace its metadata). The `slug` and the `parent_id` are
+         *     not editable here.
+         */
+        patch: operations["updateOrgGroup"];
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/parent": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * MOVE a group within its organization's group forest.
+         * @description `{"parent_id": null}` (or an omitted field) promotes the group to a root, which
+         *     is always admissible. Any other move is subject to the cycle check and the
+         *     depth bound, both evaluated in the write transaction under a per-organization
+         *     advisory lock, so a refusal leaves the store byte-identical.
+         */
+        put: operations["setOrgGroupParent"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships": {
         parameters: {
             query?: never;
@@ -988,6 +1054,43 @@ export interface paths {
         options?: never;
         head?: never;
         patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List an organization's roles (cursor paginated). */
+        get: operations["listOrgRoles"];
+        put?: never;
+        /** Define a role in an organization. */
+        post: operations["createOrgRole"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get one role of an organization. */
+        get: operations["getOrgRole"];
+        put?: never;
+        post?: never;
+        /** Delete a role (soft delete; idempotent in effect). */
+        delete: operations["deleteOrgRole"];
+        options?: never;
+        head?: never;
+        /** Rename a role (or replace its metadata). The `slug` is immutable. */
+        patch: operations["updateOrgRole"];
         trace?: never;
     };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/password-hashing/probe": {
@@ -1999,6 +2102,47 @@ export interface components {
              */
             user_id: string;
         };
+        /** @description The body to define a group in an organization. */
+        CreateOrgGroupRequest: {
+            /**
+             * @description The mutable human-facing label.
+             * @example Engineering
+             */
+            display_name: string;
+            /** @description Optional free-form group metadata; the empty object when omitted. */
+            metadata?: unknown;
+            /**
+             * @description The parent group to nest under. Omitted or null creates a ROOT, which is
+             *     always admissible. A parent that is not a LIVE group of THIS organization
+             *     (absent, deleted, another scope's, another organization's) is the uniform
+             *     not-found.
+             */
+            parent_id?: string | null;
+            /**
+             * @description The IMMUTABLE stable name, unique among the organization's LIVE groups.
+             *     Must match `^[a-z0-9][a-z0-9._-]{0,62}$`; it is never trimmed or case
+             *     folded, so a non-canonical value is refused rather than silently rewritten.
+             * @example engineering
+             */
+            slug: string;
+        };
+        /** @description The body to define a role in an organization. */
+        CreateOrgRoleRequest: {
+            /**
+             * @description The mutable human-facing label.
+             * @example Billing Administrator
+             */
+            display_name: string;
+            /** @description Optional free-form role metadata; the empty object when omitted. */
+            metadata?: unknown;
+            /**
+             * @description The IMMUTABLE stable name, unique among the organization's LIVE roles.
+             *     Must match `^[a-z0-9][a-z0-9._-]{0,62}$`; it is never trimmed or case
+             *     folded, so a non-canonical value is refused rather than silently rewritten.
+             * @example billing.admin
+             */
+            slug: string;
+        };
         /** @description The body to create an organization in an environment. */
         CreateOrganizationRequest: {
             /**
@@ -2815,6 +2959,87 @@ export interface components {
             /** @description The operator identifier (`op_...`). */
             id: string;
         };
+        /** @description A page of organization groups. */
+        OrgGroupList: {
+            /**
+             * @description The groups on this page, oldest first. FLAT: every group of the
+             *     organization with its `parent_id`, not a subtree, so a console renders the
+             *     tree from one page sequence rather than one request per level. There is no
+             *     cap on how many groups an organization may hold, at any depth level; this
+             *     page is size-clamped like every list.
+             */
+            items: components["schemas"]["OrgGroupView"][];
+            /** @description The opaque cursor for the next page, or null if this is the last page. */
+            next_cursor?: string | null;
+        };
+        /** @description An organization group, as returned by the management API (issue #97). */
+        OrgGroupView: {
+            /**
+             * Format: int64
+             * @description Creation time, milliseconds since the Unix epoch.
+             */
+            created_at_unix_ms: number;
+            /** @description The mutable human-facing label. */
+            display_name: string;
+            /** @description The group identifier (`grp_...`, embeds its scope). */
+            id: string;
+            /** @description Free-form group metadata (the empty object when none was set). */
+            metadata: unknown;
+            /** @description The organization the group belongs to (`org_...`). */
+            organization_id: string;
+            /**
+             * @description The parent group (`grp_...`), or null for a root.
+             *
+             *     It may name a group that has since been DELETED: a delete DETACHES a
+             *     subtree rather than cascading, and every hierarchy walk filters deleted
+             *     rows, so a child of a deleted group is treated as a root. A consumer must
+             *     not assume a non-null value here resolves to a readable group.
+             */
+            parent_id?: string | null;
+            /** @description The IMMUTABLE stable name. A rename changes `display_name`, never this. */
+            slug: string;
+            /**
+             * Format: int64
+             * @description Last-modification time, milliseconds since the Unix epoch.
+             */
+            updated_at_unix_ms: number;
+        };
+        /** @description A page of organization roles. */
+        OrgRoleList: {
+            /**
+             * @description The roles on this page, oldest first. There is no cap on how many roles an
+             *     organization may hold; this page is size-clamped like every list.
+             */
+            items: components["schemas"]["OrgRoleView"][];
+            /** @description The opaque cursor for the next page, or null if this is the last page. */
+            next_cursor?: string | null;
+        };
+        /** @description An organization role, as returned by the management API (issue #97). */
+        OrgRoleView: {
+            /**
+             * Format: int64
+             * @description Creation time, milliseconds since the Unix epoch.
+             */
+            created_at_unix_ms: number;
+            /** @description The mutable human-facing label. */
+            display_name: string;
+            /** @description The role identifier (`rol_...`, embeds its scope). */
+            id: string;
+            /** @description Free-form role metadata (the empty object when none was set). */
+            metadata: unknown;
+            /** @description The organization the role belongs to (`org_...`). */
+            organization_id: string;
+            /**
+             * @description The IMMUTABLE stable name. A rename changes `display_name`, never this, so
+             *     a name an authorization decision keys on cannot move under it.
+             */
+            slug: string;
+            /**
+             * Format: int64
+             * @description Last-modification time, milliseconds since the Unix epoch.
+             */
+            updated_at_unix_ms: number;
+        };
         /** @description A page of organizations. */
         OrganizationList: {
             /** @description The organizations on this page, oldest first. */
@@ -3305,6 +3530,20 @@ export interface components {
             is_env_default?: boolean;
         };
         /**
+         * @description The body to MOVE a group within its organization's group forest.
+         *
+         *     A `PUT` replaces the whole parent relationship, so an omitted `parent_id` and
+         *     an explicit `null` mean the same thing: promote the group to a ROOT, which is
+         *     always admissible and never refused.
+         */
+        SetOrgGroupParentRequest: {
+            /**
+             * @description The new parent group, or null to promote this group to a root.
+             * @example grp_...
+             */
+            parent_id?: string | null;
+        };
+        /**
          * @description The body to set (create or overwrite) a per-environment, per-client signup form (issue #87).
          *
          *     The field list is validated FAIL FAST against the scope's active trait schema before the
@@ -3548,6 +3787,36 @@ export interface components {
              *     here.
              */
             status: string;
+        };
+        /**
+         * @description The body to rename a group (RFC 7396 style partial edit: an omitted field is
+         *     left unchanged).
+         *
+         *     `parent_id` is deliberately absent: moving a group is `PUT .../parent`, which
+         *     carries the cycle and depth refusals and its own audit action. Folding the two
+         *     together would let a plain rename silently reshape the tree.
+         */
+        UpdateOrgGroupRequest: {
+            /** @description A new human-facing label. Omitted leaves it unchanged. */
+            display_name?: string | null;
+            /**
+             * @description Replacement free-form metadata (a whole-document replace, not a merge).
+             *     Omitted leaves it unchanged.
+             */
+            metadata?: unknown;
+        };
+        /**
+         * @description The body to rename a role (RFC 7396 style partial edit: an omitted field is
+         *     left unchanged). The `slug` is deliberately absent and is not editable.
+         */
+        UpdateOrgRoleRequest: {
+            /** @description A new human-facing label. Omitted leaves it unchanged. */
+            display_name?: string | null;
+            /**
+             * @description Replacement free-form metadata (a whole-document replace, not a merge).
+             *     Omitted leaves it unchanged.
+             */
+            metadata?: unknown;
         };
         /**
          * @description The body to update a user (issue #52), applied as an RFC 7396 JSON Merge Patch
@@ -8395,6 +8664,425 @@ export interface operations {
             };
         };
     };
+    listOrgGroups: {
+        parameters: {
+            query?: {
+                /**
+                 * @description The desired page size, a positive integer. Clamped to
+                 *     `[1, max_page_size]`; defaults to the configured default when absent.
+                 */
+                limit?: number;
+                /**
+                 * @description The opaque cursor from a previous page's `next_cursor`. Absent for the
+                 *     first page (keyset pagination; there is no offset).
+                 */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A page of groups */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrgGroupList"];
+                };
+            };
+            /** @description Malformed cursor */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Organization not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    createOrgGroup: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Required. Replaying a POST with the same key returns the original response without re-executing. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateOrgGroupRequest"];
+            };
+        };
+        responses: {
+            /** @description Created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrgGroupView"];
+                };
+            };
+            /** @description Malformed request (including a slug the stable-name rule refuses) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Organization not found, or the parent is not a live group of it */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description A live group of this organization already holds that slug */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The parent would nest the group past the configured maximum depth, or the Idempotency-Key was reused with a different request */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    getOrgGroup: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+                /** @description The group identifier (grp_...) */
+                group_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The group */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrgGroupView"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found (absent, deleted, another scope's, or another organization's) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    deleteOrgGroup: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+                /** @description The group identifier (grp_...) */
+                group_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted (children detached to roots; the slug is immediately free for a new group) */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found (absent, already deleted, another scope's, or another organization's) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    updateOrgGroup: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+                /** @description The group identifier (grp_...) */
+                group_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateOrgGroupRequest"];
+            };
+        };
+        responses: {
+            /** @description The updated group */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrgGroupView"];
+                };
+            };
+            /** @description Malformed request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found (absent, deleted, another scope's, or another organization's) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    setOrgGroupParent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+                /** @description The group identifier (grp_...) */
+                group_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetOrgGroupParentRequest"];
+            };
+        };
+        responses: {
+            /** @description The moved group */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrgGroupView"];
+                };
+            };
+            /** @description Malformed request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found: the group or the proposed parent is not a live group of this organization (uniform across absent, deleted, another scope's, and another organization's) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The move would close a cycle, or would nest the moved subtree past the configured maximum depth */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     listMemberships: {
         parameters: {
             query?: {
@@ -8601,6 +9289,347 @@ export interface operations {
                 };
             };
             /** @description Not found (absent, or already removed: a repeat delete) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listOrgRoles: {
+        parameters: {
+            query?: {
+                /**
+                 * @description The desired page size, a positive integer. Clamped to
+                 *     `[1, max_page_size]`; defaults to the configured default when absent.
+                 */
+                limit?: number;
+                /**
+                 * @description The opaque cursor from a previous page's `next_cursor`. Absent for the
+                 *     first page (keyset pagination; there is no offset).
+                 */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A page of roles */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrgRoleList"];
+                };
+            };
+            /** @description Malformed cursor */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Organization not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    createOrgRole: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Required. Replaying a POST with the same key returns the original response without re-executing. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateOrgRoleRequest"];
+            };
+        };
+        responses: {
+            /** @description Created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrgRoleView"];
+                };
+            };
+            /** @description Malformed request (including a slug the stable-name rule refuses) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Organization not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description A live role of this organization already holds that slug */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Idempotency-Key reused with a different request */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    getOrgRole: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+                /** @description The role identifier (rol_...) */
+                role_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The role */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrgRoleView"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found (absent, deleted, another scope's, or another organization's) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    deleteOrgRole: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+                /** @description The role identifier (rol_...) */
+                role_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted (the slug is immediately free for a new role) */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found (absent, already deleted, another scope's, or another organization's) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    updateOrgRole: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+                /** @description The role identifier (rol_...) */
+                role_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateOrgRoleRequest"];
+            };
+        };
+        responses: {
+            /** @description The updated role */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrgRoleView"];
+                };
+            };
+            /** @description Malformed request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found (absent, deleted, another scope's, or another organization's) */
             404: {
                 headers: {
                     [name: string]: unknown;

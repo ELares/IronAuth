@@ -184,6 +184,17 @@ name = "memberships"
 path = "tests/memberships.rs"
 required-features = ["testing"]
 
+# Organization roles and groups over HTTP (issue #97, PR 4): the two CRUD surfaces,
+# the dedicated reparent endpoint with its cycle and depth refusals, the
+# two-organization containment proof on every endpoint (row-level security fences
+# the environment and nothing finer, so `organization_id` is the only separator),
+# and the anti-oracle uniformity of the cross-organization case against the two
+# informative structural errors. Needs a real database (DATABASE_URL).
+[[test]]
+name = "org_roles_groups"
+path = "tests/org_roles_groups.rs"
+required-features = ["testing"]
+
 # DCR abuse-control management surface (issue #31): authoring a reusable policy
 # (create/list/replay/conflict/invalid-primitive), minting an initial access token
 # carrying a policy-chain snapshot (plaintext once, idempotent replay, unknown policy
