@@ -251,6 +251,13 @@ CREATE TABLE org_auth_policies (
     -- and inherit the other, which no row-local CHECK can see. The deployment
     -- CEILING is NOT expressible here (it is a config value), so it is a store
     -- guard parameter.
+    --
+    -- These three are LATCHES on the same terms as org_auth_policies_mfa_reachable
+    -- above: the store guard carries a matching FLOOR rule
+    -- (AuthPolicyError::NonPositiveSessionLifetime) and a matching pair rule, so a
+    -- zero lifetime is refused with a typed error before any statement runs and
+    -- these CHECKs are never what the application path hits. A seeded corpus test
+    -- pins the two verdicts equal over documents that reach every one of them.
     CONSTRAINT org_auth_policies_session_ttl_positive
         CHECK (session_ttl_secs IS NULL OR session_ttl_secs > 0),
     CONSTRAINT org_auth_policies_session_idle_positive

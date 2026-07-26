@@ -101,7 +101,7 @@ use crate::identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
 };
 use crate::locale_bundle::{LocaleBundleRecord, NewLocaleBundle};
-use crate::org_policy::AuthPolicy;
+use crate::org_policy::{AuthPolicy, ORG_POLICY_MAX_SESSION_TTL_SECS};
 use crate::pow_challenge::{NewPowChallenge, PowChallengeView};
 use crate::recovery::{
     NewRecoveryFlow, RecoveryCancelReason, RecoveryEntryPoint, RecoveryFlowRecord, RecoveryMethod,
@@ -35648,13 +35648,16 @@ impl ActingOrgAuthPolicyRepo<'_> {
     ///
     /// # Why the Rust guard must win the race against the CHECK
     ///
-    /// Migration 0090 carries `org_auth_policies_mfa_reachable` as a latch behind
-    /// this validation, and the application path must never reach it: a CHECK raised
-    /// MID-transaction poisons the transaction (SQLSTATE 25P02 thereafter), and every
-    /// mutation here writes its audit row AFTER the mutation and BEFORE the commit,
-    /// so a database-raised refusal would make that audit insert impossible. The pure
-    /// validator therefore refuses first, with a typed error, and rolls the attempted
-    /// write and its audit row back together.
+    /// Migration 0090 carries EVERY row-local rule as a latch behind this validation
+    /// (`org_auth_policies_mfa_reachable`, the two `_nonempty` list rules, the two
+    /// `_positive` duration floors, and `_idle_within_absolute`), and the application
+    /// path must never reach ANY of them: a CHECK raised MID-transaction poisons the
+    /// transaction (SQLSTATE 25P02 thereafter), and every mutation here writes its
+    /// audit row AFTER the mutation and BEFORE the commit, so a database-raised
+    /// refusal would make that audit insert impossible. The pure validator therefore
+    /// refuses first, with a typed error, and rolls the attempted write and its audit
+    /// row back together. A seeded corpus test pins the two verdicts equal over
+    /// documents that reach every one of those CHECKs, so the claim stays true.
     ///
     /// # What this validation does NOT claim
     ///
@@ -35696,7 +35699,15 @@ impl ActingOrgAuthPolicyRepo<'_> {
         // Normalization first, so validation and the stored row agree on exactly one
         // form of every domain, and so the audit detail describes what was stored.
         let document = crate::org_policy::normalize(document);
-        crate::org_policy::validate(&document, session_ttl_ceiling_secs)
+        // The ceiling arrives as a call parameter (the store deliberately has no
+        // dependency on the config crate) and is CLAMPED to the store's OWN mirror,
+        // exactly as every group write clamps its depth bound to
+        // ORG_GROUP_MAX_DEPTH_CEILING. A miswired caller must not be able to WIDEN
+        // the deployment maximum from the outside; the cross-crate test that pins the
+        // two constants equal asserts the store clamps, so passing the parameter
+        // through unclamped would make that claim false.
+        let ceiling = session_ttl_ceiling_secs.min(ORG_POLICY_MAX_SESSION_TTL_SECS);
+        crate::org_policy::validate(&document, ceiling)
             .map_err(StoreError::OrgAuthPolicyInvalid)?;
         let detail = crate::org_policy::audit_detail(&document);
 

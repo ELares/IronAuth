@@ -596,6 +596,9 @@ pub enum AuthPolicyError {
     IdleExceedsAbsolute,
     /// A stated session lifetime exceeds the deployment ceiling.
     SessionTtlAboveCeiling,
+    /// A stated session lifetime is ZERO, which would expire every session the
+    /// instant it was minted. Unconstrained is spelled by omitting the dimension.
+    NonPositiveSessionLifetime,
     /// An email-domain entry is not a plain registrable hostname.
     InvalidEmailDomain,
 }
@@ -622,6 +625,9 @@ impl AuthPolicyError {
             }
             AuthPolicyError::SessionTtlAboveCeiling => {
                 "a session lifetime exceeds the deployment maximum"
+            }
+            AuthPolicyError::NonPositiveSessionLifetime => {
+                "a session lifetime is zero (omit it to leave the lifetime unconstrained)"
             }
             AuthPolicyError::InvalidEmailDomain => {
                 "allowed_email_domains contains a value that is not a registrable domain"
@@ -770,6 +776,19 @@ pub fn validate(
             .is_some_and(|idle| idle > session_ttl_ceiling_secs)
     {
         errors.push(AuthPolicyError::SessionTtlAboveCeiling);
+    }
+
+    // The FLOOR, and the other half of what makes the CHECK constraints behind this
+    // guard a latch rather than the primary refusal. A stated lifetime of zero would
+    // expire every session the instant it was minted, and
+    // `org_auth_policies_session_ttl_positive` / `_session_idle_positive` refuse it
+    // at the storage engine; without this rule the guard would ACCEPT the document
+    // and the CHECK would raise MID-transaction, which aborts the transaction the
+    // audit row still has to be written in and surfaces as an opaque database fault
+    // instead of the typed refusal. Unconstrained is spelled by omitting the
+    // dimension, exactly as it is for the two lists.
+    if policy.session_ttl_secs == Some(0) || policy.session_idle_ttl_secs == Some(0) {
+        errors.push(AuthPolicyError::NonPositiveSessionLifetime);
     }
 
     // Row-local only: an organization may state ONE of the pair and inherit the
@@ -1738,6 +1757,59 @@ mod tests {
     }
 
     #[test]
+    fn a_zero_session_lifetime_is_refused_on_both_halves() {
+        // The FLOOR, and the half the guard originally left to the storage engine.
+        // `org_auth_policies_session_ttl_positive` and `_session_idle_positive` refuse
+        // a zero, so a guard that accepted one would hand the document to the INSERT
+        // and take a CHECK violation MID-transaction: that aborts the transaction the
+        // audit row still has to be written in, and reaches the caller as an opaque
+        // database fault instead of this typed refusal.
+        let ceiling = ORG_POLICY_MAX_SESSION_TTL_SECS;
+
+        // Both halves INDEPENDENTLY: a zero idle window with no absolute lifetime
+        // stated trips nothing else, so a rule written on the PAIR rather than on
+        // each value would miss it.
+        assert_eq!(
+            validate(
+                &AuthPolicy {
+                    session_ttl_secs: Some(0),
+                    ..AuthPolicy::default()
+                },
+                ceiling
+            ),
+            Err(vec![AuthPolicyError::NonPositiveSessionLifetime])
+        );
+        assert_eq!(
+            validate(
+                &AuthPolicy {
+                    session_idle_ttl_secs: Some(0),
+                    ..AuthPolicy::default()
+                },
+                ceiling
+            ),
+            Err(vec![AuthPolicyError::NonPositiveSessionLifetime]),
+            "the idle half has a floor too"
+        );
+        // ONE is the smallest writable lifetime, so this is a floor at exactly the
+        // value the CHECK constraints draw it at rather than a bound the two could
+        // disagree about.
+        assert_eq!(
+            validate(
+                &AuthPolicy {
+                    session_ttl_secs: Some(1),
+                    session_idle_ttl_secs: Some(1),
+                    ..AuthPolicy::default()
+                },
+                ceiling
+            ),
+            Ok(())
+        );
+        // Omitting the dimension is how "unconstrained" is spelled, exactly as it is
+        // for the two lists; it is NOT a zero.
+        assert_eq!(validate(&AuthPolicy::default(), ceiling), Ok(()));
+    }
+
+    #[test]
     fn an_unregistrable_email_domain_is_refused_at_the_write_boundary() {
         // A shapeless entry is refused before it is ever written, so a value that
         // could never match a real address cannot sit in a policy looking effective.
@@ -1775,6 +1847,7 @@ mod tests {
             AuthPolicyError::MfaRequiredWithNoSecondFactor,
             AuthPolicyError::IdleExceedsAbsolute,
             AuthPolicyError::SessionTtlAboveCeiling,
+            AuthPolicyError::NonPositiveSessionLifetime,
             AuthPolicyError::InvalidEmailDomain,
         ] {
             let rendered = error.to_string();

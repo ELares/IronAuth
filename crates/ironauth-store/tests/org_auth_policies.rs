@@ -13,17 +13,23 @@
 //!   * a removed policy is never REVIVED: the next `set` mints a FRESH id, so
 //!     removing a policy cannot be quietly undone in its identity while staying
 //!     observationally identical in value;
+//!   * the write NORMALIZES the domain list, and does so BEFORE it validates, so the
+//!     stored form is exactly the one a submitted address is later matched against;
 //!   * a self-contradictory document is refused with a typed error that writes
-//!     NEITHER the row nor its audit row, and the storage-engine CHECK behind it
-//!     agrees with the Rust validator over a seeded corpus;
+//!     NEITHER the row nor its audit row, and the storage-engine CHECKs behind it
+//!     agree with the Rust validator over a seeded corpus that REACHES every one of
+//!     them;
 //!   * the typed refusal is never an existence ORACLE: a contradictory document
-//!     against an organization the caller cannot see is the uniform not-found;
+//!     against an organization the caller cannot see is the uniform not-found, and
+//!     the login-path read fails CLOSED on an out-of-scope organization rather than
+//!     returning the `None` that means "inherit the level above unchanged";
 //!   * organization containment holds against a SECOND organization in the SAME
 //!     scope, which row-level security cannot fence;
 //!   * forced row-level security hides another scope's policies even with the
-//!     app-layer filter subverted, and the grants are least-privilege (the data plane
-//!     is read only, and the scope and organization columns are immutable by GRANT on
-//!     BOTH roles);
+//!     app-layer filter subverted, and its WITH CHECK half refuses a FORGED write
+//!     claiming another scope; the grants are least-privilege (the data plane is read
+//!     only, and the scope and organization columns are immutable by GRANT on BOTH
+//!     roles);
 //!   * migration 0049's `subject_kind` seam is LIVE: the subject-filtered read
 //!     returns the scope-wide row, the acting organization's row, and the rows of the
 //!     groups a subject effectively belongs to;
@@ -264,10 +270,27 @@ const CORPUS_FACTOR_POOL: [&str; 7] = [
 
 /// One random policy document for the CHECK-versus-validator corpus.
 ///
-/// Only the ROW-LOCAL dimensions vary: the two CHECK-backed rules the corpus
-/// compares are the MFA reachability latch and the session pair, and the durations
-/// stay well inside the deployment ceiling so the one rule the guard enforces that no
-/// CHECK can (the ceiling itself, a config value) never separates the two verdicts.
+/// Only the ROW-LOCAL dimensions vary, and every one of them is drawn so that the
+/// corpus actually REACHES each CHECK migration 0090 carries. A generator that
+/// merely produced plausible documents would be structurally blind to three of them:
+/// pinning the domain list at NULL never reaches `org_auth_policies_domains_nonempty`
+/// at all, and drawing the durations from `1..=5_000` never reaches either
+/// `_positive` floor and reaches the `<=` boundary of `_idle_within_absolute` only by
+/// accident. So:
+///
+///   * the domain list takes all THREE shapes the CHECK can distinguish (absent,
+///     explicitly empty, and a single registrable entry), all of which are
+///     SHAPE-valid to the guard too, so the two verdicts stay comparable;
+///   * each duration is absent, ZERO, or a positive value, with zero drawn as its
+///     OWN arm rather than as one value in five thousand, so the floor is reached in
+///     a large fraction of the corpus rather than in roughly one document of it;
+///   * and the idle window is sometimes made EQUAL to the absolute lifetime, which is
+///     the exact `<=` boundary a CHECK that was stricter than the guard would
+///     separate them on.
+///
+/// The positive durations stay well inside the deployment ceiling, so the one rule
+/// the guard enforces that no CHECK can (the ceiling itself, a config value) never
+/// separates the two verdicts.
 fn random_corpus_document(rng: &mut Rng) -> AuthPolicy {
     let allowed_factors = if rng.flip() {
         let mut chosen: BTreeSet<String> = BTreeSet::new();
@@ -280,21 +303,31 @@ fn random_corpus_document(rng: &mut Rng) -> AuthPolicy {
     } else {
         None
     };
-    let duration = |rng: &mut Rng| {
-        if rng.flip() {
-            Some(u32::try_from(rng.below(5_000) + 1).expect("fits u32"))
-        } else {
-            None
-        }
+    let allowed_email_domains = match rng.below(3) {
+        0 => None,
+        1 => Some(BTreeSet::new()),
+        _ => Some(tokens(&["acme.example"])),
+    };
+    let duration = |rng: &mut Rng| match rng.below(4) {
+        0 => None,
+        1 => Some(0),
+        _ => Some(u32::try_from(rng.below(5_000) + 1).expect("fits u32")),
+    };
+    let session_ttl_secs = duration(rng);
+    let mirror_the_absolute = rng.below(4) == 0;
+    let session_idle_ttl_secs = if mirror_the_absolute && session_ttl_secs.is_some() {
+        session_ttl_secs
+    } else {
+        duration(rng)
     };
     AuthPolicy {
         mfa_required: if rng.flip() { Some(rng.flip()) } else { None },
         allowed_factors,
-        allowed_email_domains: None,
+        allowed_email_domains,
         jit_provisioning: None,
         invitations_enabled: None,
-        session_ttl_secs: duration(rng),
-        session_idle_ttl_secs: duration(rng),
+        session_ttl_secs,
+        session_idle_ttl_secs,
     }
 }
 
@@ -399,6 +432,34 @@ async fn a_policy_is_stated_read_back_and_removed_with_its_audit_vocabulary() {
             "organization.policy.set".to_owned(),
             "organization.policy.set".to_owned()
         ]
+    );
+
+    // The WRITE PATH normalizes, and it normalizes BEFORE it validates. Both halves
+    // matter and one assertion pins both. Migration 0090's commitment (ii) makes
+    // matching EXACT on the normalized form, so a stored `ACME.Example` would
+    // silently never match a submitted `acme.example`: a write path that skipped the
+    // fold would look correct in every test whose domains were already lowercase.
+    // And the padded spelling is only ACCEPTABLE after folding (it is not a
+    // registrable hostname before it), so validating the raw document instead would
+    // refuse this write outright.
+    let unnormalized = AuthPolicy {
+        allowed_email_domains: Some(tokens(&["ACME.Example", " acme.example "])),
+        ..AuthPolicy::default()
+    };
+    set_policy(&db, &env, scope, &org, &unnormalized)
+        .await
+        .expect("a document whose domains normalize to a valid form is accepted");
+    assert_eq!(
+        db.control_store()
+            .management()
+            .org_auth_policies(scope)
+            .get_for_org(&org)
+            .await
+            .expect("read the normalized document back")
+            .document
+            .allowed_email_domains,
+        Some(tokens(&["acme.example"])),
+        "two spellings of one domain are stored as the ONE normalized form"
     );
 }
 
@@ -610,6 +671,26 @@ async fn a_contradictory_document_is_refused_and_writes_neither_the_row_nor_its_
             },
             AuthPolicyError::SessionTtlAboveCeiling,
         ),
+        // The FLOOR, on BOTH halves. These two are the cases the CHECK constraints
+        // `org_auth_policies_session_ttl_positive` and `_session_idle_positive`
+        // refuse: they must be the TYPED refusal here, not a raw database error. A
+        // guard that let them through would raise SQLSTATE 23514 MID-transaction,
+        // which aborts the transaction the audit row still has to be written in and
+        // reaches the caller as an opaque internal fault rather than a 422.
+        (
+            AuthPolicy {
+                session_ttl_secs: Some(0),
+                ..AuthPolicy::default()
+            },
+            AuthPolicyError::NonPositiveSessionLifetime,
+        ),
+        (
+            AuthPolicy {
+                session_idle_ttl_secs: Some(0),
+                ..AuthPolicy::default()
+            },
+            AuthPolicyError::NonPositiveSessionLifetime,
+        ),
     ] {
         let error = set_policy(&db, &env, scope, &org, &document)
             .await
@@ -631,6 +712,112 @@ async fn a_contradictory_document_is_refused_and_writes_neither_the_row_nor_its_
 }
 
 #[tokio::test]
+async fn the_deployment_ceiling_a_caller_passes_is_clamped_to_the_stores_own_mirror() {
+    // The ceiling arrives as a call PARAMETER because the store deliberately has no
+    // dependency on the config crate, and the store clamps it to its OWN mirror so a
+    // miswired caller cannot WIDEN the deployment maximum from the outside. The
+    // cross-crate test that pins the config and store constants equal states that the
+    // store clamps; this is where that claim is executable.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = create_org(&db, &env, scope, "Acme").await;
+
+    let above_the_mirror = AuthPolicy {
+        session_ttl_secs: Some(ORG_POLICY_MAX_SESSION_TTL_SECS + 1),
+        ..AuthPolicy::default()
+    };
+    let error = db
+        .control_store()
+        .management()
+        .acting(actor(&env), CorrelationId::generate(&env))
+        .org_auth_policies(scope)
+        .set(
+            &env,
+            &org,
+            &above_the_mirror,
+            ORG_POLICY_MAX_SESSION_TTL_SECS * 2,
+        )
+        .await
+        .expect_err("a lifetime above the store's OWN mirror is refused whatever ceiling arrives");
+    let StoreError::OrgAuthPolicyInvalid(ref failures) = error else {
+        panic!("expected the typed policy refusal, got {error:?}");
+    };
+    assert_eq!(failures, &vec![AuthPolicyError::SessionTtlAboveCeiling]);
+    assert!(policy_snapshot(&db, scope).await.is_empty());
+    assert!(all_policy_audit_rows(&db, scope).await.is_empty());
+
+    // Positive control: the very same call with a lifetime AT the mirror lands, so
+    // the refusal is about the clamp and not about the surface being broken.
+    db.control_store()
+        .management()
+        .acting(actor(&env), CorrelationId::generate(&env))
+        .org_auth_policies(scope)
+        .set(
+            &env,
+            &org,
+            &AuthPolicy {
+                session_ttl_secs: Some(ORG_POLICY_MAX_SESSION_TTL_SECS),
+                ..AuthPolicy::default()
+            },
+            ORG_POLICY_MAX_SESSION_TTL_SECS * 2,
+        )
+        .await
+        .expect("a lifetime at the mirror is accepted");
+}
+
+/// Write `document` STRAIGHT at the storage engine as the owner, with the
+/// application guard bypassed entirely, and report whether a CHECK constraint
+/// refused it. Any row that landed is removed again, because the live partial unique
+/// index means only the FIRST insert per organization could succeed.
+async fn engine_refuses_with_a_check(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    org: &OrganizationId,
+    document: &AuthPolicy,
+) -> bool {
+    let list = |values: Option<&BTreeSet<String>>| {
+        values.map(|set| set.iter().cloned().collect::<Vec<String>>())
+    };
+    let secs = |value: Option<u32>| {
+        value.map(|seconds| i32::try_from(seconds).expect("the corpus stays well inside i32"))
+    };
+    let outcome = sqlx::query(
+        "INSERT INTO org_auth_policies \
+         (id, tenant_id, environment_id, organization_id, mfa_required, allowed_factors, \
+          allowed_email_domains, session_ttl_secs, session_idle_ttl_secs) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+    )
+    .bind(OrgAuthPolicyId::generate(env, &scope).to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(org.to_string())
+    .bind(document.mfa_required)
+    .bind(list(document.allowed_factors.as_ref()))
+    .bind(list(document.allowed_email_domains.as_ref()))
+    .bind(secs(document.session_ttl_secs))
+    .bind(secs(document.session_idle_ttl_secs))
+    .execute(db.owner_pool())
+    .await;
+
+    if outcome.is_ok() {
+        sqlx::query("DELETE FROM org_auth_policies WHERE tenant_id = $1 AND environment_id = $2")
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .execute(db.owner_pool())
+            .await
+            .expect("clear the corpus row");
+    }
+    outcome.as_ref().err().is_some_and(|error| {
+        error
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .is_some_and(|code| code == CHECK_VIOLATION)
+    })
+}
+
+#[tokio::test]
 async fn the_check_constraints_agree_with_the_rust_validator_over_a_seeded_corpus() {
     // The highest-value test in the file, because it is exhaustive over a CORPUS
     // rather than over examples. Migration 0090 carries the row-local half of the
@@ -647,62 +834,40 @@ async fn the_check_constraints_agree_with_the_rust_validator_over_a_seeded_corpu
     let mut rng = Rng(0x0000_0095_C0DE_0090);
     let mut refused_by_both = 0_usize;
     let mut accepted_by_both = 0_usize;
+    // REACH counters, one per CHECK the corpus would otherwise be able to stop
+    // exercising without anything failing. An agreement test is only as strong as the
+    // documents it draws, so the shapes are counted and asserted below: a generator
+    // change that quietly stopped producing empty domain lists, zero durations, or
+    // the equal-pair boundary would then fail HERE rather than pass vacuously.
+    let mut saw_empty_domains = 0_usize;
+    let mut saw_stated_domains = 0_usize;
+    let mut saw_zero_duration = 0_usize;
+    let mut saw_equal_pair = 0_usize;
 
     for _ in 0..400 {
         let document = random_corpus_document(&mut rng);
+        match document.allowed_email_domains.as_ref() {
+            Some(domains) if domains.is_empty() => saw_empty_domains += 1,
+            Some(_) => saw_stated_domains += 1,
+            None => {}
+        }
+        if document.session_ttl_secs == Some(0) || document.session_idle_ttl_secs == Some(0) {
+            saw_zero_duration += 1;
+        }
+        // The boundary only PROVES anything when the pair is otherwise acceptable: a
+        // pair of zeroes is refused by both sides on the floor rule whatever the
+        // `<=` becomes, so it is not counted here.
+        if document
+            .session_ttl_secs
+            .is_some_and(|absolute| absolute > 0)
+            && document.session_ttl_secs == document.session_idle_ttl_secs
+        {
+            saw_equal_pair += 1;
+        }
         let guard_verdict =
             ironauth_store::validate_org_policy(&document, ORG_POLICY_MAX_SESSION_TTL_SECS);
-
-        // Write the SAME document straight at the storage engine, as the owner, with
-        // the application guard bypassed entirely. Only the CHECK constraints decide.
-        let engine_verdict = sqlx::query(
-            "INSERT INTO org_auth_policies \
-             (id, tenant_id, environment_id, organization_id, mfa_required, allowed_factors, \
-              session_ttl_secs, session_idle_ttl_secs) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-        )
-        .bind(OrgAuthPolicyId::generate(&env, &scope).to_string())
-        .bind(scope.tenant().to_string())
-        .bind(scope.environment().to_string())
-        .bind(org.to_string())
-        .bind(document.mfa_required)
-        .bind(
-            document
-                .allowed_factors
-                .as_ref()
-                .map(|set| set.iter().cloned().collect::<Vec<String>>()),
-        )
-        .bind(
-            document
-                .session_ttl_secs
-                .map(|secs| i32::try_from(secs).expect("the corpus stays well inside i32")),
-        )
-        .bind(
-            document
-                .session_idle_ttl_secs
-                .map(|secs| i32::try_from(secs).expect("the corpus stays well inside i32")),
-        )
-        .execute(db.owner_pool())
-        .await;
-
-        // The live partial unique index means only the FIRST insert per organization
-        // can succeed, so remove any row that landed before the next round.
-        let engine_check_violation = engine_verdict.as_ref().err().is_some_and(|error| {
-            error
-                .as_database_error()
-                .and_then(sqlx::error::DatabaseError::code)
-                .is_some_and(|code| code == CHECK_VIOLATION)
-        });
-        if engine_verdict.is_ok() {
-            sqlx::query(
-                "DELETE FROM org_auth_policies WHERE tenant_id = $1 AND environment_id = $2",
-            )
-            .bind(scope.tenant().to_string())
-            .bind(scope.environment().to_string())
-            .execute(db.owner_pool())
-            .await
-            .expect("clear the corpus row");
-        }
+        let engine_check_violation =
+            engine_refuses_with_a_check(&db, &env, scope, &org, &document).await;
 
         // The two must agree on the ROW-LOCAL rules. The guard additionally enforces
         // the deployment CEILING, which is a config value and is deliberately not
@@ -730,6 +895,30 @@ async fn the_check_constraints_agree_with_the_rust_validator_over_a_seeded_corpu
     assert!(
         accepted_by_both > 20,
         "the corpus must exercise the acceptance path (saw {accepted_by_both})"
+    );
+
+    // And every CHECK is actually REACHED. Without these the corpus could agree with
+    // the engine about constraints no document it draws ever touches, which is
+    // agreement about nothing: mutating `domains_nonempty` to CHECK (true), or either
+    // duration floor to `> -100`, or `idle_within_absolute` from `<=` to `<`, would
+    // all leave the assertion above green.
+    assert!(
+        saw_empty_domains > 20,
+        "the corpus must reach org_auth_policies_domains_nonempty (saw {saw_empty_domains})"
+    );
+    assert!(
+        saw_stated_domains > 20,
+        "the corpus must also state a VALID domain list, or the domain shapes prove \
+         nothing (saw {saw_stated_domains})"
+    );
+    assert!(
+        saw_zero_duration > 20,
+        "the corpus must reach the two duration floors (saw {saw_zero_duration})"
+    );
+    assert!(
+        saw_equal_pair > 20,
+        "the corpus must reach the idle == absolute boundary of \
+         org_auth_policies_idle_within_absolute (saw {saw_equal_pair})"
     );
 }
 
@@ -870,6 +1059,38 @@ async fn the_typed_refusal_is_never_an_existence_oracle() {
         ));
     }
 
+    // The LOGIN-path read, asserted on the read that actually carries the property.
+    // `get_for_org` maps its own Ok(None) to NotFound, so every assertion above goes
+    // through that MASKING wrapper and would survive `document_for_org` failing OPEN.
+    // `document_for_org` is what the enforcement PR threads onto /authorize, and
+    // there Ok(None) means exactly "this organization states no policy, inherit the
+    // level above unchanged", the identity element of every combinator in the
+    // resolution engine. So an OUT-OF-SCOPE organization returning Ok(None) would
+    // silently DISCARD that organization's mfa_required and its factor allowlist
+    // instead of failing closed, which is the hazard the read's own doc names.
+    for (label, target) in [
+        ("foreign tenant", foreign_tenant_org),
+        ("foreign environment", foreign_env_org),
+    ] {
+        assert!(
+            matches!(
+                policies.document_for_org(&target).await,
+                Err(StoreError::NotFound)
+            ),
+            "{label}: an out-of-scope organization must be a LOUD not-found, never Ok(None)"
+        );
+    }
+    // The contrast that makes the assertion above meaningful rather than a blanket
+    // "every miss is an error": an IN-SCOPE organization with no policy is the NORMAL
+    // case and reads as Ok(None), because it inherits the next level up unchanged.
+    assert!(
+        policies
+            .document_for_org(&absent)
+            .await
+            .expect("an in-scope organization with no policy is not an error")
+            .is_none()
+    );
+
     // Nothing at all was written by any of it.
     assert!(policy_snapshot(&db, scope).await.is_empty());
     assert!(all_policy_audit_rows(&db, scope).await.is_empty());
@@ -973,6 +1194,11 @@ async fn forced_row_level_security_hides_another_scopes_policies() {
     let scope_b = db.seed_scope(&env).await;
     let org_a = create_org(&db, &env, scope_a, "Acme A").await;
     let org_b = create_org(&db, &env, scope_b, "Acme B").await;
+    // A SECOND organization of scope B, deliberately left with NO policy: the forge
+    // probe below targets it so the live partial unique index cannot be what refuses
+    // the insert. Aimed at org_b it would fail as a duplicate even with the WITH
+    // CHECK removed, and the probe would prove nothing.
+    let unclaimed_b = create_org(&db, &env, scope_b, "Unclaimed B").await;
     set_policy(&db, &env, scope_a, &org_a, &full_document())
         .await
         .expect("policy A");
@@ -1002,6 +1228,40 @@ async fn forced_row_level_security_hides_another_scopes_policies() {
             );
             let _ = tx.rollback().await;
         }
+    }
+
+    // The WRITE half of the same policy, which the reads above cannot reach.
+    // Migration 0090 promises BYTE-IDENTICAL USING and WITH CHECK, and migration.rs
+    // asserts only that a policy of that NAME exists, so without this a WITH CHECK of
+    // `true` would let a scope A bound control session INSERT a row claiming scope B
+    // with nothing failing. The same step the sibling role and group suites carry.
+    {
+        let mut tx = db.control_pool().begin().await.expect("begin as scope A");
+        bind_scope(
+            &mut tx,
+            &scope_a.tenant().to_string(),
+            &scope_a.environment().to_string(),
+        )
+        .await;
+        let forged = OrgAuthPolicyId::generate(&env, &scope_b).to_string();
+        let insert = sqlx::query(
+            "INSERT INTO org_auth_policies \
+             (id, tenant_id, environment_id, organization_id) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(forged)
+        .bind(scope_b.tenant().to_string())
+        .bind(scope_b.environment().to_string())
+        .bind(unclaimed_b.to_string())
+        .execute(&mut *tx)
+        .await;
+        assert!(
+            insert.as_ref().err().is_some_and(|error| error
+                .as_database_error()
+                .and_then(sqlx::error::DatabaseError::code)
+                .is_some_and(|code| code == INSUFFICIENT_PRIVILEGE)),
+            "RLS WITH CHECK must reject writing another scope's policy: {insert:?}"
+        );
+        let _ = tx.rollback().await;
     }
 }
 
@@ -1063,13 +1323,29 @@ async fn the_grants_are_least_privilege_on_both_planes() {
     // even the control plane, which owns the whole policy lifecycle, may move a
     // policy between scopes or between organizations. That is what keeps the
     // containment invariant from being defeatable by an UPDATE after the fact.
-    for column in ["tenant_id", "environment_id", "organization_id", "id"] {
+    //
+    // Each probe writes the column's OWN CURRENT VALUE, so the resulting row still
+    // satisfies the row-level-security WITH CHECK and the ABSENT GRANT is the only
+    // thing that can refuse it. Postgres reports a row-level-security refusal and a
+    // privilege refusal under the SAME 42501, so a probe that moved the row out of
+    // scope (writing the organization id into tenant_id, say) would stay green even
+    // if these columns were later granted, which is exactly the trap
+    // `assert_denied_in_scope` exists to avoid.
+    for (column, value) in [
+        ("tenant_id", "$1"),
+        ("environment_id", "$2"),
+        ("organization_id", "$3"),
+        ("id", "id"),
+    ] {
         assert_denied_in_scope(
             db.control_pool(),
             &tenant,
             &environment,
             &org,
-            &format!("UPDATE org_auth_policies SET {column} = $3"),
+            &format!(
+                "UPDATE org_auth_policies SET {column} = {value} \
+                 WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3"
+            ),
         )
         .await;
     }
