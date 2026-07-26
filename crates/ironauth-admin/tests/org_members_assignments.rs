@@ -22,11 +22,15 @@
 //!
 //! One consequence of that shape is worth stating so nobody weakens a test on the
 //! strength of a surviving mutant. On the three removal paths the organization is
-//! carried TWICE, once by the pair lookup and once by the soft-delete statement, so
-//! deleting either predicate ALONE is invisible: whichever survives still refuses
-//! the request. Deleting BOTH lets a nested route remove a sibling organization's
-//! row, and `every_cross_organization_pairing_is_refused_and_mutates_nothing` below
-//! is what turns red when it happens. The census lives on
+//! carried TWICE, once by the pair lookup and once by the soft-delete statement, and
+//! the two are NOT interchangeable. Deleting the PAIR LOOKUP's copy alone is
+//! invisible everywhere, because the soft delete still refuses the request. Deleting
+//! the SOFT DELETE's copy alone is invisible only HERE: it reds two tests in
+//! `crates/ironauth-store/tests/org_assignments.rs`, which remove by an assignment id
+//! with no pair lookup in front of them. Deleting BOTH lets a nested route remove a
+//! sibling organization's row, and
+//! `every_cross_organization_pairing_is_refused_and_mutates_nothing` below is what
+//! turns red when it happens. The census, with the full mutation table, lives on
 //! `ironauth_store::OrgGroupMemberRepo::get_binding`.
 //!
 //! The second load-bearing property is ANTI-ORACLE UNIFORMITY: the refusal for a
@@ -409,6 +413,34 @@ async fn group_member_add_list_and_remove_round_trip() {
     let (status, _, response) = h.post(&members, "k-readd", &body).await;
     assert_eq!(status, StatusCode::CREATED, "re-add: {response}");
     assert_ne!(id_of(&response), binding, "the re-add gets a fresh id");
+
+    // The remove is addressed by the PAIR, so the GROUP half of that address has to
+    // select the row as much as the membership half does. A SECOND group of the SAME
+    // organization is what tells the two halves apart, and the sharp probe is the
+    // membership that is bound into the OTHER one: it is individually visible, it has
+    // a live binding, both ids are of this organization, and the group segment is the
+    // only thing saying that binding is not the one this path names. Every other test
+    // here keeps its membership in exactly ONE group, where a lookup that ignored the
+    // group segment would still find that one binding and still remove the right row.
+    let second = create_group(&h, &tenant, &environment, &f.org, "second", None, "k-g2").await;
+    let second_members = format!(
+        "{}/groups/{second}/members",
+        org_base(&tenant, &environment, &f.org)
+    );
+    let (status, _, response) = h
+        .delete(&format!("{second_members}/{}", f.membership))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a membership bound into ANOTHER group of this organization is not removable \
+         through this group's path: {response}"
+    );
+    assert_eq!(
+        list_ids(&h, &members).await.len(),
+        1,
+        "and that refusal removed nothing: the binding into the other group stands"
+    );
 }
 
 #[tokio::test]
@@ -1511,6 +1543,9 @@ async fn effective_roles_resolves_direct_group_and_ancestor_grants_each_with_its
     assert!(value["roles"].is_array(), "with a named roles array: {raw}");
 }
 
+// Four withdrawal paths over ONE arrangement. Splitting them would re-seed the same
+// organization four times to assert the same emptiness four ways.
+#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn effective_roles_is_empty_by_default_and_drops_every_withdrawn_path() {
     let h = Harness::start(50).await;
@@ -1549,8 +1584,8 @@ async fn effective_roles_is_empty_by_default_and_drops_every_withdrawn_path() {
         vec![("admin".to_owned(), "group".to_owned(), Some(group.clone()))]
     );
 
-    // Each of the three ways a path can be broken removes it, and each is asserted
-    // on its own so a single over-broad filter cannot pass for three.
+    // Each of the four ways a path can be broken removes it, and each is asserted
+    // on its own so a single over-broad filter cannot pass for four.
     //
     // 1. Withdraw the grant from the group.
     let (status, _, _) = h
@@ -1597,6 +1632,63 @@ async fn effective_roles_is_empty_by_default_and_drops_every_withdrawn_path() {
     assert!(
         effective_roles(&h, &effective).await.is_empty(),
         "a deleted role stops resolving even though its assignment row is still live"
+    );
+
+    // 4. The same two questions asked of the DIRECT branch of the provenance
+    //    projection, which carries its OWN copy of each predicate. Steps 1 to 3 all
+    //    reach the role through a GROUP, so not one of them touches that copy, and a
+    //    projection that answered "every direct grant in the organization, whatever
+    //    its role's liveness" would pass all three.
+    //
+    //    First: WHOSE grant it is. A SECOND live membership of the SAME organization
+    //    holds nothing while the first holds a live direct grant. The two rows agree
+    //    on tenant, environment, and organization, so the only thing separating them
+    //    is the direct branch's join back to the resolved membership; with one member
+    //    per organization no assertion can tell "this member's direct grants" from
+    //    "every direct grant here".
+    let direct = create_role(&h, &tenant, &environment, &org, "direct.only", "k-r2").await;
+    let bystander = create_membership(&h, &tenant, &environment, &org, "b@x.test", "k-m2").await;
+    let direct_roles = format!("{base}/memberships/{membership}/roles");
+    let (status, _, _) = h
+        .post(
+            &direct_roles,
+            "k-direct",
+            &serde_json::json!({ "role_id": direct }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(
+        effective_roles(&h, &effective).await,
+        vec![("direct.only".to_owned(), "direct".to_owned(), None)],
+        "the direct grant resolves, with no group in its provenance"
+    );
+    assert!(
+        effective_roles(
+            &h,
+            &format!("{base}/memberships/{bystander}/effective-roles")
+        )
+        .await
+        .is_empty(),
+        "a member who holds nothing resolves nothing, even while a SIBLING member of \
+         the same organization holds a direct grant"
+    );
+
+    //    Second: the ROLE's liveness on that same branch. A role delete does not
+    //    cascade its assignment rows, so the grant below stays LIVE and only the
+    //    direct branch's own filter on the role keeps it out of the answer. The
+    //    assertion on the direct-role LIST is what makes this a liveness proof rather
+    //    than a cascade proof.
+    let (status, _, _) = h.delete(&format!("{base}/roles/{direct}")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        list_ids(&h, &direct_roles).await.len(),
+        1,
+        "the direct assignment row is still LIVE after the role delete"
+    );
+    assert!(
+        effective_roles(&h, &effective).await.is_empty(),
+        "a deleted role stops resolving on the DIRECT path too, even though its \
+         assignment row is still live"
     );
 }
 

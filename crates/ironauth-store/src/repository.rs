@@ -33249,8 +33249,9 @@ impl OrgGroupRepo<'_> {
 ///      `parent_id` is an untrusted stored pointer: deleting it really does change an
 ///      answer, and
 ///      `the_read_walk_never_crosses_organization_via_a_corrupt_parent` is the test
-///      that says so. [`EFFECTIVE_ROLE_SLUGS_TAIL`] carries the full census of which
-///      organization predicates around here are redundant and which are not.
+///      that says so. [`EFFECTIVE_ROLE_SLUGS_TAIL`] carries the census of which
+///      organization predicates on this closure and on that projection are redundant
+///      and which are not, and says where the third projection's copies are counted.
 ///
 /// Binds: `$1` tenant, `$2` environment, `$3` organization, `$4` user, `$5` the walk
 /// bound (`max_group_depth`, one LOWER than the write walks use; see
@@ -33311,6 +33312,15 @@ const EFFECTIVE_CLOSURE_CTE: &str = "WITH RECURSIVE membership AS ( \
 /// Together they are the layer under that write-time invariant: if a future write path
 /// ever admitted a cross-organization assignment, these are what would keep the
 /// resulting role out of a token instead of quietly emitting it.
+///
+/// The count is a tally over THIS statement and the closure, and it is worth saying so
+/// out loud, because a THIRD projection now runs over the same closure.
+/// [`EFFECTIVE_ROLE_GRANTS_TAIL`] repeats the same predicates in its own two branches
+/// (`r.organization_id` and `mr.organization_id` in the direct branch,
+/// `r.organization_id` and `gr.organization_id` in the group branch); they are the
+/// same layer, kept for the same reason, and they are simply not part of the five
+/// counted here. That tail carries its own note on the two predicates in it that are
+/// NOT of this kind.
 ///
 /// The SIXTH is NOT of this kind and must not be filed with them. `g.organization_id`
 /// in the RECURSIVE arm of [`EFFECTIVE_CLOSURE_CTE`] is the only thing fencing the
@@ -33392,6 +33402,32 @@ const EFFECTIVE_GROUP_SLUGS_TAIL: &str = "SELECT DISTINCT slug AS slug FROM clos
 /// `ORDER BY slug, via_group_id NULLS FIRST` is a TOTAL order over the result (no two
 /// rows share both columns), so the output is byte-stable across evaluations, and the
 /// direct grant for a slug always precedes its inherited ones.
+///
+/// # The DIRECT branch's two selectors, and what pins each
+///
+/// Being a copy of [`EFFECTIVE_ROLE_SLUGS_TAIL`]'s direct-grant subquery is what
+/// makes this branch correct and also what makes it easy to prune wrongly, so the
+/// two predicates that carry it are named with the test that kills each.
+///
+/// `JOIN membership mb ON mb.id = mr.membership_id` is the only thing that makes
+/// this branch report THIS member's grants rather than EVERY live direct grant in
+/// the organization: two members of one organization agree on tenant, environment,
+/// and organization, so no scope or containment predicate separates their rows.
+///
+/// `r.deleted_at IS NULL` is this branch's OWN copy of the role-liveness filter. A
+/// role delete does not cascade its assignment rows, so without it a role deleted out
+/// from under a direct grant keeps being reported as held while
+/// [`OrgGroupRepo::effective_roles`] correctly drops it, and the console then tells
+/// an operator that a token will carry a role it will not.
+///
+/// Both were MUTATION SURVIVORS until step 4 of
+/// `effective_roles_is_empty_by_default_and_drops_every_withdrawn_path` in
+/// `crates/ironauth-admin/tests/org_members_assignments.rs` landed. Every test on
+/// this surface used to put at most ONE membership holding a direct grant in an
+/// organization, and every one that deleted a role reached that role through a
+/// GROUP, so the group branch's copies below were exercised and these two never
+/// were. That step now stands a SECOND membership beside the first and deletes a
+/// DIRECTLY granted role, and it is what turns red when either one goes.
 const EFFECTIVE_ROLE_GRANTS_TAIL: &str = "SELECT DISTINCT r.slug AS slug, \
             NULL::text AS via_group_id \
        FROM org_roles r \
@@ -33513,22 +33549,49 @@ impl OrgGroupMemberRepo<'_> {
     ///
     /// # Redundancy census (read before deleting a predicate here)
     ///
-    /// `organization_id` above and `organization_id` in
-    /// [`soft_delete_assignment_row`] are MUTUALLY redundant on the remove path and
-    /// JOINTLY load-bearing. Deleting EITHER ONE alone changes no answer and no test
-    /// can distinguish it, because a removal addressed from a sibling organization is
-    /// still refused by whichever one survives. Deleting BOTH lets a nested route
-    /// remove another organization's binding, and
-    /// `every_cross_organization_pairing_is_refused_and_mutates_nothing` in
-    /// `crates/ironauth-admin/tests/org_members_assignments.rs` is the test that says
-    /// so. Both are kept deliberately: this one is the only fence for any caller that
-    /// reads without removing, and that one is the only fence for any caller that
-    /// removes by an id it did not obtain here.
+    /// Every claim below is a MUTATION result: the predicate was neutralized, the
+    /// whole of `crates/ironauth-admin/tests/org_members_assignments.rs` and of
+    /// `crates/ironauth-store/tests/org_assignments.rs` were run, and what turned red
+    /// is what is named. A coverage claim nobody re-ran is worse than none, because
+    /// the next reader deletes the predicate the census told them was covered.
     ///
-    /// The `group_id` and `membership_id` predicates are NOT of that kind. Each is
-    /// the only thing that makes this the address of ONE pair, deleting either really
-    /// does return a different row, and both are individually pinned by that same
-    /// test and by the byte-for-byte uniformity test beside it.
+    /// Exactly ONE predicate on this address survives that treatment: the
+    /// `organization_id` HERE. Every caller in the tree reads through this statement
+    /// and then removes through [`soft_delete_assignment_row`], which carries
+    /// `organization_id` too, so a removal addressed from a sibling organization is
+    /// refused by that second copy whatever this one does. It is kept anyway, and for
+    /// a directional reason rather than a symmetric one: it is the only fence a
+    /// caller that READS a binding without removing it would have, and the paragraph
+    /// above sells this lookup as the answer to the cross-organization PAIRING
+    /// question, which such a caller will reasonably rely on.
+    ///
+    /// The redundancy does NOT run the other way, and this census used to claim it
+    /// did. Neutralizing `organization_id` in [`soft_delete_assignment_row`] ALONE
+    /// turns `every_list_and_mutation_is_fenced_to_its_own_organization` and
+    /// `absent_removed_foreign_org_and_foreign_scope_rows_are_indistinguishable` in
+    /// `crates/ironauth-store/tests/org_assignments.rs` RED, because a store caller
+    /// removes by an assignment id and never passes through a pair lookup at all.
+    /// That copy is individually load-bearing and individually covered. Neutralizing
+    /// BOTH additionally reds
+    /// `every_cross_organization_pairing_is_refused_and_mutates_nothing` in
+    /// `crates/ironauth-admin/tests/org_members_assignments.rs`, which is the same
+    /// property stated at the HTTP boundary.
+    ///
+    /// `group_id` and `membership_id` are not redundant with anything: each is the
+    /// only thing that makes this the address of ONE pair, and dropping either really
+    /// does return a different row. `membership_id` is pinned three ways, by that
+    /// same cross-organization test, by the byte-for-byte uniformity test beside it,
+    /// and by the pagination walk. `group_id` was pinned by NOTHING, and this census
+    /// used to say it was pinned by both: every test on this surface kept its
+    /// membership in exactly ONE group, so a lookup that ignored the group segment
+    /// still found that one binding and still removed the right row. The closing
+    /// paragraph of `group_member_add_list_and_remove_round_trip` now stands a SECOND
+    /// group of the same organization beside the first and addresses the membership
+    /// through it, where the binding exists, both ids are of this organization, and
+    /// only the group segment says the binding is not the one the path names. Its
+    /// shape matters: TWO live bindings for one membership would NOT pin this, because
+    /// this statement has no `ORDER BY` and a lookup that ignored the group segment
+    /// can then return the row the caller meant by luck of scan order.
     ///
     /// # Errors
     ///
@@ -37417,11 +37480,15 @@ impl ActingOrgMembershipRoleRepo<'_> {
 /// Since the pair-addressed management routes landed, this predicate has a SECOND
 /// layer in front of it: each of them resolves the row through
 /// [`OrgGroupMemberRepo::get_binding`] or one of the two `get_assignment` reads,
-/// which carry `organization_id` as well. The two are therefore mutually redundant
-/// FOR THOSE CALLERS and jointly load-bearing; see the redundancy census on
-/// [`OrgGroupMemberRepo::get_binding`] for which mutation kills which. This one
-/// remains the ONLY fence for a caller that removes by an assignment id it obtained
-/// some other way, so it is not the redundant half in general.
+/// which carry `organization_id` as well. That layering is ONE-WAY and is not a
+/// mutual redundancy. The READ's copy is the one whose removal no test can see;
+/// removing THIS one reds
+/// `every_list_and_mutation_is_fenced_to_its_own_organization` and
+/// `absent_removed_foreign_org_and_foreign_scope_rows_are_indistinguishable` in
+/// `crates/ironauth-store/tests/org_assignments.rs` on its own, because a store
+/// caller removes by an assignment id with no pair lookup in front of it. The
+/// redundancy census on [`OrgGroupMemberRepo::get_binding`] carries the full mutation
+/// table.
 async fn soft_delete_assignment_row(
     tx: &mut Transaction<'_, Postgres>,
     table: &'static str,
