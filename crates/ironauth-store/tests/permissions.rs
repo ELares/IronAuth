@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The permission vocabulary (issue #98, store PR 1), over a real database
+//! The permission vocabulary (issue #98, store PRs 1 and 2), over a real database
 //! (`DATABASE_URL`).
 //!
 //! Pins the vocabulary half of the M10 permission model at the persistence layer: a
@@ -20,20 +20,40 @@
 //! claim selects; and there is NO cap on how many permissions an environment may
 //! define.
 //!
-//! Rows are planted with direct SQL through the CONTROL pool rather than through a
-//! repository, because the audited write repository is the NEXT PR of this issue.
-//! The plant therefore runs under the same role, the same bound scope, and the same
-//! grants a real write will, so nothing here is privileged in a way production is
-//! not.
+//! PR 2 adds the WRITE half and everything that hangs off it: the create, relabel,
+//! and soft delete each write their audit row (`permission.create`,
+//! `permission.update`, `permission.delete`) in the SAME transaction as the mutation,
+//! in both directions (a failed mutation leaves no audit row, and a failed audit
+//! insert leaves no mutation); a relabel can move neither the `slug` nor the `kind`,
+//! which is enforced by a COLUMN-scoped grant rather than by convention, swept here
+//! against `pg_attribute` so a widened grant is caught by exact set equality; every
+//! mutation answers absent, soft-deleted, another tenant's, and the SAME TENANT'S
+//! OTHER ENVIRONMENT'S with one indistinguishable not-found; a deleted slug is freed
+//! and re-using it mints a FRESH id rather than reviving the dead row; and the
+//! covenant is proved on the write path, which is where a cap would have to live.
+//!
+//! Two ways of planting a row coexist here on purpose. `define` goes through the
+//! audited write repository and is the production path. `plant` and `plant_at` use
+//! direct SQL through the CONTROL pool, under the same role, the same bound scope,
+//! and the same grants, and are kept for the two things the repository cannot do: it
+//! never writes `kind = 'entitlement'` (issue #98 defines no entitlements, which
+//! migration 0091's header states as a property of this issue), and it wraps the
+//! driver error, while several assertions here need the CONSTRAINT NAME so that a
+//! refusal is pinned to the rule that was meant to refuse rather than to something
+//! else that happened to fail.
 //!
 //! Cross-tenant and cross-environment isolation is additionally exercised through the
-//! registered IDOR probes (`crates/ironauth-admin/tests/idor.rs`), and the CHECK
-//! versus Rust-validator agreement through the parity oracle
+//! registered IDOR probes (`crates/ironauth-admin/tests/idor.rs`), which now include
+//! the mutating `permissions.delete`, and the CHECK versus Rust-validator agreement
+//! through the parity oracle
 //! (`crates/ironauth-admin/tests/permission_slug_parity.rs`).
 
 use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
-use ironauth_store::{CursorPosition, PermissionEntryKind, PermissionId, Scope, StoreError};
+use ironauth_store::{
+    ActorRef, CorrelationId, CursorPosition, NewPermission, PermissionEntryKind, PermissionId,
+    Scope, ServiceId, StoreError,
+};
 use sqlx::{PgPool, Row};
 
 /// The Postgres "insufficient privilege" SQLSTATE.
@@ -132,6 +152,128 @@ async fn plant(
         at,
     )
     .await
+}
+
+fn actor(env: &Env) -> ActorRef {
+    ActorRef::service(ServiceId::generate(env))
+}
+
+/// Define a permission through the AUDITED WRITE repository: the production path,
+/// which writes the row and its `permission.create` audit row in one transaction.
+///
+/// The creation instant is supplied by the caller so a test can pin rows to chosen
+/// times; nothing here reads a wall clock of its own.
+async fn define(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    slug: &str,
+    display_name: &str,
+    created_at_micros: i64,
+) -> Result<PermissionId, StoreError> {
+    let id = PermissionId::generate(env, &scope);
+    db.control_store()
+        .management()
+        .acting(actor(env), CorrelationId::generate(env))
+        .permissions(scope)
+        .create(
+            env,
+            NewPermission {
+                id: &id,
+                slug,
+                display_name,
+                metadata: None,
+            },
+            created_at_micros,
+            None,
+        )
+        .await
+        .map(|()| id)
+}
+
+/// Relabel a permission through the audited write repository.
+async fn relabel(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    id: &PermissionId,
+    display_name: Option<&str>,
+    metadata: Option<&serde_json::Value>,
+) -> Result<(), StoreError> {
+    db.control_store()
+        .management()
+        .acting(actor(env), CorrelationId::generate(env))
+        .permissions(scope)
+        .update(env, id, display_name, metadata)
+        .await
+}
+
+/// Soft-delete a permission through the audited write repository.
+async fn remove(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    id: &PermissionId,
+) -> Result<(), StoreError> {
+    db.control_store()
+        .management()
+        .acting(actor(env), CorrelationId::generate(env))
+        .permissions(scope)
+        .delete(env, id)
+        .await
+}
+
+/// The audit actions recorded against `target_id` in `scope`, in order. Read through
+/// the OWNER pool so nothing hides behind row-level security: an audit row written
+/// into the WRONG scope would be invisible to a scoped read and would look exactly
+/// like an absent one.
+async fn audit_actions(db: &TestDatabase, scope: Scope, target_id: &str) -> Vec<String> {
+    let rows = sqlx::query(
+        "SELECT action FROM audit_log \
+         WHERE tenant_id = $1 AND environment_id = $2 AND target_id = $3 \
+         ORDER BY occurred_at, id",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(target_id)
+    .fetch_all(db.owner_pool())
+    .await
+    .expect("read audit rows");
+    rows.iter()
+        .map(|row| row.get::<String, _>("action"))
+        .collect()
+}
+
+/// Every `permission.*` audit action anywhere in the database, regardless of scope
+/// and regardless of target, read through the OWNER pool.
+///
+/// The scope-blind counterpart of [`audit_actions`]. A per-target read cannot see a
+/// PHANTOM audit row written against some other id, nor one written into another
+/// scope, and both are exactly what a broken failure path would leave behind.
+async fn all_permission_audit_actions(db: &TestDatabase) -> Vec<String> {
+    let rows = sqlx::query(
+        "SELECT action FROM audit_log WHERE action LIKE 'permission.%' \
+         ORDER BY occurred_at, id",
+    )
+    .fetch_all(db.owner_pool())
+    .await
+    .expect("read permission audit rows");
+    rows.iter()
+        .map(|row| row.get::<String, _>("action"))
+        .collect()
+}
+
+/// Count rows of `permissions` matching `predicate`, through the OWNER pool so
+/// row-level security hides nothing: a row written into another scope still counts.
+async fn count_permissions(db: &TestDatabase, predicate: &str) -> i64 {
+    // `predicate` is a fixed test-local literal, never caller input.
+    sqlx::query(&format!(
+        "SELECT count(*) AS c FROM permissions WHERE {predicate}"
+    ))
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("count permissions")
+    .get("c")
 }
 
 /// Soft-delete a permission through the CONTROL pool's column-scoped UPDATE grant.
@@ -454,12 +596,19 @@ async fn an_environment_may_define_unlimited_permissions_and_the_list_pages_them
     // gate. The page size is clamped like every management list, which is a
     // PAGINATION bound and not a cap on the set. The byte budget a later PR of this
     // issue adds bounds ONE TOKEN and has nothing to do with this table.
+    //
+    // Every row here is written through the AUDITED WRITE REPOSITORY rather than with
+    // direct SQL, because that is where a cap would have to live. A covenant test that
+    // planted rows behind the repository would leave an advisory-lock-plus-COUNT gate
+    // in `ActingPermissionRepo::create` completely unguarded, and that gate is the
+    // exact shape this module uses elsewhere and the exact shape the covenant forbids
+    // here.
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
 
     for index in 0..DEFINED {
-        plant(
+        define(
             &db,
             &env,
             scope,
@@ -468,8 +617,18 @@ async fn an_environment_may_define_unlimited_permissions_and_the_list_pages_them
             1_000 + i64::try_from(index).expect("fits i64"),
         )
         .await
-        .expect("no cap refuses a permission");
+        .unwrap_or_else(|error| panic!("no cap may refuse permission {index}: {error:?}"));
     }
+
+    // Every one of those writes was audited, and nothing else was. This is the
+    // "no unaudited mutation" property at a scale where a path that skipped the
+    // audited seam under some condition (a batch, a retry, a fast path) would show up
+    // as a count mismatch rather than as a passing single-row test.
+    assert_eq!(
+        all_permission_audit_actions(&db).await,
+        vec!["permission.create"; DEFINED],
+        "each of the {DEFINED} defines writes exactly one create audit row"
+    );
 
     let repo = db.control_store().management().permissions(scope);
     let mut seen: Vec<String> = Vec::new();
@@ -1031,8 +1190,12 @@ async fn the_kind_column_defaults_to_permission_and_admits_only_the_closed_set()
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
 
-    // The DEFAULT matters: issue #98's own writes never state a kind, so a default
-    // that drifted would silently reclassify the whole vocabulary.
+    // The DEFAULT is the storage-engine half of the closed set, and it is what a
+    // hand-written insert meets. The audited write repository does NOT rely on it: it
+    // binds the discriminator explicitly from `PermissionEntryKind::Permission`, so
+    // the stored value and the Rust enum have one source and a drifted default cannot
+    // silently reclassify what the production path writes. This pins the other half,
+    // which issue #103's first entitlement write and every operator-run insert meet.
     let id = PermissionId::generate(&env, &scope);
     let mut tx = db.control_pool().begin().await.expect("begin");
     bind_scope(
@@ -1194,4 +1357,795 @@ async fn assert_denied_in_scope(pool: &PgPool, tenant: &str, environment: &str, 
         "statement must be refused as insufficient privilege: {statement:?} -> {result:?}"
     );
     let _ = tx.rollback().await;
+}
+
+// ===========================================================================
+// The AUDITED WRITE path (issue #98, store PR 2).
+// ===========================================================================
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn a_permission_round_trips_through_the_audited_write_repository() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let control = db.control_store();
+
+    let id = define(
+        &db,
+        &env,
+        scope,
+        "billing.invoice.read",
+        "Read invoices",
+        1_000,
+    )
+    .await
+    .expect("define a permission");
+
+    // It reads back on both planes, with the kind the write path bound EXPLICITLY
+    // rather than inherited from the column default.
+    let created = control
+        .management()
+        .permissions(scope)
+        .get(&id)
+        .await
+        .expect("get after create");
+    assert_eq!(created.slug, "billing.invoice.read");
+    assert_eq!(created.kind, PermissionEntryKind::Permission);
+    assert_eq!(created.display_name, "Read invoices");
+    assert_eq!(created.metadata, serde_json::json!({}));
+    assert_eq!(created.created_at_unix_micros, 1_000);
+    assert_eq!(created.updated_at_unix_micros, 1_000);
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .permissions()
+            .get(&id)
+            .await
+            .expect("the data plane reads what the control plane wrote"),
+        created
+    );
+    assert_eq!(
+        audit_actions(&db, scope, &id.to_string()).await,
+        vec!["permission.create"]
+    );
+
+    // A relabel moves the display name and the modification time, and moves NOTHING
+    // else. The slug is what a token claim carries and the kind decides whether a
+    // resolution projection selects the row at all, so a relabel that could move
+    // either would silently move an authorization decision.
+    relabel(&db, &env, scope, &id, Some("Read invoices (billing)"), None)
+        .await
+        .expect("relabel");
+    let relabelled = control
+        .management()
+        .permissions(scope)
+        .get(&id)
+        .await
+        .expect("get after relabel");
+    assert_eq!(relabelled.display_name, "Read invoices (billing)");
+    assert_eq!(relabelled.slug, created.slug, "the slug is immutable");
+    assert_eq!(relabelled.kind, created.kind, "the kind is immutable");
+    assert_eq!(
+        relabelled.created_at_unix_micros, created.created_at_unix_micros,
+        "a relabel does not move the creation time (the pagination key)"
+    );
+    assert!(
+        relabelled.updated_at_unix_micros > created.updated_at_unix_micros,
+        "a relabel moves the modification time"
+    );
+    assert_eq!(
+        relabelled.metadata, created.metadata,
+        "a None metadata argument leaves the stored document alone"
+    );
+    assert_eq!(
+        audit_actions(&db, scope, &id.to_string()).await,
+        vec!["permission.create", "permission.update"]
+    );
+
+    // Metadata replaces on its own, leaving the label alone.
+    relabel(
+        &db,
+        &env,
+        scope,
+        &id,
+        None,
+        Some(&serde_json::json!({"owner": "billing"})),
+    )
+    .await
+    .expect("replace metadata");
+    let with_metadata = control
+        .management()
+        .permissions(scope)
+        .get(&id)
+        .await
+        .expect("get after metadata write");
+    assert_eq!(
+        with_metadata.metadata,
+        serde_json::json!({"owner": "billing"})
+    );
+    assert_eq!(with_metadata.display_name, "Read invoices (billing)");
+    assert_eq!(with_metadata.slug, created.slug);
+    assert_eq!(with_metadata.kind, created.kind);
+    assert_eq!(
+        audit_actions(&db, scope, &id.to_string()).await,
+        vec![
+            "permission.create",
+            "permission.update",
+            "permission.update"
+        ]
+    );
+
+    // The delete is SOFT: the row is retained so the audit foreign key to it stays
+    // satisfiable, and every read filters it out.
+    remove(&db, &env, scope, &id).await.expect("delete");
+    assert!(matches!(
+        control.management().permissions(scope).get(&id).await,
+        Err(StoreError::NotFound)
+    ));
+    assert!(matches!(
+        control
+            .management()
+            .permissions(scope)
+            .get_by_slug(PermissionEntryKind::Permission, "billing.invoice.read")
+            .await,
+        Err(StoreError::NotFound)
+    ));
+    assert!(
+        control
+            .management()
+            .permissions(scope)
+            .list(PermissionEntryKind::Permission, 50, None)
+            .await
+            .expect("list after delete")
+            .is_empty()
+    );
+    assert_eq!(
+        count_permissions(&db, "deleted_at IS NOT NULL").await,
+        1,
+        "the row is retained, not removed"
+    );
+
+    let after_delete = vec![
+        "permission.create",
+        "permission.update",
+        "permission.update",
+        "permission.delete",
+    ];
+    assert_eq!(
+        audit_actions(&db, scope, &id.to_string()).await,
+        after_delete,
+        "every mutation is audited, in order, under the exact wire strings migration \
+         0091 declares as the delta contract"
+    );
+
+    // A repeat delete and a relabel of the dead row are the uniform not-found, and
+    // NEITHER writes an audit row: the refusal happens inside the same transaction
+    // the audit row would have been written in, so it rolls back with it.
+    assert!(matches!(
+        remove(&db, &env, scope, &id).await,
+        Err(StoreError::NotFound)
+    ));
+    assert!(matches!(
+        relabel(&db, &env, scope, &id, Some("resurrected"), None).await,
+        Err(StoreError::NotFound)
+    ));
+    assert_eq!(
+        audit_actions(&db, scope, &id.to_string()).await,
+        after_delete,
+        "a refused mutation writes no audit row against its target"
+    );
+    assert_eq!(
+        all_permission_audit_actions(&db).await,
+        after_delete,
+        "and none against any other target or scope either"
+    );
+    assert_eq!(
+        count_permissions(&db, "true").await,
+        1,
+        "and it created nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_relabel_can_move_neither_the_slug_nor_the_kind() {
+    // Immutability here is a GRANT property, not a convention, so it is worth
+    // probing at the layer that enforces it. Migration 0091 grants the control role
+    // `UPDATE (display_name, metadata, updated_at, deleted_at)` and nothing more, so
+    // a statement naming `slug` or `kind` in its SET list is refused WHOLESALE, even
+    // when it also names a column the role may write. That is the property that makes
+    // it impossible to smuggle a slug rewrite alongside a legitimate relabel, and it
+    // is also what would turn `ActingPermissionRepo::update` red the moment somebody
+    // added `slug = COALESCE(...)` to it: every relabel would begin failing 42501.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let tenant = scope.tenant().to_string();
+    let environment = scope.environment().to_string();
+
+    let id = define(&db, &env, scope, "billing.read", "Read billing", 1_000)
+        .await
+        .expect("define");
+
+    // The repository's own relabel leaves both stable fields alone.
+    relabel(&db, &env, scope, &id, Some("Relabelled"), None)
+        .await
+        .expect("relabel");
+    let after = db
+        .control_store()
+        .management()
+        .permissions(scope)
+        .get(&id)
+        .await
+        .expect("get");
+    assert_eq!(after.slug, "billing.read");
+    assert_eq!(after.kind, PermissionEntryKind::Permission);
+
+    // A statement that TRIES, from the very role the repository runs as, with the
+    // session bound to the row's OWN scope so the row satisfies the isolation
+    // policy's USING clause and only the absent grant can refuse it. Postgres reports
+    // a policy refusal and a privilege refusal under the same SQLSTATE, so a probe
+    // aimed at a foreign row could never observe the grant at all.
+    for statement in [
+        "UPDATE permissions SET display_name = 'smuggled', slug = 'other.slug' \
+         WHERE tenant_id = $1 AND environment_id = $2",
+        "UPDATE permissions SET display_name = 'smuggled', kind = 'entitlement' \
+         WHERE tenant_id = $1 AND environment_id = $2",
+    ] {
+        assert_denied_in_scope(db.control_pool(), &tenant, &environment, statement).await;
+    }
+
+    // Nothing moved, including the display name the refused statements also named:
+    // the whole statement is refused, so a rewrite cannot ride along with a change
+    // the role IS allowed to make.
+    let untouched = db
+        .control_store()
+        .management()
+        .permissions(scope)
+        .get(&id)
+        .await
+        .expect("get after the refused statements");
+    assert_eq!(untouched, after);
+}
+
+/// Every column of `permissions` the given role may UPDATE, swept from the catalog.
+///
+/// `has_table_privilege(role, 'permissions', 'UPDATE')` cannot answer this: a
+/// COLUMN-scoped grant is invisible to it, so a table-level check would report "no
+/// UPDATE" for a role that can in fact rewrite four columns, and would keep reporting
+/// it however far the column list was widened. Sweeping `pg_attribute` and asking
+/// `has_column_privilege` per column is the only form that sees the real grant, and
+/// asking it of EVERY column (rather than of an expected list) is what makes the
+/// answer an exact set rather than a subset.
+async fn updatable_columns(db: &TestDatabase, role: &str) -> Vec<String> {
+    let rows = sqlx::query(
+        "SELECT a.attname AS name \
+           FROM pg_attribute a \
+          WHERE a.attrelid = 'permissions'::regclass \
+            AND a.attnum > 0 AND NOT a.attisdropped \
+            AND has_column_privilege($1::name, a.attrelid, a.attnum, 'UPDATE') \
+          ORDER BY a.attname",
+    )
+    .bind(role)
+    .fetch_all(db.owner_pool())
+    .await
+    .expect("sweep column privileges");
+    rows.iter()
+        .map(|row| row.get::<String, _>("name"))
+        .collect()
+}
+
+/// Every live column of `permissions`, so the sweep above can be shown to have looked
+/// at all of them rather than at an empty relation.
+async fn all_columns(db: &TestDatabase) -> Vec<String> {
+    let rows = sqlx::query(
+        "SELECT a.attname AS name FROM pg_attribute a \
+          WHERE a.attrelid = 'permissions'::regclass \
+            AND a.attnum > 0 AND NOT a.attisdropped \
+          ORDER BY a.attname",
+    )
+    .fetch_all(db.owner_pool())
+    .await
+    .expect("read columns");
+    rows.iter()
+        .map(|row| row.get::<String, _>("name"))
+        .collect()
+}
+
+/// Whether `role` holds `privilege` on `permissions` at TABLE level.
+async fn has_table_privilege(db: &TestDatabase, role: &str, privilege: &str) -> bool {
+    sqlx::query("SELECT has_table_privilege($1::name, 'permissions', $2) AS held")
+        .bind(role)
+        .bind(privilege)
+        .fetch_one(db.owner_pool())
+        .await
+        .expect("read table privilege")
+        .get("held")
+}
+
+#[tokio::test]
+async fn the_grants_are_exactly_what_the_write_path_needs_and_nothing_more() {
+    let db = TestDatabase::start().await;
+
+    // The sweep really looked at the table: ten columns, the shape migration 0091
+    // creates. Without this the set comparisons below could both be satisfied by a
+    // relation the catalog query failed to find.
+    assert_eq!(
+        all_columns(&db).await,
+        vec![
+            "created_at",
+            "deleted_at",
+            "display_name",
+            "environment_id",
+            "id",
+            "kind",
+            "metadata",
+            "slug",
+            "tenant_id",
+            "updated_at",
+        ]
+    );
+
+    // EXACTLY the four mutable columns, as an exact set. `slug` and `kind` are absent
+    // (the immutability the token claim rests on), and so are `id`, `tenant_id`, and
+    // `environment_id`, which is what makes it impossible to move a permission
+    // between scopes (the #31 lesson).
+    assert_eq!(
+        updatable_columns(&db, "ironauth_control").await,
+        vec!["deleted_at", "display_name", "metadata", "updated_at"],
+        "widening this grant is a security change and must not pass silently"
+    );
+
+    // The DATA plane holds no UPDATE on any column at all. It resolves permissions
+    // onto the token-issuance path in a later PR and must never be able to define or
+    // relabel the capability names it is about to emit.
+    assert_eq!(
+        updatable_columns(&db, "ironauth_app").await,
+        Vec::<String>::new()
+    );
+
+    // DELETE is granted to NOBODY on either plane: removal is the soft delete, which
+    // is what keeps the audit foreign key satisfiable.
+    for role in ["ironauth_control", "ironauth_app"] {
+        assert!(
+            !has_table_privilege(&db, role, "DELETE").await,
+            "{role} must not hold DELETE on permissions"
+        );
+        assert!(
+            !has_table_privilege(&db, role, "UPDATE").await,
+            "{role} must hold UPDATE per COLUMN and never over the whole table"
+        );
+        assert!(
+            has_table_privilege(&db, role, "SELECT").await,
+            "{role} reads the vocabulary"
+        );
+    }
+    assert!(
+        has_table_privilege(&db, "ironauth_control", "INSERT").await,
+        "the control plane defines the vocabulary"
+    );
+    assert!(
+        !has_table_privilege(&db, "ironauth_app", "INSERT").await,
+        "the data plane never defines one"
+    );
+}
+
+#[tokio::test]
+async fn a_deleted_slug_is_free_again_and_a_re_create_mints_a_fresh_id() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let control = db.control_store();
+
+    let first = define(&db, &env, scope, "billing.read", "Read billing", 1_000)
+        .await
+        .expect("define the first");
+
+    // While it is LIVE the slug is taken, by the partial unique index.
+    assert!(matches!(
+        define(&db, &env, scope, "billing.read", "Duplicate", 2_000).await,
+        Err(StoreError::Conflict)
+    ));
+
+    remove(&db, &env, scope, &first).await.expect("delete");
+
+    let second = define(
+        &db,
+        &env,
+        scope,
+        "billing.read",
+        "Read billing again",
+        3_000,
+    )
+    .await
+    .expect("a deleted slug is free again");
+    assert_ne!(
+        first, second,
+        "a re-create mints a FRESH id and is never a revival: the mapping table a \
+         later PR adds hangs role grants off the id, so reviving would silently \
+         restore every grant that pointed at the dead row"
+    );
+
+    // Exactly ONE live row holds the slug, and the dead one is still there.
+    assert_eq!(
+        count_permissions(&db, "slug = 'billing.read' AND deleted_at IS NULL").await,
+        1,
+        "the re-create must leave one live row, not two"
+    );
+    assert_eq!(count_permissions(&db, "slug = 'billing.read'").await, 2);
+    assert_eq!(
+        control
+            .management()
+            .permissions(scope)
+            .get_by_slug(PermissionEntryKind::Permission, "billing.read")
+            .await
+            .expect("the live row")
+            .id,
+        second
+    );
+    assert!(matches!(
+        control.management().permissions(scope).get(&first).await,
+        Err(StoreError::NotFound)
+    ));
+
+    // The dead row keeps its own audit history and the fresh row starts its own, so
+    // the log says two permissions existed rather than one that came back.
+    assert_eq!(
+        audit_actions(&db, scope, &first.to_string()).await,
+        vec!["permission.create", "permission.delete"]
+    );
+    assert_eq!(
+        audit_actions(&db, scope, &second.to_string()).await,
+        vec!["permission.create"]
+    );
+}
+
+#[tokio::test]
+async fn the_kind_is_part_of_the_live_conflict_key_from_the_write_path_too() {
+    // The issue #103 headroom as the WRITE path sees it. `permissions.rs` already
+    // pins both halves through direct SQL; this pins the half the repository can
+    // reach, because a unique index that lost `kind` would make the create below a
+    // Conflict and #103 would need a migration on a table the token path reads.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    // A live ENTITLEMENT first, planted with SQL because issue #98's write path
+    // deliberately defines no entitlements.
+    plant_at(
+        &db,
+        &env,
+        scope,
+        PermissionEntryKind::Entitlement,
+        "plan.enterprise",
+        "Enterprise plan entitlement",
+        1_000,
+    )
+    .await
+    .expect("plant the entitlement");
+
+    // The repository may define a PERMISSION of the same slug.
+    let permission = define(
+        &db,
+        &env,
+        scope,
+        "plan.enterprise",
+        "Enterprise plan capability",
+        2_000,
+    )
+    .await
+    .expect("the same slug is free under the other kind");
+
+    // A second live PERMISSION of that slug is not.
+    assert!(matches!(
+        define(&db, &env, scope, "plan.enterprise", "Duplicate", 3_000).await,
+        Err(StoreError::Conflict)
+    ));
+
+    // And a second live ENTITLEMENT of that slug is not either. Keeping this half
+    // guarded matters because every live-uniqueness probe reachable from the write
+    // path sits at `kind = 'permission'`, so narrowing the index predicate to
+    // `WHERE deleted_at IS NULL AND kind = 'permission'` would leave the whole write
+    // surface green while #103's entitlements got no uniqueness at all.
+    let duplicate = plant_at(
+        &db,
+        &env,
+        scope,
+        PermissionEntryKind::Entitlement,
+        "plan.enterprise",
+        "Duplicate entitlement",
+        4_000,
+    )
+    .await
+    .expect_err("a LIVE entitlement slug is taken too");
+    let database_error = duplicate.as_database_error().expect("a database error");
+    assert_eq!(database_error.code().as_deref(), Some(UNIQUE_VIOLATION));
+    assert_eq!(
+        database_error.constraint(),
+        Some("permissions_kind_slug_live_uniq"),
+        "refused by the live-uniqueness index BY NAME, not by something else that \
+         happened to fail"
+    );
+
+    // The conflict wrote nothing and audited nothing beyond the one real define.
+    assert_eq!(
+        all_permission_audit_actions(&db).await,
+        vec!["permission.create"]
+    );
+    assert_eq!(
+        audit_actions(&db, scope, &permission.to_string()).await,
+        vec!["permission.create"]
+    );
+}
+
+#[tokio::test]
+async fn a_refused_create_writes_neither_a_row_nor_an_audit_row() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let live = define(&db, &env, scope, "billing.read", "Read billing", 1_000)
+        .await
+        .expect("define the live one");
+
+    // 1. The CONFLICT path: a second live row with the same (kind, slug).
+    assert!(matches!(
+        define(&db, &env, scope, "billing.read", "Duplicate", 2_000).await,
+        Err(StoreError::Conflict)
+    ));
+
+    // 2. The CHECK path: a slug the storage engine refuses. The management edge
+    //    validates this up front and reports a 400, so reaching the CHECK means a
+    //    caller bypassed the edge; it must still leave nothing behind.
+    for (slug, display_name) in [
+        // A single segment: namespacing is structural in this grammar.
+        ("billing", "Not namespaced"),
+        (".leading", "Leading dot"),
+        ("Billing.Read", "Uppercase"),
+        ("read:orders", "An OAuth scope token, not a permission slug"),
+        // A valid slug with an empty label: the OTHER CHECK.
+        ("billing.write", ""),
+    ] {
+        let refused = define(&db, &env, scope, slug, display_name, 3_000).await;
+        assert!(
+            matches!(refused, Err(StoreError::Database(_))),
+            "{slug:?} with label {display_name:?} must be refused by the storage \
+             CHECKs: {refused:?}"
+        );
+    }
+
+    // Nothing landed: one row, and exactly one audit row, both from the single
+    // successful define. A phantom audit row is what a create that audited BEFORE (or
+    // outside) its data change would leave, and it would be invisible to a per-target
+    // read because the refused ids were never returned to this test.
+    assert_eq!(count_permissions(&db, "true").await, 1);
+    assert_eq!(
+        all_permission_audit_actions(&db).await,
+        vec!["permission.create"]
+    );
+    assert_eq!(
+        audit_actions(&db, scope, &live.to_string()).await,
+        vec!["permission.create"]
+    );
+
+    // Positive control: the write path still works, so the refusals above are about
+    // the values and not about a repository that stopped writing.
+    define(&db, &env, scope, "billing.write", "Write billing", 4_000)
+        .await
+        .expect("a well-formed define still lands");
+    assert_eq!(count_permissions(&db, "deleted_at IS NULL").await, 2);
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn every_mutation_answers_absent_deleted_and_both_foreign_scopes_alike() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope_a = db.seed_scope(&env).await;
+    let scope_b = db.seed_scope(&env).await;
+    // A THIRD scope differing from A in the ENVIRONMENT ALONE. `seed_scope` mints a
+    // NEW TENANT on every call, so scope_a and scope_b differ in BOTH dimensions and
+    // the tenant conjunct of every fence decides every probe between them; a victim
+    // that differs only in the environment is the one that makes the environment half
+    // deciding. Without it the whole environment fence on the WRITE path would be
+    // asserted by nothing, which is exactly the hole this file's review found on the
+    // read path.
+    let scope_a2 = Scope::new(
+        scope_a.tenant(),
+        db.seed_environment(&env, scope_a.tenant()).await,
+    );
+
+    let victim_b = define(&db, &env, scope_b, "billing.read", "Read billing", 1_000)
+        .await
+        .expect("define in tenant B");
+    let victim_a2 = define(&db, &env, scope_a2, "staging.read", "Read staging", 2_000)
+        .await
+        .expect("define in the same tenant's other environment");
+    let own_deleted = define(&db, &env, scope_a, "billing.write", "Write billing", 3_000)
+        .await
+        .expect("define in A");
+    remove(&db, &env, scope_a, &own_deleted)
+        .await
+        .expect("delete A's own");
+    let absent = PermissionId::generate(&env, &scope_a);
+
+    // Positive control first: a live permission of A really is mutable from A, so a
+    // repository that refused everything could not pass this test.
+    let live_a = define(&db, &env, scope_a, "billing.admin", "Admin billing", 4_000)
+        .await
+        .expect("define A's live one");
+    relabel(
+        &db,
+        &env,
+        scope_a,
+        &live_a,
+        Some("Administer billing"),
+        None,
+    )
+    .await
+    .expect("A may relabel its own");
+
+    let audits_before = all_permission_audit_actions(&db).await;
+
+    // Every mutating surface, against every case that must be indistinguishable.
+    for (target, label) in [
+        (&absent, "absent in the caller's own scope"),
+        (&own_deleted, "soft-deleted in the caller's own scope"),
+        (&victim_b, "live in another TENANT"),
+        (&victim_a2, "live in the same tenant's other ENVIRONMENT"),
+    ] {
+        assert!(
+            matches!(
+                relabel(&db, &env, scope_a, target, Some("hijacked"), None).await,
+                Err(StoreError::NotFound)
+            ),
+            "a relabel of a permission {label} must be the uniform not-found"
+        );
+        assert!(
+            matches!(
+                remove(&db, &env, scope_a, target).await,
+                Err(StoreError::NotFound)
+            ),
+            "a delete of a permission {label} must be the uniform not-found"
+        );
+    }
+
+    // A CREATE naming an id minted in another scope is refused before any statement
+    // runs, so a permission can never be planted into another environment's
+    // vocabulary through the id.
+    for foreign_scope in [scope_b, scope_a2] {
+        let smuggled = PermissionId::generate(&env, &foreign_scope);
+        let refused = db
+            .control_store()
+            .management()
+            .acting(actor(&env), CorrelationId::generate(&env))
+            .permissions(scope_a)
+            .create(
+                &env,
+                NewPermission {
+                    id: &smuggled,
+                    slug: "smuggled.permission",
+                    display_name: "Smuggled",
+                    metadata: None,
+                },
+                5_000,
+                None,
+            )
+            .await;
+        assert!(matches!(refused, Err(StoreError::NotFound)));
+    }
+
+    // Both victims SURVIVED, live and with their labels untouched. Without this the
+    // refusals above could be satisfied by a repository that destroyed the row and
+    // then reported not-found.
+    for (victim_scope, victim, slug, label) in [
+        (scope_b, &victim_b, "billing.read", "Read billing"),
+        (scope_a2, &victim_a2, "staging.read", "Read staging"),
+    ] {
+        let record = db
+            .control_store()
+            .management()
+            .permissions(victim_scope)
+            .get(victim)
+            .await
+            .expect("the victim survives in its own scope");
+        assert_eq!(record.slug, slug);
+        assert_eq!(record.display_name, label);
+    }
+
+    // And not one of those refusals wrote an audit row ANYWHERE: not against the
+    // foreign target, not in the caller's scope, not in the victim's.
+    assert_eq!(
+        all_permission_audit_actions(&db).await,
+        audits_before,
+        "a refused cross-scope mutation must leave the audit log untouched"
+    );
+    assert_eq!(
+        count_permissions(&db, "deleted_at IS NULL").await,
+        3,
+        "A's live one plus the two victims"
+    );
+}
+
+#[tokio::test]
+async fn a_failing_audit_insert_rolls_the_permission_write_back() {
+    // The direction the refusal tests cannot reach. They prove that a failed MUTATION
+    // writes no audit row; this proves the converse, that a failed AUDIT INSERT writes
+    // no mutation, and together the two say the pair really is one transaction rather
+    // than two statements that usually both succeed.
+    //
+    // The audit insert is made to fail by constraining `audit_log` on the exact action
+    // under test, which is the only lever a test has on a write path with no injected
+    // failure seam of its own.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let control = db.control_store();
+
+    let id = define(&db, &env, scope, "billing.read", "Read billing", 1_000)
+        .await
+        .expect("define");
+
+    for (action, attempt) in [
+        ("permission.update", "update"),
+        ("permission.delete", "delete"),
+    ] {
+        // NOT VALID, so the constraint applies to rows written from here on and does
+        // not re-validate the audit history the successful define above already
+        // wrote. Without it the ALTER itself would fail on that row and the probe
+        // would never run.
+        db.execute_owner_sql(&format!(
+            "ALTER TABLE audit_log ADD CONSTRAINT audit_probe \
+             CHECK (action <> '{action}') NOT VALID"
+        ))
+        .await;
+
+        let result = if attempt == "update" {
+            relabel(&db, &env, scope, &id, Some("hijacked"), None).await
+        } else {
+            remove(&db, &env, scope, &id).await
+        };
+        assert!(
+            matches!(result, Err(StoreError::Database(_))),
+            "the poisoned {attempt} must fail: {result:?}"
+        );
+
+        // The mutation rolled back with the audit row it could not write: the label is
+        // the original and the row is still LIVE.
+        let survivor = control
+            .management()
+            .permissions(scope)
+            .get(&id)
+            .await
+            .expect("the permission survives an audit failure, live and unchanged");
+        assert_eq!(survivor.display_name, "Read billing");
+
+        db.execute_owner_sql("ALTER TABLE audit_log DROP CONSTRAINT audit_probe")
+            .await;
+    }
+
+    // The create half of the same property: no row, and no partial write.
+    db.execute_owner_sql(
+        "ALTER TABLE audit_log ADD CONSTRAINT audit_probe \
+         CHECK (action <> 'permission.create') NOT VALID",
+    )
+    .await;
+    let result = define(&db, &env, scope, "billing.write", "Write billing", 2_000).await;
+    assert!(
+        matches!(result, Err(StoreError::Database(_))),
+        "the poisoned create must fail: {result:?}"
+    );
+    db.execute_owner_sql("ALTER TABLE audit_log DROP CONSTRAINT audit_probe")
+        .await;
+
+    assert_eq!(
+        count_permissions(&db, "true").await,
+        1,
+        "a create whose audit row could not be written leaves no permission row"
+    );
+    assert_eq!(
+        all_permission_audit_actions(&db).await,
+        vec!["permission.create"],
+        "and the only audit row is the successful define at the top"
+    );
 }

@@ -314,6 +314,37 @@ pub enum Action {
     /// does NOT mean the organization was deleted, and it does NOT mean any
     /// member's session was terminated.
     OrganizationPolicyRemove,
+    /// A permission was DEFINED in an environment's vocabulary (issue #98). The
+    /// target is the new `prm_` row.
+    ///
+    /// The three permission actions carry NO `organization.` prefix, unlike every
+    /// action above, and that is the design rather than an inconsistency: the
+    /// vocabulary hangs off the ENVIRONMENT and carries no organization at all, so
+    /// an `organization.` prefix would name a dimension the row does not have. The
+    /// header of migration 0091 states the same three strings as the delta contract
+    /// for a permission, so an operator reading the audit log and a consumer reading
+    /// that header see one vocabulary.
+    ///
+    /// A permission in issue #98 is a NAME and a label. What it GRANTS is the
+    /// role-to-permission mapping, which is its own resource with its own actions.
+    PermissionCreate,
+    /// A permission's MUTABLE fields were changed (issue #98): its display name, its
+    /// metadata, or both. The target is the relabelled permission.
+    ///
+    /// Both the `slug` (the string a token claim carries) and the `kind` (which
+    /// decides whether a resolution projection selects the row at all) are immutable
+    /// by GRANT, so this action can never mean that a permission's identity moved or
+    /// that a row was reclassified. That is what makes it safe to read a
+    /// `permission.update` as "a label changed" and nothing more.
+    PermissionUpdate,
+    /// A permission was DELETED from an environment's vocabulary (issue #98): a soft
+    /// delete that retains the row, so the audit foreign key to it stays satisfiable
+    /// and the slug is freed for a new permission. The target is the deleted row.
+    ///
+    /// A re-create of the same slug mints a FRESH id and is never a revival, so this
+    /// action is not reversible in its authorization effects: whatever a later PR of
+    /// the issue maps onto the dead id stays mapped to the dead id.
+    PermissionDelete,
     /// An authorization code and its grant were issued (issue #12).
     AuthorizationCodeIssue,
     /// An authorization code was redeemed at the token endpoint (issue #12).
@@ -1127,6 +1158,9 @@ impl Action {
             }
             Action::OrganizationPolicySet => "organization.policy.set",
             Action::OrganizationPolicyRemove => "organization.policy.remove",
+            Action::PermissionCreate => "permission.create",
+            Action::PermissionUpdate => "permission.update",
+            Action::PermissionDelete => "permission.delete",
             Action::AuthorizationCodeIssue => "authorization_code.issue",
             Action::AuthorizationCodeRedeem => "authorization_code.redeem",
             Action::AuthorizationCodeReuse => "authorization_code.reuse",
@@ -1427,5 +1461,40 @@ mod tests {
         );
         assert!(seen.contains_key("organization.policy.set"));
         assert!(seen.contains_key("organization.policy.remove"));
+
+        // Issue #98's three actions, pinned against the DEPLOYED migration header
+        // rather than against a literal copied out of it. 0091 names these three
+        // strings as "the delta contract for a permission", so a rename on either
+        // side has to fail: comparing a literal here to a literal there would agree
+        // with itself while both drifted from the header a consumer reads.
+        let migration_0091 = include_str!("../migrations/0091_permissions.sql");
+        for action in [
+            Action::PermissionCreate,
+            Action::PermissionUpdate,
+            Action::PermissionDelete,
+        ] {
+            assert!(
+                seen.contains_key(action.as_str()),
+                "{} must be in the as_str match",
+                action.as_str()
+            );
+            assert!(
+                migration_0091.contains(&format!("`{}`", action.as_str())),
+                "migration 0091 declares the permission delta contract, so {} must \
+                 appear in its header",
+                action.as_str()
+            );
+            assert!(
+                !action.as_str().starts_with("organization."),
+                "the permission vocabulary is ENVIRONMENT scoped, so {} must not \
+                 claim an organization dimension the row does not have",
+                action.as_str()
+            );
+        }
+        // The scanner really did read the migration, so the three assertions above
+        // are not satisfied by an empty or unreadable file. Pinned on a constraint
+        // name rather than on the DDL statement, because a bare table name in a
+        // create position would trip `scripts/query-audit.sh`.
+        assert!(migration_0091.contains("permissions_kind_slug_live_uniq"));
     }
 }
