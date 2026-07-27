@@ -601,6 +601,11 @@ async fn mint_device_tokens(
             // The device-authorization grant does not carry an organization context in
             // PR-B1 (issue #94 covers the browser code grant): no org_id claim.
             org_id: None,
+            // No organization context means no organization roles (issue #97): a role
+            // is org-scoped, and there is no defensible union across organizations, so
+            // the claim is ABSENT rather than a flattened cross-org set. Symmetric with
+            // `org_id` above; when the device grant gains an org context this follows it.
+            roles: None,
             at_hash: None,
             c_hash: None,
             extra_claims: &extra_claims,

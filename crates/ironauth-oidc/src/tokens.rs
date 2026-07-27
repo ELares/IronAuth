@@ -56,6 +56,7 @@
 //! ([`OidcState::resolve_access_token_target`]) and handed into the pure [`mint`],
 //! so the crypto stays pure and testable while the resource-server lookup awaits.
 
+use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime};
 
 use base64::Engine;
@@ -131,6 +132,10 @@ const OPAQUE_ACCESS_TOKEN_BYTES: usize = 32;
 /// - **Hash / session claims** (OIDC): `at_hash`/`c_hash`/`sid`. IronAuth computes and
 ///   emits these itself where they belong; a self-asserted value carries security
 ///   meaning it must never be allowed to forge.
+/// - **Authorization claims**: `org_id` (issue #94) and `roles` (issue #97). These are
+///   the only claims in the set a resource server makes an ACCESS decision on, so a
+///   self-asserted one is a privilege escalation rather than a cosmetic lie. Both are
+///   resolved by the issuer from an authoritative store read.
 pub(crate) const PROTECTED_ACCESS_TOKEN_CLAIMS: &[&str] = &[
     // Protocol claims (RFC 9068 section 2.2 + RFC 7519 registered).
     "iss",
@@ -160,6 +165,11 @@ pub(crate) const PROTECTED_ACCESS_TOKEN_CLAIMS: &[&str] = &[
     // authoritative membership check and issuer-set only; a client custom claim must
     // never self-assert an organization context.
     "org_id",
+    // Organization roles (issue #97): `roles` is resolved FRESH at issuance from an
+    // authoritative store read over the subject's memberships, group memberships, and
+    // the group ancestry, and is issuer-set only. A client custom claim must never
+    // self-assert a role.
+    "roles",
 ];
 
 /// The resolved target for an access token: the audience(s) it is minted for, the
@@ -301,6 +311,48 @@ pub struct MintRequest<'a> {
     /// resolved no org (a member-less user, a multi-org user who named none, or a
     /// machine token, which asserts no human org context); no claim is then emitted.
     pub org_id: Option<&'a str>,
+    /// The subject's effective organization roles at THIS issuance (issue #97),
+    /// emitted as the `roles` claim on the ACCESS TOKEN ONLY.
+    ///
+    /// Resolved FRESH from the store on every code exchange and every refresh, never
+    /// frozen onto the code or the grant the way [`MintRequest::org_id`] is. A role is
+    /// an AUTHORIZATION input, so a role granted or revoked after the code was issued
+    /// must be reflected on the next token; freezing it would make a revocation
+    /// invisible for the whole refresh-family lifetime. A [`BTreeSet`], so the emitted
+    /// array is totally ordered and two issuances against identical stored state
+    /// produce byte-identical tokens.
+    ///
+    /// [`None`] when the exchange resolved no organization context (symmetric with
+    /// `org_id`): the claim is then ABSENT. [`Some`] of an EMPTY set is distinct and
+    /// emits an empty array, meaning "a member of this organization holding no roles".
+    ///
+    /// # The next-issuance gap (issue #97, stated plainly)
+    ///
+    /// A role change is invisible to an ALREADY ISSUED access token for its full TTL.
+    /// Nothing in IronAuth revokes or re-mints outstanding tokens when a role is
+    /// granted or withdrawn, so a withdrawn role stays usable until the access token
+    /// carrying it expires. "Next issuance" is the whole contract. What keeps the
+    /// window tight is that the REFRESH grant re-resolves this set rather than
+    /// replaying a frozen one, so the exposure is ONE ACCESS TOKEN LIFETIME and not
+    /// one refresh-family lifetime. An operator who needs immediate withdrawal must
+    /// revoke the session or the refresh family. Active invalidation on a role change
+    /// is tracked as a follow-up; see the elevation row in `docs/THREAT-MODEL.md`.
+    ///
+    /// # Access token only, deliberately diverging from `org_id`
+    ///
+    /// `org_id` rides BOTH tokens; `roles` rides only the access token. Three reasons,
+    /// stated here because a reviewer comparing the two fields will ask. Roles are an
+    /// authorization input consumed by RESOURCE SERVERS, and a resource server reads
+    /// the access token. The ID token is deliberately lean (its scope-derived claims
+    /// live at `UserInfo`). And `org_id` is one short string whereas a role set is
+    /// UNCAPPED by covenant, so putting it on the ID token would trip the existing
+    /// 3072-byte `ID_TOKEN_BLOAT_THRESHOLD_BYTES` growth signal (see
+    /// `crate::policy_trace`) for legitimate deployments. That constant is a growth
+    /// SIGNAL and never a limit, and this field adds no cap of its own: the role set
+    /// is emitted in full, however large. The client-credentials and jwt-bearer paths
+    /// carry no roles either, by OMISSION from their own distinct claim builder:
+    /// machine roles are issue #99 and must land on both machine paths deliberately.
+    pub roles: Option<&'a BTreeSet<String>>,
     /// The access-token hash for a front-channel ID token (issue #17). The token
     /// endpoint always passes [`None`]: a token-endpoint ID token never carries
     /// `at_hash`.
@@ -351,6 +403,11 @@ pub enum IdTokenError {
 /// Build the ID token claim set (OIDC Core errata set 2), enforcing the `sub`
 /// cap and the conditional claim rules. Pure: it takes the already-resolved
 /// instants and identifiers, so it is exercised without a store or a signer.
+///
+/// [`MintRequest::roles`] is DELIBERATELY not read here (issue #97): the effective
+/// organization role set rides the ACCESS token only. Do not "fix" the asymmetry with
+/// `org_id` by adding an emission; the reasoning is on the field's doc comment, and
+/// `the_id_token_never_carries_roles` pins the omission.
 ///
 /// # Errors
 ///
@@ -520,6 +577,22 @@ pub(crate) fn build_access_token_claims(
     if let Some(org_id) = request.org_id {
         claims["org_id"] = json!(org_id);
     }
+    // roles (issue #97): the subject's effective organization roles, RESOLVED FRESH at
+    // this issuance (never replayed from the code or the grant, which is exactly how
+    // this differs from org_id above). Emitted on the ACCESS token only: a resource
+    // server is what makes an authorization decision, the ID token stays lean, and the
+    // set is uncapped by covenant. It is in PROTECTED_ACCESS_TOKEN_CLAIMS, so no client
+    // custom claim can self-assert it on any path. The BTreeSet is emitted in its own
+    // total order, so two issuances against identical stored state are byte-identical.
+    //
+    // ABSENT when the exchange resolved no organization context; an EMPTY ARRAY when it
+    // resolved an organization in which the subject holds no role. Those two are
+    // deliberately distinct: absent means "no org context", empty means "this org, no
+    // roles". A client-credentials (M2M) token never sets it (no human org context),
+    // which its distinct builder guarantees by omission.
+    if let Some(roles) = request.roles {
+        claims["roles"] = json!(roles.iter().collect::<Vec<_>>());
+    }
     // cnf (RFC 7800 / RFC 9449, issue #368): bind the access token to the DPoP proof
     // key when a valid proof accompanied issuance. `cnf` is issuer-reserved (it is in
     // PROTECTED_ACCESS_TOKEN_CLAIMS), so embedding it HERE is the only way it can be
@@ -568,10 +641,19 @@ pub struct ClientCredentialsMintRequest<'a> {
 /// asserting an authentication context would be false. It reuses the SAME signing
 /// core and opaque mint as every other access token; only the claim set differs.
 ///
+/// It likewise carries NO `org_id` (issue #94) and NO `roles` (issue #97). That
+/// omission IS the machine-principal guarantee: a machine token asserts no human
+/// organization context and no human authorization role. Attaching roles to an
+/// `sva_` service-account principal is issue #99 and needs its own field here, so it
+/// lands on BOTH machine paths (client-credentials and jwt-bearer) at once and
+/// deliberately, rather than leaking in through this builder.
+///
 /// The per-client STATIC custom claims are merged last, and a custom claim can NEVER
 /// override a protected registered claim: any name in [`PROTECTED_ACCESS_TOKEN_CLAIMS`]
 /// is skipped, and the protocol claims are already present (so even a non-protected
-/// name never shadows one). Claims hygiene otherwise mirrors the code flow: no PII.
+/// name never shadows one). `roles` is in that set, so a stored
+/// `custom_token_claims` of `{"roles":["admin"]}` is DROPPED, not emitted. Claims
+/// hygiene otherwise mirrors the code flow: no PII.
 pub(crate) fn build_client_credentials_access_token_claims(
     request: &ClientCredentialsMintRequest<'_>,
     iat: i64,
@@ -991,12 +1073,20 @@ mod tests {
             auth_time_unix_micros: None,
             sid: None,
             org_id: None,
+            roles: None,
             at_hash: None,
             c_hash: None,
             extra_claims: empty_extra(),
             id_token_signer: None,
             confirmation: None,
         }
+    }
+
+    /// An owned role set for the `roles`-claim tests, deliberately built in a
+    /// NON-alphabetical insertion order so an assertion on the emitted order is about
+    /// the [`BTreeSet`] and not about how the test happened to write it down.
+    fn role_set(slugs: &[&str]) -> BTreeSet<String> {
+        slugs.iter().map(|slug| (*slug).to_owned()).collect()
     }
 
     #[test]
@@ -1155,6 +1245,138 @@ mod tests {
             at_none.get("org_id").is_none(),
             "a no-org access token never carries org_id"
         );
+    }
+
+    #[test]
+    fn roles_are_emitted_on_the_access_token_in_total_order() {
+        // Issue #97: the effective role set lands on the ACCESS token as a JSON array
+        // in the BTreeSet's total order, whatever order the resolution produced. Two
+        // builds over the same set are byte-identical, which is what makes a diff
+        // between two issuances mean "the stored state changed" and nothing else.
+        let roles = role_set(&["viewer", "admin", "billing.reader"]);
+        let mut req = request("usr_abc", "pwd");
+        req.roles = Some(&roles);
+        let claims = build_access_token_claims(&req, 1, 2, "tok", &json!("cli_example"));
+        assert_eq!(
+            claims["roles"],
+            json!(["admin", "billing.reader", "viewer"]),
+            "roles are emitted sorted, not in insertion order"
+        );
+        let again = build_access_token_claims(&req, 1, 2, "tok", &json!("cli_example"));
+        assert_eq!(
+            serde_json::to_string(&claims).expect("serialize"),
+            serde_json::to_string(&again).expect("serialize"),
+            "two issuances against identical state are byte-identical"
+        );
+    }
+
+    #[test]
+    fn no_org_context_omits_roles_but_an_empty_set_emits_an_empty_array() {
+        // Issue #97: ABSENT and EMPTY are DIFFERENT answers and both are load-bearing.
+        // None means "this exchange resolved no organization context", so a resource
+        // server sees no roles claim at all and must not read it as "no roles". Some of
+        // an empty set means "a member of this organization holding no roles", which is
+        // a positive, resolved answer and emits `[]`.
+        let mut req = request("usr_abc", "pwd");
+        let absent = build_access_token_claims(&req, 1, 2, "tok", &json!("cli_example"));
+        assert!(
+            absent.get("roles").is_none(),
+            "no org context emits NO roles claim, not an empty array"
+        );
+
+        let empty = role_set(&[]);
+        req.roles = Some(&empty);
+        let present = build_access_token_claims(&req, 1, 2, "tok", &json!("cli_example"));
+        assert_eq!(
+            present["roles"],
+            json!([] as [&str; 0]),
+            "an org member with no roles emits an EMPTY ARRAY, present and resolved"
+        );
+        assert!(
+            present.get("roles").is_some(),
+            "the empty case is present, not absent"
+        );
+    }
+
+    #[test]
+    fn a_client_custom_claim_can_never_forge_roles() {
+        // Issue #97: `roles` is a PROTECTED, issuer-set claim, so no client-influenced
+        // bag can assert one. Proved on all three folds rather than assumed from the
+        // denylist's presence, and in BOTH directions: with a real issuer-set value
+        // (insertion-order "protocol wins" would cover this one) and with NO issuer-set
+        // value (where only the explicit filter can, which is the case that actually
+        // needs the denylist entry).
+        let hostile = json!({ "roles": ["admin"], "department": "payments" })
+            .as_object()
+            .cloned()
+            .expect("object");
+        let real = role_set(&["viewer"]);
+        let mut req = request("usr_abc", "pwd");
+        req.roles = Some(&real);
+        req.extra_claims = &hostile;
+
+        // The ID token never carries roles at all, so a hostile `roles` in the extra
+        // bag must be DROPPED there rather than stamped in as the only roles claim the
+        // relying party would ever see.
+        let id_claims = build_id_token_claims(&req, 1, 2, "tok").expect("claims");
+        assert!(
+            id_claims.get("roles").is_none(),
+            "the id token drops a forged roles claim: {id_claims}"
+        );
+        assert_eq!(
+            id_claims["department"], "payments",
+            "a benign extra claim still lands, so the drop is targeted"
+        );
+
+        // The access token carries the ISSUER's set, never the forged one.
+        let at_claims = build_access_token_claims(&req, 1, 2, "tok", &json!("cli_example"));
+        assert_eq!(
+            at_claims["roles"],
+            json!(["viewer"]),
+            "the issuer-resolved roles win over a forged custom claim"
+        );
+
+        // With NO org context the access token sets no roles and the id-token fold must
+        // still refuse the forgery: this is the case where insertion order protects
+        // nothing, so it is the one the denylist entry exists for.
+        req.roles = None;
+        let id_none = build_id_token_claims(&req, 1, 2, "tok").expect("claims");
+        assert!(
+            id_none.get("roles").is_none(),
+            "a no-org id token drops a forged roles claim from the extra bag"
+        );
+        let at_none = build_access_token_claims(&req, 1, 2, "tok", &json!("cli_example"));
+        assert!(
+            at_none.get("roles").is_none(),
+            "a no-org access token never carries roles"
+        );
+
+        assert!(
+            PROTECTED_ACCESS_TOKEN_CLAIMS.contains(&"roles"),
+            "roles is a protected access-token claim"
+        );
+    }
+
+    #[test]
+    fn the_id_token_never_carries_roles() {
+        // Issue #97, the deliberate divergence from org_id: roles ride the ACCESS token
+        // only. Even with a fully resolved, non-empty set the ID token stays lean. If
+        // this test ever fails because someone added the emission to
+        // build_id_token_claims, read that function's doc comment before "fixing" it.
+        let roles = role_set(&["admin", "viewer"]);
+        let mut req = request("usr_abc", "pwd");
+        req.org_id = Some("org_real");
+        req.roles = Some(&roles);
+        let id_claims = build_id_token_claims(&req, 1, 2, "tok").expect("claims");
+        assert!(
+            id_claims.get("roles").is_none(),
+            "the id token carries NO roles claim: {id_claims}"
+        );
+        // org_id DOES ride both, so the asymmetry is real and not an accident of the
+        // request being empty.
+        assert_eq!(id_claims["org_id"], "org_real");
+        let at_claims = build_access_token_claims(&req, 1, 2, "tok", &json!("cli_example"));
+        assert_eq!(at_claims["roles"], json!(["admin", "viewer"]));
     }
 
     #[test]
@@ -1354,6 +1576,10 @@ mod tests {
             "sid": "evil-session",
             // Organization context (issue #94): a machine token asserts no human org.
             "org_id": "org_evil",
+            // Organization roles (issue #97): a machine token asserts no human
+            // authorization role. Machine roles are issue #99 and must land on both
+            // machine paths deliberately, never through a stored custom claim.
+            "roles": ["admin", "owner"],
             // A benign business claim, which is admitted.
             "department": "payments"
         })
@@ -1398,6 +1624,7 @@ mod tests {
             "c_hash",
             "sid",
             "org_id",
+            "roles",
         ] {
             assert!(
                 claims.get(reserved_absent).is_none(),

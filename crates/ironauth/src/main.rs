@@ -321,6 +321,10 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
                 config.password_hashing.clone(),
                 config.password_policy.clone(),
                 config.diagnostics.clone(),
+                // The organization group nesting bound (issue #97): the data plane
+                // needs the SAME value the management plane installs, because the
+                // effective-role resolution the mint path runs is bounded by it.
+                config.organizations.max_group_depth,
             ))
         } else {
             None
@@ -359,6 +363,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             hashing_config,
             policy_config,
             diagnostics_config,
+            max_group_depth,
         )) = oidc_inputs
         {
             let issuer_base = server.base_url();
@@ -380,6 +385,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
                 &hashing_config,
                 &policy_config,
                 &diagnostics_config,
+                max_group_depth,
                 migration_hook,
                 federation_runtime,
             )
@@ -744,6 +750,7 @@ async fn build_oidc_router(
     hashing_config: &PasswordHashingConfig,
     policy_config: &PasswordPolicyConfig,
     diagnostics_config: &DiagnosticsConfig,
+    max_group_depth: u32,
     migration_hook: Option<Arc<LazyMigrationHook>>,
     federation_runtime: Option<Arc<FederationRuntime>>,
 ) -> Option<Router> {
@@ -858,6 +865,12 @@ async fn build_oidc_router(
         .with_flows_enabled(flows_enabled)
         .with_hosted_pages_enabled(hosted_pages_enabled)
         .with_diagnostics(diagnostics_config)
+        // The organization group nesting bound (issue #97) lives in `[organizations]`,
+        // not `[oidc]`, so it is installed by the builder rather than riding OidcConfig:
+        // one bound, one operator-visible name, the SAME value the management plane
+        // installs. It bounds the ancestor walk the mint-path effective-role resolution
+        // performs, and caps nothing that is counted.
+        .with_max_group_depth(max_group_depth)
         .with_quota_enforcer(quota_enforcer)
         .with_hashing_pool(hashing_pool)
         .with_password_policy(password_policy, screening_failure, screen_on_login)

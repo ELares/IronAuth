@@ -32,6 +32,23 @@ Its `aud` is the client id when no resource server is targeted (so `UserInfo`'s
 is. No PII beyond these protocol claims is placed in the payload; scope-derived
 claims stay at `UserInfo`.
 
+Two AUTHORIZATION claims ride the access token when an organization context was
+resolved for the exchange: `org_id` (issue #94), the durable organization the grant
+is bound to, and `roles` (issue #97), the subject's effective organization role
+slugs as a sorted JSON array. Both are issuer-set only (they are in the mint's
+protected-claim set, so no client custom claim can self-assert either), and both are
+absent when no organization context was resolved. They differ in how they are
+sourced, and the difference is deliberate: `org_id` is FROZEN onto the session and
+the grant, so it is stable for the life of a refresh family, while `roles` is
+RESOLVED FRESH from the store at every code exchange and every refresh, so a role
+granted or withdrawn is reflected on the next issuance. An empty `roles` array means
+a member of that organization who holds no role, which is a different fact from the
+claim being absent. A role change does not revoke tokens already issued, so a
+withdrawn role stays usable for at most one access-token lifetime. The ID token
+carries `org_id` but never `roles`: roles are consumed by resource servers, the ID
+token stays lean, and a role set is uncapped. A client-credentials or jwt-bearer
+machine token carries neither.
+
 ## The opaque-token prefix scheme
 
 Every opaque credential is `<prefix><handle><delimiter><secret>`, where:
