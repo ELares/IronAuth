@@ -24,7 +24,10 @@
 //! and soft delete each write their audit row (`permission.create`,
 //! `permission.update`, `permission.delete`) in the SAME transaction as the mutation,
 //! in both directions (a failed mutation leaves no audit row, and a failed audit
-//! insert leaves no mutation); a relabel can move neither the `slug` nor the `kind`,
+//! insert leaves no mutation); the create BINDS the `kind` rather than inheriting the
+//! column default, proved where the two disagree by moving the default to
+//! `'entitlement'` first, since the shipped default and the bind otherwise agree on
+//! every row this file writes; a relabel can move neither the `slug` nor the `kind`,
 //! which is enforced by a COLUMN-scoped grant rather than by convention, swept here
 //! against `pg_attribute` so a widened grant is caught by exact set equality; every
 //! mutation answers absent, soft-deleted, another tenant's, and the SAME TENANT'S
@@ -1191,11 +1194,11 @@ async fn the_kind_column_defaults_to_permission_and_admits_only_the_closed_set()
     let scope = db.seed_scope(&env).await;
 
     // The DEFAULT is the storage-engine half of the closed set, and it is what a
-    // hand-written insert meets. The audited write repository does NOT rely on it: it
-    // binds the discriminator explicitly from `PermissionEntryKind::Permission`, so
-    // the stored value and the Rust enum have one source and a drifted default cannot
-    // silently reclassify what the production path writes. This pins the other half,
-    // which issue #103's first entitlement write and every operator-run insert meet.
+    // hand-written insert meets. This pins that half, which issue #103's first
+    // entitlement write and every operator-run insert meet. The audited write
+    // repository does NOT rely on it, and that separate claim is pinned separately by
+    // `the_write_path_binds_the_kind_and_does_not_inherit_a_drifted_default`: while
+    // the default and the bind agree, no assertion here can tell them apart.
     let id = PermissionId::generate(&env, &scope);
     let mut tx = db.control_pool().begin().await.expect("begin");
     bind_scope(
@@ -1382,8 +1385,11 @@ async fn a_permission_round_trips_through_the_audited_write_repository() {
     .await
     .expect("define a permission");
 
-    // It reads back on both planes, with the kind the write path bound EXPLICITLY
-    // rather than inherited from the column default.
+    // It reads back on both planes. The `kind` assertion below is a round-trip check
+    // and NOT the proof that the write path binds the discriminator: the column
+    // default is `'permission'` too, so this row would read back the same either way.
+    // `the_write_path_binds_the_kind_and_does_not_inherit_a_drifted_default` is where
+    // the two are made to disagree.
     let created = control
         .management()
         .permissions(scope)
@@ -1544,6 +1550,82 @@ async fn a_permission_round_trips_through_the_audited_write_repository() {
         count_permissions(&db, "true").await,
         1,
         "and it created nothing"
+    );
+}
+
+#[tokio::test]
+async fn the_write_path_binds_the_kind_and_does_not_inherit_a_drifted_default() {
+    // The one rule this PR adds that no other assertion can reach. Every other test
+    // reads back `kind = permission` from a row the DEFAULT would have supplied
+    // anyway, because the shipped default IS `'permission'`: the explicit bind and the
+    // default agree on every row this file writes, so dropping the bind entirely
+    // leaves all of them green. The bind is only observable where the two DISAGREE,
+    // and the only way to make them disagree is to move the default.
+    //
+    // The scenario is issue #103's, not a hypothetical: that issue's whole job is
+    // entitlement rows, so `ALTER COLUMN kind SET DEFAULT 'entitlement'` is a
+    // plausible step in it. If the explicit bind has regressed by then, every #98
+    // create silently stores `kind = 'entitlement'` and the resolution projection's
+    // `kind = 'permission'` filter silently drops every permission from the access
+    // token claim, with nothing anywhere turning red.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    db.execute_owner_sql("ALTER TABLE permissions ALTER COLUMN kind SET DEFAULT 'entitlement'")
+        .await;
+
+    let id = define(&db, &env, scope, "billing.read", "Read billing", 1_000)
+        .await
+        .expect("define under the drifted default");
+
+    // Read through the OWNER pool, as the raw stored string. A read through the
+    // repository would decode into `PermissionEntryKind` and could only report what
+    // the row says anyway, but going around it makes the assertion about the STORED
+    // byte and not about any decode the repository performs.
+    let stored: String = sqlx::query("SELECT kind FROM permissions WHERE id = $1")
+        .bind(id.to_string())
+        .fetch_one(db.owner_pool())
+        .await
+        .expect("read the stored kind")
+        .get("kind");
+    assert_eq!(
+        stored, "permission",
+        "the audited write path must BIND the discriminator, so a drifted column \
+         default cannot reclassify what it writes"
+    );
+
+    // And the drift really was in place, or the assertion above would prove nothing:
+    // an insert that states no kind takes the moved default.
+    let mut tx = db.control_pool().begin().await.expect("begin");
+    bind_scope(
+        &mut tx,
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+    )
+    .await;
+    let unstated = PermissionId::generate(&env, &scope);
+    sqlx::query(
+        "INSERT INTO permissions (id, tenant_id, environment_id, slug, display_name) \
+         VALUES ($1, $2, $3, 'billing.write', 'Write billing')",
+    )
+    .bind(unstated.to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .execute(&mut *tx)
+    .await
+    .expect("insert with no kind stated");
+    tx.commit().await.expect("commit");
+    let drifted: String = sqlx::query("SELECT kind FROM permissions WHERE id = $1")
+        .bind(unstated.to_string())
+        .fetch_one(db.owner_pool())
+        .await
+        .expect("read the unstated kind")
+        .get("kind");
+    assert_eq!(
+        drifted, "entitlement",
+        "the default must really have moved, or this test cannot tell a bound \
+         discriminator from an inherited one"
     );
 }
 

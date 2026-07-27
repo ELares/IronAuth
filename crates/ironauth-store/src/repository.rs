@@ -31783,7 +31783,9 @@ impl PermissionEntryKind {
 ///   headroom that issue #103 turns on by widening exactly this struct and the
 ///   statement it feeds, with no migration. The create binds the discriminator
 ///   explicitly from [`PermissionEntryKind::Permission`] rather than leaning on the
-///   column DEFAULT, so the stored value and the Rust enum have ONE source.
+///   column DEFAULT, so the stored value and the Rust enum have ONE source. That bind
+///   is asserted where the two can DISAGREE, by a test that moves the column default
+///   to `'entitlement'` first; agreeing with the shipped default proves nothing.
 /// * `organization_id` is absent because the vocabulary belongs to the ENVIRONMENT.
 ///   See [`PermissionRecord`] and the header of migration 0091.
 pub struct NewPermission<'a> {
@@ -32991,14 +32993,22 @@ impl OrgRoleRepo<'_> {
 /// predicate is dead.
 ///
 /// The same census covers the WRITES in [`ActingPermissionRepo`] (issue #98, PR 2),
-/// which repeat the same two columns in the same way for the same reason. Two
-/// details are specific to them and are worth stating here, where a reader auditing
-/// the fence will look:
+/// which repeat the same two columns in the same way for the same reason. The
+/// COMPLETE write-side survivor census, naming every predicate on that path and the
+/// backstop each one hides behind, is on [`ActingPermissionRepo`]. Two details
+/// belong here, where a reader auditing the fence will look:
 ///
 /// * The INSERT carries no scope predicate to repeat, because there is no row to
-///   match yet. Its fence is the policy's WITH CHECK plus the typed
-///   [`PermissionId`], which embeds the scope, so a forged create is refused twice
-///   over.
+///   match yet, and it has NO second layer either. It binds `tenant_id` and
+///   `environment_id` from the repository's OWN scope, and [`begin_scoped`] binds
+///   the policy variables from that SAME scope, so the row it writes satisfies the
+///   policy's WITH CHECK for EVERY input the create accepts: the policy fences the
+///   scope COLUMNS, and this statement never lets a caller influence them. The typed
+///   [`PermissionId`] guard is therefore the ONLY fence on a forged id, which is
+///   exactly why it is the one create-side predicate whose removal is OBSERVABLE
+///   while every scope predicate on the update and the delete survives. Read
+///   [`ActingPermissionRepo::create`] for what removing it actually does, which is
+///   not what a reader expects.
 /// * The UPDATE statements additionally repeat `deleted_at IS NULL`, which
 ///   [`require_live_permission`] has already applied. That pair is MUTUALLY
 ///   redundant rather than one-way; the census for it is on that function.
@@ -36881,6 +36891,52 @@ impl ActingOrgRoleRepo<'_> {
 /// it likes: the advisory-lock-plus-COUNT registration gate used elsewhere in this
 /// module is deliberately NOT replicated here (a project covenant). The byte and
 /// count budget a later PR of issue #98 adds bounds ONE TOKEN and never this table.
+///
+/// # Write-side survivor census (read before deleting a predicate here)
+///
+/// The read-side census is on `PERMISSION_SELECT_COLUMNS` and its warning governs
+/// this one too: on a path this heavily backstopped, a SURVIVING mutation is the
+/// expected consequence of the backstop and is never evidence the predicate is dead.
+/// What follows is the COMPLETE set, so that nobody has to rediscover it by deleting
+/// the wrong half, and so that the create-side entry is not read as a general rule.
+/// It is stated in full because the next PR of this issue is templated from this
+/// repository and meets the same shape with THREE caller-supplied ids instead of one.
+///
+/// KILLED, and the only one on this path:
+///
+/// * [`ActingPermissionRepo::create`]'s `spec.id.scope()` guard. It is load bearing
+///   for a reason that is worth stating exactly, because the obvious account of it is
+///   wrong: removing it does NOT make a forged create fail with a row-level-security
+///   [`StoreError::Database`]. Measured with the guard deleted, the forged create
+///   returns `Ok(())` and PERSISTS a row. That function carries the three
+///   consequences.
+///
+/// SURVIVORS, every one of them equivalent behind a NAMED backstop:
+///
+/// * [`ActingPermissionRepo::update`] and [`ActingPermissionRepo::delete`] each
+///   dropping their own in-process `id.scope()` guard. These two are IDENTICAL cases
+///   and the census must not treat them differently: each statement resolves nothing
+///   outside the bound scope, so a foreign-scope id is the same uniform not-found
+///   whether the guard runs or not. The guards stay because refusing before any
+///   statement is the cheaper and more obvious answer, not because either is
+///   observable. The create-side guard differs ONLY because a create has no existing
+///   row to fail to match.
+/// * Either mutation dropping `deleted_at IS NULL` from its own statement (backstop:
+///   [`require_live_permission`]), and either mutation dropping the
+///   [`require_live_permission`] call (backstop: the statement's own
+///   `deleted_at IS NULL` and its zero-row check). The two layers are MUTUALLY
+///   redundant, and dropping BOTH on one mutation IS killed. Why each is kept
+///   anyway, including the read-committed race the statement's guard exists for, is
+///   on [`require_live_permission`].
+/// * Either mutation dropping its `tenant_id` conjunct, its `environment_id`
+///   conjunct, or both, and [`require_live_permission`] dropping either of its own.
+///   The backstop is the forced row-level-security policy, which fences both columns
+///   with no help from any statement. This holds even in bulk: removing EVERY
+///   environment fence this path applies in Rust at once (both in-process guards,
+///   both statement conjuncts, and the helper's) leaves the whole suite green,
+///   because the policy refuses on its own. They are kept for the reason the
+///   read-side census gives, which is that a statement naming its own scope is
+///   readable without the reader knowing a policy exists.
 pub struct ActingPermissionRepo<'a> {
     store: &'a Store,
     acting: ActingContext,
@@ -36896,14 +36952,65 @@ impl ActingPermissionRepo<'_> {
     /// discriminator is bound explicitly from [`PermissionEntryKind::Permission`]
     /// rather than left to the column DEFAULT, so the stored value comes from the
     /// same closed set the reader decodes against and a future ALTER of the default
-    /// cannot silently reclassify what this path writes.
+    /// cannot silently reclassify what this path writes. The shipped default is the
+    /// SAME value, so every ordinary assertion agrees with both; the bind is only
+    /// observable where they disagree, and
+    /// `the_write_path_binds_the_kind_and_does_not_inherit_a_drifted_default` is the
+    /// one test that makes them disagree, by moving the default to `'entitlement'`
+    /// exactly as issue #103 plausibly will.
     ///
-    /// Containment is structural on two layers, one fewer than the #97 family needs:
-    /// the typed [`PermissionId`] embeds this scope (a foreign id never reaches the
-    /// statement), and the forced row-level-security WITH CHECK rejects any row whose
-    /// scope is not the bound one. There is no third layer because there is no third
-    /// dimension: this table carries no organization, so its policy is its COMPLETE
-    /// fence.
+    /// # Containment is ONE layer, and it is the guard on the first line
+    ///
+    /// The `spec.id.scope()` check below is the WHOLE fence on the id. Forced row
+    /// level security is NOT a second layer under it, however much the #97 family's
+    /// three-layer prose invites reading one in: this statement binds `tenant_id` and
+    /// `environment_id` from `self.scope`, never from `spec.id`, and [`begin_scoped`]
+    /// binds the policy variables from that SAME scope, so the row satisfies the
+    /// policy's WITH CHECK for EVERY input this function accepts. The policy fences
+    /// the scope COLUMNS; nothing a caller passes can move them. (The #97 create does
+    /// have a genuine second structural refusal, its `organization_id` foreign key.
+    /// This table has no organization, so nothing here plays that part.)
+    ///
+    /// Removing the guard therefore does not make a forged create FAIL, it makes it
+    /// SUCCEED. Measured on a live database with the guard deleted, a create under
+    /// scope A naming an id minted in scope B returns `Ok(())`, and three things
+    /// follow, in rising order of how bad they are:
+    ///
+    /// 1. The row PERSISTS in the CALLER'S OWN scope while carrying another
+    ///    environment's id, with a matching `permission.create` audit row, so the
+    ///    forgery is durable and reads as legitimate in the log.
+    /// 2. [`PermissionRepo::list`] for the whole environment then fails CLOSED with
+    ///    [`StoreError::NotFound`], because `permission_from_row` cannot decode that
+    ///    id in scope. ONE such row makes EVERY permission in that environment
+    ///    unlistable through the management surface, and it holds the live
+    ///    `(kind, slug)` slot for good.
+    /// 3. `permissions.id` is a GLOBAL primary key, so a create under tenant A naming
+    ///    an id minted in tenant B answers [`StoreError::Conflict`] when B holds that
+    ///    permission and `Ok(())` when it does not: a cross-tenant EXISTENCE ORACLE,
+    ///    on the one table whose rows are capability names. No policy can close that
+    ///    one, because the row this statement writes is the caller's own by
+    ///    construction and a WITH CHECK has nothing to refuse, while the unique index
+    ///    is global and conflicts against rows the policy HIDES.
+    ///
+    /// `every_mutation_answers_absent_deleted_and_both_foreign_scopes_alike` kills the
+    /// guard's removal, and it is the only thing that does. Any repository that takes
+    /// a caller-minted id and writes its own scope inherits this shape exactly, with
+    /// one such guard needed PER ID.
+    ///
+    /// The alternative was weighed and rejected. Binding `spec.id.scope()` into the
+    /// scope columns would make the WITH CHECK a real second layer, and measurably so:
+    /// a row bound to a foreign id's own scope is refused 42501, and the policy
+    /// refuses BEFORE the unique index, so even the oracle above would close. It is
+    /// rejected because the guard has to stay regardless (that path answers
+    /// [`StoreError::Database`], which breaks the uniform not-found this whole
+    /// repository keeps), and with the guard in place `spec.id.scope()` and
+    /// `self.scope` are EQUAL on every input that reaches the statement. The change
+    /// would therefore be a provable no-op shipping a branch only a mutant can reach,
+    /// it would make the row's scope columns caller-derived on a table where they are
+    /// currently caller-proof, and in the very mutant world it exists for it would put
+    /// the permission row in one scope and its audit envelope, which binds `scope`, in
+    /// another. Honest prose over one guard the suite kills beats a second layer
+    /// nothing reachable can exercise.
     ///
     /// A `(kind, slug)` already taken by a LIVE row is refused as
     /// [`StoreError::Conflict`] on the partial unique index. A slug freed by a
@@ -38574,6 +38681,13 @@ async fn require_live_role_in_org(
 ///   could be attached to a role. Landing it with live callers rather than inert
 ///   also means its SQL is executed rather than merely compiled, which is the only
 ///   validation a runtime-API query gets.
+///
+/// This statement's own `tenant_id` and `environment_id` conjuncts are a THIRD kind
+/// of survivor, redundant behind the forced row-level-security policy rather than
+/// behind a caller, and they are kept for the reason the read-side census gives. The
+/// complete list, and which backstop covers which predicate across the whole write
+/// path, is on [`ActingPermissionRepo`]; this function's entry is the `deleted_at`
+/// pair above.
 async fn require_live_permission(
     tx: &mut Transaction<'_, Postgres>,
     scope: Scope,
