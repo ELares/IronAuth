@@ -148,7 +148,8 @@ impl IdorHarness {
     /// per-organization authentication policy (`org_auth_policies.set`,
     /// `org_auth_policies.remove`, both addressed by ORGANIZATION id rather than by
     /// the policy's own id, because the organization IS the policy's identity), and
-    /// its permission vocabulary (`permissions.get` and `permissions.delete`), the
+    /// its permission vocabulary (`permissions.get` and `permissions.delete`), its
+    /// role-to-permission mapping (`org_role_permissions.unassign`), the
     /// two-thirds of the four-level resource model
     /// that is tenant-and-environment scoped (operators, tenants, and environments
     /// are LEVEL tables whose isolation is exercised by the management-plane tests
@@ -179,6 +180,7 @@ impl IdorHarness {
         self.register(Box::new(OrgAuthPolicyRemoveProbe));
         self.register(Box::new(PermissionGetProbe));
         self.register(Box::new(PermissionDeleteProbe));
+        self.register(Box::new(OrgRolePermissionUnassignProbe));
         self
     }
 
@@ -1172,6 +1174,54 @@ impl IsolationProbe for PermissionDeleteProbe {
                 .acting(actor, correlation)
                 .permissions(caller);
             match permissions.delete(&env, &id).await {
+                Ok(()) => ProbeOutcome::Leaked,
+                Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `ActingOrgRolePermissionRepo::unassign` (issue #98). `store`
+/// must authenticate as `ironauth_control`. Detaching another scope's permission
+/// from another scope's role would silently withdraw a capability an operator
+/// believes is in force, so it must be the uniform not-found.
+///
+/// The DETACH rather than the attach is the probe worth running, on the harness's
+/// usual rule: an attach names a mapping id the caller minted, while a detach names
+/// a row that already exists in the victim's scope and destroys it. `Leaked` here
+/// therefore means a live grant in another environment was withdrawn, which is why
+/// the registering suite additionally asserts the victim mappings SURVIVED: a probe
+/// denied because nothing was planted would pass for the wrong reason.
+struct OrgRolePermissionUnassignProbe;
+
+impl IsolationProbe for OrgRolePermissionUnassignProbe {
+    fn name(&self) -> &'static str {
+        "org_role_permissions.unassign"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            let env = Env::system();
+            let Ok(id) = store
+                .management()
+                .org_role_permissions(caller)
+                .parse_id(foreign_id)
+            else {
+                return ProbeOutcome::Denied;
+            };
+            let organization = OrganizationId::generate(&env, &caller);
+            let actor = ActorRef::service(ServiceId::generate(&env));
+            let correlation = CorrelationId::generate(&env);
+            let mappings = store
+                .management()
+                .acting(actor, correlation)
+                .org_role_permissions(caller);
+            match mappings.unassign(&env, &organization, &id).await {
                 Ok(()) => ProbeOutcome::Leaked,
                 Err(_) => ProbeOutcome::Denied,
             }

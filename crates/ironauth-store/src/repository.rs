@@ -88,14 +88,14 @@ use crate::id::{
     LocaleBundleId, MagicLinkTokenId, ManagementKeyId, Mds3BlobCacheId, MigrationRunId,
     MigrationRunRecordId, OperatorId, OrgAuthPolicyId, OrgConnectionId, OrgGroupId,
     OrgGroupMemberId, OrgGroupRoleId, OrgMembershipId, OrgMembershipRoleId, OrgRoleId,
-    OrganizationId, PermissionId, PowChallengeId, PushedRequestId, RecoveryApprovalId,
-    RecoveryCodeId, RecoveryContactConfirmationId, RecoveryFlowId, RecoveryIdvSessionId,
-    RecoveryTrustedContactId, RefreshFamilyId, RefreshTokenId, ResourceServerId, RiskDecisionId,
-    RiskDisavowalId, RiskLoginGeoId, RiskSignalId, RoutingRuleId, ScopeStepUpPolicyId,
-    ServiceAccountId, SessionEventId, SessionId, SigningKeyId, SignupFormId, SignupQuarantineId,
-    SmsOtpCodeId, SmsRouteStatId, TenantId, TotpCredentialId, TraitMigrationJobId, TraitSchemaId,
-    TrustedDeviceId, UpstreamTokenGrantId, UpstreamTokenId, UserId, UserIdentifierId, VariableId,
-    WebauthnChallengeId, WebauthnCredentialId,
+    OrgRolePermissionId, OrganizationId, PermissionId, PowChallengeId, PushedRequestId,
+    RecoveryApprovalId, RecoveryCodeId, RecoveryContactConfirmationId, RecoveryFlowId,
+    RecoveryIdvSessionId, RecoveryTrustedContactId, RefreshFamilyId, RefreshTokenId,
+    ResourceServerId, RiskDecisionId, RiskDisavowalId, RiskLoginGeoId, RiskSignalId, RoutingRuleId,
+    ScopeStepUpPolicyId, ServiceAccountId, SessionEventId, SessionId, SigningKeyId, SignupFormId,
+    SignupQuarantineId, SmsOtpCodeId, SmsRouteStatId, TenantId, TotpCredentialId,
+    TraitMigrationJobId, TraitSchemaId, TrustedDeviceId, UpstreamTokenGrantId, UpstreamTokenId,
+    UserId, UserIdentifierId, VariableId, WebauthnChallengeId, WebauthnCredentialId,
 };
 use crate::identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
@@ -405,6 +405,22 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn org_membership_roles(&self) -> OrgMembershipRoleRepo<'a> {
         OrgMembershipRoleRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only role-to-permission mapping repository for this scope on the
+    /// DATA plane (issue #98). Migration 0092 grants the data-plane SELECT on
+    /// `org_role_permissions` (and nothing else): it is the join a later PR's
+    /// effective-permission resolution performs once the effective ROLE set is
+    /// known, on the token-issuance path. There is deliberately no MUTATING
+    /// data-plane counterpart and no INSERT, UPDATE, or DELETE grant of any shape: a
+    /// data plane able to decide which capabilities a role grants is a data plane
+    /// able to write its own token claim.
+    #[must_use]
+    pub fn org_role_permissions(&self) -> OrgRolePermissionRepo<'a> {
+        OrgRolePermissionRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -32003,6 +32019,61 @@ pub struct NewOrgMembershipRole<'a> {
     pub role_id: &'a OrgRoleId,
 }
 
+/// A role-to-permission mapping row (issue #98): one PERMISSION of the
+/// environment's vocabulary granted by one ROLE of one organization.
+///
+/// The join between the two halves of the model that are scoped differently. The
+/// role belongs to an organization (0086), the permission belongs to the
+/// ENVIRONMENT and carries no organization at all (0091), and this row carries
+/// `organization_id` because the ROLE half does. A reader who has just read
+/// [`PermissionRecord`], where the absence of an organization is the design, needs
+/// that difference stated rather than inferred.
+///
+/// Only LIVE (not soft-deleted) mappings are ever reconstructed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgRolePermissionRecord {
+    /// The mapping identifier (`rpm_...`, embeds its `(tenant, environment)`).
+    pub id: OrgRolePermissionId,
+    /// The organization the ROLE belongs to (`org_...`). The permission half has
+    /// no organization.
+    pub organization_id: OrganizationId,
+    /// The role that grants the permission (`rol_...`), a role of
+    /// `organization_id`.
+    pub role_id: OrgRoleId,
+    /// The permission granted (`prm_...`), an entry in this ENVIRONMENT's
+    /// vocabulary.
+    pub permission_id: PermissionId,
+    /// Creation time in microseconds since the Unix epoch (the pagination key).
+    pub created_at_unix_micros: i64,
+    /// Last-modification time in microseconds since the Unix epoch.
+    pub updated_at_unix_micros: i64,
+}
+
+/// Everything a role-to-permission attachment needs, bundled so the repository
+/// method stays within the readable-argument-count lint (issue #98).
+///
+/// Four caller-supplied identifiers, which is one more than any #97 assignment
+/// takes, and every one of them is checked against the repository's own scope
+/// before any statement runs. Read [`ActingOrgRolePermissionRepo::assign`] for
+/// which of those checks is individually observable and what removing each one
+/// actually produces.
+#[derive(Debug, Clone, Copy)]
+pub struct NewOrgRolePermission<'a> {
+    /// The mapping id (minted by the caller, embeds this scope).
+    pub id: &'a OrgRolePermissionId,
+    /// The organization the ROLE must belong to (an `org_` id in this scope).
+    pub organization_id: &'a OrganizationId,
+    /// The role to attach to. Must be a LIVE role of `organization_id`; anything
+    /// else (absent, soft-deleted, foreign scope, foreign organization) is the
+    /// uniform [`StoreError::NotFound`].
+    pub role_id: &'a OrgRoleId,
+    /// The permission to attach. Must be a LIVE permission of this SCOPE, under
+    /// the same uniform not-found. There is no organization to check on this side,
+    /// because the vocabulary has none: `(tenant, environment)` is its complete
+    /// address.
+    pub permission_id: &'a PermissionId,
+}
+
 /// WHY one role is in a membership's effective set (issue #97).
 ///
 /// The two variants are the two assignment surfaces and nothing else: a role is
@@ -32177,6 +32248,19 @@ impl<'a> ManagementStore<'a> {
     #[must_use]
     pub fn org_membership_roles(&self, scope: Scope) -> OrgMembershipRoleRepo<'a> {
         OrgMembershipRoleRepo {
+            store: self.store,
+            scope,
+        }
+    }
+
+    /// The read-only role-to-permission mapping repository for `scope` (issue #98):
+    /// which permissions a role grants, and which of an organization's roles grant a
+    /// permission. The mapping carries the ORGANIZATION even though the vocabulary
+    /// it points at does not, so every read here takes an organization while every
+    /// [`ManagementStore::permissions`] read does not.
+    #[must_use]
+    pub fn org_role_permissions(&self, scope: Scope) -> OrgRolePermissionRepo<'a> {
+        OrgRolePermissionRepo {
             store: self.store,
             scope,
         }
@@ -32374,6 +32458,23 @@ impl<'a> ActingManagementStore<'a> {
     #[must_use]
     pub fn org_membership_roles(&self, scope: Scope) -> ActingOrgMembershipRoleRepo<'a> {
         ActingOrgMembershipRoleRepo {
+            store: self.store,
+            acting: self.acting,
+            scope,
+        }
+    }
+
+    /// The mutating role-to-permission repository for `scope` (issue #98): attach a
+    /// permission of this environment's vocabulary to a role of one organization and
+    /// detach it, each audited.
+    ///
+    /// There is no data-plane counterpart and there never will be: migration 0092
+    /// grants the app role `SELECT` and nothing else, because a data plane able to
+    /// decide which capabilities a role grants is a data plane able to write its own
+    /// token claim.
+    #[must_use]
+    pub fn org_role_permissions(&self, scope: Scope) -> ActingOrgRolePermissionRepo<'a> {
+        ActingOrgRolePermissionRepo {
             store: self.store,
             acting: self.acting,
             scope,
@@ -34538,6 +34639,299 @@ impl OrgMembershipRoleRepo<'_> {
         tx.commit().await?;
         rows.iter()
             .map(|row| org_membership_role_from_row(row, &self.scope))
+            .collect()
+    }
+}
+
+/// The projection every role-permission mapping read selects from
+/// `org_role_permissions`. One constant so the get, pair-address, and list
+/// projections cannot drift.
+///
+/// # Scope-predicate redundancy census
+///
+/// Every read below repeats `tenant_id` and `environment_id` in its `WHERE` even
+/// though `org_role_permissions_tenant_isolation` already fences both. Unlike the
+/// same census on `PERMISSION_SELECT_COLUMNS`, the redundancy here is not merely one
+/// way, it is UNOBSERVABLE, and that difference was measured rather than assumed:
+///
+/// * Every read on this table is addressed by SCOPED IDS ONLY. A caller cannot get an
+///   id of another scope past the typed guard at the top of each method, a row of
+///   another scope cannot carry ids this caller could name, and
+///   [`org_role_permission_from_row`] decodes every stored id back under the scope
+///   anyway. Neutering BOTH scope conjuncts in `get_assignment` at once leaves the
+///   whole suite green. There is no test that can distinguish them, and there cannot
+///   be one while the addressing stays typed.
+/// * `permissions` (issue #98 PR 1) differs, and the difference is worth knowing
+///   before copying either census: `PermissionRepo::get_by_slug` addresses by a
+///   caller-typed SLUG rather than by an id, which is exactly what makes ITS
+///   environment conjunct observable and why that file carries a test for it.
+/// * The layer these hide behind IS individually covered. All three halves of the
+///   isolation policy are killed on their own by
+///   `rls_hides_another_scopes_mappings_and_refuses_forging_one`, including the
+///   TENANT conjunct, which needed a MISMATCHED-SCOPE probe to reach at all (an
+///   `environment_id` is globally unique and names one tenant, so no ordinary
+///   cross-tenant probe can make the tenant conjunct the deciding one).
+///
+/// The `organization_id` conjunct is a different matter entirely and is NOT
+/// redundant with anything: the policy cannot see that column, so it is the whole
+/// fence between two organizations of one environment. Dropping it from
+/// `get_assignment` or from `list_by` is killed on its own.
+///
+/// Do not delete a scope conjunct on the grounds that a mutation survives: the
+/// survival is the expected consequence of typed addressing plus the policy, not
+/// evidence the predicate is dead. The complete write-side census is on
+/// [`ActingOrgRolePermissionRepo`].
+const ORG_ROLE_PERMISSION_SELECT_COLUMNS: &str = "id, organization_id, role_id, permission_id, \
+     (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us, \
+     (EXTRACT(EPOCH FROM updated_at) * 1000000)::bigint AS updated_us";
+
+/// Read-only role-to-permission mappings for one scope (issue #98).
+///
+/// Reached by the control plane through [`ManagementStore::org_role_permissions`]
+/// and by the data plane through [`ScopedStore::org_role_permissions`]. Every read
+/// is scope-fenced, carries the organization predicate the row-level-security
+/// policy cannot see, and filters `deleted_at IS NULL`, so a detached mapping reads
+/// as absent, exactly like one of another scope, one of another organization, and
+/// one that never existed.
+///
+/// The MUTATING counterpart is [`ActingOrgRolePermissionRepo`], reachable only from
+/// the control plane: nothing on the data plane ever writes a mapping, and
+/// migration 0092 grants the app role `SELECT` and nothing else.
+pub struct OrgRolePermissionRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl OrgRolePermissionRepo<'_> {
+    /// Parse an untrusted mapping identifier under this scope. A malformed id and
+    /// one minted in another scope both return the uniform not-found.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if malformed or out of scope.
+    pub fn parse_id(&self, raw: &str) -> Result<OrgRolePermissionId, StoreError> {
+        Ok(OrgRolePermissionId::parse_in_scope(raw, &self.scope)?)
+    }
+
+    /// Fetch a live mapping by id, within scope.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no such live mapping is visible in this scope.
+    pub async fn get(
+        &self,
+        id: &OrgRolePermissionId,
+    ) -> Result<OrgRolePermissionRecord, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(&format!(
+            "SELECT {ORG_ROLE_PERMISSION_SELECT_COLUMNS} FROM org_role_permissions \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND deleted_at IS NULL"
+        ))
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        org_role_permission_from_row(&row, &self.scope)
+    }
+
+    /// Fetch a live mapping by id, requiring it to belong to `org_id`. A mapping of
+    /// ANOTHER organization in the same scope is the uniform not-found, exactly like
+    /// an absent one.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if either id is out of scope, or no such live mapping
+    /// exists in that organization.
+    pub async fn get_in_org(
+        &self,
+        org_id: &OrganizationId,
+        id: &OrgRolePermissionId,
+    ) -> Result<OrgRolePermissionRecord, StoreError> {
+        if org_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let record = self.get(id).await?;
+        if &record.organization_id == org_id {
+            Ok(record)
+        } else {
+            Err(StoreError::NotFound)
+        }
+    }
+
+    /// Fetch the live mapping of ONE `(role, permission)` PAIR inside `org_id`: the
+    /// read a PAIR-ADDRESSED management route performs, because the wire address of a
+    /// mapping is the two endpoints a caller already holds and never the `rpm_` id
+    /// (which exists only as the audit target and as the detach handle).
+    ///
+    /// Every miss is the SAME [`StoreError::NotFound`]: no such mapping, a detached
+    /// one, either endpoint absent or soft-deleted, either endpoint in another scope,
+    /// a role of another organization, and a pair whose two halves are individually
+    /// visible but do not belong together. The addressing rule and the uniformity
+    /// argument are the ones spelled out on [`OrgGroupMemberRepo::get_binding`].
+    ///
+    /// The id it returns is safe to feed straight to
+    /// [`ActingOrgRolePermissionRepo::unassign`] even though that is a second
+    /// statement: migration 0092 grants UPDATE on `updated_at` and `deleted_at` and
+    /// on NOTHING else, so a mapping's role, permission, organization, and scope are
+    /// immutable by GRANT and the pair cannot come apart between the read and the
+    /// write. A concurrent detach makes the write match no live row, which is the
+    /// same not-found this read would have given.
+    ///
+    /// # What each predicate is doing here
+    ///
+    /// `organization_id` is what refuses the cross-organization PAIRING: without it,
+    /// a caller addressing through organization B could resolve the mapping of
+    /// organization A's role, because `role_id` alone already identifies the row.
+    /// `role_id` and `permission_id` are each the only thing that makes this the
+    /// address of ONE pair, and dropping either really does return a different row,
+    /// since a role carries many permissions and a permission is carried by many
+    /// roles.
+    ///
+    /// All three are individually covered, which is the difference from the #97 pair
+    /// reads and is a measurement rather than a claim: neutering `organization_id`,
+    /// `role_id`, or `permission_id` here each turns the suite red on its own.
+    /// #97's `get_binding` census records that ITS organization copy survives, because
+    /// every caller in that tree also passes through [`soft_delete_assignment_row`],
+    /// which carries the same predicate. Here the store tests address this read
+    /// DIRECTLY from a sibling organization, so this copy stands on its own. When it
+    /// does feed the detach, the copy in [`soft_delete_assignment_row`] is a second
+    /// layer, and that layering is ONE WAY for the reason recorded there: a store
+    /// caller may detach by mapping id with no pair lookup in front of it at all.
+    ///
+    /// The two SCOPE conjuncts are the opposite case and are unobservable; the census
+    /// on `ORG_ROLE_PERMISSION_SELECT_COLUMNS` says why, and says why that is safe.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if any id is out of scope, or no live mapping of that
+    /// pair exists in that organization.
+    pub async fn get_assignment(
+        &self,
+        org_id: &OrganizationId,
+        role_id: &OrgRoleId,
+        permission_id: &PermissionId,
+    ) -> Result<OrgRolePermissionRecord, StoreError> {
+        if org_id.scope() != self.scope
+            || role_id.scope() != self.scope
+            || permission_id.scope() != self.scope
+        {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(&format!(
+            "SELECT {ORG_ROLE_PERMISSION_SELECT_COLUMNS} FROM org_role_permissions \
+             WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
+             AND role_id = $4 AND permission_id = $5 AND deleted_at IS NULL"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(org_id.to_string())
+        .bind(role_id.to_string())
+        .bind(permission_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        org_role_permission_from_row(&row, &self.scope)
+    }
+
+    /// One page of live mappings for one role: the "which permissions does this role
+    /// grant" list. `org_id` fences the organization, so a role of a sibling
+    /// organization matches nothing.
+    ///
+    /// There is no cap on how many permissions a role may carry; the page size is
+    /// clamped like every management list.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_for_role(
+        &self,
+        org_id: &OrganizationId,
+        role_id: &OrgRoleId,
+        limit: i64,
+        after: Option<&CursorPosition>,
+    ) -> Result<Vec<OrgRolePermissionRecord>, StoreError> {
+        if org_id.scope() != self.scope || role_id.scope() != self.scope {
+            return Ok(Vec::new());
+        }
+        self.list_by("role_id", org_id, &role_id.to_string(), limit, after)
+            .await
+    }
+
+    /// One page of live mappings for one permission: the "which roles grant this
+    /// permission" list, and the blast-radius answer an operator wants BEFORE
+    /// deleting a permission.
+    ///
+    /// It takes an `org_id` even though a permission has no organization, and that is
+    /// deliberate rather than an oversight: the MAPPING rows have one, so this list
+    /// answers "which of THIS organization's roles grant it". The environment-wide
+    /// question is a different one, and issue #98 has no caller for it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_for_permission(
+        &self,
+        org_id: &OrganizationId,
+        permission_id: &PermissionId,
+        limit: i64,
+        after: Option<&CursorPosition>,
+    ) -> Result<Vec<OrgRolePermissionRecord>, StoreError> {
+        if org_id.scope() != self.scope || permission_id.scope() != self.scope {
+            return Ok(Vec::new());
+        }
+        self.list_by(
+            "permission_id",
+            org_id,
+            &permission_id.to_string(),
+            limit,
+            after,
+        )
+        .await
+    }
+
+    /// The shared body of both mapping lists. `column` is a `&'static str` chosen
+    /// from two literals in this module, never caller-supplied, so no part of this
+    /// statement is caller-authored SQL. One body rather than two so the pagination
+    /// key, the organization predicate, the liveness filter, and the page clamp
+    /// cannot drift between the two lists.
+    async fn list_by(
+        &self,
+        column: &'static str,
+        org_id: &OrganizationId,
+        value: &str,
+        limit: i64,
+        after: Option<&CursorPosition>,
+    ) -> Result<Vec<OrgRolePermissionRecord>, StoreError> {
+        let (after_micros, after_id) = split_cursor(after);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {ORG_ROLE_PERMISSION_SELECT_COLUMNS} FROM org_role_permissions \
+             WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
+             AND {column} = $4 AND deleted_at IS NULL \
+             AND ($5::bigint IS NULL OR (created_at, id) > \
+                  (TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval, $6::text)) \
+             ORDER BY created_at, id LIMIT $7"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(org_id.to_string())
+        .bind(value)
+        .bind(after_micros)
+        .bind(after_id)
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| org_role_permission_from_row(row, &self.scope))
             .collect()
     }
 }
@@ -36900,7 +37294,11 @@ impl ActingOrgRoleRepo<'_> {
 /// What follows is the COMPLETE set, so that nobody has to rediscover it by deleting
 /// the wrong half, and so that the create-side entry is not read as a general rule.
 /// It is stated in full because the next PR of this issue is templated from this
-/// repository and meets the same shape with THREE caller-supplied ids instead of one.
+/// repository. That PR has since landed as [`ActingOrgRolePermissionRepo`], and it
+/// meets the same shape with FOUR caller-supplied ids rather than the three this note
+/// forecast (the mapping's own id counts, and it is the one whose guard is
+/// load bearing). Its census is the one to read for the multi-id case; this one
+/// stays the reference for the single-id case.
 ///
 /// KILLED, and the only one on this path:
 ///
@@ -38226,19 +38624,325 @@ impl ActingOrgMembershipRoleRepo<'_> {
     }
 }
 
+/// The mutating role-to-permission repository (issue #98): attach a permission of
+/// this environment's vocabulary to a role of one organization, and detach it, each
+/// audited in the same transaction as the write.
+///
+/// This is the table that gives a permission its authorization meaning. A permission
+/// row on its own (0091) is a name and a label; a mapping row is what puts that name
+/// into an access token for every member who effectively holds the role, so the
+/// blast radius of one attach is the whole effective member set of that role,
+/// direct and inherited alike.
+///
+/// # No cap
+///
+/// There is no count cap, quota, or paywall gate anywhere in this repository or in
+/// migration 0092. A role may carry unlimited permissions and a permission may be
+/// carried by unlimited roles, in both directions (a project covenant). The byte and
+/// count budget a later PR of issue #98 adds bounds ONE TOKEN and never this table.
+///
+/// # Write-side survivor census (read before deleting a predicate here)
+///
+/// Every claim below is a MEASUREMENT. The predicate was neutered, the WHOLE of
+/// `crates/ironauth-store/tests/org_role_permissions.rs` was run (plus
+/// `org_assignments.rs` and `permissions.rs` wherever the mutation touched a shared
+/// helper, and `migration.rs` wherever it touched the DDL), and what turned red, or
+/// what the mutant actually PRODUCED, is what is written. A coverage claim nobody
+/// re-ran is worse than none, because the next reader deletes the predicate the
+/// census told them was covered. The census on [`ActingPermissionRepo`] is the direct
+/// ancestor of this one and its warning governs here too: on a path this heavily
+/// backstopped a SURVIVING mutation is the expected consequence of the backstop and
+/// is never evidence the predicate is dead.
+///
+/// ## KILLED, and the only one of the four id guards
+///
+/// [`ActingOrgRolePermissionRepo::assign`]'s `spec.id.scope()` guard, for exactly the
+/// reason [`ActingPermissionRepo::create`] records and with the same three
+/// consequences: removing it does not make a forged attach FAIL, it makes it SUCCEED.
+/// Measured on a live database with the guard deleted, and stated here as what was
+/// observed rather than as what was expected:
+///
+/// 1. An attach under scope A naming an `rpm_` id minted in tenant B, over a pair
+///    that is FREE, returns `Ok(())`. The persisted row's `tenant_id` and
+///    `environment_id` are the CALLER'S OWN while its id is tenant B's, and an
+///    `organization.role.permission.assign` audit row is written beside it. The same
+///    holds for an id minted in the same tenant's other ENVIRONMENT.
+/// 2. [`OrgRolePermissionRepo::list_for_role`] for that role then answers
+///    [`StoreError::NotFound`] rather than a list, because
+///    `org_role_permission_from_row` cannot decode that id in scope. One forged row
+///    makes every mapping of that role unreadable through the management surface.
+/// 3. The legitimate attach of the SAME pair afterwards answers
+///    [`StoreError::Conflict`] for good: the live uniqueness slot is held by a row no
+///    supported path can address or remove. And the global primary key makes that
+///    conflict a cross-tenant EXISTENCE ORACLE, measured both ways: an id already
+///    TAKEN in tenant B answers `Conflict`, the same shape with an id FREE in tenant
+///    B answers `Ok(())`. No policy can close that one, because the row this
+///    statement writes is the caller's own by construction and a WITH CHECK has
+///    nothing to refuse, while the unique index is global and conflicts against rows
+///    the policy HIDES.
+///
+/// `every_mutation_answers_absent_detached_and_both_foreign_scopes_alike` kills it,
+/// and its fixture names a FRESH permission on purpose so the mutant reaches
+/// consequence 1 rather than being deflected into consequence 3.
+///
+/// ## SURVIVORS, each equivalent behind a NAMED backstop, each PAIR checked
+///
+/// * The `spec.role_id.scope()` guard. Backstop: [`require_live_role_in_org`], whose
+///   statement binds `tenant_id` and `environment_id` from this repository's scope,
+///   so a role id minted elsewhere matches no row and is the same uniform not-found.
+///   Dropping the guard AND the resolution call is KILLED.
+/// * The `spec.permission_id.scope()` guard. Backstop: [`require_live_permission`],
+///   on the same argument. Dropping the guard AND the resolution call is KILLED, and
+///   this is the sharpest of the three pairs, because the vocabulary is per
+///   ENVIRONMENT: that mutant attaches ANOTHER environment's permission to this
+///   organization's role.
+/// * The `spec.organization_id.scope()` guard. Backstop: the `organization_id = $4`
+///   conjunct inside [`require_live_role_in_org`], which no role of this scope can
+///   satisfy for a foreign-scope organization id. Dropping the guard AND that
+///   conjunct is KILLED (it reds `org_assignments.rs` too, since that conjunct is
+///   shared with issue #97).
+/// * Every scope conjunct on every READ statement here, singly or in pairs, and the
+///   typed-id guard in front of them. This one is worth stating precisely, because it
+///   is NOT the ordinary "the policy covers it" answer and it differs from the
+///   sibling `permissions` table. Every read on THIS table is addressed by SCOPED IDS
+///   ONLY. A caller cannot get an id of another scope past the guard, a row of
+///   another scope cannot carry ids this caller could name, and
+///   `org_role_permission_from_row` decodes in scope anyway. So a cross-scope read is
+///   not merely refused, it is INEXPRESSIBLE, and no test can distinguish these
+///   predicates. (`permissions` differs because `get_by_slug` addresses by a
+///   caller-typed SLUG, which is exactly why its own environment conjunct IS
+///   observable there.) They are kept because a statement that names its own scope is
+///   readable without the reader knowing a policy exists.
+///
+/// The chain of read-side equivalences terminates in a layer that IS individually
+/// killed, which is what makes it a redundancy rather than a hole: all three halves
+/// of the isolation policy (`USING` tenant, `USING` environment, and `WITH CHECK`)
+/// are killed on their own by `rls_hides_another_scopes_mappings_and_refuses_forging_one`.
+///
+/// ## NOT survivors
+///
+/// * The `organization_id` conjunct in [`soft_delete_assignment_row`], which is what
+///   makes a detach addressed from a SIBLING organization refuse. Row-level security
+///   cannot see that column. Its census lives on that function.
+/// * The `environment_id` conjunct in [`soft_delete_assignment_row`]. On the WRITE
+///   side the layers really are separable, unlike the read side above: with the
+///   policy's environment half replaced away and this method's own guard removed,
+///   that conjunct is the ONLY thing between a scope A caller and a live grant in the
+///   same tenant's other environment. `the_repository_still_fences_by_environment_with_the_policy_half_down`
+///   kills that triple and nothing else does.
+/// * Both liveness filters. [`require_live_permission`] dropping `deleted_at IS NULL`
+///   and [`require_live_role_in_org`] dropping its own are each killed on their own by
+///   `an_attach_refuses_a_deleted_role_and_a_deleted_permission`, because on THIS path
+///   each resolution is the sole layer (the foreign keys are satisfied by a retained
+///   soft-deleted row).
+pub struct ActingOrgRolePermissionRepo<'a> {
+    store: &'a Store,
+    acting: ActingContext,
+    scope: Scope,
+}
+
+impl ActingOrgRolePermissionRepo<'_> {
+    /// Attach a permission to a role and audit `organization.role.permission.assign`
+    /// in the same transaction, scoped to `(tenant, environment)`.
+    ///
+    /// # The four caller-supplied identifiers, and what actually fences each one
+    ///
+    /// This write takes one more identifier than any issue #97 assignment does, and
+    /// the four are NOT fenced alike. The account below is measured rather than
+    /// assumed, because the obvious one is wrong in the same way it was wrong for
+    /// [`ActingPermissionRepo::create`].
+    ///
+    /// `spec.id` (the `rpm_` mapping id) has NO layer behind its in-process guard.
+    /// This statement binds `tenant_id` and `environment_id` from `self.scope`, never
+    /// from `spec.id`, and [`begin_scoped`] binds the row-level-security variables
+    /// from that SAME scope, so the row satisfies the policy's WITH CHECK for EVERY
+    /// input this function accepts. The policy fences the scope COLUMNS; nothing a
+    /// caller passes can move them. Removing the guard therefore does not make a
+    /// forged attach fail, it makes it SUCCEED: measured with the guard deleted, an
+    /// attach under scope A naming an id minted in another scope returns `Ok(())`,
+    /// persists a row, makes the whole role unlistable, holds the live pair slot for
+    /// good, and turns the global primary key into a cross-tenant existence oracle.
+    /// The full measurement, including both halves of the oracle, is in the census on
+    /// [`ActingOrgRolePermissionRepo`], and
+    /// `every_mutation_answers_absent_detached_and_both_foreign_scopes_alike` is the
+    /// only thing that kills it.
+    ///
+    /// The OTHER three ids do have a second layer, and it is the resolution that runs
+    /// below rather than any database constraint. The three foreign keys are id-only,
+    /// so each proves its endpoint EXISTS somewhere and proves nothing about scope,
+    /// organization, or liveness (migration 0092's header states this in full). What
+    /// refuses a foreign endpoint is [`require_live_role_in_org`] and
+    /// [`require_live_permission`], each of which binds this repository's scope into
+    /// its own statement. So each of those three guards is individually EQUIVALENT,
+    /// measured, and is kept because refusing before any statement is the cheaper and
+    /// more obvious answer. Dropping each PAIR is KILLED, which is the check that
+    /// makes the equivalence claim safe rather than a place for two layers to go
+    /// missing together.
+    ///
+    /// # Both endpoints are resolved as LIVE before any conflict reasoning
+    ///
+    /// Under the uniform [`StoreError::NotFound`], for the anti-oracle reason
+    /// spelled out on [`ActingOrgGroupMemberRepo::add`]: a duplicate-attachment
+    /// [`StoreError::Conflict`] can only ever be seen by a caller who has already
+    /// proven they can see both endpoints.
+    ///
+    /// The role is resolved IN THE NAMED ORGANIZATION, which is the only thing that
+    /// makes same-organization containment true. The permission is resolved in this
+    /// SCOPE and in no organization, because it has none: `(tenant, environment)` is
+    /// the vocabulary's complete address. That asymmetry is the whole shape of this
+    /// table and is not an omission on the permission side.
+    ///
+    /// A `(role, permission)` pair already attached LIVE is [`StoreError::Conflict`].
+    /// A pair freed by a DETACH is available again, and re-attaching inserts a FRESH
+    /// row with a fresh id rather than reviving the withdrawn one.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if any id is not in this scope, if the role is not a
+    /// live role of that organization, or if the permission is not a live permission
+    /// of this scope;
+    /// [`StoreError::Conflict`] if the role already carries the permission;
+    /// [`StoreError::IdempotencyConflict`] on a concurrent Idempotency-Key race;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn assign(
+        &self,
+        env: &Env,
+        spec: NewOrgRolePermission<'_>,
+        created_at_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        if spec.id.scope() != self.scope
+            || spec.organization_id.scope() != self.scope
+            || spec.role_id.scope() != self.scope
+            || spec.permission_id.scope() != self.scope
+        {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let id = *spec.id;
+        let organization_id = *spec.organization_id;
+        let role_id = *spec.role_id;
+        let permission_id = *spec.permission_id;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::OrganizationRolePermissionAssign,
+                target: &id,
+            },
+            async move |tx| {
+                require_live_role_in_org(tx, scope, &organization_id, &role_id).await?;
+                require_live_permission(tx, scope, &permission_id).await?;
+                let result = sqlx::query(
+                    "INSERT INTO org_role_permissions \
+                     (id, tenant_id, environment_id, organization_id, role_id, permission_id, \
+                      created_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, \
+                             TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(organization_id.to_string())
+                .bind(role_id.to_string())
+                .bind(permission_id.to_string())
+                .bind(created_at_micros)
+                .execute(&mut **tx)
+                .await;
+                match result {
+                    Ok(_) => {}
+                    // The role already carries this permission.
+                    Err(error) if is_unique_violation(&error) => {
+                        return Err(StoreError::Conflict);
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+                insert_idempotency(tx, idempotency).await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Detach a permission from a role (soft delete) and audit
+    /// `organization.role.permission.unassign` in the same transaction.
+    ///
+    /// The row is retained so the audit foreign key to it stays satisfiable, and the
+    /// (role, permission) pair is immediately available again. A repeat detach
+    /// matches no live row and is the uniform not-found. `organization_id` is part of
+    /// the ADDRESS and is carried as a predicate, for the containment reason spelled
+    /// out on [`soft_delete_assignment_row`]: row-level security fences
+    /// `(tenant, environment)` and nothing finer, so without it a nested management
+    /// route could detach a sibling organization's grant.
+    ///
+    /// Deleting the ROLE or the PERMISSION is NOT a detach and writes none of this:
+    /// neither cascades here, and the resolution projection stops selecting the
+    /// mapping on the endpoint's own liveness filter instead. So a live mapping row
+    /// does not by itself mean a live grant.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if either id is not in this scope, or no live mapping
+    /// of `organization_id` matched.
+    pub async fn unassign(
+        &self,
+        env: &Env,
+        organization_id: &OrganizationId,
+        id: &OrgRolePermissionId,
+    ) -> Result<(), StoreError> {
+        if organization_id.scope() != self.scope || id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let organization_id = *organization_id;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::OrganizationRolePermissionUnassign,
+                target: id,
+            },
+            async move |tx| {
+                soft_delete_assignment_row(
+                    tx,
+                    "org_role_permissions",
+                    scope,
+                    &organization_id,
+                    &id.to_string(),
+                    now_micros,
+                )
+                .await
+            },
+            false,
+        )
+        .await
+    }
+}
+
 /// Soft-delete ONE live join row of `table` addressed by `(scope, organization_id,
 /// id)`, or the uniform [`StoreError::NotFound`] (issue #97).
 ///
-/// The shared body of all three join-table removals. `table` is a `&'static str`
-/// chosen from three literals in this module, never anything a caller supplies, so no
-/// part of this statement is caller-authored SQL.
+/// The shared body of all FOUR join-table removals: the three of issue #97, and
+/// issue #98's `org_role_permissions` detach. `table` is a `&'static str` chosen
+/// from four literals in this module, never anything a caller supplies, so no part
+/// of this statement is caller-authored SQL.
 ///
-/// One body rather than three copies because the three removals must agree on
-/// EXACTLY the addressing key. `organization_id` in the predicate is the containment
-/// guard: row-level security fences `(tenant, environment)` and nothing finer, so a
-/// copy that dropped it would silently let a nested management route remove a
-/// sibling organization's row. Three copies of a predicate whose absence is
-/// invisible in testing is precisely the shape of defect this collapses.
+/// One body rather than four copies because the removals must agree on EXACTLY the
+/// addressing key. `organization_id` in the predicate is the containment guard: row-
+/// level security fences `(tenant, environment)` and nothing finer, so a copy that
+/// dropped it would silently let a nested management route remove a sibling
+/// organization's row. Four copies of a predicate whose absence is invisible in
+/// testing is precisely the shape of defect this collapses, and the fourth caller is
+/// the reason to say so again: `org_role_permissions` is the one of the four whose
+/// row grants a CAPABILITY NAME rather than a role name, so a cross-organization
+/// detach there silently removes an authorization an operator believes is in force.
 ///
 /// Since the pair-addressed management routes landed, this predicate has a SECOND
 /// layer in front of it: each of them resolves the row through
@@ -38664,23 +39368,26 @@ async fn require_live_role_in_org(
 ///
 /// # Redundancy census
 ///
-/// Both callers in this PR ([`ActingPermissionRepo::update`] and
+/// The two vocabulary callers ([`ActingPermissionRepo::update`] and
 /// [`ActingPermissionRepo::delete`]) also guard their own statement on
 /// `deleted_at IS NULL` and treat a zero row count as the same not-found. The two
 /// layers are MUTUALLY redundant on a quiet database, so neutering either one alone
 /// leaves every functional assertion green and only neutering BOTH is caught. Do not
 /// delete either on the strength of a surviving mutation:
 ///
-/// * The statement's own guard is what makes the write lose a race. These callers
+/// * The statement's own guard is what makes the write lose a race. Those callers
 ///   run at READ COMMITTED, so a concurrent delete may commit between this
 ///   resolution and the UPDATE, and the row count is the only thing that then
 ///   refuses.
-/// * This resolution is what the NEXT PR of the issue needs, where it is the ONLY
-///   layer: an attachment's `permission_id` foreign key proves the row EXISTS and
-///   proves nothing about whether it is live, so without this a deleted permission
-///   could be attached to a role. Landing it with live callers rather than inert
-///   also means its SQL is executed rather than merely compiled, which is the only
-///   validation a runtime-API query gets.
+/// * On the THIRD caller, [`ActingOrgRolePermissionRepo::assign`], this resolution
+///   is the ONLY layer and has no second half at all: the `permission_id` foreign
+///   key proves the row EXISTS and proves nothing about whether it is live or in
+///   scope, so without this call a deleted or foreign-environment permission could
+///   be attached to a role. That is measured rather than reasoned: dropping this
+///   call together with the assign path's own `spec.permission_id.scope()` guard
+///   persists a cross-environment mapping, and dropping it alone lets a soft-deleted
+///   permission be attached, which
+///   `an_attach_refuses_a_deleted_role_and_a_deleted_permission` kills on its own.
 ///
 /// This statement's own `tenant_id` and `environment_id` conjuncts are a THIRD kind
 /// of survivor, redundant behind the forced row-level-security policy rather than
@@ -39887,6 +40594,34 @@ fn org_membership_role_from_row(
             scope,
         )?,
         role_id: OrgRoleId::parse_in_scope(&row.get::<String, _>("role_id"), scope)?,
+        created_at_unix_micros: row.get("created_us"),
+        updated_at_unix_micros: row.get("updated_us"),
+    })
+}
+
+/// Reconstruct an [`OrgRolePermissionRecord`] from a row read within scope. Every
+/// stored id is parsed back UNDER the scope, so a corrupt cross-scope row fails to
+/// decode rather than being returned.
+///
+/// The `permission_id` is decoded under the SAME scope as everything else, which is
+/// exactly right even though the vocabulary carries no organization: a permission is
+/// scoped to `(tenant, environment)`, and that is the scope this row is in. A
+/// mapping naming another ENVIRONMENT's permission therefore fails to decode here
+/// rather than resolving, which is the reason the write path's own guard on that id
+/// matters: this decode is what turns such a row into a poison pill for every read
+/// of the whole organization rather than a quietly working cross-environment grant.
+fn org_role_permission_from_row(
+    row: &PgRow,
+    scope: &Scope,
+) -> Result<OrgRolePermissionRecord, StoreError> {
+    Ok(OrgRolePermissionRecord {
+        id: OrgRolePermissionId::parse_in_scope(&row.get::<String, _>("id"), scope)?,
+        organization_id: OrganizationId::parse_in_scope(
+            &row.get::<String, _>("organization_id"),
+            scope,
+        )?,
+        role_id: OrgRoleId::parse_in_scope(&row.get::<String, _>("role_id"), scope)?,
+        permission_id: PermissionId::parse_in_scope(&row.get::<String, _>("permission_id"), scope)?,
         created_at_unix_micros: row.get("created_us"),
         updated_at_unix_micros: row.get("updated_us"),
     })

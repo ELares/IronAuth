@@ -535,6 +535,26 @@ name = "permissions"
 path = "tests/permissions.rs"
 required-features = ["testing"]
 
+# The role-to-permission mapping (issue #98, store PR 3): the join between the
+# environment-scoped vocabulary and an organization-scoped role. Covers the audited
+# attach / list-both-ways / detach round trip with its audit multiset, the pair
+# address read, every illegal CROSS PAIRING of the four caller-supplied identifiers
+# (a sibling organization's role, a permission of the same tenant's OTHER
+# ENVIRONMENT, and each endpoint absent or soft-deleted) as one uniform not-found
+# that mutates and audits nothing, organization containment inside ONE scope, the
+# live pair-uniqueness index in both halves plus the property lost if
+# organization_id joined its key, that a re-attach mints a FRESH id and never
+# revives, forced RLS with the tenant and the environment each deciding in a probe
+# of its own plus the WRITE-side forge probe, the repository's own conjuncts pinned
+# against a weakened policy, the least-privilege grants (data plane read only; every
+# addressing column immutable by GRANT on both roles), audit atomicity in both
+# directions, and the covenant that a role may carry unlimited permissions and a
+# permission may be carried by unlimited roles. Needs a real database (DATABASE_URL).
+[[test]]
+name = "org_role_permissions"
+path = "tests/org_role_permissions.rs"
+required-features = ["testing"]
+
 # Organization groups and hierarchy safety (issue #97, store PR 2): the group half
 # of the M10 role model, plus the write-time cycle check and depth bound. Covers the
 # audited CRUD and reparent vocabulary, the typed cycle and depth refusals (and that

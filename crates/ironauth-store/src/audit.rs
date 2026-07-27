@@ -345,6 +345,35 @@ pub enum Action {
     /// action is not reversible in its authorization effects: whatever a later PR of
     /// the issue maps onto the dead id stays mapped to the dead id.
     PermissionDelete,
+    /// A permission was ATTACHED to an organization's role (issue #98). The target
+    /// is the new `rpm_` mapping row.
+    ///
+    /// This pair of actions DOES carry the `organization.` prefix that the three
+    /// permission actions above deliberately do not, and the difference is the whole
+    /// shape of the model: the vocabulary hangs off the ENVIRONMENT and has no
+    /// organization dimension to name, while a mapping joins that vocabulary to an
+    /// organization's role and therefore has one.
+    ///
+    /// Its blast radius is not the target row. Every member who effectively holds
+    /// that role, directly or through the group forest, gains the permission at their
+    /// next token issuance, so this action is the one an operator reconstructs a
+    /// capability grant from. The header of migration 0092 names the same two strings
+    /// as the delta contract for a mapping.
+    OrganizationRolePermissionAssign,
+    /// A permission was DETACHED from an organization's role (issue #98): a soft
+    /// delete that retains the row, so the audit foreign key to it stays satisfiable
+    /// and the (role, permission) pair is free again. The target is the withdrawn
+    /// mapping.
+    ///
+    /// Its blast radius is the same member set the attachment had. A re-attach mints
+    /// a FRESH row rather than reviving this one, so a detachment is never quietly
+    /// undone in place.
+    ///
+    /// Deleting the ROLE or the PERMISSION does NOT write this action: neither
+    /// cascades here, and the resolution projection stops selecting the mapping on
+    /// the endpoint's own liveness filter instead. So the absence of this action
+    /// never means the grant is still in force.
+    OrganizationRolePermissionUnassign,
     /// An authorization code and its grant were issued (issue #12).
     AuthorizationCodeIssue,
     /// An authorization code was redeemed at the token endpoint (issue #12).
@@ -1161,6 +1190,8 @@ impl Action {
             Action::PermissionCreate => "permission.create",
             Action::PermissionUpdate => "permission.update",
             Action::PermissionDelete => "permission.delete",
+            Action::OrganizationRolePermissionAssign => "organization.role.permission.assign",
+            Action::OrganizationRolePermissionUnassign => "organization.role.permission.unassign",
             Action::AuthorizationCodeIssue => "authorization_code.issue",
             Action::AuthorizationCodeRedeem => "authorization_code.redeem",
             Action::AuthorizationCodeReuse => "authorization_code.reuse",
@@ -1399,6 +1430,12 @@ mod tests {
     /// renames the function or reflows the match) fails here instead of passing
     /// vacuously.
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one scan of the whole action registry followed by the per-issue \
+                  contract pins that read against it; splitting the pins into their \
+                  own tests would re-run the scan and let the two copies drift"
+    )]
     fn every_audit_action_wire_string_is_distinct_and_a_snake_case_dotted_token() {
         let source = include_str!("audit.rs");
         let needle = concat!("pub fn ", "as_str(&self) -> &'static str {");
@@ -1496,5 +1533,37 @@ mod tests {
         // name rather than on the DDL statement, because a bare table name in a
         // create position would trip `scripts/query-audit.sh`.
         assert!(migration_0091.contains("permissions_kind_slug_live_uniq"));
+
+        // Issue #98's role-to-permission MAPPING actions, pinned against the
+        // deployed 0092 header the same way, plus the property that separates them
+        // from the three above: a mapping DOES have an organization dimension, so
+        // its actions must claim one. That asymmetry is the reason the check on the
+        // vocabulary actions above is spelled as a refusal rather than as a shared
+        // rule, and asserting only one side of it would let a later rename collapse
+        // the two vocabularies into one.
+        let migration_0092 = include_str!("../migrations/0092_org_role_permissions.sql");
+        for action in [
+            Action::OrganizationRolePermissionAssign,
+            Action::OrganizationRolePermissionUnassign,
+        ] {
+            assert!(
+                seen.contains_key(action.as_str()),
+                "{} must be in the as_str match",
+                action.as_str()
+            );
+            assert!(
+                migration_0092.contains(&format!("`{}`", action.as_str())),
+                "migration 0092 declares the mapping delta contract, so {} must \
+                 appear in its header",
+                action.as_str()
+            );
+            assert!(
+                action.as_str().starts_with("organization.role.permission."),
+                "a mapping joins an ORGANIZATION's role to a permission, so {} must \
+                 name the dimension the row actually has",
+                action.as_str()
+            );
+        }
+        assert!(migration_0092.contains("org_role_permissions_pair_live_uniq"));
     }
 }
