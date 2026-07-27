@@ -301,6 +301,16 @@ pub struct OidcState {
     // unit the store prune binds). Kept OUTSIDE `Inner` and set through the builder for
     // the SAME top-level-config reason as the verbosity. Default: seven days.
     diagnostic_retention_micros: i64,
+    // The deployment-wide organization group nesting bound (issue #97), installed by the
+    // boot path from `organizations.max_group_depth` and passed to the effective-role
+    // resolution the mint path runs. Kept OUTSIDE `Inner` and set through the builder
+    // because it is sourced from the TOP-LEVEL `[organizations]` config section, not from
+    // `OidcConfig`, exactly like `flows_enabled` and the diagnostics knobs; the SAME value
+    // is installed on the management plane through `AdminState::with_max_group_depth`, so
+    // one bound has one operator-visible name. Defaults to the shipped default, so a
+    // directly-built state (every test harness) behaves like a default deployment rather
+    // than pinning the walk to zero. Bounds tree DEPTH only; nothing counted is capped.
+    max_group_depth: u32,
     // The per-tenant/per-environment quota enforcer (issue #50), the data plane's
     // tenant-fairness layer. Kept OUTSIDE `Inner` and installed by the boot path
     // (built from the [quota] config, seeded with the SAME env clock), so a spend
@@ -887,6 +897,7 @@ impl OidcState {
             hosted_pages_enabled: false,
             diagnostics_verbosity: DiagnosticVerbosity::Standard,
             diagnostic_retention_micros: default_diagnostic_retention_micros(),
+            max_group_depth: ironauth_config::ORGANIZATIONS_DEFAULT_MAX_GROUP_DEPTH,
             quota: None,
             migration_hook: None,
             hashing_pool: None,
@@ -1210,6 +1221,40 @@ impl OidcState {
     #[must_use]
     pub fn diagnostic_retention_micros(&self) -> i64 {
         self.diagnostic_retention_micros
+    }
+
+    /// Install the deployment-wide organization group nesting bound (issue #97).
+    ///
+    /// The boot path is the only caller and passes `organizations.max_group_depth`
+    /// straight from the loaded config, the SAME value it installs on the management
+    /// plane through `AdminState::with_max_group_depth`. A BUILDER rather than an
+    /// [`OidcConfig`] field because the setting lives in the top-level
+    /// `[organizations]` section, not `[oidc]`: duplicating it under `[oidc]` would
+    /// give one bound two operator-visible names that could disagree. The value is
+    /// clamped to [`ironauth_config::ORGANIZATIONS_MAX_GROUP_DEPTH_CEILING`] here as
+    /// defense in depth (config load already refuses a larger one, and the store
+    /// clamps its own parameter again regardless of what this passes).
+    ///
+    /// This bounds tree DEPTH, which is what makes the ancestor walk the token
+    /// issuance path runs terminate. It caps nothing that is counted: the number of
+    /// groups, roles, members, and assignments an organization may hold is uncapped by
+    /// covenant.
+    #[must_use]
+    pub fn with_max_group_depth(mut self, max_group_depth: u32) -> Self {
+        self.max_group_depth =
+            max_group_depth.min(ironauth_config::ORGANIZATIONS_MAX_GROUP_DEPTH_CEILING);
+        self
+    }
+
+    /// The configured organization group nesting bound (issue #97), passed to the
+    /// effective-role resolution the mint path runs on every code exchange and every
+    /// refresh. Defaults to
+    /// [`ironauth_config::ORGANIZATIONS_DEFAULT_MAX_GROUP_DEPTH`] when the boot path
+    /// installed nothing, so a state built directly (for example in a test) matches
+    /// the shipped default rather than zero.
+    #[must_use]
+    pub fn max_group_depth(&self) -> u32 {
+        self.max_group_depth
     }
 
     /// Whether the `/authorize` login and registration interaction redirects should retarget onto

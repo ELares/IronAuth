@@ -1062,5 +1062,18 @@ name = "org_context"
 path = "tests/org_context.rs"
 required-features = ["testing"]
 
+# The effective organization ROLES token claim (issue #97, PR 6): the access token
+# carries the union of a member's direct, group, and ancestor-inherited roles, resolved
+# FRESH at every code exchange AND every refresh (the deliberate opposite of the frozen
+# org_id, whose stability org_context.rs pins). Pins the union, both directions of
+# freshness on both grants, absent-versus-empty, the fail-closed refusal on a store
+# fault, that neither the user's own stored claim document nor a client's stored custom
+# claims can forge the claim, that the ID token and both machine paths carry none, and
+# that two issuances against identical state are byte-identical.
+[[test]]
+name = "org_roles_claim"
+path = "tests/org_roles_claim.rs"
+required-features = ["testing"]
+
 [lints]
 workspace = true

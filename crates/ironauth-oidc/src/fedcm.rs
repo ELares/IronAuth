@@ -682,6 +682,9 @@ async fn mint_assertion(
         // FedCM does not carry an organization context in PR-B1 (issue #94 covers the
         // browser code grant): no org_id claim.
         org_id: None,
+        // FedCM mints an ID TOKEN only, and the `roles` claim (issue #97) rides the
+        // ACCESS token only, so this is inert on this path twice over.
+        roles: None,
         at_hash: None,
         c_hash: None,
         extra_claims: &extra_claims,

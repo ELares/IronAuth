@@ -961,6 +961,11 @@ async fn mint_front_channel_id_token(
         // ID token minted in the same request carries the SAME org_id the code flow
         // would. None when the session resolved no org.
         org_id: resolved.org_id,
+        // The front channel mints an ID TOKEN only here, and the `roles` claim (issue
+        // #97) rides the ACCESS token only, so it is inert on this path. A hybrid
+        // flow's access token is minted at the token endpoint, which resolves roles
+        // fresh at that point.
+        roles: None,
         at_hash: None,
         c_hash: c_hash.as_deref(),
         extra_claims: &extra_claims,

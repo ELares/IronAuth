@@ -48,6 +48,7 @@
 //! observable active state of every token issued from the code), the reuse is
 //! audited, and the caller gets the same `invalid_grant`.
 
+use std::collections::BTreeSet;
 use std::fmt;
 
 use axum::extract::State;
@@ -56,10 +57,10 @@ use axum::response::{IntoResponse, Response};
 use ironauth_jose::{Confirmation, DpopExpectations, JwsAlgorithm, validate_dpop_proof};
 use ironauth_store::{
     ActorRef, AuthorizationCodeId, ClientAuthRecord, ClientId, CodeBindings, CorrelationId,
-    IssuedTokenRecord, NewOpaqueAccessToken, NewRefreshFamily, RedeemOutcome, RefreshFamilyId,
-    RefreshFamilyOpenOutcome, RefreshRedeem, RefreshRedeemOutcome, RefreshTokenId,
+    IssuedTokenRecord, NewOpaqueAccessToken, NewRefreshFamily, OrganizationId, RedeemOutcome,
+    RefreshFamilyId, RefreshFamilyOpenOutcome, RefreshRedeem, RefreshRedeemOutcome, RefreshTokenId,
     RefreshTokenResolution, RotatedRefreshToken, Scope, ServiceId, SessionId, StoreError,
-    TokenKind,
+    TokenKind, UserId,
 };
 use serde::Deserialize;
 
@@ -734,6 +735,89 @@ async fn resolve_code_exchange_sid(
     Ok(Some(sid))
 }
 
+/// The subject's effective organization roles at THIS issuance (issue #97), resolved
+/// FRESH from the store rather than replayed from the code or the grant.
+///
+/// This is deliberately the OPPOSITE of `org_id` (issue #94), which freezes onto the
+/// session and then the grant so it is stable for the life of a refresh family. A role
+/// is an AUTHORIZATION input: a role granted or revoked after the code was issued must
+/// be reflected on the next token, so it is re-resolved on every code exchange AND
+/// every refresh. The cost is one bounded query per issuance; the alternative
+/// (freezing) would make a role revocation invisible for the whole family lifetime,
+/// which is not an acceptable property for an authorization claim.
+///
+/// `subject` must be the LOCAL user id the grant recorded, never the public subject
+/// the token carries: resolution is a store read keyed by the real user, and a
+/// pairwise `sub` names no `users` row. The two are the same string TODAY only
+/// because [`OidcState::resolve_public_subject`] hard-codes the public subject type
+/// while per-client pairwise configuration is unpersisted client-registration state
+/// (issue #19). Both call sites therefore resolve roles BEFORE deriving the public
+/// subject, so there is no `subject` binding in scope to pass here by mistake; the
+/// issue that persists the pairwise configuration must keep it that way, or every
+/// pairwise client with an organization context starts failing closed at the mint.
+///
+/// Returns [`None`] when there is no organization context, symmetric with `org_id`: a
+/// role is org-scoped, so with no org there is no set to resolve and the claim is
+/// ABSENT rather than empty. An empty [`Some`] is distinct and DOES emit an empty
+/// array; it means the resolution ran and found nothing, which covers a member
+/// holding no roles, a subject who is not a member at all, and an organization that
+/// is no longer live and active.
+///
+/// # The organization's own lifecycle is fenced in the STORE, not here
+///
+/// A DISABLED or soft-DELETED organization resolves to the EMPTY set, because
+/// [`ironauth_store::OrgGroupRepo::effective_roles`] fences the membership seed of
+/// its shared closure on the organization being live and active. It has to live
+/// there rather than here, and this call site is exactly why: NEITHER mint hook is
+/// in a position to check it. The refresh path never runs the authorize-time
+/// organization resolution at all (it reads the org context frozen onto the family's
+/// grant), and on a code exchange that resolution returns EARLY for an
+/// already-bound session, so its disabled-organization refusal never runs either. A
+/// check added here would also cover only this claim, leaving the admin
+/// effective-roles view disagreeing with the token about the same organization.
+///
+/// Note that `org_id` itself is still EMITTED for a disabled organization: the grant
+/// really is bound to it, and the honest wire answer is "this token is scoped to that
+/// organization and carries no roles in it" rather than a silently org-less token.
+///
+/// # Fails CLOSED
+///
+/// A store fault is a `server_error`, never a role-less token: silently omitting roles
+/// reads downstream as a successful authorization DOWNGRADE, which is a real security
+/// bug rather than a cosmetic omission. This is also why roles do NOT ride the ID
+/// token's `extra_claims` bag, which is deliberately fail-OPEN (under-claim rather
+/// than fail issuance). A frozen `org_id` that no longer parses in this scope, or a
+/// recorded subject that does not, is a store-integrity problem and fails closed for
+/// the same reason.
+///
+/// # Errors
+///
+/// [`TokenError::ServerError`] on a store fault or an unparsable recorded identifier.
+async fn resolve_effective_roles(
+    state: &OidcState,
+    scope: Scope,
+    subject: &str,
+    org_id: Option<&str>,
+) -> Result<Option<BTreeSet<String>>, TokenError> {
+    let Some(org_id) = org_id else {
+        return Ok(None);
+    };
+    let Ok(organization_id) = OrganizationId::parse_in_scope(org_id, &scope) else {
+        return Err(TokenError::ServerError);
+    };
+    let Ok(user_id) = UserId::parse_in_scope(subject, &scope) else {
+        return Err(TokenError::ServerError);
+    };
+    state
+        .store()
+        .scoped(scope)
+        .org_groups()
+        .effective_roles(&organization_id, &user_id, state.max_group_depth())
+        .await
+        .map(Some)
+        .map_err(|_| TokenError::ServerError)
+}
+
 /// Resolves the environment's issuer entry (its signer and algorithm policy)
 /// through the shared registry, then hands the borrowed signer and policy into the
 /// pure, synchronous [`tokens::mint`]: the async key resolution is confined here,
@@ -753,6 +837,13 @@ async fn mint_tokens(
     // invalid_grant, never a live token bound to a dead session.
     let sid = resolve_code_exchange_sid(state, scope, bindings).await?;
     let sid = sid.as_deref();
+    // Resolve the effective organization roles (issue #97) FRESH from the store, in
+    // the org context frozen onto the grant. Fresh, not frozen: unlike `org_id` this
+    // is re-read at every issuance, so a role granted or withdrawn since the code was
+    // minted is reflected here. Fails closed (server_error), never a role-less token.
+    let roles =
+        resolve_effective_roles(state, scope, &bindings.subject, bindings.org_id.as_deref())
+            .await?;
     let entry = state
         .issuer_entry(&scope)
         .await
@@ -804,6 +895,9 @@ async fn mint_tokens(
             // grant at authorization and read back here, emitted as the `org_id` claim
             // on both tokens. None when the session resolved no org.
             org_id: bindings.org_id.as_deref(),
+            // The effective organization roles (issue #97), resolved FRESH above and
+            // emitted on the ACCESS token only. None when there is no org context.
+            roles: roles.as_ref(),
             // A token-endpoint ID token never carries at_hash, and the code flow
             // never carries c_hash; the front-channel/hybrid path (#17) supplies
             // them. Both are absent here by construction.
@@ -1531,6 +1625,14 @@ fn decide_rotate(
 /// format selection as the code exchange, so a refreshed access token is shaped
 /// identically to a freshly issued one. The `acr`/`auth_methods` derive from the
 /// authentication event frozen onto the family at issuance (never re-derived).
+///
+/// The one thing this does NOT replay from the family is the effective organization
+/// role set (issue #97): it is re-resolved here, from the store, on every refresh.
+/// That hook is load-bearing rather than incidental. Refresh is the highest-volume
+/// grant, so a role change that only took effect on a NEW code exchange would be
+/// invisible for the entire refresh-family lifetime; re-resolving here is what caps
+/// the exposure at ONE ACCESS TOKEN LIFETIME. Do not "optimize" it into a frozen
+/// `resolution` field.
 async fn mint_refresh_access(
     state: &OidcState,
     scope: Scope,
@@ -1538,6 +1640,16 @@ async fn mint_refresh_access(
     target: &AccessTokenTarget,
     confirmation: Option<&Confirmation>,
 ) -> Result<(MintedAccessToken, i64), TokenError> {
+    // FRESH at every refresh (issue #97), in the org context frozen onto the family's
+    // grant. Fails closed: a store fault refuses the refresh rather than rotating out
+    // an access token whose missing roles read as a successful authorization downgrade.
+    let roles = resolve_effective_roles(
+        state,
+        scope,
+        &resolution.subject,
+        resolution.org_id.as_deref(),
+    )
+    .await?;
     let entry = state
         .issuer_entry(&scope)
         .await
@@ -1566,6 +1678,10 @@ async fn mint_refresh_access(
             // family's grant, so a refreshed access token keeps the same `org_id` the
             // code exchange minted. None when the grant carried no org.
             org_id: resolution.org_id.as_deref(),
+            // The effective organization roles (issue #97), re-resolved above rather
+            // than replayed: THIS is what makes a role change visible one access-token
+            // lifetime after it happens instead of one refresh-family lifetime.
+            roles: roles.as_ref(),
             at_hash: None,
             c_hash: None,
             extra_claims: &extra_claims,

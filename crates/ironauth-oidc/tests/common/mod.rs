@@ -270,14 +270,38 @@ impl Harness {
     /// Like [`Harness::start`] but with explicit OIDC settings (for the expiry
     /// test, which wants a short code lifetime).
     pub async fn start_with(config: OidcConfig) -> Self {
-        Self::start_inner(config, None, None).await
+        Self::start_inner(config, None, None, None).await
+    }
+
+    /// Like [`Harness::start`] but with an explicit organization group nesting bound
+    /// (issue #97) installed on the state the ROUTER is built from, mirroring
+    /// `ironauth_admin`'s `Harness::start_with_group_depth` on the management side.
+    ///
+    /// The bound has to be installed on that exact state, not on a clone, because the
+    /// property under test is that the value the boot path configures is the value the
+    /// mint passes to the store: an accessor probed on a throwaway clone proves the
+    /// builder works and says nothing about the wiring. Seeding still writes groups
+    /// through the CONTROL plane at the shipped default, so a test can stand up a tree
+    /// DEEPER than this bound, which is exactly the state an operator who lowers the
+    /// setting under a populated environment leaves behind.
+    pub async fn start_with_group_depth(max_group_depth: u32) -> Self {
+        Self::start_inner(
+            OidcConfig {
+                require_pkce_for_confidential_clients: false,
+                ..OidcConfig::default()
+            },
+            None,
+            None,
+            Some(max_group_depth),
+        )
+        .await
     }
 
     /// Like [`Harness::start_with`] but wiring a `private_key_jwt` client-key
     /// resolver (issue #25), so a `jwks_uri` client's keys resolve through the
     /// fetcher. Confidential PKCE is relaxed via the passed config.
     pub async fn start_with_resolver(config: OidcConfig, resolver: Arc<ClientKeyResolver>) -> Self {
-        Self::start_inner(config, Some(resolver), None).await
+        Self::start_inner(config, Some(resolver), None, None).await
     }
 
     /// Like [`Harness::start_with`] but with the tenant/environment quota engine
@@ -285,13 +309,14 @@ impl Harness {
     /// harness's deterministic clock. Used to drive the real `/authorize` request
     /// path into a 429 and to prove tenant fairness end to end.
     pub async fn start_with_quota(config: OidcConfig, quota_config: QuotaConfig) -> Self {
-        Self::start_inner(config, None, Some(quota_config)).await
+        Self::start_inner(config, None, Some(quota_config), None).await
     }
 
     async fn start_inner(
         config: OidcConfig,
         resolver: Option<Arc<ClientKeyResolver>>,
         quota_config: Option<QuotaConfig>,
+        max_group_depth: Option<u32>,
     ) -> Self {
         let (db, env, clock, scope, client_id) = Self::seed_common().await;
 
@@ -335,6 +360,13 @@ impl Harness {
             ),
         };
         let state = admin_gate_off(state);
+        // The deployment-wide organization group nesting bound (issue #97), installed
+        // on the SAME state the router is built from, exactly as the boot path does.
+        // Left untouched (the shipped default) when the test named none.
+        let state = match max_group_depth {
+            Some(depth) => state.with_max_group_depth(depth),
+            None => state,
+        };
         // Install the tenant/environment quota engine over the SAME deterministic
         // clock when the test asked for it (issue #50), so an over-quota scope on the
         // real request path short-circuits with a 429 and refill is clock-driven.
