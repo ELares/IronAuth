@@ -31,14 +31,27 @@
 //! REACH COUNTERS. A corpus that stopped reaching a rule would make this file agree
 //! vacuously. The #95 review found exactly that shape: a corpus structurally blind
 //! to three CHECKs because its generator could not reach the relevant values. Every
-//! rule the grammar states therefore has a counter asserted against a floor.
+//! rule the grammar states therefore has a counter asserted against a floor, and the
+//! counters answer the two questions a plain "did this rule appear" cannot:
+//!
+//!   * WHERE it appeared. The regex spells its charset as FOUR separate literal
+//!     classes (the first segment's head and tail, and a later segment's head and
+//!     tail), each of which can be widened on its own. A forbidden character reached
+//!     in one position says nothing about the other three, so every forbidden
+//!     character is counted PER POSITION and floored in each.
+//!   * WHICH HALF reached it. The hand-written and generated halves are counted
+//!     apart, because a floor met entirely by the hand-written cases is no assertion
+//!     at all about the generator, and this file's promise that a generator change
+//!     failing to reach a rule fails loudly depends on exactly that separation.
 
 use std::collections::BTreeMap;
 
 use ironauth_admin::require_permission_slug;
 use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
-use ironauth_store::{PermissionId, Scope};
+use ironauth_store::{
+    ActorRef, CorrelationId, OrgRoleId, OrganizationId, PermissionId, Scope, ServiceId,
+};
 use sqlx::{PgPool, Row};
 
 /// The Postgres "check violation" SQLSTATE. The ONLY refusal this file accepts as a
@@ -49,6 +62,16 @@ const CHECK_VIOLATION: &str = "23514";
 /// any 23514) is what stops a refusal by the display-name or kind CHECK from being
 /// miscounted as a slug refusal.
 const SLUG_CONSTRAINT: &str = "permissions_slug_valid";
+
+/// The shipped ROLE slug CHECK (migration 0086), which the permission grammar claims
+/// to be a STRICT SUBSET of.
+const ROLE_SLUG_CONSTRAINT: &str = "org_roles_slug_valid";
+
+/// The corpus seed, hard-coded so a failure in CI is reproducible from the log alone.
+const SEED: u64 = 0x9851_5055_5F50_5254;
+
+/// How many generated cases the corpus carries.
+const GENERATED: usize = 220;
 
 /// A deterministic `SplitMix64` stream, seeded from a hard-coded constant so a
 /// failure in CI is reproducible from the log alone. A file-local generator rather
@@ -174,10 +197,23 @@ fn explicit_corpus() -> Vec<String> {
         cases.push(refused.to_owned());
     }
 
-    // Every remaining forbidden character, placed inside an otherwise perfect slug,
-    // so each one is reached individually rather than as an aggregate.
+    // Every forbidden character at ALL FOUR positions the grammar spells as separate
+    // literal character classes: the first segment's HEAD and TAIL, and a later
+    // segment's HEAD and TAIL. One placement per character is NOT enough, and the
+    // reason is structural rather than stylistic: the regex is
+    // `^[a-z0-9][a-z0-9_-]*(\.[a-z0-9][a-z0-9_-]*)+$`, four classes that can drift
+    // independently. A corpus placing every forbidden character only in the first
+    // segment's tail lets a widened LATER-SEGMENT TAIL class produce zero
+    // disagreements: `(\.[a-z0-9][:a-z0-9_-]*)+` accepts `billing.read:orders` while
+    // the Rust validator still refuses it, and the parity assertion stays green.
+    // That matters because the join-safety covenant rests on exactly these
+    // exclusions: `:` is excluded so a slug can never be confused with an RFC 8707
+    // resource indicator or an OAuth scope token.
     for forbidden in FORBIDDEN {
+        cases.push(format!("{forbidden}x.read"));
         cases.push(format!("billing{forbidden}x.read"));
+        cases.push(format!("billing.{forbidden}read"));
+        cases.push(format!("billing.rea{forbidden}d"));
     }
 
     // A value whose CHARACTER count is inside the bound while its BYTE count is not.
@@ -247,10 +283,73 @@ fn uppercase_a_tail_character(base: &str) -> String {
     format!("{head}{}", last.to_uppercase())
 }
 
-/// What the corpus reached. Every rule the grammar states gets a counter, so a
-/// generator change that stops reaching one fails loudly instead of leaving this
-/// file agreeing about nothing.
-#[derive(Default)]
+/// Where in a slug a character sits.
+///
+/// The grammar spells its charset as FOUR separate literal classes (the first
+/// segment's head and tail, and a later segment's head and tail), and each can be
+/// widened independently. A counter that only asks "did this character appear
+/// somewhere" is satisfied by a single placement and says nothing about the other
+/// three classes, which is the position blindness this enum exists to remove.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum Position {
+    FirstHead,
+    FirstTail,
+    LaterHead,
+    LaterTail,
+}
+
+impl Position {
+    /// Every position, so a floor can be asserted for each one individually.
+    const ALL: [Self; 4] = [
+        Self::FirstHead,
+        Self::FirstTail,
+        Self::LaterHead,
+        Self::LaterTail,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::FirstHead => "the FIRST segment's head",
+            Self::FirstTail => "the FIRST segment's tail",
+            Self::LaterHead => "a LATER segment's head",
+            Self::LaterTail => "a LATER segment's tail",
+        }
+    }
+}
+
+/// Every distinct [`Position`] at which `needle` occurs in `case`.
+fn positions_of(case: &str, needle: char) -> Vec<Position> {
+    let mut found: Vec<Position> = Vec::new();
+    for (segment_index, segment) in case.split('.').enumerate() {
+        for (offset, character) in segment.chars().enumerate() {
+            if character != needle {
+                continue;
+            }
+            let position = match (segment_index == 0, offset == 0) {
+                (true, true) => Position::FirstHead,
+                (true, false) => Position::FirstTail,
+                (false, true) => Position::LaterHead,
+                (false, false) => Position::LaterTail,
+            };
+            if !found.contains(&position) {
+                found.push(position);
+            }
+        }
+    }
+    found
+}
+
+/// What one HALF of the corpus reached. Every rule the grammar states gets a
+/// counter, so a generator change that stops reaching one fails loudly instead of
+/// leaving this file agreeing about nothing.
+///
+/// The two halves are counted SEPARATELY, and the reason is the same shape this file
+/// exists to catch: several floors were met exactly by the hand-written half, so the
+/// documented promise that a generator change failing to reach a rule fails loudly
+/// was FALSE for those rules. Disabling a generator arm moved a shared counter by a
+/// number no floor could see. Separate counters make each floor bind on the half it
+/// is a claim about.
+#[derive(Default, Debug)]
 struct Reach {
     accepted: usize,
     refused: usize,
@@ -262,11 +361,13 @@ struct Reach {
     exactly_64: usize,
     over_63: usize,
     uppercase: usize,
+    uppercase_at_a_head: usize,
     uppercase_in_a_tail: usize,
     non_ascii: usize,
     empty: usize,
     segment_leading_punctuation: usize,
-    forbidden: BTreeMap<char, usize>,
+    forbidden: BTreeMap<(char, Position), usize>,
+    forbidden_anywhere: usize,
 }
 
 impl Reach {
@@ -276,10 +377,15 @@ impl Reach {
         } else {
             self.refused += 1;
         }
+        let mut carries_a_forbidden_character = false;
         for forbidden in FORBIDDEN {
-            if case.contains(*forbidden) {
-                *self.forbidden.entry(*forbidden).or_default() += 1;
+            for position in positions_of(case, *forbidden) {
+                carries_a_forbidden_character = true;
+                *self.forbidden.entry((*forbidden, position)).or_default() += 1;
             }
+        }
+        if carries_a_forbidden_character {
+            self.forbidden_anywhere += 1;
         }
         if case.is_empty() {
             self.empty += 1;
@@ -308,6 +414,15 @@ impl Reach {
         if case.chars().any(char::is_uppercase) {
             self.uppercase += 1;
         }
+        // The head-position counter, which binds the generator arm that uppercases
+        // the WHOLE value. Without it, `uppercase` alone cannot tell that arm from
+        // the tail-only one below: disabling either leaves the other still counting.
+        if case
+            .split('.')
+            .any(|segment| segment.chars().next().is_some_and(char::is_uppercase))
+        {
+            self.uppercase_at_a_head += 1;
+        }
         // The FINER counter, and the reason it exists: a corpus whose uppercase cases
         // all sit at a segment HEAD is refused by the head rule no matter what the
         // TAIL charset allows, so it asserts nothing about the tail. A mutation
@@ -333,18 +448,25 @@ impl Reach {
         }
     }
 
-    fn assert_every_rule_was_reached(&self) {
+    /// The floors the HAND-WRITTEN half must meet: every rule a reader would ask
+    /// about by name, plus every forbidden character AT EVERY POSITION.
+    fn assert_the_named_cases_reached_every_rule(&self) {
         for (label, count, floor) in [
-            ("an accepted case", self.accepted, 40),
+            ("an accepted case", self.accepted, 15),
             ("a refused case", self.refused, 80),
-            ("a leading dot", self.leading_dot, 5),
-            ("a trailing dot", self.trailing_dot, 5),
-            ("a doubled dot", self.doubled_dot, 5),
-            ("a single segment", self.single_segment, 5),
+            ("a leading dot", self.leading_dot, 4),
+            ("a trailing dot", self.trailing_dot, 2),
+            ("a doubled dot", self.doubled_dot, 3),
+            ("a single segment", self.single_segment, 3),
             ("exactly 63 bytes", self.exactly_63, 2),
             ("exactly 64 bytes", self.exactly_64, 1),
-            ("more than 63 bytes", self.over_63, 5),
+            ("more than 63 bytes", self.over_63, 2),
             ("an uppercase character", self.uppercase, 5),
+            (
+                "an uppercase character at a segment HEAD",
+                self.uppercase_at_a_head,
+                3,
+            ),
             (
                 "an uppercase character in a segment TAIL",
                 self.uppercase_in_a_tail,
@@ -360,18 +482,87 @@ impl Reach {
         ] {
             assert!(
                 count >= floor,
-                "the corpus reached {label} only {count} times (floor {floor}); a corpus \
-                 that cannot reach a rule makes this parity assertion vacuous for it"
+                "the hand-written corpus reached {label} only {count} times (floor \
+                 {floor}); a corpus that cannot reach a rule makes this parity assertion \
+                 vacuous for it"
             );
         }
-        // EVERY forbidden character individually, not merely "some forbidden
-        // character appeared somewhere".
+        // EVERY forbidden character at EVERY POSITION, not merely "some forbidden
+        // character appeared somewhere". The four positions are four separate literal
+        // classes in the deployed regex, and widening any one of them is a real
+        // weakening that a single placement cannot see.
         for forbidden in FORBIDDEN {
-            let count = self.forbidden.get(forbidden).copied().unwrap_or_default();
+            for position in Position::ALL {
+                let count = self
+                    .forbidden
+                    .get(&(*forbidden, position))
+                    .copied()
+                    .unwrap_or_default();
+                assert!(
+                    count >= 1,
+                    "the corpus never reached the forbidden character {forbidden:?} at \
+                     {}; its exclusion THERE is asserted by nothing, and that class of \
+                     the regex could be widened with this file still green",
+                    position.label()
+                );
+            }
+        }
+    }
+
+    /// The floors the GENERATED half must meet.
+    ///
+    /// Each floor is calibrated against the count that SURVIVES disabling the arm
+    /// that feeds it, measured arm by arm, so the floor genuinely fires rather than
+    /// being satisfied by whatever else happens to reach the rule. Six of these bind
+    /// ONE arm exactly (the survivors are 0), and the tail-uppercase floor is set
+    /// above its survivor of 8 for the same reason: that arm is the one added to kill
+    /// the tail-uppercase mutant, and a floor it could not detect the loss of would be
+    /// the very shape this file exists to prevent.
+    ///
+    /// `a single segment` is the ONE floor here that binds the RULE rather than one
+    /// arm: a quarter of the generated bases are single-segment before any mutation,
+    /// so 44 of the 56 survive the delimiter-stripping arm. It is kept honest by
+    /// saying so rather than by a floor that pretends otherwise.
+    ///
+    /// The per-position forbidden floors deliberately are NOT asserted here: this
+    /// generator only ever APPENDS a forbidden character, so by construction it
+    /// reaches a tail and never a head. The aggregate is what binds that arm, and the
+    /// four positions are covered by the hand-written half.
+    fn assert_every_generator_arm_is_live(&self) {
+        for (label, count, floor) in [
+            ("an accepted case", self.accepted, 8),
+            ("a refused case", self.refused, 80),
+            ("a leading dot (arm 2, survivor 0)", self.leading_dot, 8),
+            ("a trailing dot (arm 3, survivor 0)", self.trailing_dot, 8),
+            ("a doubled dot (arm 4, survivor 0)", self.doubled_dot, 8),
+            (
+                "a single segment (arms 0, 1, and 5)",
+                self.single_segment,
+                8,
+            ),
+            ("more than 63 bytes (arm 8, survivor 0)", self.over_63, 12),
+            (
+                "an uppercase character at a segment HEAD (arm 6, survivor 0)",
+                self.uppercase_at_a_head,
+                12,
+            ),
+            (
+                "an uppercase character in a segment TAIL (arm 7, survivor 8)",
+                self.uppercase_in_a_tail,
+                12,
+            ),
+            (
+                "a forbidden character (arm 9, survivor 0)",
+                self.forbidden_anywhere,
+                12,
+            ),
+        ] {
             assert!(
-                count >= 1,
-                "the corpus never reached the forbidden character {forbidden:?}; its \
-                 exclusion is therefore asserted by nothing"
+                count >= floor,
+                "the GENERATED corpus reached {label} only {count} times (floor {floor}); \
+                 a generator that stopped reaching this rule would leave this file \
+                 agreeing about nothing for it, and the hand-written half cannot cover \
+                 for it because the two are counted apart"
             );
         }
     }
@@ -442,15 +633,24 @@ async fn the_rust_validator_and_the_postgres_check_agree_case_by_case() {
     let scope = db.seed_scope(&env).await;
     let pool = db.control_pool();
 
-    let mut corpus = explicit_corpus();
-    corpus.extend(generated_corpus(0x9851_5055_5F50_5254, 220));
+    let explicit = explicit_corpus();
+    let generated = generated_corpus(SEED, GENERATED);
+    let corpus: Vec<String> = explicit.iter().chain(generated.iter()).cloned().collect();
 
-    let mut reach = Reach::default();
+    // The two halves are counted SEPARATELY: a floor met by the hand-written cases
+    // says nothing about whether the generator still reaches the rule, and several
+    // floors in this file were met exactly that way before.
+    let mut explicit_reach = Reach::default();
+    let mut generated_reach = Reach::default();
     let mut disagreements: Vec<String> = Vec::new();
-    for case in &corpus {
+    for (index, case) in corpus.iter().enumerate() {
         let rust = require_permission_slug(case, "slug").is_ok();
         let postgres = postgres_accepts(pool, &env, scope, case).await;
-        reach.observe(case, rust);
+        if index < explicit.len() {
+            explicit_reach.observe(case, rust);
+        } else {
+            generated_reach.observe(case, rust);
+        }
         if rust != postgres {
             disagreements.push(format!(
                 "{case:?}: the Rust validator says {rust}, the CHECK says {postgres}"
@@ -475,7 +675,147 @@ async fn the_rust_validator_and_the_postgres_check_agree_case_by_case() {
         corpus.len(),
         disagreements.join("\n")
     );
-    reach.assert_every_rule_was_reached();
+    explicit_reach.assert_the_named_cases_reached_every_rule();
+    generated_reach.assert_every_generator_arm_is_live();
+}
+
+/// The STORAGE half's verdict on one slug used as a ROLE name: attempt the real
+/// insert into `org_roles`, then roll it back. `true` means the deployed
+/// `org_roles_slug_valid` CHECK accepted the value.
+///
+/// Anything other than a clean success or a 23514 naming that constraint panics, for
+/// the same reason the permission probe does: a refusal by the display-name CHECK, by
+/// the live-uniqueness index, by the isolation policy, or by a foreign key is NOT a
+/// verdict about the slug.
+async fn org_roles_accepts(
+    pool: &PgPool,
+    env: &Env,
+    scope: Scope,
+    organization: &OrganizationId,
+    slug: &str,
+) -> bool {
+    let id = OrgRoleId::generate(env, &scope).to_string();
+    let mut tx = pool.begin().await.expect("begin role probe");
+    bind_scope(&mut tx, scope).await;
+    let result = sqlx::query(
+        "INSERT INTO org_roles \
+         (id, tenant_id, environment_id, organization_id, slug, display_name) \
+         VALUES ($1, $2, $3, $4, $5, 'strict subset probe')",
+    )
+    .bind(&id)
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(organization.to_string())
+    .bind(slug)
+    .execute(&mut *tx)
+    .await;
+    let _ = tx.rollback().await;
+
+    match result {
+        Ok(_) => true,
+        Err(error) => {
+            let database_error = error.as_database_error().unwrap_or_else(|| {
+                panic!("role slug {slug:?} failed outside the database: {error}")
+            });
+            let code = database_error.code().unwrap_or_default().into_owned();
+            let constraint = database_error.constraint().unwrap_or_default().to_owned();
+            assert_eq!(
+                (code.as_str(), constraint.as_str()),
+                (CHECK_VIOLATION, ROLE_SLUG_CONSTRAINT),
+                "role slug {slug:?} was refused by something other than the role slug \
+                 CHECK: {error}"
+            );
+            false
+        }
+    }
+}
+
+/// The text of one deployed CHECK constraint.
+async fn constraint_definition(pool: &PgPool, table: &str, constraint: &str) -> String {
+    sqlx::query(
+        "SELECT pg_get_constraintdef(oid) AS def FROM pg_catalog.pg_constraint \
+         WHERE conrelid = $1::regclass AND conname = $2",
+    )
+    .bind(table)
+    .bind(constraint)
+    .fetch_one(pool)
+    .await
+    .unwrap_or_else(|error| panic!("{constraint} on {table} must exist: {error}"))
+    .get("def")
+}
+
+#[tokio::test]
+async fn every_slug_the_deployed_permission_check_accepts_is_a_valid_role_slug() {
+    // The STRICT SUBSET claim, against the DEPLOYED role CHECK.
+    //
+    // That claim is what avoids a second slug grammar and a migration on 0086 and
+    // 0087: every valid permission slug must also be a valid role slug. It was
+    // asserted in exactly one place, `ironauth_admin::input`'s unit test, against the
+    // Rust `require_slug` COPY of the role charset over seven hard-coded slugs. The
+    // shipped `org_roles_slug_valid` CHECK was never consulted, so the claim rested on
+    // a copy agreeing with a copy: a role CHECK that drifted from its Rust twin, or a
+    // permission grammar widened past the role charset, would leave the claim standing
+    // and false. This file already has a database; the claim is asserted on it.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let pool = db.control_pool();
+
+    // A role needs an organization to belong to (the 0086 foreign key), so one is
+    // created through the ordinary audited management path.
+    let organization = OrganizationId::generate(&env, &scope);
+    db.control_store()
+        .management()
+        .acting(
+            ActorRef::service(ServiceId::generate(&env)),
+            CorrelationId::generate(&env),
+        )
+        .organizations(scope)
+        .create(&env, &organization, 1_000_000, "strict subset probe", None)
+        .await
+        .expect("create the probe organization");
+
+    let mut corpus = explicit_corpus();
+    corpus.extend(generated_corpus(SEED, GENERATED));
+
+    let mut checked = 0_usize;
+    for case in &corpus {
+        // The Rust validator is only the cheap PREFILTER here; the assertion below is
+        // what makes the selected case a DEPLOYED permission verdict, and the parity
+        // test above is what guarantees the prefilter selects exactly the set the
+        // permission CHECK accepts.
+        if require_permission_slug(case, "slug").is_err() {
+            continue;
+        }
+        assert!(
+            postgres_accepts(pool, &env, scope, case).await,
+            "the prefilter and the deployed permission CHECK disagree about {case:?}"
+        );
+        assert!(
+            org_roles_accepts(pool, &env, scope, &organization, case).await,
+            "{case:?} is accepted as a permission slug but REFUSED by the deployed role \
+             CHECK; the permission grammar has stopped being a strict subset of the role \
+             charset, and the claim that migrations 0086 and 0087 need no change is false"
+        );
+        checked += 1;
+    }
+    assert!(
+        checked >= 15,
+        "only {checked} accepted permission slugs reached the role CHECK; a corpus that \
+         accepts almost nothing would make this subset claim vacuous"
+    );
+
+    // `org_groups` carries the SAME charset in a CHECK of its own (0087), and the
+    // subset claim is made about both. Rather than repeat the insert sweep against a
+    // second table, the two deployed texts are pinned EQUAL: whichever one a later
+    // migration edits, they stop matching and this fails.
+    let owner = db.owner_pool();
+    assert_eq!(
+        constraint_definition(owner, "org_roles", ROLE_SLUG_CONSTRAINT).await,
+        constraint_definition(owner, "org_groups", "org_groups_slug_valid").await,
+        "the role and group slug CHECKs must stay the SAME charset; the permission \
+         grammar is claimed to be a strict subset of one alphabet, not of two"
+    );
 }
 
 #[tokio::test]

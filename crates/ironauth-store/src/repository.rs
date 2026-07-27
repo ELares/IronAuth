@@ -32914,6 +32914,35 @@ impl OrgRoleRepo<'_> {
 /// The projection every permission read selects from `permissions` (the two
 /// timestamps as epoch microseconds, the metadata as JSON text). One constant so
 /// the get, slug, and list projections cannot drift.
+///
+/// # Scope-predicate redundancy census
+///
+/// Every read below repeats `tenant_id` and `environment_id` in its `WHERE`
+/// even though `permissions_tenant_isolation` already fences both. The
+/// redundancy is ONE WAY, and the direction matters, so it is recorded here
+/// rather than left for a future reader to rediscover by deleting the wrong
+/// half:
+///
+/// * The POLICY's `environment_id` conjunct is LOAD BEARING. Removing it from
+///   the `USING` and `WITH CHECK` halves lets a session bound to one
+///   environment read, forge into, and update another environment's rows.
+///   `rls_hides_another_scopes_vocabulary_and_refuses_forging_one` kills that
+///   mutation, using a third scope that differs from the first ONLY in the
+///   environment. A pair that differs in the tenant too cannot hold this
+///   property, because the tenant conjunct refuses first and the environment
+///   conjunct is then asserted by nothing.
+/// * These STATEMENT predicates are defense in depth and are individually
+///   UNOBSERVABLE while the policy holds: neutering one alone leaves the whole
+///   suite green, because the policy refuses the same rows anyway. Neutering
+///   BOTH layers is caught by the same test. They are kept because a statement
+///   that names its own scope is readable on its own terms and does not depend
+///   on a reader knowing the policy exists, which is the same argument
+///   `EFFECTIVE_ROLE_SLUGS_TAIL` records for its own redundant organization
+///   predicates.
+///
+/// Do not delete either half on the grounds that a mutation survives: the
+/// survival is the expected consequence of the backstop, not evidence the
+/// predicate is dead.
 const PERMISSION_SELECT_COLUMNS: &str = "id, kind, slug, display_name, \
      metadata::text AS metadata_text, \
      (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us, \

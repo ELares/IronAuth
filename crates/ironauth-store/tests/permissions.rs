@@ -8,9 +8,13 @@
 //! surfaces are a uniform not-found for an absent, a deleted, and a foreign-scope
 //! permission alike (the anti-oracle discipline); a permission and an entitlement may
 //! share a slug because `kind` is part of the live uniqueness key (the issue #103
-//! headroom, exercised rather than merely declared); forced row-level security hides
+//! headroom, exercised rather than merely declared, in BOTH directions: the shared
+//! slug is free across kinds and taken within one); forced row-level security hides
 //! another scope's vocabulary even with the app-layer filter subverted AND refuses to
-//! write into another scope; the grants are least-privilege (the data plane is read
+//! write into another scope, with the TENANT and the ENVIRONMENT each the deciding
+//! dimension in probes of its own; the repository's own scope conjuncts fence
+//! independently of that policy; the `(created_at, id)` page cursor stays total
+//! across a tied `created_at`; the grants are least-privilege (the data plane is read
 //! only, and `slug` and `kind` are immutable by GRANT on BOTH roles); an unrecognized
 //! stored `kind` fails the read CLOSED rather than defaulting into the kind a token
 //! claim selects; and there is NO cap on how many permissions an environment may
@@ -60,7 +64,9 @@ async fn bind_scope(
 
 /// Define a permission through the CONTROL pool, at an explicit creation time so a
 /// test can pin several rows to the same instant and exercise the `(created_at, id)`
-/// cursor tiebreak. The instant still originates at the caller's env clock seam;
+/// cursor tiebreak, which
+/// [`the_list_cursor_stays_total_and_stable_across_a_tied_created_at`] does. The
+/// instant is supplied by the caller (a literal, or a reading of the env clock seam);
 /// nothing here reads a wall clock of its own.
 async fn plant_at(
     db: &TestDatabase,
@@ -205,6 +211,15 @@ async fn absent_deleted_and_foreign_scope_permissions_are_all_the_same_not_found
     let env = Env::system();
     let scope_a = db.seed_scope(&env).await;
     let scope_b = db.seed_scope(&env).await;
+    // A THIRD scope differing from A in the ENVIRONMENT ALONE. `seed_scope` mints a
+    // NEW tenant on every call, so scope_a and scope_b differ in BOTH dimensions and
+    // the tenant half of every fence decides every probe between them; a foreign
+    // scope that differs only in the environment is the case that makes the
+    // environment half deciding. This follows org_roles.rs case 4.
+    let scope_a2 = Scope::new(
+        scope_a.tenant(),
+        db.seed_environment(&env, scope_a.tenant()).await,
+    );
 
     let live = plant(&db, &env, scope_a, "billing.read", "Read billing", 1_000)
         .await
@@ -216,6 +231,9 @@ async fn absent_deleted_and_foreign_scope_permissions_are_all_the_same_not_found
     let foreign = plant(&db, &env, scope_b, "billing.read", "Read billing", 3_000)
         .await
         .expect("plant in scope B");
+    let other_environment = plant(&db, &env, scope_a2, "staging.read", "Read staging", 4_000)
+        .await
+        .expect("plant in the same tenant's OTHER environment");
 
     let repo = db.control_store().management().permissions(scope_a);
 
@@ -238,25 +256,36 @@ async fn absent_deleted_and_foreign_scope_permissions_are_all_the_same_not_found
         Err(StoreError::NotFound)
     ));
 
-    // 3. Foreign scope: the typed id fails to parse in scope before any query runs,
-    //    and the raw string is refused by the same not-found rather than a distinct
-    //    parse error a caller could tell apart.
+    // 3. Foreign TENANT and 4. foreign ENVIRONMENT of the SAME tenant: the typed id
+    //    fails to parse in scope before any query runs, and the raw string is refused
+    //    by the same not-found rather than a distinct parse error a caller could tell
+    //    apart. Both dimensions are probed, so neither is decided only by the other.
+    for foreign in [&foreign, &other_environment] {
+        assert!(matches!(
+            repo.parse_id(&foreign.to_string()),
+            Err(StoreError::NotFound)
+        ));
+        assert!(matches!(repo.get(foreign).await, Err(StoreError::NotFound)));
+    }
+    // The other environment's SLUG is the uniform not-found too, which is the
+    // (kind, slug) address's version of the same fence. Two layers stand behind this
+    // one: the repository's own `environment_id` conjunct and, behind it, the
+    // in-scope id decode, so this assertion alone cannot tell which refused. The
+    // repository conjunct is pinned on its own by
+    // `the_repository_fences_by_environment_even_when_the_policy_no_longer_does`.
     assert!(matches!(
-        repo.parse_id(&foreign.to_string()),
-        Err(StoreError::NotFound)
-    ));
-    assert!(matches!(
-        repo.get(&foreign).await,
+        repo.get_by_slug(PermissionEntryKind::Permission, "staging.read")
+            .await,
         Err(StoreError::NotFound)
     ));
 
-    // 4. A malformed id is the same answer again.
+    // 5. A malformed id is the same answer again.
     assert!(matches!(
         repo.parse_id("prm_not-base64-!!"),
         Err(StoreError::NotFound)
     ));
 
-    // 5. The (kind, slug) address is not an oracle either: the RIGHT slug under the
+    // 6. The (kind, slug) address is not an oracle either: the RIGHT slug under the
     //    WRONG kind is the uniform not-found, never the other row.
     assert!(matches!(
         repo.get_by_slug(PermissionEntryKind::Entitlement, "billing.read")
@@ -264,8 +293,9 @@ async fn absent_deleted_and_foreign_scope_permissions_are_all_the_same_not_found
         Err(StoreError::NotFound)
     ));
 
-    // 6. Scope B's row is invisible to a scope A LIST as well as to a scope A get,
-    //    which is what proves the list is fenced and not merely the point read.
+    // 7. Neither foreign row reaches a scope A LIST, which is what proves the list is
+    //    fenced and not merely the point read. Scope B's row is fenced by the tenant
+    //    and scope A2's by the environment, so one page proves both.
     let listed = repo
         .list(PermissionEntryKind::Permission, 50, None)
         .await
@@ -308,6 +338,35 @@ async fn a_permission_and_an_entitlement_may_share_one_slug() {
     .await
     .expect("the same slug is free under the other kind");
     assert_ne!(permission, entitlement);
+
+    // The OTHER half of the same key, and the half nothing asserted before: two LIVE
+    // ENTITLEMENTS may not share a slug either. Every live-uniqueness probe in this
+    // file sat at `kind = 'permission'`, so narrowing the index predicate to
+    // `WHERE deleted_at IS NULL AND kind = 'permission'` left this file and the
+    // migration structure test green (`partial_unique_index_exists` reads only
+    // `indpred IS NOT NULL` and `index_columns` only `indkey`; both are blind to a
+    // narrowed predicate) while #103's entitlements would get no uniqueness at all:
+    // `get_by_slug` would return an arbitrary duplicate and soft-deleting "the"
+    // entitlement would leave a live twin still granting it.
+    let duplicate = plant_at(
+        &db,
+        &env,
+        scope,
+        PermissionEntryKind::Entitlement,
+        "plan.enterprise",
+        "Duplicate entitlement",
+        3_000,
+    )
+    .await
+    .expect_err("a LIVE entitlement slug is taken too");
+    let database_error = duplicate.as_database_error().expect("a database error");
+    assert_eq!(database_error.code().as_deref(), Some(UNIQUE_VIOLATION));
+    assert_eq!(
+        database_error.constraint(),
+        Some("permissions_kind_slug_live_uniq"),
+        "the second live entitlement must be refused by the live-uniqueness index, \
+         by name, and not by something else that happens to fail"
+    );
 
     let repo = db.control_store().management().permissions(scope);
     assert_eq!(
@@ -439,16 +498,122 @@ async fn an_environment_may_define_unlimited_permissions_and_the_list_pages_them
     assert_eq!(unique.len(), DEFINED, "no duplication across pages");
 }
 
+/// How many permissions the cursor-tiebreak test pins to ONE instant. Comfortably
+/// more than the page size it is walked at, so a page boundary lands INSIDE the tie.
+const TIED: usize = 10;
+
+#[tokio::test]
+async fn the_list_cursor_stays_total_and_stable_across_a_tied_created_at() {
+    // Every row shares ONE creation instant, so `created_at` alone cannot order them
+    // and the id half of the `(created_at, id)` pagination key is the only thing
+    // making the order total. Nothing asserted that before: every other caller of
+    // `plant_at` in this file passes a DISTINCT instant (1_000 / 2_000 / 3_000, and
+    // the covenant walk's `1_000 + index`), so no two rows ever shared a created_at
+    // and the id half of the key was exercised nowhere. Replacing the row comparison
+    // `(created_at, id) > (ts, $5)` in `PermissionRepo::list` with a created_at-only
+    // comparison left this whole file green while a walk of ten tied rows returned
+    // four and silently lost six.
+    //
+    // Ties are not hypothetical here: `created_at` defaults to `now()`, which is the
+    // TRANSACTION clock, so any multi-row define in one transaction produces
+    // byte-identical timestamps, and this table's covenant invites unbounded
+    // vocabularies. org_roles.rs ships exactly this walk; the SQL was copied here
+    // without it.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let tied = 7_000_i64;
+    for index in 0..TIED {
+        plant(
+            &db,
+            &env,
+            scope,
+            &format!("billing.tied_{index}"),
+            "Tied",
+            tied,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("permission {index} must be definable: {error:?}"));
+    }
+
+    let repo = db.control_store().management().permissions(scope);
+
+    // The whole set in one unpaged read: the reference order, in the database's own
+    // terms rather than any assumption about how Rust would sort the ids.
+    let whole = repo
+        .list(PermissionEntryKind::Permission, 50, None)
+        .await
+        .expect("unpaged list of the tied set");
+    let reference: Vec<String> = whole.iter().map(|record| record.slug.clone()).collect();
+    assert_eq!(reference.len(), TIED, "the whole tied set is listed");
+    assert!(
+        whole
+            .iter()
+            .all(|record| record.created_at_unix_micros == tied),
+        "the tie is real: every row shares one creation time"
+    );
+
+    // Walk the same set in pages of four, TWICE. A page boundary lands inside the
+    // tie, which is where a cursor keyed on created_at alone repeats or drops a row.
+    for attempt in 0..2 {
+        let mut walked: Vec<String> = Vec::new();
+        let mut cursor: Option<CursorPosition> = None;
+        loop {
+            let page = repo
+                .list(PermissionEntryKind::Permission, 4, cursor.as_ref())
+                .await
+                .expect("page of the tied set");
+            let Some(last) = page.last() else {
+                break;
+            };
+            cursor = Some(CursorPosition {
+                created_at_unix_micros: last.created_at_unix_micros,
+                id: last.id.to_string(),
+            });
+            walked.extend(page.iter().map(|record| record.slug.clone()));
+        }
+        assert_eq!(
+            walked, reference,
+            "walk {attempt}: paging a tied set must reproduce the unpaged order exactly, \
+             with no row skipped and none served twice at a page boundary"
+        );
+        let unique: std::collections::BTreeSet<&String> = walked.iter().collect();
+        assert_eq!(
+            unique.len(),
+            TIED,
+            "walk {attempt}: every slug in the tied set is seen exactly once"
+        );
+    }
+}
+
 #[tokio::test]
 async fn rls_hides_another_scopes_vocabulary_and_refuses_forging_one() {
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope_a = db.seed_scope(&env).await;
     let scope_b = db.seed_scope(&env).await;
+    // A THIRD scope differing from A in the ENVIRONMENT ALONE, and the reason it must
+    // exist: `seed_scope` mints a NEW TENANT on every call, so scope_a and scope_b
+    // differ in BOTH dimensions and the policy's TENANT conjunct decides every probe
+    // between them regardless of what its environment conjunct says. Deleting
+    // `AND environment_id = ...` from BOTH halves of the policy left this entire
+    // file, the migration structure test, the IDOR probes, the parity oracle, and the
+    // fuzz target green, while a session bound to (T, E1) could read, relabel,
+    // soft-delete, and forge rows in (T, E2). This table's policy is THE COMPLETE
+    // FENCE (there is no organization predicate repeated behind it), so half a fence
+    // guarded by nothing is the whole exposure.
+    let scope_a2 = Scope::new(
+        scope_a.tenant(),
+        db.seed_environment(&env, scope_a.tenant()).await,
+    );
 
     plant(&db, &env, scope_b, "billing.read", "Read billing", 1_000)
         .await
         .expect("plant in scope B");
+    plant(&db, &env, scope_a2, "staging.read", "Read staging", 2_000)
+        .await
+        .expect("plant in the same tenant's OTHER environment");
 
     let pool = db.control_pool();
 
@@ -473,36 +638,28 @@ async fn rls_hides_another_scopes_vocabulary_and_refuses_forging_one() {
         .get("c");
     assert_eq!(unset, 0, "an unset scope must see no permissions");
 
+    // 2, 3, and 4. Read-side isolation with the app-layer filter subverted, both
+    //    write-side probes, and the forge INSERT, run TWICE: once against a victim
+    //    that differs in the TENANT and once against one that differs ONLY in the
+    //    ENVIRONMENT. Each conjunct of the policy is therefore the deciding one in at
+    //    least one probe, and neither can be deleted without a red test.
+    for (victim, differing) in [(scope_b, "TENANT"), (scope_a2, "ENVIRONMENT")] {
+        assert_fenced_from(pool, &env, scope_a, victim, differing).await;
+    }
+
+    // 4b. The WIDER, tenant-only spelling of the two write probes as well: not merely
+    //     scope B's rows in scope B's environment, but every row of tenant B in ANY
+    //     environment, is unreachable from a scope A session. Kept alongside the
+    //     two-column probes above because it is the strictly larger claim for the
+    //     tenant half.
     {
-        let mut tx = pool.begin().await.expect("begin as scope A");
+        let mut tx = pool.begin().await.expect("begin tenant-wide write probe");
         bind_scope(
             &mut tx,
             &scope_a.tenant().to_string(),
             &scope_a.environment().to_string(),
         )
         .await;
-
-        // 2. Read-side isolation with the app-layer filter SUBVERTED: bound to A, the
-        //    query explicitly targets B's rows. Forced row-level security still
-        //    returns zero.
-        let leaked: i64 = sqlx::query(
-            "SELECT count(*) AS c FROM permissions WHERE tenant_id = $1 AND environment_id = $2",
-        )
-        .bind(scope_b.tenant().to_string())
-        .bind(scope_b.environment().to_string())
-        .fetch_one(&mut *tx)
-        .await
-        .expect("cross-scope count")
-        .get("c");
-        assert_eq!(
-            leaked, 0,
-            "RLS must hide scope B permissions from a scope A session even with the \
-             filter bypassed"
-        );
-
-        // 3. Write-side isolation, the half a read-only probe would miss: a scope A
-        //    session cannot relabel scope B's permission (the USING clause hides it)
-        //    nor soft-delete it.
         for statement in [
             "UPDATE permissions SET display_name = 'hijacked' WHERE tenant_id = $1",
             "UPDATE permissions SET deleted_at = now() WHERE tenant_id = $1",
@@ -515,49 +672,224 @@ async fn rls_hides_another_scopes_vocabulary_and_refuses_forging_one() {
                 .rows_affected();
             assert_eq!(
                 updated, 0,
-                "RLS must hide scope B rows from a scope A write: {statement}"
+                "RLS must hide every row of tenant B from a scope A write: {statement}"
             );
         }
-
-        // 4. FORGE probe: an INSERT claiming scope B from a scope A session. The
-        //    WITH CHECK half of the policy is what refuses it, and it is a distinct
-        //    property from the USING half above: a policy with USING only would pass
-        //    every assertion so far and still let one tenant write into another.
-        let forged = PermissionId::generate(&env, &scope_b).to_string();
-        let insert = sqlx::query(
-            "INSERT INTO permissions (id, tenant_id, environment_id, slug, display_name) \
-             VALUES ($1, $2, $3, 'forged.permission', 'Forged')",
-        )
-        .bind(forged)
-        .bind(scope_b.tenant().to_string())
-        .bind(scope_b.environment().to_string())
-        .execute(&mut *tx)
-        .await;
-        assert!(
-            insert.is_err(),
-            "the RLS WITH CHECK must reject writing another scope's permission"
-        );
         let _ = tx.rollback().await;
     }
 
-    // 5. Positive control: bound to B, the same role sees exactly B's row, so the
-    //    zeroes above are about isolation and not about an empty table.
-    {
-        let mut tx = pool.begin().await.expect("begin as scope B");
+    // 5. Positive controls: bound to B the same role sees exactly B's row, and bound
+    //    to A2 it sees exactly A2's row. Without the SECOND of these the environment
+    //    probes above would be satisfied by an empty environment, which is precisely
+    //    how a zero becomes vacuous.
+    for (victim, label) in [(scope_b, "scope B"), (scope_a2, "scope A2")] {
+        let mut tx = pool.begin().await.expect("begin as the victim scope");
         bind_scope(
             &mut tx,
-            &scope_b.tenant().to_string(),
-            &scope_b.environment().to_string(),
+            &victim.tenant().to_string(),
+            &victim.environment().to_string(),
         )
         .await;
         let visible: i64 = sqlx::query("SELECT count(*) AS c FROM permissions")
             .fetch_one(&mut *tx)
             .await
-            .expect("count in B")
+            .expect("count in the victim scope")
             .get("c");
-        assert_eq!(visible, 1, "scope B sees its own permission");
-        tx.commit().await.expect("commit B read");
+        assert_eq!(visible, 1, "{label} sees its own permission");
+        tx.commit().await.expect("commit the victim read");
     }
+}
+
+/// Every probe a session bound to `attacker` can aim at `victim`'s rows: the read
+/// with the app-layer filter subverted, the two cross-scope writes, and the forge
+/// INSERT. `differing` names the dimension the two scopes differ in, so a failure
+/// says which half of the policy fell.
+///
+/// Every statement names BOTH scope columns. A probe naming the tenant alone is
+/// decided by the tenant conjunct no matter what the environment conjunct says,
+/// which is exactly the position blindness that left the environment half of this
+/// policy asserted by nothing.
+///
+/// Each victim gets its OWN transaction because the forge INSERT is expected to
+/// fail, and a failed statement aborts the surrounding transaction: a second victim
+/// probed in the same transaction would see every statement refused as 25P02 and
+/// pass for the wrong reason.
+async fn assert_fenced_from(
+    pool: &PgPool,
+    env: &Env,
+    attacker: Scope,
+    victim: Scope,
+    differing: &str,
+) {
+    let tenant = victim.tenant().to_string();
+    let environment = victim.environment().to_string();
+    let mut tx = pool.begin().await.expect("begin as the attacker scope");
+    bind_scope(
+        &mut tx,
+        &attacker.tenant().to_string(),
+        &attacker.environment().to_string(),
+    )
+    .await;
+
+    // Read side, app-layer filter SUBVERTED: the query explicitly targets the
+    // victim's rows. Forced row-level security still returns zero.
+    let leaked: i64 = sqlx::query(
+        "SELECT count(*) AS c FROM permissions WHERE tenant_id = $1 AND environment_id = $2",
+    )
+    .bind(&tenant)
+    .bind(&environment)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("cross-scope count")
+    .get("c");
+    assert_eq!(
+        leaked, 0,
+        "RLS must hide a permission whose {differing} differs, even with the filter bypassed"
+    );
+
+    // Write side, the half a read-only probe would miss: the USING clause hides the
+    // victim's row from a relabel and from a soft delete alike.
+    for statement in [
+        "UPDATE permissions SET display_name = 'hijacked' \
+         WHERE tenant_id = $1 AND environment_id = $2",
+        "UPDATE permissions SET deleted_at = now() \
+         WHERE tenant_id = $1 AND environment_id = $2",
+    ] {
+        let updated = sqlx::query(statement)
+            .bind(&tenant)
+            .bind(&environment)
+            .execute(&mut *tx)
+            .await
+            .expect("update runs")
+            .rows_affected();
+        assert_eq!(
+            updated, 0,
+            "RLS must hide a row whose {differing} differs from a write: {statement}"
+        );
+    }
+
+    // FORGE probe: an INSERT claiming the victim's scope. The WITH CHECK half of the
+    // policy is what refuses it, and it is a distinct property from the USING half
+    // above: a policy with USING only would pass every assertion so far and still let
+    // one scope write into another.
+    let forged = PermissionId::generate(env, &victim).to_string();
+    let insert = sqlx::query(
+        "INSERT INTO permissions (id, tenant_id, environment_id, slug, display_name) \
+         VALUES ($1, $2, $3, 'forged.permission', 'Forged')",
+    )
+    .bind(forged)
+    .bind(&tenant)
+    .bind(&environment)
+    .execute(&mut *tx)
+    .await;
+    assert!(
+        insert.is_err(),
+        "the RLS WITH CHECK must reject writing into a scope whose {differing} differs"
+    );
+    let _ = tx.rollback().await;
+}
+
+#[tokio::test]
+async fn the_repository_fences_by_environment_even_when_the_policy_no_longer_does() {
+    // The OTHER direction of the same masking, and the reason the test above is not
+    // enough on its own. Every `PermissionRepo` statement carries its own
+    // `environment_id = $N` conjunct AND binds the row-level-security variables to
+    // the same value, so in production the two always agree and each one masks the
+    // other: deleting EITHER leaves every functional assertion green. The test above
+    // pins the POLICY half (a same-tenant, other-environment victim through raw SQL).
+    // This pins the REPOSITORY half, by weakening the deployed policy to its tenant
+    // conjunct alone and asserting the repository still refuses.
+    //
+    // The policy is REPLACED rather than dropped: this table FORCEs row-level
+    // security, so a table carrying no policy at all denies everything and the probe
+    // would pass for exactly the wrong reason.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope_a = db.seed_scope(&env).await;
+    let scope_a2 = Scope::new(
+        scope_a.tenant(),
+        db.seed_environment(&env, scope_a.tenant()).await,
+    );
+
+    plant(&db, &env, scope_a, "billing.read", "Read billing", 1_000)
+        .await
+        .expect("plant in A");
+    plant(&db, &env, scope_a2, "staging.read", "Read staging", 2_000)
+        .await
+        .expect("plant in A2");
+
+    db.execute_owner_sql("DROP POLICY permissions_tenant_isolation ON permissions")
+        .await;
+    db.execute_owner_sql(
+        "CREATE POLICY permissions_tenant_isolation ON permissions \
+         USING (tenant_id = current_setting('ironauth.tenant_id', true)) \
+         WITH CHECK (tenant_id = current_setting('ironauth.tenant_id', true))",
+    )
+    .await;
+
+    // The fence really is down: raw SQL bound to scope A now sees BOTH rows. So
+    // whatever the repository refuses below, it refuses on its own predicate and not
+    // because the storage engine got there first.
+    {
+        let mut tx = db
+            .control_pool()
+            .begin()
+            .await
+            .expect("begin weakened-policy read");
+        bind_scope(
+            &mut tx,
+            &scope_a.tenant().to_string(),
+            &scope_a.environment().to_string(),
+        )
+        .await;
+        let visible: i64 = sqlx::query("SELECT count(*) AS c FROM permissions")
+            .fetch_one(&mut *tx)
+            .await
+            .expect("count under the weakened policy")
+            .get("c");
+        assert_eq!(
+            visible, 2,
+            "the weakened policy must no longer fence the environment, or this test \
+             proves nothing about the repository"
+        );
+        tx.commit().await.expect("commit the weakened-policy read");
+    }
+
+    let repo = db.control_store().management().permissions(scope_a);
+
+    // The LIST is the assertion that catches a repository conjunct going missing: a
+    // list without it returns A2's row too, which cannot even decode under scope A.
+    let listed = repo
+        .list(PermissionEntryKind::Permission, 50, None)
+        .await
+        .expect("the list must succeed and carry only this environment's rows");
+    assert_eq!(
+        listed.len(),
+        1,
+        "the repository's own environment conjunct must fence the list with the \
+         policy no longer doing it"
+    );
+    assert_eq!(listed[0].slug, "billing.read");
+
+    // The (kind, slug) address too. Two layers stand behind this one: the conjunct
+    // and, behind it, the in-scope id decode in `permission_from_row`, which turns a
+    // leaked row into the same not-found. So this assertion is defence in depth and
+    // NOT the one that would catch a missing conjunct; the list above is.
+    assert!(matches!(
+        repo.get_by_slug(PermissionEntryKind::Permission, "staging.read")
+            .await,
+        Err(StoreError::NotFound)
+    ));
+
+    // Positive control: scope A's own vocabulary still reads, so the refusals above
+    // are about the environment and not about a repository that stopped working.
+    assert_eq!(
+        repo.get_by_slug(PermissionEntryKind::Permission, "billing.read")
+            .await
+            .expect("scope A still reads its own permission")
+            .slug,
+        "billing.read"
+    );
 }
 
 #[tokio::test]

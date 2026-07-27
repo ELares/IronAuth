@@ -355,6 +355,30 @@ async fn partial_unique_index_exists(pool: &sqlx::PgPool, table: &str, index: &s
     .get("present")
 }
 
+/// The rendered `WHERE` predicate of a partial index, as Postgres stores it.
+///
+/// [`partial_unique_index_exists`] reads only `indpred IS NOT NULL` and
+/// [`index_columns`] reads only `indkey`, so BOTH are blind to a predicate that was
+/// NARROWED rather than removed. Narrowing a live-uniqueness predicate is a real
+/// weakening (it stops refusing duplicates for every row the narrower predicate
+/// excludes) and it is invisible to every structural probe that does not read the
+/// predicate TEXT, which is why the text is pinned exactly as the constraint text is.
+async fn index_predicate(pool: &sqlx::PgPool, table: &str, index: &str) -> String {
+    sqlx::query(
+        "SELECT pg_get_expr(i.indpred, i.indrelid) AS predicate \
+           FROM pg_catalog.pg_index i \
+           JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid \
+          WHERE i.indrelid = $1::regclass AND c.relname = $2",
+    )
+    .bind(table)
+    .bind(index)
+    .fetch_one(pool)
+    .await
+    .expect("partial index predicate lookup")
+    .get::<Option<String>, _>("predicate")
+    .unwrap_or_else(|| panic!("{index} on {table} must be a PARTIAL index"))
+}
+
 #[tokio::test]
 async fn in_order_apply_records_each_and_is_idempotent() {
     let pool = TestDatabase::fresh_owner_pool().await;
@@ -5882,6 +5906,18 @@ async fn permissions_carries_its_isolation_indexes_and_least_privilege_grants() 
             "slug".to_owned()
         ],
         "the live uniqueness key is (tenant, environment, kind, slug)"
+    );
+    // And the PREDICATE itself, pinned by text the way the parity oracle pins the
+    // slug CHECK text. The two probes above cannot see a predicate that was narrowed
+    // rather than removed: `WHERE deleted_at IS NULL AND kind = 'permission'` leaves
+    // both reading exactly as they do now, while a second LIVE entitlement of one
+    // slug stops being refused and issue #103 inherits a table with no uniqueness for
+    // the kind it is about to write.
+    assert_eq!(
+        index_predicate(pool, "permissions", "permissions_kind_slug_live_uniq").await,
+        "(deleted_at IS NULL)",
+        "the live-uniqueness predicate must be the soft-delete latch ALONE: `kind` is \
+         part of the KEY, never part of the predicate"
     );
     assert_eq!(
         index_columns(pool, "permissions", "permissions_scope_idx").await,
