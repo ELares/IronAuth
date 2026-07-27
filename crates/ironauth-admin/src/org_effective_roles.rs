@@ -53,6 +53,23 @@
 //! caller must not read this endpoint as "what the bearer of that user's current
 //! access token can do". `docs/THREAT-MODEL.md` states the same gap.
 //!
+//! # A DISABLED organization resolves to an empty set here, deliberately
+//!
+//! An organization that has been disabled mints no roles, so this view reports none
+//! for every one of its members. That is the SAME sentence as the paragraph above
+//! rather than an exception to it: the endpoint answers "what would the next token
+//! carry", the next token carries nothing, and reporting provenance for roles no
+//! token will assert is the answer that would mislead. The CONFIGURATION is not
+//! hidden and nothing is lost: the direct-assignment list
+//! (`GET .../memberships/{id}/roles`) and the group-grant list
+//! (`GET .../groups/{id}/roles`) both ignore the organization's lifecycle state, and
+//! they are the surfaces that answer "which rows did someone write". Re-enabling the
+//! organization restores this view and the token claim together, in one step,
+//! because both read the one shared closure.
+//!
+//! A SOFT-DELETED organization never reaches this handler at all: `resolve_live_org`
+//! answers the uniform 404 first.
+//!
 //! # Fails closed, and loudly
 //!
 //! A store fault is a 500, never an empty `roles` array. On this surface an empty
@@ -157,7 +174,7 @@ pub struct EffectiveRolesView {
     ),
     security(("bearer" = [])),
     responses(
-        (status = 200, description = "The resolved roles, one entry per grant path. This is what the NEXT token issuance would carry; tokens already issued are NOT affected by a recent change. Not paginated: a bounded read of one membership's whole set", body = EffectiveRolesView),
+        (status = 200, description = "The resolved roles, one entry per grant path. This is what the NEXT token issuance would carry; tokens already issued are NOT affected by a recent change. A DISABLED organization mints no roles, so this is empty for every one of its members until it is re-enabled (the assignment lists still show the configuration). Not paginated: a bounded read of one membership's whole set", body = EffectiveRolesView),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
         (status = 404, description = "Not found (the organization, or a membership that is not a live membership of it: uniform across absent, removed, another scope's, and another organization's)", body = ErrorBody)
@@ -187,7 +204,9 @@ pub async fn get_org_membership_effective_roles(
     // most ONE live membership per (organization, user), so the membership resolved
     // above is the one the seed selects. The seed additionally requires state
     // `active`, so a membership in any other state resolves to the empty set, which
-    // is exactly what a token would carry for it.
+    // is exactly what a token would carry for it. The same seed requires the
+    // ORGANIZATION to be live and active, so a disabled organization resolves to the
+    // empty set here for the same reason and by the same code path the mint uses.
     let grants = state
         .store()
         .management()

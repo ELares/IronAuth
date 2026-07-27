@@ -22,12 +22,20 @@
 //! The other properties pinned, each of which a plausible refactor would break:
 //!
 //!   * ABSENT and EMPTY are different answers. No organization context emits NO claim;
-//!     an organization in which the member holds nothing emits `[]`. A consumer must
+//!     a resolved organization context that yields nothing emits `[]`. A consumer must
 //!     be able to tell "not an org token" from "org token, no roles".
-//!   * FAIL CLOSED. A store fault during resolution refuses the token request. A
+//!   * THE ORGANIZATION'S OWN LIFECYCLE reaches the claim, on both hooks. Disable and
+//!     soft-delete are the coarsest revocations an operator has, and neither hook can
+//!     check them for itself (refresh never runs the authorize-time resolution, and a
+//!     code exchange on an already-bound session returns from it early), so the fence
+//!     lives in the store's shared closure and is driven here through both.
+//!   * FAIL CLOSED. A store fault during resolution refuses the token request, and so
+//!     does a RECORDED identifier that no longer parses in scope, on either branch. A
 //!     role-less token would read downstream as a successful authorization DOWNGRADE,
 //!     which is why `roles` deliberately does not ride the fail-OPEN id-token extra
 //!     claims bag.
+//!   * THE CONFIGURED NESTING BOUND is the one the mint resolves with, observed at the
+//!     store call rather than through an accessor.
 //!   * The claim is ISSUER-SET ONLY, proved through the real forgery path rather than
 //!     asserted from the denylist: a user whose stored claim document contains
 //!     `roles`, requested through the OIDC Core 5.5 `claims` parameter, does not get
@@ -57,7 +65,8 @@ use ironauth_oidc::ClientAuthMethod;
 use ironauth_store::{
     ActorRef, CorrelationId, NewMembership, NewOrgGroup, NewOrgGroupMember, NewOrgGroupRole,
     NewOrgMembershipRole, NewOrgRole, OrgGroupId, OrgGroupMemberId, OrgGroupRoleId,
-    OrgMembershipId, OrgMembershipRoleId, OrgRoleId, OrganizationId, ServiceId, UserId,
+    OrgMembershipId, OrgMembershipRoleId, OrgRoleId, OrganizationId, OrganizationState, Scope,
+    ServiceId, UserId,
 };
 use serde_json::Value;
 
@@ -77,8 +86,17 @@ const SEED_MICROS: i64 = 1_000_000;
 
 /// Create an ACTIVE organization in the harness scope through the control plane.
 async fn create_org(harness: &Harness, display_name: &str) -> OrganizationId {
+    create_org_in(harness, harness.scope(), display_name).await
+}
+
+/// Create an ACTIVE organization in an ARBITRARY scope through the control plane.
+///
+/// The scope is a parameter rather than always the harness's own so a test can mint
+/// an organization id that is REAL (it satisfies the single-column `grants_org_fk`)
+/// and yet does not parse in the harness scope, which is the only way to reach the
+/// mint's out-of-scope fail-closed branch through the store rather than by faking it.
+async fn create_org_in(harness: &Harness, scope: Scope, display_name: &str) -> OrganizationId {
     let env = harness.env().clone();
-    let scope = harness.scope();
     let org_id = OrganizationId::generate(&env, &scope);
     harness
         .db()
@@ -90,6 +108,39 @@ async fn create_org(harness: &Harness, display_name: &str) -> OrganizationId {
         .await
         .expect("create organization");
     org_id
+}
+
+/// Flip an organization's lifecycle state through the control plane: the operator's
+/// disable (and re-enable) action, exactly as the management API drives it.
+async fn set_org_state(harness: &Harness, org: &OrganizationId, state: OrganizationState) {
+    let env = harness.env().clone();
+    let scope = harness.scope();
+    harness
+        .db()
+        .control_store()
+        .management()
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+        .organizations(scope)
+        .set_state(&env, org, state)
+        .await
+        .expect("set organization state");
+}
+
+/// Soft-delete an organization through the control plane: the operator's delete
+/// action. The row is retained (only `deleted_at` is written) and NOTHING cascades,
+/// which is precisely why the resolution has to observe it itself.
+async fn soft_delete_org(harness: &Harness, org: &OrganizationId) {
+    let env = harness.env().clone();
+    let scope = harness.scope();
+    harness
+        .db()
+        .control_store()
+        .management()
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+        .organizations(scope)
+        .delete(&env, org)
+        .await
+        .expect("soft delete organization");
 }
 
 /// Bind `subject` (a `usr_` id string) into `org` as a live member, returning the
@@ -632,6 +683,136 @@ async fn a_role_change_is_reflected_on_the_next_code_exchange_too() {
 }
 
 // ---------------------------------------------------------------------------
+// The organization's OWN lifecycle: the coarsest revocation there is
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_disabled_organization_stops_minting_its_roles_on_both_hooks() {
+    // Disable is the COARSEST kill switch the product exposes, and it must reach the
+    // roles claim on BOTH issuance hooks. Neither hook can check it for itself, which
+    // is why the check lives in the store's shared closure:
+    //
+    //   * on REFRESH, the authorize-time organization resolution is never called at
+    //     all; the org context is read straight off the family's grant;
+    //   * on a CODE EXCHANGE, that resolution returns EARLY for an already-bound
+    //     session (first write wins), so its disabled-organization refusal never runs
+    //     for any session that has already resolved an org, which is every session
+    //     that has one.
+    //
+    // So both hooks are driven here against the SAME disabled organization. Without
+    // the fence every member of a disabled organization keeps receiving freshly
+    // re-affirmed `roles` for the whole life of the refresh family, which with
+    // offline_access is unbounded.
+    let harness = Harness::start().await;
+    let client_id = harness.client_id().to_string();
+    let (subject, cookie) = consenting_subject(&harness, &client_id).await;
+    let org = create_org(&harness, "Kill Switch Co").await;
+    let membership = add_member(&harness, &org, &subject).await;
+    let admin = create_role(&harness, &org, "admin").await;
+    grant_direct_role(&harness, &org, &membership, &admin).await;
+
+    let code = authorize_to_code(&harness, &client_id, &[&org_param(&org)], &cookie).await;
+    let (_, at_claims, refresh_token) = exchange(&harness, &client_id, &code).await;
+    assert_eq!(
+        roles_of(&at_claims),
+        vec!["admin"],
+        "the control exchange carries the role while the organization is active"
+    );
+
+    set_org_state(&harness, &org, OrganizationState::Disabled).await;
+
+    // Hook one: the refresh grant.
+    let (refreshed, _) = refresh(&harness, &client_id, &refresh_token).await;
+    assert_eq!(
+        roles_of(&refreshed),
+        Vec::<String>::new(),
+        "a disabled organization asserts NO role on the very next refresh: {refreshed}"
+    );
+    // EMPTY, not absent, and not a refusal. The grant really is bound to that
+    // organization, so the honest answer is "scoped to it, holding nothing there"
+    // rather than a silently org-less token; and a disabled organization is an
+    // operator STATE, so refusing would make an administrative action an outage.
+    assert_eq!(
+        refreshed["org_id"],
+        org.to_string(),
+        "the frozen org_id is still emitted: {refreshed}"
+    );
+
+    // Hook two: a BRAND NEW code exchange on the SAME session. The session is already
+    // bound, so /authorize still issues a code (its disabled check is unreachable
+    // here) and the whole refusal has to come from the resolution.
+    let code = authorize_to_code(&harness, &client_id, &[&org_param(&org)], &cookie).await;
+    let (_, at_claims, _) = exchange(&harness, &client_id, &code).await;
+    assert_eq!(
+        roles_of(&at_claims),
+        Vec::<String>::new(),
+        "a fresh code exchange on a bound session asserts no role either: {at_claims}"
+    );
+    assert_eq!(at_claims["org_id"], org.to_string());
+
+    // And re-enabling restores the roles, so this is a FENCE on live state rather
+    // than a one-way loss of the assignments (which were never touched).
+    set_org_state(&harness, &org, OrganizationState::Active).await;
+    let code = authorize_to_code(&harness, &client_id, &[&org_param(&org)], &cookie).await;
+    let (_, at_claims, _) = exchange(&harness, &client_id, &code).await;
+    assert_eq!(
+        roles_of(&at_claims),
+        vec!["admin"],
+        "re-enabling the organization restores the claim from the untouched grants"
+    );
+}
+
+#[tokio::test]
+async fn a_soft_deleted_organization_stops_minting_its_roles_too() {
+    // The other half of the coarsest revocation. `organizations().delete()` is a bare
+    // soft delete: the row is retained and NOTHING cascades, so every membership,
+    // group, and assignment row underneath it stays live and readable. That is
+    // exactly why the resolution has to observe the organization's own `deleted_at`
+    // rather than relying on the rows below it going away, and it is why an operator
+    // who DELETES an organization and sees its members keep minting its roles would
+    // have no lever left at all.
+    let harness = Harness::start().await;
+    let client_id = harness.client_id().to_string();
+    let (subject, cookie) = consenting_subject(&harness, &client_id).await;
+    let org = create_org(&harness, "Deleted Co").await;
+    let membership = add_member(&harness, &org, &subject).await;
+    let via_group = create_role(&harness, &org, "via.group").await;
+    let direct = create_role(&harness, &org, "direct").await;
+    let group = create_group(&harness, &org, "team", None).await;
+    bind_member(&harness, &org, &group, &membership).await;
+    grant_group_role(&harness, &org, &group, &via_group).await;
+    grant_direct_role(&harness, &org, &membership, &direct).await;
+
+    let code = authorize_to_code(&harness, &client_id, &[&org_param(&org)], &cookie).await;
+    let (_, at_claims, refresh_token) = exchange(&harness, &client_id, &code).await;
+    assert_eq!(
+        roles_of(&at_claims),
+        vec!["direct", "via.group"],
+        "both grant paths carry while the organization is live"
+    );
+
+    soft_delete_org(&harness, &org).await;
+
+    let (refreshed, _) = refresh(&harness, &client_id, &refresh_token).await;
+    assert_eq!(
+        roles_of(&refreshed),
+        Vec::<String>::new(),
+        "a soft-deleted organization asserts no role on the next refresh: {refreshed}"
+    );
+    assert_eq!(refreshed["org_id"], org.to_string());
+
+    // The code-exchange hook, same as the disable case: the session is already bound,
+    // so the authorize-time resolution short-circuits and never sees the delete.
+    let code = authorize_to_code(&harness, &client_id, &[&org_param(&org)], &cookie).await;
+    let (_, at_claims, _) = exchange(&harness, &client_id, &code).await;
+    assert_eq!(
+        roles_of(&at_claims),
+        Vec::<String>::new(),
+        "and none on a fresh code exchange either: {at_claims}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Absent versus empty
 // ---------------------------------------------------------------------------
 
@@ -824,6 +1005,133 @@ async fn a_store_fault_fails_the_refresh_closed_too() {
     );
 }
 
+#[tokio::test]
+async fn a_recorded_identifier_that_is_out_of_scope_fails_closed_on_both_branches() {
+    // The OTHER two fail-closed branches of the resolution, which a store fault does
+    // not reach: a RECORDED identifier that no longer parses in the scope the mint is
+    // running under. Both are representable in the shipped schema rather than
+    // theoretical, and each is driven here through the hook that actually reads it.
+    //
+    //   * `grants.org_id` carries `grants_org_fk`, a SINGLE-COLUMN foreign key to
+    //     organizations(id), NOT a composite one over (id, tenant, environment). So a
+    //     grant can carry an organization id of ANOTHER scope and still satisfy the
+    //     key. The refresh path reads the org context from exactly this column.
+    //   * `authorization_codes.subject` is free text with no foreign key to `users`
+    //     at all. The code exchange reads the subject from exactly this column.
+    //
+    // Both must be a `server_error` with NO token, never a quietly role-less one: a
+    // missing `roles` claim reads downstream as a successful authorization DOWNGRADE.
+    // Neither branch had a test before this one, and each survived being mutated to
+    // `Ok(None)` with the whole file still green.
+    let harness = Harness::start().await;
+    let client_id = harness.client_id().to_string();
+    // A second scope of the same tenant, so the ids minted in it are REAL rows that
+    // genuinely fail to parse under the harness scope.
+    let foreign_scope = harness.second_scope().await;
+    let foreign_org = create_org_in(&harness, foreign_scope, "Foreign Co").await;
+    let foreign_user = UserId::generate(harness.env(), &foreign_scope).to_string();
+
+    // --- Branch one: the org_id frozen onto the grant, read on REFRESH. ---
+    let (subject, cookie) = consenting_subject(&harness, &client_id).await;
+    let org = create_org(&harness, "Refresh Branch Co").await;
+    let membership = add_member(&harness, &org, &subject).await;
+    let role = create_role(&harness, &org, "critical").await;
+    grant_direct_role(&harness, &org, &membership, &role).await;
+
+    let code = authorize_to_code(&harness, &client_id, &[&org_param(&org)], &cookie).await;
+    let (_, at_claims, refresh_token) = exchange(&harness, &client_id, &code).await;
+    assert_eq!(
+        roles_of(&at_claims),
+        vec!["critical"],
+        "the control exchange succeeds, so the refusal below is the corruption"
+    );
+
+    let affected = sqlx::query("UPDATE grants SET org_id = $1 WHERE subject = $2")
+        .bind(foreign_org.to_string())
+        .bind(&subject)
+        .execute(harness.db().owner_pool())
+        .await
+        .expect("re-point the grant at another scope's organization")
+        .rows_affected();
+    assert!(
+        affected > 0,
+        "the corruption must actually land, or this test proves nothing"
+    );
+
+    let (status, _, body) = harness
+        .token(&form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", &refresh_token),
+            ("client_id", &client_id),
+        ]))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "an out-of-scope org_id refuses the refresh: {body}"
+    );
+    assert_eq!(
+        json(&body)["error"],
+        "server_error",
+        "the uniform server_error, never a 200 with roles missing: {body}"
+    );
+    assert!(
+        !body.contains("access_token"),
+        "no token is rotated out at all: {body}"
+    );
+
+    // --- Branch two: the subject recorded on the code, read on a CODE EXCHANGE. ---
+    let (other_subject, other_cookie) = consenting_subject(&harness, &client_id).await;
+    let other_org = create_org(&harness, "Exchange Branch Co").await;
+    let other_membership = add_member(&harness, &other_org, &other_subject).await;
+    let other_role = create_role(&harness, &other_org, "critical").await;
+    grant_direct_role(&harness, &other_org, &other_membership, &other_role).await;
+
+    let code = authorize_to_code(
+        &harness,
+        &client_id,
+        &[&org_param(&other_org)],
+        &other_cookie,
+    )
+    .await;
+    let (_, at_claims, _) = exchange(&harness, &client_id, &code).await;
+    assert_eq!(
+        roles_of(&at_claims),
+        vec!["critical"],
+        "the control exchange for the second branch succeeds too"
+    );
+
+    // Issue the code FIRST, then corrupt, so the authorize path (which resolves the
+    // real subject) is unaffected and the failure is attributable to the resolution.
+    let code = authorize_to_code(
+        &harness,
+        &client_id,
+        &[&org_param(&other_org)],
+        &other_cookie,
+    )
+    .await;
+    let affected = sqlx::query("UPDATE authorization_codes SET subject = $1 WHERE subject = $2")
+        .bind(&foreign_user)
+        .bind(&other_subject)
+        .execute(harness.db().owner_pool())
+        .await
+        .expect("re-point the code at another scope's user")
+        .rows_affected();
+    assert!(affected > 0, "the second corruption must land too");
+
+    let (status, _, body) = harness.token(&token_form(&code, &client_id)).await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "an out-of-scope recorded subject refuses the exchange: {body}"
+    );
+    assert_eq!(json(&body)["error"], "server_error", "{body}");
+    assert!(
+        !body.contains("access_token"),
+        "no token is issued at all: {body}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Forgery, through the real paths
 // ---------------------------------------------------------------------------
@@ -948,6 +1256,81 @@ async fn the_client_credentials_grant_carries_no_roles_even_when_configured_to()
     assert!(
         claims.get("org_id").is_none(),
         "and no human organization context either"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The configured nesting bound, observed at the store call
+// ---------------------------------------------------------------------------
+
+/// Seed one three-level forest (grandparent -> parent -> child) with the member bound
+/// only into `child`, a role granted on `parent` (ONE level up) and another on
+/// `grandparent` (TWO levels up). Returns the consenting subject's cookie and the
+/// organization.
+///
+/// Two harnesses configured differently are driven over this SAME shape, so the only
+/// thing that can move the answer is the bound each was built with.
+async fn seed_two_level_ancestry(harness: &Harness, client_id: &str) -> (String, OrganizationId) {
+    let (subject, cookie) = consenting_subject(harness, client_id).await;
+    let org = create_org(harness, "Nesting Co").await;
+    let membership = add_member(harness, &org, &subject).await;
+    let grandparent = create_group(harness, &org, "grandparent", None).await;
+    let parent = create_group(harness, &org, "parent", Some(&grandparent)).await;
+    let child = create_group(harness, &org, "child", Some(&parent)).await;
+    bind_member(harness, &org, &child, &membership).await;
+    let near = create_role(harness, &org, "via.parent").await;
+    let far = create_role(harness, &org, "via.grandparent").await;
+    grant_group_role(harness, &org, &parent, &near).await;
+    grant_group_role(harness, &org, &grandparent, &far).await;
+    (cookie, org)
+}
+
+#[tokio::test]
+async fn the_configured_group_depth_is_the_bound_the_mint_actually_resolves_with() {
+    // The BEHAVIOURAL pin on the nesting bound's wiring, which two independent
+    // mutants used to survive: the mint reading a hard-coded default instead of the
+    // configured value, and the builder installing the ceiling instead of its
+    // argument. Both are silent, and they fail in opposite directions: the first
+    // makes an operator who RAISES the bound lose every role inherited above the
+    // default (an authorization downgrade with no signal), the second makes an
+    // operator who LOWERS it get a deeper walk here than the management plane runs,
+    // so the console and the token disagree about the effective set, which is the
+    // exact divergence the shared setting exists to prevent.
+    //
+    // Neither is observable through an accessor: the value has to be watched at the
+    // STORE CALL, which means driving a real issuance over a tree deeper than the
+    // bound. Groups are seeded through the control plane at the shipped default, so
+    // the tree is legal to build and only the READ is bounded, which is the state an
+    // operator who lowers the setting under a populated environment leaves behind.
+    let deep = Harness::start().await;
+    let client_id = deep.client_id().to_string();
+    let (cookie, org) = seed_two_level_ancestry(&deep, &client_id).await;
+    let code = authorize_to_code(&deep, &client_id, &[&org_param(&org)], &cookie).await;
+    let (_, at_claims, _) = exchange(&deep, &client_id, &code).await;
+    assert_eq!(
+        roles_of(&at_claims),
+        vec!["via.grandparent", "via.parent"],
+        "at the shipped default the walk reaches both ancestor levels: {at_claims}"
+    );
+
+    // The SAME fixture under a bound of ONE. The walk reaches the member's own groups
+    // plus one level of ancestor, so the parent's role still arrives and the
+    // grandparent's does not. Asserting the near role is PRESENT is what makes this a
+    // truncation rather than a walk that silently did not run at all.
+    let shallow = Harness::start_with_group_depth(1).await;
+    let client_id = shallow.client_id().to_string();
+    let (cookie, org) = seed_two_level_ancestry(&shallow, &client_id).await;
+    let code = authorize_to_code(&shallow, &client_id, &[&org_param(&org)], &cookie).await;
+    let (_, at_claims, _) = exchange(&shallow, &client_id, &code).await;
+    assert_eq!(
+        roles_of(&at_claims),
+        vec!["via.parent"],
+        "a bound of one truncates the walk one level up, and only there: {at_claims}"
+    );
+    assert_eq!(
+        shallow.state().max_group_depth(),
+        1,
+        "the configured bound is what the router's state carries"
     );
 }
 

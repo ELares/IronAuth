@@ -758,8 +758,27 @@ async fn resolve_code_exchange_sid(
 ///
 /// Returns [`None`] when there is no organization context, symmetric with `org_id`: a
 /// role is org-scoped, so with no org there is no set to resolve and the claim is
-/// ABSENT rather than empty. An empty [`Some`] (a member holding no roles) is distinct
-/// and DOES emit an empty array.
+/// ABSENT rather than empty. An empty [`Some`] is distinct and DOES emit an empty
+/// array; it means the resolution ran and found nothing, which covers a member
+/// holding no roles, a subject who is not a member at all, and an organization that
+/// is no longer live and active.
+///
+/// # The organization's own lifecycle is fenced in the STORE, not here
+///
+/// A DISABLED or soft-DELETED organization resolves to the EMPTY set, because
+/// [`ironauth_store::OrgGroupRepo::effective_roles`] fences the membership seed of
+/// its shared closure on the organization being live and active. It has to live
+/// there rather than here, and this call site is exactly why: NEITHER mint hook is
+/// in a position to check it. The refresh path never runs the authorize-time
+/// organization resolution at all (it reads the org context frozen onto the family's
+/// grant), and on a code exchange that resolution returns EARLY for an
+/// already-bound session, so its disabled-organization refusal never runs either. A
+/// check added here would also cover only this claim, leaving the admin
+/// effective-roles view disagreeing with the token about the same organization.
+///
+/// Note that `org_id` itself is still EMITTED for a disabled organization: the grant
+/// really is bound to it, and the honest wire answer is "this token is scoped to that
+/// organization and carries no roles in it" rather than a silently org-less token.
 ///
 /// # Fails CLOSED
 ///

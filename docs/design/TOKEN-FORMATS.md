@@ -41,10 +41,20 @@ absent when no organization context was resolved. They differ in how they are
 sourced, and the difference is deliberate: `org_id` is FROZEN onto the session and
 the grant, so it is stable for the life of a refresh family, while `roles` is
 RESOLVED FRESH from the store at every code exchange and every refresh, so a role
-granted or withdrawn is reflected on the next issuance. An empty `roles` array means
-a member of that organization who holds no role, which is a different fact from the
-claim being absent. A role change does not revoke tokens already issued, so a
-withdrawn role stays usable for at most one access-token lifetime. The ID token
+granted or withdrawn is reflected on the next issuance.
+
+The distinction an empty `roles` array draws is with the claim being ABSENT, and
+nothing finer. Absent means no organization context was resolved for the grant at
+all, so there was no set to resolve; `[]` means the resolution RAN, against the
+organization `org_id` names, and returned nothing. It does not say why, and a
+consumer must not read it as "a member holding no role": a subject who is not (or is
+no longer) a live member of that organization gets `[]`, and so does every member of
+an organization an operator has DISABLED or deleted, because disable and delete stop
+the organization asserting roles at the next issuance for everyone in it. All of
+those are the same wire value on purpose: each is "this token asserts no role here",
+which is the only thing a resource server may act on. A role change does not revoke
+tokens already issued, so a withdrawn role (or a disabled organization) stays usable
+for at most one access-token lifetime. The ID token
 carries `org_id` but never `roles`: roles are consumed by resource servers, the ID
 token stays lean, and a role set is uncapped. A client-credentials or jwt-bearer
 machine token carries neither.

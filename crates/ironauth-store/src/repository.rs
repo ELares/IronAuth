@@ -32971,10 +32971,18 @@ impl OrgGroupRepo<'_> {
     /// set is a silent authorization DOWNGRADE that looks exactly like a user who
     /// legitimately holds nothing.
     ///
-    /// The organization's own lifecycle STATE is deliberately not re-checked here:
-    /// the mint path refuses a disabled organization before it ever reaches
-    /// resolution, and duplicating that check would put two answers to one question
-    /// in two places.
+    /// The organization's OWN lifecycle is re-checked here too, and this is the only
+    /// place it is checked on the issuance path. A DISABLED organization and a
+    /// SOFT-DELETED one both resolve to the EMPTY set, for every member, exactly as
+    /// a user with no membership does: disable and delete are the coarsest
+    /// revocations an operator has, and an organization that has been switched off
+    /// must stop asserting roles everywhere at once. The check lives in
+    /// [`EFFECTIVE_CLOSURE_CTE`]'s membership seed rather than in a caller precisely
+    /// so there is ONE answer to it, shared by all three projections; point 4 of that
+    /// constant's documentation records why no caller can be trusted to hold it
+    /// instead. EMPTY rather than an error is deliberate: a disabled organization is
+    /// an operator state, not a store fault, and refusing here would make an
+    /// administrative action a token-endpoint outage.
     ///
     /// # Termination
     ///
@@ -33047,9 +33055,10 @@ impl OrgGroupRepo<'_> {
     ///
     /// Everything said about [`OrgGroupRepo::effective_roles`] applies here
     /// unchanged: slugs not ids, a [`BTreeSet`] for byte-stable order, the empty set
-    /// for a user with no live active membership, soft-deleted rows excluded, the
-    /// bounded walk that truncates rather than looping, and the tenant, environment,
-    /// and organization fencing repeated in every arm.
+    /// for a user with no live active membership AND for a member of an organization
+    /// that is disabled or soft-deleted, soft-deleted rows excluded, the bounded walk
+    /// that truncates rather than looping, and the tenant, environment, and
+    /// organization fencing repeated in every arm.
     ///
     /// # Errors
     ///
@@ -33134,6 +33143,16 @@ impl OrgGroupRepo<'_> {
     /// filtering, the bounded walk that truncates rather than looping, the empty
     /// result for a user with no live active membership, and the tenant,
     /// environment, and organization fencing applies here unchanged.
+    ///
+    /// That INCLUDES the organization's own lifecycle: a member of a DISABLED or
+    /// soft-deleted organization resolves to NO entries here, because the shared
+    /// closure fences it. The console consequence is deliberate. This view's whole
+    /// contract is "what the next token issuance would carry", and after a disable
+    /// the next issuance carries nothing, so reporting provenance for roles no token
+    /// will assert would be the misleading answer rather than the informative one.
+    /// The CONFIGURATION is still fully visible: the direct and group assignment
+    /// lists are unaffected by the organization's state, and they are the surface
+    /// that answers "which rows did someone write".
     ///
     /// # Errors
     ///
@@ -33223,11 +33242,11 @@ impl OrgGroupRepo<'_> {
 }
 
 /// The shared bounded closure both effective-resolution reads run (issue #97): the
-/// caller's LIVE ACTIVE membership in the organization, and the transitive ANCESTOR
-/// closure of every group that membership is a live member of.
+/// caller's LIVE ACTIVE membership in a LIVE ACTIVE organization, and the transitive
+/// ANCESTOR closure of every group that membership is a live member of.
 ///
 /// This is the read side of the group hierarchy, and it runs on the TOKEN-ISSUANCE
-/// path, so three properties are load-bearing rather than stylistic.
+/// path, so four properties are load-bearing rather than stylistic.
 ///
 ///   1. `deleted_at IS NULL` in EVERY arm, seed and recursive alike. The LIVE graph
 ///      is a forest; the STORED rows are not necessarily, because a group delete
@@ -33252,6 +33271,29 @@ impl OrgGroupRepo<'_> {
 ///      that says so. [`EFFECTIVE_ROLE_SLUGS_TAIL`] carries the census of which
 ///      organization predicates on this closure and on that projection are redundant
 ///      and which are not, and says where the third projection's copies are counted.
+///   4. The `JOIN organizations o` on the membership SEED. The organization's own
+///      lifecycle is checked HERE, once, and it is the coarsest revocation the
+///      product has: an operator who DISABLES or soft-DELETES an organization
+///      expects it to stop asserting anything, and this seed is the only place all
+///      three projections pass through. Every arm below it is fed by `membership`
+///      (directly, or through `closure`, which seeds from it), so an organization
+///      that is not live and active empties the closure and every projection over
+///      it answers the EMPTY set. Empty is the right answer rather than an error: a
+///      disabled organization is an operator STATE, not a fault, and a fault here
+///      would turn a deliberate administrative action into a token-endpoint outage
+///      for every member.
+///
+///      This predicate is LOAD BEARING on both mint hooks and has no second layer
+///      anywhere behind it. Neither hook re-checks the organization: the refresh
+///      path never calls the authorize-time org resolution at all (it reads the
+///      org context frozen onto the family's grant), and on a code exchange that
+///      resolution returns EARLY for an already-bound session, so its own
+///      disabled-organization refusal is never reached. Removing this JOIN puts
+///      the roles of a disabled organization back into every access token its
+///      members refresh, for the whole (unbounded, with `offline_access`) life of
+///      the family; `a_disabled_organization_stops_minting_its_roles_on_both_hooks`
+///      and `a_soft_deleted_organization_stops_minting_its_roles_too` in
+///      `crates/ironauth-oidc/tests/org_roles_claim.rs` are the tests that say so.
 ///
 /// Binds: `$1` tenant, `$2` environment, `$3` organization, `$4` user, `$5` the walk
 /// bound (`max_group_depth`, one LOWER than the write walks use; see
@@ -33261,6 +33303,9 @@ impl OrgGroupRepo<'_> {
 const EFFECTIVE_CLOSURE_CTE: &str = "WITH RECURSIVE membership AS ( \
          SELECT m.id \
            FROM org_memberships m \
+           JOIN organizations o ON o.id = m.organization_id \
+            AND o.tenant_id = $1 AND o.environment_id = $2 \
+            AND o.state = 'active' AND o.deleted_at IS NULL \
           WHERE m.tenant_id = $1 AND m.environment_id = $2 \
             AND m.organization_id = $3 AND m.user_id = $4 \
             AND m.state = 'active' AND m.deleted_at IS NULL \

@@ -1693,6 +1693,63 @@ async fn effective_roles_is_empty_by_default_and_drops_every_withdrawn_path() {
 }
 
 #[tokio::test]
+async fn disabling_the_organization_empties_the_effective_view_and_enabling_restores_it() {
+    // The console side of the coarsest revocation there is. This endpoint's whole
+    // contract is "what the NEXT token issuance would carry", and a disabled
+    // organization mints nothing, so it must report nothing: showing grant paths for
+    // roles no token will assert is the answer that misleads, and it would put the
+    // console and the mint into exactly the disagreement the two sharing one closure
+    // exists to prevent.
+    //
+    // Nothing is hidden by this and nothing is lost. The direct-assignment list still
+    // shows the configuration throughout (it is the surface that answers "which rows
+    // did someone write"), and re-enabling restores the view in one step.
+    let h = Harness::start(50).await;
+    let (tenant, environment) = tenant_env(&h).await;
+    let org = create_org(&h, &tenant, &environment, "k-org").await;
+    let base = org_base(&tenant, &environment, &org);
+    let membership = create_membership(&h, &tenant, &environment, &org, "m@x.test", "k-m").await;
+    let role = create_role(&h, &tenant, &environment, &org, "admin", "k-r").await;
+    let direct_roles = format!("{base}/memberships/{membership}/roles");
+    let effective = format!("{base}/memberships/{membership}/effective-roles");
+
+    let (status, _, response) = h
+        .post(
+            &direct_roles,
+            "k-grant",
+            &serde_json::json!({ "role_id": role }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{response}");
+    assert_eq!(
+        effective_roles(&h, &effective).await,
+        vec![("admin".to_owned(), "direct".to_owned(), None)],
+        "the control: the grant resolves while the organization is active"
+    );
+
+    let (status, _, response) = h.post(&format!("{base}/disable"), "k-disable", "").await;
+    assert_eq!(status, StatusCode::OK, "disable: {response}");
+    assert!(
+        effective_roles(&h, &effective).await.is_empty(),
+        "a disabled organization resolves nothing, exactly as its tokens will carry nothing"
+    );
+    assert_eq!(
+        list_ids(&h, &direct_roles).await.len(),
+        1,
+        "the assignment itself is untouched and still listed, so the configuration \
+         stays fully visible to an operator"
+    );
+
+    let (status, _, response) = h.post(&format!("{base}/enable"), "k-enable", "").await;
+    assert_eq!(status, StatusCode::OK, "enable: {response}");
+    assert_eq!(
+        effective_roles(&h, &effective).await,
+        vec![("admin".to_owned(), "direct".to_owned(), None)],
+        "re-enabling restores the view from the untouched assignment"
+    );
+}
+
+#[tokio::test]
 async fn a_deleted_group_detaches_its_subtree_and_stops_inheriting() {
     // The delete-DETACHES rule, seen from the resolution side. Deleting a mid-tree
     // group must only ever REMOVE inherited roles, never add one, and every walk

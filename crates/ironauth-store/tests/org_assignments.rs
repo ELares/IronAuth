@@ -19,6 +19,9 @@
 //!     ancestor-inherited roles, deduplicated across paths, byte-stable across
 //!     evaluations, and matches an independent in-memory model over randomized
 //!     forests;
+//!   * a DISABLED or soft-DELETED organization resolves to NOTHING on all three
+//!     projections at once, because the fence lives in the closure they share; the
+//!     coarsest revocation an operator has must not be the one that fails to land;
 //!   * resolution TERMINATES and stays correct on a STORED CYCLE through a
 //!     soft-deleted node, which the live graph's acyclicity does not rule out, and
 //!     never leaves the caller's organization (or scope) through a CORRUPT stored
@@ -48,8 +51,8 @@ use ironauth_store::{
     ActorRef, CorrelationId, InvitationCredentialType, MintedInvitationToken, NewAdminUser,
     NewInvitation, NewMembership, NewOrgGroup, NewOrgGroupMember, NewOrgGroupRole,
     NewOrgMembershipRole, NewOrgRole, ORG_GROUP_MAX_DEPTH_CEILING, OrgGroupId, OrgGroupMemberId,
-    OrgGroupRoleId, OrgMembershipId, OrgMembershipRoleId, OrgRoleId, OrganizationId, Scope,
-    ServiceId, StoreError, UserId, UserState, mint_invitation_token,
+    OrgGroupRoleId, OrgMembershipId, OrgMembershipRoleId, OrgRoleId, OrganizationId,
+    OrganizationState, Scope, ServiceId, StoreError, UserId, UserState, mint_invitation_token,
 };
 use sqlx::Row;
 
@@ -342,6 +345,58 @@ async fn roles_of(
         .effective_roles(org, user, depth)
         .await
         .expect("resolve effective roles")
+}
+
+/// The effective role slugs WITH PROVENANCE for `user` in `org` (the third
+/// projection over the shared closure), flattened to just the slugs in the order the
+/// projection emits them. One entry per GRANT PATH, so a role held twice appears
+/// twice, which is what makes this distinguishable from [`roles_of`].
+async fn grant_slugs_of(
+    db: &TestDatabase,
+    scope: Scope,
+    org: &OrganizationId,
+    user: &UserId,
+    depth: u32,
+) -> Vec<String> {
+    db.control_store()
+        .management()
+        .org_groups(scope)
+        .effective_role_grants(org, user, depth)
+        .await
+        .expect("resolve effective role grants")
+        .into_iter()
+        .map(|grant| grant.slug)
+        .collect()
+}
+
+/// Flip an organization's lifecycle state through the control plane: the operator's
+/// disable (and re-enable) action.
+async fn set_org_state(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    org: &OrganizationId,
+    state: OrganizationState,
+) {
+    db.control_store()
+        .management()
+        .acting(actor(env), CorrelationId::generate(env))
+        .organizations(scope)
+        .set_state(env, org, state)
+        .await
+        .expect("set organization state");
+}
+
+/// Soft-delete an organization through the control plane. Nothing cascades: every
+/// membership, group, and assignment row underneath stays live.
+async fn delete_org(db: &TestDatabase, env: &Env, scope: Scope, org: &OrganizationId) {
+    db.control_store()
+        .management()
+        .acting(actor(env), CorrelationId::generate(env))
+        .organizations(scope)
+        .delete(env, org)
+        .await
+        .expect("soft delete organization");
 }
 
 /// The effective group slugs for `user` in `org`, resolved through the CONTROL plane.
@@ -1554,6 +1609,131 @@ async fn resolution_excludes_every_soft_deleted_row_on_the_path() {
         roles_of(&db, &env, scope, &org, &stranger, DEFAULT_DEPTH)
             .await
             .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn a_disabled_or_deleted_organization_resolves_to_nothing_on_all_three_projections() {
+    // The organization's OWN lifecycle, which is the COARSEST revocation the product
+    // has and the one an operator reaches for when they want everything to stop at
+    // once. It is checked in the membership seed of the shared closure rather than in
+    // any caller, so this asserts it on all THREE projections together: the role set
+    // the token claim carries, the flattened group closure, and the provenance view
+    // the console renders. A check placed in one caller would leave the others
+    // disagreeing with it about the same organization.
+    //
+    // Neither state cascades. A disable writes only `state`, a delete writes only
+    // `deleted_at`, and every membership, group binding, and assignment row
+    // underneath stays live and readable, which is precisely why the resolution has
+    // to observe the organization row itself.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let org = create_org(&db, &env, scope, "Globex").await;
+    // A second organization in the SAME scope, so the fence is proved to be per
+    // organization rather than a scope-wide outage.
+    let bystander = create_org(&db, &env, scope, "Initech").await;
+
+    let group = create_group(&db, &env, scope, &org, "engineering", None).await;
+    let group_role = create_role(&db, &env, scope, &org, "engineer").await;
+    let direct_role = create_role(&db, &env, scope, &org, "founder").await;
+    grant_group_role(&db, &env, scope, &org, &group, &group_role)
+        .await
+        .expect("grant to group");
+    let (user, membership) = create_member(&db, &env, scope, &org, "dev@example.test").await;
+    bind_member(&db, &env, scope, &org, &group, &membership)
+        .await
+        .expect("bind into group");
+    grant_direct_role(&db, &env, scope, &org, &membership, &direct_role)
+        .await
+        .expect("direct grant");
+
+    let (other_user, other_membership) =
+        create_member(&db, &env, scope, &bystander, "ops@example.test").await;
+    let other_role = create_role(&db, &env, scope, &bystander, "keeper").await;
+    grant_direct_role(&db, &env, scope, &bystander, &other_membership, &other_role)
+        .await
+        .expect("bystander direct grant");
+
+    // The control: everything resolves while the organization is live and active.
+    assert_eq!(
+        roles_of(&db, &env, scope, &org, &user, DEFAULT_DEPTH).await,
+        set(&["engineer", "founder"]),
+        "the fixture resolves before any lifecycle change"
+    );
+    assert_eq!(
+        groups_of(&db, scope, &org, &user, DEFAULT_DEPTH).await,
+        set(&["engineering"])
+    );
+    assert_eq!(
+        grant_slugs_of(&db, scope, &org, &user, DEFAULT_DEPTH).await,
+        vec!["engineer".to_owned(), "founder".to_owned()]
+    );
+
+    // DISABLED: every projection answers the empty set, and NOT an error. A disabled
+    // organization is an operator state, not a store fault, and refusing here would
+    // turn a deliberate administrative action into a token-endpoint outage.
+    set_org_state(&db, &env, scope, &org, OrganizationState::Disabled).await;
+    assert!(
+        roles_of(&db, &env, scope, &org, &user, DEFAULT_DEPTH)
+            .await
+            .is_empty(),
+        "a disabled organization grants no role"
+    );
+    assert!(
+        groups_of(&db, scope, &org, &user, DEFAULT_DEPTH)
+            .await
+            .is_empty(),
+        "and places the member in no group"
+    );
+    assert!(
+        grant_slugs_of(&db, scope, &org, &user, DEFAULT_DEPTH)
+            .await
+            .is_empty(),
+        "and the provenance view agrees, rather than showing paths no token will assert"
+    );
+    assert_eq!(
+        roles_of(&db, &env, scope, &bystander, &other_user, DEFAULT_DEPTH).await,
+        set(&["keeper"]),
+        "a sibling organization in the same scope is untouched"
+    );
+
+    // Re-enabling restores all three from the assignment rows, which were never
+    // touched: this is a fence on live state, not a destructive revocation.
+    set_org_state(&db, &env, scope, &org, OrganizationState::Active).await;
+    assert_eq!(
+        roles_of(&db, &env, scope, &org, &user, DEFAULT_DEPTH).await,
+        set(&["engineer", "founder"]),
+        "re-enabling restores the whole resolution"
+    );
+    assert_eq!(
+        groups_of(&db, scope, &org, &user, DEFAULT_DEPTH).await,
+        set(&["engineering"])
+    );
+
+    // SOFT-DELETED: the same, through the other lifecycle column.
+    delete_org(&db, &env, scope, &org).await;
+    assert!(
+        roles_of(&db, &env, scope, &org, &user, DEFAULT_DEPTH)
+            .await
+            .is_empty(),
+        "a soft-deleted organization grants no role either"
+    );
+    assert!(
+        groups_of(&db, scope, &org, &user, DEFAULT_DEPTH)
+            .await
+            .is_empty()
+    );
+    assert!(
+        grant_slugs_of(&db, scope, &org, &user, DEFAULT_DEPTH)
+            .await
+            .is_empty()
+    );
+    assert_eq!(
+        roles_of(&db, &env, scope, &bystander, &other_user, DEFAULT_DEPTH).await,
+        set(&["keeper"]),
+        "and the sibling organization is still untouched"
     );
 }
 
