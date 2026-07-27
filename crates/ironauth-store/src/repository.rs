@@ -88,12 +88,12 @@ use crate::id::{
     LocaleBundleId, MagicLinkTokenId, ManagementKeyId, Mds3BlobCacheId, MigrationRunId,
     MigrationRunRecordId, OperatorId, OrgAuthPolicyId, OrgConnectionId, OrgGroupId,
     OrgGroupMemberId, OrgGroupRoleId, OrgMembershipId, OrgMembershipRoleId, OrgRoleId,
-    OrganizationId, PowChallengeId, PushedRequestId, RecoveryApprovalId, RecoveryCodeId,
-    RecoveryContactConfirmationId, RecoveryFlowId, RecoveryIdvSessionId, RecoveryTrustedContactId,
-    RefreshFamilyId, RefreshTokenId, ResourceServerId, RiskDecisionId, RiskDisavowalId,
-    RiskLoginGeoId, RiskSignalId, RoutingRuleId, ScopeStepUpPolicyId, ServiceAccountId,
-    SessionEventId, SessionId, SigningKeyId, SignupFormId, SignupQuarantineId, SmsOtpCodeId,
-    SmsRouteStatId, TenantId, TotpCredentialId, TraitMigrationJobId, TraitSchemaId,
+    OrganizationId, PermissionId, PowChallengeId, PushedRequestId, RecoveryApprovalId,
+    RecoveryCodeId, RecoveryContactConfirmationId, RecoveryFlowId, RecoveryIdvSessionId,
+    RecoveryTrustedContactId, RefreshFamilyId, RefreshTokenId, ResourceServerId, RiskDecisionId,
+    RiskDisavowalId, RiskLoginGeoId, RiskSignalId, RoutingRuleId, ScopeStepUpPolicyId,
+    ServiceAccountId, SessionEventId, SessionId, SigningKeyId, SignupFormId, SignupQuarantineId,
+    SmsOtpCodeId, SmsRouteStatId, TenantId, TotpCredentialId, TraitMigrationJobId, TraitSchemaId,
     TrustedDeviceId, UpstreamTokenGrantId, UpstreamTokenId, UserId, UserIdentifierId, VariableId,
     WebauthnChallengeId, WebauthnCredentialId,
 };
@@ -317,6 +317,22 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn org_roles(&self) -> OrgRoleRepo<'a> {
         OrgRoleRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only permission-vocabulary repository for this scope on the DATA
+    /// plane (issue #98). Migration 0091 grants the data-plane SELECT on
+    /// `permissions` (and nothing else), so the token-issuance path can resolve a
+    /// subject's effective permission set without the control role. A data plane
+    /// able to DEFINE the capability names it is about to put into a token is the
+    /// whole threat those grants exist to prevent, so there is deliberately no
+    /// mutating data-plane counterpart and no INSERT, UPDATE, or DELETE grant of any
+    /// shape.
+    #[must_use]
+    pub fn permissions(&self) -> PermissionRepo<'a> {
+        PermissionRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -31703,6 +31719,92 @@ pub struct NewOrgRole<'a> {
     pub metadata: Option<&'a serde_json::Value>,
 }
 
+/// What one [`PermissionRecord`] DEFINES (issue #98): the closed `permissions.kind`
+/// vocabulary the `permissions_kind_known` CHECK pins.
+///
+/// A typed value rather than a bare `String` for one reason worth stating: the
+/// entitlement half is shipped headroom with no writer in issue #98, and the
+/// resolution projection that feeds the token claim selects `Permission` rows and
+/// nothing else. Modelling the discriminator as a type makes "an entitlement is not
+/// a permission" checkable in Rust as well as in SQL, and makes an unrecognized
+/// stored value a LOUD decode failure rather than a value that flows onward.
+///
+/// Adding a member is a migration (widening the CHECK) plus one variant here. Both
+/// halves fail loudly without the other: a value the CHECK admits but this enum does
+/// not fails to decode, and a value this enum admits but the CHECK does not fails to
+/// write.
+///
+/// Named [`PermissionEntryKind`] and not `PermissionKind`, which is already the
+/// scoped-IDENTIFIER marker for the `prm_` prefix. The two are unrelated: this one
+/// is a column value, that one is a type-level tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum PermissionEntryKind {
+    /// A named API CAPABILITY: the only kind issue #98 writes, and the only kind the
+    /// effective-permission projection selects.
+    Permission,
+    /// A feature or plan ENTITLEMENT (issue #103). Shipped as headroom so #103 needs
+    /// no migration; nothing in issue #98 creates one.
+    Entitlement,
+}
+
+impl PermissionEntryKind {
+    /// The stored wire string, byte-identical to a value the
+    /// `permissions_kind_known` CHECK admits.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PermissionEntryKind::Permission => "permission",
+            PermissionEntryKind::Entitlement => "entitlement",
+        }
+    }
+
+    /// Parse a stored `permissions.kind` value.
+    ///
+    /// Returns `None` for anything outside the closed set, so a widened CHECK that
+    /// forgot this enum surfaces as a decode failure at the read rather than as an
+    /// unclassified row flowing into a projection.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "permission" => Some(PermissionEntryKind::Permission),
+            "entitlement" => Some(PermissionEntryKind::Entitlement),
+            _ => None,
+        }
+    }
+}
+
+/// A permission-vocabulary row (issue #98): one named API capability (or, from issue
+/// #103, one feature or plan entitlement) defined in an ENVIRONMENT.
+///
+/// It carries no `organization_id`, and that is the design rather than an omission:
+/// a permission names an API capability, and one string cannot sensibly mean
+/// different things to two organizations calling the same API. The organization
+/// lives on the role-to-permission mapping, because ROLES are per organization. See
+/// the header of migration 0091 for the full argument, which issue #103 inherits
+/// rather than reopens.
+///
+/// Only LIVE (not soft-deleted) rows are ever reconstructed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionRecord {
+    /// The permission identifier (`prm_...`, embeds its `(tenant, environment)`).
+    pub id: PermissionId,
+    /// What this row defines. IMMUTABLE (absent from every UPDATE grant).
+    pub kind: PermissionEntryKind,
+    /// The IMMUTABLE stable name, unique per `(scope, kind)` over LIVE rows. This is
+    /// the string a token claim carries, so a rename changes `display_name` and
+    /// never this.
+    pub slug: String,
+    /// The mutable human-facing label the admin console shows.
+    pub display_name: String,
+    /// Free-form vocabulary metadata, as stored JSON. Never interpreted by the auth
+    /// core and never emitted in a token claim.
+    pub metadata: serde_json::Value,
+    /// Creation time in microseconds since the Unix epoch (the pagination key).
+    pub created_at_unix_micros: i64,
+    /// Last-modification time in microseconds since the Unix epoch.
+    pub updated_at_unix_micros: i64,
+}
+
 /// An organization-group row (issue #97): one named group belonging to one
 /// organization within a scope, holding a position in that organization's group
 /// FOREST. Only LIVE (not soft-deleted) groups are ever reconstructed.
@@ -31977,6 +32079,18 @@ impl<'a> ManagementStore<'a> {
     #[must_use]
     pub fn org_roles(&self, scope: Scope) -> OrgRoleRepo<'a> {
         OrgRoleRepo {
+            store: self.store,
+            scope,
+        }
+    }
+
+    /// The read-only permission-vocabulary repository for `scope` (issue #98). The
+    /// vocabulary belongs to the ENVIRONMENT and carries no organization, so
+    /// `(tenant, environment)` is its complete address and the row-level-security
+    /// policy is its complete fence.
+    #[must_use]
+    pub fn permissions(&self, scope: Scope) -> PermissionRepo<'a> {
+        PermissionRepo {
             store: self.store,
             scope,
         }
@@ -32793,6 +32907,178 @@ impl OrgRoleRepo<'_> {
         tx.commit().await?;
         rows.iter()
             .map(|row| org_role_from_row(row, &self.scope))
+            .collect()
+    }
+}
+
+/// The projection every permission read selects from `permissions` (the two
+/// timestamps as epoch microseconds, the metadata as JSON text). One constant so
+/// the get, slug, and list projections cannot drift.
+///
+/// # Scope-predicate redundancy census
+///
+/// Every read below repeats `tenant_id` and `environment_id` in its `WHERE`
+/// even though `permissions_tenant_isolation` already fences both. The
+/// redundancy is ONE WAY, and the direction matters, so it is recorded here
+/// rather than left for a future reader to rediscover by deleting the wrong
+/// half:
+///
+/// * The POLICY's `environment_id` conjunct is LOAD BEARING. Removing it from
+///   the `USING` and `WITH CHECK` halves lets a session bound to one
+///   environment read, forge into, and update another environment's rows.
+///   `rls_hides_another_scopes_vocabulary_and_refuses_forging_one` kills that
+///   mutation, using a third scope that differs from the first ONLY in the
+///   environment. A pair that differs in the tenant too cannot hold this
+///   property, because the tenant conjunct refuses first and the environment
+///   conjunct is then asserted by nothing.
+/// * These STATEMENT predicates are defense in depth and are individually
+///   UNOBSERVABLE while the policy holds: neutering one alone leaves the whole
+///   suite green, because the policy refuses the same rows anyway. Neutering
+///   BOTH layers is caught by the same test. They are kept because a statement
+///   that names its own scope is readable on its own terms and does not depend
+///   on a reader knowing the policy exists, which is the same argument
+///   `EFFECTIVE_ROLE_SLUGS_TAIL` records for its own redundant organization
+///   predicates.
+///
+/// Do not delete either half on the grounds that a mutation survives: the
+/// survival is the expected consequence of the backstop, not evidence the
+/// predicate is dead.
+const PERMISSION_SELECT_COLUMNS: &str = "id, kind, slug, display_name, \
+     metadata::text AS metadata_text, \
+     (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us, \
+     (EXTRACT(EPOCH FROM updated_at) * 1000000)::bigint AS updated_us";
+
+/// Read-only permission vocabulary for one scope (issue #98).
+///
+/// Reached by the control plane through [`ManagementStore::permissions`] and by the
+/// data plane through [`ScopedStore::permissions`]. Every read is scope-fenced and
+/// filters `deleted_at IS NULL`, so a deleted permission reads as absent, exactly
+/// like a permission of another scope and like one that never existed: the three
+/// cases are indistinguishable to a caller. The typed [`PermissionId`] embeds its
+/// scope, so a cross-scope id fails to parse in scope before any query runs.
+///
+/// THREE cases and not the usual four, because this table is scoped to exactly
+/// `(tenant, environment)` and to nothing finer: there is no organization dimension
+/// and therefore no "foreign organization" case to make uniform. The row-level
+/// security policy is this table's COMPLETE fence, unlike every #97 table, whose
+/// organization predicate has to be repeated in every statement because the policy
+/// cannot see it. A reader auditing the repeated-predicate census will notice the
+/// absence here; the answer is that there is nothing to repeat.
+///
+/// There is no MUTATING counterpart in this PR: the audited write repository is the
+/// next PR of issue #98, and nothing on the data plane ever writes a permission.
+pub struct PermissionRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl PermissionRepo<'_> {
+    /// Parse an untrusted permission identifier under this scope. A malformed id and
+    /// one minted in another scope both return the uniform not-found.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if malformed or out of scope.
+    pub fn parse_id(&self, raw: &str) -> Result<PermissionId, StoreError> {
+        Ok(PermissionId::parse_in_scope(raw, &self.scope)?)
+    }
+
+    /// Fetch a live permission by id, within scope.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no such live permission is visible in this scope.
+    pub async fn get(&self, id: &PermissionId) -> Result<PermissionRecord, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(&format!(
+            "SELECT {PERMISSION_SELECT_COLUMNS} FROM permissions \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND deleted_at IS NULL"
+        ))
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        permission_from_row(&row, &self.scope)
+    }
+
+    /// Fetch a live permission by its `(kind, slug)` address: the read the create
+    /// path checks for a conflict with, and the read an admin surface that addresses
+    /// a permission by NAME performs.
+    ///
+    /// `kind` is part of the address because it is part of the live uniqueness key,
+    /// which is what lets `plan.enterprise` exist as an entitlement while a
+    /// permission of the same slug exists independently. Passing the wrong kind is
+    /// the uniform not-found, never the other row.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no such live permission is visible in this scope.
+    pub async fn get_by_slug(
+        &self,
+        kind: PermissionEntryKind,
+        slug: &str,
+    ) -> Result<PermissionRecord, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(&format!(
+            "SELECT {PERMISSION_SELECT_COLUMNS} FROM permissions \
+             WHERE tenant_id = $1 AND environment_id = $2 AND kind = $3 AND slug = $4 \
+             AND deleted_at IS NULL"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(kind.as_str())
+        .bind(slug)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        permission_from_row(&row, &self.scope)
+    }
+
+    /// One page of live permissions of one `kind` in this scope, ordered by
+    /// `(created_at, id)`. The "permissions in this environment" list.
+    ///
+    /// This list is PAGE-size clamped like every management list. There is NO cap on
+    /// how many permissions an environment may define: the covenant forbids one, and
+    /// the byte budget a later PR of issue #98 adds bounds one TOKEN, never this
+    /// table.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list(
+        &self,
+        kind: PermissionEntryKind,
+        limit: i64,
+        after: Option<&CursorPosition>,
+    ) -> Result<Vec<PermissionRecord>, StoreError> {
+        let (after_micros, after_id) = split_cursor(after);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {PERMISSION_SELECT_COLUMNS} FROM permissions \
+             WHERE tenant_id = $1 AND environment_id = $2 AND kind = $3 \
+             AND deleted_at IS NULL \
+             AND ($4::bigint IS NULL OR (created_at, id) > \
+                  (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval, $5::text)) \
+             ORDER BY created_at, id LIMIT $6"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(kind.as_str())
+        .bind(after_micros)
+        .bind(after_id)
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| permission_from_row(row, &self.scope))
             .collect()
     }
 }
@@ -38960,6 +39246,41 @@ fn org_role_from_row(row: &PgRow, scope: &Scope) -> Result<OrgRoleRecord, StoreE
     Ok(OrgRoleRecord {
         id,
         organization_id,
+        slug: row.get("slug"),
+        display_name: row.get("display_name"),
+        metadata,
+        created_at_unix_micros: row.get("created_us"),
+        updated_at_unix_micros: row.get("updated_us"),
+    })
+}
+
+/// Reconstruct a [`PermissionRecord`] from a row read within scope. The stored id is
+/// parsed back UNDER the scope, so a corrupt cross-scope row fails to decode rather
+/// than being returned; the metadata is parsed from its JSON text.
+///
+/// An unrecognized `kind` is a DECODE FAILURE rather than a default: the
+/// `permissions_kind_known` CHECK and [`PermissionEntryKind`] are two halves of one
+/// closed set, and a row carrying a value only the CHECK knows about must not be
+/// silently reclassified into the kind the token claim selects.
+fn permission_from_row(row: &PgRow, scope: &Scope) -> Result<PermissionRecord, StoreError> {
+    let id = PermissionId::parse_in_scope(&row.get::<String, _>("id"), scope)?;
+    let raw_kind: String = row.get("kind");
+    let kind = PermissionEntryKind::parse(&raw_kind).ok_or_else(|| {
+        StoreError::Database(sqlx::Error::Decode(
+            format!("permissions.kind is outside the closed set: {raw_kind:?}").into(),
+        ))
+    })?;
+    let metadata_text: String = row.get("metadata_text");
+    // The metadata passed a `::jsonb` cast on write, so a parse failure here is an
+    // internal invariant violation; surface it as a decode error, not a silent empty.
+    let metadata: serde_json::Value = serde_json::from_str(&metadata_text).map_err(|error| {
+        StoreError::Database(sqlx::Error::Decode(
+            format!("permissions.metadata is not valid JSON: {error}").into(),
+        ))
+    })?;
+    Ok(PermissionRecord {
+        id,
+        kind,
         slug: row.get("slug"),
         display_name: row.get("display_name"),
         metadata,

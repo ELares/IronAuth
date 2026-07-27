@@ -521,6 +521,20 @@ name = "org_roles"
 path = "tests/org_roles.rs"
 required-features = ["testing"]
 
+# The permission vocabulary (issue #98, store PR 1): the environment-scoped
+# permissions table read through the read-only repository on both planes, the
+# uniform not-found across absent / deleted / foreign-scope / wrong-kind, the
+# permission-and-entitlement slug sharing that gives issue #103 its headroom, the
+# live-vs-deleted slug uniqueness, forced RLS under the control role including the
+# WRITE-side forge probe, the least-privilege grants (data plane read only; slug and
+# kind immutable by GRANT on both roles), the fail-closed decode of a kind outside
+# the closed set, and the covenant that a vocabulary is uncapped. Needs a real
+# database (DATABASE_URL).
+[[test]]
+name = "permissions"
+path = "tests/permissions.rs"
+required-features = ["testing"]
+
 # Organization groups and hierarchy safety (issue #97, store PR 2): the group half
 # of the M10 role model, plus the write-time cycle check and depth bound. Covers the
 # audited CRUD and reparent vocabulary, the typed cycle and depth refusals (and that

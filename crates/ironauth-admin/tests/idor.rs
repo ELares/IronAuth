@@ -11,7 +11,8 @@ use ironauth_store::{
     ActorRef, AuthPolicy, CorrelationId, ManagementKeyId, NewAdminUser, NewMembership, NewOrgGroup,
     NewOrgGroupMember, NewOrgGroupRole, NewOrgMembershipRole, NewOrgRole,
     ORG_POLICY_MAX_SESSION_TTL_SECS, OrgGroupId, OrgGroupMemberId, OrgGroupRoleId, OrgMembershipId,
-    OrgMembershipRoleId, OrgRoleId, OrganizationId, Scope, ServiceId, StoreError, UserState,
+    OrgMembershipRoleId, OrgRoleId, OrganizationId, PermissionId, Scope, ServiceId, StoreError,
+    UserState,
 };
 
 /// A stand-in key hash for a planted victim (the probes resolve by id, not hash).
@@ -130,6 +131,15 @@ async fn management_probes_deny_cross_tenant_and_cross_environment_uniformly() {
             .expect("plant the victim policy");
     }
 
+    // The permission vocabulary (issue #98): plant a victim permission in each
+    // foreign scope so the vocabulary probe has a real cross-scope target rather than
+    // only an absent id. Planted with direct SQL because the audited write repository
+    // is the NEXT PR of that issue; the insert runs as the CONTROL role under the
+    // victim's own bound scope, so it exercises exactly the grants and the policy a
+    // real write will.
+    let victim_permission_b = plant_permission(&db, &env, scope_b).await;
+    let victim_permission_a2 = plant_permission(&db, &env, scope_a2).await;
+
     // A well-formed key id in the caller's OWN scope that was never stored.
     let absent_in_a = ManagementKeyId::generate(&env, &scope_a).to_string();
 
@@ -165,6 +175,7 @@ async fn management_probes_deny_cross_tenant_and_cross_environment_uniformly() {
             "org_membership_roles.unassign",
             "org_auth_policies.set",
             "org_auth_policies.remove",
+            "permissions.get",
         ],
         "every management resolve-by-id operation is registered",
     );
@@ -186,6 +197,8 @@ async fn management_probes_deny_cross_tenant_and_cross_environment_uniformly() {
         victim_group_grant_a2.to_string(),
         victim_direct_grant_b.to_string(),
         victim_direct_grant_a2.to_string(),
+        victim_permission_b.to_string(),
+        victim_permission_a2.to_string(),
         absent_in_a.clone(),
     ];
     let foreign_refs: Vec<&str> = foreign.iter().map(String::as_str).collect();
@@ -343,6 +356,24 @@ async fn management_probes_deny_cross_tenant_and_cross_environment_uniformly() {
         );
     }
 
+    // The victim PERMISSIONS must still be readable IN THEIR OWN SCOPE. `permissions.get`
+    // is a read probe, so there is nothing for it to have destroyed; what this asserts
+    // is the other failure mode, and the one #97's review actually found: a probe that
+    // reports Denied because the victim was never planted passes for the wrong reason
+    // and would keep passing if the fence were removed.
+    for (scope, permission) in [
+        (scope_b, &victim_permission_b),
+        (scope_a2, &victim_permission_a2),
+    ] {
+        let record = control
+            .management()
+            .permissions(scope)
+            .get(permission)
+            .await
+            .expect("the victim permission must exist in its OWN scope");
+        assert_eq!(record.slug, "victim.permission");
+    }
+
     // The victim POLICIES must survive both probes AND still carry their own
     // document. A liveness-only assertion would miss the sharper leak: a cross-scope
     // `set` that landed would leave the policy readable while having REPLACED the
@@ -360,6 +391,39 @@ async fn management_probes_deny_cross_tenant_and_cross_environment_uniformly() {
             "the victim policy's document must be untouched by the set probe"
         );
     }
+}
+
+/// Plant a live permission in `scope` through the CONTROL pool, returning its id.
+///
+/// Direct SQL rather than a repository call: the audited write repository for the
+/// permission vocabulary is the next PR of issue #98. The statement runs as
+/// `ironauth_control` with the victim scope bound, so the row satisfies the isolation
+/// policy's WITH CHECK and lands under exactly the grants a real write will use.
+async fn plant_permission(db: &TestDatabase, env: &Env, scope: Scope) -> PermissionId {
+    let id = PermissionId::generate(env, &scope);
+    let mut tx = db.control_pool().begin().await.expect("begin plant");
+    for (setting, value) in [
+        ("ironauth.tenant_id", scope.tenant().to_string()),
+        ("ironauth.environment_id", scope.environment().to_string()),
+    ] {
+        sqlx::query("SELECT set_config($1, $2, true)")
+            .bind(setting)
+            .bind(value)
+            .execute(&mut *tx)
+            .await
+            .expect("bind scope");
+    }
+    sqlx::query(
+        "INSERT INTO permissions (id, tenant_id, environment_id, slug, display_name)          VALUES ($1, $2, $3, 'victim.permission', 'victim permission')",
+    )
+    .bind(id.to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .execute(&mut *tx)
+    .await
+    .expect("plant victim permission");
+    tx.commit().await.expect("commit plant");
+    id
 }
 
 /// Plant a live group binding in `scope` via the control store, returning its id.
