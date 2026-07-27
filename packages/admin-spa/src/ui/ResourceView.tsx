@@ -16,6 +16,9 @@
 //   ConfirmButton gates a destructive action behind an explicit, keyboard
 //   reachable confirm step (no browser confirm dialog), so a delete, suspend,
 //   resume, or restore is always a deliberate two step.
+//
+//   MorePageNote states that a keyset read has a tail beyond the page shown, so
+//   a list surface never truncates silently.
 
 import type { ComponentChildren } from "preact";
 import { useState } from "preact/hooks";
@@ -64,6 +67,29 @@ export function AsyncBoundary<T>({
     return <>{children(state.data)}</>;
   }
   return null;
+}
+
+export interface MorePageNoteProps {
+  // The opaque cursor a keyset read reported, or null when this was the last
+  // page.
+  nextCursor: string | null;
+  // The resource named in the sentence ("organizations", "groups").
+  noun: string;
+}
+
+// A "more exist beyond this page" note, rendered when a keyset read reports a
+// next cursor. The list shows the first page; this makes the remainder EXPLICIT
+// rather than silently dropping the tail (the no-silent-truncation rule). The
+// cursor itself is a pagination token and is never rendered as a value to copy.
+export function MorePageNote({ nextCursor, noun }: MorePageNoteProps) {
+  if (nextCursor === null) {
+    return null;
+  }
+  return (
+    <p class="resource-more" role="status">
+      More {noun} exist beyond this page. Only the first page is shown.
+    </p>
+  );
 }
 
 export interface MutationFeedbackProps {

@@ -103,6 +103,50 @@ export type InvitationStateView = components["schemas"]["InvitationStateView"];
 export type InvitationCredentialTypeView =
   components["schemas"]["InvitationCredentialTypeView"];
 
+// The request and result shapes the organization roles and groups surfaces read
+// (issue #97). Roles, groups, group members, and the two assignment surfaces all
+// live UNDER one organization, which itself lives under the active
+// {tenant, environment}, so every wrapper below injects all three ids into the
+// documented path. Re-exported from the generated schema so the views never hand
+// maintain a shape the management contract already owns.
+//
+// OrgRoleView / CreateOrgRoleRequest / UpdateOrgRoleRequest for the roles CRUD
+// (the slug is IMMUTABLE, so the update carries only the display name and the
+// metadata); OrgGroupView / CreateOrgGroupRequest / UpdateOrgGroupRequest for the
+// groups CRUD, plus SetOrgGroupParentRequest for the dedicated MOVE operation
+// (reparenting is its own endpoint because it carries the cycle and depth
+// refusals a plain rename must never be able to trigger);
+// OrgGroupMemberView / AddOrgGroupMemberRequest for binding an organization
+// membership into a group; OrgGroupRoleView / AssignOrgGroupRoleRequest and
+// OrgMembershipRoleView / AssignOrgMembershipRoleRequest for the two grant
+// surfaces; and EffectiveRolesView / EffectiveRoleView for the resolved picture.
+//
+// EffectiveRoleView is ONE GRANT PATH, not one role: a role held both directly
+// and through a group yields TWO entries carrying the same slug. That is the
+// point of the view, so nothing in this app may collapse it by slug.
+export type OrgRoleView = components["schemas"]["OrgRoleView"];
+export type CreateOrgRoleRequest = components["schemas"]["CreateOrgRoleRequest"];
+export type UpdateOrgRoleRequest = components["schemas"]["UpdateOrgRoleRequest"];
+export type OrgGroupView = components["schemas"]["OrgGroupView"];
+export type CreateOrgGroupRequest =
+  components["schemas"]["CreateOrgGroupRequest"];
+export type UpdateOrgGroupRequest =
+  components["schemas"]["UpdateOrgGroupRequest"];
+export type SetOrgGroupParentRequest =
+  components["schemas"]["SetOrgGroupParentRequest"];
+export type OrgGroupMemberView = components["schemas"]["OrgGroupMemberView"];
+export type AddOrgGroupMemberRequest =
+  components["schemas"]["AddOrgGroupMemberRequest"];
+export type OrgGroupRoleView = components["schemas"]["OrgGroupRoleView"];
+export type AssignOrgGroupRoleRequest =
+  components["schemas"]["AssignOrgGroupRoleRequest"];
+export type OrgMembershipRoleView =
+  components["schemas"]["OrgMembershipRoleView"];
+export type AssignOrgMembershipRoleRequest =
+  components["schemas"]["AssignOrgMembershipRoleRequest"];
+export type EffectiveRoleView = components["schemas"]["EffectiveRoleView"];
+export type EffectiveRolesView = components["schemas"]["EffectiveRolesView"];
+
 // The request and result shapes the connectors and clients (DCR) surfaces read
 // (issue #90, PR 6). Both surfaces are ENVIRONMENT scoped, so every wrapper below
 // injects the active {tenant, environment} into the documented path, exactly as
@@ -1875,4 +1919,659 @@ export async function unlinkUserExternalId(
     throw new ManagementError(toErrorBody(error), response.status);
   }
   return data;
+}
+
+// ---- The organization roles and groups operations (issue #97) ---------------
+//
+// The organization detail surface (src/ui/OrgRolesView.tsx, mounted by
+// src/ui/OrganizationsView.tsx) calls these named wrappers, never a path, so the
+// single funnel holds: every literal below is a path the committed
+// docs/openapi/management.json documents, and the tenant, environment, and
+// organization ids substitute into the documented path parameters exactly as the
+// memberships wrappers inject them. Each throws a ManagementError carrying the
+// verbatim ErrorBody on a non 2xx (the same bodyless-non-2xx guard as the reads
+// above), which the ErrorView boundary renders unchanged. That matters more here
+// than anywhere else in the console: the reparent refusals (a cycle, or a depth
+// past the configured maximum) are 422 bodies the server words precisely, and
+// rewording them would cost the operator the reason the move was refused.
+//
+// The list reads are KEYSET paginated and return { items, nextCursor } so the
+// view can surface a "more exist" indicator rather than SILENTLY DROPPING the
+// tail. The effective-roles read is deliberately NOT paginated: it is one
+// bounded set, and it is returned whole.
+
+// List the roles of one organization (operationId listOrgRoles).
+export async function fetchOrgRoles(
+  tenantId: string,
+  environmentId: string,
+  organizationId: string,
+): Promise<KeysetPage<OrgRoleView>> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.GET(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          organization_id: organizationId,
+        },
+      },
+    },
+  );
+  if (error !== undefined || !response.ok) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return { items: data?.items ?? [], nextCursor: data?.next_cursor ?? null };
+}
+
+// Read one role (operationId getOrgRole). The role detail panel reads this fresh
+// rather than reusing the list row, so a rename made elsewhere is visible.
+export async function getOrgRole(
+  tenantId: string,
+  environmentId: string,
+  organizationId: string,
+  roleId: string,
+): Promise<OrgRoleView> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.GET(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          organization_id: organizationId,
+          role_id: roleId,
+        },
+      },
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+// Define a role in an organization (operationId createOrgRole). Idempotency-Key
+// guarded so a retried submit defines the role once.
+export async function createOrgRole(
+  tenantId: string,
+  environmentId: string,
+  organizationId: string,
+  request: CreateOrgRoleRequest,
+): Promise<OrgRoleView> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.POST(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          organization_id: organizationId,
+        },
+        header: { "Idempotency-Key": idempotencyKey() },
+      },
+      body: request,
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+// Rename a role (operationId updateOrgRole): an RFC 7396 style partial edit over
+// the display name only. The slug is IMMUTABLE and is not on this body, so a name
+// an authorization decision keys on cannot move under it.
+export async function updateOrgRole(
+  tenantId: string,
+  environmentId: string,
+  organizationId: string,
+  roleId: string,
+  request: UpdateOrgRoleRequest,
+): Promise<OrgRoleView> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.PATCH(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          organization_id: organizationId,
+          role_id: roleId,
+        },
+      },
+      body: request,
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+// Delete a role (operationId deleteOrgRole): a soft delete that also withdraws
+// every grant of it. A 204 carries no body, so the guard reads the bodyless 2xx
+// as success and any non 2xx as the verbatim failure.
+export async function deleteOrgRole(
+  tenantId: string,
+  environmentId: string,
+  organizationId: string,
+  roleId: string,
+): Promise<void> {
+  const client = createManagementClient();
+  const { error, response } = await client.DELETE(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          organization_id: organizationId,
+          role_id: roleId,
+        },
+      },
+    },
+  );
+  if (error !== undefined || !response.ok) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+}
+
+// List the groups of one organization (operationId listOrgGroups). The page is
+// FLAT: every group with its parent_id, so the console renders the hierarchy from
+// one page sequence rather than one request per level.
+export async function fetchOrgGroups(
+  tenantId: string,
+  environmentId: string,
+  organizationId: string,
+): Promise<KeysetPage<OrgGroupView>> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.GET(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          organization_id: organizationId,
+        },
+      },
+    },
+  );
+  if (error !== undefined || !response.ok) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return { items: data?.items ?? [], nextCursor: data?.next_cursor ?? null };
+}
+
+// Read one group (operationId getOrgGroup). The group detail panel reads this
+// fresh, so a move or a rename made elsewhere is visible.
+export async function getOrgGroup(
+  tenantId: string,
+  environmentId: string,
+  organizationId: string,
+  groupId: string,
+): Promise<OrgGroupView> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.GET(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          organization_id: organizationId,
+          group_id: groupId,
+        },
+      },
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+// Define a group in an organization (operationId createOrgGroup). An omitted or
+// null parent_id creates a ROOT. Idempotency-Key guarded.
+export async function createOrgGroup(
+  tenantId: string,
+  environmentId: string,
+  organizationId: string,
+  request: CreateOrgGroupRequest,
+): Promise<OrgGroupView> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.POST(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          organization_id: organizationId,
+        },
+        header: { "Idempotency-Key": idempotencyKey() },
+      },
+      body: request,
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+// Rename a group (operationId updateOrgGroup). The parent is deliberately NOT on
+// this body: moving a group is setOrgGroupParent below, which carries the cycle
+// and depth refusals, so a plain rename can never reshape the hierarchy.
+export async function updateOrgGroup(
+  tenantId: string,
+  environmentId: string,
+  organizationId: string,
+  groupId: string,
+  request: UpdateOrgGroupRequest,
+): Promise<OrgGroupView> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.PATCH(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          organization_id: organizationId,
+          group_id: groupId,
+        },
+      },
+      body: request,
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+// Delete a group (operationId deleteOrgGroup). A delete DETACHES the subtree
+// rather than cascading: the children survive and are treated as roots.
+export async function deleteOrgGroup(
+  tenantId: string,
+  environmentId: string,
+  organizationId: string,
+  groupId: string,
+): Promise<void> {
+  const client = createManagementClient();
+  const { error, response } = await client.DELETE(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          organization_id: organizationId,
+          group_id: groupId,
+        },
+      },
+    },
+  );
+  if (error !== undefined || !response.ok) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+}
+
+// MOVE a group within its organization hierarchy (operationId
+// setOrgGroupParent). A PUT replaces the whole parent relationship, so a null
+// parent_id promotes the group to a root. The server is the authority on whether
+// a move is admissible: it refuses a cycle and a nesting past the configured
+// maximum depth with a 422 whose body this wrapper surfaces verbatim.
+export async function setOrgGroupParent(
+  tenantId: string,
+  environmentId: string,
+  organizationId: string,
+  groupId: string,
+  request: SetOrgGroupParentRequest,
+): Promise<OrgGroupView> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.PUT(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/parent",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          organization_id: organizationId,
+          group_id: groupId,
+        },
+      },
+      body: request,
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+// List the memberships bound into one group (operationId listOrgGroupMembers).
+export async function fetchOrgGroupMembers(
+  tenantId: string,
+  environmentId: string,
+  organizationId: string,
+  groupId: string,
+): Promise<KeysetPage<OrgGroupMemberView>> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.GET(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/members",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          organization_id: organizationId,
+          group_id: groupId,
+        },
+      },
+    },
+  );
+  if (error !== undefined || !response.ok) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return { items: data?.items ?? [], nextCursor: data?.next_cursor ?? null };
+}
+
+// Bind an organization membership into a group (operationId addOrgGroupMember).
+// The body carries a MEMBERSHIP id, never a bare user id. Idempotency-Key
+// guarded.
+export async function addOrgGroupMember(
+  tenantId: string,
+  environmentId: string,
+  organizationId: string,
+  groupId: string,
+  request: AddOrgGroupMemberRequest,
+): Promise<OrgGroupMemberView> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.POST(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/members",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          organization_id: organizationId,
+          group_id: groupId,
+        },
+        header: { "Idempotency-Key": idempotencyKey() },
+      },
+      body: request,
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+// Unbind a membership from a group (operationId removeOrgGroupMember). The
+// binding is addressed by the (group, membership) PAIR, not by its own id.
+export async function removeOrgGroupMember(
+  tenantId: string,
+  environmentId: string,
+  organizationId: string,
+  groupId: string,
+  membershipId: string,
+): Promise<void> {
+  const client = createManagementClient();
+  const { error, response } = await client.DELETE(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/members/{membership_id}",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          organization_id: organizationId,
+          group_id: groupId,
+          membership_id: membershipId,
+        },
+      },
+    },
+  );
+  if (error !== undefined || !response.ok) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+}
+
+// List the roles one group grants (operationId listOrgGroupRoles). Every live
+// member of the group and of every DESCENDANT of it resolves these.
+export async function fetchOrgGroupRoles(
+  tenantId: string,
+  environmentId: string,
+  organizationId: string,
+  groupId: string,
+): Promise<KeysetPage<OrgGroupRoleView>> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.GET(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/roles",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          organization_id: organizationId,
+          group_id: groupId,
+        },
+      },
+    },
+  );
+  if (error !== undefined || !response.ok) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return { items: data?.items ?? [], nextCursor: data?.next_cursor ?? null };
+}
+
+// Grant a role to a group (operationId assignOrgGroupRole). Idempotency-Key
+// guarded.
+export async function assignOrgGroupRole(
+  tenantId: string,
+  environmentId: string,
+  organizationId: string,
+  groupId: string,
+  request: AssignOrgGroupRoleRequest,
+): Promise<OrgGroupRoleView> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.POST(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/roles",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          organization_id: organizationId,
+          group_id: groupId,
+        },
+        header: { "Idempotency-Key": idempotencyKey() },
+      },
+      body: request,
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+// Withdraw a role from a group (operationId unassignOrgGroupRole). The
+// assignment is addressed by the (group, role) PAIR, not by its own id.
+export async function unassignOrgGroupRole(
+  tenantId: string,
+  environmentId: string,
+  organizationId: string,
+  groupId: string,
+  roleId: string,
+): Promise<void> {
+  const client = createManagementClient();
+  const { error, response } = await client.DELETE(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/roles/{role_id}",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          organization_id: organizationId,
+          group_id: groupId,
+          role_id: roleId,
+        },
+      },
+    },
+  );
+  if (error !== undefined || !response.ok) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+}
+
+// List the roles one membership holds DIRECTLY (operationId
+// listOrgMembershipRoles). Direct grants ONLY: a role resolved through a group is
+// not here, because this list is exactly the set of rows an unassign on this
+// surface can remove. The whole resolved picture, with provenance, is
+// getOrgMembershipEffectiveRoles below.
+export async function fetchOrgMembershipRoles(
+  tenantId: string,
+  environmentId: string,
+  organizationId: string,
+  membershipId: string,
+): Promise<KeysetPage<OrgMembershipRoleView>> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.GET(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships/{membership_id}/roles",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          organization_id: organizationId,
+          membership_id: membershipId,
+        },
+      },
+    },
+  );
+  if (error !== undefined || !response.ok) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return { items: data?.items ?? [], nextCursor: data?.next_cursor ?? null };
+}
+
+// Grant a role directly to a membership (operationId assignOrgMembershipRole).
+// Exactly this membership resolves the role; no group is involved and no
+// descendant inherits it. Idempotency-Key guarded.
+export async function assignOrgMembershipRole(
+  tenantId: string,
+  environmentId: string,
+  organizationId: string,
+  membershipId: string,
+  request: AssignOrgMembershipRoleRequest,
+): Promise<OrgMembershipRoleView> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.POST(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships/{membership_id}/roles",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          organization_id: organizationId,
+          membership_id: membershipId,
+        },
+        header: { "Idempotency-Key": idempotencyKey() },
+      },
+      body: request,
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+// Withdraw a role granted directly to a membership (operationId
+// unassignOrgMembershipRole). The membership may STILL resolve the role through a
+// group, which is why the effective-roles view lists one entry per grant path.
+export async function unassignOrgMembershipRole(
+  tenantId: string,
+  environmentId: string,
+  organizationId: string,
+  membershipId: string,
+  roleId: string,
+): Promise<void> {
+  const client = createManagementClient();
+  const { error, response } = await client.DELETE(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships/{membership_id}/roles/{role_id}",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          organization_id: organizationId,
+          membership_id: membershipId,
+          role_id: roleId,
+        },
+      },
+    },
+  );
+  if (error !== undefined || !response.ok) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+}
+
+// Resolve every role one membership effectively holds, WITH PROVENANCE
+// (operationId getOrgMembershipEffectiveRoles). One entry per grant path, NOT
+// deduplicated by slug: a role held both directly and through a group appears
+// twice, and that is exactly what tells an operator that withdrawing one grant
+// will not take the role away. This wrapper returns the array unchanged, and no
+// caller may collapse it.
+//
+// Not paginated: the contract returns the whole bounded set, so there is no tail
+// to drop and no cursor to surface.
+export async function getOrgMembershipEffectiveRoles(
+  tenantId: string,
+  environmentId: string,
+  organizationId: string,
+  membershipId: string,
+): Promise<EffectiveRoleView[]> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.GET(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships/{membership_id}/effective-roles",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          organization_id: organizationId,
+          membership_id: membershipId,
+        },
+      },
+    },
+  );
+  if (error !== undefined || !response.ok) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  // A MALFORMED 2xx fails just as loud. Coercing a bodyless or wrongly shaped
+  // success into an empty array would render "this member resolves no roles",
+  // which is indistinguishable from a member who legitimately holds nothing: a
+  // silent authorization DOWNGRADE, the very reading the non 2xx path above
+  // already refuses to produce. There is no safe empty answer here, so the
+  // console says it could not read the resolved set.
+  if (data === undefined || !Array.isArray(data.roles)) {
+    throw new ManagementError(
+      {
+        error: "malformed_response",
+        message:
+          "The effective roles response did not carry a role list, so the resolved set could not be read. It is not being reported as empty.",
+      },
+      response.status,
+    );
+  }
+  return data.roles;
 }

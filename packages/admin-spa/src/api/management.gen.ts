@@ -10079,7 +10079,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description The resolved roles, one entry per grant path. This is what the NEXT token issuance would carry; tokens already issued are NOT affected by a recent change. Not paginated: a bounded read of one membership's whole set */
+            /** @description The resolved roles, one entry per grant path. This is what the NEXT token issuance would carry; tokens already issued are NOT affected by a recent change. A DISABLED organization mints no roles, so this is empty for every one of its members until it is re-enabled (the assignment lists still show the configuration). Not paginated: a bounded read of one membership's whole set */
             200: {
                 headers: {
                     [name: string]: unknown;
