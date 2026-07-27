@@ -31773,6 +31773,38 @@ impl PermissionEntryKind {
     }
 }
 
+/// Everything needed to DEFINE one permission (issue #98).
+///
+/// There is deliberately no `kind` field, and no `organization_id`:
+///
+/// * `kind` is absent because issue #98's code only ever writes
+///   `kind = 'permission'`, which migration 0091's header states as a property of
+///   this issue. The `Entitlement` half of [`PermissionEntryKind`] is shipped
+///   headroom that issue #103 turns on by widening exactly this struct and the
+///   statement it feeds, with no migration. The create binds the discriminator
+///   explicitly from [`PermissionEntryKind::Permission`] rather than leaning on the
+///   column DEFAULT, so the stored value and the Rust enum have ONE source. That bind
+///   is asserted where the two can DISAGREE, by a test that moves the column default
+///   to `'entitlement'` first; agreeing with the shipped default proves nothing.
+/// * `organization_id` is absent because the vocabulary belongs to the ENVIRONMENT.
+///   See [`PermissionRecord`] and the header of migration 0091.
+pub struct NewPermission<'a> {
+    /// The permission id (minted by the caller, embeds this scope).
+    pub id: &'a PermissionId,
+    /// The IMMUTABLE namespaced stable name, unique per `(scope, kind)` over LIVE
+    /// rows. Its grammar (`^[a-z0-9][a-z0-9_-]*(\.[a-z0-9][a-z0-9_-]*)+$` plus a
+    /// 63-character bound, no trimming and no case folding) is enforced by the
+    /// `permissions_slug_valid` CHECK; the management edge validates it up front
+    /// through `ironauth_admin::require_permission_slug` and reports it, so a value
+    /// that reaches here and is refused by the CHECK is a caller that bypassed the
+    /// edge and surfaces as [`StoreError::Database`].
+    pub slug: &'a str,
+    /// The mutable human-facing label; must be nonempty (a CHECK).
+    pub display_name: &'a str,
+    /// Optional free-form vocabulary metadata; `None` stores the empty object.
+    pub metadata: Option<&'a serde_json::Value>,
+}
+
 /// A permission-vocabulary row (issue #98): one named API capability (or, from issue
 /// #103, one feature or plan entitlement) defined in an ENVIRONMENT.
 ///
@@ -32269,6 +32301,22 @@ impl<'a> ActingManagementStore<'a> {
     #[must_use]
     pub fn org_roles(&self, scope: Scope) -> ActingOrgRoleRepo<'a> {
         ActingOrgRoleRepo {
+            store: self.store,
+            acting: self.acting,
+            scope,
+        }
+    }
+
+    /// The mutating permission-vocabulary repository for `scope` (issue #98): define
+    /// a permission in an environment, relabel it, and delete it, each audited.
+    ///
+    /// There is no data-plane counterpart and there never will be: migration 0091
+    /// grants the app role `SELECT` and nothing else, because a data plane able to
+    /// define the capability names it is about to put into a token is the whole
+    /// threat those grants exist to prevent.
+    #[must_use]
+    pub fn permissions(&self, scope: Scope) -> ActingPermissionRepo<'a> {
+        ActingPermissionRepo {
             store: self.store,
             acting: self.acting,
             scope,
@@ -32943,6 +32991,27 @@ impl OrgRoleRepo<'_> {
 /// Do not delete either half on the grounds that a mutation survives: the
 /// survival is the expected consequence of the backstop, not evidence the
 /// predicate is dead.
+///
+/// The same census covers the WRITES in [`ActingPermissionRepo`] (issue #98, PR 2),
+/// which repeat the same two columns in the same way for the same reason. The
+/// COMPLETE write-side survivor census, naming every predicate on that path and the
+/// backstop each one hides behind, is on [`ActingPermissionRepo`]. Two details
+/// belong here, where a reader auditing the fence will look:
+///
+/// * The INSERT carries no scope predicate to repeat, because there is no row to
+///   match yet, and it has NO second layer either. It binds `tenant_id` and
+///   `environment_id` from the repository's OWN scope, and [`begin_scoped`] binds
+///   the policy variables from that SAME scope, so the row it writes satisfies the
+///   policy's WITH CHECK for EVERY input the create accepts: the policy fences the
+///   scope COLUMNS, and this statement never lets a caller influence them. The typed
+///   [`PermissionId`] guard is therefore the ONLY fence on a forged id, which is
+///   exactly why it is the one create-side predicate whose removal is OBSERVABLE
+///   while every scope predicate on the update and the delete survives. Read
+///   [`ActingPermissionRepo::create`] for what removing it actually does, which is
+///   not what a reader expects.
+/// * The UPDATE statements additionally repeat `deleted_at IS NULL`, which
+///   [`require_live_permission`] has already applied. That pair is MUTUALLY
+///   redundant rather than one-way; the census for it is on that function.
 const PERMISSION_SELECT_COLUMNS: &str = "id, kind, slug, display_name, \
      metadata::text AS metadata_text, \
      (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us, \
@@ -32965,8 +33034,9 @@ const PERMISSION_SELECT_COLUMNS: &str = "id, kind, slug, display_name, \
 /// cannot see it. A reader auditing the repeated-predicate census will notice the
 /// absence here; the answer is that there is nothing to repeat.
 ///
-/// There is no MUTATING counterpart in this PR: the audited write repository is the
-/// next PR of issue #98, and nothing on the data plane ever writes a permission.
+/// The MUTATING counterpart is [`ActingPermissionRepo`], reachable only from the
+/// control plane: nothing on the data plane ever writes a permission, and migration
+/// 0091 grants the app role `SELECT` and nothing else.
 pub struct PermissionRepo<'a> {
     store: &'a Store,
     scope: Scope,
@@ -36794,6 +36864,368 @@ impl ActingOrgRoleRepo<'_> {
     }
 }
 
+/// The mutating permission-vocabulary repository (issue #98): define a permission in
+/// an environment, relabel it, and delete it, each audited in the same transaction as
+/// the write.
+///
+/// # What this repository can and cannot change
+///
+/// `slug` and `kind` are IMMUTABLE BY GRANT, not by convention. Migration 0091 gives
+/// the control role `UPDATE (display_name, metadata, updated_at, deleted_at)` and
+/// nothing else, so a statement here that named `slug` or `kind` would be refused by
+/// Postgres as SQLSTATE 42501 and would surface to a caller as an opaque
+/// [`StoreError::Database`], never as a rename. [`ActingPermissionRepo::update`]
+/// therefore writes neither, and that is a hard constraint on any future edit to this
+/// file rather than a stylistic choice. The reason is authorization: the slug is the
+/// exact string a token claim carries, so renaming one under live mappings would
+/// silently repoint every grant that names it, and the kind decides whether a
+/// resolution projection selects the row at all.
+///
+/// There is likewise no way to move a permission between scopes: `id`, `tenant_id`,
+/// and `environment_id` are absent from the same grant.
+///
+/// # No cap
+///
+/// There is no count cap, quota, or paywall gate on permissions anywhere in this
+/// repository or in migration 0091. An environment may define as many permissions as
+/// it likes: the advisory-lock-plus-COUNT registration gate used elsewhere in this
+/// module is deliberately NOT replicated here (a project covenant). The byte and
+/// count budget a later PR of issue #98 adds bounds ONE TOKEN and never this table.
+///
+/// # Write-side survivor census (read before deleting a predicate here)
+///
+/// The read-side census is on `PERMISSION_SELECT_COLUMNS` and its warning governs
+/// this one too: on a path this heavily backstopped, a SURVIVING mutation is the
+/// expected consequence of the backstop and is never evidence the predicate is dead.
+/// What follows is the COMPLETE set, so that nobody has to rediscover it by deleting
+/// the wrong half, and so that the create-side entry is not read as a general rule.
+/// It is stated in full because the next PR of this issue is templated from this
+/// repository and meets the same shape with THREE caller-supplied ids instead of one.
+///
+/// KILLED, and the only one on this path:
+///
+/// * [`ActingPermissionRepo::create`]'s `spec.id.scope()` guard. It is load bearing
+///   for a reason that is worth stating exactly, because the obvious account of it is
+///   wrong: removing it does NOT make a forged create fail with a row-level-security
+///   [`StoreError::Database`]. Measured with the guard deleted, the forged create
+///   returns `Ok(())` and PERSISTS a row. That function carries the three
+///   consequences.
+///
+/// SURVIVORS, every one of them equivalent behind a NAMED backstop:
+///
+/// * [`ActingPermissionRepo::update`] and [`ActingPermissionRepo::delete`] each
+///   dropping their own in-process `id.scope()` guard. These two are IDENTICAL cases
+///   and the census must not treat them differently: each statement resolves nothing
+///   outside the bound scope, so a foreign-scope id is the same uniform not-found
+///   whether the guard runs or not. The guards stay because refusing before any
+///   statement is the cheaper and more obvious answer, not because either is
+///   observable. The create-side guard differs ONLY because a create has no existing
+///   row to fail to match.
+/// * Either mutation dropping `deleted_at IS NULL` from its own statement (backstop:
+///   [`require_live_permission`]), and either mutation dropping the
+///   [`require_live_permission`] call (backstop: the statement's own
+///   `deleted_at IS NULL` and its zero-row check). The two layers are MUTUALLY
+///   redundant, and dropping BOTH on one mutation IS killed. Why each is kept
+///   anyway, including the read-committed race the statement's guard exists for, is
+///   on [`require_live_permission`].
+/// * Either mutation dropping its `tenant_id` conjunct, its `environment_id`
+///   conjunct, or both, and [`require_live_permission`] dropping either of its own.
+///   The backstop is the forced row-level-security policy, which fences both columns
+///   with no help from any statement. This holds even in bulk: removing EVERY
+///   environment fence this path applies in Rust at once (both in-process guards,
+///   both statement conjuncts, and the helper's) leaves the whole suite green,
+///   because the policy refuses on its own. They are kept for the reason the
+///   read-side census gives, which is that a statement naming its own scope is
+///   readable without the reader knowing a policy exists.
+pub struct ActingPermissionRepo<'a> {
+    store: &'a Store,
+    acting: ActingContext,
+    scope: Scope,
+}
+
+impl ActingPermissionRepo<'_> {
+    /// Define a permission in this environment and audit `permission.create` in the
+    /// same transaction, scoped to `(tenant, environment)`.
+    ///
+    /// The row is always `kind = 'permission'`: issue #98 defines no entitlements,
+    /// which migration 0091's header states as a property of this issue. The
+    /// discriminator is bound explicitly from [`PermissionEntryKind::Permission`]
+    /// rather than left to the column DEFAULT, so the stored value comes from the
+    /// same closed set the reader decodes against and a future ALTER of the default
+    /// cannot silently reclassify what this path writes. The shipped default is the
+    /// SAME value, so every ordinary assertion agrees with both; the bind is only
+    /// observable where they disagree, and
+    /// `the_write_path_binds_the_kind_and_does_not_inherit_a_drifted_default` is the
+    /// one test that makes them disagree, by moving the default to `'entitlement'`
+    /// exactly as issue #103 plausibly will.
+    ///
+    /// # Containment is ONE layer, and it is the guard on the first line
+    ///
+    /// The `spec.id.scope()` check below is the WHOLE fence on the id. Forced row
+    /// level security is NOT a second layer under it, however much the #97 family's
+    /// three-layer prose invites reading one in: this statement binds `tenant_id` and
+    /// `environment_id` from `self.scope`, never from `spec.id`, and [`begin_scoped`]
+    /// binds the policy variables from that SAME scope, so the row satisfies the
+    /// policy's WITH CHECK for EVERY input this function accepts. The policy fences
+    /// the scope COLUMNS; nothing a caller passes can move them. (The #97 create does
+    /// have a genuine second structural refusal, its `organization_id` foreign key.
+    /// This table has no organization, so nothing here plays that part.)
+    ///
+    /// Removing the guard therefore does not make a forged create FAIL, it makes it
+    /// SUCCEED. Measured on a live database with the guard deleted, a create under
+    /// scope A naming an id minted in scope B returns `Ok(())`, and three things
+    /// follow, in rising order of how bad they are:
+    ///
+    /// 1. The row PERSISTS in the CALLER'S OWN scope while carrying another
+    ///    environment's id, with a matching `permission.create` audit row, so the
+    ///    forgery is durable and reads as legitimate in the log.
+    /// 2. [`PermissionRepo::list`] for the whole environment then fails CLOSED with
+    ///    [`StoreError::NotFound`], because `permission_from_row` cannot decode that
+    ///    id in scope. ONE such row makes EVERY permission in that environment
+    ///    unlistable through the management surface, and it holds the live
+    ///    `(kind, slug)` slot for good.
+    /// 3. `permissions.id` is a GLOBAL primary key, so a create under tenant A naming
+    ///    an id minted in tenant B answers [`StoreError::Conflict`] when B holds that
+    ///    permission and `Ok(())` when it does not: a cross-tenant EXISTENCE ORACLE,
+    ///    on the one table whose rows are capability names. No policy can close that
+    ///    one, because the row this statement writes is the caller's own by
+    ///    construction and a WITH CHECK has nothing to refuse, while the unique index
+    ///    is global and conflicts against rows the policy HIDES.
+    ///
+    /// `every_mutation_answers_absent_deleted_and_both_foreign_scopes_alike` kills the
+    /// guard's removal, and it is the only thing that does. Any repository that takes
+    /// a caller-minted id and writes its own scope inherits this shape exactly, with
+    /// one such guard needed PER ID.
+    ///
+    /// The alternative was weighed and rejected. Binding `spec.id.scope()` into the
+    /// scope columns would make the WITH CHECK a real second layer, and measurably so:
+    /// a row bound to a foreign id's own scope is refused 42501, and the policy
+    /// refuses BEFORE the unique index, so even the oracle above would close. It is
+    /// rejected because the guard has to stay regardless (that path answers
+    /// [`StoreError::Database`], which breaks the uniform not-found this whole
+    /// repository keeps), and with the guard in place `spec.id.scope()` and
+    /// `self.scope` are EQUAL on every input that reaches the statement. The change
+    /// would therefore be a provable no-op shipping a branch only a mutant can reach,
+    /// it would make the row's scope columns caller-derived on a table where they are
+    /// currently caller-proof, and in the very mutant world it exists for it would put
+    /// the permission row in one scope and its audit envelope, which binds `scope`, in
+    /// another. Honest prose over one guard the suite kills beats a second layer
+    /// nothing reachable can exercise.
+    ///
+    /// A `(kind, slug)` already taken by a LIVE row is refused as
+    /// [`StoreError::Conflict`] on the partial unique index. A slug freed by a
+    /// DELETED permission is available again, and re-using it inserts a FRESH row
+    /// with a fresh id: a deleted permission is NEVER revived, so deleting one can
+    /// never be quietly undone in its authorization effects. Because `kind` is part
+    /// of that index, the same slug may also exist under the other kind.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id is not in this scope;
+    /// [`StoreError::Conflict`] if a live permission already holds the slug;
+    /// [`StoreError::IdempotencyConflict`] on a concurrent Idempotency-Key race;
+    /// [`StoreError::Database`] on a persistence failure (including a slug or display
+    /// name the CHECK constraints refuse, both of which the management edge validates
+    /// and reports up front).
+    pub async fn create(
+        &self,
+        env: &Env,
+        spec: NewPermission<'_>,
+        created_at_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        if spec.id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        // `None` metadata binds SQL NULL, which COALESCEs to the empty object.
+        let metadata_opt = metadata_json_opt(spec.metadata)?;
+        let id = *spec.id;
+        let slug = spec.slug.to_owned();
+        let display_name = spec.display_name.to_owned();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::PermissionCreate,
+                target: &id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "INSERT INTO permissions \
+                     (id, tenant_id, environment_id, kind, slug, display_name, metadata, \
+                      created_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7::jsonb, '{}'::jsonb), \
+                             TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(PermissionEntryKind::Permission.as_str())
+                .bind(&slug)
+                .bind(&display_name)
+                .bind(metadata_opt.as_deref())
+                .bind(created_at_micros)
+                .execute(&mut **tx)
+                .await;
+                match result {
+                    Ok(_) => {}
+                    // A live permission of this kind already holds the slug.
+                    Err(error) if is_unique_violation(&error) => {
+                        return Err(StoreError::Conflict);
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+                insert_idempotency(tx, idempotency).await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Relabel a permission (and optionally replace its metadata) and audit
+    /// `permission.update` in the same transaction. A `None` argument leaves that
+    /// column unchanged.
+    ///
+    /// This is a COLUMN-scoped UPDATE of exactly the mutable columns (the #31
+    /// lesson). It writes `display_name`, `metadata`, and `updated_at`, which is the
+    /// whole of what migration 0091 grants beyond the soft delete.
+    ///
+    /// It does NOT write `slug` and it does NOT write `kind`, and that is enforced
+    /// one layer below this code: neither column appears in the control role's
+    /// UPDATE grant, so a statement naming either is refused as SQLSTATE 42501 and
+    /// reaches a caller as an opaque [`StoreError::Database`] rather than as a
+    /// rename. A permission's stable name is a direct authorization input, so a
+    /// relabel can never move an authorization decision, and a live row can never be
+    /// reclassified into or out of the set a token claim selects.
+    ///
+    /// The target is resolved through [`require_live_permission`] before the write,
+    /// so an absent, a soft-deleted, and a foreign-scope permission are one answer.
+    /// The statement's own `deleted_at IS NULL` guard stays: at READ COMMITTED a
+    /// concurrent delete may commit between the two statements, so the row count is
+    /// what makes the update lose that race rather than resurrect a label on a dead
+    /// row.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id is not in this scope, or no live permission
+    /// matched;
+    /// [`StoreError::Database`] on a persistence failure (including an empty display
+    /// name, which the CHECK refuses).
+    pub async fn update(
+        &self,
+        env: &Env,
+        id: &PermissionId,
+        display_name: Option<&str>,
+        metadata: Option<&serde_json::Value>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let metadata_opt = metadata_json_opt(metadata)?;
+        let display_name = display_name.map(str::to_owned);
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::PermissionUpdate,
+                target: id,
+            },
+            async move |tx| {
+                require_live_permission(tx, scope, id).await?;
+                let result = sqlx::query(
+                    "UPDATE permissions SET \
+                         display_name = COALESCE($1, display_name), \
+                         metadata = COALESCE($2::jsonb, metadata), \
+                         updated_at = \
+                             TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval \
+                     WHERE id = $4 AND tenant_id = $5 AND environment_id = $6 \
+                     AND deleted_at IS NULL",
+                )
+                .bind(display_name.as_deref())
+                .bind(metadata_opt.as_deref())
+                .bind(now_micros)
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Delete a permission (soft delete) in this scope and audit `permission.delete`
+    /// in the same transaction.
+    ///
+    /// The row is retained (only the column-scoped `deleted_at` and `updated_at` are
+    /// written), so the audit foreign key to it stays satisfiable; DELETE is granted
+    /// to nobody on either plane. Because the uniqueness index is partial over live
+    /// rows, the deleted permission's slug is immediately available to a NEW
+    /// permission, and re-using it mints a FRESH id rather than reviving this row.
+    /// A repeat delete of an already deleted permission matches no live row and is
+    /// the uniform not-found.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id is not in this scope, or no live permission
+    /// matched.
+    pub async fn delete(&self, env: &Env, id: &PermissionId) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::PermissionDelete,
+                target: id,
+            },
+            async move |tx| {
+                require_live_permission(tx, scope, id).await?;
+                let result = sqlx::query(
+                    "UPDATE permissions SET \
+                         deleted_at = \
+                             TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval, \
+                         updated_at = \
+                             TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+                     WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 \
+                     AND deleted_at IS NULL",
+                )
+                .bind(now_micros)
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+}
+
 /// The mutating organization-group repository (issue #97): define a group in an
 /// organization (optionally directly under a parent), rename it, MOVE it within the
 /// organization's group forest, and delete it, each audited in the same transaction
@@ -38195,6 +38627,79 @@ async fn require_live_role_in_org(
     .bind(scope.tenant().to_string())
     .bind(scope.environment().to_string())
     .bind(organization_id.to_string())
+    .fetch_optional(&mut **tx)
+    .await?;
+    if found.is_some() {
+        Ok(())
+    } else {
+        Err(StoreError::NotFound)
+    }
+}
+
+/// Resolve `permission_id` as a LIVE permission within `scope`, or the uniform
+/// [`StoreError::NotFound`] (issue #98).
+///
+/// The vocabulary counterpart of [`require_live_role_in_org`], with the same
+/// anti-oracle role: absent, soft-deleted, and another scope's all collapse to one
+/// error, BEFORE any conflict reasoning runs, so a duplicate-attachment
+/// [`StoreError::Conflict`] can only ever be seen by a caller who has already proven
+/// they can see the permission.
+///
+/// It takes NO organization, and that is the whole shape of the difference from the
+/// #97 family. Those helpers exist mainly because the row-level-security policy
+/// fences `(tenant, environment)` and cannot see the organization, so the statement
+/// has to. This table has no organization to fence, so this helper is a pure
+/// LIVENESS resolution and the policy behind it is already complete on scope.
+///
+/// # It deliberately does not filter `kind`
+///
+/// An entitlement resolves here exactly as a permission does. That is not an
+/// oversight and must not be "fixed" by adding `AND kind = 'permission'`: the
+/// namespace is enforced at the RESOLUTION PROJECTION that feeds the token claim,
+/// in SQL, so an entitlement can never reach a claim even if some write path
+/// attaches one. Enforcing it here as well would move the guarantee to write time,
+/// where a future writer can bypass it, and would make the projection filter
+/// unreachable through any supported path and therefore untestable without raw SQL.
+/// Migration 0091's header states the projection as the load-bearing half.
+///
+/// # Redundancy census
+///
+/// Both callers in this PR ([`ActingPermissionRepo::update`] and
+/// [`ActingPermissionRepo::delete`]) also guard their own statement on
+/// `deleted_at IS NULL` and treat a zero row count as the same not-found. The two
+/// layers are MUTUALLY redundant on a quiet database, so neutering either one alone
+/// leaves every functional assertion green and only neutering BOTH is caught. Do not
+/// delete either on the strength of a surviving mutation:
+///
+/// * The statement's own guard is what makes the write lose a race. These callers
+///   run at READ COMMITTED, so a concurrent delete may commit between this
+///   resolution and the UPDATE, and the row count is the only thing that then
+///   refuses.
+/// * This resolution is what the NEXT PR of the issue needs, where it is the ONLY
+///   layer: an attachment's `permission_id` foreign key proves the row EXISTS and
+///   proves nothing about whether it is live, so without this a deleted permission
+///   could be attached to a role. Landing it with live callers rather than inert
+///   also means its SQL is executed rather than merely compiled, which is the only
+///   validation a runtime-API query gets.
+///
+/// This statement's own `tenant_id` and `environment_id` conjuncts are a THIRD kind
+/// of survivor, redundant behind the forced row-level-security policy rather than
+/// behind a caller, and they are kept for the reason the read-side census gives. The
+/// complete list, and which backstop covers which predicate across the whole write
+/// path, is on [`ActingPermissionRepo`]; this function's entry is the `deleted_at`
+/// pair above.
+async fn require_live_permission(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    permission_id: &PermissionId,
+) -> Result<(), StoreError> {
+    let found = sqlx::query(
+        "SELECT 1 AS present FROM permissions \
+         WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND deleted_at IS NULL",
+    )
+    .bind(permission_id.to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
     .fetch_optional(&mut **tx)
     .await?;
     if found.is_some() {

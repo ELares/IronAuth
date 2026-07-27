@@ -148,8 +148,7 @@ impl IdorHarness {
     /// per-organization authentication policy (`org_auth_policies.set`,
     /// `org_auth_policies.remove`, both addressed by ORGANIZATION id rather than by
     /// the policy's own id, because the organization IS the policy's identity), and
-    /// its permission vocabulary (`permissions.get`; the matching delete probe
-    /// arrives with the audited write repository in the next PR of issue #98), the
+    /// its permission vocabulary (`permissions.get` and `permissions.delete`), the
     /// two-thirds of the four-level resource model
     /// that is tenant-and-environment scoped (operators, tenants, and environments
     /// are LEVEL tables whose isolation is exercised by the management-plane tests
@@ -179,6 +178,7 @@ impl IdorHarness {
         self.register(Box::new(OrgAuthPolicySetProbe));
         self.register(Box::new(OrgAuthPolicyRemoveProbe));
         self.register(Box::new(PermissionGetProbe));
+        self.register(Box::new(PermissionDeleteProbe));
         self
     }
 
@@ -1129,6 +1129,50 @@ impl IsolationProbe for PermissionGetProbe {
             };
             match permissions.get(&id).await {
                 Ok(_) => ProbeOutcome::Leaked,
+                Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `ActingPermissionRepo::delete` (issue #98). `store` must
+/// authenticate as `ironauth_control`. Soft-deleting another scope's permission
+/// would be a cross-scope mutation with a real authorization effect once the
+/// role-to-permission mapping lands, so it must be the uniform not-found.
+///
+/// The DELETE rather than the update is the probe worth running, for the reason the
+/// harness applies everywhere: a cross-scope relabel is recoverable, while a
+/// cross-scope delete frees the slug and can never be undone, because a re-create
+/// mints a FRESH id and is never a revival. `ProbeOutcome::Leaked` here therefore
+/// means a permission in another environment was destroyed, which is why the
+/// registering suite additionally asserts that the victim rows SURVIVED: a probe
+/// that returned Denied because nothing was planted would pass for the wrong reason.
+struct PermissionDeleteProbe;
+
+impl IsolationProbe for PermissionDeleteProbe {
+    fn name(&self) -> &'static str {
+        "permissions.delete"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            let env = Env::system();
+            let Ok(id) = store.management().permissions(caller).parse_id(foreign_id) else {
+                return ProbeOutcome::Denied;
+            };
+            let actor = ActorRef::service(ServiceId::generate(&env));
+            let correlation = CorrelationId::generate(&env);
+            let permissions = store
+                .management()
+                .acting(actor, correlation)
+                .permissions(caller);
+            match permissions.delete(&env, &id).await {
+                Ok(()) => ProbeOutcome::Leaked,
                 Err(_) => ProbeOutcome::Denied,
             }
         })
