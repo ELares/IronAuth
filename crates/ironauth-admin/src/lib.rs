@@ -103,6 +103,16 @@ use axum::routing::{delete, get, post, put};
 pub use auth::Principal;
 pub use backfill::{BackfillError, BackfillReport, backfill_signing_algorithms};
 pub use error::{ApiError, ErrorBody};
+/// The permission-slug grammar (issue #98), exported because its PARITY ORACLE lives
+/// in an integration test and an integration test is an external consumer of this
+/// crate.
+///
+/// The grammar has two enforcement points that must never drift: migration 0091's
+/// `permissions_slug_valid` CHECK and this function. The only thing in the tree that
+/// would catch a drift is a test able to see BOTH, and a test able to see this one
+/// has to reach it through the crate's public surface. Its three siblings in
+/// `input` stay private because nothing outside the crate needs to pin them.
+pub use input::require_permission_slug;
 pub use openapi::{management_openapi, openapi_json};
 pub use pagination::ListQuery;
 pub use provision::{DayOneSigningKeys, ProvisionError};

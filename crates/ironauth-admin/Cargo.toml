@@ -102,6 +102,25 @@ sqlx = { workspace = true }
 name = "openapi_contract"
 path = "tests/openapi_contract.rs"
 
+# Database-free stable-toolchain fuzz harness for the permission-slug grammar
+# (issue #98): totality, no canonicalization (acceptance implies byte identity),
+# join safety (no accepted slug carries a character a consumer might join on), and
+# the three structural refusals. Seeded SplitMix64, no property-testing crate.
+# Always runs; the CHECK-versus-validator parity oracle is the separate DB-backed
+# permission_slug_parity target below.
+[[test]]
+name = "permission_slug_fuzz"
+path = "tests/permission_slug_fuzz.rs"
+
+# The permission-slug PARITY oracle (issue #98): one seeded corpus fed to BOTH the
+# Rust validator and migration 0091's permissions_slug_valid CHECK, asserting they
+# agree case by case in both directions, with REACH counters so a corpus that stops
+# reaching a rule fails loudly. Needs a real database (DATABASE_URL).
+[[test]]
+name = "permission_slug_parity"
+path = "tests/permission_slug_parity.rs"
+required-features = ["testing"]
+
 # Cursor-pagination conformance: a multi-page walk with no loss or duplication.
 [[test]]
 name = "pagination"

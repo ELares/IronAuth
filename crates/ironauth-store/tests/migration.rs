@@ -551,7 +551,7 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
     );
 }
 
-/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the seventy-eight
+/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the ninety-one
 /// real migrations and leaves no throwaway demo object in a real database.
 // A long but linear ledger-and-table assertion sweep (one line per migration and
 // per real table); splitting it would not make it clearer.
@@ -574,8 +574,8 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
     );
     assert_eq!(
         report.already_applied(),
-        90,
-        "the production chain is exactly ninety migrations (isolation, audit log, management \
+        91,
+        "the production chain is exactly ninety-one migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -598,10 +598,11 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
          grants, consent control grants, flow version pin, flow versions, first-party challenge \
          codes, DPoP binding, DPoP proof replay, organization membership, organization token \
          context, organization roles, organization groups, organization group members, \
-         organization role assignments, organization authentication policies)"
+         organization role assignments, organization authentication policies, permission \
+         vocabulary)"
     );
 
-    // The ledger holds exactly versions 1 through 90.
+    // The ledger holds exactly versions 1 through 91.
     assert_eq!(
         applied_versions(pool).await,
         vec![
@@ -609,7 +610,7 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
             46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67,
             68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89,
-            90
+            90, 91
         ]
     );
     let phase_of = |version: i64| async move {
@@ -5764,5 +5765,222 @@ async fn the_data_plane_holds_no_column_scoped_write_grant_on_org_auth_policies(
         role_has_any_column_privilege(pool, "ironauth_control", "org_auth_policies", "UPDATE")
             .await,
         "the control plane holds the column-scoped UPDATE a change and a removal need"
+    );
+}
+
+/// The `permissions` schema, policy, indexes, and grants (issue #98, migration 0091).
+///
+/// Its own test rather than more lines in the production-chain assertions: that
+/// function's future is already at the stack budget of a default test thread, and
+/// anything added to its body aborts the process on a stack overflow (the 0090
+/// precedent).
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one table's whole structural contract (phase, columns, constraints, \
+              policy, both index shapes, and the full grant matrix on both roles) \
+              read as one unit"
+)]
+async fn permissions_carries_its_isolation_indexes_and_least_privilege_grants() {
+    let db = TestDatabase::start().await;
+    let pool = db.owner_pool();
+
+    // EXPAND: one new tenant-scoped table with its indexes, policy, and grants.
+    // Nothing existing is altered or dropped.
+    let phase: String = sqlx::query("SELECT phase FROM _schema_migrations WHERE version = 91")
+        .fetch_one(pool)
+        .await
+        .expect("0091 is in the ledger")
+        .get("phase");
+    assert_eq!(phase, "expand");
+
+    assert!(
+        table_exists(pool, "permissions").await,
+        "permissions exists after 0091"
+    );
+    assert!(
+        rls_enabled_and_forced(pool, "permissions").await,
+        "permissions must ENABLE and FORCE row-level security"
+    );
+    assert!(
+        policy_exists(pool, "permissions", "permissions_tenant_isolation").await,
+        "permissions must carry the (tenant, environment) isolation policy"
+    );
+
+    // Every CHECK is asserted BY NAME, which is why none of them may be anonymous:
+    // an anonymous constraint cannot be pinned, so a later migration could drop or
+    // weaken it with nothing failing.
+    for constraint in [
+        "permissions_scope_nonempty",
+        "permissions_kind_known",
+        "permissions_slug_valid",
+        "permissions_display_name_nonempty",
+    ] {
+        assert!(
+            check_constraint_exists(pool, "permissions", constraint).await,
+            "permissions must carry the {constraint} CHECK constraint"
+        );
+    }
+
+    // There is deliberately NO organization column. The vocabulary belongs to the
+    // ENVIRONMENT (a permission names an API capability, and one string cannot mean
+    // different things to two organizations calling one API), which is what makes
+    // the isolation policy this table's COMPLETE fence, unlike every #97 table.
+    // Asserted rather than merely written down, because "someone will add it later
+    // without reading the header" is exactly how that property is lost.
+    assert!(
+        !column_exists(pool, "permissions", "organization_id").await,
+        "permissions must carry NO organization_id: the vocabulary is per ENVIRONMENT, \
+         and the role-to-permission mapping is what carries the organization"
+    );
+
+    // The identity and value columns are NOT NULL, and `kind` carries the default
+    // that makes issue #98's own writes (which never state a kind) ordinary
+    // permissions.
+    for column in [
+        "id",
+        "tenant_id",
+        "environment_id",
+        "kind",
+        "slug",
+        "display_name",
+        "metadata",
+    ] {
+        assert!(
+            column_is_not_null(pool, "permissions", column).await,
+            "permissions.{column} must be NOT NULL"
+        );
+    }
+    assert!(
+        column_default(pool, "permissions", "kind")
+            .await
+            .is_some_and(|default| default.contains("'permission'")),
+        "permissions.kind must default to the ordinary permission, so a write that \
+         states no kind cannot land as something a projection filter excludes"
+    );
+    assert!(
+        !column_is_not_null(pool, "permissions", "deleted_at").await,
+        "permissions.deleted_at must be nullable (the soft-delete latch)"
+    );
+
+    // At most one LIVE row per (scope, kind, slug), PARTIAL over live rows so a
+    // deleted permission does not occupy its slug. `kind` is IN the key, and that is
+    // what gives issue #103 its headroom: `plan.enterprise` may exist as an
+    // entitlement while a permission of the same slug exists independently. Dropping
+    // `kind` from this key would force #103 into a migration on a table the token
+    // path reads.
+    assert!(
+        partial_unique_index_exists(pool, "permissions", "permissions_kind_slug_live_uniq").await,
+        "permissions must carry the per-(kind, slug) partial unique index over live rows"
+    );
+    assert_eq!(
+        index_columns(pool, "permissions", "permissions_kind_slug_live_uniq").await,
+        vec![
+            "tenant_id".to_owned(),
+            "environment_id".to_owned(),
+            "kind".to_owned(),
+            "slug".to_owned()
+        ],
+        "the live uniqueness key is (tenant, environment, kind, slug)"
+    );
+    assert_eq!(
+        index_columns(pool, "permissions", "permissions_scope_idx").await,
+        vec![
+            "tenant_id".to_owned(),
+            "environment_id".to_owned(),
+            "created_at".to_owned(),
+            "id".to_owned()
+        ],
+        "the scope list index must lead with the scope and then the (created_at, id) \
+         pagination key"
+    );
+
+    // The scope foreign keys are the backstop that makes a permission in a
+    // nonexistent scope impossible.
+    assert!(fk_references(pool, "permissions", "tenant_id").await);
+    assert!(fk_references(pool, "permissions", "environment_id").await);
+
+    // Grants: the control plane owns the surface.
+    for privilege in ["SELECT", "INSERT"] {
+        assert!(
+            role_has_table_privilege(pool, "ironauth_control", "permissions", privilege).await,
+            "ironauth_control must hold {privilege} on permissions"
+        );
+    }
+    for column in ["display_name", "metadata", "updated_at", "deleted_at"] {
+        assert!(
+            role_has_column_privilege(pool, "ironauth_control", "permissions", column, "UPDATE")
+                .await,
+            "ironauth_control must hold column-scoped UPDATE on permissions.{column}"
+        );
+    }
+    // `slug` and `kind` are immutable by GRANT on BOTH roles, and so are the scope
+    // columns. A slug is a DIRECT authorization input that lands in a token, so a
+    // rename under live mappings would silently repoint every grant that names it; a
+    // reclassification would silently move a row into or out of the set a token
+    // claim selects. These absences are security properties, and an absence that
+    // nothing asserts is an absence a later migration can quietly fill.
+    for role in ["ironauth_control", "ironauth_app"] {
+        for column in ["id", "tenant_id", "environment_id", "slug", "kind"] {
+            assert!(
+                !role_has_column_privilege(pool, role, "permissions", column, "UPDATE").await,
+                "permissions.{column} must be immutable by GRANT: {role} must NOT hold \
+                 UPDATE on it"
+            );
+        }
+        // DELETE is granted to nobody on either plane: removal is the soft delete.
+        assert!(
+            !role_has_table_privilege(pool, role, "permissions", "DELETE").await,
+            "{role} must NOT hold DELETE on permissions (removal is a soft delete)"
+        );
+    }
+
+    // The data plane reads and NOTHING else. A data plane able to DEFINE the
+    // capability names it is about to put into a token is the whole threat this
+    // table's grants exist to prevent.
+    assert!(
+        role_has_table_privilege(pool, "ironauth_app", "permissions", "SELECT").await,
+        "the data-plane role must hold SELECT on permissions (the resolution read)"
+    );
+    for privilege in ["INSERT", "UPDATE", "DELETE"] {
+        assert!(
+            !role_has_table_privilege(pool, "ironauth_app", "permissions", privilege).await,
+            "the data-plane grant on permissions must be SELECT only (no {privilege})"
+        );
+    }
+}
+
+/// The data plane holds NO write grant of any shape on `permissions` (issue #98,
+/// 0091).
+///
+/// The table-wide `has_table_privilege` probes above CANNOT see a COLUMN-scoped
+/// grant: `GRANT INSERT (slug) ON permissions TO ironauth_app` leaves every one of
+/// them reading false while genuinely letting the token-issuance plane define the
+/// capability names it is about to emit. Sweeping every column through `pg_attribute`
+/// closes that gap, so the least-privilege invariant is a PHYSICAL property of the
+/// schema rather than a claim about which code paths happen to exist.
+#[tokio::test]
+async fn the_data_plane_holds_no_column_scoped_write_grant_on_permissions() {
+    let db = TestDatabase::start().await;
+    let pool = db.owner_pool();
+
+    // INSERT, UPDATE, and REFERENCES are the write-shaped privileges Postgres can
+    // grant per column (DELETE has no column form and is asserted table-wide with
+    // the rest of the 0091 grants).
+    for privilege in ["INSERT", "UPDATE", "REFERENCES"] {
+        assert!(
+            !role_has_any_column_privilege(pool, "ironauth_app", "permissions", privilege).await,
+            "the data plane must hold NO column-scoped {privilege} on permissions"
+        );
+    }
+    // Positive controls, so a sweep that simply answered "no" to everything could not
+    // pass this test.
+    assert!(
+        role_has_any_column_privilege(pool, "ironauth_app", "permissions", "SELECT").await,
+        "the data plane holds SELECT on permissions (the resolution read)"
+    );
+    assert!(
+        role_has_any_column_privilege(pool, "ironauth_control", "permissions", "UPDATE").await,
+        "the control plane holds the column-scoped UPDATE a relabel and a delete need"
     );
 }

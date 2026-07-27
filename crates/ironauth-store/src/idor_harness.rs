@@ -147,7 +147,9 @@ impl IdorHarness {
     /// `org_group_roles.unassign`, `org_membership_roles.unassign`), its
     /// per-organization authentication policy (`org_auth_policies.set`,
     /// `org_auth_policies.remove`, both addressed by ORGANIZATION id rather than by
-    /// the policy's own id, because the organization IS the policy's identity), the
+    /// the policy's own id, because the organization IS the policy's identity), and
+    /// its permission vocabulary (`permissions.get`; the matching delete probe
+    /// arrives with the audited write repository in the next PR of issue #98), the
     /// two-thirds of the four-level resource model
     /// that is tenant-and-environment scoped (operators, tenants, and environments
     /// are LEVEL tables whose isolation is exercised by the management-plane tests
@@ -176,6 +178,7 @@ impl IdorHarness {
         self.register(Box::new(OrgMembershipRoleUnassignProbe));
         self.register(Box::new(OrgAuthPolicySetProbe));
         self.register(Box::new(OrgAuthPolicyRemoveProbe));
+        self.register(Box::new(PermissionGetProbe));
         self
     }
 
@@ -1092,6 +1095,40 @@ impl IsolationProbe for OrgMembershipRoleUnassignProbe {
                 .org_membership_roles(caller);
             match assignments.unassign(&env, &organization, &id).await {
                 Ok(()) => ProbeOutcome::Leaked,
+                Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `PermissionRepo::get` (issue #98). `store` must authenticate
+/// as `ironauth_control`. A permission defined in another scope must resolve as the
+/// uniform not-found under the caller's scope, indistinguishable from an absent one.
+///
+/// This resource is scoped to exactly `(tenant, environment)` and carries no
+/// organization, so the row-level-security policy is its complete fence and this
+/// probe is the whole cross-scope story for it. There is no organization dimension
+/// to probe separately, unlike the #97 family above.
+struct PermissionGetProbe;
+
+impl IsolationProbe for PermissionGetProbe {
+    fn name(&self) -> &'static str {
+        "permissions.get"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            let permissions = store.management().permissions(caller);
+            let Ok(id) = permissions.parse_id(foreign_id) else {
+                return ProbeOutcome::Denied;
+            };
+            match permissions.get(&id).await {
+                Ok(_) => ProbeOutcome::Leaked,
                 Err(_) => ProbeOutcome::Denied,
             }
         })

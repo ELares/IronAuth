@@ -198,6 +198,23 @@ impl ScopedKind for OrgAuthPolicyKind {
     const PREFIX: &'static str = "oap";
 }
 
+/// Marker for a permission or entitlement definition (`prm_`), one entry in an
+/// ENVIRONMENT's permission vocabulary (issue #98). Deliberately NOT scoped to an
+/// organization, unlike a role (`rol_`) or a group (`grp_`): a permission names an
+/// API capability, and one string cannot sensibly mean different things to two
+/// organizations calling the same API. Scoped like every other resource so an id
+/// minted in another `(tenant, environment)` parses as a uniform not-found. Not a
+/// bearer secret (a permission id names configuration, never end-user data), so
+/// its debug form stays legible.
+///
+/// The prefix is `prm` and not `per`, which reads as a preposition rather than a
+/// resource.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PermissionKind;
+impl ScopedKind for PermissionKind {
+    const PREFIX: &'static str = "prm";
+}
+
 /// Marker for an audit-log event, the tenant-scoped record the audit log writes
 /// in the same transaction as every mutation. Scoped like any other resource so
 /// audit rows are themselves subject to the tenant-isolation policies.
@@ -1361,6 +1378,10 @@ pub type OrgMembershipRoleId = ScopedId<OrgMembershipRoleKind>;
 /// policy document governing one organization's authentication requirements
 /// (issue #95).
 pub type OrgAuthPolicyId = ScopedId<OrgAuthPolicyKind>;
+/// A permission identifier (`prm_...`), one entry in an ENVIRONMENT's permission
+/// vocabulary (issue #98). It carries no organization: the vocabulary belongs to
+/// the environment and the role-to-permission mapping carries the organization.
+pub type PermissionId = ScopedId<PermissionKind>;
 /// An audit-log event identifier (`aud_...`).
 pub type AuditId = ScopedId<AuditKind>;
 /// A management API key identifier (`mak_...`), environment-scoped (issue #11).
@@ -2179,6 +2200,57 @@ mod tests {
     }
 
     #[test]
+    fn property_permission_ids_round_trip_and_deny_cross_scope() {
+        // A property sweep over the permission vocabulary (issue #98): every
+        // freshly minted id round-trips in its own scope and NONE parses in a
+        // foreign tenant or environment. The scope embedded in the id is the ONLY
+        // organization-independent fence this resource has, because the table
+        // carries no organization column at all, so a cross-scope id that parsed
+        // would be an existence oracle over another environment's vocabulary.
+        let env = test_env();
+        let tenant_a = TenantId::generate(&env);
+        let tenant_b = TenantId::generate(&env);
+        let env_1 = EnvironmentId::generate(&env);
+        let env_2 = EnvironmentId::generate(&env);
+        let scope_a = Scope::new(tenant_a, env_1);
+        let cross_tenant = Scope::new(tenant_b, env_1);
+        let cross_env = Scope::new(tenant_a, env_2);
+
+        for _ in 0..1_000 {
+            let id = PermissionId::generate(&env, &scope_a);
+            let text = id.to_string();
+            assert!(text.starts_with("prm_"));
+            assert_eq!(
+                PermissionId::parse_in_scope(&text, &scope_a).expect("in scope"),
+                id
+            );
+            assert_eq!(
+                PermissionId::parse_in_scope(&text, &cross_tenant),
+                Err(NotInScope)
+            );
+            assert_eq!(
+                PermissionId::parse_in_scope(&text, &cross_env),
+                Err(NotInScope)
+            );
+        }
+
+        // Malformed and wrong-prefix inputs fail with the same NotInScope. The
+        // role id is the sharpest wrong-prefix case: the role-to-permission
+        // mapping addresses one of each, so a parser that accepted either would
+        // let a mapping write name a role where a permission belongs.
+        assert_eq!(
+            PermissionId::parse_in_scope("prm_not-base64-!!", &scope_a),
+            Err(NotInScope)
+        );
+        let a_role = OrgRoleId::generate(&env, &scope_a).to_string();
+        assert_eq!(
+            PermissionId::parse_in_scope(&a_role, &scope_a),
+            Err(NotInScope),
+            "a role id is not a permission id even in the right scope"
+        );
+    }
+
+    #[test]
     fn property_org_group_ids_round_trip_and_deny_cross_scope() {
         // A property sweep over the organization-group level (issue #97): every
         // freshly minted id round-trips in its own scope, and NONE parses in a
@@ -2427,6 +2499,14 @@ mod tests {
         assert!(
             seen.contains_key("oap"),
             "the org-auth-policy prefix is declared"
+        );
+        // Issue #98's permission vocabulary. Pinned for the same reason as the
+        // families above: `prm` was chosen over `per` and a later kind must not
+        // take it back, because a permission id is what the role-to-permission
+        // mapping addresses and what the admin surface resolves by id.
+        assert!(
+            seen.contains_key("prm"),
+            "the permission prefix is declared"
         );
     }
 

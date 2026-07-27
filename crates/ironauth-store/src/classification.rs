@@ -219,13 +219,20 @@ pub enum ResourceType {
     /// config snapshot, so a policy is Runtime too: a promoted policy would
     /// reference a target-environment organization that may not exist.
     OrgAuthPolicy,
+    /// One entry in an ENVIRONMENT's permission vocabulary (issue #98): a named API
+    /// capability, or from issue #103 a feature or plan entitlement. Unlike a role,
+    /// a group, or an authentication policy it hangs off the ENVIRONMENT rather than
+    /// an organization, so the "a promoted row would reference an organization the
+    /// target environment may not hold" argument does NOT apply to it. It is Runtime
+    /// for a different and weaker reason, recorded honestly in `classify`.
+    Permission,
 }
 
 impl ResourceType {
     /// Every resource type, in a stable order. The classification lint and the
     /// metadata endpoint both iterate this; a variant missing here is caught by
     /// the `all_lists_every_variant` test and by `scripts/classification-lint.sh`.
-    pub const ALL: [ResourceType; 31] = [
+    pub const ALL: [ResourceType; 32] = [
         ResourceType::Operator,
         ResourceType::Tenant,
         ResourceType::Environment,
@@ -257,6 +264,7 @@ impl ResourceType {
         ResourceType::OrgRole,
         ResourceType::OrgGroup,
         ResourceType::OrgAuthPolicy,
+        ResourceType::Permission,
     ];
 
     /// The stable wire name of this resource type (for example `organization`).
@@ -294,6 +302,7 @@ impl ResourceType {
             ResourceType::OrgRole => "org_role",
             ResourceType::OrgGroup => "org_group",
             ResourceType::OrgAuthPolicy => "org_auth_policy",
+            ResourceType::Permission => "permission",
         }
     }
 
@@ -332,7 +341,8 @@ impl ResourceType {
             | ResourceType::FlowVersion
             | ResourceType::OrgRole
             | ResourceType::OrgGroup
-            | ResourceType::OrgAuthPolicy => ResourceLevel::Environment,
+            | ResourceType::OrgAuthPolicy
+            | ResourceType::Permission => ResourceLevel::Environment,
         }
     }
 
@@ -463,7 +473,17 @@ pub fn classify(resource: ResourceType) -> ResourceClassification {
         // would create: that row would be Promotable and would land on the other side
         // of the promotion boundary from this one, which is a real decision rather
         // than a formality.
-        | ResourceType::OrgAuthPolicy => Runtime,
+        | ResourceType::OrgAuthPolicy
+        // The permission vocabulary (issue #98) is the one Runtime member of this
+        // arm whose reason is NOT "it hangs off an organization": it hangs off the
+        // ENVIRONMENT, so nothing structural stops it from travelling. It is Runtime
+        // because carrying it would move six coordinated promotion sites plus the
+        // snapshot JSON schema in an already extra-large issue, and because adding a
+        // snapshot projection later is EXPAND ONLY and therefore not a one-way door.
+        // Say so plainly rather than borrowing the organization argument: a reader
+        // who assumed the structural reason would later "discover" that promoting
+        // the vocabulary is safe and conclude the classification was a mistake.
+        | ResourceType::Permission => Runtime,
     }
 }
 
