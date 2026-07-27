@@ -16,6 +16,12 @@
 // The list reads are keyset paginated: when the wrapper reports a next cursor this
 // surface tells the operator more rows exist beyond the first page (the
 // no-silent-truncation rule) rather than dropping the tail.
+//
+// The detail also mounts the issue #97 panels: the roles of the organization
+// (src/ui/OrgRolesView.tsx) and its group hierarchy (src/ui/OrgGroupsView.tsx),
+// and each member row opens that member's direct role grants and resolved
+// effective roles (src/ui/MemberRolesView.tsx). Those surfaces are org scoped and
+// meaningless without an organization, so they live here rather than in the nav.
 
 import { useLocation } from "preact-iso";
 import { useState } from "preact/hooks";
@@ -37,31 +43,19 @@ import {
 } from "../api/client";
 import { activeScope } from "../scope/store";
 import type { SudoRecovery } from "./ErrorView";
-import { AsyncBoundary, ConfirmButton, MutationFeedback } from "./ResourceView";
+import {
+  AsyncBoundary,
+  ConfirmButton,
+  MorePageNote,
+  MutationFeedback,
+} from "./ResourceView";
+import { MembershipRolesPanel } from "./MemberRolesView";
+import { OrgGroupsPanel } from "./OrgGroupsView";
+import { OrgRolesPanel } from "./OrgRolesView";
 import { useAsyncResource, useMutation } from "./useResource";
 
 function inputValue(event: Event): string {
   return (event.target as HTMLInputElement).value;
-}
-
-// A "more exist beyond this page" note, rendered when a keyset read reports a next
-// cursor. The list shows the first page; this makes the remainder explicit rather
-// than silently dropping the tail. `noun` names the resource in the sentence.
-function MorePageNote({
-  nextCursor,
-  noun,
-}: {
-  nextCursor: string | null;
-  noun: string;
-}) {
-  if (nextCursor === null) {
-    return null;
-  }
-  return (
-    <p class="resource-more" role="status">
-      More {noun} exist beyond this page. Only the first page is shown.
-    </p>
-  );
 }
 
 // The organizations list root, scoped to the active {tenant, environment}. When no
@@ -357,6 +351,19 @@ function OrganizationDetailFor({
               tenantId={tenantId}
               environmentId={environmentId}
               organizationId={organizationId}
+              organizationActive={org.active}
+            />
+
+            <OrgRolesPanel
+              tenantId={tenantId}
+              environmentId={environmentId}
+              organizationId={organizationId}
+            />
+
+            <OrgGroupsPanel
+              tenantId={tenantId}
+              environmentId={environmentId}
+              organizationId={organizationId}
             />
           </div>
         )}
@@ -369,19 +376,29 @@ function OrganizationDetailFor({
 // createMembership / deleteMembership): add a member by user id, list the current
 // members, and remove a member. A membership lives UNDER the organization, so
 // every call injects the organization id alongside the active scope.
+//
+// Each row also opens the roles of that member (issue #97): the direct grants and
+// the resolved effective roles with provenance. At most ONE row is open at a
+// time, so the ids the nested forms carry stay unique in the document and the
+// panel never fires reads for members the operator is not looking at.
 function MembershipsPanel({
   tenantId,
   environmentId,
   organizationId,
+  organizationActive,
 }: {
   tenantId: string;
   environmentId: string;
   organizationId: string;
+  // A DISABLED organization resolves NO roles for any member while its grants
+  // stay on file, so the roles panel needs this to explain an empty resolved set.
+  organizationActive: boolean;
 }) {
   const { state, reload } = useAsyncResource<KeysetPage<MembershipView>>(
     () => fetchMemberships(tenantId, environmentId, organizationId),
     [tenantId, environmentId, organizationId],
   );
+  const [openMembershipId, setOpenMembershipId] = useState<string | null>(null);
   return (
     <div class="resource-subsection">
       <h3>Members</h3>
@@ -413,6 +430,13 @@ function MembershipsPanel({
                   environmentId={environmentId}
                   organizationId={organizationId}
                   member={member}
+                  organizationActive={organizationActive}
+                  rolesOpen={openMembershipId === member.id}
+                  onToggleRoles={() =>
+                    setOpenMembershipId(
+                      openMembershipId === member.id ? null : member.id,
+                    )
+                  }
                   onRemoved={reload}
                 />
               ))}
@@ -487,12 +511,18 @@ function MembershipRow({
   environmentId,
   organizationId,
   member,
+  organizationActive,
+  rolesOpen,
+  onToggleRoles,
   onRemoved,
 }: {
   tenantId: string;
   environmentId: string;
   organizationId: string;
   member: MembershipView;
+  organizationActive: boolean;
+  rolesOpen: boolean;
+  onToggleRoles: () => void;
   onRemoved: () => void;
 }) {
   const mutation = useMutation();
@@ -515,19 +545,39 @@ function MembershipRow({
   }
 
   return (
-    <li class="resource-row">
-      <code class="resource-link">{member.user_id}</code>
-      <code class="resource-id">{member.id}</code>
-      <span class="resource-status">{member.state}</span>
-      <ConfirmButton
-        label="Remove"
-        prompt="Remove this member from the organization?"
-        confirmLabel="Confirm remove"
-        danger
-        disabled={mutation.state.pending}
-        onConfirm={onRemove}
-      />
-      <MutationFeedback state={mutation.state} />
+    <li class="resource-row-block">
+      <div class="resource-row">
+        <code class="resource-link">{member.user_id}</code>
+        <code class="resource-id">{member.id}</code>
+        <span class="resource-status">{member.state}</span>
+        <button
+          type="button"
+          class="resource-btn"
+          aria-expanded={rolesOpen}
+          onClick={onToggleRoles}
+        >
+          {rolesOpen ? "Hide roles" : "Show roles"}
+        </button>
+        <ConfirmButton
+          label="Remove"
+          prompt="Remove this member from the organization?"
+          confirmLabel="Confirm remove"
+          danger
+          disabled={mutation.state.pending}
+          onConfirm={onRemove}
+        />
+        <MutationFeedback state={mutation.state} />
+      </div>
+      {rolesOpen ? (
+        <MembershipRolesPanel
+          tenantId={tenantId}
+          environmentId={environmentId}
+          organizationId={organizationId}
+          membershipId={member.id}
+          organizationActive={organizationActive}
+          membershipState={member.state}
+        />
+      ) : null}
     </li>
   );
 }

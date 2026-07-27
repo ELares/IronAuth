@@ -571,3 +571,87 @@ body {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   word-break: break-all;
 }
+
+/* The organization roles and groups panels (issue #97). The group hierarchy is a
+   flattened ARIA tree: every loaded group is one row, and the indent mirrors the
+   aria-level so the nesting is visible as well as announced. A row is never
+   dropped for having an unreadable parent; it appears at the top level, marked. */
+.resource-more {
+  font-size: 0.85rem;
+  color: var(--muted);
+  margin: 0.4rem 0 0;
+}
+
+.resource-tree {
+  list-style: none;
+  margin: 1rem 0 0;
+  padding: 0;
+}
+
+.resource-tree-item {
+  position: relative;
+}
+
+/* A row that opens a detail. It is a button, not a link: it changes what this
+   panel shows, it does not navigate. */
+.resource-linkbtn {
+  font: inherit;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+
+.resource-linkbtn:hover {
+  text-decoration: underline;
+}
+
+.resource-slug {
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+/* How one role reaches a member: the provenance of a single grant path. */
+.resource-provenance {
+  margin-left: auto;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--muted);
+}
+
+/* A list row that carries an expandable panel underneath it, so the row chrome
+   stays a single line and the panel is full width below. */
+.resource-row-block {
+  border: 1px solid var(--line);
+  border-radius: 0.4rem;
+  margin-bottom: 0.4rem;
+  padding: 0 0.6rem;
+}
+
+.resource-row-block > .resource-row {
+  border: 0;
+  margin-bottom: 0;
+  padding-left: 0;
+  padding-right: 0;
+}
+
+.resource-detail-panel {
+  margin: 0.6rem 0 0;
+  padding: 0.2rem 0.8rem 0.8rem;
+  border: 1px solid var(--line);
+  border-radius: 0.5rem;
+}
+
+.resource-detail-panel h4,
+.resource-subsection h4 {
+  font-size: 0.9rem;
+  margin: 0.8rem 0 0.4rem;
+}
+
+.resource-member-roles {
+  padding-bottom: 0.4rem;
+}
