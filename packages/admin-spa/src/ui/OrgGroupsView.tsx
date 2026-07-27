@@ -17,6 +17,13 @@
 //   past the configured maximum depth), and those 422 bodies are rendered
 //   VERBATIM, because rewording them would cost the operator the reason.
 //
+//   The move control SUBMITS EXACTLY WHAT IT DISPLAYS. The options are built from
+//   the loaded page, so a group whose current parent is deleted or beyond that
+//   page has no option matching it; the select would then render blank while a
+//   fallback to the stored parent quietly submitted a value the operator never
+//   saw. One expression feeds both the rendered value and the submitted body, and
+//   the unresolvable case is stated in words rather than defaulted in silence.
+//
 // This is a PANEL of the organization detail view (src/ui/OrganizationsView.tsx).
 // It reads and writes ONLY through the named wrappers in src/api/client.ts (the
 // single funnel) and renders every failure through the verbatim ErrorView
@@ -31,6 +38,7 @@ import {
   type OrgGroupMemberView,
   type OrgGroupRoleView,
   type OrgGroupView,
+  type UpdateOrgGroupRequest,
   addOrgGroupMember,
   assignOrgGroupRole,
   createOrgGroup,
@@ -319,12 +327,22 @@ function OrgGroupDetail({
 
   function onRename(event: Event): void {
     event.preventDefault();
-    const next = (displayName ?? "").trim();
+    // An UNTOUCHED field is OMITTED, never sent as an empty string. The body is
+    // an RFC 7396 style partial edit where an absent field is left unchanged, so
+    // omitting it says "no change"; sending "" asks for an empty label, which the
+    // server refuses with a message that contradicts the populated field the
+    // operator is looking at.
+    const request: UpdateOrgGroupRequest =
+      displayName === null ? {} : { display_name: displayName.trim() };
     void mutation
       .run(async () => {
-        await updateOrgGroup(tenantId, environmentId, organizationId, groupId, {
-          display_name: next,
-        });
+        await updateOrgGroup(
+          tenantId,
+          environmentId,
+          organizationId,
+          groupId,
+          request,
+        );
       }, "Group renamed.")
       .then((ok) => {
         if (ok) {
@@ -334,9 +352,10 @@ function OrgGroupDetail({
       });
   }
 
-  function onMove(event: Event, current: string | null): void {
+  // `chosen` is the value the select is RENDERING, computed once below and passed
+  // in, so what the operator sees and what reaches the wire cannot diverge.
+  function onMove(event: Event, chosen: string): void {
     event.preventDefault();
-    const chosen = parentId ?? current ?? NO_PARENT;
     void mutation
       .run(async () => {
         await setOrgGroupParent(
@@ -412,41 +431,14 @@ function OrgGroupDetail({
                 Rename group
               </button>
             </form>
-            <form
-              class="resource-form"
-              onSubmit={(event) => onMove(event, group.parent_id ?? null)}
-              aria-label="Move the group"
-            >
-              <div class="resource-field">
-                <label for="org-group-move-parent">New parent group</label>
-                <select
-                  id="org-group-move-parent"
-                  value={parentId ?? group.parent_id ?? NO_PARENT}
-                  onChange={(event) => setParentId(selectValue(event))}
-                >
-                  <option value={NO_PARENT}>
-                    No parent, a top level group
-                  </option>
-                  {candidates.map((candidate) => (
-                    <option key={candidate.id} value={candidate.id}>
-                      {candidate.display_name}
-                    </option>
-                  ))}
-                </select>
-              </div>
-              <p class="resource-note">
-                A move that would loop the hierarchy, or nest it deeper than the
-                configured maximum, is refused by the server and the reason is
-                shown here unchanged.
-              </p>
-              <button
-                type="submit"
-                class="resource-btn resource-btn-primary"
-                disabled={mutation.state.pending}
-              >
-                Move group
-              </button>
-            </form>
+            <OrgGroupMoveForm
+              group={group}
+              candidates={candidates}
+              parentId={parentId}
+              onChoose={setParentId}
+              onSubmit={onMove}
+              pending={mutation.state.pending}
+            />
             <div
               class="resource-actions"
               role="group"
@@ -481,6 +473,90 @@ function OrgGroupDetail({
         )}
       </AsyncBoundary>
     </div>
+  );
+}
+
+// The MOVE control, kept whole so the value it RENDERS and the value it SUBMITS
+// are ONE expression.
+//
+// `candidates` is built from the loaded page, so the current parent of this group
+// matches no option whenever that parent was deleted or sits beyond the page. A
+// select handed a value no option carries renders BLANK, and the group the
+// operator is most likely to open here is exactly that one, because the tree
+// marks it "detached parent". Falling back to the stored parent on submit would
+// then PUT a value the control never showed: the server accepts the reparent to
+// the parent it already had, the panel reports "Group moved.", and nothing moved.
+//
+// So the fallback is the sentinel the control is actually displaying, and the
+// case is STATED rather than defaulted in silence. An extra disabled option
+// naming the unresolvable parent was considered and rejected: an option is only
+// visible once the dropdown is opened, which is the step the mistaken operator
+// never takes, and selecting it would restore the same no-op submit.
+function OrgGroupMoveForm({
+  group,
+  candidates,
+  parentId,
+  onChoose,
+  onSubmit,
+  pending,
+}: {
+  group: OrgGroupView;
+  candidates: ReadonlyArray<OrgGroupView>;
+  // The parent the operator picked, or null while the control is untouched.
+  parentId: string | null;
+  onChoose: (value: string) => void;
+  onSubmit: (event: Event, chosen: string) => void;
+  pending: boolean;
+}) {
+  const currentParent = group.parent_id ?? NO_PARENT;
+  const selectable =
+    currentParent === NO_PARENT ||
+    candidates.some((candidate) => candidate.id === currentParent);
+  // The single source of both the rendered value and the submitted body.
+  const selected = parentId ?? (selectable ? currentParent : NO_PARENT);
+
+  return (
+    <form
+      class="resource-form"
+      onSubmit={(event) => onSubmit(event, selected)}
+      aria-label="Move the group"
+    >
+      <div class="resource-field">
+        <label for="org-group-move-parent">New parent group</label>
+        <select
+          id="org-group-move-parent"
+          value={selected}
+          onChange={(event) => onChoose(selectValue(event))}
+        >
+          <option value={NO_PARENT}>No parent, a top level group</option>
+          {candidates.map((candidate) => (
+            <option key={candidate.id} value={candidate.id}>
+              {candidate.display_name}
+            </option>
+          ))}
+        </select>
+      </div>
+      {selectable ? null : (
+        <p class="resource-note" role="status">
+          The current parent of this group is not among the groups readable
+          here, because it was deleted or lies beyond this page. This control
+          therefore starts at no parent, so moving now makes this a top level
+          group.
+        </p>
+      )}
+      <p class="resource-note">
+        A move that would loop the hierarchy, or nest it deeper than the
+        configured maximum, is refused by the server and the reason is shown here
+        unchanged.
+      </p>
+      <button
+        type="submit"
+        class="resource-btn resource-btn-primary"
+        disabled={pending}
+      >
+        Move group
+      </button>
+    </form>
   );
 }
 

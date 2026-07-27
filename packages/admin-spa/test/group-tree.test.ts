@@ -127,6 +127,31 @@ describe("building the group forest", () => {
     expect(forest[0].detached).toBe(true);
   });
 
+  it("keeps a self parented group in its PAGE POSITION, not swept to the end", () => {
+    // The self-parent clause of the top level test and the completeness net that
+    // catches unreachable rows both emit this group once, at depth 0, marked
+    // detached, so the single group case above cannot tell them apart. ORDER can:
+    // resolving it as a top level row keeps it where the server put it, whereas
+    // letting it fall through to the net files it as its own child, leaves it
+    // reachable from no root, and appends it after every other row.
+    //
+    // Sibling order is a stated property of this module (two reads of unchanged
+    // state must render identically), and an operator scanning a long hierarchy
+    // for a row the server listed second should not find it last.
+    const forest = expectsEveryGroupOnce([
+      group("self", "self"),
+      group("root"),
+      group("child", "root"),
+    ]);
+    expect(
+      forest.map((node) => [node.group.id, node.depth, node.detached]),
+    ).toEqual([
+      ["self", 0, true],
+      ["root", 0, false],
+      ["child", 1, false],
+    ]);
+  });
+
   it("emits every group of a parent loop rather than hanging or dropping it", () => {
     // A two node loop is reachable from no root at all. Without the completeness
     // net both rows would vanish from the panel.
@@ -139,6 +164,26 @@ describe("building the group forest", () => {
       "plain",
       "x",
       "y",
+    ]);
+  });
+
+  it("MARKS the row the completeness net lifts out of a parent loop", () => {
+    // The net anchors the loop on its first row and shows it at the top level,
+    // which its parent pointer does not justify: `x` names `y` as its parent yet
+    // is drawn as a root. Unmarked, an operator reads that placement as the
+    // truth. The marking is what tells them the hierarchy drawn is not the whole
+    // story, so it is asserted rather than assumed.
+    const forest = expectsEveryGroupOnce([
+      group("plain"),
+      group("x", "y"),
+      group("y", "x"),
+    ]);
+    expect(
+      forest.map((node) => [node.group.id, node.depth, node.detached]),
+    ).toEqual([
+      ["plain", 0, false],
+      ["x", 0, true],
+      ["y", 1, false],
     ]);
   });
 

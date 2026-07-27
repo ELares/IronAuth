@@ -18,6 +18,7 @@ import {
   type CreateOrgRoleRequest,
   type KeysetPage,
   type OrgRoleView,
+  type UpdateOrgRoleRequest,
   createOrgRole,
   deleteOrgRole,
   fetchOrgRoles,
@@ -209,12 +210,22 @@ function OrgRoleDetail({
 
   function onRename(event: Event): void {
     event.preventDefault();
-    const next = (displayName ?? "").trim();
+    // An UNTOUCHED field is OMITTED, never sent as an empty string. The body is
+    // an RFC 7396 style partial edit where an absent field is left unchanged, so
+    // omitting it says "no change"; sending "" asks for an empty label, which the
+    // server refuses with a message that contradicts the populated field the
+    // operator is looking at.
+    const request: UpdateOrgRoleRequest =
+      displayName === null ? {} : { display_name: displayName.trim() };
     void mutation
       .run(async () => {
-        await updateOrgRole(tenantId, environmentId, organizationId, roleId, {
-          display_name: next,
-        });
+        await updateOrgRole(
+          tenantId,
+          environmentId,
+          organizationId,
+          roleId,
+          request,
+        );
       }, "Role renamed.")
       .then((ok) => {
         if (ok) {

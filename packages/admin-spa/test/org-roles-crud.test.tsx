@@ -267,6 +267,39 @@ describe("the organization roles panel", () => {
     expect(root.textContent).toContain("Role renamed.");
   });
 
+  it("OMITS an untouched display name rather than PATCHing it empty", async () => {
+    // The field is showing the current label and the operator never touched it.
+    // The body is an RFC 7396 style partial edit, where "no change" is said by
+    // OMITTING the field; sending an empty string asks to blank the label, which
+    // the server refuses with a message that contradicts the populated field the
+    // operator is looking at.
+    const calls = stubFetch((call) => {
+      if (call.method === "PATCH") {
+        return json(role);
+      }
+      if (call.url.endsWith("/roles/rol_a")) {
+        return json(role);
+      }
+      return json({ items: [role] });
+    });
+    const root = mount(<OrgRolesPanel {...SCOPE} />);
+    await flush();
+    button(root, "Billing Administrator").click();
+    await flush();
+
+    const field = root.querySelector("#org-role-rename") as HTMLInputElement;
+    expect(field.value).toBe("Billing Administrator");
+
+    button(root, "Rename role").click();
+    await flush();
+
+    const patch = calls.find((call) => call.method === "PATCH");
+    expect(patch?.url).toBe(`${ORG}/roles/rol_a`);
+    const body = JSON.parse(patch?.body ?? "null") as Record<string, unknown>;
+    expect("display_name" in body).toBe(false);
+    expect(body).toEqual({});
+  });
+
   it("deletes a role only after an explicit confirm", async () => {
     const calls = stubFetch((call) => {
       if (call.method === "DELETE") {
@@ -495,6 +528,125 @@ describe("one group", () => {
     expect(root.textContent).toContain("Group moved.");
   });
 
+  it("OMITS an untouched display name rather than PATCHing it empty", async () => {
+    // Same shape as the role rename: an untouched field means "no change", which
+    // an RFC 7396 style partial edit says by omitting it, not by sending "".
+    const { root, calls } = openGroup((call) =>
+      call.method === "PATCH" ? json(groupA) : null,
+    );
+    await flush();
+    button(root, "Engineering").click();
+    await flush();
+
+    const field = root.querySelector("#org-group-rename") as HTMLInputElement;
+    expect(field.value).toBe("Engineering");
+
+    button(root, "Rename group").click();
+    await flush();
+
+    const patch = calls.find((call) => call.method === "PATCH");
+    expect(patch?.url).toBe(`${ORG}/groups/grp_a`);
+    const body = JSON.parse(patch?.body ?? "null") as Record<string, unknown>;
+    expect("display_name" in body).toBe(false);
+    expect(body).toEqual({});
+  });
+
+  it("SUBMITS what the move control DISPLAYS when the current parent is off page", async () => {
+    // `grp_gone` is on no page read here (deleted, or beyond the default page of
+    // 50), so no option carries it and the select is handed a value matching no
+    // option. This is exactly the row an operator opens to repair, because the
+    // tree marks it "detached parent".
+    //
+    // The operator presses Move WITHOUT opening the dropdown. A submit that fell
+    // back to the stored parent would PUT the parent the group already had: the
+    // server accepts a reparent to the same live parent, the panel prints "Group
+    // moved.", and NOTHING moved. The displayed state and the submitted value
+    // must be one and the same.
+    const orphan = makeGroup("grp_o", "orphan", "Orphan", "grp_gone");
+    const calls = stubFetch((call) => {
+      if (call.method === "PUT") {
+        return json({ ...orphan, parent_id: null });
+      }
+      if (call.url.endsWith("/groups/grp_o/members")) {
+        return json({ items: [] });
+      }
+      if (call.url.endsWith("/groups/grp_o/roles")) {
+        return json({ items: [] });
+      }
+      if (call.url.endsWith("/groups/grp_o")) {
+        return json(orphan);
+      }
+      return json({ items: [groupA, orphan] });
+    });
+    const root = mount(<OrgGroupsPanel {...SCOPE} />);
+    await flush();
+    button(root, "Orphan").click();
+    await flush();
+
+    const select = root.querySelector(
+      "#org-group-move-parent",
+    ) as HTMLSelectElement;
+    // The premise: the current parent is genuinely not among the options.
+    expect(
+      Array.from(select.options).map((option) => option.value),
+    ).not.toContain("grp_gone");
+    // The control is showing a real choice, not a blank with no option selected.
+    expect(select.selectedIndex).toBeGreaterThanOrEqual(0);
+    const displayed = select.value;
+
+    button(root, "Move group").click();
+    await flush();
+
+    const put = calls.find((call) => call.method === "PUT");
+    expect(put?.url).toBe(`${ORG}/groups/grp_o/parent`);
+    // What is SENT is exactly what is SHOWN, read off the live control rather
+    // than restated: the empty option value is the documented no-parent sentinel.
+    expect(JSON.parse(put?.body ?? "{}")).toEqual({
+      parent_id: displayed === "" ? null : displayed,
+    });
+    // And the operator is told why the control starts where it does, without
+    // having to open the dropdown to find out.
+    expect(root.textContent).toContain("not among the groups readable here");
+  });
+
+  it("still submits the CURRENT parent when it is an option and is untouched", async () => {
+    // The other half of the same invariant: reading the displayed value must not
+    // turn every untouched move into a detach. Platform sits under Engineering,
+    // Engineering is a legal option, so that is what the control shows and sends.
+    const calls = stubFetch((call) => {
+      if (call.method === "PUT") {
+        return json(groupB);
+      }
+      if (call.url.endsWith("/groups/grp_b/members")) {
+        return json({ items: [] });
+      }
+      if (call.url.endsWith("/groups/grp_b/roles")) {
+        return json({ items: [] });
+      }
+      if (call.url.endsWith("/groups/grp_b")) {
+        return json(groupB);
+      }
+      return json({ items: [groupA, groupB] });
+    });
+    const root = mount(<OrgGroupsPanel {...SCOPE} />);
+    await flush();
+    button(root, "Platform").click();
+    await flush();
+
+    const select = root.querySelector(
+      "#org-group-move-parent",
+    ) as HTMLSelectElement;
+    expect(select.value).toBe("grp_a");
+    // The parent IS readable here, so the unresolvable-parent note is absent.
+    expect(root.textContent).not.toContain("not among the groups readable here");
+
+    button(root, "Move group").click();
+    await flush();
+
+    const put = calls.find((call) => call.method === "PUT");
+    expect(JSON.parse(put?.body ?? "{}")).toEqual({ parent_id: "grp_a" });
+  });
+
   it("does not offer the group itself or its subtree as a new parent", async () => {
     const { root } = openGroup(() => null);
     await flush();
@@ -685,6 +837,33 @@ describe("the roles one group grants", () => {
     expect(del?.url).toBe(`${ORG}/groups/grp_a/roles/rol_a`);
     // The assignment id is carried for audit correlation, never as the address.
     expect(del?.url).not.toContain("grl_a");
+  });
+
+  it("surfaces a more-exist note rather than under-reporting the INHERITED grants", async () => {
+    // This is the one list on the surface carrying grants that every member of
+    // every group BENEATH this one also resolves, so a page silently truncated
+    // here under-reports authorization: the operator concludes the group grants
+    // less than it does and audits against the short list.
+    stubFetch((call) => {
+      if (call.url.endsWith("/groups/grp_a/members")) {
+        return json({ items: [] });
+      }
+      if (call.url.endsWith("/groups/grp_a/roles")) {
+        return json({ items: [assignment], next_cursor: "opaque_gr_2" });
+      }
+      if (call.url.endsWith("/groups/grp_a")) {
+        return json(groupA);
+      }
+      return json({ items: [groupA] });
+    });
+    const root = mount(<OrgGroupsPanel {...SCOPE} />);
+    await flush();
+    button(root, "Engineering").click();
+    await flush();
+
+    expect(root.textContent).toContain("More roles granted by this group exist");
+    // The cursor is a pagination token, never surfaced as a value to copy.
+    expect(root.textContent).not.toContain("opaque_gr_2");
   });
 });
 
@@ -916,6 +1095,31 @@ describe("the roles of one member", () => {
     expect(rowsOf(root, "Effective role grant paths")).toEqual([]);
   });
 
+  it("renders a MALFORMED 2xx as an error, never as an empty role set", async () => {
+    // A 200 whose body carries no role list is not an answer of "this member
+    // holds nothing". Coercing it to an empty array renders the resolves-nothing
+    // copy with NO error at all, which is the same silent authorization
+    // DOWNGRADE the non 2xx case above refuses to produce, only quieter. There is
+    // no safe empty answer here, so the read fails loud.
+    stubFetch((call) =>
+      call.url.endsWith("/effective-roles")
+        ? json({ ok: true })
+        : json({ items: [direct] }),
+    );
+    const root = mount(<MembershipRolesPanel {...MEMBER} />);
+    await flush();
+
+    expect(root.querySelector(".errorbody")).not.toBeNull();
+    expect(root.textContent).toContain("did not carry a role list");
+    // Emphatically NOT the "this member holds nothing" reading.
+    expect(root.textContent).not.toContain(
+      "resolves no roles in this organization",
+    );
+    expect(rowsOf(root, "Effective role grant paths")).toEqual([]);
+    // The failure is confined to the resolved half: the direct grants still list.
+    expect(rowsOf(root, "Roles granted directly to the member").length).toBe(1);
+  });
+
   it("does not claim a gate when the member actually resolves roles", async () => {
     const { root } = open(
       { items: [] },
@@ -927,6 +1131,84 @@ describe("the roles of one member", () => {
 });
 
 describe("the roles and groups panels inside the organization detail", () => {
+  // Drive the console path an operator actually walks: organization detail, then
+  // a member row, then "Show roles". Mounting MembershipRolesPanel with hand
+  // written props tests the panel; only this tests the WIRING that makes the
+  // panel right in the shipped console, which is where the organization's own
+  // `active` and the membership's own `state` have to come from.
+  //
+  // The direct grants are POPULATED and the resolved set is EMPTY, because that
+  // pairing is the whole reason the explanation exists: without it the operator
+  // reads a configuration that vanished.
+  async function openMemberRoles(
+    active: boolean,
+    state: string,
+  ): Promise<HTMLDivElement> {
+    const member = {
+      id: "omb_a",
+      user_id: "usr_a",
+      organization_id: "org_a",
+      state,
+      metadata: {},
+      created_at_unix_ms: 0,
+    };
+    const grant = {
+      id: "mrl_a",
+      membership_id: "omb_a",
+      role_id: "rol_a",
+      organization_id: "org_a",
+      created_at_unix_ms: 0,
+      updated_at_unix_ms: 0,
+    };
+    stubFetch((call) => {
+      if (call.url.endsWith("/memberships/omb_a/effective-roles")) {
+        return json({ roles: [] });
+      }
+      if (call.url.endsWith("/memberships/omb_a/roles")) {
+        return json({ items: [grant] });
+      }
+      if (call.url.endsWith("/organizations/org_a/memberships")) {
+        return json({ items: [member] });
+      }
+      if (call.url.includes("/roles") || call.url.includes("/groups")) {
+        return json({ items: [] });
+      }
+      return json({
+        id: "org_a",
+        display_name: "Globex",
+        active,
+        tenant_id: "ten_a",
+        environment_id: "env_a",
+        created_at_unix_ms: 0,
+      });
+    });
+    const root = mount(<OrganizationDetail organizationId="org_a" />);
+    await flush();
+    button(root, "Show roles").click();
+    await flush();
+    return root;
+  }
+
+  it("explains a DISABLED organization at the member row of the detail view", async () => {
+    // The seam: the detail view must carry the organization's own `active` down
+    // to the roles panel. Hardcode it and a disabled organization renders the
+    // bare resolves-nothing line beside a populated grant list.
+    const root = await openMemberRoles(false, "active");
+    expect(root.textContent).toContain("This organization is disabled");
+    expect(root.textContent).toContain("still on file and are not lost");
+    // The configuration is visibly NOT gone, which is what the copy claims.
+    expect(rowsOf(root, "Roles granted directly to the member").length).toBe(1);
+  });
+
+  it("explains a NON ACTIVE membership at the member row of the detail view", async () => {
+    // The other half of the seam: the state carried down is the state of THIS
+    // membership row, not a constant.
+    const root = await openMemberRoles(true, "removed");
+    expect(root.textContent).toContain("This membership is removed");
+    expect(root.textContent).toContain("still on file and are not lost");
+    expect(rowsOf(root, "Roles granted directly to the member").length).toBe(1);
+  });
+
   it("makes ZERO calls when no scope is selected", async () => {
     resetScope();
     const calls = stubFetch(() => json({ items: [] }));

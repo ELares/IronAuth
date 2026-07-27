@@ -2557,5 +2557,21 @@ export async function getOrgMembershipEffectiveRoles(
   if (error !== undefined || !response.ok) {
     throw new ManagementError(toErrorBody(error), response.status);
   }
-  return data?.roles ?? [];
+  // A MALFORMED 2xx fails just as loud. Coercing a bodyless or wrongly shaped
+  // success into an empty array would render "this member resolves no roles",
+  // which is indistinguishable from a member who legitimately holds nothing: a
+  // silent authorization DOWNGRADE, the very reading the non 2xx path above
+  // already refuses to produce. There is no safe empty answer here, so the
+  // console says it could not read the resolved set.
+  if (data === undefined || !Array.isArray(data.roles)) {
+    throw new ManagementError(
+      {
+        error: "malformed_response",
+        message:
+          "The effective roles response did not carry a role list, so the resolved set could not be read. It is not being reported as empty.",
+      },
+      response.status,
+    );
+  }
+  return data.roles;
 }

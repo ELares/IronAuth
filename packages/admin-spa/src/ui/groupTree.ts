@@ -66,6 +66,14 @@ export function buildGroupForest(
     // A group is a top level row when it declares no parent, when it points at
     // itself, or when the parent it names is not among the loaded rows (deleted,
     // or on a page not read yet). The last two are the `detached` case.
+    //
+    // The self-parent clause is NOT redundant with the completeness net below,
+    // and the difference is ORDER. Without it a self-parented group is filed as
+    // its own child, is reachable from no top level row, and is emitted by the
+    // net AFTER every other row instead of in the page position the server gave
+    // it. Both spellings emit it once, at depth 0, marked detached, so only a
+    // case with another row after it can tell them apart; group-tree.test.ts
+    // carries exactly that case.
     if (parent === null || parent === group.id || !byId.has(parent)) {
       tops.push(group);
       continue;
@@ -103,6 +111,11 @@ export function buildGroupForest(
   // unreachable from any top level row. It is emitted at the top level and
   // marked detached rather than dropped, because a group silently missing from
   // this panel is a group an operator cannot audit or unassign.
+  //
+  // The `true` here is load bearing and is asserted: a row lifted out of a loop
+  // is shown at a level its parent pointer does not justify, so it must carry
+  // the marking that tells the operator the hierarchy drawn is not the whole
+  // story. group-tree.test.ts asserts the loop anchor is marked detached.
   for (const group of groups) {
     if (!seen.has(group.id)) {
       walk(group, 0, true);
