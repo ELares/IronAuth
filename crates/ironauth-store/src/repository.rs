@@ -33438,7 +33438,7 @@ impl OrgGroupRepo<'_> {
     /// revocations an operator has, and an organization that has been switched off
     /// must stop asserting roles everywhere at once. The check lives in
     /// [`EFFECTIVE_CLOSURE_CTE`]'s membership seed rather than in a caller precisely
-    /// so there is ONE answer to it, shared by all three projections; point 4 of that
+    /// so there is ONE answer to it, shared by all four projections; point 4 of that
     /// constant's documentation records why no caller can be trusted to hold it
     /// instead. EMPTY rather than an error is deliberate: a disabled organization is
     /// an operator state, not a store fault, and refusing here would make an
@@ -33539,14 +33539,81 @@ impl OrgGroupRepo<'_> {
         .await
     }
 
+    /// The deterministic EFFECTIVE PERMISSION SET for one user in one organization
+    /// (issue #98): the slugs of every LIVE permission carried by any LIVE role the
+    /// subject effectively holds, whether granted DIRECTLY to their membership or to
+    /// any group in the ancestor closure.
+    ///
+    /// The FOURTH projection over the shared closure, and the one a later PR of this
+    /// issue emits into an access-token claim, so read the whole contract before
+    /// changing it.
+    ///
+    /// # One closure, one definition of "which roles"
+    ///
+    /// This resolves the permissions of exactly the roles
+    /// [`OrgGroupRepo::effective_roles`] reports, because both read the SAME
+    /// `effective_roles` arm of [`EFFECTIVE_CLOSURE_CTE`] and differ only in what
+    /// they project from it. A second walk with its own notion of which roles a
+    /// member holds could drift from the one the token-issuance path resolves, and a
+    /// drifted copy on that path is an authorization answer nobody reviewed.
+    ///
+    /// # What is filtered, and where
+    ///
+    /// Returns permission SLUGS, not ids, for the reason
+    /// [`OrgGroupRepo::effective_roles`] gives about roles: a slug is immutable by
+    /// GRANT (migration 0091 leaves it out of the UPDATE grant), so an authorization
+    /// decision never changes because an operator edited a display name.
+    ///
+    /// Only `kind = 'permission'` rows are selected. The `Entitlement` half of
+    /// [`PermissionEntryKind`] is shipped headroom with no writer in issue #98, and
+    /// the filter is in the SQL rather than at write time deliberately: see
+    /// [`EFFECTIVE_PERMISSION_SLUGS_TAIL`] and `require_live_permission`.
+    ///
+    /// Everything [`OrgGroupRepo::effective_roles`] documents applies here unchanged:
+    /// the EMPTY set (never an error, never a partial set) for a user with no live
+    /// active membership AND for a member of an organization that is DISABLED or
+    /// soft-deleted, soft-deleted rows excluded at every level, the bounded ancestor
+    /// walk that truncates rather than looping, and the tenant, environment, and
+    /// organization fencing. Two liveness filters are this projection's own, and
+    /// neither has a second layer: a DETACHED mapping and a soft-DELETED permission
+    /// each stop resolving on the very next read, while every other row on the path
+    /// stays live.
+    ///
+    /// A store fault is a genuine `Err` and must NOT be swallowed into an empty set:
+    /// on the mint path an empty set is a silent authorization DOWNGRADE that looks
+    /// exactly like a subject who legitimately holds nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if either id is out of this repository's scope (a
+    /// programming error on the mint path, where both ids come from the bound scope,
+    /// so it is reported LOUDLY rather than as an empty set);
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn effective_permissions(
+        &self,
+        organization_id: &OrganizationId,
+        user_id: &UserId,
+        max_group_depth: u32,
+    ) -> Result<BTreeSet<String>, StoreError> {
+        self.resolve_effective(
+            organization_id,
+            user_id,
+            max_group_depth,
+            EFFECTIVE_PERMISSION_SLUGS_TAIL,
+        )
+        .await
+    }
+
     /// Run one effective-resolution statement: the shared bounded closure CTE
     /// ([`EFFECTIVE_CLOSURE_CTE`]) followed by `tail`, and collect its single `slug`
     /// column into a [`BTreeSet`].
     ///
-    /// One private entry point so both public resolutions share ONE definition of
-    /// the membership seed, the ancestor walk, and the depth bound. `tail` selects
-    /// which projection runs over that closure and is a `&'static str` chosen from
-    /// two module constants, never anything a caller supplies, so no part of this
+    /// One private entry point so all three slug-set resolutions
+    /// ([`OrgGroupRepo::effective_roles`], [`OrgGroupRepo::effective_group_slugs`],
+    /// and [`OrgGroupRepo::effective_permissions`]) share ONE definition of the
+    /// membership seed, the ancestor walk, and the depth bound. `tail` selects which
+    /// projection runs over that closure and is a `&'static str` chosen from three
+    /// module constants, never anything a caller supplies, so no part of this
     /// statement is caller-authored SQL.
     async fn resolve_effective(
         &self,
@@ -33572,11 +33639,12 @@ impl OrgGroupRepo<'_> {
     /// PATH rather than one per role, so a caller learns not only WHICH roles a
     /// member holds but WHY they hold each one.
     ///
-    /// # One closure, three projections
+    /// # One closure, four projections
     ///
     /// This runs the SAME [`EFFECTIVE_CLOSURE_CTE`] as
-    /// [`OrgGroupRepo::effective_roles`] and [`OrgGroupRepo::effective_group_slugs`],
-    /// through the same private entry point, and differs ONLY in its projection
+    /// [`OrgGroupRepo::effective_roles`], [`OrgGroupRepo::effective_group_slugs`],
+    /// and [`OrgGroupRepo::effective_permissions`], through the same private entry
+    /// point, and differs ONLY in its projection
     /// ([`EFFECTIVE_ROLE_GRANTS_TAIL`]). That is load-bearing rather than tidy: a
     /// second walk with its own notion of "ancestor" could drift from the one the
     /// token-issuance path resolves, and then an operator reading provenance in the
@@ -33660,9 +33728,9 @@ impl OrgGroupRepo<'_> {
     /// depth bound, and one statement made of [`EFFECTIVE_CLOSURE_CTE`] followed by
     /// `tail`.
     ///
-    /// One private entry point so all three public resolutions share ONE definition
+    /// One private entry point so all FOUR public resolutions share ONE definition
     /// of the membership seed, the ancestor walk, and the depth bound; only the
-    /// projection differs. `tail` is a `&'static str` chosen from three module
+    /// projection differs. `tail` is a `&'static str` chosen from four module
     /// constants, never anything a caller supplies, so no part of this statement is
     /// caller-authored SQL.
     async fn run_effective(
@@ -33736,14 +33804,36 @@ impl OrgGroupRepo<'_> {
 ///      lifecycle is checked HERE, once, and it is the coarsest revocation the
 ///      product has: an operator who DISABLES or soft-DELETES an organization
 ///      expects it to stop asserting anything, and this seed is the only place all
-///      three projections pass through. Every arm below it is fed by `membership`
+///      FOUR projections pass through. Every arm below it is fed by `membership`
 ///      (directly, or through `closure`, which seeds from it, or through
 ///      `effective_roles`, whose every branch reads one of those two), so an
 ///      organization that is not live and active empties the closure, empties the
-///      effective role set, and every projection over them answers the EMPTY set.
+///      effective role set, empties the permissions those roles carry, and every
+///      projection over them answers the EMPTY set.
 ///      Empty is the right answer rather than an error: a disabled organization is
 ///      an operator STATE, not a fault, and a fault here would turn a deliberate
 ///      administrative action into a token-endpoint outage for every member.
+///
+///      THE CLAUSE ABOUT `effective_roles` ABOVE IS A CONSTRAINT ON FUTURE CODE, NOT
+///      MERELY A DESCRIPTION OF TODAY'S. EVERY branch of that arm MUST read
+///      `membership` or `closure`, and a NEW branch that reads NEITHER breaks this
+///      fence for ALL FOUR projections at once. That reading is the whole mechanism,
+///      because nothing downstream of this seed re-checks `organizations` at all, by
+///      design: a branch reaching `org_roles` by any other route would go on
+///      resolving for a DISABLED or soft-DELETED organization, and it would do so
+///      with every existing test still green, because no existing test can plant a
+///      branch that does not exist yet.
+///      The next PR of issue #98 adds the first new branch this arm has ever had, a
+///      DEFAULT-ROLE `OR`, so this is addressed to its author: seed that branch from
+///      `membership` (a default role is still a role of the caller's own live
+///      organization, so there is no reason to reach around it), and extend
+///      `a_disabled_organization_resolves_to_no_permissions` and
+///      `a_soft_deleted_organization_resolves_to_no_permissions_too` to cover the
+///      new branch rather than only the two grant kinds. This exact failure mode has
+///      been found on this milestone once already, by adversarial review on issue
+///      #97's PR 6: a disabled organization went on minting its roles into every
+///      access token its members refreshed, and every FINER revocation kept working,
+///      which is what made it invisible.
 ///
 ///      This predicate is LOAD BEARING on both mint hooks and has no second layer
 ///      anywhere behind it. Neither hook re-checks the organization: the refresh
@@ -33756,14 +33846,20 @@ impl OrgGroupRepo<'_> {
 ///      the family; `a_disabled_organization_stops_minting_its_roles_on_both_hooks`
 ///      and `a_soft_deleted_organization_stops_minting_its_roles_too` in
 ///      `crates/ironauth-oidc/tests/org_roles_claim.rs` are the tests that say so.
+///      `a_disabled_organization_resolves_to_no_permissions` and
+///      `a_soft_deleted_organization_resolves_to_no_permissions_too` in
+///      `crates/ironauth-store/tests/effective_permissions.rs` hold the same
+///      property for the fourth projection at the store layer, which is the only
+///      layer it has until a later PR of issue #98 wires it into a mint hook.
 ///   5. The `effective_roles` arm. It is the AUTHORITATIVE definition of which roles
 ///      a membership effectively holds, and it is deliberately here rather than in a
 ///      projection: [`EFFECTIVE_ROLE_SLUGS_TAIL`] is now nothing but a projection of
-///      it, so the slug set the token-issuance path emits and any later projection
-///      over this same arm cannot disagree about WHICH roles are held. The argument
-///      is the one point 4 makes for the seed. A second statement of "which roles"
-///      could drift from this one, and a drifted copy on the issuance path is an
-///      authorization answer nobody reviewed.
+///      it, and [`EFFECTIVE_PERMISSION_SLUGS_TAIL`] resolves the permissions of
+///      exactly the roles it yields, so the slug set the token-issuance path emits
+///      and every later projection over this same arm cannot disagree about WHICH
+///      roles are held. The argument is the one point 4 makes for the seed. A second
+///      statement of "which roles" could drift from this one, and a drifted copy on
+///      the issuance path is an authorization answer nobody reviewed.
 ///
 ///      Its two `OR` branches are the two grant kinds. The first reads `membership`
 ///      directly, so it is the DIRECT grant; the second reads `closure`, so it
@@ -33782,6 +33878,25 @@ impl OrgGroupRepo<'_> {
 ///      Referenced twice, the arm materializes. That is a plan choice rather than a
 ///      correctness one, but it is on the token-issuance path, so it is worth
 ///      spending a moment on rather than discovering later.
+///
+///      READ THAT AS A PLAN-SHAPE FACT AND NOT AS A PERFORMANCE RULE, because the
+///      only cost measurement taken points the OTHER way. `EXPLAIN (ANALYZE,
+///      BUFFERS)` of [`EFFECTIVE_PERMISSION_SLUGS_TAIL`] on a populated fixture read
+///      139 buffers in 0.30 ms in the shipped INLINED form, against 73 buffers in
+///      0.19 ms for the same statement rewritten with a second mention: inlining
+///      re-executes the `org_roles` scan once per candidate mapping row (68 loops on
+///      that fixture) where the materialized CTE runs it once. Nothing above is
+///      wrong, because the rule only ever claimed the two PLANS differ and they do.
+///      But one fixture at one size is not a benchmark, and "reference it once" is
+///      NOT a licence to assume the inlined form is cheaper. A later PR that
+///      profiles the issuance path should MEASURE which shape it wants at
+///      representative cardinality, and should add a second mention if the numbers
+///      say so; the behaviour is identical either way, so this is a free choice.
+///
+///      [`EFFECTIVE_PERMISSION_SLUGS_TAIL`] is the first projection ADDED since this
+///      rule was written; it mentions the arm exactly once, and its own doc comment
+///      records the plan that was read to check the rule holds in practice, together
+///      with the plan the same statement produces when a second mention is added.
 ///
 ///      [`EFFECTIVE_ROLE_GRANTS_TAIL`] deliberately does NOT read this arm, and that
 ///      is not an oversight. It answers the different question "by which PATH", so
@@ -33849,10 +33964,13 @@ impl OrgGroupRepo<'_> {
 /// The count is a tally over THIS statement, and it is worth saying so out loud, because
 /// a projection over it repeats the same predicates. [`EFFECTIVE_ROLE_GRANTS_TAIL`]
 /// carries `r.organization_id` and `mr.organization_id` in its direct branch and
-/// `r.organization_id` and `gr.organization_id` in its group branch; they are the same
-/// layer, kept for the same reason, and they are simply not part of the five counted
-/// here. That tail carries its own note on the two predicates in it that are NOT of this
-/// kind.
+/// `r.organization_id` and `gr.organization_id` in its group branch;
+/// [`EFFECTIVE_PERMISSION_SLUGS_TAIL`] carries exactly ONE, `rp.organization_id`, and
+/// its `permissions` scan carries none at all because that table has no organization
+/// column to fence. All five of those are the same layer, kept for the same reason, and
+/// they are simply not part of the SIX counted here. Each of those tails carries its own
+/// note: the grants tail on the two predicates in it that are NOT of this kind, and the
+/// permission tail on the corruption shape its one copy is the only thing that catches.
 ///
 /// # The liveness filters are not redundant either
 ///
@@ -34033,6 +34151,192 @@ const EFFECTIVE_ROLE_GRANTS_TAIL: &str = "SELECT DISTINCT r.slug AS slug, \
         AND gr.organization_id = $3 AND gr.deleted_at IS NULL \
         AND gr.group_id IN (SELECT id FROM closure) \
       ORDER BY slug, via_group_id NULLS FIRST";
+
+/// The projection [`OrgGroupRepo::effective_permissions`] runs over
+/// [`EFFECTIVE_CLOSURE_CTE`] (issue #98): the slugs of every LIVE permission carried
+/// by any LIVE role of the `effective_roles` arm.
+///
+/// The FOURTH projection over the shared closure, and the second one to READ the
+/// `effective_roles` arm. Unlike [`EFFECTIVE_ROLE_SLUGS_TAIL`], which is a bare
+/// projection of that arm, this one joins two further tables to it; what it does NOT
+/// do is reach the subject any other way. Every path from a permission slug back to a
+/// member runs through `effective_roles`, so this inherits the membership seed, the
+/// bounded ancestor walk, and the organization-liveness fence unchanged, and it cannot
+/// disagree with the roles claim about WHICH roles are held. That is the whole reason
+/// the arm was lifted into the shared preamble.
+///
+/// # It references `effective_roles` EXACTLY ONCE, deliberately
+///
+/// `rp.role_id IN (SELECT id FROM effective_roles)` is the only mention. Point 5 of
+/// [`EFFECTIVE_CLOSURE_CTE`] states the rule and why it matters on this path:
+/// Postgres INLINES a CTE referenced once and MATERIALIZES one referenced twice. That
+/// was checked on a real plan rather than assumed. `EXPLAIN` of this statement shows
+/// no `CTE effective_roles` node and no scan of one: the arm is folded into the
+/// `org_role_permissions` semi-join as a single indexed `org_roles` scan under the two
+/// hashed subplans that are its own two grant branches. The plan's only CTE nodes are
+/// `membership` and `closure`, and both are expected: `closure` is the recursive term,
+/// and `membership` is itself referenced twice (the closure seed and the direct-grant
+/// branch), which is the same rule seen from the other side. Rewritten with a second
+/// mention of `effective_roles`, the identical statement grows a `CTE effective_roles`
+/// node and two `CTE Scan on effective_roles` nodes; that contrast was measured on
+/// this schema. The behaviour is identical either way; the plan is not, and this
+/// statement runs on token issuance. Which of the two plans is CHEAPER is a separate
+/// question that this constant does not settle, and the one measurement of it
+/// (recorded in point 5) favours the materialized form on the fixture it was taken
+/// on. Do not read the single mention here as a cost claim.
+///
+/// # The `kind` filter lives HERE, and this is the only place it lives
+///
+/// `p.kind = 'permission'` is what keeps the entitlement half of
+/// [`PermissionEntryKind`] (shipped headroom for issue #103, with no writer in issue
+/// #98) out of anything this resolves, and therefore out of the token claim a later
+/// PR builds on it. It is deliberately NOT also enforced at write time:
+/// `require_live_permission` declines to filter `kind` for the reason its own doc
+/// comment gives, so an entitlement CAN be attached to a role and the only thing that
+/// stops it resolving is this predicate. Migration 0091's header states the same
+/// split, and `an_entitlement_row_never_reaches_the_permission_projection` in
+/// `crates/ironauth-store/tests/effective_permissions.rs` is the test that kills its
+/// removal: it plants an entitlement (through SQL, because [`NewPermission`] carries
+/// no `kind` and must not grow one here), attaches it to a role the subject holds,
+/// and asserts the slug is absent while a PERMISSION of the same slug resolves.
+///
+/// The literal is the same wire string [`PermissionEntryKind::as_str`] returns for
+/// its `Permission` member and the same one migration 0091's
+/// `permissions_kind_known` CHECK admits;
+/// `the_projection_filters_the_same_kind_string_the_type_writes` pins the three
+/// together, because a literal in a SQL string is exactly the kind of copy that can
+/// drift from the enum without anything noticing.
+///
+/// # The organization fence is INHERITED, not re-derived
+///
+/// Nothing here re-checks the organization's `state` or `deleted_at`, and nothing
+/// upstream of this statement does either: point 4 of [`EFFECTIVE_CLOSURE_CTE`]
+/// records that the `JOIN organizations o` on the membership seed is the ONLY
+/// organization-liveness fence anywhere on the issuance path. This projection is
+/// fenced because a disabled or soft-deleted organization empties `membership`, which
+/// empties `closure`, which empties `effective_roles`, which leaves the semi-join
+/// below with no role to match. A permission projection that opened its own scan of
+/// `org_memberships` or `org_group_members` would re-derive that seed WITHOUT the
+/// join and would put a switched-off organization's permissions into every access
+/// token its members refresh. `a_disabled_organization_resolves_to_no_permissions`
+/// and `a_soft_deleted_organization_resolves_to_no_permissions_too` are the tests
+/// that say so.
+///
+/// # The organization-predicate census, extended
+///
+/// This tail adds exactly ONE `organization_id` predicate to the tally
+/// [`EFFECTIVE_CLOSURE_CTE`] keeps, and it is `rp.organization_id`. It belongs to the
+/// same layer as the SIX counted there and is not part of that count, which is a
+/// tally over that statement alone.
+///
+/// It is redundant on data the write path can produce: `ActingOrgRolePermissionRepo`
+/// resolves the role as live IN the organization it then stamps onto the row, so a
+/// mapping row's organization and its role's organization always agree, and the role
+/// fence in the `effective_roles` arm already refuses every foreign-organization role.
+/// It catches its OWN shape of the corruption that invariant assumes, and the shape
+/// is different from every one the six catch: plant a mapping row stamped with a
+/// SIBLING organization that names a role of THIS organization which the subject
+/// holds, and this predicate is the only thing in the whole statement that keeps the
+/// permission out. That was measured, not reasoned, and
+/// `the_projection_never_crosses_organization_via_a_corrupt_mapping_row` plants both
+/// that row and its mirror.
+///
+/// The MIRROR (a mapping stamped with THIS organization that names a SIBLING's role) is
+/// worth a sentence, because it is easy to credit the wrong predicate with it. Read from
+/// the organization that does NOT hold that role, what refuses it is the arm's two GRANT
+/// SUBQUERIES yielding no such role at all, not `r.organization_id`; that fence would
+/// refuse it too, but it is the redundant second refusal, and dropping it leaves the
+/// whole of `effective_permissions.rs` green. Read from the organization whose member
+/// DOES hold the role, `rp.organization_id` is again the only thing that decides.
+///
+/// `permissions` contributes NO copy, and its absence is not a gap. That table is
+/// scoped to exactly `(tenant, environment)`; it carries no `organization_id` column
+/// at all, because the vocabulary belongs to the environment (migration 0091's section
+/// (1) decision), so its row-level-security policy is its COMPLETE fence and there is no
+/// organization dimension here to repeat. The organization fence on this path lives
+/// entirely on `rp` and on the `effective_roles` arm behind it.
+///
+/// `p.tenant_id`, `p.environment_id`, `rp.tenant_id`, and `rp.environment_id` are the
+/// module-wide scope pair, sitting above two forced row-level-security policies that
+/// fence the same rows, for the reason [`PermissionRepo`] states in full. The two
+/// ENVIRONMENT halves are each KILLED on this statement, which was measured rather than
+/// assumed: `the_projection_still_fences_the_environment_with_the_policy_half_down`
+/// replaces the environment half of BOTH policies and plants the two rows no supported
+/// path can write (a mapping of this environment naming a permission of the sibling
+/// one, and a mapping stamped with the sibling environment naming this one's role and
+/// permission). Dropping `p.environment_id` alone turns the first of those two
+/// assertions red, and dropping `rp.environment_id` alone turns the second.
+///
+/// The two TENANT halves stay EQUIVALENT SURVIVORS, and that is structural rather than a
+/// gap in the fixture, which is worth recording so nobody spends a second afternoon
+/// trying to kill them. `environments_pkey` is on `id` ALONE (migration 0001, where the
+/// tenant pairing is a separate `UNIQUE (id, tenant_id)`), so an environment id
+/// DETERMINES its tenant, and the environment conjunct standing beside each tenant one
+/// therefore already excludes every cross-tenant row. Both are kept anyway, for the
+/// reason the module-wide convention keeps every such pair: a statement should be
+/// correct on its own terms rather than on the strength of another table's key.
+///
+/// # The liveness filters have no second layer either
+///
+/// `rp.deleted_at IS NULL` is what makes a DETACH take effect. Deleting a role or a
+/// permission does not cascade to the mapping row (migration 0092 records why), and
+/// conversely a detached mapping leaves both endpoints live, so nothing but this
+/// predicate stops a withdrawn grant from resolving forever.
+///
+/// `p.deleted_at IS NULL` is what makes a permission DELETE take effect, and it is
+/// the mirror case: the mapping row stays live and its role stays live, so this is
+/// the only predicate that observes the deletion. A re-created permission of the same
+/// slug is a fresh id (migration 0091), so it does not inherit the dead one's
+/// mappings, and the grant really is gone rather than dormant.
+///
+/// Rules 1 and 2 of `resolution_excludes_every_soft_deleted_row_on_the_permission_path`
+/// are what kill each. The role, group, binding, assignment, and membership liveness
+/// filters this projection depends on are the shared arm's own, and rules 3 to 8 of the
+/// same test pin that they still apply when the answer is read as permissions. Two of
+/// the preamble's own filters survived all eight of those rules, and
+/// `resolution_ignores_a_binding_into_a_dead_group_and_a_dead_membership` is what kills
+/// both. They survived for two DIFFERENT reasons, and the difference is worth keeping
+/// straight, because only ONE of them is about reachability.
+///
+/// The MEMBERSHIP seed's `m.deleted_at IS NULL` is the REACHABILITY case.
+/// [`ActingOrgMembershipRepo::remove`] revokes every live binding and every live direct
+/// grant in the SAME transaction, so the ordinary lifecycle never leaves a live
+/// attachment standing behind a dead membership for this filter to decide. That is why
+/// the test soft-deletes the membership row out of band rather than calling `remove`.
+///
+/// The CLOSURE seed's `g.deleted_at IS NULL` is the COVERAGE case instead, and the state
+/// it guards is entirely ordinary: a group delete DETACHES rather than cascades, so the
+/// binding row stays live and any operator can produce this. It survived only because no
+/// other test in that file deletes the member's OWN group. Rule 5 deletes an ANCESTOR,
+/// which the RECURSIVE arm's copy of the filter decides, not the seed's.
+///
+/// # Determinism
+///
+/// `DISTINCT` plus `ORDER BY p.slug` makes the result sorted and deduplicated before
+/// the [`BTreeSet`] sees it. Both keywords are EQUIVALENT mutants, and saying so is
+/// better than leaving the next reader to discover it: `resolve_effective` collects
+/// into a set, so no supported path can observe either one. `DISTINCT` additionally
+/// cannot currently drop a row at all, because `p.id IN (...)` is a SEMI-join (a
+/// permission carried by SEVERAL held roles is already one row) and
+/// `permissions_kind_slug_live_uniq` (migration 0091) forbids two LIVE permission rows
+/// of one environment sharing a slug. That was measured rather than reasoned: dropping
+/// the index, planting two live rows of one slug, attaching both, and removing
+/// `DISTINCT` still yields exactly one entry, because the set collapses them. Both are
+/// kept for the reason [`EFFECTIVE_ROLE_SLUGS_TAIL`] keeps its own, which is that the
+/// statement should be correct on its own terms and not only in the company of its
+/// collector. Do not delete either on the strength of a surviving mutation.
+const EFFECTIVE_PERMISSION_SLUGS_TAIL: &str = "SELECT DISTINCT p.slug AS slug \
+       FROM permissions p \
+      WHERE p.tenant_id = $1 AND p.environment_id = $2 \
+        AND p.kind = 'permission' AND p.deleted_at IS NULL \
+        AND p.id IN ( \
+            SELECT rp.permission_id \
+              FROM org_role_permissions rp \
+             WHERE rp.tenant_id = $1 AND rp.environment_id = $2 \
+               AND rp.organization_id = $3 AND rp.deleted_at IS NULL \
+               AND rp.role_id IN (SELECT id FROM effective_roles) \
+        ) \
+      ORDER BY p.slug";
 
 /// The projection every group-member read selects from `org_group_members` (the two
 /// timestamps as epoch microseconds). One constant so the get and list projections

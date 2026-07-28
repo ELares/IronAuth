@@ -555,6 +555,28 @@ name = "org_role_permissions"
 path = "tests/org_role_permissions.rs"
 required-features = ["testing"]
 
+# The FOURTH projection over the shared effective-resolution closure (issue #98,
+# store PR 5): the effective PERMISSION set, which a later PR of the issue emits into
+# an access-token claim. Covers resolution over every shape that matters (no roles, a
+# role with no permissions, direct, group, ancestor-inherited, one permission reached
+# by several paths yielding one entry), determinism and the data plane, agreement with
+# the ROLE projection over randomized fixtures (both read one closure arm, so this is
+# what would catch them drifting), liveness at EVERY level with the two filters that
+# are this projection's own and have no second layer (a DETACHED mapping and a
+# soft-DELETED permission) plus the two that needed a test of their own (a binding into
+# a deleted group, which is an ordinary state no other test here reaches, and a
+# membership killed OUT OF BAND with its attachments left live, which the repository's
+# own remove cascade otherwise tidies away), the `kind`
+# filter that keeps an entitlement out of a token
+# claim, the organization-liveness fence in both halves (disabled and soft-deleted),
+# the corrupt mapping row whose stamped organization disagrees with its role's, scope
+# fencing against a sibling ENVIRONMENT of the same tenant, and termination on a
+# stored cycle through a soft-deleted node. Needs a real database (DATABASE_URL).
+[[test]]
+name = "effective_permissions"
+path = "tests/effective_permissions.rs"
+required-features = ["testing"]
+
 # Organization groups and hierarchy safety (issue #97, store PR 2): the group half
 # of the M10 role model, plus the write-time cycle check and depth bound. Covers the
 # audited CRUD and reparent vocabulary, the typed cycle and depth refusals (and that
