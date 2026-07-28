@@ -32074,13 +32074,13 @@ pub struct NewOrgRolePermission<'a> {
     pub permission_id: &'a PermissionId,
 }
 
-/// WHY one role is in a membership's effective set (issue #97).
+/// WHY one role is in a membership's effective set (issues #97 and #98).
 ///
-/// The two variants are the two assignment surfaces and nothing else: a role is
-/// either granted straight to the membership, or granted to a group in the
-/// membership's ancestor closure. There is no third kind, and a role that is
-/// unreachable simply produces no [`EffectiveRoleGrant`] at all rather than a
-/// variant meaning "none".
+/// The first two variants are the two ASSIGNMENT surfaces: a role is either granted
+/// straight to the membership, or granted to a group in the membership's ancestor
+/// closure. The third is not an assignment at all and that is the point of it. A
+/// role that is unreachable by any of the three simply produces no
+/// [`EffectiveRoleGrant`] rather than a variant meaning "none".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EffectiveRoleSource {
     /// Granted straight to this membership (an `org_membership_roles` row). It
@@ -32091,6 +32091,19 @@ pub enum EffectiveRoleSource {
     /// membership from the group, or withdrawing the grant from the group, is what
     /// takes it away.
     Group(OrgGroupId),
+    /// The organization's DEFAULT role (issue #98): `org_roles.is_default` on a live
+    /// role of this organization, held by every LIVE ACTIVE member because the
+    /// organization designated it and NOT because anybody granted it.
+    ///
+    /// There is NO row to point at, which is what makes this variant necessary
+    /// rather than tidy. The default role is resolved at read and never
+    /// materialized (migration 0093 states why in full), so it appears in NO
+    /// assignment list, and an operator who saw only [`EffectiveRoleSource::Direct`]
+    /// and [`EffectiveRoleSource::Group`] would be told a role is held with no
+    /// explanation that any surface could act on. Taking it away means designating a
+    /// different default or clearing the designation, for the WHOLE organization: it
+    /// cannot be withdrawn from one member.
+    Default,
 }
 
 /// ONE grant path in an effective-role resolution (issue #97): a role the
@@ -33404,11 +33417,19 @@ impl OrgGroupRepo<'_> {
 
     /// The deterministic EFFECTIVE ROLE SET for one user in one organization
     /// (issue #97): the union of the roles assigned DIRECTLY to their membership,
-    /// the roles assigned to every group they are a live member of, and the roles
-    /// assigned to every ANCESTOR of those groups, up to `max_group_depth`.
+    /// the roles assigned to every group they are a live member of, the roles
+    /// assigned to every ANCESTOR of those groups, up to `max_group_depth`, and
+    /// (issue #98) the organization's DEFAULT role if it has designated one.
     ///
     /// This is the read the token-issuance path performs, so read the whole
     /// contract before changing it.
+    ///
+    /// The DEFAULT role is in this set for every LIVE ACTIVE member and it is in NO
+    /// assignment list, because it is resolved at read and never materialized as a
+    /// row (migration 0093). A caller that needs to distinguish it from a grant
+    /// somebody actually wrote wants [`OrgGroupRepo::effective_role_grants`], which
+    /// reports [`EffectiveRoleSource::Default`] for it. A caller that wants to know
+    /// what the next token will carry wants exactly this set, undivided.
     ///
     /// # Determinism
     ///
@@ -33541,8 +33562,8 @@ impl OrgGroupRepo<'_> {
 
     /// The deterministic EFFECTIVE PERMISSION SET for one user in one organization
     /// (issue #98): the slugs of every LIVE permission carried by any LIVE role the
-    /// subject effectively holds, whether granted DIRECTLY to their membership or to
-    /// any group in the ancestor closure.
+    /// subject effectively holds, whether granted DIRECTLY to their membership, to
+    /// any group in the ancestor closure, or held as the organization's DEFAULT role.
     ///
     /// The FOURTH projection over the shared closure, and the one a later PR of this
     /// issue emits into an access-token claim, so read the whole contract before
@@ -33635,8 +33656,8 @@ impl OrgGroupRepo<'_> {
             .collect())
     }
 
-    /// The EFFECTIVE ROLE SET with its PROVENANCE (issue #97): one entry per GRANT
-    /// PATH rather than one per role, so a caller learns not only WHICH roles a
+    /// The EFFECTIVE ROLE SET with its PROVENANCE (issues #97 and #98): one entry per
+    /// GRANT PATH rather than one per role, so a caller learns not only WHICH roles a
     /// member holds but WHY they hold each one.
     ///
     /// # One closure, four projections
@@ -33656,17 +33677,27 @@ impl OrgGroupRepo<'_> {
     /// # The multiset, and why it is not deduplicated to one entry per role
     ///
     /// A role reachable by SEVERAL paths (directly AND through a group, or through
-    /// two different groups) yields SEVERAL entries, one per path. Collapsing them
-    /// to a single "primary" source would hide the operator-relevant fact: an
-    /// operator who withdraws the one grant they were shown, and sees the role
-    /// survive, has been actively misled by the endpoint that exists to explain the
-    /// role. The distinct `slug` values are the effective set; the entries are the
-    /// evidence.
+    /// two different groups, or by either of those AND as the organization's
+    /// DEFAULT) yields SEVERAL entries, one per path. Collapsing them to a single
+    /// "primary" source would hide the operator-relevant fact: an operator who
+    /// withdraws the one grant they were shown, and sees the role survive, has been
+    /// actively misled by the endpoint that exists to explain the role. The distinct
+    /// `slug` values are the effective set; the entries are the evidence.
+    ///
+    /// The DEFAULT entry (issue #98) is where that rule earns its keep, because it
+    /// is the one path with NOTHING to withdraw. An operator who removes a direct
+    /// grant from a member of an organization whose default role is that same role
+    /// sees the role stay, and the second entry is the only thing on any surface that
+    /// explains why: it is not a stale read and there is no other assignment to hunt
+    /// for. It is also the entry no assignment list can ever show, since no row
+    /// exists for it (migration 0093).
     ///
     /// # Determinism
     ///
-    /// Ordered by `(slug, via_group_id)` with DIRECT grants first, so two
-    /// evaluations against identical stored state produce byte-identical output.
+    /// Ordered by `(slug, source, via_group_id)`, so two evaluations against
+    /// identical stored state produce byte-identical output. Within one slug a
+    /// DEFAULT entry comes first, then the DIRECT grant, then the inherited ones by
+    /// group id.
     /// Everything [`OrgGroupRepo::effective_roles`] documents about liveness
     /// filtering, the bounded walk that truncates rather than looping, the empty
     /// result for a user with no live active membership, and the tenant,
@@ -33704,20 +33735,44 @@ impl OrgGroupRepo<'_> {
         rows.iter()
             .map(|row| {
                 let slug = row.get::<String, _>("slug");
-                // A NULL `via_group_id` is the DIRECT grant; anything else is the id
-                // of the group in the closure that carries it. The stored id is
-                // re-parsed IN SCOPE, exactly as every other row decode in this
-                // module does, so a corrupt value is a decode error rather than an
-                // id that silently escapes its scope.
-                let source = match row.get::<Option<String>, _>("via_group_id") {
-                    None => EffectiveRoleSource::Direct,
-                    Some(raw) => EffectiveRoleSource::Group(
-                        OrgGroupId::parse_in_scope(&raw, &self.scope).map_err(|_| {
-                            StoreError::Database(sqlx::Error::Decode(
-                                "org_group_roles.group_id is not a group id in this scope".into(),
-                            ))
-                        })?,
-                    ),
+                // The `source` discriminator is a LITERAL each branch of the tail
+                // projects, never stored data, so the three arms below are exhaustive
+                // over everything the statement can return. It replaced an earlier
+                // encoding in which a NULL `via_group_id` meant DIRECT: once the
+                // DEFAULT branch landed (issue #98) two different sources both
+                // project a NULL group, so the group id can no longer carry the
+                // discrimination.
+                //
+                // `via_group_id` is read only on the group arm, and the stored id is
+                // re-parsed IN SCOPE exactly as every other row decode in this module
+                // does, so a corrupt value is a decode error rather than an id that
+                // silently escapes its scope.
+                let raw_source = row.get::<String, _>("source");
+                let source = match raw_source.as_str() {
+                    "direct" => EffectiveRoleSource::Direct,
+                    "default" => EffectiveRoleSource::Default,
+                    "group" => {
+                        let raw =
+                            row.get::<Option<String>, _>("via_group_id")
+                                .ok_or_else(|| {
+                                    StoreError::Database(sqlx::Error::Decode(
+                                        "an inherited grant carries no group id".into(),
+                                    ))
+                                })?;
+                        EffectiveRoleSource::Group(
+                            OrgGroupId::parse_in_scope(&raw, &self.scope).map_err(|_| {
+                                StoreError::Database(sqlx::Error::Decode(
+                                    "org_group_roles.group_id is not a group id in this scope"
+                                        .into(),
+                                ))
+                            })?,
+                        )
+                    }
+                    _ => {
+                        return Err(StoreError::Database(sqlx::Error::Decode(
+                            "an effective-role grant carries an unknown source".into(),
+                        )));
+                    }
                 };
                 Ok(EffectiveRoleGrant { slug, source })
             })
@@ -33823,17 +33878,27 @@ impl OrgGroupRepo<'_> {
 ///      resolving for a DISABLED or soft-DELETED organization, and it would do so
 ///      with every existing test still green, because no existing test can plant a
 ///      branch that does not exist yet.
-///      The next PR of issue #98 adds the first new branch this arm has ever had, a
-///      DEFAULT-ROLE `OR`, so this is addressed to its author: seed that branch from
-///      `membership` (a default role is still a role of the caller's own live
-///      organization, so there is no reason to reach around it), and extend
-///      `a_disabled_organization_resolves_to_no_permissions` and
-///      `a_soft_deleted_organization_resolves_to_no_permissions_too` to cover the
-///      new branch rather than only the two grant kinds. This exact failure mode has
-///      been found on this milestone once already, by adversarial review on issue
-///      #97's PR 6: a disabled organization went on minting its roles into every
-///      access token its members refreshed, and every FINER revocation kept working,
-///      which is what made it invisible.
+///      The DEFAULT-ROLE branch (issue #98) is the first new branch this arm has
+///      ever had, and it obeys that constraint through `EXISTS (SELECT 1 FROM
+///      membership)`, which is the ONLY thing fencing it: `r.is_default` alone would
+///      resolve for a NON-MEMBER, and it would resolve for a member of a DISABLED or
+///      soft-DELETED organization, because nothing else on that branch reads a row
+///      whose liveness this seed decides. Note what the branch deliberately does NOT
+///      do: it never reads `organizations`, even though the designation is the
+///      organization's. Reading it there would either duplicate this fence, which
+///      would make it two answers that can disagree, or state it wrongly and reach
+///      around it, and migration 0093's section (2) records that as the reason the
+///      designation is a flag on the ROLE rather than a pointer on the organization.
+///      `a_non_member_never_receives_the_default_role`,
+///      `a_disabled_organization_never_resolves_its_default_role`, and
+///      `a_soft_deleted_organization_never_resolves_its_default_role_either` in
+///      `crates/ironauth-store/tests/org_default_role.rs` are the tests that hold
+///      all three, and each stands a real member of a real live organization beside
+///      the case it refuses, so none of them can pass by resolving nothing at all.
+///      This exact failure mode has been found on this milestone once already, by
+///      adversarial review on issue #97's PR 6: a disabled organization went on
+///      minting its roles into every access token its members refreshed, and every
+///      FINER revocation kept working, which is what made it invisible.
 ///
 ///      This predicate is LOAD BEARING on both mint hooks and has no second layer
 ///      anywhere behind it. Neither hook re-checks the organization: the refresh
@@ -33861,13 +33926,24 @@ impl OrgGroupRepo<'_> {
 ///      statement of "which roles" could drift from this one, and a drifted copy on
 ///      the issuance path is an authorization answer nobody reviewed.
 ///
-///      Its two `OR` branches are the two grant kinds. The first reads `membership`
-///      directly, so it is the DIRECT grant; the second reads `closure`, so it
-///      inherits the whole bounded ancestor walk and every property points 1 to 3
-///      give it. The branches are expressed as two `IN` subqueries over ONE
-///      `org_roles` scan rather than as a `UNION` of two role sets, so a role
-///      reachable by SEVERAL paths (directly AND through two different groups, say)
-///      yields exactly one row without relying on a set operator to deduplicate.
+///      Its THREE `OR` branches are the two grant kinds plus the organization's
+///      DEFAULT role. The first reads `membership` directly, so it is the DIRECT
+///      grant; the second reads `closure`, so it inherits the whole bounded ancestor
+///      walk and every property points 1 to 3 give it; the third reads `membership`
+///      through `EXISTS`, so it holds for EVERY live active member and for nobody
+///      else. The branches are expressed as subqueries and predicates over ONE
+///      `org_roles` scan rather than as a `UNION` of three role sets, so a role
+///      reachable by SEVERAL paths (directly AND through two different groups AND as
+///      the default, say) yields exactly one row without relying on a set operator
+///      to deduplicate. That is why adding the third branch changed no projection's
+///      shape: the union is the `OR`, and it always was.
+///
+///      The DEFAULT branch is the ONE that has no row of its own anywhere in the
+///      schema. Migration 0093 records why it is resolved rather than materialized,
+///      and the consequence to keep in mind when reading the arm is that no
+///      soft-delete latch can withdraw it: `r.deleted_at IS NULL` on the scan is the
+///      only liveness this branch has, so deleting the role, or clearing its
+///      `is_default`, is the whole of how it stops resolving.
 ///
 ///      A NEW PROJECTION OVER THIS ARM SHOULD REFERENCE IT EXACTLY ONCE. Postgres
 ///      inlines a CTE referenced once and MATERIALIZES one referenced twice, and the
@@ -33900,11 +33976,11 @@ impl OrgGroupRepo<'_> {
 ///
 ///      [`EFFECTIVE_ROLE_GRANTS_TAIL`] deliberately does NOT read this arm, and that
 ///      is not an oversight. It answers the different question "by which PATH", so
-///      it has to keep the two grant kinds separable and each granting group
+///      it has to keep the three kinds separable and each granting group
 ///      attributable, which needs the assignment rows themselves and not a set of
-///      role ids. It restates the same predicates over the same live rows; its own
-///      doc comment names which of them are load bearing and the test that kills
-///      each.
+///      role ids. It restates the same predicates over the same live rows, one
+///      `UNION ALL` branch per `OR` branch here; its own doc comment names which of
+///      them are load bearing and the test that kills each.
 ///
 ///      A projection that does not reference this arm does not pay for it. Postgres
 ///      drops a CTE nothing references, so `EXPLAIN` of
@@ -33913,14 +33989,14 @@ impl OrgGroupRepo<'_> {
 ///      the arm in the SHARED preamble is what buys the single definition and it
 ///      would be a poor trade if it also put a role scan on the group projection.
 ///
-/// # The organization predicates: SIX mutually redundant survivors, and one that is not
+/// # The organization predicates: FIVE mutually redundant survivors, and TWO that are not
 ///
 /// This statement carries an `organization_id = $3` predicate in SEVEN places (the
 /// `o.id = m.organization_id` join condition is a key rather than a fence and is not one
-/// of them). SIX of the seven are redundant WITH RESPECT TO EACH OTHER: deleting any
+/// of them). FIVE of the seven are redundant WITH RESPECT TO EACH OTHER: deleting any
 /// one of them ALONE changes no answer and no test can distinguish its presence, because
 /// the others still fence the same rows under the write path's invariant that every
-/// assignment resolves BOTH of its endpoints as live rows of ONE organization. All six
+/// assignment resolves BOTH of its endpoints as live rows of ONE organization. All five
 /// are retained deliberately and are named here in full, so that nobody removes one as
 /// dead weight and so that this note cannot be read as covering only the first:
 ///
@@ -33933,8 +34009,7 @@ impl OrgGroupRepo<'_> {
 ///     the direction that matters, because it read as withdrawing protection from a
 ///     predicate that needs it as much as the rest.
 ///   * `gm.organization_id` and `g.organization_id` in the SEED arm of `closure`;
-///   * `r.organization_id` on the role row itself in the `effective_roles` arm;
-///   * `mr.organization_id` in that arm's direct-grant subquery;
+///   * `mr.organization_id` in the `effective_roles` arm's direct-grant subquery;
 ///   * `gr.organization_id` in that arm's group-grant subquery.
 ///
 /// Together they are the layer under that write-time invariant: if a future write path
@@ -33949,33 +34024,74 @@ impl OrgGroupRepo<'_> {
 /// catch it while `m.organization_id` does not. No single member of this list is the
 /// one doing the work, which is exactly why none of them may be pruned.
 ///
-/// The ONE that is NOT of this kind, and must not be filed with them, is
-/// `g.organization_id` in the RECURSIVE arm of `closure`. It is the only thing fencing
-/// the organization on the ancestor walk, and `parent_id` is an UNTRUSTED stored pointer
-/// (a group delete DETACHES, so a stored parent may name a row the live invariant never
+/// TWO are NOT of that kind and must not be filed with them.
+///
+/// `g.organization_id` in the RECURSIVE arm of `closure` is the only thing fencing the
+/// organization on the ancestor walk, and `parent_id` is an UNTRUSTED stored pointer (a
+/// group delete DETACHES, so a stored parent may name a row the live invariant never
 /// re-validated, and the column's foreign key is id only). It is observable with NO
 /// write-path bug at all, only a detached pointer reachable through the ordinary delete
-/// path, which is what separates it from the six. Removing it lets a sibling
+/// path, which is what separates it from the five. Removing it lets a sibling
 /// organization's group into the closure, and therefore its name into the group set a
 /// token carries; `the_read_walk_never_crosses_organization_via_a_corrupt_parent` is the
-/// test that holds it in place, and it is the only one of the seven with a test of its
-/// own.
+/// test that holds it in place.
+///
+/// `r.organization_id` on the role row itself in the `effective_roles` arm is the OTHER,
+/// and it CHANGED CATEGORY when issue #98 added the default-role branch. This note used
+/// to file it among the redundant survivors, correctly at the time: while every branch
+/// of the arm was an `IN` subquery carrying its own `mr.organization_id` or
+/// `gr.organization_id`, no role of a sibling organization could reach the arm for this
+/// predicate to refuse. The DEFAULT branch carries no such subquery. `r.is_default AND
+/// EXISTS (SELECT 1 FROM membership)` says nothing whatever about WHICH organization the
+/// role belongs to, so `r.organization_id` is now the only thing standing between a
+/// caller and the default role of EVERY OTHER organization in the same environment.
+///
+/// That makes it the STRONGEST of the seven rather than the weakest, and this is the
+/// part to keep in mind if the arm is ever refactored: it is observable with no corrupt
+/// row and no detached pointer, only two organizations in one environment that have each
+/// designated a default role, which is the ORDINARY configuration this feature exists to
+/// produce. `a_default_role_never_crosses_into_a_sibling_organization` in
+/// `crates/ironauth-store/tests/org_default_role.rs` is the test that kills it, and it
+/// was measured: with that predicate removed the test reports the sibling's default role
+/// in this organization's effective set.
+///
+/// It also turns out to be the BACKSTOP under the arm's own `r.tenant_id` and
+/// `r.environment_id`, which is worth recording so nobody spends an afternoon trying to
+/// kill those two. Dropping either alone leaves every test green, and dropping BOTH
+/// together leaves every test green as well, so they are not each other's backstop: an
+/// organization id is globally unique and embeds its own scope, so `r.organization_id =
+/// $3` already excludes every row of another tenant or another environment, with the
+/// forced row-level-security policy underneath that. Dropping all THREE is KILLED, by
+/// the same sibling-organization test, which is what says the fence is real rather than
+/// merely untested. The scope pair is kept for the reason the module-wide convention
+/// keeps every such pair: a statement should be correct on its own terms rather than on
+/// the strength of another column's key.
 ///
 /// The count is a tally over THIS statement, and it is worth saying so out loud, because
 /// a projection over it repeats the same predicates. [`EFFECTIVE_ROLE_GRANTS_TAIL`]
-/// carries `r.organization_id` and `mr.organization_id` in its direct branch and
-/// `r.organization_id` and `gr.organization_id` in its group branch;
+/// carries `r.organization_id` and `mr.organization_id` in its direct branch,
+/// `r.organization_id` and `gr.organization_id` in its group branch, and
+/// `r.organization_id` again in its default branch;
 /// [`EFFECTIVE_PERMISSION_SLUGS_TAIL`] carries exactly ONE, `rp.organization_id`, and
 /// its `permissions` scan carries none at all because that table has no organization
-/// column to fence. All five of those are the same layer, kept for the same reason, and
-/// they are simply not part of the SIX counted here. Each of those tails carries its own
-/// note: the grants tail on the two predicates in it that are NOT of this kind, and the
-/// permission tail on the corruption shape its one copy is the only thing that catches.
+/// column to fence. All SIX of those are outside the count kept here, which is a tally
+/// over this statement alone. Five of the six are the same redundant layer; the sixth,
+/// the copy in the grants tail's DEFAULT branch, is load bearing for the same reason its
+/// counterpart in the arm is, and that tail's own note says so. Each of those tails
+/// carries such a note: the grants tail on the predicates in it that are NOT of the
+/// redundant kind, and the permission tail on the corruption shape its one copy is the
+/// only thing that catches.
 ///
 /// # The liveness filters are not redundant either
 ///
 /// `r.deleted_at IS NULL` in the `effective_roles` arm: a role can be soft-deleted while
-/// its assignment rows stay live, which is the ordinary state after a role delete.
+/// its assignment rows stay live, which is the ordinary state after a role delete. For
+/// the DEFAULT branch it carries strictly more weight, because there is no assignment
+/// row there to soft-delete instead: a deleted role keeps its `is_default` value (0093's
+/// section (3) says why nothing clears it), so this predicate is the WHOLE of how
+/// deleting the default role stops it resolving. `deleting_the_default_role_stops_it_resolving`
+/// in `crates/ironauth-store/tests/org_default_role.rs` is what says so, and it reads the
+/// flag back through the owner pool afterwards to prove the row still carries it.
 ///
 /// `gr.deleted_at IS NULL` in that arm's group-grant subquery has no second layer behind
 /// it at all, and its removal is observable in an entirely ordinary state rather than in
@@ -34038,13 +34154,14 @@ const EFFECTIVE_CLOSURE_CTE: &str = "WITH RECURSIVE membership AS ( \
                         AND gr.organization_id = $3 AND gr.deleted_at IS NULL \
                         AND gr.group_id IN (SELECT id FROM closure) \
                  ) \
+              OR (r.is_default AND EXISTS (SELECT 1 FROM membership)) \
             ) \
      ) ";
 
 /// The projection [`OrgGroupRepo::effective_roles`] runs over
 /// [`EFFECTIVE_CLOSURE_CTE`]: the slugs of the `effective_roles` arm, which is every
-/// LIVE role of the organization granted either DIRECTLY to the membership or to any
-/// group in the ancestor closure.
+/// LIVE role of the organization granted DIRECTLY to the membership, granted to any
+/// group in the ancestor closure, or designated the organization's DEFAULT role.
 ///
 /// This is a PROJECTION and nothing else, deliberately. Point 5 of
 /// [`EFFECTIVE_CLOSURE_CTE`] holds the whole definition of which roles a membership
@@ -34081,30 +34198,58 @@ const EFFECTIVE_GROUP_SLUGS_TAIL: &str = "SELECT DISTINCT slug AS slug FROM clos
 /// [`EFFECTIVE_CLOSURE_CTE`]: the same live roles [`EFFECTIVE_ROLE_SLUGS_TAIL`]
 /// resolves, but one row per GRANT PATH and carrying which path it is.
 ///
-/// # Why this is a UNION ALL of two branches rather than a read of `effective_roles`
+/// # Why this is a UNION ALL of three branches rather than a read of `effective_roles`
 ///
-/// The `effective_roles` arm of [`EFFECTIVE_CLOSURE_CTE`] collapses the two grant kinds
-/// into one `org_roles` scan under `OR`, because it answers "which roles" and a role
-/// reachable twice must appear once; [`EFFECTIVE_ROLE_SLUGS_TAIL`] is a bare projection
-/// of it. This tail answers the DIFFERENT question "by which paths", so the two kinds
-/// have to stay separable and each group that carries a grant has to stay attributable,
-/// which needs the assignment rows themselves and not a set of role ids. The branches
-/// are otherwise the SAME predicates over the SAME live rows, so the distinct slugs
-/// this returns are exactly the set that arm yields.
+/// The `effective_roles` arm of [`EFFECTIVE_CLOSURE_CTE`] collapses the three ways a
+/// role is held into one `org_roles` scan under `OR`, because it answers "which roles"
+/// and a role reachable three ways must appear once; [`EFFECTIVE_ROLE_SLUGS_TAIL`] is a
+/// bare projection of it. This tail answers the DIFFERENT question "by which paths", so
+/// the kinds have to stay separable and each group that carries a grant has to stay
+/// attributable, which needs the assignment rows themselves and not a set of role ids.
+/// The branches are otherwise the SAME predicates over the SAME live rows, so the
+/// distinct slugs this returns are exactly the set that arm yields. The DEFAULT branch
+/// here is a restatement of the arm's default branch, `r.is_default AND EXISTS (SELECT 1
+/// FROM membership)`, character for character in what it fences.
 ///
-/// The DIRECT branch projects a literal `NULL` group. A NULL is the encoding of
-/// "no group was involved", not of "unknown": `EffectiveRoleSource::Direct` is what
-/// the decode turns it into, so the ambiguity never escapes the store.
+/// # The `source` column, and why the group id can no longer carry the discrimination
+///
+/// Each branch projects a `source` LITERAL (`direct`, `group`, `default`), and the
+/// decode in [`OrgGroupRepo::effective_role_grants`] matches on it. That replaced an
+/// encoding in which a NULL `via_group_id` MEANT direct, which was unambiguous while
+/// there were two branches and became ambiguous the moment issue #98 added a third that
+/// also has no group: a NULL would then have meant "direct or default", and the console
+/// would have had to report a role nobody granted as a direct grant nobody can find.
+/// The literals are projected by the statement rather than read from a column, so the
+/// decode's three arms are exhaustive over everything this tail can return and its
+/// fourth arm is unreachable by construction.
 ///
 /// `gr.group_id IN (SELECT id FROM closure)` is a SEMI-join, so a group the closure
 /// reached by several paths (which `UNION ALL` in the closure can legitimately
 /// produce) still yields ONE row here. `DISTINCT` in each branch is the second layer
 /// under that, and under the partial unique indexes that already forbid two live
-/// assignment rows for one pair.
+/// assignment rows for one pair. The DEFAULT branch needs neither for correctness (one
+/// scan of `org_roles`, and `org_roles_org_default_live_uniq` admits at most one live
+/// default per organization) and carries `DISTINCT` anyway, so the three branches read
+/// alike.
 ///
-/// `ORDER BY slug, via_group_id NULLS FIRST` is a TOTAL order over the result (no two
-/// rows share both columns), so the output is byte-stable across evaluations, and the
-/// direct grant for a slug always precedes its inherited ones.
+/// `ORDER BY slug, source, via_group_id NULLS FIRST` is a TOTAL order over the result
+/// (no two rows share all three columns), so the output is byte-stable across
+/// evaluations. `source` is in the key because `via_group_id` alone stopped separating
+/// the rows when the third branch landed: a role held BOTH directly AND as the default
+/// yields two rows that agree on slug and on a NULL group. Sorting on the source TOKEN
+/// puts `default` first, then `direct`, then `group`, so the property the two-branch
+/// form had (a direct grant precedes its inherited ones) is unchanged and a default
+/// entry precedes both.
+///
+/// The `source` CONJUNCT of that key is an EQUIVALENT MUTANT and saying so is better
+/// than leaving the next reader to find out. Removing it was measured: every test in
+/// `crates/ironauth-store/tests/org_default_role.rs` stays green, because with the
+/// conjunct gone the two tied rows come back in the order the `UNION ALL` produced them
+/// and that happens to be the asserted one. What the conjunct buys is therefore a
+/// GUARANTEE rather than a currently observable value: without it the sort key is
+/// PARTIAL, the tie is broken by a plan detail nothing in this repository pins, and the
+/// byte-stability this constant promises would hold only by luck. Keep it, and do not
+/// read the surviving mutation as evidence that it does nothing.
 ///
 /// # The DIRECT branch's two selectors, and what pins each
 ///
@@ -34132,8 +34277,44 @@ const EFFECTIVE_GROUP_SLUGS_TAIL: &str = "SELECT DISTINCT slug AS slug FROM clos
 /// GROUP, so the group branch's copies below were exercised and these two never
 /// were. That step now stands a SECOND membership beside the first and deletes a
 /// DIRECTLY granted role, and it is what turns red when either one goes.
+///
+/// # The DEFAULT branch's two selectors, and what pins each
+///
+/// This branch joins nothing, so both of the predicates that make it correct are
+/// conjuncts on one `org_roles` scan, and neither has a second layer.
+///
+/// `EXISTS (SELECT 1 FROM membership)` is the whole of its subject fence and the whole
+/// of its organization-LIFECYCLE fence at once. Without it this branch reports the
+/// organization's default role for a user who is not a member, for a user whose
+/// membership is soft-deleted, and for every member of a DISABLED or soft-DELETED
+/// organization, because `membership` is the only thing in this statement that decides
+/// any of those and this branch reads nothing else that depends on them. Point 4 of
+/// [`EFFECTIVE_CLOSURE_CTE`] records that the seed is the only organization-liveness
+/// fence anywhere on the issuance path, so there is nothing behind this.
+///
+/// The seed's `m.state = 'active'` conjunct is deliberately NOT in that list, because
+/// it decides nothing today and claiming otherwise would be the false-premise shape
+/// this module keeps being bitten by: `org_memberships_state_valid` (migration 0084) is
+/// `CHECK (state IN ('active'))`, so no path can write a row that predicate would
+/// exclude. It is headroom for a wider lifecycle set, and it is an unreachable mutant
+/// rather than an untested one.
+///
+/// `r.organization_id = $3` is the whole of its organization-IDENTITY fence, and unlike
+/// the copies in the two branches above it is NOT redundant: those carry an
+/// `mr.organization_id` or a `gr.organization_id` beside them and this one has no
+/// companion at all. Removing it reports the default role of every OTHER organization
+/// in the environment. The census in [`EFFECTIVE_CLOSURE_CTE`] files the arm's matching
+/// copy the same way and for the same reason.
+///
+/// `a_non_member_never_receives_the_default_role`,
+/// `a_disabled_organization_never_resolves_its_default_role`,
+/// `a_soft_deleted_organization_never_resolves_its_default_role_either`, and
+/// `a_default_role_never_crosses_into_a_sibling_organization` in
+/// `crates/ironauth-store/tests/org_default_role.rs` assert over the provenance read as
+/// well as over the slug set, so each of them kills the copy in this tail as well as
+/// the copy in the arm.
 const EFFECTIVE_ROLE_GRANTS_TAIL: &str = "SELECT DISTINCT r.slug AS slug, \
-            NULL::text AS via_group_id \
+            'direct'::text AS source, NULL::text AS via_group_id \
        FROM org_roles r \
        JOIN org_membership_roles mr ON mr.role_id = r.id \
        JOIN membership mb ON mb.id = mr.membership_id \
@@ -34142,7 +34323,8 @@ const EFFECTIVE_ROLE_GRANTS_TAIL: &str = "SELECT DISTINCT r.slug AS slug, \
         AND mr.tenant_id = $1 AND mr.environment_id = $2 \
         AND mr.organization_id = $3 AND mr.deleted_at IS NULL \
       UNION ALL \
-     SELECT DISTINCT r.slug AS slug, gr.group_id AS via_group_id \
+     SELECT DISTINCT r.slug AS slug, \
+            'group'::text AS source, gr.group_id AS via_group_id \
        FROM org_roles r \
        JOIN org_group_roles gr ON gr.role_id = r.id \
       WHERE r.tenant_id = $1 AND r.environment_id = $2 \
@@ -34150,7 +34332,14 @@ const EFFECTIVE_ROLE_GRANTS_TAIL: &str = "SELECT DISTINCT r.slug AS slug, \
         AND gr.tenant_id = $1 AND gr.environment_id = $2 \
         AND gr.organization_id = $3 AND gr.deleted_at IS NULL \
         AND gr.group_id IN (SELECT id FROM closure) \
-      ORDER BY slug, via_group_id NULLS FIRST";
+      UNION ALL \
+     SELECT DISTINCT r.slug AS slug, \
+            'default'::text AS source, NULL::text AS via_group_id \
+       FROM org_roles r \
+      WHERE r.tenant_id = $1 AND r.environment_id = $2 \
+        AND r.organization_id = $3 AND r.deleted_at IS NULL \
+        AND r.is_default AND EXISTS (SELECT 1 FROM membership) \
+      ORDER BY slug, source, via_group_id NULLS FIRST";
 
 /// The projection [`OrgGroupRepo::effective_permissions`] runs over
 /// [`EFFECTIVE_CLOSURE_CTE`] (issue #98): the slugs of every LIVE permission carried
@@ -34226,8 +34415,8 @@ const EFFECTIVE_ROLE_GRANTS_TAIL: &str = "SELECT DISTINCT r.slug AS slug, \
 ///
 /// This tail adds exactly ONE `organization_id` predicate to the tally
 /// [`EFFECTIVE_CLOSURE_CTE`] keeps, and it is `rp.organization_id`. It belongs to the
-/// same layer as the SIX counted there and is not part of that count, which is a
-/// tally over that statement alone.
+/// same layer as the FIVE mutually redundant survivors counted there and is not part of
+/// that count, which is a tally over that statement alone.
 ///
 /// It is redundant on data the write path can produce: `ActingOrgRolePermissionRepo`
 /// resolves the role as live IN the organization it then stamps onto the row, so a
@@ -34245,9 +34434,15 @@ const EFFECTIVE_ROLE_GRANTS_TAIL: &str = "SELECT DISTINCT r.slug AS slug, \
 /// worth a sentence, because it is easy to credit the wrong predicate with it. Read from
 /// the organization that does NOT hold that role, what refuses it is the arm's two GRANT
 /// SUBQUERIES yielding no such role at all, not `r.organization_id`; that fence would
-/// refuse it too, but it is the redundant second refusal, and dropping it leaves the
-/// whole of `effective_permissions.rs` green. Read from the organization whose member
-/// DOES hold the role, `rp.organization_id` is again the only thing that decides.
+/// refuse it too, but it is the second refusal HERE, and dropping it leaves the whole of
+/// `effective_permissions.rs` green. Read that measurement narrowly. It says this
+/// corruption shape does not exercise `r.organization_id`; it does NOT say that
+/// predicate is redundant, which stopped being true when issue #98's default-role branch
+/// landed with no grant subquery to stand beside it. The census in
+/// [`EFFECTIVE_CLOSURE_CTE`] now files that copy among the predicates that are load
+/// bearing, and `a_default_role_never_crosses_into_a_sibling_organization` is what kills
+/// it. Read from the organization whose member DOES hold the role,
+/// `rp.organization_id` is again the only thing that decides.
 ///
 /// `permissions` contributes NO copy, and its absence is not a gap. That table is
 /// scoped to exactly `(tenant, environment)`; it carries no `organization_id` column

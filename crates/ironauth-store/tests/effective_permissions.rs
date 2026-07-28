@@ -45,9 +45,11 @@
 //!   an entirely different reason, which is that the subject HOLDS NO SUCH ROLE, so
 //!   the `effective_roles` arm's two grant subqueries never put it in the arm to map
 //!   from. That arm's `r.organization_id` fence would refuse the same row, but it is a
-//!   redundant SECOND refusal here and nothing in this file kills it, which is why the
-//!   census in `EFFECTIVE_CLOSURE_CTE` still counts it among the six mutually
-//!   redundant survivors.
+//!   SECOND refusal here and nothing in this file kills it. That is a statement about
+//!   this file and not about the predicate: `org_default_role.rs` DOES kill it, because
+//!   the default-role branch reaches `org_roles` with no grant subquery beside it, and
+//!   the census in `EFFECTIVE_CLOSURE_CTE` files it among the load-bearing predicates
+//!   for that reason.
 //! * SCOPE fencing, with the sharpest victim: a scope differing from the caller's in
 //!   the ENVIRONMENT ALONE, holding the same slugs. `seed_scope` mints a NEW TENANT on
 //!   every call, so a probe between two seeded scopes is decided by the tenant half
@@ -1500,11 +1502,12 @@ async fn the_projection_never_crosses_organization_via_a_corrupt_mapping_row() {
     // organization predicate: alpha's membership has no `org_membership_roles` row
     // naming beta's role, and this fixture stands up no groups at all, so both
     // subqueries come back empty and beta's role is never in the arm to map from. The
-    // arm's `r.organization_id` fence would refuse the row as well, but here it is a
-    // REDUNDANT second refusal, and dropping it leaves every test in this file green,
-    // which is why the census in `EFFECTIVE_CLOSURE_CTE` still files it among the six
-    // mutually redundant survivors and still calls the recursive arm's
-    // `g.organization_id` the only one of the seven with a test of its own.
+    // arm's `r.organization_id` fence would refuse the row as well, but here it is the
+    // SECOND refusal, and dropping it leaves every test in this file green. That is a
+    // fact about this file, not about the predicate: since issue #98's default-role
+    // branch reaches `org_roles` with no grant subquery beside it, that copy is load
+    // bearing, and `a_default_role_never_crosses_into_a_sibling_organization` in
+    // `org_default_role.rs` is the test that kills it.
     //
     // Read from beta, whose member DOES hold that role, `rp.organization_id` refuses it
     // instead, and THAT one is load bearing. The same corrupt row, two readers, two
