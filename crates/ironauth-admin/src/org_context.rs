@@ -25,6 +25,23 @@
 //! #97 diff for no behavior change. The two copies there are byte-identical to
 //! these and should be folded in whenever that file is next touched.
 //!
+//! # One caller here is NOT nested under an organization
+//!
+//! The permission vocabulary (issue #98) is scoped to the ENVIRONMENT: migration
+//! 0091 gives `permissions` no `organization_id`, so its row-level-security policy
+//! is the complete fence and there is no parent organization to resolve.
+//! `permissions.rs` therefore calls [`resolve_scope`] and stops, and it addresses a
+//! row through [`parse_permission_id`] and [`require_live_permission`] below.
+//!
+//! It lives here anyway, and the reason is the paragraph above rather than the
+//! module's name: [`resolve_scope`] is the ONE copy of the
+//! [`Principal::require_environment`] call that confines a management key, and the
+//! whole point of folding the copies together was that a second copy is a second
+//! thing to delete and a second thing to test. An environment-scoped module writing
+//! its own would be exactly that. Several older environment-scoped modules do carry
+//! private copies of the same two lines; those predate this module and are noted
+//! rather than claimed to be folded in.
+//!
 //! # A disabled organization is LIVE here
 //!
 //! [`resolve_live_org`] treats a DISABLED (not deleted) organization as reachable,
@@ -36,7 +53,8 @@
 //! that it reads as a decision rather than an accident.
 
 use ironauth_store::{
-    ActorRef, OrgGroupId, OrgMembershipId, OrgMembershipRecord, OrgRoleId, OrganizationId, Scope,
+    ActorRef, OrgGroupId, OrgMembershipId, OrgMembershipRecord, OrgRoleId, OrganizationId,
+    PermissionId, PermissionRecord, Scope,
 };
 
 use crate::auth::Principal;
@@ -149,6 +167,81 @@ pub fn parse_membership_id(
         .management()
         .org_memberships(scope)
         .parse_id(membership_id)?)
+}
+
+/// Verify the scope's ENVIRONMENT exists and is LIVE, for a write whose table has a
+/// foreign key to `environments`.
+///
+/// [`resolve_scope`] parses the two segments and authorizes the credential; it does
+/// NOT prove the environment row exists, because most endpoints never need it. A
+/// write does: a well-formed identifier naming an environment that was never created
+/// (or that has been deleted) reaches the insert, violates the foreign key, and
+/// surfaces as an opaque 500 for an input the caller controls. This turns that into
+/// the uniform not-found, which is the same answer a MALFORMED environment segment
+/// already gets, so a caller cannot tell the two apart.
+///
+/// # Errors
+///
+/// [`ApiError::NotFound`] if the environment is absent or soft-deleted.
+pub async fn require_live_environment(state: &AdminState, scope: &Scope) -> Result<(), ApiError> {
+    state
+        .store()
+        .management()
+        .environments(scope.tenant())
+        .get(&scope.environment())
+        .await?;
+    Ok(())
+}
+
+/// Parse an untrusted permission id in scope, under the same uniform not-found as
+/// [`parse_group_id`].
+///
+/// Unlike the three parsers above, this one addresses a row that hangs off the
+/// ENVIRONMENT rather than off an organization, so parsing in scope is the whole of
+/// what an address needs to prove here. Whether the id names a LIVE permission is
+/// answered either by [`require_live_permission`] or, on a write, by the store
+/// inside the write transaction.
+///
+/// # Errors
+///
+/// [`ApiError::NotFound`] if malformed or out of scope.
+pub fn parse_permission_id(
+    state: &AdminState,
+    scope: Scope,
+    permission_id: &str,
+) -> Result<PermissionId, ApiError> {
+    Ok(state
+        .store()
+        .management()
+        .permissions(scope)
+        .parse_id(permission_id)?)
+}
+
+/// Resolve a permission as a LIVE permission of THIS environment, returning the
+/// stored record.
+///
+/// The four addressing failures collapse to one answer: a malformed id and one
+/// minted in another `(tenant, environment)` fail to parse in scope, and an absent
+/// or soft-deleted one is the repository's own not-found. A caller therefore cannot
+/// tell "never existed" from "deleted" from "belongs to another environment" from
+/// "nonsense", which is what stops the vocabulary from being an existence oracle
+/// over a sibling environment's capability names.
+///
+/// # Errors
+///
+/// [`ApiError::NotFound`] if the id is malformed, out of scope, absent, or deleted.
+pub async fn require_live_permission(
+    state: &AdminState,
+    scope: Scope,
+    permission_id: &str,
+) -> Result<PermissionRecord, ApiError> {
+    let id = parse_permission_id(state, scope, permission_id)?;
+    Ok(state
+        .store()
+        .management()
+        .permissions(scope)
+        .get(&id)
+        .await?)
 }
 
 /// Resolve a group as a LIVE group of THIS organization: the cross-parent guard a

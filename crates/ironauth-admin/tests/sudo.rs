@@ -71,6 +71,10 @@ fn org_groups_path(tenant: &str, environment: &str, org: &str) -> String {
     format!("/v1/tenants/{tenant}/environments/{environment}/organizations/{org}/groups")
 }
 
+fn permissions_path(tenant: &str, environment: &str) -> String {
+    format!("/v1/tenants/{tenant}/environments/{environment}/permissions")
+}
+
 /// The `id` of a JSON response body.
 fn id_of(response: &str) -> String {
     serde_json::from_str::<serde_json::Value>(response).expect("json")["id"]
@@ -423,6 +427,99 @@ async fn an_org_role_or_group_write_is_sudo_gated() {
         StatusCode::NO_CONTENT,
         "elevated role delete: {resp}"
     );
+}
+
+/// The permission VOCABULARY mutations (issue #98, PR 7) are sudo gated exactly like
+/// every other environment-scoped mutator. Two route entries carry THREE mutating
+/// handlers (define, relabel, delete), so there are three `require_fresh_privilege`
+/// call sites, and every one is challenged here with the elevation window lapsed,
+/// writes nothing, and succeeds after a fresh elevation. Without this row a refactor
+/// could drop the gate from `delete_permission` and let the stolen-cookie case this
+/// file calls acceptance-critical destroy an environment's capability names with no
+/// re-authentication, with CI still green.
+///
+/// The two READS (list and get) are deliberately NOT gated and are exercised below
+/// with the window lapsed, because sudo gates mutations only; asserting that keeps a
+/// future "gate everything" refactor from silently breaking the console's ability to
+/// show an operator what they are about to change. They are also what makes "wrote
+/// nothing" observable without elevating first.
+///
+/// One test rather than three: the challenged half and the elevated half have to run
+/// against the SAME seeded rows for "wrote nothing" to mean anything.
+#[tokio::test]
+async fn a_permission_vocabulary_write_is_sudo_gated() {
+    let (harness, clock) = Harness::start_with_sudo(600).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k1").await;
+    let elevate = elevate_path(&tenant, &env);
+    let base = permissions_path(&tenant, &env);
+
+    // Seed inside an open window (defining a permission is itself a gated mutation),
+    // then let it lapse so the probes below run against the exact state the gate is
+    // supposed to protect.
+    let (status, _, body) = harness.post(&elevate, "e1", "{}").await;
+    assert_eq!(status, StatusCode::OK, "elevate: {body}");
+    let seed_body =
+        serde_json::json!({ "slug": "seeded.read", "display_name": "Label" }).to_string();
+    let (status, _, response) = harness.post(&base, "p-seed", &seed_body).await;
+    assert_eq!(status, StatusCode::CREATED, "seed permission: {response}");
+    let permission = id_of(&response);
+    let path = format!("{base}/{permission}");
+
+    clock.advance(Duration::from_secs(601));
+
+    let create_body =
+        serde_json::json!({ "slug": "fresh.read", "display_name": "Label" }).to_string();
+    let relabel_body = serde_json::json!({ "display_name": "Pwned" }).to_string();
+
+    // --- With the window lapsed, every mutating endpoint is challenged. ---
+    let (status, _, resp) = harness.post(&base, "p-1", &create_body).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "create_permission is challenged without an elevation: {resp}"
+    );
+    assert!(resp.contains("insufficient_user_authentication"), "{resp}");
+    let (status, _, resp) = harness.patch(&path, &relabel_body).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "update_permission is challenged without an elevation: {resp}"
+    );
+    assert!(resp.contains("insufficient_user_authentication"), "{resp}");
+    let (status, _, resp) = harness.delete(&path).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "delete_permission is challenged without an elevation: {resp}"
+    );
+    assert!(resp.contains("insufficient_user_authentication"), "{resp}");
+
+    // Nothing executed: no row was added, none removed, none relabeled. Reads are
+    // ungated, so this is observable without elevating first.
+    let (status, _, listed) = harness.get(&base).await;
+    assert_eq!(status, StatusCode::OK, "the list is ungated: {listed}");
+    assert_eq!(
+        item_count(&listed),
+        1,
+        "the challenged create and delete wrote nothing: {listed}"
+    );
+    let (status, _, stored) = harness.get(&path).await;
+    assert_eq!(status, StatusCode::OK, "the get is ungated: {stored}");
+    assert!(
+        stored.contains("\"display_name\":\"Label\""),
+        "the challenged relabel wrote nothing: {stored}"
+    );
+
+    // --- After a fresh elevation, every one of the same requests succeeds. ---
+    let (status, _, body) = harness.post(&elevate, "e2", "{}").await;
+    assert_eq!(status, StatusCode::OK, "re-elevate: {body}");
+
+    let (status, _, resp) = harness.post(&base, "p-2", &create_body).await;
+    assert_eq!(status, StatusCode::CREATED, "elevated create: {resp}");
+    let (status, _, resp) = harness.patch(&path, &relabel_body).await;
+    assert_eq!(status, StatusCode::OK, "elevated relabel: {resp}");
+    let (status, _, resp) = harness.delete(&path).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "elevated delete: {resp}");
 }
 
 /// The organization group-MEMBER and role-ASSIGNMENT mutations (issue #97, PR 5) are

@@ -74,6 +74,14 @@ use crate::views::{
                                            in M10 (an immutable slug an authorization decision \
                                            keys on, plus a mutable label); what it grants is \
                                            issue #98. Uncapped in number by covenant"),
+        (name = "permissions", description = "The permission vocabulary (issue #98): the named \
+                                             API capabilities an ENVIRONMENT defines. Scoped to \
+                                             the environment and NOT to an organization, because \
+                                             a permission names a capability and one string \
+                                             cannot mean different things to two organizations \
+                                             calling the same API; which permissions a ROLE \
+                                             grants is per organization. The slug and the kind \
+                                             are immutable. Uncapped in number by covenant"),
         (name = "org-groups", description = "Organization groups (issue #97): first-class, \
                                             per-organization named groups holding a position in \
                                             that organization's group forest, with a dedicated \
@@ -161,6 +169,11 @@ use crate::views::{
         crate::memberships::create_membership,
         crate::memberships::list_memberships,
         crate::memberships::delete_membership,
+        crate::permissions::create_permission,
+        crate::permissions::list_permissions,
+        crate::permissions::get_permission,
+        crate::permissions::update_permission,
+        crate::permissions::delete_permission,
         crate::org_roles::create_org_role,
         crate::org_roles::list_org_roles,
         crate::org_roles::get_org_role,
@@ -286,6 +299,10 @@ use crate::views::{
         MembershipView,
         MembershipList,
         CreateMembershipRequest,
+        crate::permissions::PermissionView,
+        crate::permissions::PermissionList,
+        crate::permissions::CreatePermissionRequest,
+        crate::permissions::UpdatePermissionRequest,
         crate::org_roles::OrgRoleView,
         crate::org_roles::OrgRoleList,
         crate::org_roles::CreateOrgRoleRequest,
