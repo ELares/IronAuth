@@ -351,6 +351,24 @@ async fn a_patch_naming_the_immutable_slug_or_kind_is_refused_at_the_edge() {
             "kind",
             serde_json::json!({ "display_name": "Pwned", "kind": "entitlement" }),
         ),
+        // Named with an EXPLICIT NULL. This is the case a value test cannot see:
+        // under `#[serde(default)]` a plain `Option` maps both an absent key and a
+        // key carrying `null` to `None`, so `is_some()` waves this body through, the
+        // handler answers 200, and a caller who wrote `"slug": null` is told their
+        // request about the slug succeeded. That IS the silent ignore this rule
+        // exists to prevent, so presence and not value is what must be refused.
+        ("slug", serde_json::json!({ "slug": null })),
+        ("kind", serde_json::json!({ "kind": null })),
+        // The null smuggled in behind a legitimate edit, which is how the value test
+        // was observably wrong: it returned 200 AND applied the display name.
+        (
+            "slug",
+            serde_json::json!({ "display_name": "Pwned", "slug": null }),
+        ),
+        (
+            "kind",
+            serde_json::json!({ "display_name": "Pwned", "kind": null }),
+        ),
     ] {
         let (status, _, response) = h.patch(&path, &body.to_string()).await;
         assert_eq!(
@@ -668,6 +686,12 @@ async fn every_addressing_failure_is_the_uniform_not_found_byte_for_byte() {
     {
         for (shape, request) in [
             ("immutable field", r#"{"slug":"pwned.read"}"#),
+            // The immutable field named with an explicit NULL. It belongs here for
+            // the same reason and it is the sharper case of the two: it is refused
+            // on PRESENCE alone, so the moment the body ran first it would separate
+            // "not yours" from "does not exist" for a request that asks for nothing
+            // at all. The address resolving first is what keeps it a 404.
+            ("immutable field, null", r#"{"slug":null}"#),
             ("unparseable", "not json at all"),
         ] {
             let (status, _, body) = h.patch(&format!("{base_one}/{probe}"), request).await;

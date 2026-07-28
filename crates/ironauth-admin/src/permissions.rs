@@ -51,11 +51,20 @@
 //!     [`ironauth_store::ActingPermissionRepo::update`] takes a display name and
 //!     metadata and has no parameter for either immutable column.
 //!   * A request that NAMES either one is refused at the edge as a typed 400 that
-//!     says which field and why, instead of being silently ignored. A permission
-//!     slug is a direct authorization input, so a caller who believes they renamed
-//!     one and did not is worse off than a caller who is told no. This is a
-//!     deliberate departure from [`crate::org_roles`], whose `UpdateOrgRoleRequest`
-//!     simply has no `slug` field and lets serde drop the value.
+//!     says which field and why, instead of being silently ignored. The test is
+//!     PRESENCE of the key and never its value, so `"slug": null` is refused
+//!     exactly like `"slug": "other.name"`: a caller who writes it believes they
+//!     said something about the slug, so a 200 would be the silent ignore this
+//!     rule exists to prevent. A permission slug is a direct authorization input,
+//!     so a caller who believes they renamed one and did not is worse off than a
+//!     caller who is told no. This is a deliberate departure from
+//!     [`crate::org_roles`], whose `UpdateOrgRoleRequest` simply has no `slug`
+//!     field and lets serde drop the value.
+//!
+//!     Presence is not something serde's plain `Option` can report: under
+//!     `#[serde(default)]` an ABSENT key and a key carrying `null` both arrive as
+//!     `None`. Both immutable fields therefore deserialize through
+//!     `named_field`, which keeps the two apart.
 //!
 //! # The `kind` discriminator
 //!
@@ -163,6 +172,38 @@ pub struct CreatePermissionRequest {
     pub metadata: Option<serde_json::Value>,
 }
 
+/// Deserialize a body field so that its PRESENCE survives, whatever value it
+/// carried.
+///
+/// The outer [`Option`] answers "was the key in the object at all", which is the
+/// question the immutable-field refusal actually asks; the inner one carries the
+/// JSON value, so `null` stays distinguishable from a string and a non-string
+/// still fails to parse exactly as before. serde's own `Option` cannot report
+/// this: with `#[serde(default)]` an absent key yields `None` because the default
+/// runs, and a key carrying `null` yields the same `None` because that is how
+/// `Option` deserializes a null, so the two collapse. `#[serde(default,
+/// deserialize_with = "named_field")]` splits them because the default runs ONLY
+/// for an absent key and this function runs only when one was present, wrapping
+/// whatever it found in `Some`.
+///
+/// # Errors
+///
+/// Whatever the inner [`Option<String>`] deserialization reports: a `slug` that is
+/// present but is not a string or null is still a parse failure, unchanged by this
+/// wrapper.
+#[allow(
+    clippy::option_option,
+    reason = "the nesting is the point: the outer Option is key PRESENCE and the \
+              inner one is the JSON value, and pedantic's objection (that the two \
+              levels usually mean the same thing) is exactly what does not hold here"
+)]
+fn named_field<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
+}
+
 /// The body to relabel a permission (RFC 7396 style partial edit: an omitted field
 /// is left unchanged).
 ///
@@ -171,6 +212,12 @@ pub struct CreatePermissionRequest {
 /// store: both are absent from the control role's `UPDATE` grant in migration 0091,
 /// so a statement naming one would be refused as SQLSTATE 42501 and reach the
 /// caller as an opaque 500.
+#[allow(
+    clippy::option_option,
+    reason = "see `named_field`: on the two immutable fields the outer Option is \
+              key PRESENCE and the inner one is the value, and only the outer one \
+              is ever read"
+)]
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct UpdatePermissionRequest {
     /// A new human-facing label. Omitted leaves it unchanged.
@@ -180,15 +227,18 @@ pub struct UpdatePermissionRequest {
     /// Omitted leaves it unchanged.
     #[serde(default)]
     pub metadata: Option<serde_json::Value>,
-    /// REFUSED if present: the stable name is immutable. A permission slug is a
-    /// direct authorization input, so a rename under live mappings would silently
-    /// repoint every grant that names it.
-    #[serde(default)]
-    pub slug: Option<String>,
-    /// REFUSED if present: the discriminator is immutable. Reclassifying a live row
-    /// would change which resolution projections select it.
-    #[serde(default)]
-    pub kind: Option<String>,
+    /// REFUSED if the key is present AT ALL, `null` included: the stable name is
+    /// immutable. A permission slug is a direct authorization input, so a rename
+    /// under live mappings would silently repoint every grant that names it.
+    #[serde(default, deserialize_with = "named_field")]
+    #[schema(value_type = Option<String>)]
+    pub slug: Option<Option<String>>,
+    /// REFUSED if the key is present AT ALL, `null` included: the discriminator is
+    /// immutable. Reclassifying a live row would change which resolution
+    /// projections select it.
+    #[serde(default, deserialize_with = "named_field")]
+    #[schema(value_type = Option<String>)]
+    pub kind: Option<Option<String>>,
 }
 
 /// A page of permissions.
@@ -205,6 +255,12 @@ pub struct PermissionList {
 
 /// Refuse a partial edit that names an immutable column, naming the field and the
 /// rule.
+///
+/// The test is PRESENCE and never value: both fields arrive through `named_field`,
+/// so `Some(None)` is a key carrying `null` and is refused exactly like
+/// `Some(Some(value))`. A caller who writes `"slug": null` is saying something
+/// about the slug, and answering 200 would be the silent ignore this refusal
+/// exists to prevent.
 ///
 /// This runs AFTER the target has resolved, so a caller who cannot address the
 /// permission at all still gets the uniform not-found and learns nothing from the

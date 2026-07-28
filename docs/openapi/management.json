@@ -17366,7 +17366,7 @@
               "string",
               "null"
             ],
-            "description": "REFUSED if present: the discriminator is immutable. Reclassifying a live row\nwould change which resolution projections select it."
+            "description": "REFUSED if the key is present AT ALL, `null` included: the discriminator is\nimmutable. Reclassifying a live row would change which resolution\nprojections select it."
           },
           "metadata": {
             "description": "Replacement free-form metadata (a whole-document replace, not a merge).\nOmitted leaves it unchanged."
@@ -17376,7 +17376,7 @@
               "string",
               "null"
             ],
-            "description": "REFUSED if present: the stable name is immutable. A permission slug is a\ndirect authorization input, so a rename under live mappings would silently\nrepoint every grant that names it."
+            "description": "REFUSED if the key is present AT ALL, `null` included: the stable name is\nimmutable. A permission slug is a direct authorization input, so a rename\nunder live mappings would silently repoint every grant that names it."
           }
         }
       },

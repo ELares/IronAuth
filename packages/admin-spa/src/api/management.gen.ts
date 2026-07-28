@@ -4264,8 +4264,9 @@ export interface components {
             /** @description A new human-facing label. Omitted leaves it unchanged. */
             display_name?: string | null;
             /**
-             * @description REFUSED if present: the discriminator is immutable. Reclassifying a live row
-             *     would change which resolution projections select it.
+             * @description REFUSED if the key is present AT ALL, `null` included: the discriminator is
+             *     immutable. Reclassifying a live row would change which resolution
+             *     projections select it.
              */
             kind?: string | null;
             /**
@@ -4274,9 +4275,9 @@ export interface components {
              */
             metadata?: unknown;
             /**
-             * @description REFUSED if present: the stable name is immutable. A permission slug is a
-             *     direct authorization input, so a rename under live mappings would silently
-             *     repoint every grant that names it.
+             * @description REFUSED if the key is present AT ALL, `null` included: the stable name is
+             *     immutable. A permission slug is a direct authorization input, so a rename
+             *     under live mappings would silently repoint every grant that names it.
              */
             slug?: string | null;
         };
