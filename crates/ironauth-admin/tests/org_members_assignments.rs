@@ -1693,6 +1693,67 @@ async fn effective_roles_is_empty_by_default_and_drops_every_withdrawn_path() {
 }
 
 #[tokio::test]
+async fn the_organizations_default_role_reaches_the_view_as_its_own_source() {
+    // The wire half of issue #98's default role. The store reports
+    // `EffectiveRoleSource::Default`; this asserts the view does not flatten it into
+    // `direct`, which is the failure that would matter most here. A role held because
+    // the organization designated it has NO assignment row, so an operator told it is
+    // a direct grant would go looking in `.../memberships/{id}/roles` for something
+    // that is not there and cannot be put there.
+    //
+    // The designation is written with SQL because issue #98's PR 8 is what adds the
+    // management route for it. That is also why this test lives here rather than
+    // waiting: the enum variant and the `source` discriminator ship NOW, and an
+    // untested mapping is one a later refactor can silently invert.
+    let h = Harness::start(50).await;
+    let (tenant, environment) = tenant_env(&h).await;
+    let org = create_org(&h, &tenant, &environment, "k-org").await;
+    let base = org_base(&tenant, &environment, &org);
+    let membership = create_membership(&h, &tenant, &environment, &org, "m@x.test", "k-m").await;
+    let role = create_role(&h, &tenant, &environment, &org, "everyone", "k-r").await;
+    let effective = format!("{base}/memberships/{membership}/effective-roles");
+
+    assert!(
+        effective_roles(&h, &effective).await.is_empty(),
+        "the control: an undesignated role is held by nobody"
+    );
+
+    sqlx::query("UPDATE org_roles SET is_default = true WHERE id = $1")
+        .bind(&role)
+        .execute(h.db().owner_pool())
+        .await
+        .expect("designate the default role");
+
+    assert_eq!(
+        effective_roles(&h, &effective).await,
+        vec![("everyone".to_owned(), "default".to_owned(), None)],
+        "the designation alone puts the role in the view, under its OWN source and \
+         with no via_group_id"
+    );
+
+    // And the two sources stay separable when the SAME role is also granted
+    // directly. This is the assertion a mapping that collapsed Default into Direct
+    // would fail: it would report two entries both reading `direct`, and an operator
+    // who withdrew the grant would see one of them survive with no explanation.
+    let (status, _, response) = h
+        .post(
+            &format!("{base}/memberships/{membership}/roles"),
+            "k-grant",
+            &serde_json::json!({ "role_id": role }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{response}");
+    assert_eq!(
+        effective_roles(&h, &effective).await,
+        vec![
+            ("everyone".to_owned(), "default".to_owned(), None),
+            ("everyone".to_owned(), "direct".to_owned(), None),
+        ],
+        "one entry per PATH, and the two paths are told apart on the wire"
+    );
+}
+
+#[tokio::test]
 async fn disabling_the_organization_empties_the_effective_view_and_enabling_restores_it() {
     // The console side of the coarsest revocation there is. This endpoint's whole
     // contract is "what the NEXT token issuance would carry", and a disabled

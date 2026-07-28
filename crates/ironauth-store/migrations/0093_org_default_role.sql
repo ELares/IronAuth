@@ -1,0 +1,167 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+--
+-- The organization's DEFAULT ROLE (issue #98, milestone M10).
+--
+-- Adds one column, `org_roles.is_default`, and the partial unique index that
+-- makes "at most one default role per organization" structural. Together they
+-- are the whole storage cost of the feature, because the default role is
+-- RESOLVED AT READ and never MATERIALIZED: no membership ever gains a row
+-- because a role is the default.
+--
+-- ---------------------------------------------------------------------------
+-- (1) RESOLVED at read, never materialized. This is the decision of the issue.
+-- ---------------------------------------------------------------------------
+-- The alternative was a hook at every membership-creating and membership-
+-- reviving site writing an `org_membership_roles` row. It was rejected for two
+-- reasons, and the first is a hard one:
+--
+--   * It would require granting `ironauth_app` INSERT on `org_membership_roles`.
+--     The invitation-accept path runs on the DATA plane, and 0089 grants that
+--     role SELECT plus UPDATE (updated_at, deleted_at) there and nothing else,
+--     stating in prose that "the data plane holds no INSERT, so it can never
+--     create an assignment". A materialized default role either fails that
+--     write with SQLSTATE 42501 or makes that shipped sentence false.
+--   * It would need six correct wiring decisions (two branches of
+--     `ActingOrgMembershipRepo::create`, three of `ActingInvitationRepo::accept`
+--     including its already-live-member `Conflict` arm, and the just-in-time
+--     provisioning path of issue #95 that has no consumer yet), two of which
+--     have an ordering constraint against the attachment strip that a revive
+--     performs. A hook wired into only some of them is a silent hole.
+--
+-- Resolving at read has NO wiring points, so it has none to miss, including on
+-- the path that does not exist yet. The union happens in exactly one place: the
+-- `effective_roles` arm of the shared closure statement in repository.rs, which
+-- all four effective-resolution projections read.
+--
+-- Two costs are accepted deliberately and are stated so nobody reports them as
+-- defects:
+--
+--   * The default role does NOT appear in the direct-assignment list
+--     (`GET .../memberships/{id}/roles`), because it is not an assignment. It
+--     appears in the effective-role views and in the token claim. That split is
+--     the one already drawn between "which rows did someone write" and "what
+--     will the next token carry".
+--   * It cannot be removed from ONE member. The answer is a clean no rather
+--     than a removal that the next membership revive would silently undo.
+--
+-- ---------------------------------------------------------------------------
+-- (2) The designation is a FLAG ON THE ROLE, not a POINTER ON THE ORGANIZATION.
+-- ---------------------------------------------------------------------------
+-- `organizations.default_role_id` was the obvious alternative shape. Three
+-- reasons against it, and the third is specific to how this resolution is now
+-- built:
+--
+--   * A role soft-delete would leave that pointer DANGLING. Here a delete
+--     clears the designation by construction, because every read of this column
+--     already filters `deleted_at IS NULL` and the index below is partial over
+--     the same live set. `org_groups.parent_id` is the one dangling pointer
+--     this schema tolerates and it needed a doc paragraph of its own; this
+--     shape needs none.
+--   * `organizations` is a much hotter and more general table, and the
+--     designation belongs to the role vocabulary rather than to the customer
+--     object.
+--   * The resolution reads it from a row it is ALREADY scanning. The
+--     `effective_roles` arm is one indexed scan of `org_roles`, so the default
+--     branch is a predicate on that scan and joins nothing. A pointer on
+--     `organizations` would force that arm to read the ORGANIZATION row, and
+--     the arm's contract (point 4 of EFFECTIVE_CLOSURE_CTE) is that every one
+--     of its branches must reach the subject through the membership seed and
+--     through nothing else, because that seed is the only organization-liveness
+--     fence anywhere on the token-issuance path. A branch that read
+--     `organizations` directly would either duplicate that fence, which the
+--     module forbids, or omit it, which is the exact defect issue #97's PR 6
+--     shipped and then fixed.
+--
+-- ---------------------------------------------------------------------------
+-- (3) At most one live default per organization, structurally.
+-- ---------------------------------------------------------------------------
+-- The partial unique index below carries the invariant. The column name and the
+-- index shape are not invented here: `brands.is_default` with `brands_default_idx`
+-- (0068) is the same flag under the same kind of partial unique index, and
+-- `org_auth_policies_org_live_uniq` (0090) is the same live-set idiom keyed on the
+-- organization. This index is the two of them composed. Its predicate is
+-- `is_default AND deleted_at IS NULL`: `brands` needs no `deleted_at` conjunct
+-- because that table has no soft delete, and `org_roles` does, which is the ONE
+-- difference between the two shapes and is the whole reason this one has two
+-- conjuncts. The `is_default` conjunct is what lets an organization hold many
+-- non-default roles while holding at most one default; without it this would be an
+-- at-most-one-live-role-per-organization index, refusing the second role an
+-- organization ever defines.
+--
+-- The index is a BACKSTOP as well as an invariant: the write path a later PR of
+-- this issue adds clears the current default and sets the new one in ONE
+-- transaction, and this index is what refuses the second writer if two such
+-- requests race.
+--
+-- A soft-deleted role keeps its `is_default` value. It does NOT resolve (every
+-- read filters `deleted_at IS NULL`) and it does NOT occupy the designation
+-- (this index is partial over live rows), so the flag on a dead row is inert in
+-- both directions and needs no clearing pass.
+--
+-- ---------------------------------------------------------------------------
+-- (4) Grants.
+-- ---------------------------------------------------------------------------
+-- The CONTROL plane gains a COLUMN-scoped UPDATE on `is_default` and nothing
+-- else. Designating a default role is a management action on an existing role
+-- row, so it needs no INSERT beyond the one 0086 already grants.
+--
+-- The DATA plane gains NOTHING. It already holds SELECT on `org_roles` from
+-- 0086, which is all the token-issuance resolution needs, and it must not be
+-- able to decide which role every member of an organization holds: that is the
+-- same power as writing its own token claim, and it is exactly the power the
+-- 0089 grant matrix withholds. Sweeping every column of `org_roles` for a
+-- data-plane write grant is what
+-- `the_data_plane_holds_no_column_scoped_write_grant_on_org_roles` does, and it
+-- covers this new column automatically because it enumerates columns rather
+-- than naming them.
+--
+-- ---------------------------------------------------------------------------
+-- (5) The delta vocabulary.
+-- ---------------------------------------------------------------------------
+-- 0086 states three audit actions for this table: `organization.role.create`,
+-- `organization.role.update`, and `organization.role.delete`. Designating a
+-- default role is a FOURTH kind of mutation, and a later PR of this issue adds
+-- `organization.default_role.set` and `organization.default_role.clear` to that
+-- contract, so the delta vocabulary for `org_roles` becomes five actions rather
+-- than three.
+--
+-- Until that PR lands NOTHING writes this column: there is no store writer and
+-- no management route for it, every row reads `false`, and the resolution this
+-- migration enables is therefore inert on real data. That is deliberate, and it
+-- is the same staging every other structural PR of this issue used. ADR 0002 is
+-- binding here as everywhere: which role is the default is always this column,
+-- never a fold over audit events.
+--
+-- Migration safety obligation (see migrate.rs): `org_roles` is an EXISTING
+-- tenant-scoped table that already ENABLEs and FORCEs row-level security,
+-- already carries the (tenant, environment) isolation policy with byte-identical
+-- USING and WITH CHECK, already carries the nonempty-scope CHECK, and is already
+-- registered in scripts/query-audit.sh, so this migration inherits all four and
+-- adds no new obligation. The grant it adds is least-privilege and
+-- COLUMN-scoped (the #31 lesson). Every statement is additive (one new column
+-- with a NOT NULL DEFAULT that Postgres applies without rewriting the table, one
+-- new index, one new grant; no existing column is altered or dropped and no
+-- existing grant is revoked), so this migration is an EXPAND.
+
+-- Whether this role is the organization's DEFAULT role: the role every LIVE
+-- ACTIVE member of the organization holds without an assignment row existing for
+-- it. Read at resolution time by the `effective_roles` arm of the shared
+-- effective-resolution closure; never written by the data plane.
+--
+-- DEFAULT false is the safe value for every row that already exists: an
+-- organization has no default role until an operator designates one.
+ALTER TABLE org_roles ADD COLUMN is_default boolean NOT NULL DEFAULT false;
+
+-- At most one LIVE default role per organization. PARTIAL over exactly the rows
+-- the resolution can see, so a soft-deleted role neither resolves nor holds the
+-- designation, and a fresh role can be designated the moment the old one is
+-- deleted.
+CREATE UNIQUE INDEX org_roles_org_default_live_uniq
+    ON org_roles (tenant_id, environment_id, organization_id)
+    WHERE is_default AND deleted_at IS NULL;
+
+-- The control plane designates and clears. This grant is ADDITIVE to the
+-- column-scoped UPDATE 0086 already granted (display_name, metadata, updated_at,
+-- deleted_at): Postgres unions column grants, so `slug` and every addressing
+-- column stay immutable by GRANT exactly as before.
+GRANT UPDATE (is_default) ON org_roles TO ironauth_control;

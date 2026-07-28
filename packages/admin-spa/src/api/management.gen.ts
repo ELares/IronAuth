@@ -2396,7 +2396,7 @@ export interface components {
          * @description How one role reaches a membership.
          * @enum {string}
          */
-        EffectiveRoleSourceView: "direct" | "group";
+        EffectiveRoleSourceView: "direct" | "group" | "default";
         /**
          * @description One role a membership effectively holds, and the ONE path by which it holds it.
          *
@@ -2411,7 +2411,10 @@ export interface components {
              * @example billing.admin
              */
             slug: string;
-            /** @description Whether this path is a direct grant or an inherited one. */
+            /**
+             * @description Whether this path is a direct grant, an inherited one, or the organization's
+             *     default role.
+             */
             source: components["schemas"]["EffectiveRoleSourceView"];
             /**
              * @description The group that carries the grant (`grp_...`). Present exactly when `source`
@@ -2423,10 +2426,12 @@ export interface components {
         /** @description The resolved roles of one organization membership. */
         EffectiveRolesView: {
             /**
-             * @description Every grant path, ordered by `(slug, via_group_id)` with direct grants
-             *     first, so two reads of unchanged state are byte-identical. NOT deduplicated
-             *     by slug: a role held both directly and through a group appears twice, which
-             *     is what tells an operator that withdrawing one grant will not take it away.
+             * @description Every grant path, ordered by `(slug, source, via_group_id)`, so two reads of
+             *     unchanged state are byte-identical. NOT deduplicated by slug: a role held both
+             *     directly and through a group appears twice, which is what tells an operator
+             *     that withdrawing one grant will not take it away, and a role that is also the
+             *     organization's default appears with a `default` entry that no withdrawal
+             *     touches at all.
              *
              *     An OBJECT wraps this array rather than the array being the whole body, so a
              *     later `permissions` field (issue #98) is a pure addition.

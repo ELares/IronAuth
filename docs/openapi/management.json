@@ -13732,7 +13732,8 @@
         "description": "How one role reaches a membership.",
         "enum": [
           "direct",
-          "group"
+          "group",
+          "default"
         ]
       },
       "EffectiveRoleView": {
@@ -13750,7 +13751,7 @@
           },
           "source": {
             "$ref": "#/components/schemas/EffectiveRoleSourceView",
-            "description": "Whether this path is a direct grant or an inherited one."
+            "description": "Whether this path is a direct grant, an inherited one, or the organization's\ndefault role."
           },
           "via_group_id": {
             "type": [
@@ -13774,7 +13775,7 @@
             "items": {
               "$ref": "#/components/schemas/EffectiveRoleView"
             },
-            "description": "Every grant path, ordered by `(slug, via_group_id)` with direct grants\nfirst, so two reads of unchanged state are byte-identical. NOT deduplicated\nby slug: a role held both directly and through a group appears twice, which\nis what tells an operator that withdrawing one grant will not take it away.\n\nAn OBJECT wraps this array rather than the array being the whole body, so a\nlater `permissions` field (issue #98) is a pure addition.\n\nThe whole set, never a page: this is a bounded read (see the module docs),\nand there is no cap on how many roles a member may hold."
+            "description": "Every grant path, ordered by `(slug, source, via_group_id)`, so two reads of\nunchanged state are byte-identical. NOT deduplicated by slug: a role held both\ndirectly and through a group appears twice, which is what tells an operator\nthat withdrawing one grant will not take it away, and a role that is also the\norganization's default appears with a `default` entry that no withdrawal\ntouches at all.\n\nAn OBJECT wraps this array rather than the array being the whole body, so a\nlater `permissions` field (issue #98) is a pure addition.\n\nThe whole set, never a page: this is a bounded read (see the module docs),\nand there is no cap on how many roles a member may hold."
           }
         }
       },

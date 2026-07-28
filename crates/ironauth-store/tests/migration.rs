@@ -575,7 +575,7 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
     );
 }
 
-/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the ninety-two
+/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the ninety-three
 /// real migrations and leaves no throwaway demo object in a real database.
 // A long but linear ledger-and-table assertion sweep (one line per migration and
 // per real table); splitting it would not make it clearer.
@@ -598,8 +598,8 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
     );
     assert_eq!(
         report.already_applied(),
-        92,
-        "the production chain is exactly ninety-two migrations (isolation, audit log, management \
+        93,
+        "the production chain is exactly ninety-three migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -623,10 +623,10 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
          codes, DPoP binding, DPoP proof replay, organization membership, organization token \
          context, organization roles, organization groups, organization group members, \
          organization role assignments, organization authentication policies, permission \
-         vocabulary, role-to-permission mapping)"
+         vocabulary, role-to-permission mapping, organization default role)"
     );
 
-    // The ledger holds exactly versions 1 through 92.
+    // The ledger holds exactly versions 1 through 93.
     assert_eq!(
         applied_versions(pool).await,
         vec![
@@ -634,7 +634,7 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
             46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67,
             68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89,
-            90, 91, 92
+            90, 91, 92, 93
         ]
     );
     let phase_of = |version: i64| async move {
@@ -6295,5 +6295,122 @@ async fn the_data_plane_holds_no_column_scoped_write_grant_on_org_role_permissio
         role_has_any_column_privilege(pool, "ironauth_control", "org_role_permissions", "UPDATE")
             .await,
         "the control plane holds the column-scoped UPDATE a detach needs"
+    );
+}
+
+/// The organization DEFAULT ROLE designation: the column, the partial unique index
+/// that makes "at most one per organization" structural, and the one new grant
+/// (issue #98, migration 0093).
+///
+/// Its own test rather than more lines in the production-chain assertions: that
+/// function's future is already at the stack budget of a default test thread, and
+/// anything added to its body aborts the process on a stack overflow (the 0090
+/// precedent).
+#[tokio::test]
+async fn org_roles_carries_the_default_designation_its_live_uniqueness_and_its_grant() {
+    let db = TestDatabase::start().await;
+    let pool = db.owner_pool();
+
+    // EXPAND: one additive column with a NOT NULL DEFAULT, one new index, one new
+    // grant. No existing column is altered or dropped and no existing grant is
+    // revoked.
+    let phase: String = sqlx::query("SELECT phase FROM _schema_migrations WHERE version = 93")
+        .fetch_one(pool)
+        .await
+        .expect("0093 is in the ledger")
+        .get("phase");
+    assert_eq!(phase, "expand");
+
+    assert!(
+        column_exists(pool, "org_roles", "is_default").await,
+        "org_roles.is_default exists after 0093"
+    );
+    assert_eq!(
+        column_data_type(pool, "org_roles", "is_default").await,
+        "boolean",
+        "the designation is a boolean flag on the ROLE, not a pointer on the organization"
+    );
+    // NOT NULL with a false DEFAULT, so every row that existed before 0093 reads
+    // false and no backfill is needed. A nullable column would make "no default" and
+    // "unknown" two states where the resolution treats them as one.
+    assert!(
+        column_is_not_null(pool, "org_roles", "is_default").await,
+        "org_roles.is_default must be NOT NULL"
+    );
+    assert_eq!(
+        column_default(pool, "org_roles", "is_default").await,
+        Some("false".to_owned()),
+        "the safe default is false: an organization has no default role until an \
+         operator designates one"
+    );
+
+    // At most ONE LIVE default role per organization, structurally rather than by
+    // convention. This is also the backstop that refuses the loser if two designate
+    // requests race, which is why it is a UNIQUE index and not merely an index.
+    assert!(
+        partial_unique_index_exists(pool, "org_roles", "org_roles_org_default_live_uniq").await,
+        "org_roles must carry the per-organization default partial unique index"
+    );
+    assert_eq!(
+        index_columns(pool, "org_roles", "org_roles_org_default_live_uniq").await,
+        vec![
+            "tenant_id".to_owned(),
+            "environment_id".to_owned(),
+            "organization_id".to_owned()
+        ],
+        "the key is the ORGANIZATION address alone: adding any further column would \
+         WEAKEN it into admitting two live defaults"
+    );
+    // And the PREDICATE by text, because neither probe above can see a predicate that
+    // was WIDENED rather than removed. Dropping the `is_default` conjunct would make
+    // this an at-most-one-live-ROLE-per-organization index, which refuses the second
+    // role an organization ever defines; dropping the `deleted_at` conjunct would let
+    // a soft-deleted role go on occupying the designation forever.
+    assert_eq!(
+        index_predicate(pool, "org_roles", "org_roles_org_default_live_uniq").await,
+        "(is_default AND (deleted_at IS NULL))",
+        "the designation is unique over exactly the rows the resolution can see"
+    );
+
+    // The control plane designates and clears; the column-scoped UPDATE grant is
+    // ADDITIVE to the one 0086 wrote, so the four columns named there must still be
+    // updatable and `slug` must still not be.
+    assert!(
+        role_has_column_privilege(
+            pool,
+            "ironauth_control",
+            "org_roles",
+            "is_default",
+            "UPDATE"
+        )
+        .await,
+        "ironauth_control must hold column-scoped UPDATE on org_roles.is_default"
+    );
+    for column in ["display_name", "metadata", "updated_at", "deleted_at"] {
+        assert!(
+            role_has_column_privilege(pool, "ironauth_control", "org_roles", column, "UPDATE")
+                .await,
+            "0086's column-scoped UPDATE on org_roles.{column} must survive 0093 \
+             (Postgres unions column grants; a re-GRANT that replaced them would not)"
+        );
+    }
+    assert!(
+        !role_has_column_privilege(pool, "ironauth_control", "org_roles", "slug", "UPDATE").await,
+        "org_roles.slug must still be immutable by GRANT after 0093"
+    );
+
+    // The DATA plane gains nothing. A data plane able to designate the role every
+    // member of an organization holds is a data plane able to write its own token
+    // claim. `the_data_plane_holds_no_column_scoped_write_grant_on_org_roles` sweeps
+    // every column and so covers this one automatically; this is the named assertion
+    // for the column 0093 introduces.
+    assert!(
+        !role_has_column_privilege(pool, "ironauth_app", "org_roles", "is_default", "UPDATE").await,
+        "the data plane must NOT hold UPDATE on org_roles.is_default"
+    );
+    assert!(
+        role_has_table_privilege(pool, "ironauth_app", "org_roles", "SELECT").await,
+        "the data plane keeps the SELECT the token-issuance resolution reads this \
+         column through"
     );
 }

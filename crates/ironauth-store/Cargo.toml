@@ -577,6 +577,25 @@ name = "effective_permissions"
 path = "tests/effective_permissions.rs"
 required-features = ["testing"]
 
+# The organization's DEFAULT ROLE (issue #98, store PR 6): the role every live active
+# member holds because the organization designated it, resolved at read from
+# `org_roles.is_default` and never materialized as an assignment row. Covers resolution
+# for a member holding NOTHING else through all four projections (roles, permissions,
+# provenance as Default, and the group set it deliberately leaves alone), a NON-MEMBER
+# and a member of a SIBLING organization receiving nothing, the organization-liveness
+# fence in both halves THROUGH this branch (the subject holds no other grant, so nothing
+# else can be what empties the answer), a soft-deleted membership, the
+# organization-IDENTITY fence that this branch promoted from a redundant survivor to the
+# only thing keeping a sibling organization's default role out, scope fencing against a
+# sibling ENVIRONMENT of the same tenant, the union and multiset rules for a role held as
+# the default AND directly AND through a group, and the two ways it stops resolving
+# (deleting the role, and designating a different one, which the partial unique index
+# forces to be a clear followed by a set). Needs a real database (DATABASE_URL).
+[[test]]
+name = "org_default_role"
+path = "tests/org_default_role.rs"
+required-features = ["testing"]
+
 # Organization groups and hierarchy safety (issue #97, store PR 2): the group half
 # of the M10 role model, plus the write-time cycle check and depth bound. Covers the
 # audited CRUD and reparent vocabulary, the typed cycle and depth refusals (and that

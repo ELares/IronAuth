@@ -13,9 +13,16 @@
 //! common case where a role arrives by more than one route: an operator who
 //! withdraws the one grant they know about, sees the role survive, and concludes
 //! the system is broken. Each entry here therefore names its GRANT PATH: `direct`
-//! for a grant straight to the membership, or `group` plus the `via_group_id` of
-//! the group that carries it (which may be a group the member is in, or an ANCESTOR
-//! of one).
+//! for a grant straight to the membership, `group` plus the `via_group_id` of the
+//! group that carries it (which may be a group the member is in, or an ANCESTOR of
+//! one), or `default` for the organization's default role (issue #98).
+//!
+//! `default` is the case this endpoint exists for. That role is held by every live
+//! active member with no assignment row anywhere, so it is the ONE path that appears
+//! in neither assignment list and that no amount of reading the configuration would
+//! explain. Without this variant an operator would see a role in the effective set,
+//! find no grant for it on any surface, and have nothing to conclude but that the
+//! system is wrong.
 //!
 //! # One entry per PATH, not per role
 //!
@@ -36,7 +43,9 @@
 //!
 //! This is a BOUNDED read, not an unbounded one. Its cost is bounded by the number
 //! of roles the organization DEFINES, and each role contributes at most one direct
-//! entry plus one entry per group in the member's ancestor closure that grants it;
+//! entry, at most one default entry (and at most ONE role per organization can carry
+//! that, by partial unique index), plus one entry per group in the member's ancestor
+//! closure that grants it;
 //! that closure is itself bounded by `max_group_depth` (default 8, ceiling 32)
 //! times the groups the member belongs to. The bound is structural, not a cap:
 //! nothing here refuses to return a row, no count is checked, and an organization
@@ -102,6 +111,14 @@ pub enum EffectiveRoleSourceView {
     /// removing the membership from the group or withdrawing the grant from the
     /// group named there.
     Group,
+    /// The ORGANIZATION'S DEFAULT ROLE: held by every live active member because the
+    /// organization designated it, and NOT because anybody granted it.
+    ///
+    /// There is no assignment row behind this entry, so it appears in NO assignment
+    /// list and no `DELETE .../memberships/{id}/roles/{role}` can take it away. It is
+    /// withdrawn for the WHOLE organization at once, by designating a different
+    /// default role, clearing the designation, or deleting the role.
+    Default,
 }
 
 /// One role a membership effectively holds, and the ONE path by which it holds it.
@@ -115,7 +132,8 @@ pub struct EffectiveRoleView {
     /// is stable across a rename and across a promotion between environments.
     #[schema(example = "billing.admin")]
     pub slug: String,
-    /// Whether this path is a direct grant or an inherited one.
+    /// Whether this path is a direct grant, an inherited one, or the organization's
+    /// default role.
     pub source: EffectiveRoleSourceView,
     /// The group that carries the grant (`grp_...`). Present exactly when `source`
     /// is `group`, and absent (rather than null) otherwise.
@@ -139,6 +157,14 @@ impl EffectiveRoleView {
                 source: EffectiveRoleSourceView::Group,
                 via_group_id: Some(group.to_string()),
             },
+            // No `via_group_id`, and not because one is unknown: the organization's
+            // default role reaches the member through no group and through no
+            // assignment row at all.
+            EffectiveRoleSource::Default => Self {
+                slug: grant.slug,
+                source: EffectiveRoleSourceView::Default,
+                via_group_id: None,
+            },
         }
     }
 }
@@ -146,10 +172,12 @@ impl EffectiveRoleView {
 /// The resolved roles of one organization membership.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct EffectiveRolesView {
-    /// Every grant path, ordered by `(slug, via_group_id)` with direct grants
-    /// first, so two reads of unchanged state are byte-identical. NOT deduplicated
-    /// by slug: a role held both directly and through a group appears twice, which
-    /// is what tells an operator that withdrawing one grant will not take it away.
+    /// Every grant path, ordered by `(slug, source, via_group_id)`, so two reads of
+    /// unchanged state are byte-identical. NOT deduplicated by slug: a role held both
+    /// directly and through a group appears twice, which is what tells an operator
+    /// that withdrawing one grant will not take it away, and a role that is also the
+    /// organization's default appears with a `default` entry that no withdrawal
+    /// touches at all.
     ///
     /// An OBJECT wraps this array rather than the array being the whole body, so a
     /// later `permissions` field (issue #98) is a pure addition.
