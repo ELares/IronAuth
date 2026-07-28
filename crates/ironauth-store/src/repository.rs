@@ -33088,8 +33088,9 @@ impl OrgRoleRepo<'_> {
 ///   BOTH layers is caught by the same test. They are kept because a statement
 ///   that names its own scope is readable on its own terms and does not depend
 ///   on a reader knowing the policy exists, which is the same argument
-///   `EFFECTIVE_ROLE_SLUGS_TAIL` records for its own redundant organization
-///   predicates.
+///   [`EFFECTIVE_CLOSURE_CTE`] records for its own redundant organization
+///   predicates. (That argument used to live on `EFFECTIVE_ROLE_SLUGS_TAIL`,
+///   which is now a bare projection carrying no organization predicate at all.)
 ///
 /// Do not delete either half on the grounds that a mutation survives: the
 /// survival is the expected consequence of the backstop, not evidence the
@@ -33772,6 +33773,16 @@ impl OrgGroupRepo<'_> {
 ///      reachable by SEVERAL paths (directly AND through two different groups, say)
 ///      yields exactly one row without relying on a set operator to deduplicate.
 ///
+///      A NEW PROJECTION OVER THIS ARM SHOULD REFERENCE IT EXACTLY ONCE. Postgres
+///      inlines a CTE referenced once and MATERIALIZES one referenced twice, and the
+///      measured difference is confined to the referring statement's own plan (each
+///      tail is planned separately, so the others stay byte-identical). Referenced
+///      once, a tail of the shape `... IN (SELECT id FROM effective_roles)` inlines
+///      into the same single indexed `org_roles` scan this arm already produces.
+///      Referenced twice, the arm materializes. That is a plan choice rather than a
+///      correctness one, but it is on the token-issuance path, so it is worth
+///      spending a moment on rather than discovering later.
+///
 ///      [`EFFECTIVE_ROLE_GRANTS_TAIL`] deliberately does NOT read this arm, and that
 ///      is not an oversight. It answers the different question "by which PATH", so
 ///      it has to keep the two grant kinds separable and each granting group
@@ -33787,17 +33798,25 @@ impl OrgGroupRepo<'_> {
 ///      the arm in the SHARED preamble is what buys the single definition and it
 ///      would be a poor trade if it also put a role scan on the group projection.
 ///
-/// # The organization predicates: FIVE mutually redundant survivors, and two that are not
+/// # The organization predicates: SIX mutually redundant survivors, and one that is not
 ///
 /// This statement carries an `organization_id = $3` predicate in SEVEN places (the
 /// `o.id = m.organization_id` join condition is a key rather than a fence and is not one
-/// of them). FIVE of the seven are redundant WITH RESPECT TO EACH OTHER: deleting any
+/// of them). SIX of the seven are redundant WITH RESPECT TO EACH OTHER: deleting any
 /// one of them ALONE changes no answer and no test can distinguish its presence, because
 /// the others still fence the same rows under the write path's invariant that every
-/// assignment resolves BOTH of its endpoints as live rows of ONE organization. All five
+/// assignment resolves BOTH of its endpoints as live rows of ONE organization. All six
 /// are retained deliberately and are named here in full, so that nobody removes one as
 /// dead weight and so that this note cannot be read as covering only the first:
 ///
+///   * `m.organization_id` on the membership SEED. This one is also the SELECTOR, in
+///     that it is what makes `membership` the caller's membership in THIS organization
+///     rather than their membership in any organization of the scope. Being the selector
+///     does not take it out of this layer, which is a correction: an earlier version of
+///     this note filed it as a separate category on the grounds that it was "not a
+///     repetition of a fence some other predicate also carries", and that was wrong in
+///     the direction that matters, because it read as withdrawing protection from a
+///     predicate that needs it as much as the rest.
 ///   * `gm.organization_id` and `g.organization_id` in the SEED arm of `closure`;
 ///   * `r.organization_id` on the role row itself in the `effective_roles` arm;
 ///   * `mr.organization_id` in that arm's direct-grant subquery;
@@ -33805,23 +33824,27 @@ impl OrgGroupRepo<'_> {
 ///
 /// Together they are the layer under that write-time invariant: if a future write path
 /// ever admitted a cross-organization assignment, these are what would keep the
-/// resulting role out of a token instead of quietly emitting it.
+/// resulting role out of a token instead of quietly emitting it. They are one layer
+/// rather than several categories precisely because EACH CATCHES A DIFFERENT SHAPE of
+/// that corruption, which was measured rather than reasoned. Plant an
+/// `org_membership_roles` row stamped with organization A that names the caller's
+/// organization B membership, and `m.organization_id` is the predicate that keeps the
+/// role out while `gm.organization_id` and `mr.organization_id` do nothing; plant the
+/// mirror, where the assignment row's own organization is the sibling, and those two
+/// catch it while `m.organization_id` does not. No single member of this list is the
+/// one doing the work, which is exactly why none of them may be pruned.
 ///
-/// The SIXTH is NOT of this kind and must not be filed with them. `g.organization_id` in
-/// the RECURSIVE arm of `closure` is the only thing fencing the organization on the
-/// ancestor walk, and `parent_id` is an UNTRUSTED stored pointer (a group delete
-/// DETACHES, so a stored parent may name a row the live invariant never re-validated,
-/// and the column's foreign key is id only). Removing it lets a sibling organization's
-/// group into the closure, and therefore its name into the group set a token carries;
-/// `the_read_walk_never_crosses_organization_via_a_corrupt_parent` is the test that
-/// holds it in place.
-///
-/// The SEVENTH is a different category again, and is called out so the count is honest.
-/// `m.organization_id` on the membership seed is the SELECTOR: it is what makes
-/// `membership` the caller's membership in THIS organization rather than their
-/// membership in any organization of the scope. It is not a repetition of a fence some
-/// other predicate also carries, which is what the five above are and what the
-/// five-count exists to stop a reader pruning.
+/// The ONE that is NOT of this kind, and must not be filed with them, is
+/// `g.organization_id` in the RECURSIVE arm of `closure`. It is the only thing fencing
+/// the organization on the ancestor walk, and `parent_id` is an UNTRUSTED stored pointer
+/// (a group delete DETACHES, so a stored parent may name a row the live invariant never
+/// re-validated, and the column's foreign key is id only). It is observable with NO
+/// write-path bug at all, only a detached pointer reachable through the ordinary delete
+/// path, which is what separates it from the six. Removing it lets a sibling
+/// organization's group into the closure, and therefore its name into the group set a
+/// token carries; `the_read_walk_never_crosses_organization_via_a_corrupt_parent` is the
+/// test that holds it in place, and it is the only one of the seven with a test of its
+/// own.
 ///
 /// The count is a tally over THIS statement, and it is worth saying so out loud, because
 /// a projection over it repeats the same predicates. [`EFFECTIVE_ROLE_GRANTS_TAIL`]
