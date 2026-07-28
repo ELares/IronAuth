@@ -215,6 +215,26 @@ impl ScopedKind for PermissionKind {
     const PREFIX: &'static str = "prm";
 }
 
+/// Marker for a role-to-permission mapping (`rpm_`), the tenant-scoped join row
+/// recording that one organization's ROLE grants one of the environment's
+/// PERMISSIONS (issue #98). It is the join between the two halves of the model
+/// that are scoped differently: the role belongs to an organization and the
+/// permission belongs to the environment, so the row carries the organization
+/// because the role does. Scoped like every other resource so an id minted in
+/// another `(tenant, environment)` parses as a uniform not-found. Not a bearer
+/// secret (a mapping id names configuration, never end-user data), so its debug
+/// form stays legible.
+///
+/// The prefix is `rpm` (role-permission mapping) and not `prm`, which is already
+/// the permission itself: the two are the resources a mapping write names in
+/// adjacent argument positions, so a shared prefix would let one be passed where
+/// the other belongs and still parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OrgRolePermissionKind;
+impl ScopedKind for OrgRolePermissionKind {
+    const PREFIX: &'static str = "rpm";
+}
+
 /// Marker for an audit-log event, the tenant-scoped record the audit log writes
 /// in the same transaction as every mutation. Scoped like any other resource so
 /// audit rows are themselves subject to the tenant-isolation policies.
@@ -1382,6 +1402,10 @@ pub type OrgAuthPolicyId = ScopedId<OrgAuthPolicyKind>;
 /// vocabulary (issue #98). It carries no organization: the vocabulary belongs to
 /// the environment and the role-to-permission mapping carries the organization.
 pub type PermissionId = ScopedId<PermissionKind>;
+/// A role-to-permission mapping identifier (`rpm_...`), the join row recording
+/// that one organization's role grants one of the environment's permissions
+/// (issue #98).
+pub type OrgRolePermissionId = ScopedId<OrgRolePermissionKind>;
 /// An audit-log event identifier (`aud_...`).
 pub type AuditId = ScopedId<AuditKind>;
 /// A management API key identifier (`mak_...`), environment-scoped (issue #11).
@@ -2251,6 +2275,75 @@ mod tests {
     }
 
     #[test]
+    fn property_org_role_permission_ids_round_trip_and_deny_cross_scope() {
+        // A property sweep over the role-to-permission mapping (issue #98): every
+        // freshly minted id round-trips in its own scope and NONE parses in a
+        // foreign tenant or environment. A mapping id is the audit target and the
+        // handle a detach is addressed by, so a cross-scope id that parsed would be
+        // a cross-scope WITHDRAWAL of somebody else's grant rather than merely a
+        // read oracle.
+        let env = test_env();
+        let tenant_a = TenantId::generate(&env);
+        let tenant_b = TenantId::generate(&env);
+        let env_1 = EnvironmentId::generate(&env);
+        let env_2 = EnvironmentId::generate(&env);
+        let scope_a = Scope::new(tenant_a, env_1);
+        let cross_tenant = Scope::new(tenant_b, env_1);
+        let cross_env = Scope::new(tenant_a, env_2);
+
+        for _ in 0..1_000 {
+            let id = OrgRolePermissionId::generate(&env, &scope_a);
+            let text = id.to_string();
+            assert!(text.starts_with("rpm_"));
+            assert_eq!(
+                OrgRolePermissionId::parse_in_scope(&text, &scope_a).expect("in scope"),
+                id
+            );
+            assert_eq!(
+                OrgRolePermissionId::parse_in_scope(&text, &cross_tenant),
+                Err(NotInScope)
+            );
+            assert_eq!(
+                OrgRolePermissionId::parse_in_scope(&text, &cross_env),
+                Err(NotInScope)
+            );
+        }
+
+        // Malformed and wrong-prefix inputs fail with the same NotInScope. The
+        // PERMISSION id is the sharpest wrong-prefix case: `rpm` and `prm` are
+        // anagrams and the two resources are named in adjacent argument positions
+        // by the same write, so a parser that accepted either would let a mapping
+        // be addressed by the permission it maps.
+        assert_eq!(
+            OrgRolePermissionId::parse_in_scope("rpm_not-base64-!!", &scope_a),
+            Err(NotInScope)
+        );
+        let a_permission = PermissionId::generate(&env, &scope_a).to_string();
+        assert_eq!(
+            OrgRolePermissionId::parse_in_scope(&a_permission, &scope_a),
+            Err(NotInScope),
+            "a permission id is not a mapping id even in the right scope"
+        );
+        let a_role = OrgRoleId::generate(&env, &scope_a).to_string();
+        assert_eq!(
+            OrgRolePermissionId::parse_in_scope(&a_role, &scope_a),
+            Err(NotInScope),
+            "a role id is not a mapping id even in the right scope"
+        );
+        // And the converse direction, which is what makes the mapping id unusable
+        // where a permission id belongs: the mapping write takes both, so both
+        // parsers have to refuse the other's spelling.
+        assert_eq!(
+            PermissionId::parse_in_scope(
+                &OrgRolePermissionId::generate(&env, &scope_a).to_string(),
+                &scope_a
+            ),
+            Err(NotInScope),
+            "a mapping id is not a permission id even in the right scope"
+        );
+    }
+
+    #[test]
     fn property_org_group_ids_round_trip_and_deny_cross_scope() {
         // A property sweep over the organization-group level (issue #97): every
         // freshly minted id round-trips in its own scope, and NONE parses in a
@@ -2507,6 +2600,15 @@ mod tests {
         assert!(
             seen.contains_key("prm"),
             "the permission prefix is declared"
+        );
+        // Issue #98's role-to-permission mapping. Pinned for the same reason, and
+        // for one specific to this pair: `rpm` and `prm` are anagrams of each other
+        // and name the two resources a mapping write passes in adjacent argument
+        // positions, so a later kind taking either back would make the wrong-prefix
+        // refusal asserted above unenforceable.
+        assert!(
+            seen.contains_key("rpm"),
+            "the role-permission mapping prefix is declared"
         );
     }
 

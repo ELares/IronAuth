@@ -9,10 +9,10 @@ use ironauth_store::idor_harness::IdorHarness;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
     ActorRef, AuthPolicy, CorrelationId, ManagementKeyId, NewAdminUser, NewMembership, NewOrgGroup,
-    NewOrgGroupMember, NewOrgGroupRole, NewOrgMembershipRole, NewOrgRole, NewPermission,
-    ORG_POLICY_MAX_SESSION_TTL_SECS, OrgGroupId, OrgGroupMemberId, OrgGroupRoleId, OrgMembershipId,
-    OrgMembershipRoleId, OrgRoleId, OrganizationId, PermissionId, Scope, ServiceId, StoreError,
-    UserState,
+    NewOrgGroupMember, NewOrgGroupRole, NewOrgMembershipRole, NewOrgRole, NewOrgRolePermission,
+    NewPermission, ORG_POLICY_MAX_SESSION_TTL_SECS, OrgGroupId, OrgGroupMemberId, OrgGroupRoleId,
+    OrgMembershipId, OrgMembershipRoleId, OrgRoleId, OrgRolePermissionId, OrganizationId,
+    PermissionId, Scope, ServiceId, StoreError, UserState,
 };
 
 /// A stand-in key hash for a planted victim (the probes resolve by id, not hash).
@@ -138,6 +138,30 @@ async fn management_probes_deny_cross_tenant_and_cross_environment_uniformly() {
     let victim_permission_b = plant_permission(control, &env, scope_b).await;
     let victim_permission_a2 = plant_permission(control, &env, scope_a2).await;
 
+    // The role-to-permission MAPPING (issue #98): plant a victim in each foreign
+    // scope, attaching that scope's victim permission to that scope's victim role.
+    // `org_role_permissions.unassign` is a MUTATING probe over the row that decides
+    // which capability names a token carries, so a leak here silently WITHDRAWS a
+    // capability in a foreign environment rather than merely reading one.
+    let victim_mapping_b = plant_role_permission(
+        control,
+        &env,
+        scope_b,
+        &victim_org_b,
+        &victim_role_b,
+        &victim_permission_b,
+    )
+    .await;
+    let victim_mapping_a2 = plant_role_permission(
+        control,
+        &env,
+        scope_a2,
+        &victim_org_a2,
+        &victim_role_a2,
+        &victim_permission_a2,
+    )
+    .await;
+
     // A well-formed key id in the caller's OWN scope that was never stored.
     let absent_in_a = ManagementKeyId::generate(&env, &scope_a).to_string();
 
@@ -175,6 +199,7 @@ async fn management_probes_deny_cross_tenant_and_cross_environment_uniformly() {
             "org_auth_policies.remove",
             "permissions.get",
             "permissions.delete",
+            "org_role_permissions.unassign",
         ],
         "every management resolve-by-id operation is registered",
     );
@@ -198,6 +223,8 @@ async fn management_probes_deny_cross_tenant_and_cross_environment_uniformly() {
         victim_direct_grant_a2.to_string(),
         victim_permission_b.to_string(),
         victim_permission_a2.to_string(),
+        victim_mapping_b.to_string(),
+        victim_mapping_a2.to_string(),
         absent_in_a.clone(),
     ];
     let foreign_refs: Vec<&str> = foreign.iter().map(String::as_str).collect();
@@ -378,6 +405,31 @@ async fn management_probes_deny_cross_tenant_and_cross_environment_uniformly() {
         assert_eq!(record.display_name, "victim permission");
     }
 
+    // The victim MAPPINGS must have SURVIVED `org_role_permissions.unassign`, read
+    // back through the PAIR address rather than by id. The pair address is the
+    // stronger read: it proves the row is still live AND still joins the same role to
+    // the same permission in the same organization, which is exactly the grant a leak
+    // would have withdrawn. A by-id read would prove only that the row exists.
+    for (scope, org, role, permission) in [
+        (scope_b, &victim_org_b, &victim_role_b, &victim_permission_b),
+        (
+            scope_a2,
+            &victim_org_a2,
+            &victim_role_a2,
+            &victim_permission_a2,
+        ),
+    ] {
+        let record = control
+            .management()
+            .org_role_permissions(scope)
+            .get_assignment(org, role, permission)
+            .await
+            .expect("the victim mapping must survive the unassign probe in its OWN scope");
+        assert_eq!(&record.organization_id, org);
+        assert_eq!(&record.role_id, role);
+        assert_eq!(&record.permission_id, permission);
+    }
+
     // The victim POLICIES must survive both probes AND still carry their own
     // document. A liveness-only assertion would miss the sharper leak: a cross-scope
     // `set` that landed would leave the policy readable while having REPLACED the
@@ -395,6 +447,44 @@ async fn management_probes_deny_cross_tenant_and_cross_environment_uniformly() {
             "the victim policy's document must be untouched by the set probe"
         );
     }
+}
+
+/// Plant a live role-to-permission mapping in `scope` via the control store,
+/// returning its id (issue #98).
+///
+/// Through the AUDITED WRITE repository, so the victim is a row a real operator
+/// could have created: it passes the same live-role-in-organization and
+/// live-permission-in-scope resolutions a production attach passes, which also means
+/// a mis-seeded fixture fails loudly here rather than producing a victim the probe
+/// then cannot destroy for the wrong reason.
+async fn plant_role_permission(
+    control: &ironauth_store::Store,
+    env: &Env,
+    scope: Scope,
+    org: &OrganizationId,
+    role: &OrgRoleId,
+    permission: &PermissionId,
+) -> OrgRolePermissionId {
+    let id = OrgRolePermissionId::generate(env, &scope);
+    let actor = ActorRef::service(ServiceId::generate(env));
+    control
+        .management()
+        .acting(actor, CorrelationId::generate(env))
+        .org_role_permissions(scope)
+        .assign(
+            env,
+            NewOrgRolePermission {
+                id: &id,
+                organization_id: org,
+                role_id: role,
+                permission_id: permission,
+            },
+            1_000_000,
+            None,
+        )
+        .await
+        .expect("plant victim role-permission mapping");
+    id
 }
 
 /// Plant a live permission in `scope` via the control store, returning its id
