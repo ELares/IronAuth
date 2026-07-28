@@ -15,17 +15,20 @@
 //!   grant, one permission reachable by SEVERAL paths yielding exactly one entry, and
 //!   a permission attached to a role nobody holds staying absent. Plus determinism,
 //!   plus the DATA plane (the plane the mint path runs on) resolving identically.
-//! * AGREEMENT with the third projection over randomized fixtures: the permission set
+//! * AGREEMENT with the ROLE projection over randomized fixtures: the permission set
 //!   is exactly the union of the mappings of the roles [`OrgGroupRepo::effective_roles`]
 //!   reports. Both read one `effective_roles` arm, and this is what would catch them
 //!   drifting apart.
 //! * LIVENESS at EVERY level, one numbered rule per soft-deletable row on the path,
 //!   against ONE fixture so the rules cannot be tested against several graphs. Two of
 //!   them are this projection's own and have no second layer behind them: a DETACHED
-//!   mapping and a soft-DELETED permission. Two more live in a test of their own,
-//!   because the repository's cascades tidy up behind themselves and the ordinary
-//!   lifecycle therefore cannot reach them: a binding into a DELETED group, and a
-//!   membership soft-deleted with its attachments left live.
+//!   mapping and a soft-DELETED permission. Two more live in a test of their own, and
+//!   they are there for two DIFFERENT reasons. A membership soft-deleted with its
+//!   attachments left live is UNREACHABLE through the ordinary lifecycle, because
+//!   `remove` revokes those attachments in the same transaction, so that test kills
+//!   the row out of band. A binding into a DELETED group is perfectly reachable, since
+//!   a group delete DETACHES; it was simply UNCOVERED, because no rule in the liveness
+//!   test deletes the member's OWN group.
 //! * The `kind` filter, twice over. An ENTITLEMENT planted by SQL and attached to a
 //!   role the subject holds never resolves, while a PERMISSION of the same slug does;
 //!   and a row whose `kind` is drifted underneath a live mapping stops resolving on
@@ -38,8 +41,13 @@
 //! * The organization fence one layer lower: a mapping row whose stamped
 //!   `organization_id` disagrees with its role's. The write path cannot produce one,
 //!   the id-only foreign keys accept it, and `rp.organization_id` is the only thing in
-//!   the statement that catches one of the two shapes (the `effective_roles` arm's own
-//!   role fence catches the other).
+//!   the statement that catches the FIRST of the two shapes. The second is refused for
+//!   an entirely different reason, which is that the subject HOLDS NO SUCH ROLE, so
+//!   the `effective_roles` arm's two grant subqueries never put it in the arm to map
+//!   from. That arm's `r.organization_id` fence would refuse the same row, but it is a
+//!   redundant SECOND refusal here and nothing in this file kills it, which is why the
+//!   census in `EFFECTIVE_CLOSURE_CTE` still counts it among the six mutually
+//!   redundant survivors.
 //! * SCOPE fencing, with the sharpest victim: a scope differing from the caller's in
 //!   the ENVIRONMENT ALONE, holding the same slugs. `seed_scope` mints a NEW TENANT on
 //!   every call, so a probe between two seeded scopes is decided by the tenant half
@@ -845,7 +853,7 @@ impl Rng {
 async fn the_permission_set_is_exactly_the_mapping_of_the_role_set() {
     // What holds the shared `effective_roles` arm honest. Both projections read that
     // one arm, so the permissions resolved must be exactly the union of the mappings
-    // of the roles the THIRD projection reports, over any graph. A permission tail
+    // of the roles the ROLE projection reports, over any graph. A permission tail
     // that re-derived "which roles are held" could pass every named fixture in this
     // file and still disagree here on a randomized one.
     //
@@ -1428,9 +1436,15 @@ async fn a_soft_deleted_organization_resolves_to_no_permissions_too() {
 
 #[tokio::test]
 async fn the_projection_never_crosses_organization_via_a_corrupt_mapping_row() {
-    // The organization fence the fourth projection adds, `rp.organization_id`, and the
-    // one the `effective_roles` arm already carries. Both are needed and each catches a
-    // DIFFERENT shape, which is measured here rather than reasoned about.
+    // The organization fence the fourth projection adds, `rp.organization_id`, over the
+    // two shapes of corruption it has to survive. It is the ONLY thing in the statement
+    // that decides the FIRST, which is what earns it a place in the census. The SECOND
+    // is read from BOTH organizations here, and the two readings are refused by
+    // different things: from the organization that does not hold the role, by the
+    // `effective_roles` arm declining to yield a role the subject was never granted;
+    // from the one that DOES hold it, by `rp.organization_id` again. Which thing
+    // decides which reading is measured rather than reasoned about, and the comments
+    // below say so per shape.
     //
     // Neither row below is writable through any supported path: `assign` resolves the
     // role as live IN the organization it then stamps. Both satisfy every foreign key
@@ -1479,16 +1493,29 @@ async fn the_projection_never_crosses_organization_via_a_corrupt_mapping_row() {
     );
 
     // Shape 2: the mirror, a mapping row stamped with THIS organization that names a
-    // role of the SIBLING. Read from alpha, the `effective_roles` arm refuses it,
-    // because beta's role is not one of alpha's live roles and the subject cannot hold
-    // it. Read from beta, whose member DOES hold that role, `rp.organization_id`
-    // refuses it instead. The same corrupt row, two readers, two different predicates.
+    // role of the SIBLING.
+    //
+    // Read from alpha, what keeps it out is that the subject HOLDS NO SUCH ROLE, which
+    // is decided by the `effective_roles` arm's two GRANT SUBQUERIES rather than by any
+    // organization predicate: alpha's membership has no `org_membership_roles` row
+    // naming beta's role, and this fixture stands up no groups at all, so both
+    // subqueries come back empty and beta's role is never in the arm to map from. The
+    // arm's `r.organization_id` fence would refuse the row as well, but here it is a
+    // REDUNDANT second refusal, and dropping it leaves every test in this file green,
+    // which is why the census in `EFFECTIVE_CLOSURE_CTE` still files it among the six
+    // mutually redundant survivors and still calls the recursive arm's
+    // `g.organization_id` the only one of the seven with a test of its own.
+    //
+    // Read from beta, whose member DOES hold that role, `rp.organization_id` refuses it
+    // instead, and THAT one is load bearing. The same corrupt row, two readers, two
+    // different reasons.
     let alpha_only = create_permission(&db, &env, scope, "alpha.private").await;
     plant_mapping(&db, &env, scope, &alpha, &beta_role, &alpha_only).await;
     assert_eq!(
         permissions_of(&db, scope, &alpha, &alpha_user, DEFAULT_DEPTH).await,
         set(&["alpha.granted"]),
-        "alpha's member does not hold beta's role, so the role fence keeps it out"
+        "alpha's member holds no such role, so neither grant subquery of the arm ever \
+         yields beta's role to map a permission from"
     );
     assert_eq!(
         permissions_of(&db, scope, &beta, &beta_user, DEFAULT_DEPTH).await,
@@ -1505,7 +1532,7 @@ async fn resolution_is_fenced_to_its_own_scope_including_a_sibling_environment()
     // environment conjunct is widened, and can say nothing about it.
     //
     // This table pair makes the case sharp rather than hypothetical. The vocabulary is
-    // per ENVIRONMENT (migration 0091's Fork 1), so the SAME SLUG legitimately exists
+    // per ENVIRONMENT (migration 0091's section (1)), so the SAME SLUG legitimately exists
     // as a different row in the sibling environment, and a resolution that leaked
     // across would return a slug that looks entirely plausible.
     let db = TestDatabase::start().await;
@@ -1709,12 +1736,21 @@ async fn the_projection_still_fences_the_environment_with_the_policy_half_down()
     // the policy refuses the row anyway. That is the expected consequence of the
     // backstop and not evidence the conjunct is dead.
     //
-    // This is the one fixture where the two layers come apart. With the environment
-    // half of each policy replaced away, the conjuncts are the ONLY thing left, and
-    // both rows below are ones the write path cannot produce and the id-only foreign
+    // This is the one fixture where the two layers come apart, and it comes apart for
+    // the ENVIRONMENT halves specifically. With the environment half of each policy
+    // replaced away, `p.environment_id` and `rp.environment_id` are the only thing left,
+    // and both rows below are ones the write path cannot produce and the id-only foreign
     // keys accept: a mapping of THIS environment naming a permission of the sibling
     // one, and a mapping stamped with the sibling environment naming a permission and
-    // a role of this one. Each isolates one side of the pair.
+    // a role of this one. Each isolates one side of the pair, so dropping
+    // `p.environment_id` reddens the first probe and dropping `rp.environment_id`
+    // reddens the second.
+    //
+    // The two TENANT conjuncts stay equivalent survivors even under this fixture, and no
+    // fixture on this statement can change that, because the reason is structural rather
+    // than a gap here: `environments_pkey` is on `id` ALONE, so an environment id
+    // DETERMINES its tenant, and the environment conjunct standing beside each tenant
+    // one already excludes every cross-tenant row.
     //
     // The policies are REPLACED rather than dropped: both tables FORCE row-level
     // security, so a table carrying no policy at all denies everything and every probe
@@ -1815,13 +1851,24 @@ async fn the_projection_still_fences_the_environment_with_the_policy_half_down()
 
 #[tokio::test]
 async fn resolution_ignores_a_binding_into_a_dead_group_and_a_dead_membership() {
-    // The two seed-arm liveness filters the ordinary lifecycle CANNOT exercise,
-    // because the repository's own cascades tidy up behind themselves. Both were
-    // measured to survive every other test in this file, which is exactly why they get
-    // one of their own: a binding whose GROUP was deleted (the binding row stays live,
-    // since a group delete DETACHES) and a MEMBERSHIP soft-deleted with its attachments
-    // left live. Each is a reachable state and each is guarded by exactly one predicate
-    // in the seed.
+    // The two seed-arm liveness filters that survived every other test in this file,
+    // which is exactly why they get one of their own. Each is guarded by exactly one
+    // predicate in the seed, but they survived for two DIFFERENT reasons, and the
+    // difference is what tells the next author whether an ordinary test could have
+    // caught them.
+    //
+    // Step 1's binding whose GROUP was deleted is an entirely ORDINARY state that any
+    // operator can produce, because a group delete DETACHES and the binding row stays
+    // live. That filter was merely UNCOVERED: no other test here deletes the member's
+    // OWN group, and rule 5 of the liveness test deletes an ANCESTOR, which the
+    // recursive arm's copy of the filter decides instead of the seed's.
+    //
+    // Step 2's MEMBERSHIP soft-deleted with its attachments left live is the
+    // REACHABILITY case, and the ordinary lifecycle cannot produce it at all: `remove`
+    // revokes every binding and every direct grant in the same transaction, so it never
+    // leaves anything standing for the seed filter to decide. That is why the step below
+    // kills the row out of band rather than calling `remove`, and the state it builds is
+    // one an import or a restore reaches rather than one an operator can.
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
