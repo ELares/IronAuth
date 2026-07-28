@@ -77,6 +77,7 @@ mod org_roles;
 mod organizations;
 mod pagination;
 mod password_hashing;
+mod permissions;
 mod promotion;
 mod provision;
 mod ratelimit;
@@ -305,6 +306,23 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/keys/{key_id}",
             get(keys::get_key).delete(keys::delete_key),
+        )
+        // The permission vocabulary (issue #98): the named API capabilities an
+        // ENVIRONMENT defines. Deliberately NOT nested under an organization, and no
+        // handler takes one: `permissions` carries no `organization_id`, because a
+        // permission names an API capability and one string cannot mean different
+        // things to two organizations calling the same API (migration 0091). That
+        // makes the row-level-security policy the complete fence for the table.
+        // Uncapped in number by covenant.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/permissions",
+            post(permissions::create_permission).get(permissions::list_permissions),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/permissions/{permission_id}",
+            get(permissions::get_permission)
+                .patch(permissions::update_permission)
+                .delete(permissions::delete_permission),
         )
         // Organizations: the fourth level of the resource model (issue #41), a
         // minimal per-environment shell M10 extends with membership.

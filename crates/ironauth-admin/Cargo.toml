@@ -227,6 +227,20 @@ name = "org_members_assignments"
 path = "tests/org_members_assignments.rs"
 required-features = ["testing"]
 
+# The permission vocabulary over HTTP (issue #98, PR 7): the five ENVIRONMENT-scoped
+# endpoints (there is no organization segment, because `permissions` carries no
+# organization), the typed refusals the schema would otherwise turn into an opaque 500
+# (a slug the namespaced grammar refuses, a duplicate live slug, and a PATCH naming the
+# grant-immutable slug or kind), byte-identical anti-oracle uniformity across every
+# shape of unreachable id on the read and both mutations, the audit multiset at each
+# step, the Idempotency-Key replay and its credential and path namespacing, the
+# multi-page cursor walk across a row a relabel touched, and the environment-scoped-key
+# confinement on all five endpoints. Needs a real database (DATABASE_URL).
+[[test]]
+name = "permission_vocabulary"
+path = "tests/permission_vocabulary.rs"
+required-features = ["testing"]
+
 # DCR abuse-control management surface (issue #31): authoring a reusable policy
 # (create/list/replay/conflict/invalid-primitive), minting an initial access token
 # carrying a policy-chain snapshot (plaintext once, idempotent replay, unknown policy

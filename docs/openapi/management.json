@@ -9780,6 +9780,499 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/permissions": {
+      "get": {
+        "tags": [
+          "permissions"
+        ],
+        "summary": "List an environment's permission vocabulary (cursor paginated).",
+        "operationId": "listPermissions",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "The desired page size, a positive integer. Clamped to\n`[1, max_page_size]`; defaults to the configured default when absent.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "The opaque cursor from a previous page's `next_cursor`. Absent for the\nfirst page (keyset pagination; there is no offset).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of permissions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PermissionList"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed cursor",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Tenant or environment not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "permissions"
+        ],
+        "summary": "Define a permission in an environment.",
+        "operationId": "createPermission",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying a POST with the same key returns the original response without re-executing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreatePermissionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PermissionView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request (including a slug the namespaced stable-name rule refuses)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Tenant or environment not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A live permission of this environment already holds that slug",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency-Key reused with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/permissions/{permission_id}": {
+      "get": {
+        "tags": [
+          "permissions"
+        ],
+        "summary": "Get one permission of an environment.",
+        "operationId": "getPermission",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "permission_id",
+            "in": "path",
+            "description": "The permission identifier (prm_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The permission",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PermissionView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (absent, deleted, malformed, or another scope's)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "permissions"
+        ],
+        "summary": "Delete a permission (soft delete; idempotent in effect).",
+        "operationId": "deletePermission",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "permission_id",
+            "in": "path",
+            "description": "The permission identifier (prm_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted (the slug is immediately free for a NEW permission, which gets a fresh id)"
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (absent, already deleted, malformed, or another scope's)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "patch": {
+        "tags": [
+          "permissions"
+        ],
+        "summary": "Relabel a permission (or replace its metadata). The `slug` and `kind` are\nimmutable.",
+        "operationId": "updatePermission",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "permission_id",
+            "in": "path",
+            "description": "The permission identifier (prm_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdatePermissionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The updated permission",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PermissionView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request, or a body naming the immutable slug or kind",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (absent, deleted, malformed, or another scope's)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/recovery-approvals": {
       "get": {
         "tags": [
@@ -13564,6 +14057,29 @@
           }
         }
       },
+      "CreatePermissionRequest": {
+        "type": "object",
+        "description": "The body to define a permission in an environment.",
+        "required": [
+          "slug",
+          "display_name"
+        ],
+        "properties": {
+          "display_name": {
+            "type": "string",
+            "description": "The mutable human-facing label.",
+            "example": "Read invoices"
+          },
+          "metadata": {
+            "description": "Optional free-form vocabulary metadata; the empty object when omitted."
+          },
+          "slug": {
+            "type": "string",
+            "description": "The IMMUTABLE namespaced stable name, unique among the environment's LIVE\npermissions. Must match `^[a-z0-9][a-z0-9_-]*(\\.[a-z0-9][a-z0-9_-]*)+$` and\nbe at most 63 characters, so it carries two or more dot-separated segments;\nit is never trimmed or case folded, so a non-canonical value is refused\nrather than silently rewritten.",
+            "example": "billing.invoice.read"
+          }
+        }
+      },
       "CreateTenantRequest": {
         "type": "object",
         "description": "The body to create a tenant. The first environment is created with it.",
@@ -15638,6 +16154,76 @@
         },
         "additionalProperties": false
       },
+      "PermissionList": {
+        "type": "object",
+        "description": "A page of permissions.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PermissionView"
+            },
+            "description": "The permissions on this page, oldest first. There is no cap on how many\npermissions an environment may define; this page is size-clamped like every\nlist."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The opaque cursor for the next page, or null if this is the last page."
+          }
+        }
+      },
+      "PermissionView": {
+        "type": "object",
+        "description": "A permission-vocabulary entry, as returned by the management API (issue #98).",
+        "required": [
+          "id",
+          "kind",
+          "slug",
+          "display_name",
+          "metadata",
+          "created_at_unix_ms",
+          "updated_at_unix_ms"
+        ],
+        "properties": {
+          "created_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Creation time, milliseconds since the Unix epoch."
+          },
+          "display_name": {
+            "type": "string",
+            "description": "The mutable human-facing label.",
+            "example": "Read invoices"
+          },
+          "id": {
+            "type": "string",
+            "description": "The permission identifier (`prm_...`, embeds its scope)."
+          },
+          "kind": {
+            "type": "string",
+            "description": "What this row defines: `permission` (a named API capability) or, from issue\n#103, `entitlement`. Projected from the stored row rather than hard coded.\nEvery row this API can create carries `permission`, because the create path\nbinds that discriminator and issue #98 defines no entitlements.",
+            "example": "permission"
+          },
+          "metadata": {
+            "description": "Free-form vocabulary metadata (the empty object when none was set). Never\ninterpreted by the auth core and never emitted in a token claim."
+          },
+          "slug": {
+            "type": "string",
+            "description": "The IMMUTABLE namespaced stable name. This is the string a token claim\ncarries, so a relabel changes `display_name` and never this.",
+            "example": "billing.invoice.read"
+          },
+          "updated_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Last-modification time, milliseconds since the Unix epoch."
+          }
+        }
+      },
       "PolicyTraceView": {
         "type": "object",
         "description": "One recorded policy decision trace (issue #91).\n\nEvery field is a bounded, non secret datum the store record already holds: `policy`\nand `outcome` are closed sets, `subject` is an internal usr_ handle (a blind\nreference, never raw PII), `reason` is a bounded hint, and `decision_inputs` is the\nSTRUCTURALLY REDACTED safe field projection (the acr floor and achieved acr, the auth\nage, the risk signal names and levels, the connector slug and the mapped trait count),\nserialized as a JSON string. There is deliberately NO field capable of holding a claim\nvalue, a token, or a secret: those are unrepresentable in the record this view carries.",
@@ -16764,6 +17350,36 @@
           }
         }
       },
+      "UpdatePermissionRequest": {
+        "type": "object",
+        "description": "The body to relabel a permission (RFC 7396 style partial edit: an omitted field\nis left unchanged).\n\n`slug` and `kind` appear here ONLY so that naming either is a typed 400 that\nsays which field and why. Neither is editable, and neither is forwarded to the\nstore: both are absent from the control role's `UPDATE` grant in migration 0091,\nso a statement naming one would be refused as SQLSTATE 42501 and reach the\ncaller as an opaque 500.",
+        "properties": {
+          "display_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A new human-facing label. Omitted leaves it unchanged."
+          },
+          "kind": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "REFUSED if present: the discriminator is immutable. Reclassifying a live row\nwould change which resolution projections select it."
+          },
+          "metadata": {
+            "description": "Replacement free-form metadata (a whole-document replace, not a merge).\nOmitted leaves it unchanged."
+          },
+          "slug": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "REFUSED if present: the stable name is immutable. A permission slug is a\ndirect authorization input, so a rename under live mappings would silently\nrepoint every grant that names it."
+          }
+        }
+      },
       "UpdateUserRequest": {
         "type": "object",
         "description": "The body to update a user (issue #52), applied as an RFC 7396 JSON Merge Patch\nover the mutable profile. Only the standard-claim document is updatable here;\nthe lifecycle state and external id have their own explicit operations.",
@@ -17112,6 +17728,10 @@
     {
       "name": "org-roles",
       "description": "Organization roles (issue #97): first-class, per-organization named roles. A role is a NAME only in M10 (an immutable slug an authorization decision keys on, plus a mutable label); what it grants is issue #98. Uncapped in number by covenant"
+    },
+    {
+      "name": "permissions",
+      "description": "The permission vocabulary (issue #98): the named API capabilities an ENVIRONMENT defines. Scoped to the environment and NOT to an organization, because a permission names a capability and one string cannot mean different things to two organizations calling the same API; which permissions a ROLE grants is per organization. The slug and the kind are immutable. Uncapped in number by covenant"
     },
     {
       "name": "org-groups",

@@ -1238,6 +1238,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/permissions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List an environment's permission vocabulary (cursor paginated). */
+        get: operations["listPermissions"];
+        put?: never;
+        /** Define a permission in an environment. */
+        post: operations["createPermission"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/permissions/{permission_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get one permission of an environment. */
+        get: operations["getPermission"];
+        put?: never;
+        post?: never;
+        /** Delete a permission (soft delete; idempotent in effect). */
+        delete: operations["deletePermission"];
+        options?: never;
+        head?: never;
+        /**
+         * Relabel a permission (or replace its metadata). The `slug` and `kind` are
+         *     immutable.
+         */
+        patch: operations["updatePermission"];
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/recovery-approvals": {
         parameters: {
             query?: never;
@@ -2307,6 +2347,25 @@ export interface components {
              * @example Globex Corporation
              */
             display_name: string;
+        };
+        /** @description The body to define a permission in an environment. */
+        CreatePermissionRequest: {
+            /**
+             * @description The mutable human-facing label.
+             * @example Read invoices
+             */
+            display_name: string;
+            /** @description Optional free-form vocabulary metadata; the empty object when omitted. */
+            metadata?: unknown;
+            /**
+             * @description The IMMUTABLE namespaced stable name, unique among the environment's LIVE
+             *     permissions. Must match `^[a-z0-9][a-z0-9_-]*(\.[a-z0-9][a-z0-9_-]*)+$` and
+             *     be at most 63 characters, so it carries two or more dot-separated segments;
+             *     it is never trimmed or case folded, so a non-canonical value is refused
+             *     rather than silently rewritten.
+             * @example billing.invoice.read
+             */
+            slug: string;
         };
         /** @description The body to create a tenant. The first environment is created with it. */
         CreateTenantRequest: {
@@ -3474,6 +3533,56 @@ export interface components {
              */
             target_latency_ms: number | null;
         };
+        /** @description A page of permissions. */
+        PermissionList: {
+            /**
+             * @description The permissions on this page, oldest first. There is no cap on how many
+             *     permissions an environment may define; this page is size-clamped like every
+             *     list.
+             */
+            items: components["schemas"]["PermissionView"][];
+            /** @description The opaque cursor for the next page, or null if this is the last page. */
+            next_cursor?: string | null;
+        };
+        /** @description A permission-vocabulary entry, as returned by the management API (issue #98). */
+        PermissionView: {
+            /**
+             * Format: int64
+             * @description Creation time, milliseconds since the Unix epoch.
+             */
+            created_at_unix_ms: number;
+            /**
+             * @description The mutable human-facing label.
+             * @example Read invoices
+             */
+            display_name: string;
+            /** @description The permission identifier (`prm_...`, embeds its scope). */
+            id: string;
+            /**
+             * @description What this row defines: `permission` (a named API capability) or, from issue
+             *     #103, `entitlement`. Projected from the stored row rather than hard coded.
+             *     Every row this API can create carries `permission`, because the create path
+             *     binds that discriminator and issue #98 defines no entitlements.
+             * @example permission
+             */
+            kind: string;
+            /**
+             * @description Free-form vocabulary metadata (the empty object when none was set). Never
+             *     interpreted by the auth core and never emitted in a token claim.
+             */
+            metadata: unknown;
+            /**
+             * @description The IMMUTABLE namespaced stable name. This is the string a token claim
+             *     carries, so a relabel changes `display_name` and never this.
+             * @example billing.invoice.read
+             */
+            slug: string;
+            /**
+             * Format: int64
+             * @description Last-modification time, milliseconds since the Unix epoch.
+             */
+            updated_at_unix_ms: number;
+        };
         /**
          * @description One recorded policy decision trace (issue #91).
          *
@@ -4140,6 +4249,36 @@ export interface components {
              *     Omitted leaves it unchanged.
              */
             metadata?: unknown;
+        };
+        /**
+         * @description The body to relabel a permission (RFC 7396 style partial edit: an omitted field
+         *     is left unchanged).
+         *
+         *     `slug` and `kind` appear here ONLY so that naming either is a typed 400 that
+         *     says which field and why. Neither is editable, and neither is forwarded to the
+         *     store: both are absent from the control role's `UPDATE` grant in migration 0091,
+         *     so a statement naming one would be refused as SQLSTATE 42501 and reach the
+         *     caller as an opaque 500.
+         */
+        UpdatePermissionRequest: {
+            /** @description A new human-facing label. Omitted leaves it unchanged. */
+            display_name?: string | null;
+            /**
+             * @description REFUSED if present: the discriminator is immutable. Reclassifying a live row
+             *     would change which resolution projections select it.
+             */
+            kind?: string | null;
+            /**
+             * @description Replacement free-form metadata (a whole-document replace, not a merge).
+             *     Omitted leaves it unchanged.
+             */
+            metadata?: unknown;
+            /**
+             * @description REFUSED if present: the stable name is immutable. A permission slug is a
+             *     direct authorization input, so a rename under live mappings would silently
+             *     repoint every grant that names it.
+             */
+            slug?: string | null;
         };
         /**
          * @description The body to update a user (issue #52), applied as an RFC 7396 JSON Merge Patch
@@ -10744,6 +10883,337 @@ export interface operations {
                 };
             };
             /** @description Environment not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listPermissions: {
+        parameters: {
+            query?: {
+                /**
+                 * @description The desired page size, a positive integer. Clamped to
+                 *     `[1, max_page_size]`; defaults to the configured default when absent.
+                 */
+                limit?: number;
+                /**
+                 * @description The opaque cursor from a previous page's `next_cursor`. Absent for the
+                 *     first page (keyset pagination; there is no offset).
+                 */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A page of permissions */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PermissionList"];
+                };
+            };
+            /** @description Malformed cursor */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Tenant or environment not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    createPermission: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Required. Replaying a POST with the same key returns the original response without re-executing. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreatePermissionRequest"];
+            };
+        };
+        responses: {
+            /** @description Created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PermissionView"];
+                };
+            };
+            /** @description Malformed request (including a slug the namespaced stable-name rule refuses) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Tenant or environment not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description A live permission of this environment already holds that slug */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Idempotency-Key reused with a different request */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    getPermission: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The permission identifier (prm_...) */
+                permission_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The permission */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PermissionView"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found (absent, deleted, malformed, or another scope's) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    deletePermission: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The permission identifier (prm_...) */
+                permission_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted (the slug is immediately free for a NEW permission, which gets a fresh id) */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found (absent, already deleted, malformed, or another scope's) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    updatePermission: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The permission identifier (prm_...) */
+                permission_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdatePermissionRequest"];
+            };
+        };
+        responses: {
+            /** @description The updated permission */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PermissionView"];
+                };
+            };
+            /** @description Malformed request, or a body naming the immutable slug or kind */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found (absent, deleted, malformed, or another scope's) */
             404: {
                 headers: {
                     [name: string]: unknown;
