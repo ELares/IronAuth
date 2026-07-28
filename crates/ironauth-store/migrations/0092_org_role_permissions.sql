@@ -165,8 +165,16 @@ CREATE TABLE org_role_permissions (
     created_at      timestamptz NOT NULL DEFAULT now(),
     updated_at      timestamptz NOT NULL DEFAULT now(),
     -- When the permission was detached from the role (present only in a
-    -- soft-deleted row). The row is retained so the audit foreign key to it
-    -- stays satisfiable.
+    -- soft-deleted row). The row is RETAINED so the target of the two audit
+    -- actions stays resolvable: an `organization.role.permission.unassign` row
+    -- names this mapping's id, and a hard delete would leave that row pointing
+    -- at an id nothing can look up. No foreign key enforces the retention and
+    -- there deliberately is none: `audit_log` (0002) stores `target_id` as free
+    -- text and references only `tenants` and `environments`, because an
+    -- append-only audit trail must not be constrained by a data table's
+    -- lifecycle. Retention is therefore an APPLICATION rule, and it is the same
+    -- rule (4) in the header states from the other side: a detached mapping is
+    -- never revived, so its detachment stays legible forever.
     deleted_at      timestamptz,
     CONSTRAINT org_role_permissions_scope_nonempty
         CHECK (tenant_id <> '' AND environment_id <> ''),

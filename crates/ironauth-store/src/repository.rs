@@ -32256,8 +32256,10 @@ impl<'a> ManagementStore<'a> {
     /// The read-only role-to-permission mapping repository for `scope` (issue #98):
     /// which permissions a role grants, and which of an organization's roles grant a
     /// permission. The mapping carries the ORGANIZATION even though the vocabulary
-    /// it points at does not, so every read here takes an organization while every
-    /// [`ManagementStore::permissions`] read does not.
+    /// it points at does not, so every read here that answers an organization-scoped
+    /// question takes an organization while every [`ManagementStore::permissions`]
+    /// read does not. [`OrgRolePermissionRepo::get`] is the deliberate exception and
+    /// its own doc says why.
     #[must_use]
     pub fn org_role_permissions(&self, scope: Scope) -> OrgRolePermissionRepo<'a> {
         OrgRolePermissionRepo {
@@ -34675,7 +34677,9 @@ impl OrgMembershipRoleRepo<'_> {
 /// The `organization_id` conjunct is a different matter entirely and is NOT
 /// redundant with anything: the policy cannot see that column, so it is the whole
 /// fence between two organizations of one environment. Dropping it from
-/// `get_assignment` or from `list_by` is killed on its own.
+/// `get_assignment` or from `list_by` is killed on its own. `get` does not carry it
+/// AT ALL and is deliberately organization-blind; [`OrgRolePermissionRepo`] records
+/// what that means for a caller and what a nested route must use instead.
 ///
 /// Do not delete a scope conjunct on the grounds that a mutation survives: the
 /// survival is the expected consequence of typed addressing plus the policy, not
@@ -34689,10 +34693,29 @@ const ORG_ROLE_PERMISSION_SELECT_COLUMNS: &str = "id, organization_id, role_id, 
 ///
 /// Reached by the control plane through [`ManagementStore::org_role_permissions`]
 /// and by the data plane through [`ScopedStore::org_role_permissions`]. Every read
-/// is scope-fenced, carries the organization predicate the row-level-security
-/// policy cannot see, and filters `deleted_at IS NULL`, so a detached mapping reads
-/// as absent, exactly like one of another scope, one of another organization, and
-/// one that never existed.
+/// is scope-fenced and filters `deleted_at IS NULL`, so a detached mapping reads as
+/// absent, exactly like one of another scope and one that never existed.
+///
+/// The ORGANIZATION fence is a SEPARATE property, and only SOME of these reads carry
+/// it. That split matters more than it would on a #97 table, because the
+/// row-level-security policy cannot see `organization_id` at all: the organization
+/// predicate is the whole fence between two organizations of one environment.
+///
+/// * [`Self::get_in_org`], [`Self::get_assignment`], [`Self::list_for_role`] and
+///   [`Self::list_for_permission`] each take an organization and carry the
+///   predicate, so a mapping of a SIBLING organization is the uniform not-found.
+/// * [`Self::get`] and [`Self::parse_id`] take none. `get` is addressed by the
+///   mapping id ALONE and is DELIBERATELY organization-blind, because it is the
+///   by-id read the audit target and the detach handle resolve through: given a
+///   well-formed id of this scope it returns that mapping whatever organization the
+///   row carries.
+///
+/// The redundancy census on `ORG_ROLE_PERMISSION_SELECT_COLUMNS` records the same
+/// split from the predicate side. The consequence for anything built on top: a
+/// management route NESTED UNDER AN ORGANIZATION must resolve through
+/// [`Self::get_in_org`] or [`Self::get_assignment`], NEVER through [`Self::get`],
+/// which would resolve a sibling organization's capability grant with no fence in
+/// front of it.
 ///
 /// The MUTATING counterpart is [`ActingOrgRolePermissionRepo`], reachable only from
 /// the control plane: nothing on the data plane ever writes a mapping, and
@@ -34714,6 +34737,12 @@ impl OrgRolePermissionRepo<'_> {
     }
 
     /// Fetch a live mapping by id, within scope.
+    ///
+    /// ORGANIZATION-BLIND by design: the statement carries `tenant_id`,
+    /// `environment_id` and the liveness filter and NO `organization_id` conjunct, so
+    /// a well-formed id of this scope resolves whatever organization its row carries.
+    /// That is what the audit target and the detach handle need, and it is why a
+    /// caller that has an organization in hand must use [`Self::get_in_org`] instead.
     ///
     /// # Errors
     ///
@@ -38871,7 +38900,9 @@ impl ActingOrgRolePermissionRepo<'_> {
     /// Detach a permission from a role (soft delete) and audit
     /// `organization.role.permission.unassign` in the same transaction.
     ///
-    /// The row is retained so the audit foreign key to it stays satisfiable, and the
+    /// The row is retained so the `target_id` this audit row names stays resolvable,
+    /// which is an APPLICATION rule and not a database one (`audit_log` carries no
+    /// foreign key to this table; migration 0092 records why), and the
     /// (role, permission) pair is immediately available again. A repeat detach
     /// matches no live row and is the uniform not-found. `organization_id` is part of
     /// the ADDRESS and is carried as a predicate, for the containment reason spelled

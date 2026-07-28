@@ -22,8 +22,16 @@
 //!   uniform not-found with nothing mutated and nothing audited.
 //! * ORGANIZATION containment inside ONE scope, which is the only pair a cross-scope
 //!   test cannot stand in for: row-level security fences `(tenant, environment)` and
-//!   nothing finer, so the organization predicate every read and write repeats is
-//!   the whole fence between two organizations of one environment.
+//!   nothing finer, so the organization predicate an organization-addressed read or
+//!   write carries is the whole fence between two organizations of one environment.
+//!   The one DELIBERATE exception is pinned in the same test: `get` is addressed by
+//!   the mapping id alone, carries no organization predicate, and resolves a sibling
+//!   organization's row.
+//! * PAGINATION, in two separable halves. The CURSOR comparison must be strict and
+//!   keyed on `(created_at, id)`, and the list's own ORDER BY must be TOTAL, which
+//!   only becomes observable once the index that supplies the order incidentally is
+//!   taken away. Every walk in this file is BOUNDED, so a cursor that stops
+//!   advancing fails fast instead of hanging the job.
 //! * LIVENESS on all three rows: a soft-deleted role and a soft-deleted permission
 //!   are unattachable, a detached mapping is invisible and re-detaching it is the
 //!   uniform not-found, and re-attaching after a detach mints a FRESH id rather than
@@ -81,6 +89,27 @@ const WIDE: usize = 40;
 /// How many mappings the cursor-tiebreak walk pins to ONE instant. Comfortably more
 /// than the page size it is walked at, so a page boundary lands INSIDE the tie.
 const TIED: usize = 10;
+
+/// The page size both covenant walks page at: small enough that several page
+/// boundaries are crossed.
+const WALK_PAGE: usize = 7;
+
+/// The page size the tied-set walk pages at, chosen so a boundary lands INSIDE the
+/// tie, which is exactly where a cursor keyed on `created_at` alone loses rows.
+const TIED_PAGE: usize = 4;
+
+/// The iteration cap every pagination walk in this file runs under.
+///
+/// A cursor comparison that is not STRICT (`>=` where `>` is meant) makes a walk
+/// serve the SAME page forever. In an unbounded loop that defect does not fail, it
+/// HANGS: the test job burns its whole budget and reports nothing, which is strictly
+/// worse than a red. The cap turns it into a fast, named failure.
+///
+/// Generous by construction, so no correct walk can reach it: one iteration per row,
+/// plus one per page, plus slack for the terminating empty page.
+fn walk_cap(rows: usize, page: usize) -> usize {
+    rows + rows.div_ceil(page) + 8
+}
 
 /// Bind the transaction-local row-level-security scope variables, exactly as the
 /// repository does.
@@ -341,6 +370,41 @@ async fn count_mappings(db: &TestDatabase, predicate: &str) -> i64 {
     .get("c")
 }
 
+/// The ids of every live mapping of `role`, ordered by `id` ALONE, read through the
+/// OWNER pool.
+///
+/// The reference the list's own `ORDER BY created_at, id` must reproduce once every
+/// row shares one `created_at`: under a full tie the two orders are the same order by
+/// definition. Sorted by the DATABASE rather than in Rust, so the comparison is in
+/// the column's own collation and not in whatever order Rust would put the strings.
+async fn ids_ordered_by_id(db: &TestDatabase, role: &OrgRoleId) -> Vec<String> {
+    let rows = sqlx::query(
+        "SELECT id FROM org_role_permissions \
+         WHERE role_id = $1 AND deleted_at IS NULL ORDER BY id",
+    )
+    .bind(role.to_string())
+    .fetch_all(db.owner_pool())
+    .await
+    .expect("read mapping ids ordered by id");
+    rows.iter().map(|row| row.get::<String, _>("id")).collect()
+}
+
+/// How many indexes of `name` exist on `org_role_permissions`. Read from the
+/// catalog, so a test that removes an index to expose the layer above it can prove
+/// the removal actually happened.
+async fn count_indexes_named(db: &TestDatabase, name: &str) -> i64 {
+    sqlx::query(
+        "SELECT count(*) AS c FROM pg_index \
+         JOIN pg_class idx ON idx.oid = pg_index.indexrelid \
+         WHERE pg_index.indrelid = 'org_role_permissions'::regclass AND idx.relname = $1",
+    )
+    .bind(name)
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("count indexes")
+    .get("c")
+}
+
 /// Assert `statement` is refused as SQLSTATE 42501 with the session bound to its OWN
 /// scope.
 ///
@@ -458,8 +522,8 @@ async fn a_permission_is_attached_to_a_role_listed_both_ways_and_detached() {
         vec!["organization.role.permission.assign"]
     );
 
-    // The detach is SOFT: the row is retained so the audit foreign key to it stays
-    // satisfiable, and every read filters it out.
+    // The detach is SOFT: the row is retained so the id the unassign audit row names
+    // stays resolvable, and every read filters it out.
     detach(&db, &env, scope, &org, &mapping)
         .await
         .expect("detach");
@@ -905,6 +969,24 @@ async fn every_list_and_mutation_is_fenced_to_its_own_organization() {
         "both mappings are still live"
     );
 
+    // The ONE deliberate exception, asserted here so the code and the doc on
+    // `OrgRolePermissionRepo` cannot drift apart. `get` is addressed by the mapping id
+    // ALONE and its statement carries no `organization_id` conjunct, so it resolves a
+    // SIBLING organization's mapping: alpha's caller, holding beta's id, gets beta's
+    // row back. That is what the audit target and the detach handle need from a by-id
+    // read, and it is exactly why a management route nested under an organization must
+    // resolve through `get_in_org` (refused just above) and never through this. If
+    // this ever stops holding, the struct doc and the redundancy census both have to
+    // change with it.
+    assert_eq!(
+        repo.get(&beta_mapping)
+            .await
+            .expect("get resolves by id alone, whatever organization the row carries")
+            .organization_id,
+        beta,
+        "`get` is organization-BLIND by design, and the fenced read is `get_in_org`"
+    );
+
     // A cross-organization PAIRING is refused on the write too, in both directions.
     for (org, role) in [(&alpha, &beta_role), (&beta, &alpha_role)] {
         assert!(matches!(
@@ -916,10 +998,10 @@ async fn every_list_and_mutation_is_fenced_to_its_own_organization() {
 
 #[tokio::test]
 async fn an_attach_refuses_a_deleted_role_and_a_deleted_permission() {
-    // The liveness half. Both foreign keys are satisfied by a soft-deleted row (the
-    // row is RETAINED so the audit foreign key to it stays satisfiable), so nothing
-    // in the database refuses either of these: the two resolutions are the whole
-    // fence, and dropping either one lets a dead endpoint be attached.
+    // The liveness half. A soft delete RETAINS the row, so both endpoint foreign keys
+    // are still satisfied by a DEAD endpoint and nothing in the database refuses
+    // either of these: the two resolutions are the whole fence, and dropping either
+    // one lets a dead endpoint be attached.
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
@@ -1809,7 +1891,7 @@ async fn the_grants_are_exactly_what_the_write_path_needs_and_nothing_more() {
     );
 
     // DELETE is granted to NOBODY on either plane: removal is the soft delete, which
-    // is what keeps the audit foreign key satisfiable.
+    // is what keeps a detached mapping's id resolvable from its audit row.
     for role in ["ironauth_control", "ironauth_app"] {
         assert!(
             !has_table_privilege(&db, role, "DELETE").await,
@@ -2100,6 +2182,9 @@ async fn a_role_may_carry_unlimited_permissions_and_a_permission_unlimited_roles
 
 /// Page the whole "permissions of this role" list through the `(created_at, id)`
 /// cursor, at a page size small enough that several boundaries are crossed.
+///
+/// BOUNDED, for the reason [`walk_cap`] gives: a cursor that stops advancing must
+/// fail here rather than spin.
 async fn walk_role(
     repo: &ironauth_store::OrgRolePermissionRepo<'_>,
     org: &OrganizationId,
@@ -2107,9 +2192,23 @@ async fn walk_role(
 ) -> Vec<OrgRolePermissionId> {
     let mut seen = Vec::new();
     let mut cursor: Option<CursorPosition> = None;
+    let cap = walk_cap(WIDE, WALK_PAGE);
+    let mut steps = 0_usize;
     loop {
+        steps += 1;
+        assert!(
+            steps <= cap,
+            "the \"permissions of this role\" walk ran past {cap} pages without ending: \
+             the cursor is not advancing, which is what a non-strict cursor comparison \
+             produces"
+        );
         let page = repo
-            .list_for_role(org, role, 7, cursor.as_ref())
+            .list_for_role(
+                org,
+                role,
+                i64::try_from(WALK_PAGE).expect("page size fits i64"),
+                cursor.as_ref(),
+            )
             .await
             .expect("page");
         let Some(last) = page.last() else {
@@ -2124,7 +2223,8 @@ async fn walk_role(
     seen
 }
 
-/// The reverse-direction walk, over "roles carrying this permission".
+/// The reverse-direction walk, over "roles carrying this permission". Bounded for
+/// the same reason as [`walk_role`].
 async fn walk_permission(
     repo: &ironauth_store::OrgRolePermissionRepo<'_>,
     org: &OrganizationId,
@@ -2132,9 +2232,23 @@ async fn walk_permission(
 ) -> Vec<OrgRolePermissionId> {
     let mut seen = Vec::new();
     let mut cursor: Option<CursorPosition> = None;
+    let cap = walk_cap(WIDE, WALK_PAGE);
+    let mut steps = 0_usize;
     loop {
+        steps += 1;
+        assert!(
+            steps <= cap,
+            "the \"roles carrying this permission\" walk ran past {cap} pages without \
+             ending: the cursor is not advancing, which is what a non-strict cursor \
+             comparison produces"
+        );
         let page = repo
-            .list_for_permission(org, permission, 7, cursor.as_ref())
+            .list_for_permission(
+                org,
+                permission,
+                i64::try_from(WALK_PAGE).expect("page size fits i64"),
+                cursor.as_ref(),
+            )
             .await
             .expect("page");
         let Some(last) = page.last() else {
@@ -2193,14 +2307,34 @@ async fn the_list_cursor_stays_total_and_stable_across_a_tied_created_at() {
         "the tie is real: every row shares one creation time"
     );
 
+    // This test pins the CURSOR comparison. The ORDER BY's own `, id` tiebreak is a
+    // separate property that nothing here can see, because both sides of every
+    // assertion below come from the same ORDER BY and would drift together;
+    // `the_list_order_by_is_total_with_the_ordering_index_taken_away` pins that one
+    // and records why it needs its own fixture.
+    //
     // Walk the same set in pages of four, TWICE. A page boundary lands inside the
     // tie, which is where a cursor keyed on created_at alone repeats or drops a row.
+    let cap = walk_cap(TIED, TIED_PAGE);
     for attempt in 0..2 {
         let mut walked: Vec<OrgRolePermissionId> = Vec::new();
         let mut cursor: Option<CursorPosition> = None;
+        let mut steps = 0_usize;
         loop {
+            steps += 1;
+            assert!(
+                steps <= cap,
+                "walk {attempt}: the tied-set walk ran past {cap} pages without ending: \
+                 the cursor is not advancing, which is what a non-strict cursor \
+                 comparison produces"
+            );
             let page = repo
-                .list_for_role(&org, &role, 4, cursor.as_ref())
+                .list_for_role(
+                    &org,
+                    &role,
+                    i64::try_from(TIED_PAGE).expect("page size fits i64"),
+                    cursor.as_ref(),
+                )
                 .await
                 .expect("page of the tied set");
             let Some(last) = page.last() else {
@@ -2223,6 +2357,80 @@ async fn the_list_cursor_stays_total_and_stable_across_a_tied_created_at() {
             unique.len(),
             TIED,
             "walk {attempt}: every mapping in the tied set is seen exactly once"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_list_order_by_is_total_with_the_ordering_index_taken_away() {
+    // The list's own `ORDER BY created_at, id`, which the cursor test above cannot
+    // reach and which is worth its own fixture for a reason that was MEASURED rather
+    // than assumed.
+    //
+    // Dropping `, id` from the ORDER BY leaves this whole file green on the shipped
+    // schema, and not because the property does not matter: the planner answers
+    // `list_for_role` from `org_role_permissions_role_idx`, whose trailing
+    // `(created_at, id)` columns hand the tie back in id order FOR FREE. So the
+    // predicate looks pinned while what is actually holding the order up is an index
+    // the query never named. Take that index away and the query has to stand on its
+    // own: the plan becomes a scan plus a sort, and a sort keyed on `created_at`
+    // ALONE returns a tie in whatever order the scan produced, which is insertion
+    // order and not id order (the ids carry random unique components).
+    //
+    // Same move, and the same reason, as
+    // `the_repository_still_fences_by_environment_with_the_policy_half_down`: remove
+    // the layer underneath so the layer under test is the only thing left. A walk
+    // over a set whose ORDER BY is not total can miss or repeat rows at a page
+    // boundary even though the cursor comparison is exactly right, which is why the
+    // two properties need two tests.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = create_org(&db, &env, scope, "Acme").await;
+    let role = create_role(&db, &env, scope, &org, "admin").await;
+
+    let tied = 7_000_i64;
+    for index in 0..TIED {
+        let permission =
+            create_permission(&db, &env, scope, &format!("billing.tied_{index}")).await;
+        attach_at(&db, &env, scope, &org, &role, &permission, tied)
+            .await
+            .unwrap_or_else(|error| panic!("mapping {index} must be attachable: {error:?}"));
+    }
+
+    // Under a FULL tie in `created_at`, `ORDER BY created_at, id` IS `ORDER BY id`.
+    // That is the reference, sorted by the database in the column's own collation.
+    let by_id = ids_ordered_by_id(&db, &role).await;
+    assert_eq!(by_id.len(), TIED, "the whole tied set is there");
+
+    // The layer really is down, and it cannot come back: after this no plan can use
+    // it, whatever role or statistics the read runs under.
+    db.execute_owner_sql("DROP INDEX org_role_permissions_role_idx")
+        .await;
+    assert_eq!(
+        count_indexes_named(&db, "org_role_permissions_role_idx").await,
+        0,
+        "the ordering index must be gone, or this test proves nothing about the \
+         ORDER BY"
+    );
+
+    let repo = db.control_store().management().org_role_permissions(scope);
+
+    // Repeated, because a total order is also a STABLE one: the same query over the
+    // same rows cannot reorder the tie between two calls.
+    for repeat in 0..3 {
+        let listed: Vec<String> = repo
+            .list_for_role(&org, &role, 50, None)
+            .await
+            .expect("unpaged list of the tied set")
+            .iter()
+            .map(|record| record.id.to_string())
+            .collect();
+        assert_eq!(
+            listed, by_id,
+            "repeat {repeat}: with no index supplying the order, the list's own \
+             ORDER BY must still be TOTAL, which under a full created_at tie means \
+             exactly the id order"
         );
     }
 }
