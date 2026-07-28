@@ -33700,12 +33700,13 @@ impl OrgGroupRepo<'_> {
     }
 }
 
-/// The shared bounded closure both effective-resolution reads run (issue #97): the
-/// caller's LIVE ACTIVE membership in a LIVE ACTIVE organization, and the transitive
-/// ANCESTOR closure of every group that membership is a live member of.
+/// The shared preamble every effective-resolution read runs (issue #97): the caller's
+/// LIVE ACTIVE membership in a LIVE ACTIVE organization, the transitive ANCESTOR
+/// closure of every group that membership is a live member of, and the set of role ids
+/// that membership therefore effectively holds.
 ///
 /// This is the read side of the group hierarchy, and it runs on the TOKEN-ISSUANCE
-/// path, so four properties are load-bearing rather than stylistic.
+/// path, so five properties are load-bearing rather than stylistic.
 ///
 ///   1. `deleted_at IS NULL` in EVERY arm, seed and recursive alike. The LIVE graph
 ///      is a forest; the STORED rows are not necessarily, because a group delete
@@ -33727,20 +33728,21 @@ impl OrgGroupRepo<'_> {
 ///      `parent_id` is an untrusted stored pointer: deleting it really does change an
 ///      answer, and
 ///      `the_read_walk_never_crosses_organization_via_a_corrupt_parent` is the test
-///      that says so. [`EFFECTIVE_ROLE_SLUGS_TAIL`] carries the census of which
-///      organization predicates on this closure and on that projection are redundant
-///      and which are not, and says where the third projection's copies are counted.
+///      that says so. The census of which organization predicates here are redundant
+///      and which are not is the section below, and it says where the copies that are
+///      not part of it are counted instead.
 ///   4. The `JOIN organizations o` on the membership SEED. The organization's own
 ///      lifecycle is checked HERE, once, and it is the coarsest revocation the
 ///      product has: an operator who DISABLES or soft-DELETES an organization
 ///      expects it to stop asserting anything, and this seed is the only place all
 ///      three projections pass through. Every arm below it is fed by `membership`
-///      (directly, or through `closure`, which seeds from it), so an organization
-///      that is not live and active empties the closure and every projection over
-///      it answers the EMPTY set. Empty is the right answer rather than an error: a
-///      disabled organization is an operator STATE, not a fault, and a fault here
-///      would turn a deliberate administrative action into a token-endpoint outage
-///      for every member.
+///      (directly, or through `closure`, which seeds from it, or through
+///      `effective_roles`, whose every branch reads one of those two), so an
+///      organization that is not live and active empties the closure, empties the
+///      effective role set, and every projection over them answers the EMPTY set.
+///      Empty is the right answer rather than an error: a disabled organization is
+///      an operator STATE, not a fault, and a fault here would turn a deliberate
+///      administrative action into a token-endpoint outage for every member.
 ///
 ///      This predicate is LOAD BEARING on both mint hooks and has no second layer
 ///      anywhere behind it. Neither hook re-checks the organization: the refresh
@@ -33753,6 +33755,95 @@ impl OrgGroupRepo<'_> {
 ///      the family; `a_disabled_organization_stops_minting_its_roles_on_both_hooks`
 ///      and `a_soft_deleted_organization_stops_minting_its_roles_too` in
 ///      `crates/ironauth-oidc/tests/org_roles_claim.rs` are the tests that say so.
+///   5. The `effective_roles` arm. It is the AUTHORITATIVE definition of which roles
+///      a membership effectively holds, and it is deliberately here rather than in a
+///      projection: [`EFFECTIVE_ROLE_SLUGS_TAIL`] is now nothing but a projection of
+///      it, so the slug set the token-issuance path emits and any later projection
+///      over this same arm cannot disagree about WHICH roles are held. The argument
+///      is the one point 4 makes for the seed. A second statement of "which roles"
+///      could drift from this one, and a drifted copy on the issuance path is an
+///      authorization answer nobody reviewed.
+///
+///      Its two `OR` branches are the two grant kinds. The first reads `membership`
+///      directly, so it is the DIRECT grant; the second reads `closure`, so it
+///      inherits the whole bounded ancestor walk and every property points 1 to 3
+///      give it. The branches are expressed as two `IN` subqueries over ONE
+///      `org_roles` scan rather than as a `UNION` of two role sets, so a role
+///      reachable by SEVERAL paths (directly AND through two different groups, say)
+///      yields exactly one row without relying on a set operator to deduplicate.
+///
+///      [`EFFECTIVE_ROLE_GRANTS_TAIL`] deliberately does NOT read this arm, and that
+///      is not an oversight. It answers the different question "by which PATH", so
+///      it has to keep the two grant kinds separable and each granting group
+///      attributable, which needs the assignment rows themselves and not a set of
+///      role ids. It restates the same predicates over the same live rows; its own
+///      doc comment names which of them are load bearing and the test that kills
+///      each.
+///
+///      A projection that does not reference this arm does not pay for it. Postgres
+///      drops a CTE nothing references, so `EXPLAIN` of
+///      [`EFFECTIVE_GROUP_SLUGS_TAIL`] over this preamble visits `org_roles` not at
+///      all; that was checked on a real plan rather than assumed, because putting
+///      the arm in the SHARED preamble is what buys the single definition and it
+///      would be a poor trade if it also put a role scan on the group projection.
+///
+/// # The organization predicates: FIVE mutually redundant survivors, and two that are not
+///
+/// This statement carries an `organization_id = $3` predicate in SEVEN places (the
+/// `o.id = m.organization_id` join condition is a key rather than a fence and is not one
+/// of them). FIVE of the seven are redundant WITH RESPECT TO EACH OTHER: deleting any
+/// one of them ALONE changes no answer and no test can distinguish its presence, because
+/// the others still fence the same rows under the write path's invariant that every
+/// assignment resolves BOTH of its endpoints as live rows of ONE organization. All five
+/// are retained deliberately and are named here in full, so that nobody removes one as
+/// dead weight and so that this note cannot be read as covering only the first:
+///
+///   * `gm.organization_id` and `g.organization_id` in the SEED arm of `closure`;
+///   * `r.organization_id` on the role row itself in the `effective_roles` arm;
+///   * `mr.organization_id` in that arm's direct-grant subquery;
+///   * `gr.organization_id` in that arm's group-grant subquery.
+///
+/// Together they are the layer under that write-time invariant: if a future write path
+/// ever admitted a cross-organization assignment, these are what would keep the
+/// resulting role out of a token instead of quietly emitting it.
+///
+/// The SIXTH is NOT of this kind and must not be filed with them. `g.organization_id` in
+/// the RECURSIVE arm of `closure` is the only thing fencing the organization on the
+/// ancestor walk, and `parent_id` is an UNTRUSTED stored pointer (a group delete
+/// DETACHES, so a stored parent may name a row the live invariant never re-validated,
+/// and the column's foreign key is id only). Removing it lets a sibling organization's
+/// group into the closure, and therefore its name into the group set a token carries;
+/// `the_read_walk_never_crosses_organization_via_a_corrupt_parent` is the test that
+/// holds it in place.
+///
+/// The SEVENTH is a different category again, and is called out so the count is honest.
+/// `m.organization_id` on the membership seed is the SELECTOR: it is what makes
+/// `membership` the caller's membership in THIS organization rather than their
+/// membership in any organization of the scope. It is not a repetition of a fence some
+/// other predicate also carries, which is what the five above are and what the
+/// five-count exists to stop a reader pruning.
+///
+/// The count is a tally over THIS statement, and it is worth saying so out loud, because
+/// a projection over it repeats the same predicates. [`EFFECTIVE_ROLE_GRANTS_TAIL`]
+/// carries `r.organization_id` and `mr.organization_id` in its direct branch and
+/// `r.organization_id` and `gr.organization_id` in its group branch; they are the same
+/// layer, kept for the same reason, and they are simply not part of the five counted
+/// here. That tail carries its own note on the two predicates in it that are NOT of this
+/// kind.
+///
+/// # The liveness filters are not redundant either
+///
+/// `r.deleted_at IS NULL` in the `effective_roles` arm: a role can be soft-deleted while
+/// its assignment rows stay live, which is the ordinary state after a role delete.
+///
+/// `gr.deleted_at IS NULL` in that arm's group-grant subquery has no second layer behind
+/// it at all, and its removal is observable in an entirely ordinary state rather than in
+/// a corrupt one. Without it an operator who withdraws a role from a group sees the
+/// `organization.group.role.unassign` audit row and sees the grant leave
+/// `list_for_group`, while every live member of that group AND of every DESCENDANT keeps
+/// receiving the role in `effective_roles`, and therefore in the access token, forever.
+/// Rules 2 and 3 of `resolution_excludes_every_soft_deleted_row_on_the_path` are what
+/// say so.
 ///
 /// Binds: `$1` tenant, `$2` environment, `$3` organization, `$4` user, `$5` the walk
 /// bound (`max_group_depth`, one LOWER than the write walks use; see
@@ -33785,91 +33876,56 @@ const EFFECTIVE_CLOSURE_CTE: &str = "WITH RECURSIVE membership AS ( \
           WHERE g.tenant_id = $1 AND g.environment_id = $2 \
             AND g.organization_id = $3 AND g.deleted_at IS NULL \
             AND c.depth < $5 \
+     ), \
+     effective_roles AS ( \
+         SELECT r.id, r.slug \
+           FROM org_roles r \
+          WHERE r.tenant_id = $1 AND r.environment_id = $2 \
+            AND r.organization_id = $3 AND r.deleted_at IS NULL \
+            AND ( \
+                 r.id IN ( \
+                     SELECT mr.role_id \
+                       FROM org_membership_roles mr \
+                       JOIN membership mb ON mb.id = mr.membership_id \
+                      WHERE mr.tenant_id = $1 AND mr.environment_id = $2 \
+                        AND mr.organization_id = $3 AND mr.deleted_at IS NULL \
+                 ) \
+              OR r.id IN ( \
+                     SELECT gr.role_id \
+                       FROM org_group_roles gr \
+                      WHERE gr.tenant_id = $1 AND gr.environment_id = $2 \
+                        AND gr.organization_id = $3 AND gr.deleted_at IS NULL \
+                        AND gr.group_id IN (SELECT id FROM closure) \
+                 ) \
+            ) \
      ) ";
 
 /// The projection [`OrgGroupRepo::effective_roles`] runs over
-/// [`EFFECTIVE_CLOSURE_CTE`]: every LIVE role of the organization granted either
-/// DIRECTLY to the membership or to any group in the ancestor closure.
+/// [`EFFECTIVE_CLOSURE_CTE`]: the slugs of the `effective_roles` arm, which is every
+/// LIVE role of the organization granted either DIRECTLY to the membership or to any
+/// group in the ancestor closure.
 ///
-/// The union is expressed as two `IN` subqueries over one `org_roles` scan rather
-/// than as a `UNION` of two role sets, so a role reachable by SEVERAL paths (direct
-/// AND via two different groups, say) collapses to exactly one row without relying
-/// on a set operator to deduplicate. `DISTINCT` plus `ORDER BY r.slug` makes the
-/// result already sorted and deduplicated before the [`BTreeSet`] sees it.
+/// This is a PROJECTION and nothing else, deliberately. Point 5 of
+/// [`EFFECTIVE_CLOSURE_CTE`] holds the whole definition of which roles a membership
+/// effectively holds, together with the organization-predicate census and the liveness
+/// argument that used to live here, so that a later projection over the same arm reads
+/// ONE definition rather than a restatement that could drift from the one the
+/// token-issuance path resolves. Selecting slugs here rather than re-visiting
+/// `org_roles` is the same move [`EFFECTIVE_GROUP_SLUGS_TAIL`] makes over `closure`:
+/// the arm already carries the slug and is already fenced to live roles of this
+/// organization, so a second scan would add a second copy of the fence and no answer.
 ///
-/// # The organization predicates: FIVE mutually redundant survivors, and one that is not
-///
-/// This statement and the closure it runs over repeat `organization_id` in six places,
-/// and FIVE of them are redundant WITH RESPECT TO EACH OTHER: deleting any one of them
-/// ALONE changes no answer and no test can distinguish its presence, because the
-/// others still fence the same rows under the write path's invariant that every
-/// assignment resolves BOTH of its endpoints as live rows of ONE organization. All
-/// five are retained deliberately and are named here in full, so that nobody removes
-/// one as dead weight and so that this note cannot be read as covering only the first:
-///
-///   * `r.organization_id` below, on the role row itself;
-///   * `gm.organization_id` and `g.organization_id` in the SEED arm of
-///     [`EFFECTIVE_CLOSURE_CTE`];
-///   * `mr.organization_id` in the direct-grant subquery below;
-///   * `gr.organization_id` in the group-grant subquery below.
-///
-/// Together they are the layer under that write-time invariant: if a future write path
-/// ever admitted a cross-organization assignment, these are what would keep the
-/// resulting role out of a token instead of quietly emitting it.
-///
-/// The count is a tally over THIS statement and the closure, and it is worth saying so
-/// out loud, because a THIRD projection now runs over the same closure.
-/// [`EFFECTIVE_ROLE_GRANTS_TAIL`] repeats the same predicates in its own two branches
-/// (`r.organization_id` and `mr.organization_id` in the direct branch,
-/// `r.organization_id` and `gr.organization_id` in the group branch); they are the
-/// same layer, kept for the same reason, and they are simply not part of the five
-/// counted here. That tail carries its own note on the two predicates in it that are
-/// NOT of this kind.
-///
-/// The SIXTH is NOT of this kind and must not be filed with them. `g.organization_id`
-/// in the RECURSIVE arm of [`EFFECTIVE_CLOSURE_CTE`] is the only thing fencing the
-/// organization on the ancestor walk, and `parent_id` is an UNTRUSTED stored pointer
-/// (a group delete DETACHES, so a stored parent may name a row the live invariant
-/// never re-validated, and the column's foreign key is id only). Removing it lets a
-/// sibling organization's group into the closure, and therefore its name into the
-/// group set a token carries;
-/// `the_read_walk_never_crosses_organization_via_a_corrupt_parent` is the test that
-/// holds it in place.
-///
-/// # The liveness filters are not redundant either
-///
-/// `r.deleted_at IS NULL` here: a role can be soft-deleted while its assignment rows
-/// stay live, which is the ordinary state after a role delete.
-///
-/// `gr.deleted_at IS NULL` in the group-grant subquery has no second layer behind it
-/// at all, and its removal is observable in an entirely ordinary state rather than in
-/// a corrupt one. Without it an operator who withdraws a role from a group sees the
-/// `organization.group.role.unassign` audit row and sees the grant leave
-/// `list_for_group`, while every live member of that group AND of every DESCENDANT
-/// keeps receiving the role in `effective_roles`, and therefore in the access token,
-/// forever. Rules 2 and 3 of
-/// `resolution_excludes_every_soft_deleted_row_on_the_path` are what say so.
-const EFFECTIVE_ROLE_SLUGS_TAIL: &str = "SELECT DISTINCT r.slug AS slug \
-       FROM org_roles r \
-      WHERE r.tenant_id = $1 AND r.environment_id = $2 \
-        AND r.organization_id = $3 AND r.deleted_at IS NULL \
-        AND ( \
-             r.id IN ( \
-                 SELECT mr.role_id \
-                   FROM org_membership_roles mr \
-                   JOIN membership mb ON mb.id = mr.membership_id \
-                  WHERE mr.tenant_id = $1 AND mr.environment_id = $2 \
-                    AND mr.organization_id = $3 AND mr.deleted_at IS NULL \
-             ) \
-          OR r.id IN ( \
-                 SELECT gr.role_id \
-                   FROM org_group_roles gr \
-                  WHERE gr.tenant_id = $1 AND gr.environment_id = $2 \
-                    AND gr.organization_id = $3 AND gr.deleted_at IS NULL \
-                    AND gr.group_id IN (SELECT id FROM closure) \
-             ) \
-        ) \
-      ORDER BY r.slug";
+/// `DISTINCT` plus `ORDER BY slug` makes the result already sorted and deduplicated
+/// before the [`BTreeSet`] sees it. `DISTINCT` cannot currently drop a row: the arm
+/// scans `org_roles` once, so a role reachable by several paths is already one row, and
+/// `org_roles_org_slug_live_uniq` (migration 0086) forbids two LIVE roles of one
+/// organization sharing a slug. That was equally true of the two-subquery form this
+/// replaced, which carried the same `DISTINCT` over the same single scan, so keeping it
+/// preserves the statement exactly; this refactor promises no behaviour change and does
+/// not get to spend that promise on pruning a keyword.
+const EFFECTIVE_ROLE_SLUGS_TAIL: &str = "SELECT DISTINCT slug AS slug \
+       FROM effective_roles \
+      ORDER BY slug";
 
 /// The projection [`OrgGroupRepo::effective_group_slugs`] runs over
 /// [`EFFECTIVE_CLOSURE_CTE`]: the FLATTENED closure itself.
@@ -33884,14 +33940,16 @@ const EFFECTIVE_GROUP_SLUGS_TAIL: &str = "SELECT DISTINCT slug AS slug FROM clos
 /// [`EFFECTIVE_CLOSURE_CTE`]: the same live roles [`EFFECTIVE_ROLE_SLUGS_TAIL`]
 /// resolves, but one row per GRANT PATH and carrying which path it is.
 ///
-/// # Why this is a UNION ALL of two branches rather than one scan with two `IN`s
+/// # Why this is a UNION ALL of two branches rather than a read of `effective_roles`
 ///
-/// [`EFFECTIVE_ROLE_SLUGS_TAIL`] deliberately collapses the two grant kinds into one
-/// `org_roles` scan under `OR`, because it answers "which roles" and a role reachable
-/// twice must appear once. This tail answers the DIFFERENT question "by which paths",
-/// so the two kinds have to stay separable and each group that carries a grant has to
-/// stay attributable. The branches are otherwise the SAME predicates over the SAME
-/// live rows, so the distinct slugs this returns are exactly the set that one returns.
+/// The `effective_roles` arm of [`EFFECTIVE_CLOSURE_CTE`] collapses the two grant kinds
+/// into one `org_roles` scan under `OR`, because it answers "which roles" and a role
+/// reachable twice must appear once; [`EFFECTIVE_ROLE_SLUGS_TAIL`] is a bare projection
+/// of it. This tail answers the DIFFERENT question "by which paths", so the two kinds
+/// have to stay separable and each group that carries a grant has to stay attributable,
+/// which needs the assignment rows themselves and not a set of role ids. The branches
+/// are otherwise the SAME predicates over the SAME live rows, so the distinct slugs
+/// this returns are exactly the set that arm yields.
 ///
 /// The DIRECT branch projects a literal `NULL` group. A NULL is the encoding of
 /// "no group was involved", not of "unknown": `EffectiveRoleSource::Direct` is what
@@ -33909,9 +33967,10 @@ const EFFECTIVE_GROUP_SLUGS_TAIL: &str = "SELECT DISTINCT slug AS slug FROM clos
 ///
 /// # The DIRECT branch's two selectors, and what pins each
 ///
-/// Being a copy of [`EFFECTIVE_ROLE_SLUGS_TAIL`]'s direct-grant subquery is what
-/// makes this branch correct and also what makes it easy to prune wrongly, so the
-/// two predicates that carry it are named with the test that kills each.
+/// Being a copy of the direct-grant subquery in the `effective_roles` arm of
+/// [`EFFECTIVE_CLOSURE_CTE`] is what makes this branch correct and also what makes it
+/// easy to prune wrongly, so the two predicates that carry it are named with the test
+/// that kills each.
 ///
 /// `JOIN membership mb ON mb.id = mr.membership_id` is the only thing that makes
 /// this branch report THIS member's grants rather than EVERY live direct grant in
