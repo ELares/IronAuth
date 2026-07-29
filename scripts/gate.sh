@@ -79,6 +79,9 @@ git diff --exit-code docs/flow-golden.json
 echo "==> openapi freshness (served management spec vs committed artifact)"
 scripts/openapi-check.sh
 
+echo "==> fuzz matrix freshness (every registered fuzz target has a CI matrix row)"
+scripts/fuzz-matrix-freshness.sh
+
 if command -v cargo-deny >/dev/null 2>&1; then
   echo "==> cargo deny"
   cargo deny check

@@ -794,4 +794,35 @@ mod tests {
             Some(X509Error::ConstraintViolation)
         );
     }
+
+    #[test]
+    fn a_multibyte_validity_time_is_rejected_not_a_panic() {
+        // Issue #419, the char-boundary panic class, driven through the PUBLIC entry
+        // point the caller reaches with bytes it does not control: a packed attestation
+        // statement's `x5c` is parsed here BEFORE any signature or chain check. The
+        // patch keeps the DER byte lengths identical (a 4-byte character replaces four
+        // ASCII digits), so the only thing that changes is that `notBefore` is no
+        // longer all one-byte characters, which used to slice through a character.
+        let mut der = cert("Leaf", "Root", [3; 32], [1; 32], FAR, None, false);
+        // The UNPATCHED fixture parses, so the rejection below is attributable to the
+        // one byte range this test edits and not to some unrelated refusal.
+        assert!(
+            parse_certificate(&der).is_ok(),
+            "the generated certificate parses before the validity time is patched"
+        );
+        let ascii_time = b"19700101000000Z";
+        let start = der
+            .windows(ascii_time.len())
+            .position(|w| w == ascii_time)
+            .expect("the generated certificate carries a notBefore GeneralizedTime");
+        der[start..start + ascii_time.len()].copy_from_slice(b"1970010203\xf0\x9f\x98\x80Z");
+        // Pin the VARIANT, as the sibling tests in this module do. A bare `is_err` would
+        // stay green if a future edit made `parse_certificate` refuse this fixture
+        // earlier for an unrelated reason, silently retiring the coverage.
+        assert_eq!(
+            parse_certificate(&der).err(),
+            Some(X509Error::Malformed),
+            "a non-ASCII validity time is a clean parse rejection"
+        );
+    }
 }

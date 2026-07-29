@@ -6,6 +6,19 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Char-boundary panics in the DER time parser and the MDS3 AAGUID parser (issue #419):
+  `der::parse_time` cut every field at a constant byte offset behind a byte-LENGTH
+  check, with the ASCII-digit validation running INSIDE `parse_2` AFTER the slice, so a
+  value of the right length carrying a multi-byte character panicked ("end byte index 2
+  is not a char boundary"). It runs on a `packed` attestation statement's `x5c` chain
+  BEFORE the signature, AAGUID, and chain checks, so an unauthenticated passkey signup
+  reached it on a tenant configured for `direct` attestation, and on an MDS3 BLOB's
+  `x5c` chain BEFORE the JWS signature check. `mds3::parse_aaguid` had the same shape.
+  Both now require the value to be ASCII, which is what the digit and hex-digit parses
+  already assumed, so every constant offset is a character boundary and no value that
+  parsed before parses differently. The root `fuzz/ceremony_parse` target now covers
+  `x509::parse_certificate` through both carriers, with the crashing certificate
+  committed as a corpus seed.
 - X.509 path-constraint enforcement (issue #66 PR B, adversarial review): the `x509`
   chain verifier now parses `basicConstraints` and `keyUsage` and enforces them on every
   certificate that signs another: an issuer MUST be a CA (`CA:TRUE`), a present `keyUsage`

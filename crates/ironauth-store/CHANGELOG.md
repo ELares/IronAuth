@@ -6,6 +6,14 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Char-boundary panic in redirect matching (issue #418, entered retroactively with issue
+  #419): `redirect::strip_http_scheme_ci` sliced a `str` at the constant byte 7 behind a
+  byte-LENGTH check, so a URI whose byte 7 fell inside a multi-byte character panicked.
+  The comparison now runs over the leading BYTES. `redirect_uri_matches` is public and
+  its documented contract is that it is safe on any input, so the fix is user-visible
+  even though the panic was NOT remotely reachable (every production caller runs the
+  registrability check first, which rejects every byte outside `0x21..=0x7E`). The entry
+  was omitted when #418 landed; it belongs here per CONTRIBUTING.md.
 - Federation outbound-login correlation state (issue #75, PR B): migration 0058 adds the
   tenant-scoped, forced-RLS `federation_login_states` table (a NEW `fls_` scope-embedded
   `ScopedKind`) and its data-plane `FederationLoginStateRepo`. A row correlates an upstream

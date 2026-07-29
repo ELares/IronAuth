@@ -1087,10 +1087,16 @@ fn check_url(url: &str, pointer: &str, shape: UrlShape, errors: &mut Vec<Validat
 /// beyond confirming an authority exists, because the SSRF-hardened fetcher parses
 /// and resolves the URL authoritatively at fetch time.
 fn validate_https_url(url: &str, shape: UrlShape) -> Result<(), String> {
-    // Scheme: case-insensitive `https://`.
+    // Scheme: case-insensitive `https://`, compared on the leading BYTES. Slicing at
+    // the constant `scheme_len` PANICKED when a multi-byte character straddled that
+    // offset, because a length check is not a character-boundary check. Once the
+    // leading bytes ARE the ASCII scheme the offset is a boundary, so the tail slice
+    // below stays a direct slice.
     let scheme_len = "https://".len();
-    let starts_https =
-        url.len() >= scheme_len && url[..scheme_len].eq_ignore_ascii_case("https://");
+    let starts_https = url
+        .as_bytes()
+        .get(..scheme_len)
+        .is_some_and(|head| head.eq_ignore_ascii_case(b"https://"));
     if !starts_https {
         return Err(format!(
             "must be an absolute https URL (got {})",
@@ -1692,5 +1698,39 @@ mod tests {
             errors.iter().any(|error| error.pointer == "/endpoints"),
             "{errors:?}"
         );
+    }
+
+    #[test]
+    fn a_multibyte_character_at_the_scheme_boundary_is_a_validation_error_not_a_panic() {
+        // Issue #419, the char-boundary panic class, the sibling of the same defect in
+        // `discovery::has_scheme`. The scheme test used to slice at the constant byte 8
+        // after only a LENGTH check, so a value whose byte 8 fell inside a character
+        // panicked: "end byte index 8 is not a char boundary".
+        for issuer in [
+            "https:/\u{20ac}",
+            "https:/\u{20ac}/x",
+            "\u{1f600}\u{1f600}",
+            "https:/\u{e9}",
+        ] {
+            assert!(
+                validate_https_url(issuer, UrlShape::AbsoluteHttps).is_err(),
+                "{issuer}"
+            );
+            let json = VALID.replace("https://issuer.example.com", issuer);
+            let def = parse(&json).expect("parses");
+            let errors = def.validate().expect_err("a non-absolute issuer rejected");
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.pointer == "/endpoints/issuer"),
+                "{errors:?}"
+            );
+        }
+        // The byte comparison moves no verdict: a well-formed issuer still validates,
+        // the scheme test is still case-insensitive, and a short value is still short.
+        assert!(validate_https_url("https://issuer.example.com", UrlShape::AbsoluteHttps).is_ok());
+        assert!(validate_https_url("HTTPS://issuer.example.com", UrlShape::AbsoluteHttps).is_ok());
+        assert!(validate_https_url("https:/", UrlShape::AbsoluteHttps).is_err());
+        assert!(validate_https_url("", UrlShape::AbsoluteHttps).is_err());
     }
 }

@@ -232,7 +232,17 @@ fn check_endpoint_url(
 
 /// Whether `value` begins with `scheme` (case-insensitively).
 fn has_scheme(value: &str, scheme: &str) -> bool {
-    value.len() >= scheme.len() && value[..scheme.len()].eq_ignore_ascii_case(scheme)
+    // Compare the leading BYTES rather than slicing at the constant `scheme.len()`: a
+    // length check proves only that the bytes exist, not that `scheme.len()` is a
+    // character boundary, so `&value[..scheme.len()]` PANICKED on a value with a
+    // multi-byte character straddling that offset (`https:/<euro>`), and the value here
+    // comes from a fetched upstream discovery document. Once the leading bytes ARE the
+    // ASCII scheme, that offset is a boundary, so the caller's `&value[scheme_len..]`
+    // stays a direct slice.
+    value
+        .as_bytes()
+        .get(..scheme.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(scheme.as_bytes()))
 }
 
 /// Resolve a connector's endpoints WITHOUT discovery: an explicit-endpoint connector
@@ -389,5 +399,74 @@ mod tests {
             matches!(err, ConnectorError::UpstreamProtocol(_)),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn a_multibyte_character_at_the_scheme_boundary_is_a_protocol_fault_not_a_panic() {
+        // Issue #419, the char-boundary panic class. The endpoint value is whatever a
+        // fetched upstream document carried, and the scheme test used to slice at the
+        // constant byte 8 after only a LENGTH check: "end byte index 8 is not a char
+        // boundary". Every one of these is now the protocol fault the check intended.
+        for endpoint in [
+            "https:/\u{20ac}/authorize",
+            "http:/\u{20ac}",
+            "\u{1f600}\u{1f600}/authorize",
+            "https:/\u{e9}",
+        ] {
+            assert!(!has_scheme(endpoint, "https://"), "{endpoint}");
+            assert!(!has_scheme(endpoint, "http://"), "{endpoint}");
+            let body = format!(
+                r#"{{"issuer":"{ISSUER}","authorization_endpoint":"{endpoint}","token_endpoint":"https://issuer.example.com/token","jwks_uri":"https://issuer.example.com/jwks"}}"#
+            );
+            let err = parse_discovery(body.as_bytes(), ISSUER)
+                .expect_err("a non-absolute endpoint is rejected");
+            assert!(
+                matches!(err, ConnectorError::UpstreamProtocol(_)),
+                "{err:?}"
+            );
+        }
+        // The byte comparison moves no verdict: the scheme test is still exact, still
+        // case-insensitive, and a shorter value is still simply not a match.
+        assert!(has_scheme("HtTpS://issuer.example.com/x", "https://"));
+        assert!(has_scheme("https://issuer.example.com/x", "https://"));
+        assert!(!has_scheme("https:/", "https://"));
+        assert!(!has_scheme("", "https://"));
+        assert!(!has_scheme("ftps://issuer.example.com", "https://"));
+    }
+
+    #[test]
+    fn a_multibyte_authority_under_a_plaintext_issuer_resolves_to_the_ordinary_accept() {
+        // The one shape in this family whose outcome is an ACCEPT rather than a
+        // rejection, and the case the sibling test above cannot reach. In
+        // `http://\u{20ac}` the DOUBLE slash makes byte 8 land inside the euro, so the
+        // `https://` test panicked before the `http://` test ever ran. With the byte
+        // comparison the `http://` test simply matches, the authority is non-empty, and
+        // the function gives its ordinary answer, which for a plaintext authority with
+        // `require_https` off is acceptance. That is the check's own intended
+        // semantics: nothing that was previously accepted changes verdict, and no
+        // plaintext downgrade rides in on it, since the value is not an `https://` URL
+        // and an https issuer still refuses it.
+        let endpoint = "http://\u{20ac}";
+        assert!(!has_scheme(endpoint, "https://"));
+        assert!(has_scheme(endpoint, "http://"));
+        assert_eq!(
+            check_endpoint_url(endpoint.to_owned(), "authorization_endpoint", false)
+                .expect("a plaintext authority under a loopback issuer is accepted"),
+            endpoint
+        );
+        assert!(
+            check_endpoint_url(endpoint.to_owned(), "authorization_endpoint", true).is_err(),
+            "an https issuer still refuses the plaintext scheme"
+        );
+
+        // End to end, through the plaintext-loopback issuer that is the only way a
+        // caller reaches `require_https = false`.
+        let http_issuer = "http://upstream.example";
+        let doc = format!(
+            r#"{{"issuer":"{http_issuer}","authorization_endpoint":"{endpoint}","token_endpoint":"http://upstream.example/token","jwks_uri":"http://upstream.example/jwks"}}"#
+        );
+        let resolved =
+            parse_discovery(doc.as_bytes(), http_issuer).expect("a plaintext authority parses");
+        assert_eq!(resolved.authorize_url, endpoint);
     }
 }

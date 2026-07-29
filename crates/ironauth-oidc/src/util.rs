@@ -63,7 +63,22 @@ pub fn percent_decode(value: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 3 <= bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(&value[i + 1..i + 3], 16) {
+            // The two escape digits are read through `get`, never `&value[i + 1..i + 3]`.
+            // The length check above proves three BYTES exist; it proves nothing about
+            // `i + 3` being a character boundary, so the direct slice PANICKED whenever a
+            // multi-byte character followed the `%`. That is reachable on an
+            // unauthenticated request: the federation authorize and callback legs hand
+            // `query_get` the RAW wire query, and the `http` URI parser admits bytes
+            // 0x80..=0xFF in a query verbatim (it requires only that the whole target be
+            // valid UTF-8). `get` returns [`None`] on a non-boundary, which is not a
+            // `%XX` escape at all, so it takes the same verbatim pass-through a malformed
+            // escape already took. The twin in `client_auth::form_urldecode` was already
+            // written this way and is unchanged; the two stay separate because form
+            // decoding maps `+` to a space and this one must not.
+            if let Some(Ok(byte)) = value
+                .get(i + 1..i + 3)
+                .map(|escape| u8::from_str_radix(escape, 16))
+            {
                 out.push(byte);
                 i += 3;
                 continue;
@@ -106,4 +121,72 @@ pub fn append_query(base: &str, params: &[(&str, Option<&str>)]) -> String {
         url.push_str(&percent_encode_query(value));
     }
     url
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_multibyte_character_after_a_percent_does_not_panic() {
+        // Issue #419, the char-boundary panic class. `%<euro>` is three bytes after the
+        // `%`, so the old length check passed and the escape slice landed INSIDE the
+        // character: "end byte index 3 is not a char boundary". A non-boundary escape is
+        // not a `%XX`, so it passes through verbatim exactly as `%zz` already did.
+        assert_eq!(percent_decode("%\u{20ac}"), "%\u{20ac}");
+        assert_eq!(percent_decode("%zz"), "%zz");
+
+        // The whole hazard class, not only the width the crash was found with: every
+        // multi-byte width, at every offset that can straddle the escape, with and
+        // without surrounding text. A well-formed `%40` rides along at the end so the
+        // expectation pins DECODING rather than restating the function under test: a
+        // `percent_decode` that decoded nothing would leave `%40x` and fail here, and
+        // `expected` is built from the input alone, never from `percent_decode`.
+        for lead in 0..4 {
+            for wide in ['\u{e9}', '\u{20ac}', '\u{1f600}'] {
+                let prefix = "a".repeat(lead);
+                let value = format!("{prefix}%{wide}tail%40x");
+                let expected = format!("{prefix}%{wide}tail@x");
+                assert_eq!(percent_decode(&value), expected, "{value:?}");
+                assert_eq!(
+                    query_get(&format!("state={value}"), "state"),
+                    Some(expected),
+                    "{value:?}"
+                );
+            }
+        }
+
+        // The same expectations written out as literals, so the pin does not depend on
+        // the loop's own string building either.
+        assert_eq!(percent_decode("a%\u{20ac}tail%40x"), "a%\u{20ac}tail@x");
+        assert_eq!(
+            query_get("state=a%\u{20ac}tail%40x", "state"),
+            Some("a%\u{20ac}tail@x".to_owned())
+        );
+    }
+
+    #[test]
+    fn well_formed_escapes_still_decode_after_the_boundary_fix() {
+        // The fix must not move a verdict: an ASCII `%XX` still decodes, a truncated
+        // trailing escape still passes through, and a full round trip is unchanged.
+        assert_eq!(percent_decode("ada%40example.test"), "ada@example.test");
+        assert_eq!(percent_decode("%E2%82%AC"), "\u{20ac}");
+        assert_eq!(percent_decode("%4"), "%4");
+        assert_eq!(percent_decode("%"), "%");
+        assert_eq!(
+            percent_decode(&percent_encode_query("a b/c?d=e&f\u{20ac}")),
+            "a b/c?d=e&f\u{20ac}"
+        );
+    }
+
+    #[test]
+    fn a_raw_query_string_carrying_a_multibyte_escape_reads_back() {
+        // The reachable shape: the federation authorize and callback legs hand
+        // `query_get` the RAW wire query, and the `http` URI parser admits bytes
+        // 0x80..=0xFF in a query. This is the exact call that panicked.
+        let query = "return_to=%\u{20ac}&code=abc";
+        assert_eq!(query_get(query, "return_to"), Some("%\u{20ac}".to_owned()));
+        assert_eq!(query_get(query, "code"), Some("abc".to_owned()));
+        assert_eq!(query_get(query, "absent"), None);
+    }
 }
