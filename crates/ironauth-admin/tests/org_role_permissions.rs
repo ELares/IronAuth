@@ -497,6 +497,120 @@ async fn deleting_a_permission_leaves_the_mapping_detachable_and_writes_no_detac
     );
 }
 
+#[tokio::test]
+async fn a_mapping_under_a_soft_deleted_role_stays_detachable_by_its_pair_while_the_list_refuses() {
+    // The ROLE-side counterpart of the test above, and it exists because the
+    // uniform-not-found row in the threat model would otherwise be read as covering
+    // this address too. Migration 0092: deleting a ROLE does not cascade to the
+    // mapping table either, so an orphaned mapping has to stay removable through its
+    // pair address for exactly the reason the deleted PERMISSION case records, or the
+    // table accumulates rows no supported path can clear.
+    //
+    // The three endpoints therefore do NOT agree about a dead role, deliberately: the
+    // list and the attach resolve it with `require_role_in_org`, and the pair-addressed
+    // detach resolves it with `parse_role_id` alone and then matches the pair in ONE
+    // predicate. All three answers are pinned here so a later change cannot quietly
+    // make the stronger uniformity claim true and leave the prose describing a
+    // behaviour that no longer ships:
+    //
+    //   * the LIST at the dead role is the uniform 404;
+    //   * the ATTACH at the dead role is the uniform 404;
+    //   * the DETACH of a mapping that REALLY EXISTS under it is a 204.
+    //
+    // The operational consequence, which the threat model now states rather than
+    // leaving in this comment: an orphan of a deleted PERMISSION stays both listable
+    // and detachable, while an orphan of a deleted ROLE is detachable only by an
+    // operator who still holds the permission id, because the list refuses.
+    //
+    // None of it crosses an organization, and that is asserted rather than argued:
+    // the same pair driven through a SIBLING organization's path is the uniform 404
+    // that writes no audit row, because `get_assignment` carries `organization_id`.
+    let h = Harness::start(50).await;
+    let (tenant, environment) = tenant_env(&h).await;
+    let org = create_org(&h, &tenant, &environment, "k-org").await;
+    let other_org = create_org(&h, &tenant, &environment, "k-org-2").await;
+    let roles = roles_base(&tenant, &environment, &org);
+    let role = create_role(&h, &roles, "billing.admin", "k-role").await;
+    let permission = create_permission(
+        &h,
+        &permissions_base(&tenant, &environment),
+        "billing.invoice.read",
+        "k-p",
+    )
+    .await;
+    let base = mapping_base(&tenant, &environment, &org, &role);
+    // The mapping is attached BEFORE the role dies, so the detach below probes an
+    // address that really has a live row under it. Probing a dead role with nothing
+    // attached answers 404 for the trivial reason and proves nothing about the
+    // resolution.
+    attach(&h, &base, &permission, "k-a").await;
+
+    let (status, _, response) = h.delete(&format!("{roles}/{role}")).await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "the role is deleted: {response}"
+    );
+
+    // The reference: a well-formed, in-scope role id that was never created.
+    let absent_base = mapping_base(
+        &tenant,
+        &environment,
+        &org,
+        &fresh_in_scope_role(&tenant, &environment),
+    );
+    let (absent_status, _, absent_body) = h.get(&absent_base).await;
+    assert_eq!(absent_status, StatusCode::NOT_FOUND);
+
+    let (status, _, body) = h.get(&base).await;
+    assert_eq!(
+        status, absent_status,
+        "the list refuses a dead role: {body}"
+    );
+    assert_eq!(body, absent_body, "and byte for byte as an absent one");
+
+    let (status, _, body) = h
+        .post(&base, "k-attach-after", &attach_body(&permission))
+        .await;
+    assert_eq!(
+        status, absent_status,
+        "the attach refuses a dead role: {body}"
+    );
+    assert_eq!(body, absent_body, "and byte for byte as an absent one");
+
+    // The organization fence still holds over the dead role.
+    let sibling = mapping_base(&tenant, &environment, &other_org, &role);
+    let (status, _, body) = h.delete(&format!("{sibling}/{permission}")).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the same pair through a sibling organization's path: {body}"
+    );
+    assert_eq!(
+        mapping_audit(&h, &tenant, &environment).await,
+        vec!["organization.role.permission.assign"],
+        "and that refusal wrote nothing"
+    );
+
+    // And the point. Through its OWN pair address the orphan is still removable, and
+    // the 204 is itself the proof the row was live: a detach that matched no live row
+    // would be the 404 above.
+    let (status, _, response) = h.delete(&format!("{base}/{permission}")).await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "the orphan of a dead role is still detachable by its pair: {response}"
+    );
+    assert_eq!(
+        mapping_audit(&h, &tenant, &environment).await,
+        vec![
+            "organization.role.permission.assign",
+            "organization.role.permission.unassign",
+        ],
+        "and the detach IS attributed"
+    );
+}
+
 // The parallel `*_one` / `*_two` names track the two organizations; the test is one
 // indivisible proof over three endpoints, so it is not split.
 #[allow(clippy::similar_names, clippy::too_many_lines)]
@@ -832,6 +946,14 @@ async fn every_mapping_addressing_failure_is_the_uniform_not_found_byte_for_byte
     }
 
     // --- The DETACH, over the PERMISSION segment as well as the role segment. ---
+    //
+    // Read the "soft-deleted role" row of `role_probes` here for exactly what it is:
+    // in THIS fixture nothing is attached to that role, so the detach matches no
+    // mapping and the 404 is the pair failing to resolve rather than the role's
+    // liveness being checked. The detach resolves the role with `parse_role_id`
+    // alone, so a mapping attached BEFORE the role died is still removable, and
+    // `a_mapping_under_a_soft_deleted_role_stays_detachable_by_its_pair_while_the_list_refuses`
+    // pins that 204 deliberately. Nothing here may be read as claiming otherwise.
     let base = mapping_base(&tenant, &env_one, &org, &role);
     let unattached = fresh_in_scope_permission(&tenant, &env_one);
     let (absent_status, _, absent_body) = h.delete(&format!("{base}/{unattached}")).await;
