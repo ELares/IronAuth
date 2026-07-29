@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Organization role CRUD under an organization (issue #97).
+//! Organization role CRUD under an organization (issue #97), plus the
+//! organization's DEFAULT ROLE designation (issue #98).
 //!
 //! A role in M10 is a NAME only: an immutable `slug` an authorization decision
 //! keys on, plus a mutable `display_name` and free-form metadata. What a role
@@ -8,6 +9,61 @@
 //! is scoped to a `(tenant, environment)` pair and reachable by the operator OR by
 //! a management key scoped to exactly that environment, the same authorization as
 //! the organization and membership endpoints.
+//!
+//! # The default role: why `PUT .../default-role` and not `.../roles/{id}/default`
+//!
+//! The designation is a per-ORGANIZATION SINGLETON. It is STORED as a flag on a role
+//! (migration 0093 records why it is not a pointer on `organizations`), but what it
+//! names is one property of the organization, and its ADDRESS follows what it names
+//! rather than where it is stored. Three consequences decided the shape:
+//!
+//!   * `PUT .../organizations/{organization_id}/default-role` addresses that one
+//!     property at ONE path. `PUT .../roles/{role_id}/default` would give a
+//!     single-valued property as many addresses as the organization has roles, and
+//!     `PUT` would then no longer mean idempotent replacement of a value: two
+//!     successive puts on two different role paths would both claim to have
+//!     succeeded while only the second survives.
+//!   * CLEARING has no role to name. `DELETE .../default-role` says exactly what it
+//!     does; `DELETE .../roles/{role_id}/default` would force the caller to already
+//!     know which role holds the designation, and would have to invent an answer for
+//!     a role that does not, which is either a 404 that looks like the role is gone
+//!     or a 204 that claims a removal it did not perform.
+//!   * READING it needs no endpoint at all, because the flag is projected onto
+//!     [`OrgRoleView`]: `GET .../roles` and `GET .../roles/{role_id}` report
+//!     `is_default`, which is the honest place for it given where the value lives,
+//!     and it keeps this PR at the five endpoints it owns.
+//!
+//! ## The second designation MOVES it; it is not a 409
+//!
+//! `org_roles_org_default_live_uniq` is a partial unique index, so a second LIVE
+//! default in one organization is refused by Postgres. This endpoint does not let
+//! that refusal reach a caller who sent one request: the store clears the incumbent
+//! and sets the new role in ONE transaction, which is what `PUT` on a singleton
+//! means. A caller who wants to move the designation must not have to perform a read,
+//! a delete and a create with a window in the middle where the organization has no
+//! default at all.
+//!
+//! The index stays the backstop for the case a single caller cannot produce: two
+//! CONCURRENT designations in one organization. The loser's insert collides, the
+//! store reports it as a conflict rather than as a raw database error, and this
+//! module answers a typed 409. An untyped 500 there would be a defect, and it is the
+//! one thing the atomic-move choice does not remove.
+//!
+//! ## A DISABLED organization can still be given a default role, deliberately
+//!
+//! [`crate::org_context::resolve_live_org`] treats a disabled (not deleted)
+//! organization as reachable, because
+//! [`ironauth_store::OrganizationRepo::get`] filters `deleted_at` and does NOT filter
+//! `state`. So an operator may designate a default role on an organization whose
+//! members cannot currently sign in, and the designation resolves to nothing until
+//! the organization is enabled again. That is the right answer and it is the same one
+//! every other management write under a disabled organization already gives: enabling
+//! an organization must not require the operator to then remember to re-do the
+//! configuration they set up while it was down, and refusing here would make winding
+//! an organization up a two-step dance the API gives no signal about. Nothing on the
+//! ISSUANCE path relies on this endpoint refusing: the closure seed is the only
+//! organization-liveness fence there, and it is what makes a disabled organization
+//! resolve no roles at all.
 //!
 //! # Containment, and the two layers that enforce it
 //!
@@ -46,8 +102,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::Response;
 use ironauth_store::{
-    CorrelationId, IdempotencyWrite, NewOrgRole, OrgRoleId, OrgRoleRecord, OrganizationId, Scope,
-    StoreError,
+    CorrelationId, IdempotencyWrite, NewOrgRole, OrgRoleId, OrgRoleRecord, StoreError,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -56,7 +111,7 @@ use crate::auth::Principal;
 use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
 use crate::input::{parse_json, require_non_empty, require_slug};
-use crate::org_context::{resolve_live_org, resolve_scope};
+use crate::org_context::{parse_role_id, require_role_in_org, resolve_live_org, resolve_scope};
 use crate::pagination::{ListQuery, Pagination};
 use crate::response::{json, no_content};
 use crate::state::AdminState;
@@ -75,6 +130,19 @@ pub struct OrgRoleView {
     pub display_name: String,
     /// Free-form role metadata (the empty object when none was set).
     pub metadata: serde_json::Value,
+    /// Whether this role is the organization's DEFAULT role (issue #98): the role
+    /// every LIVE ACTIVE member of the organization holds without an assignment
+    /// existing for it. At most one live role of an organization carries `true`.
+    ///
+    /// It is READ ONLY on this resource. `PUT .../organizations/{organization_id}/default-role`
+    /// designates and `DELETE` on the same path clears, because the designation is a
+    /// property of the organization rather than of the role. A role create or a role
+    /// PATCH can never set it, which is why neither request body has the field.
+    ///
+    /// A role holding `true` is NOT listed in any membership's direct-assignment
+    /// list, because the default role is resolved at read and no row is ever written
+    /// for it. It appears in the effective-role views.
+    pub is_default: bool,
     /// Creation time, milliseconds since the Unix epoch.
     pub created_at_unix_ms: i64,
     /// Last-modification time, milliseconds since the Unix epoch.
@@ -83,7 +151,8 @@ pub struct OrgRoleView {
 
 impl OrgRoleView {
     /// Build a view from a stored record. The repository only returns LIVE (not
-    /// soft-deleted) roles.
+    /// soft-deleted) roles, so an `is_default` of `true` here always means the
+    /// designation is in force.
     fn from_record(record: OrgRoleRecord) -> Self {
         Self {
             id: record.id.to_string(),
@@ -91,6 +160,7 @@ impl OrgRoleView {
             slug: record.slug,
             display_name: record.display_name,
             metadata: record.metadata,
+            is_default: record.is_default,
             created_at_unix_ms: record.created_at_unix_micros / 1000,
             updated_at_unix_ms: record.updated_at_unix_micros / 1000,
         }
@@ -137,23 +207,14 @@ pub struct OrgRoleList {
     pub next_cursor: Option<String>,
 }
 
-/// Resolve the nested `(organization, role)` pair, which is the ROLE'S ADDRESS.
-///
-/// The cross-parent guard: a role of a DIFFERENT organization, even in the same
-/// environment, is the uniform not-found here, exactly like an absent, a
-/// soft-deleted, and a foreign-scope one. That uniformity is what stops the nested
-/// path from being an existence oracle over a sibling organization's roles.
-async fn resolve_role_in_org(
-    state: &AdminState,
-    scope: Scope,
-    org_id: &OrganizationId,
-    role_id: &str,
-) -> Result<OrgRoleRecord, ApiError> {
-    let roles = state.store().management().org_roles(scope);
-    // A malformed id and one minted in another `(tenant, environment)` both fail to
-    // parse in scope, which is the same not-found the read below returns.
-    let id = roles.parse_id(role_id)?;
-    Ok(roles.get_in_org(org_id, &id).await?)
+/// The body to designate an organization's DEFAULT role.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct SetOrgDefaultRoleRequest {
+    /// The role to designate (`rol_...`). It must be a LIVE role of THIS
+    /// organization; anything else (absent, deleted, another scope's, another
+    /// organization's) is the uniform not-found.
+    #[schema(example = "rol_...")]
+    pub role_id: String,
 }
 
 /// Define a role in an organization.
@@ -221,6 +282,11 @@ pub async fn create_org_role(
             .metadata
             .clone()
             .unwrap_or_else(|| serde_json::json!({})),
+        // A create can never designate: the designation is a property of the
+        // ORGANIZATION and moves through its own endpoint, so a fresh role is never
+        // the default and `CreateOrgRoleRequest` has no field that could say
+        // otherwise.
+        is_default: false,
         created_at_unix_ms: created_at_micros / 1000,
         updated_at_unix_ms: created_at_micros / 1000,
     };
@@ -345,7 +411,7 @@ pub async fn get_org_role(
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
     let org_id = resolve_live_org(&state, scope, &organization_id).await?;
-    let record = resolve_role_in_org(&state, scope, &org_id, &role_id).await?;
+    let record = require_role_in_org(&state, scope, &org_id, &role_id).await?;
     let body =
         serde_json::to_string(&OrgRoleView::from_record(record)).map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body))
@@ -391,7 +457,7 @@ pub async fn update_org_role(
     // presented under this organization's path is the uniform not-found, so the
     // nested path can never rename another organization's role. `organization_id`
     // is immutable by GRANT, so this pair cannot come apart before the write.
-    let record = resolve_role_in_org(&state, scope, &org_id, &role_id).await?;
+    let record = require_role_in_org(&state, scope, &org_id, &role_id).await?;
 
     let request: UpdateOrgRoleRequest = parse_json(&body)?;
     let display_name = request
@@ -415,7 +481,7 @@ pub async fn update_org_role(
     }
     // Re-read through the SAME nested address, so the response can only ever
     // describe a role of this organization.
-    let updated = resolve_role_in_org(&state, scope, &org_id, &role_id).await?;
+    let updated = require_role_in_org(&state, scope, &org_id, &role_id).await?;
     let body = serde_json::to_string(&OrgRoleView::from_record(updated))
         .map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body))
@@ -456,13 +522,132 @@ pub async fn delete_org_role(
     let org_id = resolve_live_org(&state, scope, &organization_id).await?;
     // The cross-parent guard: deleting a sibling organization's role through this
     // path is the uniform not-found and removes nothing.
-    let record = resolve_role_in_org(&state, scope, &org_id, &role_id).await?;
+    let record = require_role_in_org(&state, scope, &org_id, &role_id).await?;
     state
         .store()
         .management()
         .acting(actor, CorrelationId::generate(state.env()))
         .org_roles(scope)
         .delete(state.env(), &record.id)
+        .await?;
+    Ok(no_content())
+}
+
+/// DESIGNATE one of the organization's roles as its DEFAULT role.
+///
+/// Idempotent replacement of a single-valued property: the store clears whatever
+/// role held the designation and sets it on this one in ONE transaction, so a
+/// second designation MOVES it rather than being refused. Designating the role
+/// that already holds it is a no-op in effect and still answers 200.
+#[utoipa::path(
+    put,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/default-role",
+    operation_id = "setOrgDefaultRole",
+    tag = "org-roles",
+    request_body = SetOrgDefaultRoleRequest,
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("organization_id" = String, Path, description = "The organization identifier")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "The role that is now the organization's default. Every LIVE ACTIVE member resolves it at the NEXT token issuance, with NO assignment row written for any of them, so it appears in the effective-role views and in no membership's direct-assignment list", body = OrgRoleView),
+        (status = 400, description = "Malformed request", body = ErrorBody),
+        (status = 401, description = "Missing or invalid credential", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "Not found: the organization, or a role that is not a live role of it (uniform across absent, deleted, another scope's, and another organization's)", body = ErrorBody),
+        (status = 409, description = "A CONCURRENT designation in this organization won the race; retry. A caller sending one request cannot reach this, because a second designation moves the existing one rather than colliding with it", body = ErrorBody)
+    )
+)]
+pub async fn set_org_default_role(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, organization_id)): Path<(String, String, String)>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
+    // The ADDRESS of this resource is the ORGANIZATION, and it resolves BEFORE the
+    // body is parsed: a caller who cannot reach the organization must not be able to
+    // tell a body this endpoint would refuse from one it would accept.
+    let org_id = resolve_live_org(&state, scope, &organization_id).await?;
+
+    let request: SetOrgDefaultRoleRequest = parse_json(&body)?;
+    // Parse ONLY. Whether the id names a live role OF THIS ORGANIZATION is the
+    // store's own predicate, carried inside the write transaction, so a pre-read here
+    // would be a second copy of the fence and would answer a question the write then
+    // asks again.
+    let role = parse_role_id(&state, scope, &request.role_id)?;
+
+    let result = state
+        .store()
+        .management()
+        .acting(actor, CorrelationId::generate(state.env()))
+        .org_roles(scope)
+        .set_default(state.env(), &org_id, &role)
+        .await;
+    match result {
+        Ok(()) => {}
+        Err(StoreError::Conflict) => {
+            return Err(ApiError::Conflict(
+                "a concurrent request is designating this organization's default \
+                 role; retry"
+                    .to_owned(),
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    }
+
+    // Read back through the NESTED pair address, so the response can only ever
+    // describe a live role of this organization and reports the flag as STORED
+    // rather than as this handler assumed it.
+    let updated = require_role_in_org(&state, scope, &org_id, &request.role_id).await?;
+    let body = serde_json::to_string(&OrgRoleView::from_record(updated))
+        .map_err(|_| ApiError::Internal)?;
+    Ok(json(StatusCode::OK, body))
+}
+
+/// CLEAR the organization's DEFAULT role designation.
+///
+/// Nothing is deleted: the role stays a live role of the organization and every
+/// direct and group grant of it stands. What stops is the resolution that gave it to
+/// every member without a row.
+#[utoipa::path(
+    delete,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/default-role",
+    operation_id = "clearOrgDefaultRole",
+    tag = "org-roles",
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("organization_id" = String, Path, description = "The organization identifier")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 204, description = "Cleared. Members stop resolving the role through the designation at the NEXT token issuance, and keep it if some row grants it; access tokens already issued are NOT revoked (revoke the session or refresh family for that). The role itself is untouched"),
+        (status = 401, description = "Missing or invalid credential", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "Not found (the organization, or an organization with no live default role: a repeat clear and an organization whose default role has since been deleted are the same answer)", body = ErrorBody)
+    )
+)]
+pub async fn clear_org_default_role(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, organization_id)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
+    let org_id = resolve_live_org(&state, scope, &organization_id).await?;
+    // The store resolves the outgoing role IN THE SAME STATEMENT that clears it, so
+    // there is nothing to name here and no second read to race against. An
+    // organization with no live default matches no row and is the uniform not-found.
+    state
+        .store()
+        .management()
+        .acting(actor, CorrelationId::generate(state.env()))
+        .org_roles(scope)
+        .clear_default(state.env(), &org_id)
         .await?;
     Ok(no_content())
 }

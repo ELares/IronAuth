@@ -31709,6 +31709,18 @@ pub struct OrgRoleRecord {
     pub display_name: String,
     /// Free-form role metadata, as stored JSON. Never interpreted by the auth core.
     pub metadata: serde_json::Value,
+    /// Whether this role is the organization's DEFAULT role (issue #98): the role
+    /// every LIVE ACTIVE member of the organization holds without an assignment row
+    /// existing for it.
+    ///
+    /// At most one LIVE role per organization carries `true`, which migration 0093's
+    /// partial unique index makes structural rather than conventional. A soft-deleted
+    /// role KEEPS whatever value it had, and the value is inert on a dead row in both
+    /// directions: it does not resolve, because every read filters `deleted_at IS
+    /// NULL`, and it does not occupy the designation, because the index is partial
+    /// over the same live set. Since this repository only ever returns live rows, a
+    /// `true` here always means the designation is in force.
+    pub is_default: bool,
     /// Creation time in microseconds since the Unix epoch (the pagination key).
     pub created_at_unix_micros: i64,
     /// Last-modification time in microseconds since the Unix epoch.
@@ -32951,7 +32963,7 @@ impl OrgMembershipRepo<'_> {
 /// timestamps as epoch microseconds, the metadata as JSON text). One constant so
 /// the get and list projections cannot drift.
 const ORG_ROLE_SELECT_COLUMNS: &str = "id, organization_id, slug, display_name, \
-     metadata::text AS metadata_text, \
+     metadata::text AS metadata_text, is_default, \
      (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us, \
      (EXTRACT(EPOCH FROM updated_at) * 1000000)::bigint AS updated_us";
 
@@ -37647,14 +37659,76 @@ impl ActingOrgAuthPolicyRepo<'_> {
     }
 }
 
-/// The mutating organization-role repository (issue #97): define a role in an
-/// organization, rename it, and delete it, each audited in the same transaction as
-/// the write.
+/// The mutating organization-role repository (issues #97 and #98): define a role in
+/// an organization, rename it, delete it, and designate or clear the organization's
+/// DEFAULT role, each audited in the same transaction as the write.
 ///
 /// There is no count cap, quota, or paywall gate on roles anywhere in this
 /// repository or in migration 0086. An organization may define as many roles as it
 /// likes: the advisory-lock-plus-COUNT registration gate used elsewhere in this
 /// module is deliberately NOT replicated here (a project covenant).
+///
+/// # The two DESIGNATION methods are a different KIND of write from the other three
+///
+/// [`Self::create`], [`Self::update`] and [`Self::delete`] each act on the role
+/// vocabulary and are addressed by role id alone, which is sound because
+/// `org_roles.organization_id` is immutable by GRANT.
+/// [`Self::set_default`] and [`Self::clear_default`] act on a per-ORGANIZATION
+/// SINGLETON that happens to be stored as a flag on a role (migration 0093 records
+/// why it is not a pointer on `organizations`), so both take the organization
+/// explicitly and carry it as a statement predicate. That is not decoration: the flag
+/// decides which role EVERY live active member of the organization resolves, so a
+/// designation written under the wrong organization would grant a role to a member
+/// set the caller cannot see, and row-level security fences `(tenant, environment)`
+/// and cannot see the organization at all.
+///
+/// Neither of them writes `is_default` on a soft-deleted row, and neither needs a
+/// pass to clean one up: a dead role keeps whatever value it had, and that value is
+/// inert in both directions because every read filters `deleted_at IS NULL` and the
+/// unique index is partial over the same live set.
+///
+/// # Designation survivor census (read before deleting a predicate here)
+///
+/// Every claim below is a MEASUREMENT. The predicate was neutered, the WHOLE of
+/// `crates/ironauth-admin/tests/org_role_permissions.rs` was run (plus
+/// `crates/ironauth-store/tests/org_default_role.rs` and
+/// `crates/ironauth-admin/tests/org_roles_groups.rs`, since this column is on a #97
+/// table), and what turned red is what is written.
+///
+/// KILLED, each on its own:
+///
+/// * [`Self::set_default`]'s `organization_id` conjunct, and its `deleted_at IS NULL`
+///   filter. Each is the whole of what makes a sibling organization's role, and a
+///   soft-deleted one, the uniform not-found.
+/// * The CLEAR statement inside [`Self::set_default`], both by DELETING it (the
+///   second designation then hits the unique index and the move becomes a refusal)
+///   and by dropping ITS `organization_id` conjunct (one organization's designation
+///   then clears every sibling's).
+/// * All three of [`Self::clear_default`]'s conjuncts: `organization_id`,
+///   `is_default`, and `deleted_at IS NULL`. The first fences the organization, the
+///   second is what makes "no designation" a not-found rather than a 204 clearing an
+///   arbitrary role, and the third is what makes a soft-deleted default leave nothing
+///   to clear.
+/// * [`Self::clear_default`]'s audit TARGET. Pointing it at the organization instead
+///   of the role it resolved is killed, because the trail is asserted by target and
+///   not only by action.
+///
+/// SURVIVOR, one, EQUIVALENT behind a chain that terminates in a layer that IS
+/// individually killed:
+///
+/// * [`Self::set_default`]'s in-process `organization_id.scope()` and `id.scope()`
+///   guard. Both statements bind `tenant_id` and `environment_id` from `self.scope`,
+///   so a foreign-scope id matches no row and is the same uniform not-found whether
+///   the guard runs or not. The pair-drop was taken all the way down and is recorded
+///   as measured rather than as expected: dropping the guard AND every scope conjunct
+///   both statements apply in SQL ALSO survives, because [`begin_scoped`] binds the
+///   row-level-security variables from that same scope and the policy refuses on its
+///   own. That last layer is not a survivor:
+///   `rls_hides_another_scopes_roles_from_the_control_role_and_refuses_forging_one`
+///   in `crates/ironauth-store/tests/org_roles.rs` turns red when the `org_roles`
+///   isolation policy is neutered, which was measured too. The guard is kept because
+///   refusing before any statement is the cheaper and more obvious answer, not
+///   because it is observable.
 pub struct ActingOrgRoleRepo<'a> {
     store: &'a Store,
     acting: ActingContext,
@@ -37865,6 +37939,189 @@ impl ActingOrgRoleRepo<'_> {
             false,
         )
         .await
+    }
+
+    /// Designate `id` as `organization_id`'s DEFAULT role and audit
+    /// `organization.default_role.set` in the same transaction.
+    ///
+    /// The designation is a per-organization SINGLETON, so this is a MOVE and not an
+    /// addition: the statement pair below clears whatever live role of that
+    /// organization held the designation and then sets it on this one, in ONE
+    /// transaction. Designating a role that is already the default is therefore
+    /// idempotent in effect rather than a conflict.
+    ///
+    /// # Why clear-then-set, and why that ordering is forced
+    ///
+    /// `org_roles_org_default_live_uniq` (migration 0093) is a partial unique index
+    /// over `(tenant, environment, organization)` where `is_default AND deleted_at IS
+    /// NULL`, so the two statements cannot run the other way round: setting this role
+    /// while the incumbent is still designated violates that index inside the
+    /// transaction. Clearing first leaves the organization with no live default for
+    /// the width of one statement, which no other transaction can observe.
+    ///
+    /// # The index is still the backstop, and it is REACHABLE
+    ///
+    /// Two concurrent designations in one organization do not both succeed. The
+    /// second one's clear finds the incumbent already cleared and matches nothing,
+    /// its set then collides with the row the first one designated, and the unique
+    /// violation surfaces as [`StoreError::Conflict`] rather than as a raw database
+    /// error, so the management edge can answer a typed refusal instead of an opaque
+    /// 500. That is the ONLY way this method produces a conflict: nothing a single
+    /// caller can send reaches it.
+    ///
+    /// # Containment
+    ///
+    /// The SET statement carries `organization_id`, both scope columns, and the
+    /// liveness filter, so a role of a SIBLING organization in the same environment
+    /// matches nothing and is the uniform [`StoreError::NotFound`], exactly like an
+    /// absent, a soft-deleted, and a foreign-scope one. That conjunct is the whole
+    /// fence: row-level security fences `(tenant, environment)` and cannot see the
+    /// organization. There is deliberately no separate pre-resolution of the role in
+    /// front of it, because a second copy of a predicate this statement already
+    /// carries is a second place for the fence to go missing.
+    ///
+    /// The failed SET rolls the CLEAR back with it, which is what makes a refused
+    /// designation leave the organization's existing default exactly as it was.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if either id is not in this scope, or `id` is not a
+    /// live role of `organization_id`;
+    /// [`StoreError::Conflict`] if a concurrent designation in the same organization
+    /// won the race;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn set_default(
+        &self,
+        env: &Env,
+        organization_id: &OrganizationId,
+        id: &OrgRoleId,
+    ) -> Result<(), StoreError> {
+        if organization_id.scope() != self.scope || id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let organization_id = *organization_id;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::OrganizationDefaultRoleSet,
+                target: id,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "UPDATE org_roles SET is_default = false, \
+                         updated_at = \
+                             TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+                     WHERE tenant_id = $2 AND environment_id = $3 AND organization_id = $4 \
+                     AND is_default AND deleted_at IS NULL",
+                )
+                .bind(now_micros)
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(organization_id.to_string())
+                .execute(&mut **tx)
+                .await?;
+                let result = sqlx::query(
+                    "UPDATE org_roles SET is_default = true, \
+                         updated_at = \
+                             TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+                     WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 \
+                     AND organization_id = $5 AND deleted_at IS NULL",
+                )
+                .bind(now_micros)
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(organization_id.to_string())
+                .execute(&mut **tx)
+                .await;
+                match result {
+                    Ok(done) => {
+                        if done.rows_affected() == 0 {
+                            return Err(StoreError::NotFound);
+                        }
+                    }
+                    // A concurrent designation in this organization got there first.
+                    Err(error) if is_unique_violation(&error) => {
+                        return Err(StoreError::Conflict);
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Clear `organization_id`'s DEFAULT role designation and audit
+    /// `organization.default_role.clear` in the same transaction, returning the role
+    /// that WAS the default.
+    ///
+    /// Nothing is deleted: the role stays a live role of the organization and every
+    /// direct and group grant of it stands. What stops is the resolution that gave it
+    /// to every member without a row.
+    ///
+    /// The returned id is the audit TARGET, which is why this method resolves it from
+    /// the statement rather than taking it: the organization is not an addressable
+    /// target of this table's actions, and an operator pairing a clear with the set
+    /// that preceded it needs the outgoing role named. Resolving it in the same
+    /// statement that clears it is what makes the two agree with no second read to
+    /// race against.
+    ///
+    /// An organization with no live default matches no row and is the uniform
+    /// [`StoreError::NotFound`], which is also the answer for an organization of
+    /// another scope, one that never existed, and one whose default role has since
+    /// been soft-deleted (a dead role does not occupy the designation, because the
+    /// unique index is partial over live rows).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the organization is not in this scope or has no
+    /// live default role;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn clear_default(
+        &self,
+        env: &Env,
+        organization_id: &OrganizationId,
+    ) -> Result<OrgRoleId, StoreError> {
+        if organization_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let now_micros = epoch_micros(env.clock().now_utc());
+
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "UPDATE org_roles SET is_default = false, \
+                 updated_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+             WHERE tenant_id = $2 AND environment_id = $3 AND organization_id = $4 \
+             AND is_default AND deleted_at IS NULL \
+             RETURNING id",
+        )
+        .bind(now_micros)
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(organization_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        let cleared_id = OrgRoleId::parse_in_scope(&row.get::<String, _>("id"), &scope)?;
+        let spec = AuditedWrite {
+            store: self.store,
+            scope,
+            acting: &self.acting,
+            env,
+            action: Action::OrganizationDefaultRoleClear,
+            target: &cleared_id,
+        };
+        insert_audit_row(&mut tx, &spec, None).await?;
+        tx.commit().await?;
+        Ok(cleared_id)
     }
 }
 
@@ -41073,6 +41330,7 @@ fn org_role_from_row(row: &PgRow, scope: &Scope) -> Result<OrgRoleRecord, StoreE
         slug: row.get("slug"),
         display_name: row.get("display_name"),
         metadata,
+        is_default: row.get("is_default"),
         created_at_unix_micros: row.get("created_us"),
         updated_at_unix_micros: row.get("updated_us"),
     })

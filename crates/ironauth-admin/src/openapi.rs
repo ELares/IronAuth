@@ -82,6 +82,15 @@ use crate::views::{
                                              calling the same API; which permissions a ROLE \
                                              grants is per organization. The slug and the kind \
                                              are immutable. Uncapped in number by covenant"),
+        (name = "org-role-permissions", description = "The role-to-permission mapping \
+                                                       (issue #98): which permissions of the \
+                                                       ENVIRONMENT'S vocabulary one \
+                                                       ORGANIZATION'S role grants. Nested under \
+                                                       the organization because the ROLE half \
+                                                       is, while the permission half carries no \
+                                                       organization at all. PAIR addressed, so \
+                                                       the mapping id never appears in a path. \
+                                                       Uncapped in both directions by covenant"),
         (name = "org-groups", description = "Organization groups (issue #97): first-class, \
                                             per-organization named groups holding a position in \
                                             that organization's group forest, with a dedicated \
@@ -179,6 +188,11 @@ use crate::views::{
         crate::org_roles::get_org_role,
         crate::org_roles::update_org_role,
         crate::org_roles::delete_org_role,
+        crate::org_roles::set_org_default_role,
+        crate::org_roles::clear_org_default_role,
+        crate::org_role_permissions::assign_org_role_permission,
+        crate::org_role_permissions::list_org_role_permissions,
+        crate::org_role_permissions::unassign_org_role_permission,
         crate::org_groups::create_org_group,
         crate::org_groups::list_org_groups,
         crate::org_groups::get_org_group,
@@ -306,6 +320,10 @@ use crate::views::{
         crate::org_roles::OrgRoleView,
         crate::org_roles::OrgRoleList,
         crate::org_roles::CreateOrgRoleRequest,
+        crate::org_roles::SetOrgDefaultRoleRequest,
+        crate::org_role_permissions::OrgRolePermissionView,
+        crate::org_role_permissions::OrgRolePermissionList,
+        crate::org_role_permissions::AssignOrgRolePermissionRequest,
         crate::org_roles::UpdateOrgRoleRequest,
         crate::org_groups::OrgGroupView,
         crate::org_groups::OrgGroupList,

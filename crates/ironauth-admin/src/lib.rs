@@ -73,6 +73,7 @@ mod org_effective_roles;
 mod org_group_members;
 mod org_groups;
 mod org_role_assignments;
+mod org_role_permissions;
 mod org_roles;
 mod organizations;
 mod pagination;
@@ -383,6 +384,30 @@ pub fn management_router(state: AdminState) -> Router {
             get(org_roles::get_org_role)
                 .patch(org_roles::update_org_role)
                 .delete(org_roles::delete_org_role),
+        )
+        // The organization's DEFAULT role (issue #98): the role every live active
+        // member holds without an assignment row existing for it. A per-organization
+        // SINGLETON, so it is addressed at the ORGANIZATION and not once per role;
+        // `PUT` designates (moving the designation if one is already held) and
+        // `DELETE` clears. Reading it is `is_default` on the role views above, which
+        // is where the value is stored.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/default-role",
+            put(org_roles::set_org_default_role).delete(org_roles::clear_org_default_role),
+        )
+        // The role-to-permission MAPPING (issue #98): which permissions of the
+        // ENVIRONMENT'S vocabulary this ORGANIZATION'S role grants. Nested under the
+        // organization because the ROLE half is, while the permission half hangs off
+        // the environment and carries no organization at all. PAIR addressed, so the
+        // `rpm_` id never appears in a path. Uncapped in both directions by covenant.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}/permissions",
+            post(org_role_permissions::assign_org_role_permission)
+                .get(org_role_permissions::list_org_role_permissions),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}/permissions/{permission_id}",
+            delete(org_role_permissions::unassign_org_role_permission),
         )
         // Organization groups (issue #97): first-class, per-organization named groups
         // holding a position in that organization's group forest. Uncapped in number,

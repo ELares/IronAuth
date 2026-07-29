@@ -52,7 +52,9 @@ fn operation_ids_are_the_stable_set() {
             "approveSignupQuarantine",
             "assignOrgGroupRole",
             "assignOrgMembershipRole",
+            "assignOrgRolePermission",
             "bulkRevokeSessions",
+            "clearOrgDefaultRole",
             "createBan",
             "createConnector",
             "createDcrInitialAccessToken",
@@ -135,6 +137,7 @@ fn operation_ids_are_the_stable_set() {
             "listOrgGroupRoles",
             "listOrgGroups",
             "listOrgMembershipRoles",
+            "listOrgRolePermissions",
             "listOrgRoles",
             "listOrganizations",
             "listPermissions",
@@ -165,12 +168,14 @@ fn operation_ids_are_the_stable_set() {
             "setClientAdminConsent",
             "setClientSigningAlgorithm",
             "setLocale",
+            "setOrgDefaultRole",
             "setOrgGroupParent",
             "setSignupForm",
             "setUserState",
             "suspendTenant",
             "unassignOrgGroupRole",
             "unassignOrgMembershipRole",
+            "unassignOrgRolePermission",
             "unlinkUserExternalId",
             "updateConnector",
             "updateOrgGroup",
@@ -220,6 +225,7 @@ fn every_list_endpoint_documents_cursor_pagination() {
         "listOrgGroupMembers",
         "listOrgGroupRoles",
         "listOrgMembershipRoles",
+        "listOrgRolePermissions",
         "listPermissions",
     ] {
         let params = find_operation(&doc, op)["parameters"]
@@ -272,6 +278,7 @@ fn every_post_documents_the_idempotency_key_header() {
         "addOrgGroupMember",
         "assignOrgGroupRole",
         "assignOrgMembershipRole",
+        "assignOrgRolePermission",
         "createPermission",
     ] {
         let params = find_operation(&doc, op)["parameters"]
@@ -322,12 +329,14 @@ fn documented_paths_are_the_expected_set() {
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/keys/{key_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/locales/{locale}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}",
+            "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/default-role",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/members/{membership_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/roles/{role_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships/{membership_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships/{membership_id}/roles/{role_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}",
+            "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}/permissions/{permission_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/permissions/{permission_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/external-id",
@@ -376,6 +385,7 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships/{membership_id}/roles",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}/permissions",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/permissions",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/permissions/{permission_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/recovery-approvals",
@@ -420,6 +430,7 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships/{membership_id}/roles",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}/permissions",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/password-hashing/probe",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/permissions",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/recovery-approvals/{flow_id}/approve",
@@ -443,6 +454,7 @@ fn documented_paths_are_the_expected_set() {
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/signing-algorithm",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/connectors/{connector_id}",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/locales/{locale}",
+            "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/default-role",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/parent",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/external-id",
         ]
@@ -485,7 +497,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        133,
+        138,
         "the documented route count is pinned"
     );
 

@@ -918,6 +918,35 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/default-role": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * DESIGNATE one of the organization's roles as its DEFAULT role.
+         * @description Idempotent replacement of a single-valued property: the store clears whatever
+         *     role held the designation and sets it on this one in ONE transaction, so a
+         *     second designation MOVES it rather than being refused. Designating the role
+         *     that already holds it is a no-op in effect and still answers 200.
+         */
+        put: operations["setOrgDefaultRole"];
+        post?: never;
+        /**
+         * CLEAR the organization's DEFAULT role designation.
+         * @description Nothing is deleted: the role stays a live role of the organization and every
+         *     direct and group grant of it stands. What stops is the resolution that gave it to
+         *     every member without a row.
+         */
+        delete: operations["clearOrgDefaultRole"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/disable": {
         parameters: {
             query?: never;
@@ -1219,6 +1248,41 @@ export interface paths {
         head?: never;
         /** Rename a role (or replace its metadata). The `slug` is immutable. */
         patch: operations["updateOrgRole"];
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}/permissions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List the permissions an organization's role grants (cursor paginated). */
+        get: operations["listOrgRolePermissions"];
+        put?: never;
+        /** Attach a permission to an organization's role. */
+        post: operations["assignOrgRolePermission"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}/permissions/{permission_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Detach a permission from an organization's role. */
+        delete: operations["unassignOrgRolePermission"];
+        options?: never;
+        head?: never;
+        patch?: never;
         trace?: never;
     };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/password-hashing/probe": {
@@ -1778,6 +1842,17 @@ export interface components {
              * @example rol_...
              */
             role_id: string;
+        };
+        /** @description The body to attach a permission to a role. */
+        AssignOrgRolePermissionRequest: {
+            /**
+             * @description The permission to attach (`prm_...`). It must be a LIVE permission of THIS
+             *     ENVIRONMENT; anything else (absent, deleted, another environment's,
+             *     malformed) is the uniform not-found. It takes no organization, because the
+             *     vocabulary has none.
+             * @example prm_...
+             */
+            permission_id: string;
         };
         /** @description A page of bans. */
         BanList: {
@@ -3396,6 +3471,51 @@ export interface components {
             /** @description The opaque cursor for the next page, or null if this is the last page. */
             next_cursor?: string | null;
         };
+        /** @description A page of the permissions a role grants. */
+        OrgRolePermissionList: {
+            /**
+             * @description The mappings on this page, oldest first. There is no cap on how many
+             *     permissions a role may carry; this page is size-clamped like every list.
+             *
+             *     A mapping listed here is not by itself a live grant: deleting the permission
+             *     leaves the row alone and the resolution stops selecting it on the
+             *     permission's own liveness filter.
+             */
+            items: components["schemas"]["OrgRolePermissionView"][];
+            /** @description The opaque cursor for the next page, or null if this is the last page. */
+            next_cursor?: string | null;
+        };
+        /**
+         * @description A permission attached to an organization's role, as returned by the management
+         *     API (issue #98).
+         */
+        OrgRolePermissionView: {
+            /**
+             * Format: int64
+             * @description Creation time, milliseconds since the Unix epoch.
+             */
+            created_at_unix_ms: number;
+            /**
+             * @description The mapping identifier (`rpm_...`). Carried for correlation with the audit
+             *     log, which targets it; the mapping's ADDRESS on the wire is the
+             *     `(role_id, permission_id)` pair, and no endpoint here accepts this value.
+             */
+            id: string;
+            /**
+             * @description The organization the ROLE belongs to (`org_...`). The permission half has no
+             *     organization, because the vocabulary is per environment.
+             */
+            organization_id: string;
+            /** @description The permission granted (`prm_...`), an entry in this ENVIRONMENT's vocabulary. */
+            permission_id: string;
+            /** @description The role that grants the permission (`rol_...`). */
+            role_id: string;
+            /**
+             * Format: int64
+             * @description Last-modification time, milliseconds since the Unix epoch.
+             */
+            updated_at_unix_ms: number;
+        };
         /** @description An organization role, as returned by the management API (issue #97). */
         OrgRoleView: {
             /**
@@ -3407,6 +3527,21 @@ export interface components {
             display_name: string;
             /** @description The role identifier (`rol_...`, embeds its scope). */
             id: string;
+            /**
+             * @description Whether this role is the organization's DEFAULT role (issue #98): the role
+             *     every LIVE ACTIVE member of the organization holds without an assignment
+             *     existing for it. At most one live role of an organization carries `true`.
+             *
+             *     It is READ ONLY on this resource. `PUT .../organizations/{organization_id}/default-role`
+             *     designates and `DELETE` on the same path clears, because the designation is a
+             *     property of the organization rather than of the role. A role create or a role
+             *     PATCH can never set it, which is why neither request body has the field.
+             *
+             *     A role holding `true` is NOT listed in any membership's direct-assignment
+             *     list, because the default role is resolved at read and no row is ever written
+             *     for it. It appears in the effective-role views.
+             */
+            is_default: boolean;
             /** @description Free-form role metadata (the empty object when none was set). */
             metadata: unknown;
             /** @description The organization the role belongs to (`org_...`). */
@@ -3960,6 +4095,16 @@ export interface components {
              *     new default demotes the previous one. Defaults to false.
              */
             is_env_default?: boolean;
+        };
+        /** @description The body to designate an organization's DEFAULT role. */
+        SetOrgDefaultRoleRequest: {
+            /**
+             * @description The role to designate (`rol_...`). It must be a LIVE role of THIS
+             *     organization; anything else (absent, deleted, another scope's, another
+             *     organization's) is the uniform not-found.
+             * @example rol_...
+             */
+            role_id: string;
         };
         /**
          * @description The body to MOVE a group within its organization's group forest.
@@ -9019,6 +9164,134 @@ export interface operations {
             };
         };
     };
+    setOrgDefaultRole: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetOrgDefaultRoleRequest"];
+            };
+        };
+        responses: {
+            /** @description The role that is now the organization's default. Every LIVE ACTIVE member resolves it at the NEXT token issuance, with NO assignment row written for any of them, so it appears in the effective-role views and in no membership's direct-assignment list */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrgRoleView"];
+                };
+            };
+            /** @description Malformed request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found: the organization, or a role that is not a live role of it (uniform across absent, deleted, another scope's, and another organization's) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description A CONCURRENT designation in this organization won the race; retry. A caller sending one request cannot reach this, because a second designation moves the existing one rather than colliding with it */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    clearOrgDefaultRole: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Cleared. Members stop resolving the role through the designation at the NEXT token issuance, and keep it if some row grants it; access tokens already issued are NOT revoked (revoke the session or refresh family for that). The role itself is untouched */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found (the organization, or an organization with no live default role: a repeat clear and an organization whose default role has since been deleted are the same answer) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     disableOrganization: {
         parameters: {
             query?: never;
@@ -10815,6 +11088,228 @@ export interface operations {
                 };
             };
             /** @description Not found (absent, deleted, another scope's, or another organization's) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listOrgRolePermissions: {
+        parameters: {
+            query?: {
+                /**
+                 * @description The desired page size, a positive integer. Clamped to
+                 *     `[1, max_page_size]`; defaults to the configured default when absent.
+                 */
+                limit?: number;
+                /**
+                 * @description The opaque cursor from a previous page's `next_cursor`. Absent for the
+                 *     first page (keyset pagination; there is no offset).
+                 */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+                /** @description The role identifier (rol_...) */
+                role_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A page of the permissions this role grants. A row here is not by itself a live grant: deleting the permission leaves the row and stops the resolution selecting it */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrgRolePermissionList"];
+                };
+            };
+            /** @description Malformed cursor */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found (the organization, or a role that is not a live role of it) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    assignOrgRolePermission: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Required. Replaying a POST with the same key returns the original response without re-executing. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+                /** @description The role identifier (rol_...) */
+                role_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AssignOrgRolePermissionRequest"];
+            };
+        };
+        responses: {
+            /** @description Attached. Every member who effectively holds the role, directly or through the group forest, resolves the permission at the NEXT token issuance */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrgRolePermissionView"];
+                };
+            };
+            /** @description Malformed request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found: the organization, a role that is not a live role of it, or a permission that is not a live permission of this environment (uniform across absent, deleted, another scope's, and another organization's, so a cross pairing never says which half was wrong) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The role already carries that permission */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Idempotency-Key reused with a different request */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    unassignOrgRolePermission: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+                /** @description The role identifier (rol_...) */
+                role_id: string;
+                /** @description The permission identifier (prm_...) */
+                permission_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Detached. Members holding the role stop resolving the permission at the NEXT token issuance; access tokens already issued are NOT revoked (revoke the session or refresh family for that). The pair is immediately available again, and re-attaching mints a FRESH mapping rather than reviving this one */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found (no such live mapping: absent, already detached, either half in another scope, a role of another organization, or a pair whose two halves are individually visible but do not belong together) */
             404: {
                 headers: {
                     [name: string]: unknown;

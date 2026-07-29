@@ -374,6 +374,40 @@ pub enum Action {
     /// the endpoint's own liveness filter instead. So the absence of this action
     /// never means the grant is still in force.
     OrganizationRolePermissionUnassign,
+    /// An organization DESIGNATED one of its roles as its DEFAULT role (issue #98).
+    /// The target is the role that is the default AFTER the write.
+    ///
+    /// The designation is a per-organization singleton (`org_roles.is_default` under
+    /// the partial unique index migration 0093 creates), so this action states the
+    /// whole of the new designation on its own: a set naming role B means role A, if
+    /// there was one, is no longer the default. Moving the designation is ONE
+    /// request, ONE transaction, and therefore ONE audit row, and the row that names
+    /// B is what an operator reads the move from. There is no separate clear row for
+    /// the outgoing role.
+    ///
+    /// Its blast radius is not the target row and it is the largest of any action in
+    /// this family: every LIVE ACTIVE member of the organization resolves the role at
+    /// their next token issuance, without an assignment row existing for any of them.
+    /// The default role is RESOLVED AT READ and never materialized (migration 0093
+    /// states why in full), so no `organization.membership.role.assign` accompanies
+    /// this action and the absence of one never means the role is not held.
+    OrganizationDefaultRoleSet,
+    /// An organization's DEFAULT role designation was CLEARED (issue #98). The target
+    /// is the role that WAS the default, which is what keeps the trail legible: the
+    /// organization is not an addressable target of this table's actions, and naming
+    /// the outgoing role is what lets an operator pair a clear with the set that
+    /// preceded it.
+    ///
+    /// After this the organization has no default role, so its members resolve only
+    /// the roles some row grants them. Nothing is deleted: the role itself stays a
+    /// live role of the organization and every direct and group grant of it stands.
+    ///
+    /// Deleting the default ROLE does NOT write this action. A soft-deleted role
+    /// keeps its `is_default` value and simply stops resolving and stops occupying
+    /// the designation, because every read and the unique index alike are partial
+    /// over live rows. So the absence of this action never means an organization
+    /// still has a default role.
+    OrganizationDefaultRoleClear,
     /// An authorization code and its grant were issued (issue #12).
     AuthorizationCodeIssue,
     /// An authorization code was redeemed at the token endpoint (issue #12).
@@ -1192,6 +1226,8 @@ impl Action {
             Action::PermissionDelete => "permission.delete",
             Action::OrganizationRolePermissionAssign => "organization.role.permission.assign",
             Action::OrganizationRolePermissionUnassign => "organization.role.permission.unassign",
+            Action::OrganizationDefaultRoleSet => "organization.default_role.set",
+            Action::OrganizationDefaultRoleClear => "organization.default_role.clear",
             Action::AuthorizationCodeIssue => "authorization_code.issue",
             Action::AuthorizationCodeRedeem => "authorization_code.redeem",
             Action::AuthorizationCodeReuse => "authorization_code.reuse",
@@ -1565,5 +1601,50 @@ mod tests {
             );
         }
         assert!(migration_0092.contains("org_role_permissions_pair_live_uniq"));
+
+        // Issue #98's DEFAULT-ROLE actions. `org_roles` is the one table in this
+        // issue whose delta contract is stated across TWO migration headers: 0086
+        // named three actions, and 0093 says that this PR takes it to five. Both
+        // halves are pinned, because a check that read only 0093 would stay green if
+        // a rename dropped one of 0086's three out of the union that header is
+        // counting.
+        let migration_0086 = include_str!("../migrations/0086_org_roles.sql");
+        let migration_0093 = include_str!("../migrations/0093_org_default_role.sql");
+        for (action, header, source) in [
+            (Action::OrganizationRoleCreate, migration_0086, "0086"),
+            (Action::OrganizationRoleUpdate, migration_0086, "0086"),
+            (Action::OrganizationRoleDelete, migration_0086, "0086"),
+            (Action::OrganizationDefaultRoleSet, migration_0093, "0093"),
+            (Action::OrganizationDefaultRoleClear, migration_0093, "0093"),
+        ] {
+            assert!(
+                seen.contains_key(action.as_str()),
+                "{} must be in the as_str match",
+                action.as_str()
+            );
+            assert!(
+                header.contains(&format!("`{}`", action.as_str())),
+                "migration {source} declares part of the org_roles delta contract, \
+                 so {} must appear in its header",
+                action.as_str()
+            );
+        }
+        // The designation is a property of the ORGANIZATION rather than of the role
+        // vocabulary, so unlike 0086's three these two name that dimension. Spelled
+        // as a positive check on the prefix AND a refusal of the role-vocabulary
+        // prefix, so a rename cannot quietly fold them into the create/update/delete
+        // family whose target means something else.
+        for action in [
+            Action::OrganizationDefaultRoleSet,
+            Action::OrganizationDefaultRoleClear,
+        ] {
+            assert!(
+                action.as_str().starts_with("organization.default_role."),
+                "{} designates one role for a whole ORGANIZATION, so it must name \
+                 that dimension",
+                action.as_str()
+            );
+        }
+        assert!(migration_0093.contains("org_roles_org_default_live_uniq"));
     }
 }
