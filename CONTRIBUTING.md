@@ -13,6 +13,12 @@ to pick an open issue in the current milestone and say so on the issue.
   compatibility checks CI enforces. Changes to the management API additionally
   run `scripts/openapi-check.sh` (the served-versus-committed OpenAPI drift
   check).
+- **New fuzz targets run in CI.** A fuzz target is registered by a `[[bin]]`
+  entry in its `*/fuzz/Cargo.toml`, and it only ever EXECUTES if it also has a
+  row in the `.github/workflows/fuzz.yml` matrix. `scripts/fuzz-matrix-freshness.sh`
+  (in the gate) fails if those two sets differ in either direction, so a new
+  target lands with its matrix row or not at all. The check is static and needs
+  no nightly toolchain and no `cargo-fuzz` install.
 - **Prose rule.** No em dashes and no en dashes anywhere in repo text
   (code, comments, docs, commit messages). CI enforces this.
 - **Determinism seam.** All time and randomness flows through

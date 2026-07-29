@@ -23,25 +23,57 @@ permissions:
 
 jobs:
   fuzz:
-    name: fuzz ${{ matrix.crate }}
+    name: fuzz ${{ matrix.target }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
+        # `dir` is the fuzz crate's PARENT: most live under their crate, and the
+        # ceremony harness is the repository-root `fuzz/` crate.
+        #
+        # EVERY registered target belongs here. A target absent from this matrix has
+        # never run, which is exactly how issue #418 sat undetected; keep this list
+        # equal to the union of `cargo fuzz list` over every `*/fuzz` crate. As of
+        # issue #419 that is 14 targets, matching the 14 `fuzz_targets/*.rs` files and
+        # the 14 `[[bin]]` entries.
+        #
+        # That equality is ENFORCED, not merely documented here: the gate runs
+        # `scripts/fuzz-matrix-freshness.sh`, which fails naming any target that is
+        # registered but unlisted, or listed but unregistered. It reads this file and
+        # the fuzz manifests statically, so it needs no nightly toolchain.
         include:
-          - crate: ironauth-jose
+          - dir: crates/ironauth-jose
             target: verify_jws
-          - crate: ironauth-fetch
+          - dir: crates/ironauth-fetch
             target: fetch_validation
-          - crate: ironauth-store
+          - dir: crates/ironauth-store
             target: redirect_match
-          - crate: ironauth-store
+          - dir: crates/ironauth-store
             target: canonicalize_identifier
-          - crate: ironauth-oidc
+          - dir: crates/ironauth-oidc
             target: flow_submission_parse
-          - crate: ironauth-oidc
+          - dir: crates/ironauth-oidc
             target: branding_sanitize
+          - dir: .
+            target: ceremony_parse
+          # Added by issue #419. These landed with their crates (all five importers in
+          # #254, `connector_def` in #277, `claim_mapping` in #281) but the matrix last
+          # changed in #315 and never gained them, so none had ever run in CI.
+          - dir: crates/ironauth-importers
+            target: auth0
+          - dir: crates/ironauth-importers
+            target: firebase
+          - dir: crates/ironauth-importers
+            target: keycloak
+          - dir: crates/ironauth-importers
+            target: ldap
+          - dir: crates/ironauth-importers
+            target: scim
+          - dir: crates/ironauth-connector
+            target: claim_mapping
+          - dir: crates/ironauth-connector
+            target: connector_def
     steps:
       - uses: actions/checkout@v4
       # cargo-fuzz needs a nightly toolchain for the sanitizer build. The
@@ -52,7 +84,7 @@ jobs:
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
       - name: Run ${{ matrix.target }}
-        working-directory: crates/${{ matrix.crate }}
+        working-directory: ${{ matrix.dir }}
         env:
           RUSTUP_TOOLCHAIN: nightly
         run: >-
@@ -63,6 +95,6 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: fuzz-artifacts-${{ matrix.crate }}
-          path: crates/${{ matrix.crate }}/fuzz/artifacts/
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: ${{ matrix.dir }}/fuzz/artifacts/
           if-no-files-found: ignore

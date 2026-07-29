@@ -24,6 +24,12 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 ironauth-webauthn = { path = "../crates/ironauth-webauthn" }
 serde_json = "1"
+# The certificate-facing half of the target builds the two carriers an X.509 chain
+# arrives in: a CBOR `packed` attestation statement and an MDS3 JWS header, whose
+# `x5c` entries are standard-alphabet base64. Both are structure, not parsing: the
+# fuzzer's bytes ride INSIDE them so the parser under test is actually reached.
+ciborium = "0.2"
+base64 = "0.22"
 
 [[bin]]
 name = "ceremony_parse"

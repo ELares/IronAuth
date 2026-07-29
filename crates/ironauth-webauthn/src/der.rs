@@ -246,6 +246,17 @@ pub fn oid_arcs(contents: &[u8]) -> Result<Vec<u64>, DerError> {
 pub fn parse_time(tag_byte: u8, contents: &[u8]) -> Result<i64, DerError> {
     let text = core::str::from_utf8(contents).map_err(|_| DerError::BadValue)?;
     let text = text.strip_suffix('Z').ok_or(DerError::BadValue)?;
+    // Every field below is cut at a CONSTANT byte offset, and the ASCII-digit checks
+    // live INSIDE `parse_2`, which runs AFTER the slice. The `text.len()` checks prove
+    // only that the bytes exist, never that an offset is a character boundary, so a
+    // multi-byte character straddling one made `&text[0..2]` (and each sibling offset)
+    // PANIC on a certificate whose bytes the caller does not control. Rejecting a
+    // non-ASCII value here makes every offset below a boundary. It moves no verdict:
+    // the length is exact and every byte of an accepted value already had to satisfy
+    // an ASCII-only field parse, so nothing that parses today was non-ASCII.
+    if !text.is_ascii() {
+        return Err(DerError::BadValue);
+    }
     let (year, rest) = match tag_byte {
         tag::UTC_TIME => {
             if text.len() != 12 {
@@ -376,6 +387,48 @@ mod tests {
         assert_eq!(
             parse_time(tag::UTC_TIME, b"700101000000").err(),
             Some(DerError::BadValue)
+        );
+    }
+
+    #[test]
+    fn a_multibyte_character_in_a_time_is_rejected_not_a_panic() {
+        // Issue #419, the char-boundary panic class. The length checks are BYTE checks,
+        // so a value of the right byte length whose characters are not all one byte
+        // used to be sliced through the middle of one: "end byte index 2 is not a char
+        // boundary". Each of these is exactly 12 (UTCTime) or 14 (GeneralizedTime)
+        // bytes before the `Z`, straddling a different field offset, and every one is
+        // now the ordinary rejection the digit checks always intended.
+        for contents in [
+            // UTCTime: the euro straddles the year, month, and day cuts in turn.
+            &b"\xe2\x82\xac123456789Z"[..],
+            &b"99\xe2\x82\xac1234567Z"[..],
+            &b"9901\xe2\x82\xac12345Z"[..],
+            // A 2-byte and a 4-byte character, at other offsets.
+            &b"9\xc3\xa90102030405Z"[..],
+            &b"99010203\xf0\x9f\x98\x8005Z"[..],
+        ] {
+            assert_eq!(
+                parse_time(tag::UTC_TIME, contents).err(),
+                Some(DerError::BadValue),
+                "UTCTime {contents:?}"
+            );
+        }
+        for contents in [
+            &b"12\xe2\x82\xac123456789Z"[..],
+            &b"\xe2\x82\xac12345678901Z"[..],
+            &b"2024010203\xf0\x9f\x98\x80Z"[..],
+        ] {
+            assert_eq!(
+                parse_time(tag::GENERALIZED_TIME, contents).err(),
+                Some(DerError::BadValue),
+                "GeneralizedTime {contents:?}"
+            );
+        }
+        // The ASCII gate moves no accepted value: the conformant times still parse.
+        assert_eq!(parse_time(tag::UTC_TIME, b"700101000000Z").unwrap(), 0);
+        assert_eq!(
+            parse_time(tag::GENERALIZED_TIME, b"20240101000000Z").unwrap(),
+            1_704_067_200
         );
     }
 }

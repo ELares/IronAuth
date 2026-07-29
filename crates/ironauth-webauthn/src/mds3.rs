@@ -228,7 +228,12 @@ fn parse_date(text: &str) -> Option<i64> {
 /// bytes.
 fn parse_aaguid(text: &str) -> Option<[u8; 16]> {
     let hex: String = text.chars().filter(|c| *c != '-').collect();
-    if hex.len() != 32 {
+    // The pairs below are cut at CONSTANT byte offsets, and `hex.len()` is a BYTE
+    // length: it proves 32 bytes are there and nothing about character boundaries, so
+    // a multi-byte character inside them made `&hex[i * 2..i * 2 + 2]` PANIC. Requiring
+    // ASCII makes every offset a boundary and moves no verdict, since a pair holding a
+    // non-ASCII byte could never have hex-decoded.
+    if hex.len() != 32 || !hex.is_ascii() {
         return None;
     }
     let mut out = [0u8; 16];
@@ -429,6 +434,40 @@ mod tests {
             verify_blob(&tampered, &root(FAR_FUTURE), NOW),
             Err(Mds3Error::BadSignature)
         );
+    }
+
+    #[test]
+    fn a_multibyte_aaguid_or_date_is_skipped_not_a_panic() {
+        // Issue #419, the char-boundary panic class. `parse_aaguid` checked the BYTE
+        // length of the de-hyphenated text and then cut 16 pairs at constant offsets,
+        // so a multi-byte character inside them sliced through a character: "end byte
+        // index 2 is not a char boundary". Each of these is 32 bytes with a character
+        // straddling a different pair.
+        for aaguid in [
+            format!("\u{20ac}{}", "a".repeat(29)),
+            format!("{}\u{20ac}{}", "a".repeat(4), "b".repeat(25)),
+            format!("{}\u{1f600}", "0".repeat(28)),
+            format!("{}\u{e9}{}", "0".repeat(17), "f".repeat(13)),
+        ] {
+            assert_eq!(
+                aaguid.len(),
+                32,
+                "the byte length is the one that used to pass"
+            );
+            assert_eq!(parse_aaguid(&aaguid), None, "{aaguid:?}");
+        }
+        // The canonical hyphenated form still parses, and still round trips.
+        let canonical = "0132d110-bf4e-4208-a403-ab4f5f12efe5";
+        let parsed = parse_aaguid(canonical).expect("the canonical form still parses");
+        assert_eq!(aaguid_to_hex(&parsed), canonical);
+
+        // `parse_date` hands `der::parse_time` a string it builds from three
+        // byte-length-checked parts. Every cut `parse_time` makes lands on one of those
+        // part edges, so that route was already boundary-safe; these hold that line and
+        // confirm the ASCII gate in `parse_time` moved none of its verdicts.
+        assert_eq!(parse_date("2099-01-01"), Some(4_070_908_800));
+        assert_eq!(parse_date("2\u{20ac}-01-01"), None);
+        assert_eq!(parse_date("2099-\u{e9}-01"), None);
     }
 
     fn b64url_encode(bytes: &[u8]) -> String {

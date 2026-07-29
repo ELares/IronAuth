@@ -6,6 +6,16 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Char-boundary panic in query percent-decoding (issue #419): `percent_decode` sliced
+  a `str` at the constant `value[i + 1..i + 3]` behind a byte-LENGTH check, so a `%`
+  followed by a multi-byte character panicked ("end byte index 3 is not a char
+  boundary"). That is reachable UNAUTHENTICATED: the federation authorize and callback
+  legs hand `query_get` the RAW wire query, and the `http` URI parser admits bytes
+  `0x80..=0xFF` in a query verbatim (it requires only that the whole request target be
+  valid UTF-8). The escape digits are now read through `get`, and a non-boundary escape
+  takes the same verbatim pass-through a malformed escape already took, so no input
+  that decoded before decodes differently. `form_urldecode` in `client_auth` was already
+  written correctly and is unchanged.
 - `ID_TOKEN_BLOAT_THRESHOLD_BYTES` (3072) is now PUBLIC (issue #98). It was already the
   shipped ID-token growth signal threshold and its value is unchanged; only its
   visibility moves. The access-token budget's approach threshold

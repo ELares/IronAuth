@@ -6,6 +6,23 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Char-boundary panics in the two scheme tests (issue #419): `discovery::has_scheme` and
+  `validate_https_url` sliced a `str` at a constant scheme length behind a byte-LENGTH
+  check, so a URL whose byte 8 fell inside a multi-byte character panicked ("end byte
+  index 8 is not a char boundary"). The discovery one runs on `authorization_endpoint`,
+  `token_endpoint`, and `jwks_uri` out of a FETCHED upstream document, so a malicious or
+  compromised upstream IdP controlled the value. Both now compare the leading BYTES,
+  which takes character boundaries out of the question; the tail slices behind them stay
+  direct slices because a matched ASCII scheme makes that offset a boundary. The
+  comparison is still exact and still case-insensitive, so no input that was previously
+  ACCEPTED changes verdict. Inputs that previously PANICKED now resolve to the
+  function's ordinary answer, which is a rejection for every shape except one: a
+  plaintext `http://` authority that OPENS with a multi-byte character, so that byte 8
+  falls inside it, under a plaintext-loopback test issuer (`require_https` off). The
+  `https://` test used to panic before the `http://` test ran; now the `http://` test
+  matches and the value is accepted, which is what the check always intended for that
+  issuer. No plaintext downgrade rides in on it: such a value is not an `https://` URL,
+  and a production https issuer still rejects it.
 - First-party social-provider connector DATA for issue #74. The declarative framework grows the
   data every social provider needs, with the login logic staying in the federation slice:
   - **`oauth2` protocol + `OAuth2Endpoints`.** A first-class non-OIDC protocol variant (GitHub)

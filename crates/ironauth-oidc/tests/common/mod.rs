@@ -2603,7 +2603,28 @@ pub fn percent_decode(value: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(&value[i + 1..i + 3], 16) {
+            // `get`, never `&value[i + 1..i + 3]`: the length check proves the bytes
+            // exist, not that `i + 3` is a character boundary (issue #419). The values
+            // read here are ones IronAuth itself emitted, so this helper is not a live
+            // hazard, but it must not carry the anti-pattern that would turn a future
+            // assertion failure into an unrelated char-boundary panic.
+            //
+            // STATE IT PLAINLY: this is the ONE of the six sites issue #419 fixes that
+            // carries NO regression test, so five of six are covered and a mutant that
+            // reverted this line would survive the suite. That is not an oversight and
+            // it cannot be repaired from the existing suite. Every caller (`location_param`
+            // and `location_fragment_param` here, and the local `location_param` in
+            // `tests/rfc9700.rs`) feeds this helper a `Location` header IronAuth itself
+            // wrote, and IronAuth percent-encodes every value it emits into ASCII `%XX`,
+            // so no input the suite can produce ever reaches the branch below with a
+            // multi-byte character after a `%`. The only thing that would kill the
+            // mutant is a direct unit test of a test helper, which asserts nothing about
+            // IronAuth and would be a coverage prop rather than a regression test. The
+            // real coverage for this defect class lives at the five PRODUCTION sites.
+            if let Some(Ok(byte)) = value
+                .get(i + 1..i + 3)
+                .map(|escape| u8::from_str_radix(escape, 16))
+            {
                 out.push(byte);
                 i += 3;
                 continue;
