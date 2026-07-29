@@ -58,15 +58,25 @@ fuzz_target!(|data: &[u8]| {
 
     // The anti-bypass invariant: a match between DIFFERENT strings is ONLY ever the
     // RFC 8252 loopback port exception, which applies only to http. So any accepted
-    // non-exact match must have both sides on the http scheme.
+    // non-exact match must have both sides on the http scheme. The check compares
+    // BYTES: were the invariant ever violated, slicing a `str` at the constant index
+    // 7 could itself panic on a character boundary and hide the real failure.
     if a != b && redirect_uri_matches(a, b) {
         assert!(
-            a.len() >= 7 && a[..7].eq_ignore_ascii_case("http://"),
+            starts_with_http_scheme(a),
             "non-exact match on a non-http registered value: {a:?}"
         );
         assert!(
-            b.len() >= 7 && b[..7].eq_ignore_ascii_case("http://"),
+            starts_with_http_scheme(b),
             "non-exact match on a non-http presented value: {b:?}"
         );
     }
 });
+
+/// Whether `uri` begins with a case-insensitive `http://`, compared on bytes so it
+/// is total over every input the fuzzer can produce.
+fn starts_with_http_scheme(uri: &str) -> bool {
+    uri.as_bytes()
+        .get(..7)
+        .is_some_and(|head| head.eq_ignore_ascii_case(b"http://"))
+}
