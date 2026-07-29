@@ -75,6 +75,16 @@ fn permissions_path(tenant: &str, environment: &str) -> String {
     format!("/v1/tenants/{tenant}/environments/{environment}/permissions")
 }
 
+fn org_role_permissions_path(tenant: &str, environment: &str, org: &str, role: &str) -> String {
+    format!(
+        "/v1/tenants/{tenant}/environments/{environment}/organizations/{org}/roles/{role}/permissions"
+    )
+}
+
+fn org_default_role_path(tenant: &str, environment: &str, org: &str) -> String {
+    format!("/v1/tenants/{tenant}/environments/{environment}/organizations/{org}/default-role")
+}
+
 /// The `id` of a JSON response body.
 fn id_of(response: &str) -> String {
     serde_json::from_str::<serde_json::Value>(response).expect("json")["id"]
@@ -520,6 +530,166 @@ async fn a_permission_vocabulary_write_is_sudo_gated() {
     assert_eq!(status, StatusCode::OK, "elevated relabel: {resp}");
     let (status, _, resp) = harness.delete(&path).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "elevated delete: {resp}");
+}
+
+/// The role-to-permission MAPPING and the organization DEFAULT-ROLE mutations (issue
+/// #98, PR 8) are sudo gated exactly like every other organization-nested mutator.
+/// Three route entries carry FOUR mutating handlers (attach, detach, designate,
+/// clear), so there are four `require_fresh_privilege` call sites, and every one is
+/// challenged here with the elevation window lapsed, writes nothing, and succeeds
+/// after a fresh elevation. Each is dropped INDIVIDUALLY: without a per-handler probe
+/// a refactor could take the gate off `clear_org_default_role` alone and let the
+/// stolen-cookie case this file calls acceptance-critical take a role away from every
+/// member of an organization at once with no re-authentication, with CI still green.
+///
+/// The READS are deliberately NOT gated and are exercised below with the window
+/// lapsed, because sudo gates mutations only. They are also what makes "wrote nothing"
+/// observable without elevating first, which is why the designation is asserted
+/// through the ungated role list rather than through a second write.
+///
+/// One test rather than four: the challenged half and the elevated half have to run
+/// against the SAME seeded rows for "wrote nothing" to mean anything.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn an_org_role_permission_or_default_role_write_is_sudo_gated() {
+    let (harness, clock) = Harness::start_with_sudo(600).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k1").await;
+    let elevate = elevate_path(&tenant, &env);
+
+    // Seed inside an open window (every one of these is itself a gated mutation),
+    // then let it lapse so the probes below run against the exact state the gate is
+    // supposed to protect.
+    let (status, _, body) = harness.post(&elevate, "e1", "{}").await;
+    assert_eq!(status, StatusCode::OK, "elevate: {body}");
+    let (status, _, response) = harness
+        .post(
+            &organizations_path(&tenant, &env),
+            "o-seed",
+            &serde_json::json!({ "display_name": "Globex" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "seed org: {response}");
+    let org = id_of(&response);
+    let roles = org_roles_path(&tenant, &env, &org);
+    let role = create_named(&harness, &roles, "billing.admin", "r-seed").await;
+    let permissions = permissions_path(&tenant, &env);
+    let (status, _, response) = harness
+        .post(
+            &permissions,
+            "p-seed",
+            &serde_json::json!({ "slug": "billing.invoice.read", "display_name": "Label" })
+                .to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "seed permission: {response}");
+    let seeded_permission = id_of(&response);
+    let (status, _, response) = harness
+        .post(
+            &permissions,
+            "p-seed-2",
+            &serde_json::json!({ "slug": "billing.invoice.write", "display_name": "Label" })
+                .to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "seed permission 2: {response}");
+    let fresh_permission = id_of(&response);
+    let mappings = org_role_permissions_path(&tenant, &env, &org, &role);
+    let (status, _, response) = harness
+        .post(
+            &mappings,
+            "m-seed",
+            &serde_json::json!({ "permission_id": seeded_permission }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "seed mapping: {response}");
+    let default_role = org_default_role_path(&tenant, &env, &org);
+    let (status, _, response) = harness
+        .put(
+            &default_role,
+            &serde_json::json!({ "role_id": role }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "seed the designation: {response}");
+
+    clock.advance(Duration::from_secs(601));
+
+    let attach = serde_json::json!({ "permission_id": fresh_permission }).to_string();
+    let designate = serde_json::json!({ "role_id": role }).to_string();
+
+    // --- With the window lapsed, every mutating endpoint is challenged. ---
+    let (status, _, resp) = harness.post(&mappings, "m-1", &attach).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "assign_org_role_permission is challenged without an elevation: {resp}"
+    );
+    assert!(resp.contains("insufficient_user_authentication"), "{resp}");
+    let (status, _, resp) = harness
+        .delete(&format!("{mappings}/{seeded_permission}"))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "unassign_org_role_permission is challenged without an elevation: {resp}"
+    );
+    assert!(resp.contains("insufficient_user_authentication"), "{resp}");
+    let (status, _, resp) = harness.put(&default_role, &designate).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "set_org_default_role is challenged without an elevation: {resp}"
+    );
+    assert!(resp.contains("insufficient_user_authentication"), "{resp}");
+    let (status, _, resp) = harness.delete(&default_role).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "clear_org_default_role is challenged without an elevation: {resp}"
+    );
+    assert!(resp.contains("insufficient_user_authentication"), "{resp}");
+
+    // Nothing executed: no mapping was added or removed, and the designation still
+    // stands. Reads are ungated, so this is observable without elevating first.
+    let (status, _, listed) = harness.get(&mappings).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the mapping list is ungated: {listed}"
+    );
+    assert_eq!(
+        item_count(&listed),
+        1,
+        "the challenged attach and detach wrote nothing: {listed}"
+    );
+    assert!(
+        listed.contains(&seeded_permission) && !listed.contains(&fresh_permission),
+        "and the surviving mapping is the seeded one: {listed}"
+    );
+    let (status, _, roles_listed) = harness.get(&roles).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the role list is ungated: {roles_listed}"
+    );
+    assert!(
+        roles_listed.contains("\"is_default\":true"),
+        "the challenged clear did not remove the designation: {roles_listed}"
+    );
+
+    // --- After a fresh elevation, every one of the same requests succeeds. ---
+    let (status, _, body) = harness.post(&elevate, "e2", "{}").await;
+    assert_eq!(status, StatusCode::OK, "re-elevate: {body}");
+
+    let (status, _, resp) = harness.post(&mappings, "m-2", &attach).await;
+    assert_eq!(status, StatusCode::CREATED, "elevated attach: {resp}");
+    let (status, _, resp) = harness
+        .delete(&format!("{mappings}/{seeded_permission}"))
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "elevated detach: {resp}");
+    let (status, _, resp) = harness.put(&default_role, &designate).await;
+    assert_eq!(status, StatusCode::OK, "elevated designate: {resp}");
+    let (status, _, resp) = harness.delete(&default_role).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "elevated clear: {resp}");
 }
 
 /// The organization group-MEMBER and role-ASSIGNMENT mutations (issue #97, PR 5) are

@@ -241,6 +241,24 @@ name = "permission_vocabulary"
 path = "tests/permission_vocabulary.rs"
 required-features = ["testing"]
 
+# The role-to-permission mapping and the organization DEFAULT ROLE over HTTP
+# (issue #98, PR 8): the three ORGANIZATION-nested mapping endpoints that join an
+# organization-scoped role to an environment-scoped permission, plus the two that
+# designate and clear the per-organization default role. Covers the cross-pairing
+# refusals in both directions (a role of another organization, a permission of
+# another environment), the proof that a nested route resolves through the fenced
+# pair read and never through the organization-blind by-id one, byte-identical
+# anti-oracle uniformity on every endpoint, the audit multiset at each step
+# including the two new org_roles actions, the atomic MOVE of the default
+# designation and the slot a soft-deleted default frees, the Idempotency-Key
+# replay and its credential and path namespacing, the multi-page cursor walk, and
+# the environment-scoped-key confinement on all five endpoints. Needs a real
+# database (DATABASE_URL).
+[[test]]
+name = "org_role_permissions"
+path = "tests/org_role_permissions.rs"
+required-features = ["testing"]
+
 # DCR abuse-control management surface (issue #31): authoring a reusable policy
 # (create/list/replay/conflict/invalid-primitive), minting an initial access token
 # carrying a policy-chain snapshot (plaintext once, idempotent replay, unknown policy

@@ -6789,6 +6789,199 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/default-role": {
+      "put": {
+        "tags": [
+          "org-roles"
+        ],
+        "summary": "DESIGNATE one of the organization's roles as its DEFAULT role.",
+        "description": "Idempotent replacement of a single-valued property: the store clears whatever\nrole held the designation and sets it on this one in ONE transaction, so a\nsecond designation MOVES it rather than being refused. Designating the role\nthat already holds it is a no-op in effect and still answers 200.",
+        "operationId": "setOrgDefaultRole",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "The organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetOrgDefaultRoleRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The role that is now the organization's default. Every LIVE ACTIVE member resolves it at the NEXT token issuance, with NO assignment row written for any of them, so it appears in the effective-role views and in no membership's direct-assignment list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrgRoleView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found: the organization, or a role that is not a live role of it (uniform across absent, deleted, another scope's, and another organization's)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A CONCURRENT designation in this organization won the race; retry. A caller sending one request cannot reach this, because a second designation moves the existing one rather than colliding with it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "org-roles"
+        ],
+        "summary": "CLEAR the organization's DEFAULT role designation.",
+        "description": "Nothing is deleted: the role stays a live role of the organization and every\ndirect and group grant of it stands. What stops is the resolution that gave it to\nevery member without a row.",
+        "operationId": "clearOrgDefaultRole",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "The organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Cleared. Members stop resolving the role through the designation at the NEXT token issuance, and keep it if some row grants it; access tokens already issued are NOT revoked (revoke the session or refresh family for that). The role itself is untouched"
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (the organization, or an organization with no live default role: a repeat clear and an organization whose default role has since been deleted are the same answer)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/disable": {
       "post": {
         "tags": [
@@ -9655,6 +9848,367 @@
           },
           "404": {
             "description": "Not found (absent, deleted, another scope's, or another organization's)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}/permissions": {
+      "get": {
+        "tags": [
+          "org-role-permissions"
+        ],
+        "summary": "List the permissions an organization's role grants (cursor paginated).",
+        "operationId": "listOrgRolePermissions",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "The organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "role_id",
+            "in": "path",
+            "description": "The role identifier (rol_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "The desired page size, a positive integer. Clamped to\n`[1, max_page_size]`; defaults to the configured default when absent.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "The opaque cursor from a previous page's `next_cursor`. Absent for the\nfirst page (keyset pagination; there is no offset).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of the permissions this role grants. A row here is not by itself a live grant: deleting the permission leaves the row and stops the resolution selecting it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrgRolePermissionList"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed cursor",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (the organization, or a role that is not a live role of it)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "org-role-permissions"
+        ],
+        "summary": "Attach a permission to an organization's role.",
+        "operationId": "assignOrgRolePermission",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "The organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "role_id",
+            "in": "path",
+            "description": "The role identifier (rol_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying a POST with the same key returns the original response without re-executing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AssignOrgRolePermissionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Attached. Every member who effectively holds the role, directly or through the group forest, resolves the permission at the NEXT token issuance",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrgRolePermissionView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found: the organization, a role that is not a live role of it, or a permission that is not a live permission of this environment (uniform across absent, deleted, another scope's, and another organization's, so a cross pairing never says which half was wrong)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The role already carries that permission",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency-Key reused with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}/permissions/{permission_id}": {
+      "delete": {
+        "tags": [
+          "org-role-permissions"
+        ],
+        "summary": "Detach a permission from an organization's role.",
+        "operationId": "unassignOrgRolePermission",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "The organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "role_id",
+            "in": "path",
+            "description": "The role identifier (rol_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "permission_id",
+            "in": "path",
+            "description": "The permission identifier (prm_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Detached. Members holding the role stop resolving the permission at the NEXT token issuance; access tokens already issued are NOT revoked (revoke the session or refresh family for that). The pair is immediately available again, and re-attaching mints a FRESH mapping rather than reviving this one"
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (no such live mapping: absent, already detached, either half in another scope, a role of another organization, or a pair whose two halves are individually visible but do not belong together)",
             "content": {
               "application/json": {
                 "schema": {
@@ -13233,6 +13787,20 @@
           }
         }
       },
+      "AssignOrgRolePermissionRequest": {
+        "type": "object",
+        "description": "The body to attach a permission to a role.",
+        "required": [
+          "permission_id"
+        ],
+        "properties": {
+          "permission_id": {
+            "type": "string",
+            "description": "The permission to attach (`prm_...`). It must be a LIVE permission of THIS\nENVIRONMENT; anything else (absent, deleted, another environment's,\nmalformed) is the uniform not-found. It takes no organization, because the\nvocabulary has none.",
+            "example": "prm_..."
+          }
+        }
+      },
       "BanList": {
         "type": "object",
         "description": "A page of bans.",
@@ -15940,6 +16508,69 @@
           }
         }
       },
+      "OrgRolePermissionList": {
+        "type": "object",
+        "description": "A page of the permissions a role grants.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OrgRolePermissionView"
+            },
+            "description": "The mappings on this page, oldest first. There is no cap on how many\npermissions a role may carry; this page is size-clamped like every list.\n\nA mapping listed here is not by itself a live grant: deleting the permission\nleaves the row alone and the resolution stops selecting it on the\npermission's own liveness filter."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The opaque cursor for the next page, or null if this is the last page."
+          }
+        }
+      },
+      "OrgRolePermissionView": {
+        "type": "object",
+        "description": "A permission attached to an organization's role, as returned by the management\nAPI (issue #98).",
+        "required": [
+          "id",
+          "organization_id",
+          "role_id",
+          "permission_id",
+          "created_at_unix_ms",
+          "updated_at_unix_ms"
+        ],
+        "properties": {
+          "created_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Creation time, milliseconds since the Unix epoch."
+          },
+          "id": {
+            "type": "string",
+            "description": "The mapping identifier (`rpm_...`). Carried for correlation with the audit\nlog, which targets it; the mapping's ADDRESS on the wire is the\n`(role_id, permission_id)` pair, and no endpoint here accepts this value."
+          },
+          "organization_id": {
+            "type": "string",
+            "description": "The organization the ROLE belongs to (`org_...`). The permission half has no\norganization, because the vocabulary is per environment."
+          },
+          "permission_id": {
+            "type": "string",
+            "description": "The permission granted (`prm_...`), an entry in this ENVIRONMENT's vocabulary."
+          },
+          "role_id": {
+            "type": "string",
+            "description": "The role that grants the permission (`rol_...`)."
+          },
+          "updated_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Last-modification time, milliseconds since the Unix epoch."
+          }
+        }
+      },
       "OrgRoleView": {
         "type": "object",
         "description": "An organization role, as returned by the management API (issue #97).",
@@ -15949,6 +16580,7 @@
           "slug",
           "display_name",
           "metadata",
+          "is_default",
           "created_at_unix_ms",
           "updated_at_unix_ms"
         ],
@@ -15965,6 +16597,10 @@
           "id": {
             "type": "string",
             "description": "The role identifier (`rol_...`, embeds its scope)."
+          },
+          "is_default": {
+            "type": "boolean",
+            "description": "Whether this role is the organization's DEFAULT role (issue #98): the role\nevery LIVE ACTIVE member of the organization holds without an assignment\nexisting for it. At most one live role of an organization carries `true`.\n\nIt is READ ONLY on this resource. `PUT .../organizations/{organization_id}/default-role`\ndesignates and `DELETE` on the same path clears, because the designation is a\nproperty of the organization rather than of the role. A role create or a role\nPATCH can never set it, which is why neither request body has the field.\n\nA role holding `true` is NOT listed in any membership's direct-assignment\nlist, because the default role is resolved at read and no row is ever written\nfor it. It appears in the effective-role views."
           },
           "metadata": {
             "description": "Free-form role metadata (the empty object when none was set)."
@@ -16837,6 +17473,20 @@
           "is_env_default": {
             "type": "boolean",
             "description": "Whether this is the environment's DEFAULT locale (resolved when an end user requests no\n`ui_locales` the environment can render). At most one default per environment; setting a\nnew default demotes the previous one. Defaults to false."
+          }
+        }
+      },
+      "SetOrgDefaultRoleRequest": {
+        "type": "object",
+        "description": "The body to designate an organization's DEFAULT role.",
+        "required": [
+          "role_id"
+        ],
+        "properties": {
+          "role_id": {
+            "type": "string",
+            "description": "The role to designate (`rol_...`). It must be a LIVE role of THIS\norganization; anything else (absent, deleted, another scope's, another\norganization's) is the uniform not-found.",
+            "example": "rol_..."
           }
         }
       },
@@ -17732,6 +18382,10 @@
     {
       "name": "permissions",
       "description": "The permission vocabulary (issue #98): the named API capabilities an ENVIRONMENT defines. Scoped to the environment and NOT to an organization, because a permission names a capability and one string cannot mean different things to two organizations calling the same API; which permissions a ROLE grants is per organization. The slug and the kind are immutable. Uncapped in number by covenant"
+    },
+    {
+      "name": "org-role-permissions",
+      "description": "The role-to-permission mapping (issue #98): which permissions of the ENVIRONMENT'S vocabulary one ORGANIZATION'S role grants. Nested under the organization because the ROLE half is, while the permission half carries no organization at all. PAIR addressed, so the mapping id never appears in a path. Uncapped in both directions by covenant"
     },
     {
       "name": "org-groups",

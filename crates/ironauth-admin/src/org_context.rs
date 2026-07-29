@@ -53,8 +53,8 @@
 //! that it reads as a decision rather than an accident.
 
 use ironauth_store::{
-    ActorRef, OrgGroupId, OrgMembershipId, OrgMembershipRecord, OrgRoleId, OrganizationId,
-    PermissionId, PermissionRecord, Scope,
+    ActorRef, OrgGroupId, OrgMembershipId, OrgMembershipRecord, OrgRoleId, OrgRoleRecord,
+    OrganizationId, PermissionId, PermissionRecord, Scope,
 };
 
 use crate::auth::Principal;
@@ -270,6 +270,37 @@ pub async fn require_group_in_org(
         .get_in_org(org_id, &id)
         .await?;
     Ok(id)
+}
+
+/// Resolve a role as a LIVE role of THIS organization, returning the stored record:
+/// the cross-parent guard every endpoint addressed by the `(organization, role)` pair
+/// performs, and the ONE copy of it.
+///
+/// A role of a DIFFERENT organization, even in the same environment, is the uniform
+/// not-found here, exactly like an absent, a soft-deleted, and a foreign-scope one,
+/// so a nested path is never an existence oracle over a sibling organization's roles.
+///
+/// It resolves through [`ironauth_store::OrgRoleRepo::get_in_org`] and NEVER through
+/// `get`, which takes no organization: the same split
+/// [`ironauth_store::OrgRolePermissionRepo`] records for the mapping table applies
+/// here, and an id-only read behind an organization-nested route would hand back a
+/// sibling organization's row with no fence in front of it.
+///
+/// # Errors
+///
+/// [`ApiError::NotFound`] if the id is malformed, out of scope, absent, deleted, or
+/// belongs to another organization.
+pub async fn require_role_in_org(
+    state: &AdminState,
+    scope: Scope,
+    org_id: &OrganizationId,
+    role_id: &str,
+) -> Result<OrgRoleRecord, ApiError> {
+    let roles = state.store().management().org_roles(scope);
+    // A malformed id and one minted in another `(tenant, environment)` both fail to
+    // parse in scope, which is the same not-found the read below returns.
+    let id = roles.parse_id(role_id)?;
+    Ok(roles.get_in_org(org_id, &id).await?)
 }
 
 /// Resolve a membership as a LIVE membership of THIS organization, returning the
