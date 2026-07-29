@@ -6,6 +6,37 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Pre-signature compact-length arithmetic (issue #98), three new public functions plus one
+  accessor: `b64_no_pad_len`, `compact_len`, `protected_header`, and
+  `SigningKey::signature_len`. Together they answer "how long will this token be" BEFORE the
+  token exists, which is what lets a caller apply a size budget to a claim set while it can
+  still choose not to emit it; measuring after signing is too late, because by then the token
+  is minted and no policy can be applied to it.
+  - **Exact, never an upper bound.** `sign_jws` composes `b64(header) '.' b64(payload) '.'
+    b64(signature)`, and every one of those lengths is determined, so `compact_len` returns
+    the number that ships. An upper bound would be wrong in the direction that matters: it
+    would withhold content that in fact fits. `signature_len` is exact for the same reason,
+    64 bytes for Ed25519 and `ES256`, 96 for `ES384`, and THAT KEY's modulus width for every
+    RSA algorithm. The RSA width follows the key rather than the enforced 2048-bit floor,
+    which is a minimum and not a fixed size: a 3072-bit key loads and signs 384 bytes. The
+    ECDSA widths hold because this crate signs through ring's `ECDSA_*_FIXED_SIGNING`
+    algorithms (the JWS `R || S` form of RFC 7518 section 3.4); an ASN.1 DER signature would
+    be VARIABLE length and would make the prediction silently wrong on the fraction of
+    signatures with a short `R` or `S`.
+  - `protected_header` returns the header bytes `sign_jws` will emit for a key and its
+    emission options. The predicted header cannot drift from the minted one because
+    `sign_jws` now obtains its own header BY CALLING it: sharing a builder would not have
+    been enough, since the builder's arguments would still be assembled at two independent
+    call sites. It is the one compact-JWS segment a caller does not already hold.
+  - The exactness is PROVEN rather than asserted: the signing suite mints real tokens across
+    the full nine-algorithm matrix (over both a 2048-bit and a 3072-bit RSA fixture, so a
+    per-key modulus width is distinguishable from a constant), three header shapes, keys with
+    and without a `kid`, and every payload length from 0 to 32 bytes (all three `len % 3`
+    residues, which is where base64 arithmetic goes off by one), and requires
+    `compact_len(...) == token.len()` exactly, through `sign_jws_with_policy` as well as
+    `sign_jws`. A separate test signs the same payload 512 times per algorithm and requires
+    the signature width never to vary.
+
 - Compact-JWS `kid` hint (issue #75): `compact_jws_kid` reads the `kid` from a compact
   JWS/JWT protected header WITHOUT verifying the token, bounded and allocating no key
   material. It is a REFETCH HINT only (inbound federation uses it to decide whether a cached

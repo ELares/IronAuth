@@ -97,8 +97,12 @@ pub fn sign_jws(
     payload: &[u8],
     options: &EmissionOptions,
 ) -> Result<String, SignError> {
-    let alg_name = options.alg_name(key.algorithm());
-    let header = build_header(alg_name, key.kid(), options.typ.as_deref())?;
+    // Through [`protected_header`] rather than through a second [`build_header`]
+    // call of its own, which makes `protected_header` the ONE place an asymmetric
+    // protected header's arguments are assembled. That is what makes a predicted
+    // compact length equal to the minted one BY CONSTRUCTION rather than by two
+    // call sites happening to agree (issue #98).
+    let header = protected_header(key, options)?;
     let signing_input = signing_input(&header, payload);
     let signature =
         sign::sign_asymmetric(key, signing_input.as_bytes()).map_err(|()| SignError::Backend)?;
@@ -276,6 +280,82 @@ fn signing_input(header: &[u8], payload: &[u8]) -> String {
 /// Assemble the compact serialization from the signing input and signature.
 fn assemble(signing_input: &str, signature: &[u8]) -> String {
     format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(signature))
+}
+
+/// The protected header [`sign_jws`] WILL emit for `key` under `options`, without
+/// signing anything.
+///
+/// This exists so a caller can know a token's size BEFORE the token exists (issue
+/// #98): the header is the one compact-JWS segment whose bytes are not already in
+/// the caller's hand.
+///
+/// The predicted header cannot drift from the minted one because [`sign_jws`]
+/// CALLS this function for the header it signs. Sharing the [`build_header`]
+/// builder alone would not be enough: the builder's arguments (the `alg` name
+/// under the emission options, the key's kid, the `typ`) would still be assembled
+/// at two independent call sites, and an edit that taught one site to emit a new
+/// header parameter would leave the other silently short. With exactly one site,
+/// such an edit is either picked up by both or does not compile.
+///
+/// # Errors
+///
+/// [`SignError::Header`] if the protected header cannot be serialized (which does
+/// not happen for the fixed header shape and is surfaced for completeness).
+pub fn protected_header(key: &SigningKey, options: &EmissionOptions) -> Result<Vec<u8>, SignError> {
+    build_header(
+        options.alg_name(key.algorithm()),
+        key.kid(),
+        options.typ.as_deref(),
+    )
+}
+
+/// The EXACT length of unpadded `base64url` over `n` bytes.
+///
+/// Exact, not an upper bound: the encoder emits four characters per full
+/// three-byte group, three characters for a trailing two-byte group and two for a
+/// trailing one-byte group, which is precisely `(n * 4).div_ceil(3)` in all three
+/// residue cases.
+///
+/// `n * 4` overflows for `n` above `usize::MAX / 4`, and nothing guards it. That
+/// is the deliberate choice over a saturating multiplication, which would
+/// silently answer a question it cannot answer; an unguarded one is exact
+/// wherever it is defined and panics in a debug build rather than returning a
+/// plausible wrong number.
+///
+/// The overflow is unreachable through the material a compact JWS is made of. The
+/// smallest input that reaches it is `usize::MAX / 4 + 1`: one GiB on the
+/// narrowest supported TARGET (32-bit pointers) and four EiB on a 64-bit one,
+/// against the three byte counts [`compact_len`] composes, which are a protected
+/// header, a claims payload, and a fixed signature width. This function is `pub`
+/// and re-exported, so a caller CAN hand it any `usize`; the claim is about the
+/// inputs a token produces, not about every argument the signature admits.
+#[must_use]
+pub const fn b64_no_pad_len(n: usize) -> usize {
+    (n * 4).div_ceil(3)
+}
+
+/// The EXACT compact-JWS length [`sign_jws`] will produce for `header` and
+/// `payload` under a key whose raw signature is `signature_len` bytes, computed
+/// BEFORE anything is signed.
+///
+/// Take `header` from [`protected_header`] and `signature_len` from
+/// [`SigningKey::signature_len`], and the result equals `token.len()` for the
+/// token those same inputs would mint. It is exact and not an estimate because
+/// [`sign_jws`] composes `b64(header) '.' b64(payload) '.' b64(signature)` and
+/// every one of those five lengths is determined: the two separators are one byte
+/// each and each segment is [`b64_no_pad_len`] of a known byte count.
+///
+/// Exactness is the whole value of this function. A caller budgeting a token
+/// against a header limit gets the number that ships; an upper bound would be a
+/// lie in the direction that matters, because it would withhold content that
+/// would in fact have fit.
+#[must_use]
+pub const fn compact_len(header: &[u8], payload: &[u8], signature_len: usize) -> usize {
+    b64_no_pad_len(header.len())
+        + 1
+        + b64_no_pad_len(payload.len())
+        + 1
+        + b64_no_pad_len(signature_len)
 }
 
 /// A failure to mint a token.

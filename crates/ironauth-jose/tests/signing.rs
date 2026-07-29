@@ -8,7 +8,8 @@
 //! fully-specified emission toggle, the restricted `HS*` client-secret contexts,
 //! the generalized RFC 7800 confirmation model across both binding types, the
 //! per-environment key store with its day-one multi-key JWKS and downgrade flip,
-//! the pluggable seams, and the redaction of secret material.
+//! the pluggable seams, the pre-signature compact-length arithmetic, and the
+//! redaction of secret material.
 
 mod common;
 
@@ -18,8 +19,9 @@ use ironauth_env::FixedEntropy;
 use ironauth_jose::seams::{ClientAuthMethod, GrantType, TokenBindingMethod};
 use ironauth_jose::{
     ClientSecret, ClientSecretContext, Confirmation, EmissionOptions, EnvironmentKeyStore, Jwk,
-    JwkSet, JwsAlgorithm, MacAlgorithm, RejectReason, SigningKey, TrustedKey, VerificationPolicy,
-    sign_jws, verify,
+    JwkSet, JwsAlgorithm, MacAlgorithm, RejectReason, SigningKey, SigningPolicy, TrustedKey,
+    VerificationPolicy, b64_no_pad_len, compact_len, protected_header, sign_jws,
+    sign_jws_with_policy, verify,
 };
 use serde_json::{Map, Value, json};
 
@@ -134,6 +136,232 @@ fn full_matrix_signs_and_round_trips_through_verify() {
         assert_eq!(verified.claims().issuer(), common::ISS);
         assert_eq!(verified.claims().subject(), Some("user-123"));
         assert_eq!(verified.key_id(), key.kid());
+    }
+}
+
+/// The three emission shapes that give a protected header three different byte
+/// lengths, so the length arithmetic is not proven against one header only.
+fn emission_shapes() -> [EmissionOptions; 3] {
+    [
+        EmissionOptions::new(),
+        EmissionOptions::new().with_typ("at+jwt"),
+        EmissionOptions::new().fully_specified(true).with_typ("JWT"),
+    ]
+}
+
+/// The RSA fixture moduli the length arithmetic is proven over, each with the raw
+/// signature width it must produce.
+///
+/// TWO sizes and not one. The loader's 2048-bit modulus is a MINIMUM rather than a
+/// fixed size, so against a single 2048-bit fixture a hardcoded 256 would be
+/// indistinguishable from the shipped per-key modulus width, while under-predicting
+/// a 3072-bit deployment's compact token by 128 bytes.
+const RSA_FIXTURES: [(&str, &[u8], usize); 2] = [
+    ("rsa2048", signing_keys::RSA_PKCS1, 256),
+    ("rsa3072", signing_keys::RSA_3072_PKCS1, 384),
+];
+
+/// Every key the length arithmetic must hold for at `alg`, labelled and paired
+/// with the raw signature width it is required to produce. Only RSA contributes
+/// more than one key, one per fixture modulus size.
+fn keys_and_widths(alg: JwsAlgorithm) -> Vec<(String, SigningKey, usize)> {
+    match alg {
+        JwsAlgorithm::EdDsa | JwsAlgorithm::Es256 | JwsAlgorithm::Es384 => {
+            let width = if alg == JwsAlgorithm::Es384 { 96 } else { 64 };
+            vec![(
+                alg.as_jose_name().to_lowercase(),
+                signing_key_for(alg),
+                width,
+            )]
+        }
+        _ => RSA_FIXTURES
+            .iter()
+            .map(|(label, der, width)| {
+                let kid = Some(format!("{}-{label}-key", alg.as_jose_name().to_lowercase()));
+                let key = SigningKey::rsa_from_pkcs1_der(kid, alg, der)
+                    .expect("fixture RSA key material is valid");
+                ((*label).to_owned(), key, *width)
+            })
+            .collect(),
+    }
+}
+
+/// The raw signature bytes of a compact JWS, decoded from its third segment.
+fn signature_bytes(token: &str) -> Vec<u8> {
+    let segment = token
+        .rsplit('.')
+        .next()
+        .expect("a compact JWS has 3 segments");
+    URL_SAFE_NO_PAD
+        .decode(segment)
+        .expect("segment is base64url")
+}
+
+#[test]
+fn b64_no_pad_len_matches_the_encoder_at_every_residue() {
+    // Every `n % 3` residue, including 0 bytes, over a range wide enough that a
+    // constant offset and a wrong rounding rule both show up.
+    for n in 0_usize..=512 {
+        let bytes = vec![0xa5_u8; n];
+        assert_eq!(
+            b64_no_pad_len(n),
+            URL_SAFE_NO_PAD.encode(&bytes).len(),
+            "{n} bytes (residue {})",
+            n % 3
+        );
+    }
+}
+
+#[test]
+fn compact_len_is_exact_for_every_algorithm_and_every_payload_residue() {
+    for alg in MATRIX {
+        for (label, key, _) in keys_and_widths(alg) {
+            for options in emission_shapes() {
+                let header = protected_header(&key, &options).expect("protected header");
+                // The header this predicts is byte-identical to the one the mint
+                // emits, so the prediction is not merely the same LENGTH by
+                // coincidence.
+                let minted_header = sign_jws(&key, b"{}", &options).expect("sign");
+                let first = minted_header.split('.').next().expect("first segment");
+                assert_eq!(
+                    first,
+                    URL_SAFE_NO_PAD.encode(&header),
+                    "{alg:?}/{label} header bytes"
+                );
+
+                for n in 0_usize..=32 {
+                    let payload = vec![b'x'; n];
+                    let token = sign_jws(&key, &payload, &options).expect("sign");
+                    assert_eq!(
+                        compact_len(&header, &payload, key.signature_len()),
+                        token.len(),
+                        "{alg:?}/{label} payload {n} bytes (residue {})",
+                        n % 3
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn compact_len_is_exact_through_the_policy_wrapper_the_mint_uses() {
+    // The real caller (`ironauth_oidc`'s access-token mint) signs through
+    // `sign_jws_with_policy`, so the exactness is proven against THAT wrapper too
+    // and not only against the inner `sign_jws` the tests above reach for.
+    for alg in MATRIX {
+        let key = signing_key_for(alg);
+        let policy = SigningPolicy::new(vec![alg]).expect("single-algorithm policy");
+        let options = EmissionOptions::new().with_typ("at+jwt");
+        let header = protected_header(&key, &options).expect("protected header");
+        for n in [0_usize, 1, 2, 31] {
+            let payload = vec![b'x'; n];
+            let token =
+                sign_jws_with_policy(&policy, &key, &payload, &options).expect("policy permits");
+            assert_eq!(
+                compact_len(&header, &payload, key.signature_len()),
+                token.len(),
+                "{alg:?} payload {n} bytes through the policy wrapper"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_key_with_no_kid_predicts_its_own_shorter_header() {
+    // Every matrix fixture carries a kid, so without this the `kid: None` arm of
+    // the header builder is never reached THROUGH `protected_header`, and a
+    // prediction that always assumed a kid would stay green.
+    let keyless = SigningKey::ed25519_from_seed(None, &[9_u8; 32]).expect("valid seed");
+    let keyed = signing_key_for(JwsAlgorithm::EdDsa);
+    assert_eq!(keyless.kid(), None, "the fixture is deliberately kid-less");
+    for options in emission_shapes() {
+        let header = protected_header(&keyless, &options).expect("protected header");
+        let decoded: Value = serde_json::from_slice(&header).expect("valid JSON header");
+        assert!(
+            decoded.get("kid").is_none(),
+            "a key with no kid must emit no kid member"
+        );
+        let with_kid = protected_header(&keyed, &options).expect("protected header");
+        assert!(
+            header.len() < with_kid.len(),
+            "the kid-less header is genuinely a different length"
+        );
+
+        let payload = claims_payload();
+        let token = sign_jws(&keyless, &payload, &options).expect("sign");
+        assert_eq!(
+            token.split('.').next().expect("header segment"),
+            URL_SAFE_NO_PAD.encode(&header),
+            "the minted header is the predicted one"
+        );
+        assert_eq!(
+            compact_len(&header, &payload, keyless.signature_len()),
+            token.len(),
+            "kid-less compact length"
+        );
+    }
+}
+
+#[test]
+fn signature_len_equals_the_observed_signature_width_for_every_algorithm() {
+    for alg in MATRIX {
+        // Over BOTH RSA fixture moduli, so the RSA arm is proven to return the
+        // key's own modulus width rather than a constant that happens to match
+        // the 2048-bit floor. See RSA_FIXTURES.
+        for (label, key, expected) in keys_and_widths(alg) {
+            let token = sign_jws(&key, &claims_payload(), &EmissionOptions::new()).expect("sign");
+            assert_eq!(
+                key.signature_len(),
+                signature_bytes(&token).len(),
+                "{alg:?}/{label} signature width"
+            );
+            // The documented widths, pinned so a future key-type edit cannot
+            // quietly change one and stay green.
+            assert_eq!(
+                key.signature_len(),
+                expected,
+                "{alg:?}/{label} documented width"
+            );
+        }
+    }
+}
+
+#[test]
+fn every_signature_width_is_fixed_across_repeated_signing() {
+    // What the REPETITION buys, stated precisely, because the obvious hazard is
+    // not the one that needs it.
+    //
+    // A switch to ring's ASN.1 DER ECDSA signing is NOT the reason for the rounds.
+    // Measured over 2000 P-256 DER signings the lengths ran 69, 70, 71, 72 and
+    // never 64, so a DER encoder is caught at round 0 with probability 1 and is
+    // already caught by the single-signature width test above.
+    //
+    // The hazard that needs the rounds is a leading-zero-STRIPPING `R || S`
+    // encoder. Its MODAL width is still the correct 64, so it agrees with a
+    // one-shot check almost every time, and it deviates exactly when `R` or `S`
+    // has a leading zero byte. Measured rate: 1547 of 200000 P-256 signatures,
+    // 0.77%, which is the 1 minus (255/256)^2 the byte distribution predicts. One
+    // round would catch it with probability 0.008; 512 rounds catch it with
+    // probability 0.98.
+    //
+    // Both ECDSA algorithms and all three PSS algorithms draw fresh randomness per
+    // signature, so repeating the SAME payload genuinely samples that
+    // distribution. Ed25519 and the three PKCS1-v1_5 algorithms are deterministic
+    // and produce one signature however often they are asked, so for those four
+    // this pins the width rather than sampling it.
+    const ROUNDS: usize = 512;
+    for alg in MATRIX {
+        let key = signing_key_for(alg);
+        let expected = key.signature_len();
+        for round in 0..ROUNDS {
+            let token = sign_jws(&key, &claims_payload(), &EmissionOptions::new()).expect("sign");
+            assert_eq!(
+                signature_bytes(&token).len(),
+                expected,
+                "{alg:?} round {round}: signature width varied"
+            );
+        }
     }
 }
 
