@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: tag equals crates/ironauth version
         run: |
           tag_version="${GITHUB_REF_NAME#ironauth-v}"
@@ -42,7 +42,7 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Install musl target for the pinned toolchain
         run: rustup target add x86_64-unknown-linux-musl
@@ -93,7 +93,7 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Install musl target for the pinned toolchain
         run: rustup target add x86_64-unknown-linux-musl
