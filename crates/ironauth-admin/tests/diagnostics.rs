@@ -14,8 +14,8 @@ use axum::http::StatusCode;
 use common::Harness;
 use ironauth_env::Env;
 use ironauth_store::{
-    ClientAuthDiagnosticReason, EnvironmentId, FlowId, NewClientAuthDiagnostic, NewFlow, Scope,
-    TenantId,
+    ClientAuthDiagnosticReason, EnvironmentId, FlowId, NewClientAuthDiagnostic, NewFlow,
+    NewTokenSizeEvent, Scope, TenantId, TokenSizeKind, TokenSizeReason,
 };
 use sqlx::PgPool;
 
@@ -517,4 +517,597 @@ async fn the_flow_dry_run_is_scope_gated() {
         .post_as(&base_b, "not-a-real-token", "dry-run-c", &body)
         .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+// ===========================================================================
+// The operational warnings read (issue #91), and the two PERMISSION BUDGET kinds
+// issue #98 adds to it out of the same event sink.
+// ===========================================================================
+
+/// Seed one token size event into `scope` through the data-plane store, exactly as the
+/// OIDC mint path records it. The management plane reads these rows; it never writes them.
+async fn seed_size_event(harness: &Harness, env: &Env, scope: Scope, event: NewTokenSizeEvent<'_>) {
+    harness
+        .store()
+        .scoped(scope)
+        .token_size_events()
+        .record(env, RETENTION_MICROS, event)
+        .await
+        .expect("record token size event");
+}
+
+/// The audience one organization hits the budget on.
+const ORDERS: &str = "https://api.example.com/orders";
+
+/// A SECOND audience for the same organization, so the (organization, audience) subject can
+/// be shown to separate two warnings a client-id subject would have merged.
+const REPORTS: &str = "https://api.example.com/reports";
+
+/// Seed the corpus the warnings assertions below read: three withholdings on one
+/// (organization, audience) pair, one approach on a second audience of the same
+/// organization, and one ID-token bloat event from the same client.
+async fn seed_budget_corpus(harness: &Harness, env: &Env, scope: Scope) {
+    // Two withholdings and one still-oversize fallback on ONE pair, so the aggregate is
+    // three events with the worst case of each dimension surfaced.
+    for (reason, byte_size, permission_count) in [
+        (TokenSizeReason::BudgetOverflowCount, 7000_i64, 900_i64),
+        (TokenSizeReason::BudgetOverflowBytes, 9001, 412),
+        (TokenSizeReason::RolesOnlyStillOversize, 9500, 412),
+    ] {
+        seed_size_event(
+            harness,
+            env,
+            scope,
+            NewTokenSizeEvent {
+                token_type: TokenSizeKind::AccessToken,
+                byte_size,
+                claim_count: None,
+                client_id: "cli_budget",
+                reason: Some(reason),
+                audience: Some(ORDERS),
+                organization_id: Some("org_acme"),
+                permission_count: Some(permission_count),
+                permission_status: Some("budget_exceeded"),
+            },
+        )
+        .await;
+    }
+
+    // One APPROACHING event on the same organization but a DIFFERENT audience: a separate
+    // warning, which is the whole reason the subject is the pair.
+    seed_size_event(
+        harness,
+        env,
+        scope,
+        NewTokenSizeEvent {
+            token_type: TokenSizeKind::AccessToken,
+            byte_size: 6000,
+            claim_count: None,
+            client_id: "cli_budget",
+            reason: Some(TokenSizeReason::BudgetApproaching),
+            audience: Some(REPORTS),
+            organization_id: Some("org_acme"),
+            permission_count: Some(300),
+            permission_status: None,
+        },
+    )
+    .await;
+
+    // And one ID-token bloat event from the SAME client, which must stay its own kind.
+    seed_size_event(
+        harness,
+        env,
+        scope,
+        NewTokenSizeEvent {
+            token_type: TokenSizeKind::IdToken,
+            byte_size: 4096,
+            claim_count: Some(37),
+            client_id: "cli_budget",
+            reason: None,
+            audience: None,
+            organization_id: None,
+            permission_count: None,
+            permission_status: None,
+        },
+    )
+    .await;
+}
+
+/// The one warning item of `kind` whose `subject` is `subject`.
+fn warning<'a>(items: &'a [serde_json::Value], kind: &str, subject: &str) -> &'a serde_json::Value {
+    let matching: Vec<&serde_json::Value> = items
+        .iter()
+        .filter(|item| item["kind"] == kind && item["subject"] == subject)
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "exactly one {kind} warning for {subject}, got {matching:?}"
+    );
+    matching[0]
+}
+
+#[tokio::test]
+async fn the_warnings_read_surfaces_the_two_permission_budget_kinds() {
+    // Issue #98: the permission budget's operator-visible half. Four properties, each of
+    // which a plausible refactor would break:
+    //
+    //   * The two new `kind` values appear, from the SAME sink the token_size kind reads,
+    //     with no schema change (`kind` is a string and the console groups on it).
+    //   * They are addressed by the (organization, audience) PAIR, not by the client id. A
+    //     client id cannot tell an operator which organization on which audience to act on.
+    //   * They AGGREGATE per pair, the way token_size aggregates per client, so a flood of
+    //     mints for one pair is one legible item rather than hundreds.
+    //   * An access-token budget event is NOT counted as ID token claim bloat. The
+    //     token_size detail claims to count ID tokens, and it has to keep being true.
+    let harness = Harness::start(50).await;
+    let (tenant, environment) = harness.create_tenant("Acme", "tenant-key").await;
+    let scope = scope_of(&tenant, &environment);
+    let env = Env::system();
+    seed_budget_corpus(&harness, &env, scope).await;
+
+    let path = format!("/v1/tenants/{tenant}/environments/{environment}/diagnostics/warnings");
+    let (status, _, body) = harness.get(&path).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let items = list_items(&body);
+
+    // The overflow warning: one item for the pair, counting all THREE withholding events,
+    // carrying the largest set and the largest token, and naming the still-oversize case.
+    let overflow = warning(
+        &items,
+        "permission_budget_overflow",
+        "org_acme https://api.example.com/orders",
+    );
+    let detail = overflow["detail"].as_str().expect("a detail string");
+    assert!(
+        detail.starts_with("3 recent access token(s) did NOT carry the permission claim"),
+        "the three withholdings aggregate into one item: {detail}"
+    );
+    assert!(
+        detail.contains("largest set 900 permissions")
+            && detail.contains("largest token 9500 bytes"),
+        "the aggregate carries the worst case of each dimension: {detail}"
+    );
+    // WHICH bound was crossed, because the remediations differ (a smaller permission set
+    // or a larger permission_claim_max_count, against a larger access_token_max_bytes).
+    // This aggregate holds one of each, so it must name both rather than say "the budget".
+    assert!(
+        detail.contains(
+            "the permission count budget on some mints and the token byte \
+                         budget on others"
+        ),
+        "the detail must say WHICH bound was crossed: {detail}"
+    );
+    assert!(
+        detail.contains("STILL over the byte budget"),
+        "the roles-only-still-oversize case is named, not folded away silently: {detail}"
+    );
+
+    // The approaching warning: the SAME organization on a different audience is a separate
+    // item, and it says plainly that nothing was withheld.
+    let approaching = warning(
+        &items,
+        "permission_budget_approaching",
+        "org_acme https://api.example.com/reports",
+    );
+    let detail = approaching["detail"].as_str().expect("a detail string");
+    assert!(
+        detail.starts_with("1 recent access token(s) carried a permission claim at or past a warn"),
+        "an approach is reported as emitted, not withheld: {detail}"
+    );
+    assert!(
+        detail.contains("nothing was withheld"),
+        "the approach warning must not read as a withholding: {detail}"
+    );
+    // The still-oversize sentence belongs to the OVERFLOW half and to nothing else.
+    // Latched onto an approach it produces a self contradicting operator message
+    // ("nothing was withheld ... STILL over the byte budget with the permission claim
+    // withheld"), so its ABSENCE here is asserted rather than assumed.
+    assert!(
+        !detail.contains("STILL over the byte budget"),
+        "the still-oversize sentence must never attach to an approach, which withheld \
+         nothing: {detail}"
+    );
+
+    // The ID-token bloat warning counts ONE token, not five: the four access-token budget
+    // events share this sink and this client id, and counting them here would report them
+    // as oversized ID tokens, which they are not.
+    let bloat = warning(&items, "token_size", "cli_budget");
+    let detail = bloat["detail"].as_str().expect("a detail string");
+    assert!(
+        detail.starts_with("1 recent ID token(s) exceeded the claim bloat threshold"),
+        "an access-token budget event is not ID token claim bloat: {detail}"
+    );
+
+    // Nothing else: five seeded rows produce exactly these three aggregated warnings.
+    assert_eq!(items.len(), 3, "no other warning is produced: {body}");
+
+    // The ORDER is promised in the response schema, in the OpenAPI description, and in the
+    // changelog, so it is pinned here rather than left to whatever the code happens to do:
+    // connector warnings first (none seeded), then token size, then permission budget.
+    let kinds: Vec<&str> = items
+        .iter()
+        .map(|item| item["kind"].as_str().expect("a kind string"))
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            "token_size",
+            "permission_budget_approaching",
+            "permission_budget_overflow",
+        ],
+        "the documented item order must hold: token size warnings before permission \
+         budget warnings, and the budget kinds in their own stable order"
+    );
+}
+
+#[tokio::test]
+async fn the_warnings_read_is_scope_confined_for_permission_budget_events() {
+    // The same IDOR property the other diagnostics reads hold, driven over the new kinds:
+    // tenant B's budget event is invisible to tenant A even to the all-seeing operator,
+    // because the read runs under forced row level security in the path's scope.
+    let harness = Harness::start(50).await;
+    let (tenant_a, env_a) = harness.create_tenant("Acme", "key-a").await;
+    let (tenant_b, env_b) = harness.create_tenant("Beta", "key-b").await;
+    let env = Env::system();
+
+    seed_size_event(
+        &harness,
+        &env,
+        scope_of(&tenant_b, &env_b),
+        NewTokenSizeEvent {
+            token_type: TokenSizeKind::AccessToken,
+            byte_size: 9001,
+            claim_count: None,
+            client_id: "cli_victim_b",
+            reason: Some(TokenSizeReason::BudgetOverflowBytes),
+            audience: Some("https://api.beta.example.com"),
+            organization_id: Some("org_victim_b"),
+            permission_count: Some(412),
+            permission_status: Some("budget_exceeded"),
+        },
+    )
+    .await;
+
+    let path_a = format!("/v1/tenants/{tenant_a}/environments/{env_a}/diagnostics/warnings");
+    let (status, _, body) = harness.get(&path_a).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        !body.contains("org_victim_b") && !body.contains("api.beta.example.com"),
+        "tenant B's permission budget event must not appear in tenant A's warnings: {body}"
+    );
+
+    // And it IS visible in its own scope, so the absence above is the fence and not a
+    // seeding failure.
+    let path_b = format!("/v1/tenants/{tenant_b}/environments/{env_b}/diagnostics/warnings");
+    let (status, _, body) = harness.get(&path_b).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.contains("org_victim_b"),
+        "the event is visible in its own scope: {body}"
+    );
+}
+
+/// Bulk-seed `count` permission-budget withholdings for one (organization, audience) pair
+/// directly, as OWNER SQL, all NEWER than anything the repository has written so far.
+///
+/// Through the repository this would be `count` separate transactions each running the
+/// retention prune first, which for a flood past the 200-row read clamp is slow enough to
+/// matter and buys nothing: the property under test is what the READ does with a saturated
+/// window, not what the write path does. Owner SQL also fixes the ordering exactly, which
+/// is the whole point of a starvation test.
+async fn seed_budget_flood(harness: &Harness, scope: Scope, count: i64) {
+    harness
+        .db()
+        .execute_owner_sql(&format!(
+            "INSERT INTO token_size_events \
+             (id, tenant_id, environment_id, token_type, byte_size, claim_count, client_id, \
+              reason, audience, organization_id, permission_count, permission_status, \
+              occurred_at, expires_at) \
+             SELECT 'evt_flood_{environment}_' || i, '{tenant}', '{environment}', \
+                    'access_token', 9001, \
+                    NULL, 'cli_noisy', 'budget_overflow_bytes', \
+                    'https://api.example.com/noisy', 'org_noisy', 412, 'budget_exceeded', \
+                    now() + (i || ' seconds')::interval, \
+                    now() + '30 days'::interval \
+             FROM generate_series(1, {count}) AS i",
+            tenant = scope.tenant(),
+            environment = scope.environment(),
+        ))
+        .await;
+}
+
+/// Seed the pair of quiet rows the starvation assertions look for in `scope`: one quiet
+/// organization's withholding, and one ID-token bloat event from a different client.
+async fn seed_quiet_pair(harness: &Harness, env: &Env, scope: Scope) {
+    seed_size_event(
+        harness,
+        env,
+        scope,
+        NewTokenSizeEvent {
+            token_type: TokenSizeKind::AccessToken,
+            byte_size: 7000,
+            claim_count: None,
+            client_id: "cli_quiet",
+            reason: Some(TokenSizeReason::BudgetOverflowCount),
+            audience: Some(ORDERS),
+            organization_id: Some("org_quiet"),
+            permission_count: Some(900),
+            permission_status: Some("budget_exceeded"),
+        },
+    )
+    .await;
+    seed_size_event(
+        harness,
+        env,
+        scope,
+        NewTokenSizeEvent {
+            token_type: TokenSizeKind::IdToken,
+            byte_size: 4096,
+            claim_count: Some(37),
+            client_id: "cli_bloat",
+            reason: None,
+            audience: None,
+            organization_id: None,
+            permission_count: None,
+            permission_status: None,
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_noisy_pair_cannot_starve_the_other_warning_families() {
+    // Issue #98, the read-clamp starvation seam, and the honest boundary of the fix.
+    //
+    // The permission budget shares the issue #91 event sink, and both families used to be
+    // read through ONE `recent(200)` window. A flood of budget events therefore evicted,
+    // from a SHIPPED response, the entire `token_size` family, which is a regression to a
+    // shipped feature, along with every quieter budget pair.
+    //
+    // Each family now gets its own clamped window. That removes the CROSS family eviction
+    // outright and the WITHIN family eviction below the clamp. It does NOT remove within
+    // family eviction above the clamp, and nothing could without an unbounded read, which
+    // is exactly why a saturated window is rendered as a lower bound rather than a count.
+    // Both regimes are measured here, on two tenants of one harness.
+    let harness = Harness::start(50).await;
+    let env = Env::system();
+
+    // REGIME ONE, below the clamp: nothing is lost and every count is exact.
+    let (calm_tenant, calm_environment) = harness.create_tenant("Acme", "tenant-key").await;
+    let calm = scope_of(&calm_tenant, &calm_environment);
+    seed_quiet_pair(&harness, &env, calm).await;
+    seed_budget_flood(&harness, calm, 50).await;
+
+    let path =
+        format!("/v1/tenants/{calm_tenant}/environments/{calm_environment}/diagnostics/warnings");
+    let (status, _, body) = harness.get(&path).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let items = list_items(&body);
+
+    let quiet = warning(
+        &items,
+        "permission_budget_overflow",
+        "org_quiet https://api.example.com/orders",
+    );
+    assert!(
+        quiet["detail"]
+            .as_str()
+            .expect("a detail")
+            .starts_with("1 recent access token(s)"),
+        "a quiet pair survives a noisy pair below the clamp, with an EXACT count: {quiet}"
+    );
+    let bloat = warning(&items, "token_size", "cli_bloat");
+    assert!(
+        bloat["detail"]
+            .as_str()
+            .expect("a detail")
+            .starts_with("1 recent ID token(s)"),
+        "and so does the other family: {bloat}"
+    );
+    let noisy = warning(
+        &items,
+        "permission_budget_overflow",
+        "org_noisy https://api.example.com/noisy",
+    );
+    assert!(
+        noisy["detail"]
+            .as_str()
+            .expect("a detail")
+            .starts_with("50 recent access token(s)"),
+        "an unsaturated window reports an exact count and does not hedge: {noisy}"
+    );
+
+    // REGIME TWO, past the clamp: the OTHER family still survives, which is the shipped
+    // regression this fix is about, and the saturated family's counts become lower bounds.
+    let (loud_tenant, loud_environment) = harness.create_tenant("Beta", "tenant-key-2").await;
+    let loud = scope_of(&loud_tenant, &loud_environment);
+    seed_quiet_pair(&harness, &env, loud).await;
+    seed_budget_flood(&harness, loud, 220).await;
+
+    let path =
+        format!("/v1/tenants/{loud_tenant}/environments/{loud_environment}/diagnostics/warnings");
+    let (status, _, body) = harness.get(&path).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let items = list_items(&body);
+
+    // THE REGRESSION THAT IS FIXED: a shipped warning family is not evicted by a newer one.
+    let bloat = warning(&items, "token_size", "cli_bloat");
+    assert!(
+        bloat["detail"]
+            .as_str()
+            .expect("a detail")
+            .starts_with("1 recent ID token(s)"),
+        "the issue #91 family must survive 220 access-token events, which a shared window \
+         deleted outright: {bloat}"
+    );
+
+    // THE RESIDUAL, asserted rather than glossed: the quiet budget pair IS beyond a
+    // saturated same-family window. That is a bound of the clamp, not of the split, and it
+    // is precisely why the next assertion exists.
+    assert!(
+        !body.contains("org_quiet"),
+        "a quiet pair 220 events deep in its OWN family is outside the clamped window, \
+         which the response must therefore not present as a complete picture: {body}"
+    );
+
+    // So a saturated window reports a LOWER BOUND. Rendering the clamp as an exact figure
+    // ("200 recent access token(s)") would be an under report presented as precision.
+    let noisy = warning(
+        &items,
+        "permission_budget_overflow",
+        "org_noisy https://api.example.com/noisy",
+    );
+    let detail = noisy["detail"].as_str().expect("a detail");
+    assert!(
+        detail.starts_with("at least 200 recent access token(s) did NOT carry"),
+        "a full window is reported as a lower bound, never as a count: {detail}"
+    );
+}
+
+#[tokio::test]
+async fn an_unparseable_reason_produces_no_warning_item() {
+    // The rolling-upgrade skip, at the READ rather than only at `TokenSizeReason::from_wire`
+    // (issue #98). A row written by a NEWER build carries a reason this build has never
+    // heard of, and an advisory read that mapped it to some kind anyway would be inventing
+    // an operator message out of a value it cannot interpret.
+    let harness = Harness::start(50).await;
+    let (tenant, environment) = harness.create_tenant("Acme", "tenant-key").await;
+    let scope = scope_of(&tenant, &environment);
+    let env = Env::system();
+
+    seed_size_event(
+        &harness,
+        &env,
+        scope,
+        NewTokenSizeEvent {
+            token_type: TokenSizeKind::AccessToken,
+            byte_size: 9001,
+            claim_count: None,
+            client_id: "cli_future",
+            reason: Some(TokenSizeReason::BudgetOverflowBytes),
+            audience: Some(ORDERS),
+            organization_id: Some("org_future"),
+            permission_count: Some(412),
+            permission_status: Some("budget_exceeded"),
+        },
+    )
+    .await;
+
+    // Rewrite the recorded reason to one only a newer build could have written. Raw SQL,
+    // because no Rust API can express a value outside the closed enum, which is the point.
+    harness
+        .db()
+        .execute_owner_sql(
+            "UPDATE token_size_events SET reason = 'reason_from_a_newer_build' \
+             WHERE client_id = 'cli_future'",
+        )
+        .await;
+
+    let path = format!("/v1/tenants/{tenant}/environments/{environment}/diagnostics/warnings");
+    let (status, _, body) = harness.get(&path).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let items = list_items(&body);
+    assert!(
+        items.is_empty(),
+        "a reason this build cannot parse produces NO warning item, rather than being \\
+         mapped to a kind the row never claimed: {body}"
+    );
+    assert!(
+        !body.contains("org_future"),
+        "and the row's subject does not surface through some other item: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_multi_audience_verdict_is_addressed_by_its_organization_alone() {
+    // Issue #98: the budget produces ONE verdict per TOKEN, and a token may target several
+    // resource servers, so a verdict is attributable to one audience only when the token
+    // targets exactly one. The recorder writes no audience for the multi-audience case, and
+    // the subject is then the organization alone rather than a fabricated "unknown" half.
+    //
+    // The organizationless row beside it pins UNKNOWN_SUBJECT_PART and the
+    // `permission_count.unwrap_or(0)` fallback, both of which are reachable from the public
+    // store API and neither of which any recorder produces. They keep the warning VISIBLE
+    // instead of dropping it for an incomplete address, and that is asserted, not claimed.
+    let harness = Harness::start(50).await;
+    let (tenant, environment) = harness.create_tenant("Acme", "tenant-key").await;
+    let scope = scope_of(&tenant, &environment);
+    let env = Env::system();
+
+    seed_size_event(
+        &harness,
+        &env,
+        scope,
+        NewTokenSizeEvent {
+            token_type: TokenSizeKind::AccessToken,
+            byte_size: 9001,
+            claim_count: None,
+            client_id: "cli_multi",
+            reason: Some(TokenSizeReason::BudgetOverflowBytes),
+            audience: None,
+            organization_id: Some("org_multi"),
+            permission_count: Some(412),
+            permission_status: Some("pdp_required"),
+        },
+    )
+    .await;
+    seed_size_event(
+        &harness,
+        &env,
+        scope,
+        NewTokenSizeEvent {
+            token_type: TokenSizeKind::AccessToken,
+            byte_size: 8000,
+            claim_count: None,
+            client_id: "cli_headless",
+            reason: Some(TokenSizeReason::BudgetOverflowCount),
+            audience: Some(REPORTS),
+            organization_id: None,
+            permission_count: None,
+            permission_status: Some("budget_exceeded"),
+        },
+    )
+    .await;
+
+    let path = format!("/v1/tenants/{tenant}/environments/{environment}/diagnostics/warnings");
+    let (status, _, body) = harness.get(&path).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let items = list_items(&body);
+
+    let multi = warning(&items, "permission_budget_overflow", "org_multi");
+    let multi_detail = multi["detail"].as_str().expect("a detail");
+    assert!(
+        multi_detail.contains("exceeded the token byte budget"),
+        "the organization alone is a complete subject for a multi-audience verdict, and \
+         the detail names the BYTE bound this row crossed: {multi_detail}"
+    );
+    assert!(
+        !multi_detail.contains("the permission count budget"),
+        "and does not also claim the count bound: {multi_detail}"
+    );
+
+    // The organizationless row: still visible, addressed by the stand-in, and its missing
+    // permission count reported as zero rather than dropping the item.
+    let headless = warning(
+        &items,
+        "permission_budget_overflow",
+        "unknown https://api.example.com/reports",
+    );
+    let headless_detail = headless["detail"].as_str().expect("a detail");
+    assert!(
+        headless_detail.contains("largest set 0 permissions"),
+        "a row with no permission count still produces a visible warning: {headless_detail}"
+    );
+    // The SINGLE bound cases, one per row, so a detail that collapsed either back into a
+    // generic "the budget" fails: this one crossed the element bound and the one above
+    // crossed the byte bound, and the two have different remediations.
+    assert!(
+        headless_detail.contains("exceeded the permission count budget"),
+        "a count overflow names the count bound: {headless_detail}"
+    );
+    assert!(
+        !headless_detail.contains("the token byte budget"),
+        "and does not also claim the byte bound: {headless_detail}"
+    );
 }

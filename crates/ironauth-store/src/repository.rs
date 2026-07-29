@@ -11054,6 +11054,22 @@ impl PolicyDecisionTracesRepo<'_> {
 
 // ===========================================================================
 // The token size event sink (issue #91): the one materialized operational warning.
+//
+// Issue #98 (migration 0095) gives it a SECOND event kind rather than a second table:
+// the permission-claim budget verdict, carried on five nullable columns. Same append
+// only shape, same on-insert retention prune, same grants.
+//
+// Sharing one table does NOT mean sharing one read window. The 200-row clamp is applied
+// PER KIND (`recent_by_kind`), because a single shared window lets whichever kind is
+// noisier evict the other: a flood of budget events would otherwise starve the ID-token
+// bloat warning issue #91 shipped, and vice versa. `recent` (the unfiltered read) is kept
+// for tests and for a caller that genuinely wants the mixed window.
+//
+// The honest scope note that belongs beside the clamp: these rows are a CONVENIENCE
+// view of a withholding, never its record of record. Once the mint is wired the token
+// itself carries `permissions_status`, so the durable record is the wire contract; if
+// this row were the sole record, retention pruning would silently defeat issue #98's
+// covenant that no configuration produces a silent permission drop.
 // ===========================================================================
 
 /// Which token a size event is about (issue #91). The closed set the
@@ -11077,9 +11093,82 @@ impl TokenSizeKind {
     }
 }
 
+/// WHY a size event was recorded, when the reason is a PERMISSION-CLAIM BUDGET verdict
+/// (issue #98). A closed set with a stable wire string, mirroring [`TokenSizeKind`].
+///
+/// [`None`] on [`NewTokenSizeEvent::reason`] means the row is not a permission-budget
+/// event at all: it is the ID-token bloat event this sink has recorded since issue #91,
+/// which has no budget to report.
+///
+/// Deliberately NOT pinned by a database CHECK. The vocabulary lives here, `as_str` and
+/// [`TokenSizeReason::from_wire`] are round-trip tested against the full variant list,
+/// and the only consumer is an advisory operator read that ignores a value it cannot
+/// parse, so a future variant should not cost a migration. Contrast `token_type`, whose
+/// 0073 CHECK is load bearing because the read groups on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenSizeReason {
+    /// The permission set fits, but it is at or past a warn threshold. Nothing is
+    /// withheld: this is the early signal an operator can act on before a token stops
+    /// carrying permissions.
+    BudgetApproaching,
+    /// The permission claim was WITHHELD because the set held more elements than the
+    /// configured maximum.
+    BudgetOverflowCount,
+    /// The permission claim was WITHHELD because the token carrying it would have
+    /// exceeded the configured byte budget.
+    BudgetOverflowBytes,
+    /// The permission claim was withheld and the token that actually ships, carrying
+    /// only `roles` and `scope`, is STILL over the byte budget. Recorded and
+    /// deliberately not acted on: the role set is uncapped by covenant (issue #97), so
+    /// there is nothing further to withhold.
+    RolesOnlyStillOversize,
+}
+
+impl TokenSizeReason {
+    /// The stable wire string recorded in the event row's `reason` column.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TokenSizeReason::BudgetApproaching => "budget_approaching",
+            TokenSizeReason::BudgetOverflowCount => "budget_overflow_count",
+            TokenSizeReason::BudgetOverflowBytes => "budget_overflow_bytes",
+            TokenSizeReason::RolesOnlyStillOversize => "roles_only_still_oversize",
+        }
+    }
+
+    /// Parse a recorded `reason` column value back to the closed set, so the read side
+    /// never re-spells this vocabulary. [`None`] for any value this build does not know,
+    /// which is the right answer for an ID-token bloat row (no reason at all) and for a
+    /// row written by a NEWER build during a rolling upgrade: an advisory operator read
+    /// skips what it cannot interpret rather than guessing.
+    #[must_use]
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "budget_approaching" => Some(TokenSizeReason::BudgetApproaching),
+            "budget_overflow_count" => Some(TokenSizeReason::BudgetOverflowCount),
+            "budget_overflow_bytes" => Some(TokenSizeReason::BudgetOverflowBytes),
+            "roles_only_still_oversize" => Some(TokenSizeReason::RolesOnlyStillOversize),
+            _ => None,
+        }
+    }
+}
+
 /// A token size (claim bloat) event to record (issue #91). Carries only the token
 /// TYPE, the byte SIZE, and the claim COUNT (bounded integers), plus the non secret
 /// client id; there is deliberately NO field capable of holding the token itself.
+///
+/// Issue #98 adds the five PERMISSION-BUDGET dimensions (migration 0095), all optional
+/// because the ID-token bloat event has no budget verdict to report. Every one of them
+/// is bounded and non secret by construction: server vocabulary, an operator-registered
+/// audience URI, a scoped organization identifier, a count, and the wire status the token
+/// carried. There is deliberately no field for the permission SLUGS, so a claim value
+/// still has nowhere to go.
+///
+/// The type does NOT make the two event shapes mutually exclusive: nothing here stops a
+/// caller writing an `access_token` row with no `reason`, which both halves of the M9
+/// warnings read would then skip. That is caller discipline rather than a type guarantee,
+/// and it is pinned by the two recorders' own tests rather than claimed here (see
+/// `ironauth_oidc::policy_trace`).
 #[derive(Debug, Clone)]
 pub struct NewTokenSizeEvent<'a> {
     /// The token type the size event is about.
@@ -11090,6 +11179,29 @@ pub struct NewTokenSizeEvent<'a> {
     pub claim_count: Option<i64>,
     /// The client the token was minted for (a non secret identifier).
     pub client_id: &'a str,
+    /// WHY this event was recorded, when it is a permission-budget verdict (issue #98).
+    /// [`None`] for the ID-token bloat event.
+    pub reason: Option<TokenSizeReason>,
+    /// The resource server audience the access token was minted for (issue #98): an
+    /// operator-registered URI, never a subject. [`None`] when the verdict cannot be
+    /// attributed to ONE resource server, which is the multi-audience token case: the
+    /// budget produces one verdict for the whole token, not one per audience.
+    pub audience: Option<&'a str>,
+    /// The organization whose resolved permission set tripped the budget (issue #98): a
+    /// scoped `org_` identifier, a blind reference.
+    pub organization_id: Option<&'a str>,
+    /// How many permissions the resolved set held (issue #98). A bounded integer, never
+    /// the set itself.
+    pub permission_count: Option<i64>,
+    /// The `permissions_status` value the token actually put ON THE WIRE (issue #98), as
+    /// its stable wire string (`budget_exceeded` or `pdp_required`).
+    ///
+    /// [`None`] when the token carried no status, which is every non-withholding row: an
+    /// ID-token bloat event and a `budget_approaching` verdict alike. Recorded because it
+    /// is the one thing that tells a resource server whether to fall back to `roles` or to
+    /// consult a policy decision point, and an event that could not express it would be a
+    /// record of a withholding missing what the token said about it.
+    pub permission_status: Option<&'a str>,
 }
 
 /// A read back token size event row (issue #91), for the M9 admin warnings read.
@@ -11103,6 +11215,20 @@ pub struct TokenSizeEventRecord {
     pub claim_count: Option<i64>,
     /// The client the token was minted for.
     pub client_id: String,
+    /// The permission-budget verdict, if this is a permission-budget event (issue #98).
+    /// The RAW recorded string rather than the enum, so a value written by a newer build
+    /// round-trips through this read unchanged; parse it with
+    /// [`TokenSizeReason::from_wire`].
+    pub reason: Option<String>,
+    /// The resource server audience the access token was minted for (issue #98).
+    pub audience: Option<String>,
+    /// The organization whose resolved permission set tripped the budget (issue #98).
+    pub organization_id: Option<String>,
+    /// How many permissions the resolved set held (issue #98).
+    pub permission_count: Option<i64>,
+    /// The `permissions_status` the token put on the wire (issue #98), RAW, for the same
+    /// rolling-upgrade reason `reason` is raw. [`None`] on every non-withholding row.
+    pub permission_status: Option<String>,
     /// When the mint happened, in epoch microseconds from the application clock seam.
     pub occurred_at_micros: i64,
 }
@@ -11149,13 +11275,18 @@ impl TokenSizeEventsRepo<'_> {
         .bind(occurred_micros)
         .execute(&mut *tx)
         .await?;
+        // The five issue #98 budget columns (migration 0095) are named in this list even
+        // when they bind NULL: 0073's INSERT grant is table-wide, so naming a column
+        // added later needs no further grant (unlike a column-scoped UPDATE, which is why
+        // 0094 needed one and 0095 needs none).
         sqlx::query(
             "INSERT INTO token_size_events \
              (id, tenant_id, environment_id, token_type, byte_size, claim_count, \
-              client_id, occurred_at, expires_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, \
-                     TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval, \
-                     TIMESTAMPTZ 'epoch' + ($9::text || ' microseconds')::interval)",
+              client_id, reason, audience, organization_id, permission_count, \
+              permission_status, occurred_at, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, \
+                     TIMESTAMPTZ 'epoch' + ($13::text || ' microseconds')::interval, \
+                     TIMESTAMPTZ 'epoch' + ($14::text || ' microseconds')::interval)",
         )
         .bind(id)
         .bind(self.scope.tenant().to_string())
@@ -11164,6 +11295,11 @@ impl TokenSizeEventsRepo<'_> {
         .bind(event.byte_size)
         .bind(event.claim_count)
         .bind(event.client_id)
+        .bind(event.reason.map(TokenSizeReason::as_str))
+        .bind(event.audience)
+        .bind(event.organization_id)
+        .bind(event.permission_count)
+        .bind(event.permission_status)
         .bind(occurred_micros)
         .bind(expires_micros)
         .execute(&mut *tx)
@@ -11172,26 +11308,70 @@ impl TokenSizeEventsRepo<'_> {
         Ok(())
     }
 
-    /// Read the most recent token size events in this scope, newest first, bounded to
-    /// `limit` clamped to [`TokenSizeEventsRepo::MAX_QUERY_LIMIT`]. For the M9 warnings
-    /// read. The forced RLS and the scope predicates confine it to the caller's scope.
+    /// Read the most recent token size events in this scope of EVERY kind, newest first,
+    /// bounded to `limit` clamped to [`TokenSizeEventsRepo::MAX_QUERY_LIMIT`]. The forced
+    /// RLS and the scope predicates confine it to the caller's scope.
+    ///
+    /// A caller that wants ONE event family should use
+    /// [`TokenSizeEventsRepo::recent_by_kind`] instead: a mixed window shared between two
+    /// families lets the noisier one evict the quieter one at the clamp.
     ///
     /// # Errors
     ///
     /// [`StoreError::Database`] on a persistence failure.
     pub async fn recent(&self, limit: i64) -> Result<Vec<TokenSizeEventRecord>, StoreError> {
+        self.recent_matching(None, limit).await
+    }
+
+    /// Read the most recent token size events of ONE token kind in this scope, newest
+    /// first, bounded to `limit` clamped to [`TokenSizeEventsRepo::MAX_QUERY_LIMIT`]
+    /// (issue #98).
+    ///
+    /// This is what the M9 warnings read uses, once per family, so each family gets its
+    /// OWN clamped window. With a single shared window the clamp is a starvation seam: 200
+    /// access-token budget events would push every `id_token` bloat row out of the window
+    /// and silently delete the issue #91 warning family from the response. Two windows
+    /// cost one extra scoped read and make that impossible.
+    ///
+    /// The clamp still bounds each window, so a caller that wants to say how many events
+    /// there were must treat a FULL window as a lower bound rather than as a count. The
+    /// admin read does exactly that.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn recent_by_kind(
+        &self,
+        token_type: TokenSizeKind,
+        limit: i64,
+    ) -> Result<Vec<TokenSizeEventRecord>, StoreError> {
+        self.recent_matching(Some(token_type), limit).await
+    }
+
+    /// The shared body of the two reads above: one scoped, RLS-forced, clamped query,
+    /// optionally predicated on `token_type`.
+    async fn recent_matching(
+        &self,
+        token_type: Option<TokenSizeKind>,
+        limit: i64,
+    ) -> Result<Vec<TokenSizeEventRecord>, StoreError> {
         let limit = limit.clamp(0, Self::MAX_QUERY_LIMIT);
         let mut tx = begin_scoped(self.store, self.scope).await?;
+        // A NULL `$3` matches every kind, so the predicate is one statement rather than
+        // two spellings of the same SELECT that could drift apart.
         let rows = sqlx::query(
             "SELECT token_type, byte_size, claim_count, client_id, \
+                    reason, audience, organization_id, permission_count, permission_status, \
                     (EXTRACT(EPOCH FROM occurred_at) * 1000000)::bigint AS occurred_us \
              FROM token_size_events \
              WHERE tenant_id = $1 AND environment_id = $2 \
+             AND ($3::text IS NULL OR token_type = $3::text) \
              ORDER BY occurred_at DESC, id DESC \
-             LIMIT $3",
+             LIMIT $4",
         )
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
+        .bind(token_type.map(TokenSizeKind::as_str))
         .bind(limit)
         .fetch_all(&mut *tx)
         .await?;
@@ -11203,6 +11383,11 @@ impl TokenSizeEventsRepo<'_> {
                 byte_size: row.get("byte_size"),
                 claim_count: row.get("claim_count"),
                 client_id: row.get("client_id"),
+                reason: row.get("reason"),
+                audience: row.get("audience"),
+                organization_id: row.get("organization_id"),
+                permission_count: row.get("permission_count"),
+                permission_status: row.get("permission_status"),
                 occurred_at_micros: row.get("occurred_us"),
             })
             .collect())

@@ -575,7 +575,7 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
     );
 }
 
-/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the ninety-three
+/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the ninety-five
 /// real migrations and leaves no throwaway demo object in a real database.
 // A long but linear ledger-and-table assertion sweep (one line per migration and
 // per real table); splitting it would not make it clearer.
@@ -598,8 +598,8 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
     );
     assert_eq!(
         report.already_applied(),
-        94,
-        "the production chain is exactly ninety-four migrations (isolation, audit log, management \
+        95,
+        "the production chain is exactly ninety-five migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -624,10 +624,10 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
          context, organization roles, organization groups, organization group members, \
          organization role assignments, organization authentication policies, permission \
          vocabulary, role-to-permission mapping, organization default role, resource-server \
-         permission claims)"
+         permission claims, token size event budget columns)"
     );
 
-    // The ledger holds exactly versions 1 through 94.
+    // The ledger holds exactly versions 1 through 95.
     assert_eq!(
         applied_versions(pool).await,
         vec![
@@ -635,7 +635,7 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
             46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67,
             68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89,
-            90, 91, 92, 93, 94
+            90, 91, 92, 93, 94, 95
         ]
     );
     let phase_of = |version: i64| async move {
@@ -6528,4 +6528,142 @@ async fn resource_servers_carries_the_permission_claim_opt_in_and_its_column_gra
         role_has_table_privilege(pool, "ironauth_app", "resource_servers", "SELECT").await,
         "the data plane keeps the SELECT the mint reads this column through"
     );
+}
+
+/// The permission-budget dimensions on the token size event sink: five nullable columns,
+/// and the GRANT that did NOT have to be written (issue #98, migration 0095).
+///
+/// Its own test rather than more lines in the production-chain assertions, for the
+/// stack-budget reason the 0090, 0093, and 0094 tests record.
+#[tokio::test]
+async fn token_size_events_carries_the_budget_columns_under_the_existing_grants() {
+    let db = TestDatabase::start().await;
+    let pool = db.owner_pool();
+
+    // EXPAND: five additive nullable columns, which Postgres adds without rewriting the
+    // table, and no grant, no CHECK edit, and no backfill.
+    let phase: String = sqlx::query("SELECT phase FROM _schema_migrations WHERE version = 95")
+        .fetch_one(pool)
+        .await
+        .expect("0095 is in the ledger")
+        .get("phase");
+    assert_eq!(phase, "expand");
+
+    for (column, data_type) in [
+        ("reason", "text"),
+        ("audience", "text"),
+        ("organization_id", "text"),
+        ("permission_count", "bigint"),
+        ("permission_status", "text"),
+    ] {
+        assert!(
+            column_exists(pool, "token_size_events", column).await,
+            "token_size_events.{column} exists after 0095"
+        );
+        assert_eq!(
+            column_data_type(pool, "token_size_events", column).await,
+            data_type,
+            "token_size_events.{column} is a {data_type}"
+        );
+        // NULLABLE and DEFAULT-less, deliberately. The ID-token bloat event that has
+        // written this table since 0073 has no permission budget to report, so NULL means
+        // "not a permission budget event" and there is no value that would be true of the
+        // rows already there. A NOT NULL column would have needed a backfill inventing one.
+        assert!(
+            !column_is_not_null(pool, "token_size_events", column).await,
+            "token_size_events.{column} must be nullable (a bloat event has no budget)"
+        );
+        assert_eq!(
+            column_default(pool, "token_size_events", column).await,
+            None,
+            "token_size_events.{column} carries no DEFAULT"
+        );
+    }
+
+    // THE POINT OF THIS TEST. 0095 writes no GRANT, and this is why it does not have to:
+    // 0073's `GRANT SELECT, INSERT, DELETE ON token_size_events TO ironauth_app` is
+    // TABLE-wide, and a table-wide grant covers columns added afterwards, so the data
+    // plane's INSERT may name all five with no further grant.
+    //
+    // Contrast 0094, which DID need one: 0035 had granted the control role a
+    // COLUMN-SCOPED `UPDATE (token_format, access_token_ttl_secs)` on `resource_servers`,
+    // and a column-scoped grant enumerates columns, so the column it added was invisible
+    // to it. The rule is a property of the grants already written, never of the column.
+    for column in [
+        "reason",
+        "audience",
+        "organization_id",
+        "permission_count",
+        "permission_status",
+    ] {
+        assert!(
+            role_has_column_privilege(pool, "ironauth_app", "token_size_events", column, "INSERT")
+                .await,
+            "0073's TABLE-wide INSERT must already cover token_size_events.{column}, which is \
+             why 0095 needs no column-scoped grant of its own"
+        );
+        assert!(
+            role_has_column_privilege(
+                pool,
+                "ironauth_control",
+                "token_size_events",
+                column,
+                "SELECT"
+            )
+            .await,
+            "0073's TABLE-wide SELECT must already cover token_size_events.{column} for the \
+             management warnings read"
+        );
+    }
+
+    // The sink stays APPEND ONLY: nobody holds UPDATE on it in any shape, so no plane can
+    // rewrite a recorded withholding. `has_table_privilege` cannot see a column-scoped
+    // grant, so the sweep over live columns is the only probe that proves this.
+    for role in ["ironauth_app", "ironauth_control"] {
+        assert!(
+            !role_has_table_privilege(pool, role, "token_size_events", "UPDATE").await
+                && !role_has_any_column_privilege(pool, role, "token_size_events", "UPDATE").await,
+            "{role} must hold no UPDATE of any shape on the append-only token_size_events"
+        );
+    }
+
+    // And the 0073 CHECK that admits the access-token event 0095 exists to serve is
+    // UNCHANGED: recording an access-token size event needed no constraint edit.
+    assert!(
+        check_constraint_exists(pool, "token_size_events", "token_size_events_type_known").await,
+        "the 0073 token_type CHECK is untouched by 0095"
+    );
+    let admits_access_token: bool = sqlx::query(
+        "SELECT pg_get_constraintdef(oid) LIKE '%access_token%' AS admits \
+         FROM pg_constraint WHERE conname = 'token_size_events_type_known'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("read the token_type CHECK")
+    .get("admits");
+    assert!(
+        admits_access_token,
+        "the 0073 CHECK already admits 'access_token', which is why 0095 edits no CHECK"
+    );
+
+    // `reason` deliberately carries NO CHECK: the closed set lives in Rust
+    // (`TokenSizeReason`, round-trip tested), and the only consumer is an advisory read
+    // that skips a value it cannot parse, so a future variant must not cost a migration.
+    for column in ["reason", "permission_status"] {
+        let vocabulary_checks: i64 = sqlx::query(
+            "SELECT count(*) AS n FROM pg_constraint c \
+             JOIN pg_class t ON t.oid = c.conrelid \
+             WHERE t.relname = 'token_size_events' AND c.contype = 'c' \
+             AND pg_get_constraintdef(c.oid) LIKE '%' || $1 || '%'",
+        )
+        .bind(column)
+        .fetch_one(pool)
+        .await
+        .expect("count vocabulary CHECKs")
+        .get("n");
+        assert_eq!(
+            vocabulary_checks, 0,
+            "the {column} vocabulary is pinned in Rust, not by a CHECK"
+        );
+    }
 }
