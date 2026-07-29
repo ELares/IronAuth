@@ -37,7 +37,7 @@ use ironauth_oidc::flow::model::{Journey, NodeAttributes};
 use ironauth_store::{
     ClientAuthDiagnosticQuery, ClientAuthDiagnosticRecord, ClientAuthDiagnosticsRepo, FlowId,
     PolicyDecisionTraceQuery, PolicyDecisionTraceRecord, PolicyDecisionTracesRepo, Scope, TenantId,
-    TokenSizeEventsRepo,
+    TokenSizeEventRecord, TokenSizeEventsRepo, TokenSizeKind, TokenSizeReason,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
@@ -395,14 +395,22 @@ pub async fn get_policy_traces(
 const DEGRADED_ERROR_RATE: f64 = 0.5;
 
 /// One operational warning item (issue #91): a bounded `kind`, the `subject` it is about
-/// (a connector slug or a client id, non secret), and a safe `detail`. Every field is a
-/// bounded, non secret datum; the detail never carries a claim value, a token, or a secret.
+/// (a connector slug, a client id, or an organization optionally followed by an audience,
+/// all non secret), and a safe `detail`. Every field is a bounded, non secret datum; the
+/// detail never carries a claim value, a token, or a secret.
+///
+/// `kind` is a `String` rather than an enum on purpose, and the admin console groups on it
+/// generically, so a new warning family is additive on the wire: issue #98 added two kinds
+/// with no schema change and no console change.
 #[derive(Serialize, ToSchema)]
 pub struct WarningItemView {
     /// The bounded warning kind (for example `connector_config_error`,
-    /// `connector_unavailable`, `connector_degraded`, `token_size`).
+    /// `connector_unavailable`, `connector_degraded`, `token_size`,
+    /// `permission_budget_overflow`, `permission_budget_approaching`).
     pub kind: String,
-    /// The subject the warning is about (a connector slug or a client id), non secret.
+    /// The subject the warning is about (a connector slug, a client id, or an organization
+    /// followed by one space and an audience, the audience omitted when a verdict spans
+    /// several), non secret.
     pub subject: String,
     /// A safe, bounded detail (a health counter, an error rate, a size summary). Never a
     /// claim value, a token, or a secret.
@@ -413,9 +421,20 @@ pub struct WarningItemView {
 /// seams (the connector health registry and the token size event sink). Nothing here is a
 /// stored, staleness prone materialization except the token size events, which are already
 /// bounded and retention pruned.
+///
+/// The permission budget warnings (issue #98) are read from the SAME event sink, though
+/// through a SEPARATE clamped window per event family, so one noisy family cannot evict
+/// the other. They inherit that bound and that pruning: they are an operator's CONVENIENCE
+/// view of a withholding and never its record of record, because the token itself carries
+/// `permissions_status` once the mint is wired, so a warning aged out of this list does
+/// not mean the withholding went unrecorded.
 #[derive(Serialize, ToSchema)]
 pub struct DiagnosticsWarningsList {
-    /// The computed warnings, connector warnings first, then token size warnings.
+    /// The computed warnings, connector warnings first, then token size warnings, then
+    /// permission budget warnings. The order of the two token size event families is part
+    /// of the contract and is pinned by
+    /// `the_warnings_read_surfaces_the_two_permission_budget_kinds`; the connector family
+    /// is first by construction, because it is pushed before the event sink is read.
     pub items: Vec<WarningItemView>,
 }
 
@@ -434,8 +453,9 @@ pub struct DiagnosticsWarningsList {
         (status = 200, description = "The environment's operational warnings, computed live from \
          the connector health registry (a misconfigured, unreachable, or degraded upstream, which \
          is how a stale or expired connector cert or metadata manifests through the live probe) \
-         and the token size (claim bloat) event sink. Each is a bounded kind, the non secret \
-         subject, and a safe detail.", body = DiagnosticsWarningsList),
+         and the token size event sink (ID token claim bloat, and the permission claim budget: a \
+         withheld permission claim, or one approaching the budget). Each is a bounded kind, the \
+         non secret subject, and a safe detail.", body = DiagnosticsWarningsList),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
         (status = 404, description = "Environment not found", body = ErrorBody)
@@ -498,36 +518,273 @@ pub async fn get_diagnostics_warnings(
         }
     }
 
+    // The token size event sink feeds TWO warning families, and each gets its OWN clamped
+    // window (issue #98). One shared `recent(200)` would make the clamp a starvation seam:
+    // 200 access-token budget events would push every `id_token` row out of the window and
+    // silently delete the issue #91 `token_size` family from the response, and a flood of
+    // ID-token bloat would do the same to the budget family. Two kind-predicated reads cost
+    // one extra scoped query and make that impossible.
+    let scoped = state.store().scoped(scope);
+    let sink = scoped.token_size_events();
+    let bloat_events = sink
+        .recent_by_kind(TokenSizeKind::IdToken, TokenSizeEventsRepo::MAX_QUERY_LIMIT)
+        .await?;
+    let budget_events = sink
+        .recent_by_kind(
+            TokenSizeKind::AccessToken,
+            TokenSizeEventsRepo::MAX_QUERY_LIMIT,
+        )
+        .await?;
+
     // Token size (claim bloat) warnings: the one materialized warning. Aggregate the recent
     // oversized mints per client into one warning, so a flood of large tokens for one client
     // is a single, legible item rather than hundreds.
-    let events = state
-        .store()
-        .scoped(scope)
-        .token_size_events()
-        .recent(TokenSizeEventsRepo::MAX_QUERY_LIMIT)
-        .await?;
-    let mut per_client: std::collections::BTreeMap<String, (usize, i64)> =
-        std::collections::BTreeMap::new();
-    for event in &events {
-        let entry = per_client.entry(event.client_id.clone()).or_insert((0, 0));
-        entry.0 += 1;
-        entry.1 = entry.1.max(event.byte_size);
-    }
-    for (client_id, (count, max_bytes)) in per_client {
-        items.push(WarningItemView {
-            kind: "token_size".to_owned(),
-            subject: client_id,
-            detail: format!(
-                "{count} recent ID token(s) exceeded the claim bloat threshold (largest \
-                 {max_bytes} bytes)"
-            ),
-        });
-    }
+    items.extend(token_size_warnings(&bloat_events));
+
+    // Permission-claim budget warnings (issue #98), out of the access-token window.
+    items.extend(permission_budget_warnings(&budget_events));
 
     let list = DiagnosticsWarningsList { items };
     let body = serde_json::to_string(&list).map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body))
+}
+
+/// The `kind` for a permission claim that was WITHHELD from a minted access token
+/// (issue #98). One of the two bounded kinds the permission budget adds.
+const PERMISSION_BUDGET_OVERFLOW_KIND: &str = "permission_budget_overflow";
+
+/// The `kind` for a permission claim that was EMITTED but is at or past a warn
+/// threshold (issue #98). Nothing was withheld: this is the early signal.
+const PERMISSION_BUDGET_APPROACHING_KIND: &str = "permission_budget_approaching";
+
+/// The stand-in for a missing ORGANIZATION on a permission budget row.
+///
+/// A budget event always records one, so this is defense in depth against a hand-written
+/// row rather than a state the recorder can produce, and it keeps a warning VISIBLE (an
+/// operator still sees the count) instead of dropping it for an incomplete address. It is
+/// NOT the stand-in for a missing audience: an absent audience is a real, expected state
+/// (a multi-audience token), and it is rendered by leaving the audience half off entirely.
+///
+/// Reachable from the public store API, so it is pinned by
+/// `an_organizationless_budget_row_is_still_visible` rather than merely claimed.
+const UNKNOWN_SUBJECT_PART: &str = "unknown";
+
+/// How a count that came out of a CLAMPED window is rendered.
+///
+/// Both windows are bounded by `TokenSizeEventsRepo::MAX_QUERY_LIMIT`, so a full window
+/// means the number of events aggregated is a LOWER BOUND on what happened, not a count of
+/// it. Rendering the clamp as an exact figure would be an under report presented as
+/// precision, which on the permission budget is the wrong direction to be wrong in. A
+/// partial window is an exact count and says so by saying nothing.
+fn observed_events(events: usize, window_full: bool) -> String {
+    if window_full {
+        format!("at least {events}")
+    } else {
+        events.to_string()
+    }
+}
+
+/// The ID-token claim bloat warnings for `events` (issue #91), aggregated per client.
+///
+/// `events` is the `id_token` window, so nothing filters here: an access-token
+/// permission-budget row is not in it. Before issue #98 this read took the mixed window
+/// and counted every row, which was correct only because every row was an `id_token` row.
+fn token_size_warnings(events: &[TokenSizeEventRecord]) -> Vec<WarningItemView> {
+    let window_full = events.len() >= usize_clamp(TokenSizeEventsRepo::MAX_QUERY_LIMIT);
+    let mut per_client: std::collections::BTreeMap<String, (usize, i64)> =
+        std::collections::BTreeMap::new();
+    for event in events {
+        let entry = per_client.entry(event.client_id.clone()).or_insert((0, 0));
+        entry.0 += 1;
+        entry.1 = entry.1.max(event.byte_size);
+    }
+    per_client
+        .into_iter()
+        .map(|(client_id, (count, max_bytes))| {
+            let count = observed_events(count, window_full);
+            WarningItemView {
+                kind: "token_size".to_owned(),
+                subject: client_id,
+                detail: format!(
+                    "{count} recent ID token(s) exceeded the claim bloat threshold (largest \
+                     {max_bytes} bytes)"
+                ),
+            }
+        })
+        .collect()
+}
+
+/// The read clamp as a `usize`, for comparing against a returned row count. Saturating,
+/// so a negative or absurd constant can never wrap into a small bound.
+fn usize_clamp(limit: i64) -> usize {
+    usize::try_from(limit).unwrap_or(usize::MAX)
+}
+
+/// The running aggregate for one (kind, subject) pair.
+#[derive(Default)]
+struct PermissionBudgetTally {
+    /// How many recent events fell under this pair.
+    events: usize,
+    /// The largest resolved permission set seen.
+    max_permission_count: i64,
+    /// The largest access token size seen.
+    max_token_bytes: i64,
+    /// Whether any of them crossed the ELEMENT bound. Tracked apart from the byte bound
+    /// because the two have different remediations (a smaller permission set or a larger
+    /// `permission_claim_max_count`, against a larger `access_token_max_bytes`), and one
+    /// sentence for both would leave an operator unable to tell which knob to reach for.
+    count_exceeded: bool,
+    /// Whether any of them crossed the BYTE bound.
+    bytes_exceeded: bool,
+    /// Whether any of them was the "withheld and the fallback is STILL oversize" case,
+    /// which is a materially worse situation than a plain withholding and is the one
+    /// distinction inside the overflow kind an operator has to be told about.
+    roles_only_still_oversize: bool,
+}
+
+/// The composite `subject` for a permission budget warning: the ORGANIZATION, then the
+/// AUDIENCE when the verdict has one, separated by one space.
+///
+/// Every other warning's `subject` is a single identifier (a connector slug, a client id),
+/// and a client id is deliberately not enough here: a permission set is resolved per
+/// (organization, subject), so one client can hit the budget for one organization and be
+/// fine for every other, and an operator who is only told the client id cannot act.
+///
+/// The audience is appended when the verdict names one. It does not always: the budget
+/// produces ONE verdict per TOKEN, and a token may target several resource servers, in
+/// which case the recorder writes no audience rather than picking one, and the subject is
+/// the organization alone.
+///
+/// Splitting the composite back into its halves is unambiguous at the FIRST space, and the
+/// reason is the ORGANIZATION half alone: an organization identifier is an `org_` prefix
+/// followed by a URL-safe base64 payload (see `ironauth_store::id`), an alphabet with no
+/// space in it. Nothing here validates the audience's shape and nothing needs to, because
+/// the audience is whatever remains after that first space.
+fn permission_budget_subject(event: &TokenSizeEventRecord) -> String {
+    let organization = event
+        .organization_id
+        .as_deref()
+        .unwrap_or(UNKNOWN_SUBJECT_PART);
+    match event.audience.as_deref() {
+        Some(audience) => format!("{organization} {audience}"),
+        None => organization.to_owned(),
+    }
+}
+
+/// The permission budget warnings for `events` (issue #98), aggregated per (kind,
+/// organization, audience) exactly the way the `token_size` kind aggregates per client.
+///
+/// Aggregating AT READ TIME is the damping strategy, matching the sink beside it rather
+/// than the quota engine's in-memory once-per-upward-crossing latch. The mint path is
+/// multi process, so an in-memory latch would be per replica and would UNDER report, which
+/// on this covenant is the wrong direction to be wrong in. Read-time aggregation needs no
+/// state and no coordination.
+///
+/// It does NOT abolish under reporting, and claiming it did would be worse than the clamp
+/// it hides. `events` is one clamped window (`TokenSizeEventsRepo::MAX_QUERY_LIMIT`), so a
+/// FULL window means the per-pair counts are lower bounds and every detail below says "at
+/// least" instead of naming a figure. Retention pruning bounds it from the other side. The
+/// thing that is never lost is the wire contract: the token carries `permissions_status`
+/// once the mint is wired, and that is the record this list is only a view of.
+///
+/// A row whose `reason` this build cannot parse is skipped, which is the correct answer for
+/// both cases that produce one: an access-token row that carries no reason at all, and a
+/// row written by a NEWER build during a rolling upgrade. An advisory read that guessed
+/// would be worse than one that says less.
+fn permission_budget_warnings(events: &[TokenSizeEventRecord]) -> Vec<WarningItemView> {
+    let window_full = events.len() >= usize_clamp(TokenSizeEventsRepo::MAX_QUERY_LIMIT);
+    let mut per_target: std::collections::BTreeMap<(&str, String), PermissionBudgetTally> =
+        std::collections::BTreeMap::new();
+
+    for event in events {
+        // Positively require the ACCESS token kind rather than inferring it from the
+        // presence of a reason. The caller passes the access-token window, so this is
+        // belt and suspenders against a future caller handing over a mixed one.
+        if event.token_type != TokenSizeKind::AccessToken.as_str() {
+            continue;
+        }
+        let Some(reason) = event.reason.as_deref().and_then(TokenSizeReason::from_wire) else {
+            continue;
+        };
+        let kind = match reason {
+            TokenSizeReason::BudgetApproaching => PERMISSION_BUDGET_APPROACHING_KIND,
+            TokenSizeReason::BudgetOverflowCount
+            | TokenSizeReason::BudgetOverflowBytes
+            | TokenSizeReason::RolesOnlyStillOversize => PERMISSION_BUDGET_OVERFLOW_KIND,
+        };
+        let tally = per_target
+            .entry((kind, permission_budget_subject(event)))
+            .or_default();
+        tally.events += 1;
+        tally.max_permission_count = tally
+            .max_permission_count
+            .max(event.permission_count.unwrap_or(0));
+        tally.max_token_bytes = tally.max_token_bytes.max(event.byte_size);
+        tally.count_exceeded |= reason == TokenSizeReason::BudgetOverflowCount;
+        tally.bytes_exceeded |= reason == TokenSizeReason::BudgetOverflowBytes;
+        tally.roles_only_still_oversize |= reason == TokenSizeReason::RolesOnlyStillOversize;
+    }
+
+    per_target
+        .into_iter()
+        .map(|((kind, subject), tally)| WarningItemView {
+            kind: kind.to_owned(),
+            subject,
+            detail: permission_budget_detail(kind, &tally, window_full),
+        })
+        .collect()
+}
+
+/// The safe, bounded detail for one aggregated permission budget warning. Two counts and
+/// a byte size; never a permission slug, a claim value, or a token.
+fn permission_budget_detail(
+    kind: &str,
+    tally: &PermissionBudgetTally,
+    window_full: bool,
+) -> String {
+    let events = observed_events(tally.events, window_full);
+    let permissions = tally.max_permission_count;
+    let bytes = tally.max_token_bytes;
+    let mut detail = if kind == PERMISSION_BUDGET_OVERFLOW_KIND {
+        format!(
+            "{events} recent access token(s) did NOT carry the permission claim because the \
+             resolved set exceeded {} (largest set {permissions} permissions, largest token \
+             {bytes} bytes)",
+            crossed_bound(tally)
+        )
+    } else {
+        format!(
+            "{events} recent access token(s) carried a permission claim at or past a warn \
+             threshold; nothing was withheld (largest set {permissions} permissions, largest \
+             token {bytes} bytes)"
+        )
+    };
+    if tally.roles_only_still_oversize {
+        detail.push_str(
+            ". At least one of them is STILL over the byte budget with the permission claim \
+             withheld, on roles and scope alone, which withholding cannot fix",
+        );
+    }
+    detail
+}
+
+/// WHICH bound the withholdings in this aggregate crossed. The two have different
+/// remediations, so a detail that said only "the budget" would leave an operator guessing
+/// between shrinking the permission set and raising the byte budget.
+///
+/// "the budget" survives as the answer for an aggregate holding only
+/// `roles_only_still_oversize` rows, which record the fallback's size rather than the
+/// bound that was crossed to get there.
+fn crossed_bound(tally: &PermissionBudgetTally) -> &'static str {
+    match (tally.count_exceeded, tally.bytes_exceeded) {
+        (true, true) => {
+            "the permission count budget on some mints and the token byte budget \
+                         on others"
+        }
+        (true, false) => "the permission count budget",
+        (false, true) => "the token byte budget",
+        (false, false) => "the budget",
+    }
 }
 
 // ===========================================================================

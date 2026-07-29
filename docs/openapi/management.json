@@ -4227,7 +4227,7 @@
         ],
         "responses": {
           "200": {
-            "description": "The environment's operational warnings, computed live from the connector health registry (a misconfigured, unreachable, or degraded upstream, which is how a stale or expired connector cert or metadata manifests through the live probe) and the token size (claim bloat) event sink. Each is a bounded kind, the non secret subject, and a safe detail.",
+            "description": "The environment's operational warnings, computed live from the connector health registry (a misconfigured, unreachable, or degraded upstream, which is how a stale or expired connector cert or metadata manifests through the live probe) and the token size event sink (ID token claim bloat, and the permission claim budget: a withheld permission claim, or one approaching the budget). Each is a bounded kind, the non secret subject, and a safe detail.",
             "content": {
               "application/json": {
                 "schema": {
@@ -15101,7 +15101,7 @@
       },
       "DiagnosticsWarningsList": {
         "type": "object",
-        "description": "The environment's operational warnings (issue #91), COMPUTED LIVE from the existing\nseams (the connector health registry and the token size event sink). Nothing here is a\nstored, staleness prone materialization except the token size events, which are already\nbounded and retention pruned.",
+        "description": "The environment's operational warnings (issue #91), COMPUTED LIVE from the existing\nseams (the connector health registry and the token size event sink). Nothing here is a\nstored, staleness prone materialization except the token size events, which are already\nbounded and retention pruned.\n\nThe permission budget warnings (issue #98) are read from the SAME event sink, though\nthrough a SEPARATE clamped window per event family, so one noisy family cannot evict\nthe other. They inherit that bound and that pruning: they are an operator's CONVENIENCE\nview of a withholding and never its record of record, because the token itself carries\n`permissions_status` once the mint is wired, so a warning aged out of this list does\nnot mean the withholding went unrecorded.",
         "required": [
           "items"
         ],
@@ -15111,7 +15111,7 @@
             "items": {
               "$ref": "#/components/schemas/WarningItemView"
             },
-            "description": "The computed warnings, connector warnings first, then token size warnings."
+            "description": "The computed warnings, connector warnings first, then token size warnings, then\npermission budget warnings. The order of the two token size event families is part\nof the contract and is pinned by\n`the_warnings_read_surfaces_the_two_permission_budget_kinds`; the connector family\nis first by construction, because it is pushed before the event sink is read."
           }
         }
       },
@@ -18734,7 +18734,7 @@
       },
       "WarningItemView": {
         "type": "object",
-        "description": "One operational warning item (issue #91): a bounded `kind`, the `subject` it is about\n(a connector slug or a client id, non secret), and a safe `detail`. Every field is a\nbounded, non secret datum; the detail never carries a claim value, a token, or a secret.",
+        "description": "One operational warning item (issue #91): a bounded `kind`, the `subject` it is about\n(a connector slug, a client id, or an organization optionally followed by an audience,\nall non secret), and a safe `detail`. Every field is a bounded, non secret datum; the\ndetail never carries a claim value, a token, or a secret.\n\n`kind` is a `String` rather than an enum on purpose, and the admin console groups on it\ngenerically, so a new warning family is additive on the wire: issue #98 added two kinds\nwith no schema change and no console change.",
         "required": [
           "kind",
           "subject",
@@ -18747,11 +18747,11 @@
           },
           "kind": {
             "type": "string",
-            "description": "The bounded warning kind (for example `connector_config_error`,\n`connector_unavailable`, `connector_degraded`, `token_size`)."
+            "description": "The bounded warning kind (for example `connector_config_error`,\n`connector_unavailable`, `connector_degraded`, `token_size`,\n`permission_budget_overflow`, `permission_budget_approaching`)."
           },
           "subject": {
             "type": "string",
-            "description": "The subject the warning is about (a connector slug or a client id), non secret."
+            "description": "The subject the warning is about (a connector slug, a client id, or an organization\nfollowed by one space and an audience, the audience omitted when a verdict spans\nseveral), non secret."
           }
         }
       }

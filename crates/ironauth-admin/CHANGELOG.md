@@ -6,6 +6,43 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Two new operational warning kinds, `permission_budget_overflow` and
+  `permission_budget_approaching`, on `GET .../diagnostics/warnings` (issue #98, PR 12),
+  read out of the SAME `token_size_events` sink the `token_size` kind already reads and
+  aggregated the same way. NO schema change and NO console change were needed:
+  `WarningItemView.kind` is a string, not an enum, and the admin console groups warnings by
+  kind generically. The `subject` is the `(organization, audience)` pair rendered as a
+  composite string (the organization id, one space, the audience) rather than a client id,
+  because a permission set is resolved per (organization, subject), so one client can hit
+  the budget for one organization and be fine everywhere else and a client id alone leaves
+  an operator unable to act. The audience half is APPENDED only when the verdict names one:
+  the budget produces one verdict per TOKEN and a token may target several resource servers,
+  in which case the subject is the organization alone rather than a fabricated placeholder.
+  Splitting the composite at the first space is unambiguous because the ORGANIZATION half is
+  an `org_` prefix over a URL-safe base64 payload, an alphabet with no space; nothing
+  validates the audience's shape and nothing needs to, because it is the remainder.
+  Aggregation happens at READ time, matching the sink beside it rather than the quota
+  engine's in-memory latch, because the mint path is multi process and a per-replica latch
+  would UNDER report. Read-time aggregation does NOT abolish under reporting, and the read
+  no longer claims it does: each family is read through its OWN clamped window
+  (`recent_by_kind`) so neither can evict the other, and a FULL window renders every count
+  as "at least N" rather than as a figure, because rendering the clamp as an exact number is
+  an under report presented as precision. A row whose `reason` this build cannot parse is
+  skipped, which is the right answer for both cases that produce one (an access-token row
+  with no reason, and a row written by a newer build mid rolling upgrade), and that skip is
+  now measured at the READ and not only at the enum. An overflow detail says WHICH bound was
+  crossed (the permission count budget, the token byte budget, or both), because the
+  remediations differ. BEHAVIOUR CORRECTION to the existing `token_size` kind: it now reads
+  the `id_token` window only. Its detail claims to count oversized ID tokens, and once
+  access-token budget events share the sink, counting those would make that claim false;
+  every row the sink held before issue #98 is an `id_token` row, so nothing that shipped
+  changes. The OpenAPI descriptions for the warning kind, the subject, and the item ordering
+  were updated to match (and the item order is now pinned by a test rather than only
+  promised), so `docs/openapi/management.json` and the generated
+  `packages/admin-spa/src/api/management.gen.ts` are regenerated. The console's warnings
+  panel hint, which still described only connector health and token sizes, now names the
+  budget verdicts.
+
 - Resource-server registry management API (issue #98, PR 11), a NET-NEW surface: the
   audience-to-format registry issue #29 shipped has never had a management route.
   `GET .../resource-servers` (`listResourceServers`, cursor paginated), `GET

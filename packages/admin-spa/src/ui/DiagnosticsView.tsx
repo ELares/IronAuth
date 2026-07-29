@@ -349,8 +349,10 @@ function WarningsPanel({
     <div class="resource-subsection">
       <h3>Operational warnings</h3>
       <p class="resource-hint">
-        Live warnings computed from the connector health and the recent token sizes. Nothing
-        here is stored to go stale (except the bounded token size events).
+        Live warnings computed from the connector health, the recent token sizes, and the
+        recent permission claim budget verdicts. Nothing here is stored to go stale (except
+        the bounded token size events, which also carry the budget verdicts). A budget
+        warning is a convenience view: the token itself carries the withholding status.
       </p>
       <AsyncBoundary
         state={state}

@@ -6,6 +6,50 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Permission-budget dimensions on the token size event sink (issue #98, PR 12): migration
+  0095 adds five NULLABLE columns to `token_size_events` (`reason text`, `audience text`,
+  `organization_id text`, `permission_count bigint`, `permission_status text`), so the sink
+  issue #91 built as the one materialized operational warning carries a SECOND event kind
+  rather than needing a second table. `permission_status` records what the token itself put
+  ON THE WIRE (`budget_exceeded` or `pdp_required`), which is the one datum that tells a
+  resource server whether to fall back to `roles` or to consult a policy decision point; an
+  event that could not express it would be a record of a withholding missing what the token
+  said about the withholding. `audience` is nullable for a second reason beyond "a bloat
+  event has none": the budget produces ONE verdict per TOKEN and `AccessTokenTarget` permits
+  several audiences, so the recorder fills it only when the token targets exactly one
+  resource server and leaves it NULL otherwise, rather than picking one and mislabelling the
+  verdict. `NewTokenSizeEvent` gains the five matching optional fields and
+  `TokenSizeEventRecord` reads them back; the new `TokenSizeReason` is a closed Rust enum
+  (`BudgetApproaching`, `BudgetOverflowCount`, `BudgetOverflowBytes`,
+  `RolesOnlyStillOversize`) with a stable `as_str` and a `from_wire` parse, round-trip
+  tested over the full variant list. NO backfill, NO CHECK edit, and NO new grant, each for
+  a stated reason: nullable because an ID-token bloat event has no budget to report (so
+  NULL means "not a permission budget event" and no value would be true of the rows already
+  there); 0073's `token_size_events_type_known` CHECK already admits `'access_token'`; and
+  0073's `GRANT SELECT, INSERT, DELETE ... TO ironauth_app` is TABLE-wide, so it covers
+  columns added afterwards. That last point is the difference from 0094 and it is a
+  property of the grants already written rather than of the column: 0094 needed a grant
+  only because 0035's UPDATE on `resource_servers` was COLUMN-scoped. A migration test
+  measures all of it (`has_column_privilege` on each new column for both roles, the absent
+  UPDATE of every shape on the append-only sink, the untouched CHECK, and the deliberate
+  absence of a CHECK on `reason` and on `permission_status`). Neither vocabulary column
+  carries a CHECK on purpose: both are pinned in Rust and their only consumer is an advisory
+  read that skips a value it cannot parse, so a future variant must not cost a migration.
+  NEW READ, `TokenSizeEventsRepo::recent_by_kind`: the 200-row clamp is now applied PER
+  EVENT FAMILY. One shared window made the clamp a starvation seam, because a flood of
+  access-token budget rows evicts every `id_token` row and silently deletes the issue #91
+  warning family from a shipped response;
+  `the_per_kind_read_gives_each_event_family_its_own_clamped_window` measures both halves
+  (the shared window IS entirely evicted, the per-kind windows are not). Honest scope,
+  stated in the migration header and in the module docs: these rows are retention pruned and
+  each read is clamped, so they are an operator's CONVENIENCE view of a withholding and
+  never its record of record; the durable record is the token's own `permissions_status`
+  once the mint is wired. `a_recorded_budget_event_is_retention_pruned` measures the pruning
+  half on a budget row rather than asserting it, and the migration header now states the
+  `retention_secs = 0` consequence outright (at 0 every row expires as it is written, so
+  this sink holds at most one budget row per scope). Nothing writes the columns on this
+  build.
+
 - Per-audience PERMISSION-CLAIM opt-in (issue #98, PR 11): migration 0094 adds
   `resource_servers.permission_claims_enabled boolean NOT NULL DEFAULT false` and the
   COLUMN-scoped `GRANT UPDATE (permission_claims_enabled) ON resource_servers TO

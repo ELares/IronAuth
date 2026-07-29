@@ -6,6 +6,48 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- `record_permission_budget_event`, the permission-budget recorder (issue #98, PR 12), in
+  `policy_trace` beside `record_token_size_event`. It writes an `access_token` row into the
+  token size event sink carrying the migration 0095 dimensions, and it is the FIRST
+  construction of `TokenSizeKind::AccessToken` in the product: the variant and the 0073
+  CHECK that admits `'access_token'` have both existed unconstructed since issue #91, so a
+  permission-budget event is the first access-token size event IronAuth has ever recorded.
+  UNLIKE every other recorder in that module it is deliberately NOT gated on
+  `DiagnosticVerbosity`, and that exemption is the point rather than an oversight: issue
+  #98's covenant is that no configuration produces a silent permission drop, and routing
+  this through the verbosity gate would make `diagnostics.verbosity = "off"` exactly that
+  configuration. A DB-backed suite drives the recorder at EVERY verbosity setting, `off`
+  included, and asserts a row every time, with a contrasting case asserting
+  `record_token_size_event` at `off` still writes nothing, so the two behaviours are pinned
+  apart rather than assumed apart. The exemption is from verbosity only:
+  `diagnostics.retention_secs` still prunes these rows, and
+  `the_recorder_threads_the_configured_retention` measures that threading through a real
+  `DiagnosticsConfig` on a manual clock rather than leaving it to the store-side test that
+  passes a literal window. That pruning is acceptable ONLY because the token itself carries
+  `permissions_status` once the mint is wired, making the durable record the wire contract
+  and this row the operator's convenience view; the sharpest case is stated outright rather
+  than derived, namely that `retention_secs = 0` is a valid posture under which this sink
+  holds at most ONE budget row per scope. Recording stays
+  BEST EFFORT (a write failure is logged and swallowed, the token is returned unchanged),
+  because the covenant does not depend on this write landing. `record_token_size_event` is
+  otherwise UNCHANGED: it still returns early at `off`, still measures after signing, still
+  writes nothing at or below its threshold, still records only `IdToken`, and still swallows
+  write errors. `PermissionBudgetEvent` carries the `permissions_status` the token put on
+  the wire (`None` for an approach, which withholds nothing) and an OPTIONAL audience,
+  because the budget produces one verdict per TOKEN and a token may target several resource
+  servers: the recorder names an audience only when there is exactly one to name. The
+  redaction corpus gains the new dimensions with the argument for each written into the
+  corpus rather than assumed, and it distinguishes the three that are structurally safe (two
+  closed enums and an integer, proved by sweeping their whole value space) from the two that
+  are free-form strings whose safety is CALLER DISCIPLINE. That distinction is now measured
+  rather than claimed: two `should_panic` probes route a real sentinel through `audience`
+  and through `organization_id` and watch the corpus scan catch it, which is what stops the
+  negative half of the corpus being vacuous. The corpus no longer claims a destructuring
+  "enforces" the caller guarantee (it does not: the struct literal beside it already fails to
+  compile on a new field, so the destructuring was a no-op) and no longer claims anything
+  "proves no sentinel can reach" a `&str`. INERT on this build: nothing calls the recorder;
+  the mint hooks land in a later PR of issue #98 and issue #422 tracks removing the markers.
+
 - Char-boundary panic in query percent-decoding (issue #419): `percent_decode` sliced
   a `str` at the constant `value[i + 1..i + 3]` behind a byte-LENGTH check, so a `%`
   followed by a multi-byte character panicked ("end byte index 3 is not a char

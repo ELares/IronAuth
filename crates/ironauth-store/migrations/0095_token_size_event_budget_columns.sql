@@ -1,0 +1,188 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+--
+-- The permission-budget dimensions on the token size event sink (issue #98,
+-- milestone M10).
+--
+-- Adds five NULLABLE columns to `token_size_events` so one already-shipped,
+-- already-bounded, already-retention-pruned sink can carry a SECOND kind of event:
+-- the issue #98 permission-claim budget verdict (approaching the budget, or a
+-- withholding). No backfill, no CHECK edit, no new grant, no new table.
+--
+-- Nothing writes these columns on this build. The recorder that fills them
+-- (`ironauth_oidc::policy_trace::record_permission_budget_event`) lands with this
+-- migration and has no production caller until the mint hooks are wired in a later
+-- PR of this issue.
+--
+-- ---------------------------------------------------------------------------
+-- (1) Why this sink rather than a new one.
+-- ---------------------------------------------------------------------------
+-- 0073 built `token_size_events` as the ONE materialized operational warning:
+-- append only, scope forced, retention pruned on insert, read through a hard
+-- 200-row clamp, and off the audited write path. A permission-budget event has
+-- exactly those properties and exactly that consumer (the M9
+-- `GET .../diagnostics/warnings` read). A parallel table would duplicate the
+-- isolation policy, the two indexes, the prune, the grants, and the retention
+-- semantics, and would give an operator two places to look for one question.
+--
+-- The five columns are nullable because the ID-token bloat event that has always
+-- written this table has no permission budget to report. NULL therefore means "not
+-- a permission-budget event", which is the honest reading of an absent value here
+-- and is why no DEFAULT and no backfill are appropriate: there is no value that
+-- would be true of the rows already in the table.
+--
+-- ---------------------------------------------------------------------------
+-- (2) No CHECK edit. `access_token` was already admitted.
+-- ---------------------------------------------------------------------------
+-- A permission-budget event is about an ACCESS token, and 0073's
+-- `token_size_events_type_known` CHECK is already
+-- `CHECK (token_type IN ('id_token', 'access_token'))`, so recording one needs no
+-- constraint change. `TokenSizeKind::AccessToken` has existed and been unconstructed
+-- since 0073; the recorder this migration serves is the first thing in the product
+-- ever to write that value.
+--
+-- `reason` deliberately carries NO CHECK. The closed set lives in Rust
+-- (`TokenSizeReason`, whose `as_str` / `from_wire` pair is round-trip tested), and a
+-- CHECK here would turn a future vocabulary addition into a migration, on a column
+-- whose only consumer is an advisory operator read that already ignores a value it
+-- cannot parse. Contrast `token_type`, whose CHECK 0073 wrote is load bearing
+-- because the read GROUPS on it.
+--
+-- ---------------------------------------------------------------------------
+-- (3) No new GRANT. This is the difference from 0094, and it is worth stating.
+-- ---------------------------------------------------------------------------
+-- 0094 needed `GRANT UPDATE (permission_claims_enabled)` because 0035 had granted
+-- the control role a COLUMN-SCOPED `UPDATE (token_format,
+-- access_token_ttl_secs)` on `resource_servers`, and a column-scoped grant
+-- ENUMERATES columns, so a column added later is invisible to it.
+--
+-- The grants 0073 wrote for this table are TABLE-wide:
+--
+--   GRANT SELECT, INSERT, DELETE ON token_size_events TO ironauth_app;
+--   GRANT SELECT ON token_size_events TO ironauth_control;
+--
+-- A table-wide INSERT covers every column of the table, including columns added
+-- afterwards, so the data plane's INSERT may name the five new columns with no
+-- further grant, and the control plane's table-wide SELECT reads them. No UPDATE is
+-- granted to anyone on this table by anyone, which stays true: the sink is append
+-- only, and the only deletion is the retention prune the data plane's DELETE
+-- serves.
+--
+-- The rule this records, so the next column on some other table is not decided by
+-- analogy to the wrong precedent: a new column needs a new grant exactly when an
+-- EXISTING grant on that table is column scoped for the privilege the new column
+-- needs. It is a property of the grants already written, never of the column.
+--
+-- ---------------------------------------------------------------------------
+-- (4) What these columns may hold, and what they may not.
+-- ---------------------------------------------------------------------------
+-- The same rule 0073 wrote for this table: bounded, non secret data only, and NO
+-- field capable of holding a token, a claim value, or a secret.
+--
+--   * `reason` is server vocabulary from a closed Rust enum.
+--   * `audience` is an OPERATOR-REGISTERED resource server URI (the same string
+--     `resource_servers.audience` holds and the same string a token's `aud`
+--     carries), not a subject and not a secret.
+--   * `organization_id` is a scoped `org_` identifier, a blind reference.
+--   * `permission_count` is a bounded integer, never the permission set.
+--   * `permission_status` is server vocabulary too: the `permissions_status` value
+--     the token itself put on the wire, from the closed `PermissionStatus` enum
+--     (`budget_exceeded` or `pdp_required`), so it is a string this server chose
+--     rather than one anybody supplied.
+--
+-- The permission SLUGS are deliberately absent. A count answers the operator's
+-- question ("how far past the budget") and a list would grow this row without
+-- bound. The redaction corpus
+-- (`ironauth_oidc::policy_trace::tests::redaction_corpus_leaks_no_secret_sentinel`,
+-- gated by scripts/diagnostics-redaction-scan.sh) carries the argument for each of
+-- the five in prose, and it PROVES only what it can prove: `reason`,
+-- `permission_count`, and `permission_status` are structurally incapable of holding
+-- a sentinel (an enum, an integer, an enum), while `audience` and `organization_id`
+-- are `&str` and WOULD record a sentinel verbatim, so the corpus routes a real one
+-- through both of them and asserts it comes out. Their guarantee is about the
+-- CALLER (both are resolved from the operator's own configuration and from the
+-- organization frozen onto the grant, never from an end user's claims), not about
+-- the type.
+--
+-- No column here is classified PII or secret, so scripts/pii-encryption-scan.sh
+-- requires no envelope encryption for them: an audience URI and an organization id
+-- are the same class of datum as the `client_id` this table has always stored in
+-- plaintext.
+--
+-- ---------------------------------------------------------------------------
+-- (5) Honest scope: this sink is a CONVENIENCE view, never the record of record.
+-- ---------------------------------------------------------------------------
+-- These rows are retention pruned (0073's `expires_at`, enforced by the prune the
+-- recorder runs before every insert) and the read is clamped to 200 rows
+-- (`TokenSizeEventsRepo::MAX_QUERY_LIMIT`), applied PER EVENT FAMILY so that the two
+-- kinds sharing this table cannot evict each other, and reported as a LOWER BOUND
+-- once a window is full. That is acceptable ONLY because the
+-- token itself carries `permissions_status` once the mint is wired: the durable
+-- record of a withholding is the WIRE CONTRACT, and this row is the operator's
+-- convenience view of it. If this row were the sole record of a withholding,
+-- retention pruning would silently defeat issue #98's covenant that no
+-- configuration produces a silent permission drop.
+--
+-- Two tests measure the pruning half on a budget row rather than asserting it.
+-- `a_recorded_budget_event_is_retention_pruned` (crates/ironauth-store/tests/
+-- repository.rs) drives the repository directly: it records one, crosses the
+-- retention window on a manual clock, records a second (the prune runs on insert),
+-- and observes the first row gone. `the_recorder_threads_the_configured_retention`
+-- (crates/ironauth-oidc/src/policy_trace.rs) drives the SAME loss through
+-- `record_permission_budget_event` and a real `DiagnosticsConfig`, which is what
+-- pins the threading rather than the store constant.
+--
+-- The sharpest case is worth stating outright: `diagnostics.retention_secs = 0` is
+-- a valid, safe posture, and at 0 every insert expires immediately, so each write
+-- prunes its predecessor and this sink holds AT MOST ONE budget row per scope. An
+-- operator who sets 0 keeps the covenant (the token still carries
+-- `permissions_status`) and keeps essentially none of the convenience view.
+--
+-- Migration safety obligation (see migrate.rs): `token_size_events` is an EXISTING
+-- tenant-scoped table that already ENABLEs and FORCEs row-level security, already
+-- carries the (tenant, environment) isolation policy with byte-identical USING and
+-- WITH CHECK, already carries the nonempty-scope CHECK, and is already registered in
+-- scripts/query-audit.sh, so this migration inherits all four and adds no new
+-- obligation. Every statement is additive (five nullable columns, which Postgres
+-- adds without rewriting the table; no existing column is altered or dropped, no
+-- CHECK is changed, and no grant is granted or revoked), so this migration is an
+-- EXPAND.
+
+-- Which permission-budget verdict this row records, as the stable wire string of
+-- `TokenSizeReason`. NULL means the row is not a permission-budget event (every row
+-- written before this migration, and every ID-token bloat event written after it).
+ALTER TABLE token_size_events ADD COLUMN reason text;
+
+-- The resource server audience the access token was minted FOR: an operator
+-- registered URI, the finer half of the address an operator needs, because the
+-- `client_id` this table has always carried cannot distinguish two audiences one
+-- client requests.
+--
+-- NULLABLE for a second reason beyond "a bloat event has none". The budget produces
+-- ONE verdict for the whole TOKEN, not one per audience, and `AccessTokenTarget`
+-- permits several (RFC 8707 / RFC 9068 `aud` arrays). The recorder therefore fills
+-- this column only when the token targets EXACTLY ONE resource server, and leaves it
+-- NULL when it targets several, rather than picking one and mislabelling the verdict
+-- as belonging to it. A NULL here means "this verdict cannot be attributed to a
+-- single audience", and the warnings read renders the organization alone.
+ALTER TABLE token_size_events ADD COLUMN audience text;
+
+-- The organization whose resolved permission set tripped the budget: a scoped `org_`
+-- identifier, the other half of that address. A permission set is resolved per
+-- (organization, subject), so the organization is what an operator acts on.
+ALTER TABLE token_size_events ADD COLUMN organization_id text;
+
+-- How many permissions the resolved set held. A bounded integer, never the set
+-- itself: it is the only number from which "how far past the budget" can be read,
+-- and a slug list would grow this append-only row without bound.
+ALTER TABLE token_size_events ADD COLUMN permission_count bigint;
+
+-- The `permissions_status` value the token actually put ON THE WIRE, as the stable
+-- wire string of the closed `PermissionStatus` enum (`budget_exceeded` or
+-- `pdp_required`). NULL on every non-withholding row: an ID-token bloat event and a
+-- `budget_approaching` verdict alike, because neither token carries a status.
+--
+-- Recorded because it is the one datum that tells a resource server whether to fall
+-- back to `roles` or to consult a policy decision point, so an event that could not
+-- express it would be a record of a withholding missing what the token said about
+-- the withholding. NO CHECK, for the same reason `reason` has none.
+ALTER TABLE token_size_events ADD COLUMN permission_status text;

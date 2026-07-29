@@ -2559,9 +2559,22 @@ export interface components {
          *     seams (the connector health registry and the token size event sink). Nothing here is a
          *     stored, staleness prone materialization except the token size events, which are already
          *     bounded and retention pruned.
+         *
+         *     The permission budget warnings (issue #98) are read from the SAME event sink, though
+         *     through a SEPARATE clamped window per event family, so one noisy family cannot evict
+         *     the other. They inherit that bound and that pruning: they are an operator's CONVENIENCE
+         *     view of a withholding and never its record of record, because the token itself carries
+         *     `permissions_status` once the mint is wired, so a warning aged out of this list does
+         *     not mean the withholding went unrecorded.
          */
         DiagnosticsWarningsList: {
-            /** @description The computed warnings, connector warnings first, then token size warnings. */
+            /**
+             * @description The computed warnings, connector warnings first, then token size warnings, then
+             *     permission budget warnings. The order of the two token size event families is part
+             *     of the contract and is pinned by
+             *     `the_warnings_read_surfaces_the_two_permission_budget_kinds`; the connector family
+             *     is first by construction, because it is pushed before the event sink is read.
+             */
             items: components["schemas"]["WarningItemView"][];
         };
         /**
@@ -4760,8 +4773,13 @@ export interface components {
         };
         /**
          * @description One operational warning item (issue #91): a bounded `kind`, the `subject` it is about
-         *     (a connector slug or a client id, non secret), and a safe `detail`. Every field is a
-         *     bounded, non secret datum; the detail never carries a claim value, a token, or a secret.
+         *     (a connector slug, a client id, or an organization optionally followed by an audience,
+         *     all non secret), and a safe `detail`. Every field is a bounded, non secret datum; the
+         *     detail never carries a claim value, a token, or a secret.
+         *
+         *     `kind` is a `String` rather than an enum on purpose, and the admin console groups on it
+         *     generically, so a new warning family is additive on the wire: issue #98 added two kinds
+         *     with no schema change and no console change.
          */
         WarningItemView: {
             /**
@@ -4771,10 +4789,15 @@ export interface components {
             detail: string;
             /**
              * @description The bounded warning kind (for example `connector_config_error`,
-             *     `connector_unavailable`, `connector_degraded`, `token_size`).
+             *     `connector_unavailable`, `connector_degraded`, `token_size`,
+             *     `permission_budget_overflow`, `permission_budget_approaching`).
              */
             kind: string;
-            /** @description The subject the warning is about (a connector slug or a client id), non secret. */
+            /**
+             * @description The subject the warning is about (a connector slug, a client id, or an organization
+             *     followed by one space and an audience, the audience omitted when a verdict spans
+             *     several), non secret.
+             */
             subject: string;
         };
     };
@@ -7633,7 +7656,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description The environment's operational warnings, computed live from the connector health registry (a misconfigured, unreachable, or degraded upstream, which is how a stale or expired connector cert or metadata manifests through the live probe) and the token size (claim bloat) event sink. Each is a bounded kind, the non secret subject, and a safe detail. */
+            /** @description The environment's operational warnings, computed live from the connector health registry (a misconfigured, unreachable, or degraded upstream, which is how a stale or expired connector cert or metadata manifests through the live probe) and the token size event sink (ID token claim bloat, and the permission claim budget: a withheld permission claim, or one approaching the budget). Each is a bounded kind, the non secret subject, and a safe detail. */
             200: {
                 headers: {
                     [name: string]: unknown;

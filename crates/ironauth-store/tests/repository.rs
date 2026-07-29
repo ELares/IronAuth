@@ -3,6 +3,7 @@
 //! Repository round-trip and non-recycling, against a real database.
 
 use std::collections::HashSet;
+use std::time::{Duration, UNIX_EPOCH};
 
 use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
@@ -10,7 +11,8 @@ use ironauth_store::{
     AuthorizationCodeId, ClientId, CorrelationId, GrantId, IssueCode, NewPolicyDecisionTrace,
     NewRefreshFamily, NewSession, NewTokenSizeEvent, PolicyDecisionInputs,
     PolicyDecisionTraceQuery, PolicyKind, PolicyOutcome, PolicyTraceSignal, RefreshFamilyId,
-    RefreshTokenId, Scope, SessionId, StoreError, TokenSizeKind, refresh_token_digest,
+    RefreshTokenId, Scope, SessionId, StoreError, TokenSizeEventsRepo, TokenSizeKind,
+    TokenSizeReason, refresh_token_digest,
 };
 
 #[tokio::test]
@@ -1377,6 +1379,11 @@ async fn token_size_events_round_trip() {
                     byte_size,
                     claim_count: Some(40),
                     client_id: "cli_bloat",
+                    reason: None,
+                    audience: None,
+                    organization_id: None,
+                    permission_count: None,
+                    permission_status: None,
                 },
             )
             .await
@@ -1392,5 +1399,262 @@ async fn token_size_events_round_trip() {
     assert!(
         recent.iter().any(|event| event.byte_size == 5120),
         "the byte size round-trips"
+    );
+    // An ID-token bloat event leaves all five issue #98 budget columns NULL, which is what
+    // makes "not a permission budget event" readable off the row itself.
+    assert!(
+        recent.iter().all(|event| event.reason.is_none()
+            && event.audience.is_none()
+            && event.organization_id.is_none()
+            && event.permission_count.is_none()
+            && event.permission_status.is_none()),
+        "a bloat event records no budget dimension"
+    );
+}
+
+#[tokio::test]
+async fn token_size_event_budget_columns_round_trip() {
+    // The issue #98 permission-budget dimensions on the same sink (migration 0095): all five
+    // columns are WRITTEN and READ BACK, and none of them is a default that happens to look
+    // right. The values are chosen so a crossed or defaulted column fails: the two strings
+    // are not substrings of each other, the count is not the byte size, and this is the FIRST
+    // row in the product recorded against `TokenSizeKind::AccessToken` (the variant and the
+    // 0073 CHECK that admits it have both existed unconstructed since issue #91).
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let events = db.store().scoped(scope).token_size_events();
+
+    events
+        .record(
+            &env,
+            TRACE_RETENTION_MICROS,
+            NewTokenSizeEvent {
+                token_type: TokenSizeKind::AccessToken,
+                byte_size: 9001,
+                claim_count: None,
+                client_id: "cli_budget",
+                reason: Some(TokenSizeReason::BudgetOverflowCount),
+                audience: Some("https://api.example.com/orders"),
+                organization_id: Some("org_budget"),
+                permission_count: Some(412),
+                permission_status: Some("pdp_required"),
+            },
+        )
+        .await
+        .expect("record a permission budget event");
+
+    let recent = events.recent(50).await.expect("read recent");
+    assert_eq!(recent.len(), 1, "the budget event is readable");
+    let event = &recent[0];
+    assert_eq!(
+        event.token_type, "access_token",
+        "the first access-token size event the product has ever recorded"
+    );
+    assert_eq!(
+        event.reason.as_deref(),
+        Some("budget_overflow_count"),
+        "reason round-trips as the stable wire string"
+    );
+    assert_eq!(
+        TokenSizeReason::from_wire(event.reason.as_deref().expect("a reason")),
+        Some(TokenSizeReason::BudgetOverflowCount),
+        "and parses back to the same variant"
+    );
+    assert_eq!(
+        event.audience.as_deref(),
+        Some("https://api.example.com/orders"),
+        "audience round-trips"
+    );
+    assert_eq!(
+        event.organization_id.as_deref(),
+        Some("org_budget"),
+        "organization_id round-trips and is not crossed with the audience"
+    );
+    assert_eq!(
+        event.permission_count,
+        Some(412),
+        "permission_count round-trips and is not the byte size"
+    );
+    assert_eq!(
+        event.permission_status.as_deref(),
+        Some("pdp_required"),
+        "the permissions_status the TOKEN put on the wire round-trips, and is not crossed \
+         with the reason (which is the OTHER closed vocabulary on this row)"
+    );
+    assert_eq!(event.byte_size, 9001, "the byte size is the token size");
+    assert_eq!(
+        event.claim_count, None,
+        "a budget event records no claim count"
+    );
+}
+
+#[tokio::test]
+async fn a_recorded_budget_event_is_retention_pruned() {
+    // The HONESTY claim the recorder's doc comment makes, measured rather than asserted: a
+    // permission-budget row is retention pruned, so it is an operator's CONVENIENCE view of
+    // a withholding and never its record of record. The other half of the same bound is the
+    // read clamp, `TokenSizeEventsRepo::MAX_QUERY_LIMIT`.
+    //
+    // Read this test the right way round. It measures DATA LOSS on a row that records a
+    // withheld permission claim, and that is acceptable ONLY because the token itself
+    // carries `permissions_status` once the mint is wired, making the wire contract the
+    // durable record. If this row were the sole record, this test would be describing a bug
+    // that defeats issue #98's covenant rather than a documented bound.
+    let db = TestDatabase::start().await;
+    // A manual clock, so the retention window is crossed deterministically rather than by
+    // waiting on wall time.
+    let (env, clock) = Env::deterministic(UNIX_EPOCH, 0x98);
+    let scope = db.seed_scope(&env).await;
+    let events = db.store().scoped(scope).token_size_events();
+
+    let budget = |permission_count: i64| NewTokenSizeEvent {
+        token_type: TokenSizeKind::AccessToken,
+        byte_size: 9001,
+        claim_count: None,
+        client_id: "cli_budget",
+        reason: Some(TokenSizeReason::BudgetOverflowBytes),
+        audience: Some("https://api.example.com/orders"),
+        organization_id: Some("org_budget"),
+        permission_count: Some(permission_count),
+        permission_status: Some("budget_exceeded"),
+    };
+
+    // A one second retention window, so the row expires one second after it is written.
+    events
+        .record(&env, 1_000_000, budget(412))
+        .await
+        .expect("record the first budget event");
+    assert_eq!(
+        events.recent(50).await.expect("read recent").len(),
+        1,
+        "the budget event is readable before its retention window closes"
+    );
+
+    // Cross the window and record a SECOND event: the prune runs on insert, so the write
+    // path is what reclaims the expired row (there is no background job to wait for).
+    clock.advance(Duration::from_secs(2));
+    events
+        .record(&env, 1_000_000, budget(7))
+        .await
+        .expect("record the second budget event");
+
+    let recent = events.recent(50).await.expect("read recent");
+    assert_eq!(
+        recent.len(),
+        1,
+        "the first budget event was pruned by retention, so this sink cannot be the durable \
+         record of a withholding"
+    );
+    assert_eq!(
+        recent[0].permission_count,
+        Some(7),
+        "the surviving row is the second one, so the prune removed the EXPIRED row rather \
+         than the newest"
+    );
+    // ATTRIBUTION CAVEAT, stated rather than left implicit. This test measures the
+    // repository call with a LITERAL window, so on its own it cannot tell a working
+    // retention thread from a store that ignores its argument and prunes on some default:
+    // the sibling `token_size_events_round_trip` in this file is what shows a long window
+    // keeps its rows. The threading of `diagnostics.retention_secs` through the RECORDER
+    // is a different claim again, and it is measured in
+    // `ironauth_oidc::policy_trace::exemption_tests::the_recorder_threads_the_configured_retention`.
+}
+
+#[tokio::test]
+async fn the_per_kind_read_gives_each_event_family_its_own_clamped_window() {
+    // Issue #98: the two warning families share one table, and the M9 read gives each its
+    // OWN clamped window. A single shared `recent(MAX_QUERY_LIMIT)` makes the clamp a
+    // STARVATION seam: enough access-token budget rows push every id_token row out of the
+    // window, and the issue #91 warning family disappears from a shipped response.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let events = db.store().scoped(scope).token_size_events();
+
+    // ONE quiet ID-token bloat row first, so every later row is newer than it.
+    events
+        .record(
+            &env,
+            TRACE_RETENTION_MICROS,
+            NewTokenSizeEvent {
+                token_type: TokenSizeKind::IdToken,
+                byte_size: 4096,
+                claim_count: Some(37),
+                client_id: "cli_quiet",
+                reason: None,
+                audience: None,
+                organization_id: None,
+                permission_count: None,
+                permission_status: None,
+            },
+        )
+        .await
+        .expect("record the quiet bloat event");
+
+    // Then a flood of budget rows, comfortably past the clamp.
+    let flood = TokenSizeEventsRepo::MAX_QUERY_LIMIT + 20;
+    for index in 0..flood {
+        events
+            .record(
+                &env,
+                TRACE_RETENTION_MICROS,
+                NewTokenSizeEvent {
+                    token_type: TokenSizeKind::AccessToken,
+                    byte_size: 9001,
+                    claim_count: None,
+                    client_id: "cli_noisy",
+                    reason: Some(TokenSizeReason::BudgetOverflowBytes),
+                    audience: Some("https://api.example.com/orders"),
+                    organization_id: Some("org_noisy"),
+                    permission_count: Some(index),
+                    permission_status: Some("budget_exceeded"),
+                },
+            )
+            .await
+            .expect("record a budget event");
+    }
+
+    // The SHARED window is the failure this read avoids: it is all budget rows.
+    let mixed = events
+        .recent(TokenSizeEventsRepo::MAX_QUERY_LIMIT)
+        .await
+        .expect("read the mixed window");
+    assert!(
+        mixed.iter().all(|event| event.token_type == "access_token"),
+        "the shared window is entirely evicted by the noisy family, which is exactly why \
+         the M9 read no longer uses it for either family"
+    );
+
+    // The PER KIND windows: the quiet family survives, and the noisy one is still clamped.
+    let bloat = events
+        .recent_by_kind(TokenSizeKind::IdToken, TokenSizeEventsRepo::MAX_QUERY_LIMIT)
+        .await
+        .expect("read the id_token window");
+    assert_eq!(
+        bloat.len(),
+        1,
+        "the quiet ID-token row survives a flood of the other family"
+    );
+    assert_eq!(bloat[0].client_id, "cli_quiet");
+
+    let budget = events
+        .recent_by_kind(
+            TokenSizeKind::AccessToken,
+            TokenSizeEventsRepo::MAX_QUERY_LIMIT,
+        )
+        .await
+        .expect("read the access_token window");
+    assert_eq!(
+        i64::try_from(budget.len()).expect("a window fits an i64"),
+        TokenSizeEventsRepo::MAX_QUERY_LIMIT,
+        "the budget window is still clamped, which is why the read renders a full window \
+         as a lower bound rather than as a count"
+    );
+    assert!(
+        budget
+            .iter()
+            .all(|event| event.token_type == "access_token"),
+        "and it holds only its own family"
     );
 }
