@@ -1,0 +1,132 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+--
+-- The per-AUDIENCE permission-claim opt-in (issue #98, milestone M10).
+--
+-- Adds one column, `resource_servers.permission_claims_enabled`, and the one
+-- column-scoped grant that makes it writable by the control plane. Nothing in
+-- this migration decides what a token carries: the mint wiring is a later PR of
+-- this issue, and until it lands this column is read by the management API and
+-- by the snapshot export and by nothing else.
+--
+-- ---------------------------------------------------------------------------
+-- (1) The flag lives on the ROW the mint already reads.
+-- ---------------------------------------------------------------------------
+-- `resolve_access_token_target` reads exactly this row by audience through
+-- `ResourceServerRepo::by_audience` to select the access-token format and
+-- lifetime a registered protected API receives. The opt-in therefore rides back
+-- on `ResourceServerRecord` for free, costs zero additional queries on the
+-- hottest path, and cannot disagree with the row it describes. A separate
+-- opt-in table would add one read per targeted resource and would introduce two
+-- rows that can drift.
+--
+-- DEFAULT false is the safe value for every row that already exists: a
+-- registered resource server is opted OUT until an operator says otherwise, so
+-- this migration cannot change what any token carries even after the mint is
+-- wired.
+--
+-- ---------------------------------------------------------------------------
+-- (2) The GRANT is not decoration. Without it the promotion APPLY fails 42501.
+-- ---------------------------------------------------------------------------
+-- `resource_servers` is classified PROMOTABLE (crate::classification), so this
+-- column is promotable configuration and it travels in a config snapshot.
+--
+-- 0032 granted the control role SELECT on this table and 0035 granted it
+-- INSERT, DELETE, and a COLUMN-SCOPED `UPDATE (token_format,
+-- access_token_ttl_secs)`. A column-scoped UPDATE grant enumerates columns, so
+-- a column added later is INVISIBLE to it: the promotion engine's
+-- `apply_resource_server_change` Update arm names every promotable column in one
+-- SET list, and the moment that list carries `permission_claims_enabled` the
+-- statement is refused with SQLSTATE 42501 (insufficient_privilege) unless the
+-- grant below exists. That failure reaches a caller as an opaque 500 on a
+-- promotion apply, which is exactly the "#31 lesson" shape: least privilege is
+-- correct, and least privilege means every new column is a deliberate grant
+-- decision rather than an inherited one.
+--
+-- `the_promotion_apply_fails_42501_without_the_permission_claims_grant`
+-- (crates/ironauth-store/tests/config_promotion.rs) revokes exactly this grant
+-- and asserts the apply fails with 42501, so the sentence above is measured
+-- rather than asserted.
+--
+-- The INSERT half needs no new grant: 0035's `GRANT INSERT` is table-wide, so
+-- the Create arm's column list may name the new column freely. Only UPDATE is
+-- column-scoped here.
+--
+-- ---------------------------------------------------------------------------
+-- (3) The DATA plane gains nothing.
+-- ---------------------------------------------------------------------------
+-- 0011 grants `ironauth_app` SELECT and INSERT and no UPDATE at all, and that
+-- stays true. The data plane READS this flag on the token-issuance path and must
+-- never be able to set it: a data plane that can decide which audiences receive
+-- permission claims is a data plane that can widen its own token, which is the
+-- power these grant matrices exist to withhold.
+--
+-- ---------------------------------------------------------------------------
+-- (4) `opaque` plus opted-in is REACHABLE, and deliberately carries no CHECK.
+-- ---------------------------------------------------------------------------
+-- An opaque access token carries no claims at all, so issue #98 declares
+-- permission claims an `at+jwt`-only feature. The management API refuses to
+-- ENABLE the opt-in on a resource server whose `token_format` is `opaque`, with
+-- a typed 422 naming the reason, because refusing at configuration time beats
+-- silently dropping at mint time.
+--
+-- That refusal is a MANAGEMENT-PLANE guard and not a schema invariant, and the
+-- difference is stated here rather than left for a reader to discover. The
+-- promotion apply writes `token_format` and `permission_claims_enabled` from one
+-- source snapshot in one statement, so a snapshot carrying
+-- `{"token_format": "opaque", "permission_claims_enabled": true}` lands that
+-- combination in the target with no management handler in the path. There is
+-- deliberately NO CHECK constraint forbidding it, for two reasons:
+--
+--   * A CHECK would turn a promotion apply into a constraint violation, which
+--     surfaces as an opaque 500 on a whole-environment operation, and it would
+--     do so for a configuration whose only consequence is that a claim is not
+--     emitted. Refusing a promotion is a far worse outcome than carrying an
+--     inert flag.
+--   * The combination is INERT rather than unsafe. The mint reads the format
+--     first, and an opaque token has nowhere to put a claim, so the flag is
+--     ignored by construction. Nothing is over-granted and no token widens.
+--
+-- The honest summary, which the module docs repeat: the 422 makes the bad
+-- combination unreachable through the management API, and it is reachable
+-- through promotion, where it is inert.
+--
+-- ---------------------------------------------------------------------------
+-- (5) The delta vocabulary.
+-- ---------------------------------------------------------------------------
+-- `resource_server.register` has been the only audit action this table admits
+-- (crate::audit::Action), though 0011 does not say so: it predates the
+-- convention of stating a table's delta vocabulary in its header, which arrived
+-- at 0086. Setting the opt-in is a SECOND kind of mutation and this issue adds
+-- `resource_server.permission_claims.set`, so the delta vocabulary for
+-- `resource_servers` becomes two actions rather than one. ADR 0002 is binding
+-- here as everywhere: whether an audience is opted in is always this column,
+-- never a fold over audit events.
+--
+-- Migration safety obligation (see migrate.rs): `resource_servers` is an
+-- EXISTING tenant-scoped table that already ENABLEs and FORCEs row-level
+-- security, already carries the (tenant, environment) isolation policy with
+-- byte-identical USING and WITH CHECK, already carries the nonempty-scope CHECK,
+-- and is already registered in scripts/query-audit.sh, so this migration
+-- inherits all four and adds no new obligation. The grant it adds is
+-- least-privilege and COLUMN-scoped (the #31 lesson). Every statement is
+-- additive (one new column with a NOT NULL DEFAULT that Postgres applies without
+-- rewriting the table, one new grant; no existing column is altered or dropped
+-- and no existing grant is revoked), so this migration is an EXPAND.
+
+-- Whether tokens minted FOR this resource server may carry the issue #98
+-- permission claim. Read at mint time from the row the audience already selects,
+-- and exported as promotable configuration.
+--
+-- DEFAULT false is the safe value for every row that already exists: a
+-- permission claim appears only when an operator explicitly turns it on for a
+-- registered audience.
+ALTER TABLE resource_servers
+    ADD COLUMN permission_claims_enabled boolean NOT NULL DEFAULT false;
+
+-- The control plane toggles the opt-in, both through the management API and
+-- through a promotion apply. This grant is ADDITIVE to the column-scoped UPDATE
+-- 0035 already granted (token_format, access_token_ttl_secs): Postgres unions
+-- column grants, so those two stay updatable and every addressing column
+-- (`id`, `tenant_id`, `environment_id`, `audience`) stays immutable by GRANT
+-- exactly as before.
+GRANT UPDATE (permission_claims_enabled) ON resource_servers TO ironauth_control;

@@ -172,6 +172,10 @@
         "access_token_ttl_secs": {
           "type": "integer",
           "minimum": 1
+        },
+        "permission_claims_enabled": {
+          "type": "boolean",
+          "description": "Whether tokens minted for this audience may carry the permission claim (issue #98). Absent reads as false, so a document written before this field existed still validates and imports as opted out; that is why it is not in the required list even though an export always emits it. A resource server whose token_format is opaque cannot be opted in through the management API (a typed 422); a snapshot may still carry the combination, where it is inert because an opaque access token carries no claims."
         }
       }
     },

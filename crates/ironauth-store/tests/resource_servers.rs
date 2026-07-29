@@ -229,3 +229,90 @@ async fn registering_a_resource_server_writes_its_audit_row() {
     assert_eq!(rows[0].target_kind, "rsv");
     assert_eq!(rows[0].target_id, id.to_string());
 }
+
+/// `set_permission_claims` turns "the statement matched no row" into
+/// [`StoreError::NotFound`], and writes no audit row when it does (issue #98).
+///
+/// This pins the write path's LAST line of defence, and it is worth its own test
+/// because that line is easy to read as redundant. The id below is well formed and of
+/// the CALLER'S OWN scope, so the `id.scope()` guard passes, the transaction opens,
+/// and the UPDATE runs; it simply matches nothing, because no such row was ever
+/// registered. The only thing between that and a silent `Ok(())` is the
+/// `rows_affected() == 0` check.
+///
+/// The same check is what stands behind row-level security. Measured: with the
+/// statement's scope predicates deleted and the policy left intact, the UPDATE
+/// matches zero rows on a FOREIGN victim exactly as it does here, and deleting this
+/// check in that configuration makes the `resource_servers.set_permission_claims`
+/// IDOR probe report `Leaked` on both planted victims. There is no decode step on a
+/// write to catch it afterwards, unlike the read path.
+///
+/// The audit half matters as much as the status: without the check the write reports
+/// success AND `write_audited` commits an audit row for a mutation that changed
+/// nothing, so an operator reading the audit log would see an opt-in that never
+/// happened.
+#[tokio::test]
+async fn a_write_matching_no_row_is_not_found_and_audits_nothing() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    // A REAL registration, so the table is non-empty and the refusal below cannot be
+    // an artifact of an empty relation.
+    register(
+        &db,
+        &env,
+        scope,
+        "https://api.example/present",
+        TokenFormat::AtJwt,
+        None,
+    )
+    .await;
+
+    // A well-formed id OF THIS SCOPE that was never registered.
+    let absent = ResourceServerId::generate(&env, &scope);
+    let error = db
+        .control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .resource_servers(scope)
+        .set_permission_claims(&env, &absent, true)
+        .await
+        .expect_err("a write that matches no row must be refused");
+    assert!(
+        matches!(error, StoreError::NotFound),
+        "the refusal must be the uniform not-found, not a success and not a database \
+         error: {error:?}"
+    );
+
+    // Nothing was audited. `write_audited` commits the data change and the audit row
+    // together, so a check that let the empty UPDATE through would have committed a
+    // row asserting an opt-in that never landed.
+    let audit = db
+        .control_store()
+        .scoped(scope)
+        .audit()
+        .list()
+        .await
+        .expect("list audit");
+    assert!(
+        !audit
+            .iter()
+            .any(|row| row.action == "resource_server.permission_claims.set"),
+        "a refused opt-in must write no audit row: {:?}",
+        audit.iter().map(|row| &row.action).collect::<Vec<_>>()
+    );
+
+    // The registered sibling is untouched, so the refusal was not a blanket failure.
+    assert!(
+        !db.store()
+            .scoped(scope)
+            .resource_servers()
+            .by_audience("https://api.example/present")
+            .await
+            .expect("fetch")
+            .expect("present")
+            .permission_claims_enabled,
+        "the refused write must not have flipped some other row"
+    );
+}

@@ -189,6 +189,17 @@ pub struct ResourceServerSnapshot {
     /// back to the environment default.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub access_token_ttl_secs: Option<i64>,
+    /// Whether tokens minted for this audience may carry the issue #98 permission
+    /// claim. Promotable configuration, because `resource_servers` is a promotable
+    /// resource type and this is a non-secret per-environment setting on it.
+    ///
+    /// ALWAYS serialized (an export always carries it, so two exports of the same
+    /// configuration stay byte-identical), and `#[serde(default)]` on the way IN, so
+    /// a document written before this field existed still imports and reads as opted
+    /// OUT. It is therefore NOT in the published schema's `required` list, matching
+    /// that pair of decisions.
+    #[serde(default)]
+    pub permission_claims_enabled: bool,
 }
 
 /// The secret-free projection of one DCR policy (issue #43). A policy holds no
@@ -671,6 +682,7 @@ pub async fn export(scoped: &ScopedStore<'_>) -> Result<Snapshot, StoreError> {
             audience: record.audience,
             token_format: record.token_format.as_str().to_string(),
             access_token_ttl_secs: record.access_token_ttl_secs,
+            permission_claims_enabled: record.permission_claims_enabled,
         })
         .collect();
     // Re-sort by the stable public natural key in Rust (byte / code-point order),
@@ -1055,7 +1067,18 @@ const CLIENT_KEYS: [&str; 16] = [
 const CLIENT_SECRET_KEY: &str = "secret";
 
 /// Every key a snapshot `resource_server` element may carry.
-const RESOURCE_SERVER_KEYS: [&str; 3] = ["audience", "token_format", "access_token_ttl_secs"];
+///
+/// This list is the Rust MIRROR of `additionalProperties: false` on the published
+/// schema, so it is a promotion site in its own right: a field added to
+/// [`ResourceServerSnapshot`] and not added here makes the exporter's own output
+/// fail [`validate_document`] with "unknown field", which fails the apply rather
+/// than dropping the field.
+const RESOURCE_SERVER_KEYS: [&str; 4] = [
+    "audience",
+    "token_format",
+    "access_token_ttl_secs",
+    "permission_claims_enabled",
+];
 
 /// Every key a snapshot `dcr_policy` element may carry.
 const DCR_POLICY_KEYS: [&str; 2] = ["name", "primitives"];
@@ -1819,9 +1842,9 @@ pub fn classification_coverage_gaps() -> (Vec<ResourceType>, Vec<ResourceType>) 
 #[cfg(test)]
 mod tests {
     use super::{
-        FlowVersionSnapshot, PRIVATE_JWK_PARAMS, SNAPSHOT_RESOURCE_TYPES, SNAPSHOT_SCHEMA_VERSION,
-        SignupFormSnapshot, Snapshot, SnapshotResources, classification_coverage_gaps,
-        project_jwks_public, validate_document,
+        FlowVersionSnapshot, PRIVATE_JWK_PARAMS, RESOURCE_SERVER_KEYS, ResourceServerSnapshot,
+        SNAPSHOT_RESOURCE_TYPES, SNAPSHOT_SCHEMA_VERSION, SignupFormSnapshot, Snapshot,
+        SnapshotResources, classification_coverage_gaps, project_jwks_public, validate_document,
     };
     use crate::classification::{ResourceClassification, ResourceType, classify};
 
@@ -2023,6 +2046,108 @@ mod tests {
         let parsed = validate_document(a.as_bytes()).expect("valid");
         let reserialized = parsed.to_canonical_string().expect("reserialize");
         assert_eq!(a, reserialized, "canonical form must round-trip losslessly");
+    }
+
+    /// The issue #98 opt-in is ALWAYS serialized, in BOTH directions.
+    ///
+    /// [`ResourceServerSnapshot::permission_claims_enabled`] documents this as a
+    /// property ("an export always carries it, so two exports of the same
+    /// configuration stay byte-identical"), and nothing asserted it. The assertion is
+    /// on PRESENCE of the key including when the value is `false`, which is the half
+    /// a `skip_serializing_if` would remove: with `skip_serializing_if =
+    /// "std::ops::Not::not"` the opted-out element below simply loses the key, and
+    /// two documents describing the same configuration stop being comparable byte for
+    /// byte even though both still validate.
+    ///
+    /// Note what this does NOT claim. The promotion diff would survive that change,
+    /// because the two sides of a comparison do not serialize identically when one
+    /// omits the key, so `the_permission_claim_opt_in_alone_is_an_update` in
+    /// `crate::promotion` stays green under it. Byte-stability of the export is the
+    /// property at stake here, and it is a different one.
+    #[test]
+    fn the_permission_claim_opt_in_is_always_serialized_in_both_directions() {
+        for enabled in [false, true] {
+            let mut resources = SnapshotResources::default();
+            resources.resource_server.push(ResourceServerSnapshot {
+                audience: "https://api.test/one".to_string(),
+                token_format: "at_jwt".to_string(),
+                access_token_ttl_secs: None,
+                permission_claims_enabled: enabled,
+            });
+            let snapshot = Snapshot {
+                schema_version: SNAPSHOT_SCHEMA_VERSION.to_string(),
+                resources,
+            };
+            let text = snapshot.to_canonical_string().expect("canonicalize");
+            assert!(
+                text.contains(&format!("\"permission_claims_enabled\":{enabled}")),
+                "an export must carry the opt-in key even when it is {enabled}: {text}"
+            );
+            // And it survives the validator, so the property holds for a document
+            // that has been through the published contract rather than only for one
+            // this process just built.
+            let parsed = validate_document(text.as_bytes()).expect("valid");
+            assert_eq!(
+                text,
+                parsed.to_canonical_string().expect("reserialize"),
+                "validate then re-serialize must be byte-identical"
+            );
+        }
+    }
+
+    /// The PUBLISHED schema's `resource_server` property set is exactly
+    /// [`RESOURCE_SERVER_KEYS`].
+    ///
+    /// `RESOURCE_SERVER_KEYS` is described as the Rust mirror of
+    /// `additionalProperties: false` on `docs/snapshot/snapshot.schema.json`, and
+    /// nothing bound the two: renaming the property in the published file left every
+    /// suite green, so the document operators validate against could drift from the
+    /// document this crate produces without anything noticing.
+    ///
+    /// Scoped deliberately to the resource-server object rather than to the whole
+    /// schema. Binding every type is a pre-existing convention gap and a change of
+    /// its own; this closes it for the object issue #98 touches.
+    #[test]
+    fn the_published_schema_resource_server_keys_match_the_rust_mirror() {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../docs/snapshot/snapshot.schema.json"))
+                .expect("the published snapshot schema must be valid JSON");
+        let object = &schema["$defs"]["resource_server"];
+        assert_eq!(
+            object["additionalProperties"],
+            serde_json::Value::Bool(false),
+            "the published resource_server object must close its property set, or the \
+             Rust mirror mirrors nothing"
+        );
+        let mut published: Vec<String> = object["properties"]
+            .as_object()
+            .expect("the published resource_server object must carry properties")
+            .keys()
+            .cloned()
+            .collect();
+        published.sort();
+        let mut mirrored: Vec<String> = RESOURCE_SERVER_KEYS
+            .iter()
+            .map(|key| (*key).to_string())
+            .collect();
+        mirrored.sort();
+        assert_eq!(
+            published, mirrored,
+            "docs/snapshot/snapshot.schema.json and RESOURCE_SERVER_KEYS must describe \
+             the same resource_server element"
+        );
+        // Every key the exporter emits that is NOT in the published `required` list
+        // must be one an older document may omit. `permission_claims_enabled` is
+        // exactly that case, and the schema's own description says so.
+        assert!(
+            !object["required"]
+                .as_array()
+                .expect("required")
+                .iter()
+                .any(|key| key == "permission_claims_enabled"),
+            "the opt-in must stay optional, so a document written before it existed \
+             still validates"
+        );
     }
 
     #[test]

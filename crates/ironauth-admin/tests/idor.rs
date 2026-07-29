@@ -10,9 +10,10 @@ use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
     ActorRef, AuthPolicy, CorrelationId, ManagementKeyId, NewAdminUser, NewMembership, NewOrgGroup,
     NewOrgGroupMember, NewOrgGroupRole, NewOrgMembershipRole, NewOrgRole, NewOrgRolePermission,
-    NewPermission, ORG_POLICY_MAX_SESSION_TTL_SECS, OrgGroupId, OrgGroupMemberId, OrgGroupRoleId,
-    OrgMembershipId, OrgMembershipRoleId, OrgRoleId, OrgRolePermissionId, OrganizationId,
-    PermissionId, Scope, ServiceId, StoreError, UserState,
+    NewPermission, NewResourceServer, ORG_POLICY_MAX_SESSION_TTL_SECS, OrgGroupId,
+    OrgGroupMemberId, OrgGroupRoleId, OrgMembershipId, OrgMembershipRoleId, OrgRoleId,
+    OrgRolePermissionId, OrganizationId, PermissionId, ResourceServerId, Scope, ServiceId,
+    StoreError, TokenFormat, UserState,
 };
 
 /// A stand-in key hash for a planted victim (the probes resolve by id, not hash).
@@ -162,6 +163,16 @@ async fn management_probes_deny_cross_tenant_and_cross_environment_uniformly() {
     )
     .await;
 
+    // The RESOURCE-SERVER registry (issue #98): plant a victim in each foreign scope,
+    // registered OPTED OUT. `resource_servers.set_permission_claims` is a MUTATING
+    // probe that flips the opt-in ON, so a leak leaves an observable `true` on a row
+    // planted `false`, and the survival assertion below reads the flag rather than
+    // only the row's existence. Reading only "is it still there" would miss the
+    // entire mutation, because this table has no soft delete and the leaked write
+    // changes one boolean in place.
+    let victim_server_b = plant_resource_server(control, &env, scope_b).await;
+    let victim_server_a2 = plant_resource_server(control, &env, scope_a2).await;
+
     // A well-formed key id in the caller's OWN scope that was never stored.
     let absent_in_a = ManagementKeyId::generate(&env, &scope_a).to_string();
 
@@ -200,6 +211,8 @@ async fn management_probes_deny_cross_tenant_and_cross_environment_uniformly() {
             "permissions.get",
             "permissions.delete",
             "org_role_permissions.unassign",
+            "resource_servers.get",
+            "resource_servers.set_permission_claims",
         ],
         "every management resolve-by-id operation is registered",
     );
@@ -225,6 +238,8 @@ async fn management_probes_deny_cross_tenant_and_cross_environment_uniformly() {
         victim_permission_a2.to_string(),
         victim_mapping_b.to_string(),
         victim_mapping_a2.to_string(),
+        victim_server_b.to_string(),
+        victim_server_a2.to_string(),
         absent_in_a.clone(),
     ];
     let foreign_refs: Vec<&str> = foreign.iter().map(String::as_str).collect();
@@ -430,6 +445,27 @@ async fn management_probes_deny_cross_tenant_and_cross_environment_uniformly() {
         assert_eq!(&record.permission_id, permission);
     }
 
+    // The victim RESOURCE SERVERS must still read `permission_claims_enabled = false`.
+    // This assertion, and not a liveness read, is what makes the mutating probe
+    // non-vacuous: `resource_servers` has no soft delete, so a leaked
+    // `set_permission_claims` leaves the row perfectly readable while having opted a
+    // foreign environment's audience INTO carrying permission claims, which is a
+    // widening of what that environment's tokens will assert.
+    for (scope, server) in [(scope_b, &victim_server_b), (scope_a2, &victim_server_a2)] {
+        let record = control
+            .management()
+            .resource_servers(scope)
+            .get(server)
+            .await
+            .expect("the victim resource server must survive the probes in its OWN scope");
+        assert_eq!(record.audience, "https://victim.example.test/api");
+        assert!(
+            !record.permission_claims_enabled,
+            "the victim resource server must still be opted OUT: a cross-scope \
+             set_permission_claims that landed would read `true` here"
+        );
+    }
+
     // The victim POLICIES must survive both probes AND still carry their own
     // document. A liveness-only assertion would miss the sharper leak: a cross-scope
     // `set` that landed would leave the policy readable while having REPLACED the
@@ -484,6 +520,41 @@ async fn plant_role_permission(
         )
         .await
         .expect("plant victim role-permission mapping");
+    id
+}
+
+/// Plant a registered resource server in `scope` via the control store, returning
+/// its id (issue #98).
+///
+/// Registered OPTED OUT, which is the only state a registration can produce
+/// ([`NewResourceServer`] has no opt-in field by design), so the mutating probe has
+/// a real `false` to flip and the survival assertion has something to observe.
+async fn plant_resource_server(
+    control: &ironauth_store::Store,
+    env: &Env,
+    scope: Scope,
+) -> ResourceServerId {
+    let id = ResourceServerId::generate(env, &scope);
+    let actor = ActorRef::service(ServiceId::generate(env));
+    control
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(env))
+        .resource_servers()
+        .register(
+            env,
+            NewResourceServer {
+                id: &id,
+                audience: "https://victim.example.test/api",
+                // `at_jwt`, so the opt-in this probe tries to flip is one the
+                // management API would genuinely accept in its own scope. An opaque
+                // victim would be refused by the edge for a reason unrelated to
+                // scope, which is not what this probe measures.
+                token_format: TokenFormat::AtJwt,
+                access_token_ttl_secs: None,
+            },
+        )
+        .await
+        .expect("plant victim resource server");
     id
 }
 

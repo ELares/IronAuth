@@ -115,6 +115,7 @@ fn operation_ids_are_the_stable_set() {
             "getPermission",
             "getPolicyDecisionTraces",
             "getRefreshFamily",
+            "getResourceServer",
             "getSession",
             "getSigningRecommendations",
             "getSignupForm",
@@ -143,6 +144,7 @@ fn operation_ids_are_the_stable_set() {
             "listPermissions",
             "listRecoveryApprovals",
             "listRefreshFamilies",
+            "listResourceServers",
             "listResourceTypes",
             "listSessions",
             "listSignupQuarantines",
@@ -181,6 +183,7 @@ fn operation_ids_are_the_stable_set() {
             "updateOrgGroup",
             "updateOrgRole",
             "updatePermission",
+            "updateResourceServerPermissionClaims",
             "updateUser",
             "verifyDcrClient",
             "verifyMigrationCredential",
@@ -227,6 +230,7 @@ fn every_list_endpoint_documents_cursor_pagination() {
         "listOrgMembershipRoles",
         "listOrgRolePermissions",
         "listPermissions",
+        "listResourceServers",
     ] {
         let params = find_operation(&doc, op)["parameters"]
             .as_array()
@@ -391,6 +395,8 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/recovery-approvals",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/refresh-families",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/refresh-families/{family_id}",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/resource-servers",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/resource-servers/{resource_server_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/sessions",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/sessions/{session_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/signup-quarantine",
@@ -401,6 +407,7 @@ fn documented_paths_are_the_expected_set() {
             "PATCH /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}",
             "PATCH /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}",
             "PATCH /v1/tenants/{tenant_id}/environments/{environment_id}/permissions/{permission_id}",
+            "PATCH /v1/tenants/{tenant_id}/environments/{environment_id}/resource-servers/{resource_server_id}",
             "PATCH /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}",
             "POST /v1/tenants",
             "POST /v1/tenants/{tenant_id}/environments",
@@ -497,7 +504,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        138,
+        141,
         "the documented route count is pinned"
     );
 

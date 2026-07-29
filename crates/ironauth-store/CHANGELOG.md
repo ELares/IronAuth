@@ -6,6 +6,30 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Per-audience PERMISSION-CLAIM opt-in (issue #98, PR 11): migration 0094 adds
+  `resource_servers.permission_claims_enabled boolean NOT NULL DEFAULT false` and the
+  COLUMN-scoped `GRANT UPDATE (permission_claims_enabled) ON resource_servers TO
+  ironauth_control`. The flag lives on the row the mint already reads by audience
+  (`ResourceServerRepo::by_audience`), so it costs no extra query and cannot drift from
+  the format and lifetime beside it, and it rides back on `ResourceServerRecord`.
+  `resource_servers` is a PROMOTABLE resource type, so the column is promotable
+  configuration and travels in a config snapshot: `ResourceServerSnapshot` gains the
+  field (always serialized, `#[serde(default)]` on the way in, so a document written
+  before it existed still imports as opted out), the export and
+  `read_promoted_snapshot` project it, `apply_resource_server_change` writes it on both
+  the Create and the Update arm, and `RESOURCE_SERVER_KEYS` admits it (the Rust mirror
+  of `additionalProperties: false` on `docs/snapshot/snapshot.schema.json`, which gains
+  the property). The GRANT is load bearing rather than decoration: 0035's UPDATE on this
+  table is COLUMN-scoped, so without 0094 the promotion apply's SET list is refused with
+  SQLSTATE 42501; a test revokes the grant and measures exactly that, then restores it
+  and re-runs the same apply. New reads `ResourceServerRepo::{parse_id, get, list_page}`
+  and the audited write `ActingResourceServerRepo::set_permission_claims` (new audit
+  action `resource_server.permission_claims.set`), reachable through new
+  `ManagementStore` / `ActingManagementStore` accessors, plus two registered cross-scope
+  IDOR probes (`resource_servers.get`, `resource_servers.set_permission_claims`). The
+  data plane gains NOTHING: it keeps SELECT and holds no UPDATE on this table at all.
+  Nothing reads the column on the mint path yet, so it is INERT on real data.
+
 - Char-boundary panic in redirect matching (issue #418, entered retroactively with issue
   #419): `redirect::strip_http_scheme_ci` sliced a `str` at the constant byte 7 behind a
   byte-LENGTH check, so a URI whose byte 7 fell inside a multi-byte character panicked.

@@ -85,6 +85,11 @@ fn org_default_role_path(tenant: &str, environment: &str, org: &str) -> String {
     format!("/v1/tenants/{tenant}/environments/{environment}/organizations/{org}/default-role")
 }
 
+/// The resource-server registry base path (issue #98, PR 11).
+fn resource_servers_path(tenant: &str, environment: &str) -> String {
+    format!("/v1/tenants/{tenant}/environments/{environment}/resource-servers")
+}
+
 /// The `id` of a JSON response body.
 fn id_of(response: &str) -> String {
     serde_json::from_str::<serde_json::Value>(response).expect("json")["id"]
@@ -927,6 +932,123 @@ async fn an_org_member_or_assignment_write_is_sudo_gated() {
         )
         .await;
     assert_eq!(status, StatusCode::CREATED, "elevated add: {resp}");
+}
+
+/// The resource-server permission-claim OPT-IN (issue #98, PR 11) is sudo gated.
+///
+/// It is the one mutating handler that surface adds, and it is worth its own probe
+/// rather than a line in another test: the column it writes decides whether tokens
+/// minted for a registered audience may carry permission claims, so a stolen console
+/// cookie that could flip it without re-authentication would widen what an entire
+/// audience's tokens assert.
+///
+/// The scope is narrower than
+/// `a_stale_credential_cannot_mutate_but_can_read_and_no_header_forges_elevation`
+/// below, which is this file's designated acceptance-critical case: this test sends
+/// no forged header and uses no stale credential, it only lets the window lapse. The
+/// forging half is that test's business and is not re-proved here.
+///
+/// The resource server is seeded through the STORE rather than through the API,
+/// because issue #98 adds no create endpoint, so unlike the sibling tests here the
+/// seed does not itself need an open elevation window.
+///
+/// The two READS are deliberately NOT gated and are exercised with the window lapsed,
+/// which is also what makes "wrote nothing" observable without elevating first.
+#[tokio::test]
+async fn a_resource_server_opt_in_write_is_sudo_gated() {
+    let (harness, clock) = Harness::start_with_sudo(600).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k1").await;
+    let elevate = elevate_path(&tenant, &env);
+    let base = resource_servers_path(&tenant, &env);
+
+    let system = ironauth_env::Env::system();
+    let scope = scope_of(&tenant, &env);
+    let id = ironauth_store::ResourceServerId::generate(&system, &scope);
+    harness
+        .control_store()
+        .scoped(scope)
+        .acting(
+            harness.test_actor(&system),
+            ironauth_store::CorrelationId::generate(&system),
+        )
+        .resource_servers()
+        .register(
+            &system,
+            ironauth_store::NewResourceServer {
+                id: &id,
+                audience: "https://api.example.test/billing",
+                token_format: ironauth_store::TokenFormat::AtJwt,
+                access_token_ttl_secs: None,
+            },
+        )
+        .await
+        .expect("seed the resource server");
+    let path = format!("{base}/{id}");
+    let opt_in = serde_json::json!({ "permission_claims_enabled": true }).to_string();
+
+    clock.advance(Duration::from_secs(601));
+
+    // --- With the window lapsed, the one mutating endpoint is challenged. ---
+    let (status, _, resp) = harness.patch(&path, &opt_in).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "updateResourceServerPermissionClaims is challenged without an elevation: {resp}"
+    );
+    assert!(resp.contains("insufficient_user_authentication"), "{resp}");
+
+    // Nothing executed. The reads are ungated, so this is observable without
+    // elevating first, and the assertion is on the FLAG rather than on the row's
+    // existence: this table has no soft delete, so a leaked write changes one boolean
+    // in place and leaves the row perfectly readable.
+    let (status, _, listed) = harness.get(&base).await;
+    assert_eq!(status, StatusCode::OK, "the list is ungated: {listed}");
+    let (status, _, stored) = harness.get(&path).await;
+    assert_eq!(status, StatusCode::OK, "the get is ungated: {stored}");
+    assert!(
+        stored.contains("\"permission_claims_enabled\":false"),
+        "the challenged opt-in wrote nothing: {stored}"
+    );
+    // And it is unattributed in the audit log too, which is the half the state read
+    // above cannot see: a refused mutation must leave no trace suggesting it ran.
+    // Only the seed registration is present.
+    assert_eq!(
+        opt_in_audit(&harness, scope).await,
+        vec!["resource_server.register"],
+        "a challenged opt-in must write no audit row"
+    );
+
+    // --- After a fresh elevation, the same request succeeds. ---
+    let (status, _, body) = harness.post(&elevate, "e2", "{}").await;
+    assert_eq!(status, StatusCode::OK, "re-elevate: {body}");
+    let (status, _, resp) = harness.patch(&path, &opt_in).await;
+    assert_eq!(status, StatusCode::OK, "elevated opt-in: {resp}");
+    assert!(
+        resp.contains("\"permission_claims_enabled\":true"),
+        "the elevated opt-in landed: {resp}"
+    );
+    // The ELEVATED write does audit, so the assertion above is a real absence rather
+    // than an action this suite can never observe.
+    assert_eq!(
+        opt_in_audit(&harness, scope).await,
+        vec![
+            "resource_server.permission_claims.set",
+            "resource_server.register"
+        ],
+        "the elevated opt-in is audited"
+    );
+}
+
+/// Every `resource_server.*` audit action recorded in `scope`, sorted: the audit
+/// MULTISET, so an extra row is as visible as a missing one.
+async fn opt_in_audit(harness: &Harness, scope: Scope) -> Vec<String> {
+    let mut actions: Vec<String> = audit_actions(harness, scope)
+        .await
+        .into_iter()
+        .filter(|action| action.starts_with("resource_server."))
+        .collect();
+    actions.sort();
+    actions
 }
 
 /// The acceptance-critical adversarial case: a valid credential whose recorded elevation

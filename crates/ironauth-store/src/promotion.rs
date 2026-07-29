@@ -897,7 +897,55 @@ mod tests {
             audience: audience.to_owned(),
             token_format: token_format.to_owned(),
             access_token_ttl_secs: None,
+            permission_claims_enabled: false,
         }
+    }
+
+    /// The same fixture with the issue #98 opt-in ON, so a diff can be driven by
+    /// THAT field alone rather than by the format.
+    fn resource_server_opted_in(audience: &str, token_format: &str) -> ResourceServerSnapshot {
+        ResourceServerSnapshot {
+            permission_claims_enabled: true,
+            ..resource_server(audience, token_format)
+        }
+    }
+
+    /// The permission-claim opt-in is a PROMOTABLE difference on its own.
+    ///
+    /// The diff keys resource servers by `audience` and compares the whole serialized
+    /// element, so a field that reaches `ResourceServerSnapshot` is compared for free.
+    /// What this test guards is that "for free" holds at all: a field the diff never
+    /// looks at is a field a promotion silently drops, and only a case driven by THIS
+    /// field alone can tell the two apart.
+    ///
+    /// What it does NOT guard, stated because the obvious guess is wrong: it is not a
+    /// tripwire on `skip_serializing_if`. Measured by adding `#[serde(default,
+    /// skip_serializing_if = "std::ops::Not::not")]` to the field, which leaves this
+    /// test and all of `tests/config_promotion.rs` green, because the opted-out side
+    /// then omits the key while the opted-in side still carries it, so the two
+    /// elements still do not serialize identically and the diff still fires. The
+    /// property that change WOULD break is byte-stability of the export, which
+    /// `the_permission_claim_opt_in_is_always_serialized_in_both_directions` in
+    /// `crate::snapshot` asserts.
+    #[test]
+    fn the_permission_claim_opt_in_alone_is_an_update() {
+        let source = snapshot(SnapshotResources {
+            resource_server: vec![resource_server_opted_in("https://api.test", "at_jwt")],
+            ..SnapshotResources::default()
+        });
+        let target = snapshot(SnapshotResources {
+            resource_server: vec![resource_server("https://api.test", "at_jwt")],
+            ..SnapshotResources::default()
+        });
+        let diff = diff(&source, &target);
+        let changes: Vec<_> = diff
+            .changes
+            .iter()
+            .filter(|change| change.resource_type == ResourceType::ResourceServer)
+            .collect();
+        assert_eq!(changes.len(), 1, "one resource-server change: {changes:?}");
+        assert_eq!(changes[0].kind, ChangeKind::Update);
+        assert_eq!(changes[0].key, "https://api.test");
     }
 
     fn dcr_policy(name: &str, primitives: serde_json::Value) -> DcrPolicySnapshot {

@@ -149,8 +149,11 @@ impl IdorHarness {
     /// `org_auth_policies.remove`, both addressed by ORGANIZATION id rather than by
     /// the policy's own id, because the organization IS the policy's identity), and
     /// its permission vocabulary (`permissions.get` and `permissions.delete`), its
-    /// role-to-permission mapping (`org_role_permissions.unassign`), the
-    /// two-thirds of the four-level resource model
+    /// role-to-permission mapping (`org_role_permissions.unassign`), its
+    /// resource-server registry (`resource_servers.get` and
+    /// `resource_servers.set_permission_claims`, the read and the one mutation the
+    /// issue #98 management surface exposes over the audience-to-format registry),
+    /// the two-thirds of the four-level resource model
     /// that is tenant-and-environment scoped (operators, tenants, and environments
     /// are LEVEL tables whose isolation is exercised by the management-plane tests
     /// directly, not through the scope-embedding IDOR harness).
@@ -181,6 +184,8 @@ impl IdorHarness {
         self.register(Box::new(PermissionGetProbe));
         self.register(Box::new(PermissionDeleteProbe));
         self.register(Box::new(OrgRolePermissionUnassignProbe));
+        self.register(Box::new(ResourceServerGetProbe));
+        self.register(Box::new(ResourceServerSetPermissionClaimsProbe));
         self
     }
 
@@ -1222,6 +1227,94 @@ impl IsolationProbe for OrgRolePermissionUnassignProbe {
                 .acting(actor, correlation)
                 .org_role_permissions(caller);
             match mappings.unassign(&env, &organization, &id).await {
+                Ok(()) => ProbeOutcome::Leaked,
+                Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `ResourceServerRepo::get` (issue #98). `store` must
+/// authenticate as `ironauth_control`. A resource server registered in another scope
+/// must resolve as the uniform not-found under the caller's scope, indistinguishable
+/// from an absent one.
+///
+/// The row it addresses carries an AUDIENCE, which is the URI of a protected API,
+/// plus that API's token format and its permission-claim opt-in. A leak here is
+/// therefore an inventory of a sibling environment's protected APIs, read one id at
+/// a time, which is why the read half is probed at all on a table whose reads are
+/// otherwise unremarkable.
+///
+/// Like `permissions`, this table is scoped to exactly `(tenant, environment)` and
+/// carries no organization, so the row-level-security policy is its complete fence
+/// and there is no sibling-organization dimension to probe separately. Unlike it,
+/// this table has no soft delete, so a probe cannot be answered by a `deleted_at`
+/// filter and the scope predicates are the whole of what refuses it.
+struct ResourceServerGetProbe;
+
+impl IsolationProbe for ResourceServerGetProbe {
+    fn name(&self) -> &'static str {
+        "resource_servers.get"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            let servers = store.management().resource_servers(caller);
+            let Ok(id) = servers.parse_id(foreign_id) else {
+                return ProbeOutcome::Denied;
+            };
+            match servers.get(&id).await {
+                Ok(_) => ProbeOutcome::Leaked,
+                Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `ActingResourceServerRepo::set_permission_claims` (issue #98).
+/// `store` must authenticate as `ironauth_control`.
+///
+/// The MUTATING half, and on this table it is the sharper of the two: the opt-in
+/// decides whether tokens minted for that audience may carry permission claims, so a
+/// cross-scope flip either widens what a foreign environment's tokens assert or
+/// silently withdraws a claim an operator believes is in force. It is probed in the
+/// ENABLING direction, so a leak leaves an observable `true` on a victim planted
+/// `false`, and the registering suite asserts the victim still reads `false`: a probe
+/// denied because nothing was planted would pass for the wrong reason.
+struct ResourceServerSetPermissionClaimsProbe;
+
+impl IsolationProbe for ResourceServerSetPermissionClaimsProbe {
+    fn name(&self) -> &'static str {
+        "resource_servers.set_permission_claims"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            let env = Env::system();
+            let Ok(id) = store
+                .management()
+                .resource_servers(caller)
+                .parse_id(foreign_id)
+            else {
+                return ProbeOutcome::Denied;
+            };
+            let actor = ActorRef::service(ServiceId::generate(&env));
+            let correlation = CorrelationId::generate(&env);
+            let servers = store
+                .management()
+                .acting(actor, correlation)
+                .resource_servers(caller);
+            match servers.set_permission_claims(&env, &id, true).await {
                 Ok(()) => ProbeOutcome::Leaked,
                 Err(_) => ProbeOutcome::Denied,
             }
