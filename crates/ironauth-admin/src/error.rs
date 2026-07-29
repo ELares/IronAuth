@@ -355,6 +355,7 @@ impl From<StoreError> for ApiError {
 #[cfg(test)]
 mod tests {
     use super::{ApiError, StatusCode};
+    use crate::state::AdminState;
     use ironauth_store::{AuthPolicyError, StoreError};
 
     #[test]
@@ -474,5 +475,230 @@ mod tests {
             shipped.organizations.max_group_depth <= ironauth_store::ORG_GROUP_MAX_DEPTH_CEILING,
             "the shipped default must not be clamped by the store"
         );
+    }
+
+    #[test]
+    fn the_id_token_bloat_signal_and_the_access_token_budget_warn_at_the_same_number() {
+        // The access-token budget's shipped approach threshold (issue #98) is
+        // deliberately the SAME number as the shipped ID-token growth signal, so an
+        // operator meets ONE number across both token kinds rather than two that mean
+        // "this token is getting big" and can silently disagree. That parity is
+        // asserted in four places in prose (the two constants' doc comments, the
+        // config CHANGELOG, and the design) and, before this assertion, was enforced
+        // by nothing: moving either number alone left both crates green.
+        //
+        // `ironauth-config` cannot hold this, because it depends on no other IronAuth
+        // crate and so cannot name the OIDC constant at all. `ironauth-oidc` could
+        // (it does depend on `ironauth-config`), but it lands here instead so that
+        // every cross-crate constant agreement sits in ONE place: this module already
+        // holds the session TTL and group depth ceiling agreements above, and a
+        // reviewer auditing them finds this one without knowing to look elsewhere.
+        assert_eq!(
+            u32::try_from(ironauth_oidc::ID_TOKEN_BLOAT_THRESHOLD_BYTES)
+                .expect("the ID-token growth signal threshold fits a u32"),
+            ironauth_config::TOKEN_CLAIMS_DEFAULT_ACCESS_TOKEN_WARN_BYTES,
+            "the ID-token growth signal and the access-token budget's approach \
+             threshold must stay EQUAL: they are one operator-facing number, and \
+             moving one alone gives the same idea two values that disagree"
+        );
+        // And the shared number really is the one a default deployment runs, rather
+        // than a constant the shipped section overrides: an EMPTY config file loads
+        // and its threshold is that same number.
+        let shipped = ironauth_config::Config::from_toml_str("", "<inline>")
+            .expect("the shipped defaults must load")
+            .config;
+        assert_eq!(
+            usize::try_from(shipped.token_claims.access_token_warn_bytes)
+                .expect("a byte threshold fits a usize"),
+            ironauth_oidc::ID_TOKEN_BLOAT_THRESHOLD_BYTES,
+            "a default deployment must warn on both token kinds at the same size"
+        );
+    }
+
+    /// A store over a LAZY pool: parses the URL but never connects, so the two token
+    /// claim budget tests below stay database-free (neither touches the store).
+    fn lazy_store() -> ironauth_store::Store {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://ironauth@localhost/ironauth")
+            .expect("lazy pool parses the URL");
+        ironauth_store::Store::from_pool(pool)
+    }
+
+    /// A database-free [`OidcState`] carrying nothing but its defaults, so a builder
+    /// installed on it is the only thing under test.
+    fn oidc_state() -> ironauth_oidc::OidcState {
+        let registry = std::sync::Arc::new(ironauth_oidc::IssuerRegistry::new(
+            "https://auth.example.test",
+            ironauth_oidc::JwksCacheWindow::clamped(300),
+        ));
+        ironauth_oidc::OidcState::new(
+            lazy_store(),
+            ironauth_env::Env::system(),
+            registry,
+            &ironauth_config::OidcConfig::default(),
+            "https://auth.example.test",
+        )
+    }
+
+    #[tokio::test]
+    async fn the_token_claims_budget_is_clamped_to_the_same_ceilings_on_both_planes() {
+        // The token claim budget (issue #98) lives in ONE top-level `[token_claims]`
+        // section and is installed on BOTH planes: the mint enforces it and the
+        // management API reports the approach warning against it. If the two planes
+        // disagreed about what the budget is, one operator-visible number would mean
+        // two things. This crate is the only one that can see both state builders, so
+        // the agreement is pinned here, exactly as the group depth ceiling is above.
+        //
+        // The section fed in is one config load would have REFUSED outright, because
+        // that is precisely the case the builders' re-clamp exists for: a state can
+        // also be built directly from a hand-constructed section (every test harness
+        // does that), and a budget that quietly exceeded its ceiling there would be a
+        // bound that is not a bound.
+        let over_ceiling = ironauth_config::TokenClaimsConfig {
+            access_token_max_bytes: ironauth_config::TOKEN_CLAIMS_ACCESS_TOKEN_MAX_BYTES_CEILING
+                + 10_000,
+            access_token_warn_bytes: u32::MAX,
+            permission_claim_max_count:
+                ironauth_config::TOKEN_CLAIMS_PERMISSION_CLAIM_MAX_COUNT_CEILING + 10_000,
+            permission_claim_warn_count: u32::MAX,
+            permission_claim_overflow: ironauth_config::PermissionOverflow::PdpRequired,
+        };
+        // The section really is outside the bounds, so the assertions below are about a
+        // clamp that fired rather than a value that was already inside.
+        assert!(
+            over_ceiling.access_token_max_bytes
+                > ironauth_config::TOKEN_CLAIMS_ACCESS_TOKEN_MAX_BYTES_CEILING
+                && over_ceiling.permission_claim_max_count
+                    > ironauth_config::TOKEN_CLAIMS_PERMISSION_CLAIM_MAX_COUNT_CEILING,
+            "the fixture must be over both ceilings or the clamp is untested"
+        );
+
+        let data_plane = oidc_state().with_token_claims(&over_ceiling);
+        let management_plane = AdminState::new(
+            lazy_store(),
+            ironauth_env::Env::system(),
+            &ironauth_config::AdminConfig::default(),
+        )
+        .expect("an AdminState with no bootstrap token builds")
+        .with_token_claims(&over_ceiling);
+
+        for (plane, budget) in [
+            ("data", data_plane.token_claims()),
+            ("management", management_plane.token_claims()),
+        ] {
+            assert_eq!(
+                budget.access_token_max_bytes,
+                ironauth_config::TOKEN_CLAIMS_ACCESS_TOKEN_MAX_BYTES_CEILING,
+                "the {plane} plane must clamp the token budget to the ceiling"
+            );
+            assert_eq!(
+                budget.permission_claim_max_count,
+                ironauth_config::TOKEN_CLAIMS_PERMISSION_CLAIM_MAX_COUNT_CEILING,
+                "the {plane} plane must clamp the claim element budget to the ceiling"
+            );
+            // Each approach threshold lands on the CLAMPED maximum, never above it, so
+            // no plane is left with a threshold that could not fire.
+            assert_eq!(
+                budget.access_token_warn_bytes,
+                ironauth_config::TOKEN_CLAIMS_ACCESS_TOKEN_MAX_BYTES_CEILING,
+                "the {plane} plane must clamp the byte threshold to the clamped maximum"
+            );
+            assert_eq!(
+                budget.permission_claim_warn_count,
+                ironauth_config::TOKEN_CLAIMS_PERMISSION_CLAIM_MAX_COUNT_CEILING,
+                "the {plane} plane must clamp the count threshold to the clamped maximum"
+            );
+            // The overflow mode has no ceiling and is carried through untouched.
+            assert_eq!(
+                budget.permission_claim_overflow,
+                ironauth_config::PermissionOverflow::PdpRequired,
+                "the {plane} plane must carry the configured overflow mode"
+            );
+        }
+        // And the two planes agree value for value, which is the property the single
+        // top-level section exists to guarantee.
+        assert_eq!(
+            data_plane.token_claims().access_token_max_bytes,
+            management_plane.token_claims().access_token_max_bytes
+        );
+        assert_eq!(
+            data_plane.token_claims().access_token_warn_bytes,
+            management_plane.token_claims().access_token_warn_bytes
+        );
+        assert_eq!(
+            data_plane.token_claims().permission_claim_max_count,
+            management_plane.token_claims().permission_claim_max_count
+        );
+        assert_eq!(
+            data_plane.token_claims().permission_claim_warn_count,
+            management_plane.token_claims().permission_claim_warn_count
+        );
+        assert_eq!(
+            data_plane.token_claims().permission_claim_overflow,
+            management_plane.token_claims().permission_claim_overflow
+        );
+    }
+
+    #[tokio::test]
+    async fn a_state_built_with_no_token_claims_budget_matches_a_default_deployment() {
+        // A directly-built state must behave like a default deployment rather than
+        // pinning every bound to zero, on BOTH planes: a zero budget would mean no
+        // access token could ever carry a permission claim, which is the opposite of
+        // the shipped posture and would make every harness silently untypical.
+        let shipped = ironauth_config::Config::from_toml_str("", "<inline>")
+            .expect("the shipped defaults must load")
+            .config
+            .token_claims;
+        assert_eq!(
+            shipped.access_token_max_bytes,
+            ironauth_config::TOKEN_CLAIMS_DEFAULT_ACCESS_TOKEN_MAX_BYTES
+        );
+        assert_eq!(
+            shipped.permission_claim_max_count,
+            ironauth_config::TOKEN_CLAIMS_DEFAULT_PERMISSION_CLAIM_MAX_COUNT
+        );
+        // The shipped defaults land inside both ceilings, so a deployment that never
+        // touches the section gets the bounds it reads rather than clamped ones.
+        assert!(
+            shipped.access_token_max_bytes
+                <= ironauth_config::TOKEN_CLAIMS_ACCESS_TOKEN_MAX_BYTES_CEILING
+                && shipped.permission_claim_max_count
+                    <= ironauth_config::TOKEN_CLAIMS_PERMISSION_CLAIM_MAX_COUNT_CEILING,
+            "the shipped defaults must not be clamped by either builder"
+        );
+
+        let data_plane = oidc_state();
+        let management_plane = AdminState::new(
+            lazy_store(),
+            ironauth_env::Env::system(),
+            &ironauth_config::AdminConfig::default(),
+        )
+        .expect("an AdminState with no bootstrap token builds");
+        for (plane, budget) in [
+            ("data", data_plane.token_claims()),
+            ("management", management_plane.token_claims()),
+        ] {
+            assert_eq!(
+                budget.access_token_max_bytes, shipped.access_token_max_bytes,
+                "an uninstalled {plane} plane must carry the shipped token budget"
+            );
+            assert_eq!(
+                budget.access_token_warn_bytes, shipped.access_token_warn_bytes,
+                "an uninstalled {plane} plane must carry the shipped byte threshold"
+            );
+            assert_eq!(
+                budget.permission_claim_max_count, shipped.permission_claim_max_count,
+                "an uninstalled {plane} plane must carry the shipped element budget"
+            );
+            assert_eq!(
+                budget.permission_claim_warn_count, shipped.permission_claim_warn_count,
+                "an uninstalled {plane} plane must carry the shipped count threshold"
+            );
+            assert_eq!(
+                budget.permission_claim_overflow,
+                ironauth_config::PermissionOverflow::RolesOnly,
+                "an uninstalled {plane} plane must default to the roles-only overflow"
+            );
+        }
     }
 }

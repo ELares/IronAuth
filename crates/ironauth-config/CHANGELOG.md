@@ -6,6 +6,49 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Token claim budget for issue #98: the new top-level `[token_claims]` section
+  (`TokenClaimsConfig`) with `token_claims.access_token_max_bytes` (default
+  `TOKEN_CLAIMS_DEFAULT_ACCESS_TOKEN_MAX_BYTES` = 4096, refused above the
+  `TOKEN_CLAIMS_ACCESS_TOKEN_MAX_BYTES_CEILING` = 32768 ceiling at load),
+  `token_claims.access_token_warn_bytes` (default
+  `TOKEN_CLAIMS_DEFAULT_ACCESS_TOKEN_WARN_BYTES` = 3072, deliberately the same number
+  the shipped ID-token growth signal uses, refused above `access_token_max_bytes`),
+  `token_claims.permission_claim_max_count` (default
+  `TOKEN_CLAIMS_DEFAULT_PERMISSION_CLAIM_MAX_COUNT` = 256, refused above the
+  `TOKEN_CLAIMS_PERMISSION_CLAIM_MAX_COUNT_CEILING` = 4096 ceiling at load),
+  `token_claims.permission_claim_warn_count` (default
+  `TOKEN_CLAIMS_DEFAULT_PERMISSION_CLAIM_WARN_COUNT` = 192, refused above
+  `permission_claim_max_count`), and `token_claims.permission_claim_overflow` (a closed
+  `PermissionOverflow` enum of exactly `roles_only` (the default) and `pdp_required`).
+  THE BUDGET IS A SIZE BOUND ON A TOKEN, never a cap on how many permissions or roles
+  may be STORED: every key is named for the CLAIM it bounds rather than for the model,
+  so `permission_claim_max_count` bounds what one claim carries, there is no
+  `max_permissions_per_role` and there never will be, and no count column, quota row, or
+  count CHECK exists anywhere for permissions, roles, or their mappings. `PermissionOverflow`
+  has no `truncate` variant and will not get one: a partial permission set is
+  indistinguishable to a resource server from a complete one, so its having exactly two
+  variants is what makes silent truncation unrepresentable rather than merely unconfigured.
+  `0` is valid on every numeric key and means the STRICTEST posture (no permission claim
+  is ever emitted), never unlimited; none of them has an unlimited value. Setting a
+  MAXIMUM to `0` requires setting its sibling threshold to `0` in the same edit, because
+  the shipped threshold default would otherwise exceed the lowered maximum and the load
+  is refused (the refusal names both keys and both values); this is the general shape of
+  lowering any maximum below its threshold, not a zero special case. A top-level
+  section rather than a field on `[oidc]` because the budget is consumed on BOTH planes
+  (the mint enforces it, the management API reports the approach warning against it), so
+  one bound has one operator-visible name. Threaded to both planes by the boot path
+  through `OidcState::with_token_claims` and `AdminState::with_token_claims`, each taking
+  the whole section and re-clamping it through the new `TokenClaimsConfig::clamped` as
+  defense in depth. The keys are installed but NOT YET CONSULTED: the permission claim
+  and its budget enforcement land with the claim itself, so setting them changes no
+  response and no token on this build. That qualifier is stated in the FIRST paragraph of
+  the section doc and of all five field docs, so it survives into the generated operator
+  reference (which keeps only the first paragraph), and each copy cites issue #413, which
+  tracks deleting them when the mint activates the claim. The 3072 parity with the
+  ID-token growth signal is now enforced rather than merely asserted in prose:
+  `ironauth_oidc::ID_TOKEN_BLOAT_THRESHOLD_BYTES` is public and `ironauth-admin` pins the
+  two equal, beside the session-TTL and group-depth ceiling agreements. `docs/CONFIG.md`
+  and `docs/config-schema.json` regenerate.
 - Organization group nesting bound for issue #97: the new top-level `[organizations]` section
   (`OrganizationsConfig`) with `organizations.max_group_depth` (default
   `ORGANIZATIONS_DEFAULT_MAX_GROUP_DEPTH` = 8, refused above the

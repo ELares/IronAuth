@@ -1688,6 +1688,21 @@
       },
       "type": "object"
     },
+    "PermissionOverflow": {
+      "description": "What the mint does when a resolved permission set will not fit the budget\n(issue #98). There is no `truncate` variant and there will not be one: a\npartial permission set is indistinguishable to a resource server from a\ncomplete one, so silent truncation would be an authorization DOWNGRADE that\nno consumer can detect. The enum having exactly two variants IS the\nno-silent-truncation guarantee.",
+      "oneOf": [
+        {
+          "const": "roles_only",
+          "description": "Withhold the permission claim and emit `permissions_status: \"budget_exceeded\"`.\nThe resource server authorizes from `roles`.",
+          "type": "string"
+        },
+        {
+          "const": "pdp_required",
+          "description": "Withhold the permission claim and emit `permissions_status: \"pdp_required\"`.\nThe resource server must consult the policy decision point (issue #100).",
+          "type": "string"
+        }
+      ]
+    },
     "PowConfig": {
       "additionalProperties": false,
       "description": "The proof-of-work challenge settings (issue #80). OFF by default: the challenge is\nnever issued or required until a tenant opts in. `challenge_at` reuses the #79 risk\nthreshold vocabulary (`off`/`low`/`med`/`high`): the challenge is required when the\nanonymous registration/verification risk level meets the threshold, so `low` challenges\nevery attempt while `med` challenges only an elevated one (a suspect IP or a flagged\ndisposable domain).",
@@ -2341,6 +2356,46 @@
       },
       "type": "object"
     },
+    "TokenClaimsConfig": {
+      "additionalProperties": false,
+      "description": "Token claim budget settings (issue #98). NOTHING CONSULTS THESE KEYS YET: they\nare validated at load and installed on both planes, but the permissions claim\nand its budget enforcement land with the claim itself, so setting any of them\nchanges no response and no token on this build. Issue #413 tracks deleting this\nsentence, and its five copies on the fields below, when the mint activates the\nclaim.\n\nThe budget is a SIZE BOUND ON A TOKEN. It is not a cap on how many permissions\nor roles may be STORED, and it never becomes one. Every key is named for the\nCLAIM it bounds rather than for the model: `permission_claim_max_count` bounds\nwhat one claim carries; there is no `max_permissions_per_role` and there never\nwill be. No table in the permission and role model has a count column, a\ncounter, or a quota row, and no CHECK constrains how many permissions an\nenvironment defines, how many a role holds, or how many an organization's roles\ncollectively grant.\n\nA top-level section rather than a field on `[oidc]` because both planes read it:\nthe mint enforces the bound and the management API reports the approach warning\nagainst it. Duplicating it under `[oidc]` would give one bound two\noperator-visible names that could disagree.\n\nExceeding the budget never refuses anything. On the management plane the only\nstatuses the budget can produce are 200 and 201 carrying a warning field; on the\ntoken-issuance path an overflow WITHHOLDS the complete permission claim and says\nso on the wire, and never truncates, never refuses issuance, and never returns\nan error.",
+      "properties": {
+        "access_token_max_bytes": {
+          "default": 4096,
+          "description": "The largest compact access token, in bytes, the mint will emit WITH a\npermissions claim. NOTHING CONSULTS THIS KEY YET: setting it changes no\nresponse and no token on this build, because the permissions claim and its\nbudget enforcement land with the claim itself (issue #413 tracks deleting\nthis sentence when the mint activates the claim). Default\n[`TOKEN_CLAIMS_DEFAULT_ACCESS_TOKEN_MAX_BYTES`] (4096); config load REJECTS a\nvalue above the 32768 ceiling\n([`TOKEN_CLAIMS_ACCESS_TOKEN_MAX_BYTES_CEILING`]). `0` does NOT mean\nunlimited, and this setting has no unlimited value: `0` means no access token\nmay carry a permissions claim at all, which is a valid, safe posture, but set\n`access_token_warn_bytes = 0` alongside it or the load is refused, because\nconfig load also rejects a threshold above the maximum it warns about and the\nshipped 3072 threshold would then exceed this maximum.\n\nMeasured over the COMPACT JWS string (the whole `header.payload.signature` an\n`Authorization` header carries) rather than over the payload, because the\ncompact string is what a proxy header limit applies to and what an operator's\nintuition is built on.\n\nThis bounds a TOKEN's size. It caps nothing that is counted or stored: the\nnumber of permissions an environment defines and the number a role holds are\nuncapped by covenant, and no count check exists anywhere in the schema or\nthe code. The absence of an unlimited value is what makes the bound a bound.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "access_token_warn_bytes": {
+          "default": 3072,
+          "description": "The approach threshold, in bytes, over the same compact token size. NOTHING\nCONSULTS THIS KEY YET: setting it changes no response and no token on this\nbuild, because the permissions claim and its budget enforcement land with the\nclaim itself (issue #413 tracks deleting this sentence when the mint\nactivates the claim). A token within `access_token_max_bytes` but above this\nis reported as approaching the budget; nothing is withheld and no request is\nrefused at this threshold. Default\n[`TOKEN_CLAIMS_DEFAULT_ACCESS_TOKEN_WARN_BYTES`] (3072), deliberately the same\nnumber the ID-token growth signal already uses\n(`ironauth_oidc::ID_TOKEN_BLOAT_THRESHOLD_BYTES`), so an operator meets ONE\nnumber rather than two that mean the same thing. Config load REJECTS a value\nabove `access_token_max_bytes`: a threshold above the bound it warns about\ncould never fire, because a token past the bound is settled by the overflow\nmode first. `0` does NOT mean unlimited and does not disable the warning, and\nthere is no unlimited value: it means every access token carrying a\npermissions claim is reported as approaching, which is a valid (if noisy)\nposture and is the value to set alongside `access_token_max_bytes = 0`.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "permission_claim_max_count": {
+          "default": 256,
+          "description": "The largest number of elements the mint will emit in ONE permissions claim.\nNOTHING CONSULTS THIS KEY YET: setting it changes no response and no token on\nthis build, because the permissions claim and its budget enforcement land\nwith the claim itself (issue #413 tracks deleting this sentence when the mint\nactivates the claim). Default\n[`TOKEN_CLAIMS_DEFAULT_PERMISSION_CLAIM_MAX_COUNT`] (256); config load\nREJECTS a value above the 4096 ceiling\n([`TOKEN_CLAIMS_PERMISSION_CLAIM_MAX_COUNT_CEILING`]). `0` does NOT mean\nunlimited, and this setting has no unlimited value: `0` means no permission\nclaim is ever emitted, which is a valid, safe posture, but set\n`permission_claim_warn_count = 0` alongside it or the load is refused,\nbecause config load also rejects a threshold above the maximum it warns about\nand the shipped 192 threshold would then exceed this maximum.\n\nThis bounds the CLAIM, never the model: it is not a cap on how many\npermissions an environment may define, how many a role may hold, or how many\nan organization's roles collectively grant, all of which are uncapped by\ncovenant, with no count column, quota row, or count CHECK anywhere for them.\nThere is no `max_permissions_per_role` and there never will be.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "permission_claim_overflow": {
+          "$ref": "#/$defs/PermissionOverflow",
+          "default": "roles_only",
+          "description": "What the mint does when a resolved permission set will not fit the budget.\nNOTHING CONSULTS THIS KEY YET: setting it changes no response and no token on\nthis build, because the permissions claim and its budget enforcement land\nwith the claim itself (issue #413 tracks deleting this sentence when the mint\nactivates the claim). Both values WITHHOLD the COMPLETE set and say so on the\nwire; neither truncates, and neither refuses the request. `roles_only` (the\ndefault) tells the resource server to authorize from the `roles` claim it\nalready receives; `pdp_required` tells it to consult the policy decision point\ninstead. Config load REJECTS any other value: the enum is closed, so a typo\nis a startup failure rather than a silent fallback to the default.\n\nSee [`PermissionOverflow`]: its having exactly two variants, with no\n`truncate` among them, is what makes silent truncation unrepresentable\nrather than merely unconfigured."
+        },
+        "permission_claim_warn_count": {
+          "default": 192,
+          "description": "The approach threshold over the permission claim's element count. NOTHING\nCONSULTS THIS KEY YET: setting it changes no response and no token on this\nbuild, because the permissions claim and its budget enforcement land with the\nclaim itself (issue #413 tracks deleting this sentence when the mint\nactivates the claim). A claim within `permission_claim_max_count` but above\nthis is reported as approaching the budget; nothing is withheld and no\nrequest is refused at this threshold. Default\n[`TOKEN_CLAIMS_DEFAULT_PERMISSION_CLAIM_WARN_COUNT`] (192); config load\nREJECTS a value above `permission_claim_max_count`, because a threshold above\nthe bound it warns about could never fire. `0` does NOT mean unlimited and\ndoes not disable the warning, and there is no unlimited value: it means every\nemitted permission claim is reported as approaching, and it is the value to\nset alongside `permission_claim_max_count = 0`. Like the maximum, it bounds\nonly what one CLAIM carries and caps no stored count.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "TokenFormat": {
       "description": "The access-token format an environment mints by default (issue #29).\n\nA registered resource server can override this per audience; when no resource\nserver is targeted, the environment default applies. The default is the\nself-contained RFC 9068 `at+jwt`, which preserves the existing `UserInfo` and\noffline-verification behavior; `opaque` mints a random, digest-only reference\ntoken that can only be validated by a store lookup (introspection).",
       "oneOf": [
@@ -2769,6 +2824,17 @@
         "otlp_endpoint": null
       },
       "description": "Observability settings: log format and trace export."
+    },
+    "token_claims": {
+      "$ref": "#/$defs/TokenClaimsConfig",
+      "default": {
+        "access_token_max_bytes": 4096,
+        "access_token_warn_bytes": 3072,
+        "permission_claim_max_count": 256,
+        "permission_claim_overflow": "roles_only",
+        "permission_claim_warn_count": 192
+      },
+      "description": "Token claim budget settings (issue #98): the SIZE bounds an access token\ncarrying a permissions claim is held to. NOTHING CONSULTS THESE KEYS YET.\nThey are validated at load and installed on both planes, but the permissions\nclaim and its budget enforcement land with the claim itself, so setting any\nof them changes no response and no token on this build; issue #413 tracks\ndeleting this sentence when the mint activates the claim. The budget is a\nsize bound on a TOKEN, never a cap on how many permissions or roles may be\nSTORED; every key is named for the CLAIM it bounds rather than for the model,\nso `permission_claim_max_count` bounds what one claim carries, and there is\nno `max_permissions_per_role` and there never will be.\n\nA top-level section rather than a field on `[oidc]` deliberately, because\nthe budget is consumed on BOTH planes: the mint enforces it and the\nmanagement API reports the approach warning against it, so one bound has one\noperator-visible name."
     }
   },
   "title": "Config",
