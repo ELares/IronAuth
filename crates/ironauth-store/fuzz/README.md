@@ -31,8 +31,12 @@ cargo +nightly fuzz run redirect_match
 
 `corpus/redirect_match/` is seeded from representative pairs: an identical
 https redirect, a loopback IP-literal pair that differs only in the port (the
-one accepted deviation), and a userinfo-smuggling pair that must stay rejected.
-Continuous fuzzing should persist and grow this corpus.
+one accepted deviation), a userinfo-smuggling pair that must stay rejected, and
+`seed_multibyte_prefix_boundary`, the input that crashed the nightly lane (a
+candidate whose byte 7 falls inside a multi-byte character, which the http-prefix
+strip used to slice through). Continuous fuzzing should persist and grow this
+corpus; a reproducer for a fixed crash belongs here, since `artifacts/` is
+scratch and is not committed.
 
 ## Stable, in-CI coverage of the same input space
 

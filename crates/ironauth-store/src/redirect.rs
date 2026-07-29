@@ -249,7 +249,13 @@ fn loopback_port_variant_matches(registered: &str, presented: &str) -> bool {
 /// Strip a case-insensitive `http://` prefix, or `None` if the URI is not http.
 fn strip_http_scheme_ci(uri: &str) -> Option<&str> {
     const PREFIX: &str = "http://";
-    if uri.len() >= PREFIX.len() && uri[..PREFIX.len()].eq_ignore_ascii_case(PREFIX) {
+    // Compare the leading BYTES rather than slicing the `str` at the constant index
+    // 7: a length check proves only that seven bytes exist, not that byte 7 is a
+    // character boundary, so `&uri[..7]` panics when a multi-byte character
+    // straddles it. Once those seven bytes are exactly the ASCII `http://`, byte 7
+    // IS a boundary, so the tail slice below is safe.
+    let head = uri.as_bytes().get(..PREFIX.len())?;
+    if head.eq_ignore_ascii_case(PREFIX.as_bytes()) {
         Some(&uri[PREFIX.len()..])
     } else {
         None
@@ -436,6 +442,33 @@ mod tests {
                 !redirect_uri_matches(reg, presented),
                 "redirect bypass accepted: registered={reg:?} presented={presented:?}"
             );
+        }
+    }
+
+    #[test]
+    fn multibyte_at_the_http_prefix_boundary_does_not_panic() {
+        // Nightly fuzz regression (`redirect_match`): the http-prefix strip checked
+        // only the byte LENGTH before slicing at the constant index 7, so a
+        // candidate whose byte 7 fell INSIDE a multi-byte character panicked
+        // ("end byte index 7 is not a char boundary"). These are the two halves of
+        // the crashing input, split on its NUL exactly as the fuzz target does.
+        let registered = ".0.0\t1\u{45f}b";
+        let presented = "http://127.0.0.ex1ample/cb";
+        assert!(!redirect_uri_matches(registered, presented));
+        assert!(!redirect_uri_matches(presented, registered));
+        // The registrability rule refuses the same value (it is non-ASCII), which is
+        // what kept the panic off the authorization endpoint.
+        assert!(!redirect_uri_is_registrable(registered));
+
+        // The whole hazard class, not only the offset the fuzzer happened to find:
+        // every multi-byte width at every position that can straddle byte 7.
+        for filler in 0..8 {
+            for wide in ['\u{45f}', '\u{2028}', '\u{1f600}'] {
+                let uri = format!("{}{wide}/cb", "h".repeat(filler));
+                assert!(!redirect_uri_matches(&uri, presented));
+                assert!(!redirect_uri_matches(presented, &uri));
+                assert!(!redirect_uri_is_registrable(&uri));
+            }
         }
     }
 
