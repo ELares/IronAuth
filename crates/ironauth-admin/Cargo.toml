@@ -241,6 +241,25 @@ name = "permission_vocabulary"
 path = "tests/permission_vocabulary.rs"
 required-features = ["testing"]
 
+# The resource-server registry over HTTP (issue #98, PR 11): the three
+# ENVIRONMENT-scoped endpoints of a NET-NEW management surface (there is no
+# organization segment, because `resource_servers` carries no organization, and the
+# item endpoints take the `rsv_` id because an audience is an absolute URI and cannot
+# be a path segment), the narrow PATCH that writes exactly the permission-claim
+# opt-in, the typed 422 that refuses ENABLING it on an `opaque` resource server and
+# the ordering that keeps that refusal from being a token-format oracle, byte-identical
+# anti-oracle uniformity across every shape of unreachable id on the read and the
+# mutation, the audit multiset and its TARGETS, the typed 400 that refuses a body
+# naming a read-only field, the projection read back off a resource server that is
+# neither the one format nor the one audience the rest of the file uses, the cursor
+# walk (order, page size, no repeat at a boundary, and a sibling environment that must
+# appear on no page), and the environment-scoped-key confinement on all three
+# endpoints. Needs a real database (DATABASE_URL).
+[[test]]
+name = "resource_servers"
+path = "tests/resource_servers.rs"
+required-features = ["testing"]
+
 # The role-to-permission mapping and the organization DEFAULT ROLE over HTTP
 # (issue #98, PR 8): the three ORGANIZATION-nested mapping endpoints that join an
 # organization-scoped role to an environment-scoped permission, plus the two that

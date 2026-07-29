@@ -1433,6 +1433,44 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/resource-servers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List an environment's registered resource servers (cursor paginated). */
+        get: operations["listResourceServers"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/resource-servers/{resource_server_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get one registered resource server of an environment. */
+        get: operations["getResourceServer"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * Set a resource server's permission-claim opt-in. Nothing else about the resource
+         *     server is editable here.
+         */
+        patch: operations["updateResourceServerPermissionClaims"];
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/sessions": {
         parameters: {
             query?: never;
@@ -3857,6 +3895,52 @@ export interface components {
             /** @description The authenticated end-user subject the family's tokens are minted for. */
             subject: string;
         };
+        /** @description A page of resource servers. */
+        ResourceServerList: {
+            /**
+             * @description The resource servers on this page, oldest first. There is no cap on how many
+             *     an environment may register; this page is size-clamped like every list.
+             */
+            items: components["schemas"]["ResourceServerView"][];
+            /** @description The opaque cursor for the next page, or null if this is the last page. */
+            next_cursor?: string | null;
+        };
+        /** @description A registered resource server, as returned by the management API (issue #98). */
+        ResourceServerView: {
+            /**
+             * Format: int64
+             * @description The per-resource-server access-token lifetime in seconds, or null to fall back
+             *     to the environment default. Read-only on this surface.
+             */
+            access_token_ttl_secs?: number | null;
+            /**
+             * @description The resource identifier / resource URI a token targets. Unique per
+             *     environment.
+             * @example https://api.example.test/billing
+             */
+            audience: string;
+            /**
+             * Format: int64
+             * @description Registration time, milliseconds since the Unix epoch.
+             */
+            created_at_unix_ms: number;
+            /**
+             * @description The resource-server identifier (`rsv_...`, embeds its scope). This is the
+             *     address every item endpoint takes, because the audience cannot be one.
+             */
+            id: string;
+            /**
+             * @description Whether tokens minted for this audience may carry the permission claim. The
+             *     ONE field this surface can write.
+             */
+            permission_claims_enabled: boolean;
+            /**
+             * @description The access-token format this resource server receives: `at_jwt` or `opaque`.
+             *     Read-only on this surface; issue #98 changes no token format.
+             * @example at_jwt
+             */
+            token_format: string;
+        };
         /**
          * @description One resource type's promotion classification, as served by the resource-model
          *     metadata endpoint. This is the machine-readable classification the snapshot
@@ -4425,6 +4509,66 @@ export interface components {
              *     under live mappings would silently repoint every grant that names it.
              */
             slug?: string | null;
+        };
+        /**
+         * @description The body to set a resource server's permission-claim opt-in.
+         *
+         *     One REQUIRED field, deliberately: a partial edit whose only editable field is
+         *     optional would make the empty object a legal request that does nothing, and a
+         *     caller who sent one would have no way to tell it apart from a request that was
+         *     applied. `permission_claims_enabled` is therefore mandatory, and omitting it is a
+         *     400 that names it.
+         *
+         *     # The three read-only fields, and why they are declared here at all
+         *
+         *     `token_format`, `audience`, and `access_token_ttl_secs` are NOT editable on this
+         *     surface, and they appear in this struct for exactly one reason: naming one is a
+         *     typed 400 that says which field and why, instead of a 200 that quietly ignored
+         *     it. This follows [`crate::permissions`]'s `UpdatePermissionRequest` rather than a
+         *     bare `deny_unknown_fields`, so the refusal names the field and states the rule.
+         *
+         *     The reason to spend that here rather than take the silent ignore is specific to
+         *     this endpoint: its whole subject is the INTERACTION between `token_format` and
+         *     the opt-in (the 422 below exists only because of it), so a caller who sends
+         *     `{"permission_claims_enabled": true, "token_format": "at_jwt"}` believing they
+         *     have changed the format to make the opt-in legal must not be told 200. A field
+         *     this surface cannot write is a field it must refuse rather than drop.
+         *
+         *     The test is PRESENCE and never value, so `"token_format": null` is refused
+         *     exactly like `"token_format": "at_jwt"`: a caller who writes the key believes
+         *     they said something about it.
+         *
+         *     Genuinely UNKNOWN keys (a typo, a field from a future version) are still
+         *     tolerated and ignored, exactly as on every other management body in this crate.
+         *     This struct refuses the three keys that name real, real-looking columns of THIS
+         *     resource, which are the ones a caller can plausibly believe they just wrote.
+         */
+        UpdateResourceServerRequest: {
+            /**
+             * Format: int64
+             * @description REFUSED if the key is present AT ALL, `null` included: the per-resource-server
+             *     access-token lifetime is not editable on this surface.
+             */
+            access_token_ttl_secs?: number | null;
+            /**
+             * @description REFUSED if the key is present AT ALL, `null` included: the audience is the
+             *     registry's natural key and is immutable by GRANT, not merely by policy.
+             */
+            audience?: string | null;
+            /**
+             * @description Whether tokens minted for this audience may carry the permission claim.
+             *
+             *     Enabling this on a resource server whose `token_format` is `opaque` is refused
+             *     with a 422: an opaque access token carries no claims, so the setting could
+             *     only ever be silently dropped at mint time.
+             */
+            permission_claims_enabled: boolean;
+            /**
+             * @description REFUSED if the key is present AT ALL, `null` included: issue #98 changes no
+             *     token format. Accepting it silently would be worst here of all, because this
+             *     endpoint's 422 is decided BY the stored format.
+             */
+            token_format?: string | null;
         };
         /**
          * @description The body to update a user (issue #52), applied as an RFC 7396 JSON Merge Patch
@@ -12036,6 +12180,208 @@ export interface operations {
             };
             /** @description Not found (absent or in another scope) */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listResourceServers: {
+        parameters: {
+            query?: {
+                /**
+                 * @description The desired page size, a positive integer. Clamped to
+                 *     `[1, max_page_size]`; defaults to the configured default when absent.
+                 */
+                limit?: number;
+                /**
+                 * @description The opaque cursor from a previous page's `next_cursor`. Absent for the
+                 *     first page (keyset pagination; there is no offset).
+                 */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A page of resource servers */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResourceServerList"];
+                };
+            };
+            /** @description Malformed cursor */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Tenant or environment not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    getResourceServer: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The resource-server identifier (rsv_...) */
+                resource_server_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The resource server */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResourceServerView"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found (absent, malformed, or another scope's) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    updateResourceServerPermissionClaims: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The resource-server identifier (rsv_...) */
+                resource_server_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateResourceServerRequest"];
+            };
+        };
+        responses: {
+            /** @description The updated resource server */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResourceServerView"];
+                };
+            };
+            /** @description Malformed request, a body omitting permission_claims_enabled, or a body naming a read-only field (token_format, audience, access_token_ttl_secs) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found (absent, malformed, or another scope's) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Cannot enable permission claims on an opaque resource server */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

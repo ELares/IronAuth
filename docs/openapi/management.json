@@ -11340,6 +11340,310 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/resource-servers": {
+      "get": {
+        "tags": [
+          "resource-servers"
+        ],
+        "summary": "List an environment's registered resource servers (cursor paginated).",
+        "operationId": "listResourceServers",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "The desired page size, a positive integer. Clamped to\n`[1, max_page_size]`; defaults to the configured default when absent.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "The opaque cursor from a previous page's `next_cursor`. Absent for the\nfirst page (keyset pagination; there is no offset).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of resource servers",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResourceServerList"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed cursor",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Tenant or environment not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/resource-servers/{resource_server_id}": {
+      "get": {
+        "tags": [
+          "resource-servers"
+        ],
+        "summary": "Get one registered resource server of an environment.",
+        "operationId": "getResourceServer",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "resource_server_id",
+            "in": "path",
+            "description": "The resource-server identifier (rsv_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The resource server",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResourceServerView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (absent, malformed, or another scope's)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "patch": {
+        "tags": [
+          "resource-servers"
+        ],
+        "summary": "Set a resource server's permission-claim opt-in. Nothing else about the resource\nserver is editable here.",
+        "operationId": "updateResourceServerPermissionClaims",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "resource_server_id",
+            "in": "path",
+            "description": "The resource-server identifier (rsv_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateResourceServerRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The updated resource server",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResourceServerView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request, a body omitting permission_claims_enabled, or a body naming a read-only field (token_format, audience, access_token_ttl_secs)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (absent, malformed, or another scope's)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Cannot enable permission claims on an opaque resource server",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/sessions": {
       "get": {
         "tags": [
@@ -17125,6 +17429,73 @@
           }
         }
       },
+      "ResourceServerList": {
+        "type": "object",
+        "description": "A page of resource servers.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ResourceServerView"
+            },
+            "description": "The resource servers on this page, oldest first. There is no cap on how many\nan environment may register; this page is size-clamped like every list."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The opaque cursor for the next page, or null if this is the last page."
+          }
+        }
+      },
+      "ResourceServerView": {
+        "type": "object",
+        "description": "A registered resource server, as returned by the management API (issue #98).",
+        "required": [
+          "id",
+          "audience",
+          "token_format",
+          "permission_claims_enabled",
+          "created_at_unix_ms"
+        ],
+        "properties": {
+          "access_token_ttl_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The per-resource-server access-token lifetime in seconds, or null to fall back\nto the environment default. Read-only on this surface."
+          },
+          "audience": {
+            "type": "string",
+            "description": "The resource identifier / resource URI a token targets. Unique per\nenvironment.",
+            "example": "https://api.example.test/billing"
+          },
+          "created_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Registration time, milliseconds since the Unix epoch."
+          },
+          "id": {
+            "type": "string",
+            "description": "The resource-server identifier (`rsv_...`, embeds its scope). This is the\naddress every item endpoint takes, because the audience cannot be one."
+          },
+          "permission_claims_enabled": {
+            "type": "boolean",
+            "description": "Whether tokens minted for this audience may carry the permission claim. The\nONE field this surface can write."
+          },
+          "token_format": {
+            "type": "string",
+            "description": "The access-token format this resource server receives: `at_jwt` or `opaque`.\nRead-only on this surface; issue #98 changes no token format.",
+            "example": "at_jwt"
+          }
+        }
+      },
       "ResourceTypeView": {
         "type": "object",
         "description": "One resource type's promotion classification, as served by the resource-model\nmetadata endpoint. This is the machine-readable classification the snapshot\nexport (5.3) and the promotion engine (5.4) consume so they never maintain a\nparallel promotable/runtime list.",
@@ -18030,6 +18401,41 @@
           }
         }
       },
+      "UpdateResourceServerRequest": {
+        "type": "object",
+        "description": "The body to set a resource server's permission-claim opt-in.\n\nOne REQUIRED field, deliberately: a partial edit whose only editable field is\noptional would make the empty object a legal request that does nothing, and a\ncaller who sent one would have no way to tell it apart from a request that was\napplied. `permission_claims_enabled` is therefore mandatory, and omitting it is a\n400 that names it.\n\n# The three read-only fields, and why they are declared here at all\n\n`token_format`, `audience`, and `access_token_ttl_secs` are NOT editable on this\nsurface, and they appear in this struct for exactly one reason: naming one is a\ntyped 400 that says which field and why, instead of a 200 that quietly ignored\nit. This follows [`crate::permissions`]'s `UpdatePermissionRequest` rather than a\nbare `deny_unknown_fields`, so the refusal names the field and states the rule.\n\nThe reason to spend that here rather than take the silent ignore is specific to\nthis endpoint: its whole subject is the INTERACTION between `token_format` and\nthe opt-in (the 422 below exists only because of it), so a caller who sends\n`{\"permission_claims_enabled\": true, \"token_format\": \"at_jwt\"}` believing they\nhave changed the format to make the opt-in legal must not be told 200. A field\nthis surface cannot write is a field it must refuse rather than drop.\n\nThe test is PRESENCE and never value, so `\"token_format\": null` is refused\nexactly like `\"token_format\": \"at_jwt\"`: a caller who writes the key believes\nthey said something about it.\n\nGenuinely UNKNOWN keys (a typo, a field from a future version) are still\ntolerated and ignored, exactly as on every other management body in this crate.\nThis struct refuses the three keys that name real, real-looking columns of THIS\nresource, which are the ones a caller can plausibly believe they just wrote.",
+        "required": [
+          "permission_claims_enabled"
+        ],
+        "properties": {
+          "access_token_ttl_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "REFUSED if the key is present AT ALL, `null` included: the per-resource-server\naccess-token lifetime is not editable on this surface."
+          },
+          "audience": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "REFUSED if the key is present AT ALL, `null` included: the audience is the\nregistry's natural key and is immutable by GRANT, not merely by policy."
+          },
+          "permission_claims_enabled": {
+            "type": "boolean",
+            "description": "Whether tokens minted for this audience may carry the permission claim.\n\nEnabling this on a resource server whose `token_format` is `opaque` is refused\nwith a 422: an opaque access token carries no claims, so the setting could\nonly ever be silently dropped at mint time."
+          },
+          "token_format": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "REFUSED if the key is present AT ALL, `null` included: issue #98 changes no\ntoken format. Accepting it silently would be worst here of all, because this\nendpoint's 422 is decided BY the stored format."
+          }
+        }
+      },
       "UpdateUserRequest": {
         "type": "object",
         "description": "The body to update a user (issue #52), applied as an RFC 7396 JSON Merge Patch\nover the mutable profile. Only the standard-claim document is updatable here;\nthe lifecycle state and external id have their own explicit operations.",
@@ -18382,6 +18788,10 @@
     {
       "name": "permissions",
       "description": "The permission vocabulary (issue #98): the named API capabilities an ENVIRONMENT defines. Scoped to the environment and NOT to an organization, because a permission names a capability and one string cannot mean different things to two organizations calling the same API; which permissions a ROLE grants is per organization. The slug and the kind are immutable. Uncapped in number by covenant"
+    },
+    {
+      "name": "resource-servers",
+      "description": "The resource-server registry (issue #29), given a management surface by issue #98. ENVIRONMENT level and not per organization: a registered protected API belongs to the environment. Addressed by `rsv_` id and never by audience, because an audience is an absolute URI and cannot be a path segment; the list exists so a console can find the id. The PATCH writes exactly one column, the permission-claim opt-in, and refuses to enable it on an `opaque` resource server"
     },
     {
       "name": "org-role-permissions",

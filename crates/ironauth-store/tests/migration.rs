@@ -598,8 +598,8 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
     );
     assert_eq!(
         report.already_applied(),
-        93,
-        "the production chain is exactly ninety-three migrations (isolation, audit log, management \
+        94,
+        "the production chain is exactly ninety-four migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -623,10 +623,11 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
          codes, DPoP binding, DPoP proof replay, organization membership, organization token \
          context, organization roles, organization groups, organization group members, \
          organization role assignments, organization authentication policies, permission \
-         vocabulary, role-to-permission mapping, organization default role)"
+         vocabulary, role-to-permission mapping, organization default role, resource-server \
+         permission claims)"
     );
 
-    // The ledger holds exactly versions 1 through 93.
+    // The ledger holds exactly versions 1 through 94.
     assert_eq!(
         applied_versions(pool).await,
         vec![
@@ -634,7 +635,7 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
             46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67,
             68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89,
-            90, 91, 92, 93
+            90, 91, 92, 93, 94
         ]
     );
     let phase_of = |version: i64| async move {
@@ -6412,5 +6413,119 @@ async fn org_roles_carries_the_default_designation_its_live_uniqueness_and_its_g
         role_has_table_privilege(pool, "ironauth_app", "org_roles", "SELECT").await,
         "the data plane keeps the SELECT the token-issuance resolution reads this \
          column through"
+    );
+}
+
+/// The per-audience PERMISSION-CLAIM opt-in: the column, and the one column-scoped
+/// grant without which a config promotion of a resource server fails 42501 (issue
+/// #98, migration 0094).
+///
+/// Its own test rather than more lines in the production-chain assertions, for the
+/// stack-budget reason the 0090 and 0093 tests record.
+#[tokio::test]
+async fn resource_servers_carries_the_permission_claim_opt_in_and_its_column_grant() {
+    let db = TestDatabase::start().await;
+    let pool = db.owner_pool();
+
+    // EXPAND: one additive column with a NOT NULL DEFAULT (which Postgres applies
+    // without rewriting the table) and one new grant.
+    let phase: String = sqlx::query("SELECT phase FROM _schema_migrations WHERE version = 94")
+        .fetch_one(pool)
+        .await
+        .expect("0094 is in the ledger")
+        .get("phase");
+    assert_eq!(phase, "expand");
+
+    assert!(
+        column_exists(pool, "resource_servers", "permission_claims_enabled").await,
+        "resource_servers.permission_claims_enabled exists after 0094"
+    );
+    assert_eq!(
+        column_data_type(pool, "resource_servers", "permission_claims_enabled").await,
+        "boolean",
+        "the opt-in is a boolean on the row the mint already reads by audience"
+    );
+    // NOT NULL with a false DEFAULT, so every row that existed before 0094 reads
+    // false and no backfill is needed. A nullable column would make "opted out" and
+    // "never decided" two states where the mint treats them as one.
+    assert!(
+        column_is_not_null(pool, "resource_servers", "permission_claims_enabled").await,
+        "resource_servers.permission_claims_enabled must be NOT NULL"
+    );
+    assert_eq!(
+        column_default(pool, "resource_servers", "permission_claims_enabled").await,
+        Some("false".to_owned()),
+        "the safe default is false: a registered audience is opted OUT until an \
+         operator says otherwise"
+    );
+
+    // THE grant this migration exists for. 0035's UPDATE on this table is
+    // COLUMN-scoped, so without this the promotion engine's Update arm, which names
+    // every promotable column in one SET list, is refused with SQLSTATE 42501.
+    // `the_promotion_apply_fails_42501_without_the_permission_claims_grant` in
+    // tests/config_promotion.rs revokes it and measures that failure end to end;
+    // this is the static half.
+    assert!(
+        role_has_column_privilege(
+            pool,
+            "ironauth_control",
+            "resource_servers",
+            "permission_claims_enabled",
+            "UPDATE"
+        )
+        .await,
+        "ironauth_control must hold column-scoped UPDATE on \
+         resource_servers.permission_claims_enabled"
+    );
+    // ADDITIVE to 0035: Postgres unions column grants, so a re-GRANT that REPLACED
+    // them would leave these two unwritable and break the promotion of a format or a
+    // lifetime while the new column worked.
+    for column in ["token_format", "access_token_ttl_secs"] {
+        assert!(
+            role_has_column_privilege(
+                pool,
+                "ironauth_control",
+                "resource_servers",
+                column,
+                "UPDATE"
+            )
+            .await,
+            "0035's column-scoped UPDATE on resource_servers.{column} must survive 0094"
+        );
+    }
+    // Every ADDRESSING column stays immutable by GRANT. A control plane able to
+    // rewrite an `audience` could silently repoint which protected API a live token
+    // targets, and one able to rewrite `tenant_id` could move a row across the
+    // isolation fence the policy enforces.
+    for column in ["id", "tenant_id", "environment_id", "audience"] {
+        assert!(
+            !role_has_column_privilege(
+                pool,
+                "ironauth_control",
+                "resource_servers",
+                column,
+                "UPDATE"
+            )
+            .await,
+            "resource_servers.{column} must still be immutable by GRANT after 0094"
+        );
+    }
+
+    // The DATA plane gains NOTHING. It READS this flag on the token-issuance path,
+    // and a data plane able to SET it is a data plane able to widen its own token.
+    assert!(
+        !role_has_column_privilege(
+            pool,
+            "ironauth_app",
+            "resource_servers",
+            "permission_claims_enabled",
+            "UPDATE"
+        )
+        .await,
+        "the data plane must NOT hold UPDATE on resource_servers.permission_claims_enabled"
+    );
+    assert!(
+        role_has_table_privilege(pool, "ironauth_app", "resource_servers", "SELECT").await,
+        "the data plane keeps the SELECT the mint reads this column through"
     );
 }

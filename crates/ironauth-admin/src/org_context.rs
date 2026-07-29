@@ -25,13 +25,18 @@
 //! #97 diff for no behavior change. The two copies there are byte-identical to
 //! these and should be folded in whenever that file is next touched.
 //!
-//! # One caller here is NOT nested under an organization
+//! # Two callers here are NOT nested under an organization
 //!
 //! The permission vocabulary (issue #98) is scoped to the ENVIRONMENT: migration
 //! 0091 gives `permissions` no `organization_id`, so its row-level-security policy
 //! is the complete fence and there is no parent organization to resolve.
 //! `permissions.rs` therefore calls [`resolve_scope`] and stops, and it addresses a
 //! row through [`parse_permission_id`] and [`require_live_permission`] below.
+//!
+//! The resource-server registry (issue #98) is the second, for the same reason:
+//! `resource_servers` carries no organization either, so `resource_servers.rs` calls
+//! [`resolve_scope`] and addresses a row through [`parse_resource_server_id`] and
+//! [`require_live_resource_server`].
 //!
 //! It lives here anyway, and the reason is the paragraph above rather than the
 //! module's name: [`resolve_scope`] is the ONE copy of the
@@ -54,7 +59,7 @@
 
 use ironauth_store::{
     ActorRef, OrgGroupId, OrgMembershipId, OrgMembershipRecord, OrgRoleId, OrgRoleRecord,
-    OrganizationId, PermissionId, PermissionRecord, Scope,
+    OrganizationId, PermissionId, PermissionRecord, ResourceServerId, ResourceServerRecord, Scope,
 };
 
 use crate::auth::Principal;
@@ -240,6 +245,59 @@ pub async fn require_live_permission(
         .store()
         .management()
         .permissions(scope)
+        .get(&id)
+        .await?)
+}
+
+/// Parse an untrusted resource-server id in scope, under the same uniform not-found
+/// as [`parse_group_id`].
+///
+/// Like [`parse_permission_id`] this addresses a row hanging off the ENVIRONMENT
+/// rather than off an organization, so parsing in scope is the whole of what an
+/// address needs to prove here.
+///
+/// # Errors
+///
+/// [`ApiError::NotFound`] if malformed or out of scope.
+pub fn parse_resource_server_id(
+    state: &AdminState,
+    scope: Scope,
+    resource_server_id: &str,
+) -> Result<ResourceServerId, ApiError> {
+    Ok(state
+        .store()
+        .management()
+        .resource_servers(scope)
+        .parse_id(resource_server_id)?)
+}
+
+/// Resolve a resource server as a live resource server of THIS environment,
+/// returning the stored record.
+///
+/// The addressing failures collapse to one answer: a malformed id and one minted in
+/// another `(tenant, environment)` fail to parse in scope, and an absent one is the
+/// repository's own not-found. A caller therefore cannot tell "never registered" from
+/// "belongs to another environment" from "nonsense", which is what stops the registry
+/// from being an existence oracle over a sibling environment's protected APIs.
+///
+/// There are THREE such failures here and not the usual four: `resource_servers`
+/// carries no `deleted_at`, so there is no soft-deleted state to make uniform. A row
+/// a promotion hard-deleted is simply absent, and reads exactly like one that never
+/// existed.
+///
+/// # Errors
+///
+/// [`ApiError::NotFound`] if the id is malformed, out of scope, or absent.
+pub async fn require_live_resource_server(
+    state: &AdminState,
+    scope: Scope,
+    resource_server_id: &str,
+) -> Result<ResourceServerRecord, ApiError> {
+    let id = parse_resource_server_id(state, scope, resource_server_id)?;
+    Ok(state
+        .store()
+        .management()
+        .resource_servers(scope)
         .get(&id)
         .await?)
 }

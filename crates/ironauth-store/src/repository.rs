@@ -9638,10 +9638,29 @@ pub struct ResourceServerRecord {
     /// The per-resource-server access-token lifetime in seconds, or [`None`] to
     /// fall back to the environment default lifetime.
     pub access_token_ttl_secs: Option<i64>,
+    /// Whether tokens minted FOR this resource server may carry the issue #98
+    /// permission claim. `false` for every resource server until an operator turns
+    /// it on, which migration 0094 makes the column DEFAULT.
+    ///
+    /// It rides on THIS record rather than on a row of its own precisely because the
+    /// mint already reads this row by audience: the opt-in costs no extra query and
+    /// cannot drift from the format and lifetime it sits beside.
+    pub permission_claims_enabled: bool,
+    /// Registration time, epoch microseconds. The management list pages by
+    /// `(created_at, id)`, so this is the cursor position rather than anything the
+    /// mint consumes.
+    pub created_at_unix_micros: i64,
 }
 
 /// A resource server to register (issue #29). The `id` is minted under the
 /// caller's scope; the `audience` is unique per environment.
+///
+/// There is deliberately no `permission_claims_enabled` field: a registration
+/// always writes the column DEFAULT (`false`), and turning the opt-in on is a
+/// separate, separately audited mutation
+/// ([`ActingResourceServerRepo::set_permission_claims`]). A create that could opt in
+/// would let one request both register an audience and widen what its tokens carry,
+/// under one audit row that names only the registration.
 #[derive(Debug, Clone, Copy)]
 pub struct NewResourceServer<'a> {
     /// The `rsv_` identifier, minted under this scope.
@@ -9654,6 +9673,27 @@ pub struct NewResourceServer<'a> {
     /// the environment default.
     pub access_token_ttl_secs: Option<i64>,
 }
+
+/// The projection every resource-server read selects. ONE constant so the
+/// by-audience read, the by-id read, and both list projections cannot drift.
+///
+/// The failure mode this prevents is LOUD rather than silent, and it is worth saying
+/// which, because the two call for different amounts of vigilance.
+/// [`resource_server_from_row`] reads each column with `Row::get`, which panics on a
+/// column the projection did not select, so a column added to
+/// [`ResourceServerRecord`] and to only three of four projections does NOT decode as
+/// its type default: it panics with `ColumnNotFound`. Measured by dropping
+/// `permission_claims_enabled` from this very constant, which turns all four
+/// `tests/resource_servers.rs` cases red with
+/// `` called `Result::unwrap()` on an `Err` value: ColumnNotFound("permission_claims_enabled") ``.
+///
+/// The constant therefore buys a smaller thing than "it would silently read false",
+/// and still a real one: with four projections there are four places to remember,
+/// and a forgotten one is a runtime panic on a production read path rather than a
+/// compile error. With one, there is nothing to forget.
+const RESOURCE_SERVER_SELECT_COLUMNS: &str = "id, audience, token_format, \
+     access_token_ttl_secs, permission_claims_enabled, \
+     (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us";
 
 /// The read-only resource-server repository (issue #29).
 pub struct ResourceServerRepo<'a> {
@@ -9677,10 +9717,10 @@ impl ResourceServerRepo<'_> {
         audience: &str,
     ) -> Result<Option<ResourceServerRecord>, StoreError> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
-        let row = sqlx::query(
-            "SELECT id, audience, token_format, access_token_ttl_secs FROM resource_servers \
-             WHERE audience = $1 AND tenant_id = $2 AND environment_id = $3",
-        )
+        let row = sqlx::query(&format!(
+            "SELECT {RESOURCE_SERVER_SELECT_COLUMNS} FROM resource_servers \
+             WHERE audience = $1 AND tenant_id = $2 AND environment_id = $3"
+        ))
         .bind(audience)
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
@@ -9705,12 +9745,154 @@ impl ResourceServerRepo<'_> {
     /// to decode (an unknown token format).
     pub async fn list(&self) -> Result<Vec<ResourceServerRecord>, StoreError> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
-        let rows = sqlx::query(
-            "SELECT id, audience, token_format, access_token_ttl_secs FROM resource_servers \
-             WHERE tenant_id = $1 AND environment_id = $2 ORDER BY audience",
-        )
+        let rows = sqlx::query(&format!(
+            "SELECT {RESOURCE_SERVER_SELECT_COLUMNS} FROM resource_servers \
+             WHERE tenant_id = $1 AND environment_id = $2 ORDER BY audience"
+        ))
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| resource_server_from_row(row, &self.scope))
+            .collect()
+    }
+
+    /// Parse an untrusted resource-server identifier under this scope. A malformed
+    /// id and one minted in another scope both return the uniform not-found.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if malformed or out of scope.
+    pub fn parse_id(&self, raw: &str) -> Result<ResourceServerId, StoreError> {
+        Ok(ResourceServerId::parse_in_scope(raw, &self.scope)?)
+    }
+
+    /// Fetch a resource server by ID, within scope: the address the management API
+    /// uses, because an `audience` is an absolute URI carrying `:` and `/` and cannot
+    /// be a path segment.
+    ///
+    /// This table has NO soft delete, so the three addressing failures are malformed,
+    /// out of scope, and absent, and all three are one answer. "Absent" covers a row
+    /// a promotion hard-deleted, which is the only delete this table has; there is no
+    /// soft-deleted state to make uniform, unlike every issue #97 table.
+    ///
+    /// # Which layer actually refuses a foreign id, measured
+    ///
+    /// FOUR mechanisms fence a cross-scope read here, and NONE of them is observable
+    /// on its own. That is stated because a reader auditing them will otherwise
+    /// assume each is independently load bearing, and the matrix below was measured
+    /// by mutation rather than reasoned:
+    ///
+    ///   1. [`ResourceServerRepo::parse_id`], which every caller (the management
+    ///      handler and the `resource_servers.get` IDOR probe alike) runs BEFORE this
+    ///      function. A foreign id fails [`ScopedId::parse_in_scope`] and never
+    ///      arrives here.
+    ///   2. The `id.scope()` guard on the first line below, plus this statement's own
+    ///      `tenant_id` / `environment_id` predicates.
+    ///   3. Forced row-level security, whose policy compares the row against the
+    ///      `ironauth.tenant_id` / `ironauth.environment_id` settings that
+    ///      [`begin_scoped`] binds. This one is NOT independent of 2 the way 1 and 4
+    ///      are: it and the predicates in 2 read the SAME caller scope, so the
+    ///      binding is a shared input rather than a fourth guard. It is counted
+    ///      separately because the policy is enforced by Postgres and survives any
+    ///      mistake in the statement, which the predicates cannot claim.
+    ///   4. [`resource_server_from_row`], which decodes the stored `id` through
+    ///      [`ScopedId::parse_in_scope`] against the CALLER'S scope, so even a row
+    ///      that somehow arrived fails to become a record.
+    ///
+    /// Measured against
+    /// `management_probes_deny_cross_tenant_and_cross_environment_uniformly`, with
+    /// 1 and 4 neutered by parsing the id without a scope check, 2 by deleting the
+    /// guard and the scope predicates, and 3 by rewriting migration 0011's policy to
+    /// `USING (true)`:
+    ///
+    /// | neutered | probe |
+    /// |---|---|
+    /// | 1 / 2 / 3 / 4, each alone | GREEN |
+    /// | every PAIR (1+2, 1+3, 1+4, 2+3, 2+4, 3+4) | GREEN |
+    /// | every TRIPLE (1+2+3, 1+2+4, 1+3+4, 2+3+4) | GREEN |
+    /// | all FOUR | `Leaked` on BOTH planted victims |
+    ///
+    /// So on the READ path each of the four is fully redundant with the other three:
+    /// the probe first leaks only when nothing at all is left. In particular
+    /// neutering 1, 2 and 4 is still GREEN, because RLS alone refuses, and neutering
+    /// 1, 2 and 3 is still GREEN, because the decode alone refuses. RLS is the last
+    /// line that a bug in this file cannot reach, which is why it is the one to keep
+    /// hardest.
+    ///
+    /// The all-four row is also what proves the probe non-vacuous and the planted
+    /// victims real rows.
+    ///
+    /// Do not delete a layer on the grounds that a mutation survives: on this path
+    /// EVERY single removal survives, and the survival is the expected consequence of
+    /// the layers around it rather than evidence the guard is dead. This is the same
+    /// census discipline `PERMISSION_SELECT_COLUMNS` records.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no such resource server is visible in this scope.
+    pub async fn get(&self, id: &ResourceServerId) -> Result<ResourceServerRecord, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(&format!(
+            "SELECT {RESOURCE_SERVER_SELECT_COLUMNS} FROM resource_servers \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3"
+        ))
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        resource_server_from_row(&row, &self.scope)
+    }
+
+    /// One page of this scope's resource servers, ordered by `(created_at, id)`: the
+    /// management LIST, which exists so a console can find the `rsv_` id the item
+    /// endpoints address.
+    ///
+    /// Deliberately a DIFFERENT order from [`ResourceServerRepo::list`], and the
+    /// reason is what each order is FOR rather than any property `audience` lacks.
+    /// [`ResourceServerRepo::list`] feeds the snapshot export, whose elements are
+    /// keyed by `audience`: ordering by the natural key is what makes two exports of
+    /// one configuration byte-identical. This one feeds a console walking pages, and
+    /// `(created_at, id)` is stable under a re-registration that changes nothing else
+    /// and puts the oldest registration first.
+    ///
+    /// Note what is NOT the reason. `audience` would also work as a cursor key: `id`
+    /// is `text` too, so both are equally collation-dependent, and what a cursor walk
+    /// actually needs is that the comparison and the `ORDER BY` share a collation,
+    /// which holds either way. The pair is a total order because `id` is the primary
+    /// key, and `audience` is unique per environment so it would be a total order on
+    /// its own. The two orders differ because they answer to two consumers.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_page(
+        &self,
+        limit: i64,
+        after: Option<&CursorPosition>,
+    ) -> Result<Vec<ResourceServerRecord>, StoreError> {
+        let (after_micros, after_id) = split_cursor(after);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {RESOURCE_SERVER_SELECT_COLUMNS} FROM resource_servers \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+             AND ($3::bigint IS NULL OR (created_at, id) > \
+                  (TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval, $4::text)) \
+             ORDER BY created_at, id LIMIT $5"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(after_micros)
+        .bind(after_id)
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
         .fetch_all(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -9784,6 +9966,119 @@ impl ActingResourceServerRepo<'_> {
         )
         .await
     }
+
+    /// Set (or clear) this resource server's issue #98 permission-claim opt-in and
+    /// audit `resource_server.permission_claims.set` in the same transaction.
+    ///
+    /// This is a COLUMN-scoped UPDATE of exactly one column (the #31 lesson), and it
+    /// is the whole of what migration 0094 grants. It cannot touch `token_format`,
+    /// `access_token_ttl_secs`, or any addressing column, and not because this code
+    /// declines to: those columns are simply not in the SET list, and the addressing
+    /// columns are not in the control role's grant at all.
+    ///
+    /// # It does NOT refuse an opaque resource server, and that is deliberate
+    ///
+    /// Issue #98 makes permission claims an `at+jwt`-only feature, and the refusal
+    /// lives on the MANAGEMENT EDGE as a typed 422 rather than here. Two reasons:
+    /// the promotion engine writes `token_format` and this column from one snapshot
+    /// in one statement and must not be refused by a rule the edge enforces (see
+    /// migration 0094 section 4), and a store-level refusal would have to answer with
+    /// [`StoreError::Database`] or a new variant, neither of which reaches a caller
+    /// as the 422 that names the reason.
+    ///
+    /// The combination is INERT rather than unsafe: an opaque access token carries no
+    /// claims, so the flag has nowhere to apply.
+    ///
+    /// # The cross-scope fence: THREE layers, not the read's four
+    ///
+    /// `resource_servers.set_permission_claims` is the IDOR probe over this path, and
+    /// it is the MUTATING one: a leak would opt a foreign environment's audience INTO
+    /// carrying permission claims.
+    ///
+    /// [`ResourceServerRepo::get`] enumerates four mechanisms. Only three of them
+    /// exist here, and the missing one matters:
+    ///
+    ///   1. [`ResourceServerRepo::parse_id`] in the caller, exactly as on the read.
+    ///   2. The `id.scope()` guard below, plus this statement's `tenant_id` /
+    ///      `environment_id` predicates.
+    ///   3. Forced row-level security, driven by the settings [`begin_scoped`] binds
+    ///      inside [`write_audited`].
+    ///
+    /// There is NO layer-4 counterpart. Layer 4 on the read is
+    /// [`resource_server_from_row`] re-parsing the stored `id` in the caller's scope,
+    /// and a write decodes no row, so the read's last-ditch check simply does not
+    /// exist on this path. What stands in its place is the `rows_affected() == 0`
+    /// check below, and it is a genuinely different kind of thing: it does not refuse
+    /// a foreign row, it CONVERTS "row-level security matched nothing" into
+    /// [`StoreError::NotFound`] instead of a silent success.
+    ///
+    /// Measured against
+    /// `management_probes_deny_cross_tenant_and_cross_environment_uniformly`, the
+    /// same way the read's matrix was:
+    ///
+    /// | neutered | probe |
+    /// |---|---|
+    /// | 1 / 2 / 3, each alone | GREEN |
+    /// | every PAIR (1+2, 1+3, 2+3) | GREEN |
+    /// | all THREE | `Leaked` on BOTH planted victims |
+    /// | the `rows_affected` check alone | GREEN |
+    /// | 1 and 2, plus the `rows_affected` check (RLS INTACT) | `Leaked` on BOTH |
+    ///
+    /// The last row is the one to read twice. With the scope predicates gone and
+    /// row-level security intact, the UPDATE is not refused: it matches zero rows and
+    /// reports success, and the `rows_affected` check is the ONLY thing that turns
+    /// that into a denial. So the write leaks one step earlier than the read, and its
+    /// last line of defence is a Rust `if` rather than the database.
+    /// `a_write_matching_no_row_is_not_found_and_audits_nothing` in
+    /// `crates/ironauth-store/tests/resource_servers.rs` pins that conversion
+    /// directly, without needing the mutation: it addresses an id of the caller's own
+    /// scope that names no row, so the guard passes, the statement runs, and only
+    /// this check can produce the refusal.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id is not in this scope or names no row of it;
+    /// [`StoreError::Database`] on a persistence failure (including SQLSTATE 42501 if
+    /// migration 0094's column grant is missing).
+    pub async fn set_permission_claims(
+        &self,
+        env: &Env,
+        id: &ResourceServerId,
+        enabled: bool,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ResourceServerPermissionClaimsSet,
+                target: id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "UPDATE resource_servers SET permission_claims_enabled = $1 \
+                     WHERE id = $2 AND tenant_id = $3 AND environment_id = $4",
+                )
+                .bind(enabled)
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
 }
 
 /// Reconstruct a [`ResourceServerRecord`] from a row read within scope.
@@ -9804,6 +10099,8 @@ fn resource_server_from_row(
         audience: row.get("audience"),
         token_format,
         access_token_ttl_secs: row.get("access_token_ttl_secs"),
+        permission_claims_enabled: row.get("permission_claims_enabled"),
+        created_at_unix_micros: row.get("created_us"),
     })
 }
 
@@ -32224,6 +32521,23 @@ impl<'a> ManagementStore<'a> {
         }
     }
 
+    /// The read-only resource-server repository for `scope` (issue #29, reached from
+    /// the control plane for issue #98). The registry is environment-scoped, so
+    /// `(tenant, environment)` is its complete address and the row-level-security
+    /// policy is its complete fence.
+    ///
+    /// The identical accessor on [`ScopedStore`] is what the MINT reads through. This
+    /// one exists so the management API and the cross-scope IDOR probes reach the
+    /// same repository through the control plane's own door, exactly as
+    /// [`ManagementStore::permissions`] does.
+    #[must_use]
+    pub fn resource_servers(&self, scope: Scope) -> ResourceServerRepo<'a> {
+        ResourceServerRepo {
+            store: self.store,
+            scope,
+        }
+    }
+
     /// The read-only per-organization authentication policy repository for `scope`
     /// (issue #95). Policies are environment-scoped, so the repository is
     /// constructible only from a `(tenant, environment)` scope and binds row-level
@@ -32428,6 +32742,22 @@ impl<'a> ActingManagementStore<'a> {
     #[must_use]
     pub fn permissions(&self, scope: Scope) -> ActingPermissionRepo<'a> {
         ActingPermissionRepo {
+            store: self.store,
+            acting: self.acting,
+            scope,
+        }
+    }
+
+    /// The mutating resource-server repository for `scope` (issue #98): set or clear
+    /// the permission-claim opt-in, audited.
+    ///
+    /// The REGISTRATION half of this repository is reached through
+    /// [`ActingStore::resource_servers`] and is unchanged; this door exists because
+    /// the opt-in is a management-plane mutation and migration 0094 grants its
+    /// column-scoped UPDATE to the control role alone.
+    #[must_use]
+    pub fn resource_servers(&self, scope: Scope) -> ActingResourceServerRepo<'a> {
+        ActingResourceServerRepo {
             store: self.store,
             acting: self.acting,
             scope,
@@ -44826,8 +45156,21 @@ async fn read_promoted_snapshot(
     tx: &mut Transaction<'_, Postgres>,
     scope: Scope,
 ) -> Result<crate::snapshot::Snapshot, StoreError> {
+    // Every PROMOTABLE column of the row, and the column list is hard coded rather
+    // than shared with `RESOURCE_SERVER_SELECT_COLUMNS` because the two projections
+    // answer different questions: that one is the runtime record (it carries `id`,
+    // which is scope-embedding and must never be promoted), this one is the
+    // snapshot's secret-free projection. A column added to `ResourceServerSnapshot`
+    // and not added here PANICS on the next promotion, because `Row::get` reports
+    // `ColumnNotFound` for a column the projection did not select. Measured by
+    // dropping `permission_claims_enabled` from this SELECT, which turns the two
+    // opt-in cases in tests/config_promotion.rs red with
+    // `ColumnNotFound("permission_claims_enabled")`. The failure is loud, and it is
+    // still a promotion site because the panic is a runtime one on the apply path
+    // rather than a compile error.
     let mut resource_server: Vec<crate::snapshot::ResourceServerSnapshot> = sqlx::query(
-        "SELECT audience, token_format, access_token_ttl_secs FROM resource_servers \
+        "SELECT audience, token_format, access_token_ttl_secs, permission_claims_enabled \
+         FROM resource_servers \
          WHERE tenant_id = $1 AND environment_id = $2",
     )
     .bind(scope.tenant().to_string())
@@ -44839,6 +45182,7 @@ async fn read_promoted_snapshot(
         audience: row.get("audience"),
         token_format: row.get("token_format"),
         access_token_ttl_secs: row.get("access_token_ttl_secs"),
+        permission_claims_enabled: row.get("permission_claims_enabled"),
     })
     .collect();
     resource_server.sort_by(|a, b| a.audience.cmp(&b.audience));
@@ -45014,10 +45358,14 @@ async fn apply_resource_server_change(
                 .find(|server| server.audience == change.key)
                 .ok_or(StoreError::NotFound)?;
             let id = ResourceServerId::generate(env, &scope);
+            // 0035's `GRANT INSERT` is table-wide, so the new column may be named
+            // here freely; only the UPDATE arm below needs migration 0094's
+            // column-scoped grant.
             sqlx::query(
                 "INSERT INTO resource_servers \
-                 (id, tenant_id, environment_id, audience, token_format, access_token_ttl_secs) \
-                 VALUES ($1, $2, $3, $4, $5, $6)",
+                 (id, tenant_id, environment_id, audience, token_format, \
+                  access_token_ttl_secs, permission_claims_enabled) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
             )
             .bind(id.to_string())
             .bind(scope.tenant().to_string())
@@ -45025,6 +45373,7 @@ async fn apply_resource_server_change(
             .bind(&server.audience)
             .bind(&server.token_format)
             .bind(server.access_token_ttl_secs)
+            .bind(server.permission_claims_enabled)
             .execute(&mut **tx)
             .await?;
             Ok(())
@@ -45036,13 +45385,21 @@ async fn apply_resource_server_change(
                 .iter()
                 .find(|server| server.audience == change.key)
                 .ok_or(StoreError::NotFound)?;
+            // Every promotable column in one SET list. This is the statement migration
+            // 0094's `GRANT UPDATE (permission_claims_enabled)` exists for: the control
+            // role's UPDATE grant on this table is COLUMN-scoped (0035), so naming a
+            // column outside it is refused with SQLSTATE 42501 and the whole apply
+            // fails. `the_promotion_apply_fails_42501_without_the_permission_claims_grant`
+            // in tests/config_promotion.rs revokes it and measures exactly that.
             sqlx::query(
                 "UPDATE resource_servers \
-                 SET token_format = $1, access_token_ttl_secs = $2 \
-                 WHERE tenant_id = $3 AND environment_id = $4 AND audience = $5",
+                 SET token_format = $1, access_token_ttl_secs = $2, \
+                     permission_claims_enabled = $3 \
+                 WHERE tenant_id = $4 AND environment_id = $5 AND audience = $6",
             )
             .bind(&server.token_format)
             .bind(server.access_token_ttl_secs)
+            .bind(server.permission_claims_enabled)
             .bind(scope.tenant().to_string())
             .bind(scope.environment().to_string())
             .bind(&server.audience)

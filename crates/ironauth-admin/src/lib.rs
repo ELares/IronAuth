@@ -83,6 +83,7 @@ mod promotion;
 mod provision;
 mod ratelimit;
 mod recovery_approvals;
+mod resource_servers;
 mod resource_types;
 mod response;
 mod sessions;
@@ -324,6 +325,23 @@ pub fn management_router(state: AdminState) -> Router {
             get(permissions::get_permission)
                 .patch(permissions::update_permission)
                 .delete(permissions::delete_permission),
+        )
+        // The resource-server registry (issue #98): the audience-to-format registry
+        // issue #29 shipped, given a management surface for the first time. Like the
+        // permission vocabulary this is ENVIRONMENT level and takes no organization:
+        // a registered protected API belongs to the environment. Addressed by `rsv_`
+        // id, never by audience, because an audience is an absolute URI carrying `:`
+        // and `/` and cannot be a path segment. The PATCH writes exactly one column,
+        // the permission-claim opt-in; full resource-server CRUD is not this issue's
+        // business.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/resource-servers",
+            get(resource_servers::list_resource_servers),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/resource-servers/{resource_server_id}",
+            get(resource_servers::get_resource_server)
+                .patch(resource_servers::update_resource_server_permission_claims),
         )
         // Organizations: the fourth level of the resource model (issue #41), a
         // minimal per-environment shell M10 extends with membership.

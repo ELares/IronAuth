@@ -597,6 +597,13 @@ pub enum Action {
     /// A resource server was registered (issue #29). Records the audience and the
     /// access-token format a registered protected API receives.
     ResourceServerRegister,
+    /// A resource server's PERMISSION-CLAIM opt-in was set or cleared (issue #98).
+    /// The second mutation `resource_servers` admits, and the only one that changes
+    /// what a token minted for that audience may carry. One action for both
+    /// directions: whether the opt-in is on is always the stored column, never a fold
+    /// over these events (ADR 0002), so a separate `clear` action would be two names
+    /// for one state transition and would invite exactly that fold.
+    ResourceServerPermissionClaimsSet,
     /// A refresh-token family was opened at first issuance (issue #21). The
     /// generation-0 refresh token and its family were recorded against the grant.
     RefreshTokenIssue,
@@ -1270,6 +1277,7 @@ impl Action {
             Action::ConsentSkipped => "consent.skip",
             Action::SigningKeyProvision => "signing_key.provision",
             Action::ResourceServerRegister => "resource_server.register",
+            Action::ResourceServerPermissionClaimsSet => "resource_server.permission_claims.set",
             Action::RefreshTokenIssue => "refresh_token.issue",
             Action::RefreshTokenRotate => "refresh_token.rotate",
             Action::RefreshTokenReuse => "refresh_token.reuse",

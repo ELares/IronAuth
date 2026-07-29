@@ -6,6 +6,32 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Resource-server registry management API (issue #98, PR 11), a NET-NEW surface: the
+  audience-to-format registry issue #29 shipped has never had a management route.
+  `GET .../resource-servers` (`listResourceServers`, cursor paginated), `GET
+  .../resource-servers/{resource_server_id}` (`getResourceServer`), and `PATCH` on the
+  same path (`updateResourceServerPermissionClaims`). Addressed by `rsv_` id and never
+  by audience, because an audience is an absolute URI containing `:` and `/` and cannot
+  be a path segment; the list exists so a console can resolve an audience to its id.
+  ENVIRONMENT level and not per organization, because `resource_servers` carries no
+  `organization_id`, so the row-level-security policy is the table's complete fence.
+  The PATCH is narrow by design and writes exactly `permission_claims_enabled`; full
+  resource-server CRUD is out of scope for this issue, and a body that NAMES
+  `token_format`, `audience`, or `access_token_ttl_secs` is a typed 400 saying which
+  field and why rather than a 200 that dropped it (presence, so `null` is refused like a
+  value; genuinely unknown keys are still ignored as everywhere else). Permission claims
+  are an `at+jwt`-ONLY feature, so the PATCH REFUSES enabling the opt-in on a resource
+  server whose `token_format` is anything other than `at_jwt` with a typed 422 naming the
+  reason (an opaque access token carries no claims, so the setting could only be silently
+  dropped at mint time); clearing the flag on an opaque resource server stays allowed,
+  because a config promotion can land that combination with no handler in the path and a
+  refusal would trap the row there. The refusal is reachable only AFTER the row resolves
+  in this scope, so it is not a token-format oracle. Sudo gated like every management
+  mutation; every addressing failure is one byte-identical `not_found`. The OpenAPI
+  op-id/path/count contract and `docs/openapi/management.json` are updated accordingly
+  (138 -> 141 routes), along with `packages/admin-spa/src/api/management.gen.ts` and a
+  new `docs/THREAT-MODEL.md` section.
+
 - Per-connector health-diagnostics read for issue #76:
   `GET .../connectors/{connector_id}/health` (`getConnectorHealth`, operator-gated,
   secret-free) returns THIS node's live federation health for a connector (state, recent

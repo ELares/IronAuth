@@ -82,6 +82,17 @@ use crate::views::{
                                              calling the same API; which permissions a ROLE \
                                              grants is per organization. The slug and the kind \
                                              are immutable. Uncapped in number by covenant"),
+        (name = "resource-servers", description = "The resource-server registry (issue #29), \
+                                                  given a management surface by issue #98. \
+                                                  ENVIRONMENT level and not per organization: a \
+                                                  registered protected API belongs to the \
+                                                  environment. Addressed by `rsv_` id and never \
+                                                  by audience, because an audience is an \
+                                                  absolute URI and cannot be a path segment; the \
+                                                  list exists so a console can find the id. The \
+                                                  PATCH writes exactly one column, the \
+                                                  permission-claim opt-in, and refuses to enable \
+                                                  it on an `opaque` resource server"),
         (name = "org-role-permissions", description = "The role-to-permission mapping \
                                                        (issue #98): which permissions of the \
                                                        ENVIRONMENT'S vocabulary one \
@@ -183,6 +194,9 @@ use crate::views::{
         crate::permissions::get_permission,
         crate::permissions::update_permission,
         crate::permissions::delete_permission,
+        crate::resource_servers::list_resource_servers,
+        crate::resource_servers::get_resource_server,
+        crate::resource_servers::update_resource_server_permission_claims,
         crate::org_roles::create_org_role,
         crate::org_roles::list_org_roles,
         crate::org_roles::get_org_role,
@@ -317,6 +331,9 @@ use crate::views::{
         crate::permissions::PermissionList,
         crate::permissions::CreatePermissionRequest,
         crate::permissions::UpdatePermissionRequest,
+        crate::resource_servers::ResourceServerView,
+        crate::resource_servers::ResourceServerList,
+        crate::resource_servers::UpdateResourceServerRequest,
         crate::org_roles::OrgRoleView,
         crate::org_roles::OrgRoleList,
         crate::org_roles::CreateOrgRoleRequest,

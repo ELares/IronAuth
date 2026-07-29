@@ -31,7 +31,7 @@ use ironauth_store::{
     NewFlowVersion, NewResourceServer, PromotionApplyError, PromotionOutcome, Reference, Resolved,
     ResourceServerId, SNAPSHOT_SCHEMA_VERSION, Scope, Snapshot, SnapshotResources, Store,
     TokenFormat, VariableSnapshot, diff_snapshots, export_snapshot, plan_promotion,
-    promotion_revision, resolve_value,
+    promotion_revision, resolve_value, validate_document,
 };
 
 /// A fresh write actor plus correlation id for a mutation.
@@ -1011,4 +1011,344 @@ async fn a_load_invalid_promoted_artifact_rolls_back_the_whole_apply() {
         "no version survives a rolled-back apply"
     );
     assert_eq!(apply_audit_count(&db, target).await, 0);
+}
+
+/// Set a resource server's issue #98 permission-claim opt-in in `scope`, addressed
+/// by audience (control plane).
+async fn set_opt_in(db: &TestDatabase, env: &Env, scope: Scope, audience: &str, enabled: bool) {
+    let record = control(db)
+        .scoped(scope)
+        .resource_servers()
+        .by_audience(audience)
+        .await
+        .expect("read resource server")
+        .expect("the resource server is registered");
+    let (actor, corr) = acting(db, env);
+    control(db)
+        .management()
+        .acting(actor, corr)
+        .resource_servers(scope)
+        .set_permission_claims(env, &record.id, enabled)
+        .await
+        .expect("set the permission-claim opt-in");
+}
+
+/// The stored opt-in of one audience in `scope` (control plane).
+async fn opt_in_of(db: &TestDatabase, scope: Scope, audience: &str) -> bool {
+    control(db)
+        .scoped(scope)
+        .resource_servers()
+        .by_audience(audience)
+        .await
+        .expect("read resource server")
+        .expect("the resource server is registered")
+        .permission_claims_enabled
+}
+
+/// The issue #98 permission-claim opt-in survives an EXPORT and a re-APPLY intact,
+/// on the CREATE arm and on the UPDATE arm, and it is a promotable difference in its
+/// own right.
+///
+/// This is the end-to-end proof of the four promotion sites plus the schema, and it
+/// is written so that breaking ANY ONE of them turns it red rather than leaving it
+/// green on a coincidence. Concretely:
+///
+///   * Drop the field from `ResourceServerSnapshot` and it does not compile.
+///   * Write `false` into the EXPORT (`snapshot::export`) and the source snapshot
+///     carries `false`, so the create arm below lands `false` in the target.
+///   * Write `false` into `read_promoted_snapshot` and the TARGET side of every diff
+///     reads `false`, so the second phase reports no change for a difference that is
+///     real and `assert!(diff.is_empty())` after the apply fails. Dropping the COLUMN
+///     from that projection instead is louder still: `Row::get` panics with
+///     `ColumnNotFound`, measured.
+///   * Drop it from the apply's INSERT and the create arm lands the column default.
+///   * Drop it from the apply's UPDATE SET list and the second phase changes nothing.
+///   * Drop it from `RESOURCE_SERVER_KEYS` (the Rust mirror of the schema's
+///     `additionalProperties: false`) and the plan fails validation outright, which
+///     `the_exported_permission_claim_opt_in_validates_and_round_trips` below is the
+///     test for.
+#[tokio::test]
+async fn the_permission_claim_opt_in_survives_an_export_and_an_apply() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let source = db.seed_scope(&env).await;
+    let target = Scope::new(
+        source.tenant(),
+        db.seed_environment(&env, source.tenant()).await,
+    );
+
+    // --- Phase 1: the CREATE arm. The audience exists only in the source, opted IN.
+    register_rs(
+        &db,
+        &env,
+        source,
+        "https://api.opted-in",
+        TokenFormat::AtJwt,
+    )
+    .await;
+    set_opt_in(&db, &env, source, "https://api.opted-in", true).await;
+    // A second audience left opted OUT, so a bug that hard-codes `true` anywhere is
+    // as visible as one that hard-codes `false`.
+    register_rs(
+        &db,
+        &env,
+        source,
+        "https://api.opted-out",
+        TokenFormat::AtJwt,
+    )
+    .await;
+
+    let source_snapshot = export(&db, source).await;
+    // The EXPORT site, asserted directly: the flag is IN the document, per audience.
+    let exported: Vec<(&str, bool)> = source_snapshot
+        .resources
+        .resource_server
+        .iter()
+        .map(|server| (server.audience.as_str(), server.permission_claims_enabled))
+        .collect();
+    assert_eq!(
+        exported,
+        vec![
+            ("https://api.opted-in", true),
+            ("https://api.opted-out", false)
+        ],
+        "the export carries the opt-in per audience"
+    );
+
+    let plan = plan_promotion(&control(&db).scoped(target), &source_snapshot)
+        .await
+        .expect("plan db")
+        .expect("plan builds");
+    let (actor, corr) = acting(&db, &env);
+    control(&db)
+        .scoped(target)
+        .acting(actor, corr)
+        .apply_promotion(&env, &source_snapshot, plan.base_revision(), false)
+        .await
+        .expect("apply the creates");
+
+    assert!(
+        opt_in_of(&db, target, "https://api.opted-in").await,
+        "the CREATE arm of the apply must land the opt-in, not the column default"
+    );
+    assert!(
+        !opt_in_of(&db, target, "https://api.opted-out").await,
+        "an opted-out audience must land opted out"
+    );
+
+    // The ROUND TRIP: re-exporting the target and re-diffing must be empty. This is
+    // what `read_promoted_snapshot` is on the hook for, because that read is the
+    // TARGET side of the diff.
+    let target_after = export(&db, target).await;
+    assert!(
+        diff_snapshots(&source_snapshot, &target_after).is_empty(),
+        "apply then re-diff must be empty: {:?}",
+        diff_snapshots(&source_snapshot, &target_after)
+    );
+
+    // --- Phase 2: the UPDATE arm, driven by the OPT-IN ALONE. Both audiences exist
+    //     in both environments now, so nothing but this one boolean differs.
+    set_opt_in(&db, &env, source, "https://api.opted-in", false).await;
+    set_opt_in(&db, &env, source, "https://api.opted-out", true).await;
+
+    let flipped = export(&db, source).await;
+    let diff = diff_snapshots(&flipped, &target_after);
+    assert_eq!(
+        diff.len(),
+        2,
+        "the opt-in alone must be a promotable difference: {diff:?}"
+    );
+
+    let plan = plan_promotion(&control(&db).scoped(target), &flipped)
+        .await
+        .expect("plan db")
+        .expect("plan builds");
+    let (actor, corr) = acting(&db, &env);
+    control(&db)
+        .scoped(target)
+        .acting(actor, corr)
+        .apply_promotion(&env, &flipped, plan.base_revision(), false)
+        .await
+        .expect("apply the updates");
+
+    assert!(
+        !opt_in_of(&db, target, "https://api.opted-in").await,
+        "the UPDATE arm must promote the opt-in OFF"
+    );
+    assert!(
+        opt_in_of(&db, target, "https://api.opted-out").await,
+        "the UPDATE arm must promote the opt-in ON"
+    );
+    assert!(
+        diff_snapshots(&flipped, &export(&db, target).await).is_empty(),
+        "the second apply must round-trip too"
+    );
+}
+
+/// The exported opt-in VALIDATES against the snapshot schema's Rust mirror.
+///
+/// Its own test rather than more lines in the round-trip above, and it guards a
+/// promotion site the round-trip cannot reach: `RESOURCE_SERVER_KEYS` in
+/// `ironauth_store::snapshot` is the Rust copy of `additionalProperties: false` on
+/// the published `docs/snapshot/snapshot.schema.json`. Drop the field from that list
+/// and `validate_document` reports "unknown field" on the EXPORTER'S OWN OUTPUT: the
+/// document stops being a legal snapshot, so no operator could submit it and the
+/// whole promotion path for this resource type is dead. The apply path never calls
+/// the validator, which is exactly why the round-trip test stays green under that
+/// mutation and this one does not.
+#[tokio::test]
+async fn the_exported_permission_claim_opt_in_validates_and_round_trips() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    register_rs(&db, &env, scope, "https://api.opted-in", TokenFormat::AtJwt).await;
+    set_opt_in(&db, &env, scope, "https://api.opted-in", true).await;
+
+    let bytes = export(&db, scope)
+        .await
+        .to_canonical_bytes()
+        .expect("canonicalize the exported snapshot");
+    let parsed = validate_document(&bytes).expect("the exported snapshot must validate");
+    assert_eq!(
+        parsed
+            .resources
+            .resource_server
+            .iter()
+            .filter(|server| server.permission_claims_enabled)
+            .count(),
+        1,
+        "the opt-in survives the validator"
+    );
+    // Validate then re-serialize is byte-identical, so the field survives a document
+    // that has been through the validator rather than merely being tolerated by it.
+    assert_eq!(
+        bytes,
+        parsed.to_canonical_bytes().expect("reserialize"),
+        "the canonical snapshot must round-trip byte-identically"
+    );
+}
+
+/// Migration 0094's `GRANT UPDATE (permission_claims_enabled)` is LOAD BEARING:
+/// without it a config promotion that updates a resource server is refused by
+/// Postgres with SQLSTATE 42501 and the whole apply fails.
+///
+/// The claim in the migration header is MEASURED here rather than asserted. The
+/// grant is revoked on THIS test's throwaway database (`TestDatabase::start` creates
+/// a fresh one per run, so no other test can see it), the apply is driven, and the
+/// SQLSTATE is read off the failure. Then the grant is restored and the SAME apply is
+/// driven again and succeeds, which is what rules out "the apply would have failed
+/// anyway".
+///
+/// It also pins WHICH statement fails. The CREATE arm runs first, with the grant
+/// already revoked, and SUCCEEDS, because 0035's `GRANT INSERT` is table-wide. Only
+/// the column-scoped UPDATE is affected.
+///
+/// The source-side difference is introduced by editing the EXPORTED SNAPSHOT rather
+/// than by writing the source database, deliberately: the store writer for this
+/// column needs the very grant under test, so writing the source would fail for the
+/// same reason and prove nothing about the apply. A snapshot is also exactly what an
+/// operator promoting between environments actually submits.
+#[tokio::test]
+async fn the_promotion_apply_fails_42501_without_the_permission_claims_grant() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let source = db.seed_scope(&env).await;
+    let target = Scope::new(
+        source.tenant(),
+        db.seed_environment(&env, source.tenant()).await,
+    );
+
+    register_rs(&db, &env, source, "https://api.example", TokenFormat::AtJwt).await;
+    set_opt_in(&db, &env, source, "https://api.example", true).await;
+    let source_snapshot = export(&db, source).await;
+
+    // Revoke the grant 0094 added. The owner pool is the schema owner, so this leaves
+    // the database in exactly the state an operator who applied 0035 and skipped
+    // 0094 would have.
+    sqlx::query(
+        "REVOKE UPDATE (permission_claims_enabled) ON resource_servers FROM ironauth_control",
+    )
+    .execute(db.owner_pool())
+    .await
+    .expect("revoke the 0094 column grant");
+
+    // The CREATE arm still works with the grant revoked: `GRANT INSERT` is table-wide.
+    let plan = plan_promotion(&control(&db).scoped(target), &source_snapshot)
+        .await
+        .expect("plan db")
+        .expect("plan builds");
+    let (actor, corr) = acting(&db, &env);
+    control(&db)
+        .scoped(target)
+        .acting(actor, corr)
+        .apply_promotion(&env, &source_snapshot, plan.base_revision(), false)
+        .await
+        .expect("the create arm needs no column grant");
+    assert!(
+        opt_in_of(&db, target, "https://api.example").await,
+        "the create landed the opt-in through the table-wide INSERT grant"
+    );
+
+    // Now drive the UPDATE arm, with the OPT-IN as the only difference, so the apply
+    // must write the very column the grant was revoked on.
+    let mut flipped = source_snapshot.clone();
+    flipped.resources.resource_server[0].permission_claims_enabled = false;
+    let plan = plan_promotion(&control(&db).scoped(target), &flipped)
+        .await
+        .expect("plan db")
+        .expect("plan builds");
+    assert_eq!(plan.diff().len(), 1, "exactly one update to apply");
+    let (actor, corr) = acting(&db, &env);
+    let error = control(&db)
+        .scoped(target)
+        .acting(actor, corr)
+        .apply_promotion(&env, &flipped, plan.base_revision(), false)
+        .await
+        .expect_err("the update arm must be refused without the column grant");
+
+    let PromotionApplyError::Store(store_error) = error else {
+        panic!("expected a store error carrying the Postgres refusal, got {error:?}");
+    };
+    let sqlstate = match &store_error {
+        ironauth_store::StoreError::Database(sqlx::Error::Database(database)) => database
+            .code()
+            .map(std::borrow::Cow::into_owned)
+            .expect("the refusal carries a SQLSTATE"),
+        other => panic!("expected a database error, got {other:?}"),
+    };
+    assert_eq!(
+        sqlstate, "42501",
+        "the missing column grant must surface as insufficient_privilege"
+    );
+
+    // ATOMIC: the refused apply changed nothing, so the target still reads what the
+    // create landed.
+    assert!(
+        opt_in_of(&db, target, "https://api.example").await,
+        "a refused apply must leave the target untouched"
+    );
+
+    // RESTORE the grant, and the SAME apply now succeeds. Without this half the test
+    // would pass against an apply that was broken for some entirely other reason.
+    sqlx::query("GRANT UPDATE (permission_claims_enabled) ON resource_servers TO ironauth_control")
+        .execute(db.owner_pool())
+        .await
+        .expect("restore the 0094 column grant");
+
+    let plan = plan_promotion(&control(&db).scoped(target), &flipped)
+        .await
+        .expect("plan db")
+        .expect("plan builds");
+    let (actor, corr) = acting(&db, &env);
+    control(&db)
+        .scoped(target)
+        .acting(actor, corr)
+        .apply_promotion(&env, &flipped, plan.base_revision(), false)
+        .await
+        .expect("with the grant restored the same apply succeeds");
+    assert!(
+        !opt_in_of(&db, target, "https://api.example").await,
+        "the restored grant lets the update land"
+    );
 }
