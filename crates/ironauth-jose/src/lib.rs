@@ -159,7 +159,7 @@ pub use jwks::{Jwk, JwkSet, trusted_keys_from_jwks};
 pub use keystore::EnvironmentKeyStore;
 pub use mint::{
     ClientSecret, ClientSecretContext, ClientSecretJws, EmissionOptions, MacAlgorithm, SignError,
-    sign_jws, sign_jws_with_policy,
+    b64_no_pad_len, compact_len, protected_header, sign_jws, sign_jws_with_policy,
 };
 pub use policy::{
     JwsAlgorithm, KeyError, KeyFamily, PolicyError, TrustedKey, VerificationCaps,

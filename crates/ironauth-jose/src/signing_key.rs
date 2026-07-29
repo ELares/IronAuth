@@ -47,6 +47,19 @@ const ED25519_SEED_LEN: usize = 32;
 /// weaker key than the verifier will accept.
 const RSA_MIN_MODULUS_BYTES: usize = 256;
 
+/// The number of bytes in an Ed25519 signature (RFC 8032): `R || S`, 32 each.
+const ED25519_SIGNATURE_BYTES: usize = 64;
+
+/// The number of bytes in a JWS `ES256` signature (RFC 7518 section 3.4): the
+/// fixed-width `R || S` concatenation, 32 bytes per P-256 coordinate. This crate
+/// signs ECDSA through ring's `*_FIXED_SIGNING` algorithms, never the ASN.1 DER
+/// forms, so the width does not vary with the value of `R` or `S`.
+const ECDSA_P256_SIGNATURE_BYTES: usize = 64;
+
+/// The number of bytes in a JWS `ES384` signature: fixed-width `R || S`, 48 bytes
+/// per P-384 coordinate. See [`ECDSA_P256_SIGNATURE_BYTES`] on fixed width.
+const ECDSA_P384_SIGNATURE_BYTES: usize = 96;
+
 /// The private key material for one asymmetric signing key.
 ///
 /// Crate-private: the live `ring` key objects are handed only to the private
@@ -246,6 +259,34 @@ impl SigningKey {
     #[must_use]
     pub fn key_family(&self) -> KeyFamily {
         self.algorithm.key_family()
+    }
+
+    /// The number of RAW signature bytes this key produces, before `base64url`.
+    ///
+    /// EXACT and CONSTANT for the key, not an upper bound, which is what lets a
+    /// caller compute a compact token's length before the token exists (issue
+    /// #98, see [`crate::compact_len`]). Every algorithm this crate signs has a
+    /// fixed signature width: Ed25519 and `ES256` are 64 bytes, `ES384` is 96, and
+    /// every RSA algorithm is THAT KEY's modulus width. The RSA width is per key
+    /// rather than one constant, because the enforced 2048-bit modulus is a
+    /// MINIMUM and not a fixed size: a 3072-bit key loads and signs 384 bytes, so
+    /// a hardcoded 256 would under-predict a compact token by 128 bytes for every
+    /// deployment that uses one.
+    ///
+    /// The ECDSA widths hold because the mint signs through ring's
+    /// `ECDSA_*_FIXED_SIGNING` algorithms, which emit the JWS `R || S`
+    /// concatenation of RFC 7518 section 3.4. A DER-encoded ECDSA signature would
+    /// be VARIABLE length, and a length computed from it would be silently wrong
+    /// on the fraction of signatures whose `R` or `S` has a short big-endian
+    /// encoding; nothing here ever produces one.
+    #[must_use]
+    pub fn signature_len(&self) -> usize {
+        match &self.inner {
+            KeyInner::Ed25519(_) => ED25519_SIGNATURE_BYTES,
+            KeyInner::EcdsaP256(_) => ECDSA_P256_SIGNATURE_BYTES,
+            KeyInner::EcdsaP384(_) => ECDSA_P384_SIGNATURE_BYTES,
+            KeyInner::Rsa(key) => key.public().modulus_len(),
+        }
     }
 
     /// The matching public verification key, as the one hardened verifier's

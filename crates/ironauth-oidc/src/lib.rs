@@ -120,6 +120,9 @@ mod migration;
 mod pages;
 mod par;
 mod password;
+/// The pure permission-claim budget (issue #98). INERT on this build: nothing
+/// calls it yet, and the mint hooks are wired in a later PR.
+mod permission_budget;
 mod phone;
 mod pkce;
 mod policy_trace;

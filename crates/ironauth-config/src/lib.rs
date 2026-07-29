@@ -454,11 +454,19 @@ pub struct TokenClaimsConfig {
     /// [`TOKEN_CLAIMS_DEFAULT_PERMISSION_CLAIM_MAX_COUNT`] (256); config load
     /// REJECTS a value above the 4096 ceiling
     /// ([`TOKEN_CLAIMS_PERMISSION_CLAIM_MAX_COUNT_CEILING`]). `0` does NOT mean
-    /// unlimited, and this setting has no unlimited value: `0` means no permission
-    /// claim is ever emitted, which is a valid, safe posture, but set
-    /// `permission_claim_warn_count = 0` alongside it or the load is refused,
-    /// because config load also rejects a threshold above the maximum it warns about
-    /// and the shipped 192 threshold would then exceed this maximum.
+    /// unlimited, and this setting has no unlimited value: `0` means no NON-EMPTY
+    /// permission claim is ever emitted. An EMPTY claim still is, because the bound
+    /// is at-the-maximum-emits at both ends (a set of exactly `0` elements is within
+    /// a bound of `0`, exactly as a token of exactly `access_token_max_bytes` is
+    /// within that bound), and `permissions: []` is a meaningful statement: the
+    /// subject is in an organization and holds nothing. `0` is a valid, safe posture
+    /// for bounding the claim, but it is NOT the deployment-wide off switch; that is
+    /// the per-resource-server `permission_claims_enabled` opt-in, which lands with
+    /// the claim itself (issue #98) and is what stops the claim being emitted at
+    /// all. Set
+    /// `permission_claim_warn_count = 0` alongside a `0` maximum or the load is
+    /// refused, because config load also rejects a threshold above the maximum it
+    /// warns about and the shipped 192 threshold would then exceed this maximum.
     ///
     /// This bounds the CLAIM, never the model: it is not a cap on how many
     /// permissions an environment may define, how many a role may hold, or how many

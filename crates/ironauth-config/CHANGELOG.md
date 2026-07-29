@@ -28,8 +28,9 @@ range per docs/RELEASING.md.
   has no `truncate` variant and will not get one: a partial permission set is
   indistinguishable to a resource server from a complete one, so its having exactly two
   variants is what makes silent truncation unrepresentable rather than merely unconfigured.
-  `0` is valid on every numeric key and means the STRICTEST posture (no permission claim
-  is ever emitted), never unlimited; none of them has an unlimited value. Setting a
+  `0` is valid on every numeric key and means the STRICTEST posture (no NON-EMPTY
+  permission claim is ever emitted), never unlimited; none of them has an unlimited
+  value. Setting a
   MAXIMUM to `0` requires setting its sibling threshold to `0` in the same edit, because
   the shipped threshold default would otherwise exceed the lowered maximum and the load
   is refused (the refusal names both keys and both values); this is the general shape of
@@ -49,6 +50,18 @@ range per docs/RELEASING.md.
   `ironauth_oidc::ID_TOKEN_BLOAT_THRESHOLD_BYTES` is public and `ironauth-admin` pins the
   two equal, beside the session-TTL and group-depth ceiling agreements. `docs/CONFIG.md`
   and `docs/config-schema.json` regenerate.
+- Corrected the `token_claims.permission_claim_max_count = 0` posture sentence (issue #98).
+  It said `0` means "no permission claim is ever emitted"; the budget core proves it means
+  no NON-EMPTY one. The bound is at-the-maximum-EMITS at both ends, so a set of exactly `0`
+  elements is within a bound of `0` and `permissions: []` is still emitted, which is a
+  meaningful statement (the subject is in an organization and holds nothing) rather than an
+  oversight. The code boundary is deliberately unchanged: special-casing `0` would make it
+  the one bound in the section that excludes its own maximum. The sentence now also points
+  an operator at the switch that DOES turn the claim off deployment-wide, the
+  per-resource-server `permission_claims_enabled` opt-in, since somebody reading the `0`
+  posture is looking for exactly that. The correction sits in the FIRST paragraph, so it
+  reaches the generated operator reference; `docs/CONFIG.md` and `docs/config-schema.json`
+  regenerate.
 - Organization group nesting bound for issue #97: the new top-level `[organizations]` section
   (`OrganizationsConfig`) with `organizations.max_group_depth` (default
   `ORGANIZATIONS_DEFAULT_MAX_GROUP_DEPTH` = 8, refused above the
