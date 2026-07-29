@@ -148,6 +148,23 @@ pub struct Config {
     /// resolves a subject's effective roles.
     pub organizations: OrganizationsConfig,
 
+    /// Token claim budget settings (issue #98): the SIZE bounds an access token
+    /// carrying a permissions claim is held to. NOTHING CONSULTS THESE KEYS YET.
+    /// They are validated at load and installed on both planes, but the permissions
+    /// claim and its budget enforcement land with the claim itself, so setting any
+    /// of them changes no response and no token on this build; issue #413 tracks
+    /// deleting this sentence when the mint activates the claim. The budget is a
+    /// size bound on a TOKEN, never a cap on how many permissions or roles may be
+    /// STORED; every key is named for the CLAIM it bounds rather than for the model,
+    /// so `permission_claim_max_count` bounds what one claim carries, and there is
+    /// no `max_permissions_per_role` and there never will be.
+    ///
+    /// A top-level section rather than a field on `[oidc]` deliberately, because
+    /// the budget is consumed on BOTH planes: the mint enforces it and the
+    /// management API reports the approach warning against it, so one bound has one
+    /// operator-visible name.
+    pub token_claims: TokenClaimsConfig,
+
     /// Feature toggles keyed by registered feature name. Enabling an
     /// experimental feature additionally requires `ack` equal to the
     /// feature's exact current version; see the feature reference in the
@@ -283,6 +300,258 @@ impl Default for OrganizationsConfig {
     fn default() -> Self {
         Self {
             max_group_depth: ORGANIZATIONS_DEFAULT_MAX_GROUP_DEPTH,
+        }
+    }
+}
+
+/// The default largest compact access token, in bytes, the mint will emit WITH a
+/// permissions claim (issue #98). Measured over the whole compact JWS string, which
+/// is the number an `Authorization` header limit applies to. 4096 sits inside the
+/// request-header budget a default reverse proxy or gateway allows for the entire
+/// header block, so a token within it rides an unmodified deployment.
+pub const TOKEN_CLAIMS_DEFAULT_ACCESS_TOKEN_MAX_BYTES: u32 = 4096;
+
+/// The hard ceiling on `token_claims.access_token_max_bytes` (issue #98). Config
+/// load refuses any larger value, because this budget bounds a per-request cost
+/// paid by everyone downstream, not a one-off: the token is serialized once per
+/// mint, then carried in the header block of every call that presents it and parsed
+/// and signature-verified by every resource server that receives it, for the
+/// token's whole lifetime. 32768 is already far outside the header budget a default
+/// proxy allows, so an operator who raises the bound to the ceiling has left the
+/// region where a token is transportable at all; admitting anything larger would
+/// let one configuration put an unbounded per-request cost on every resource server
+/// the token reaches.
+pub const TOKEN_CLAIMS_ACCESS_TOKEN_MAX_BYTES_CEILING: u32 = 32768;
+
+/// The default approach threshold, in bytes, for the compact access token size
+/// (issue #98). Deliberately equal to the shipped ID-token growth signal threshold
+/// (`ID_TOKEN_BLOAT_THRESHOLD_BYTES` in the OIDC policy-trace recorder), so an
+/// operator meets ONE number across both token kinds rather than two numbers that
+/// mean the same thing and can disagree.
+pub const TOKEN_CLAIMS_DEFAULT_ACCESS_TOKEN_WARN_BYTES: u32 = 3072;
+
+/// The default largest number of elements the mint will emit in ONE permissions
+/// claim (issue #98). It bounds what the CLAIM carries and nothing else: an
+/// environment may define unlimited permissions and a role may hold unlimited
+/// permissions. The count check exists because counting is free while measuring a
+/// token is not, so an obviously oversized set is settled before a second
+/// serialization is paid for on the token-issuance path.
+pub const TOKEN_CLAIMS_DEFAULT_PERMISSION_CLAIM_MAX_COUNT: u32 = 256;
+
+/// The hard ceiling on `token_claims.permission_claim_max_count` (issue #98).
+/// Config load refuses any larger value, because every admitted element costs an
+/// array entry the mint serializes on the latency-sensitive token-issuance path and
+/// every resource server parses on each call that presents the token. 4096 is well
+/// past any element count that could still fit the byte budget at a realistic slug
+/// width, so the ceiling never binds a working deployment; it only keeps a
+/// configuration from putting an unbounded per-mint serialization and per-request
+/// parse cost on that path.
+pub const TOKEN_CLAIMS_PERMISSION_CLAIM_MAX_COUNT_CEILING: u32 = 4096;
+
+/// The default approach threshold for the permission claim's element count (issue
+/// #98): three quarters of [`TOKEN_CLAIMS_DEFAULT_PERMISSION_CLAIM_MAX_COUNT`], so
+/// an operator sees the approach warning with room left to act before the claim is
+/// withheld.
+pub const TOKEN_CLAIMS_DEFAULT_PERMISSION_CLAIM_WARN_COUNT: u32 = 192;
+
+/// What the mint does when a resolved permission set will not fit the budget
+/// (issue #98). There is no `truncate` variant and there will not be one: a
+/// partial permission set is indistinguishable to a resource server from a
+/// complete one, so silent truncation would be an authorization DOWNGRADE that
+/// no consumer can detect. The enum having exactly two variants IS the
+/// no-silent-truncation guarantee.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionOverflow {
+    /// Withhold the permission claim and emit `permissions_status: "budget_exceeded"`.
+    /// The resource server authorizes from `roles`.
+    #[default]
+    RolesOnly,
+    /// Withhold the permission claim and emit `permissions_status: "pdp_required"`.
+    /// The resource server must consult the policy decision point (issue #100).
+    PdpRequired,
+}
+
+/// Token claim budget settings (issue #98). NOTHING CONSULTS THESE KEYS YET: they
+/// are validated at load and installed on both planes, but the permissions claim
+/// and its budget enforcement land with the claim itself, so setting any of them
+/// changes no response and no token on this build. Issue #413 tracks deleting this
+/// sentence, and its five copies on the fields below, when the mint activates the
+/// claim.
+///
+/// The budget is a SIZE BOUND ON A TOKEN. It is not a cap on how many permissions
+/// or roles may be STORED, and it never becomes one. Every key is named for the
+/// CLAIM it bounds rather than for the model: `permission_claim_max_count` bounds
+/// what one claim carries; there is no `max_permissions_per_role` and there never
+/// will be. No table in the permission and role model has a count column, a
+/// counter, or a quota row, and no CHECK constrains how many permissions an
+/// environment defines, how many a role holds, or how many an organization's roles
+/// collectively grant.
+///
+/// A top-level section rather than a field on `[oidc]` because both planes read it:
+/// the mint enforces the bound and the management API reports the approach warning
+/// against it. Duplicating it under `[oidc]` would give one bound two
+/// operator-visible names that could disagree.
+///
+/// Exceeding the budget never refuses anything. On the management plane the only
+/// statuses the budget can produce are 200 and 201 carrying a warning field; on the
+/// token-issuance path an overflow WITHHOLDS the complete permission claim and says
+/// so on the wire, and never truncates, never refuses issuance, and never returns
+/// an error.
+///
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct TokenClaimsConfig {
+    /// The largest compact access token, in bytes, the mint will emit WITH a
+    /// permissions claim. NOTHING CONSULTS THIS KEY YET: setting it changes no
+    /// response and no token on this build, because the permissions claim and its
+    /// budget enforcement land with the claim itself (issue #413 tracks deleting
+    /// this sentence when the mint activates the claim). Default
+    /// [`TOKEN_CLAIMS_DEFAULT_ACCESS_TOKEN_MAX_BYTES`] (4096); config load REJECTS a
+    /// value above the 32768 ceiling
+    /// ([`TOKEN_CLAIMS_ACCESS_TOKEN_MAX_BYTES_CEILING`]). `0` does NOT mean
+    /// unlimited, and this setting has no unlimited value: `0` means no access token
+    /// may carry a permissions claim at all, which is a valid, safe posture, but set
+    /// `access_token_warn_bytes = 0` alongside it or the load is refused, because
+    /// config load also rejects a threshold above the maximum it warns about and the
+    /// shipped 3072 threshold would then exceed this maximum.
+    ///
+    /// Measured over the COMPACT JWS string (the whole `header.payload.signature` an
+    /// `Authorization` header carries) rather than over the payload, because the
+    /// compact string is what a proxy header limit applies to and what an operator's
+    /// intuition is built on.
+    ///
+    /// This bounds a TOKEN's size. It caps nothing that is counted or stored: the
+    /// number of permissions an environment defines and the number a role holds are
+    /// uncapped by covenant, and no count check exists anywhere in the schema or
+    /// the code. The absence of an unlimited value is what makes the bound a bound.
+    pub access_token_max_bytes: u32,
+
+    /// The approach threshold, in bytes, over the same compact token size. NOTHING
+    /// CONSULTS THIS KEY YET: setting it changes no response and no token on this
+    /// build, because the permissions claim and its budget enforcement land with the
+    /// claim itself (issue #413 tracks deleting this sentence when the mint
+    /// activates the claim). A token within `access_token_max_bytes` but above this
+    /// is reported as approaching the budget; nothing is withheld and no request is
+    /// refused at this threshold. Default
+    /// [`TOKEN_CLAIMS_DEFAULT_ACCESS_TOKEN_WARN_BYTES`] (3072), deliberately the same
+    /// number the ID-token growth signal already uses
+    /// (`ironauth_oidc::ID_TOKEN_BLOAT_THRESHOLD_BYTES`), so an operator meets ONE
+    /// number rather than two that mean the same thing. Config load REJECTS a value
+    /// above `access_token_max_bytes`: a threshold above the bound it warns about
+    /// could never fire, because a token past the bound is settled by the overflow
+    /// mode first. `0` does NOT mean unlimited and does not disable the warning, and
+    /// there is no unlimited value: it means every access token carrying a
+    /// permissions claim is reported as approaching, which is a valid (if noisy)
+    /// posture and is the value to set alongside `access_token_max_bytes = 0`.
+    pub access_token_warn_bytes: u32,
+
+    /// The largest number of elements the mint will emit in ONE permissions claim.
+    /// NOTHING CONSULTS THIS KEY YET: setting it changes no response and no token on
+    /// this build, because the permissions claim and its budget enforcement land
+    /// with the claim itself (issue #413 tracks deleting this sentence when the mint
+    /// activates the claim). Default
+    /// [`TOKEN_CLAIMS_DEFAULT_PERMISSION_CLAIM_MAX_COUNT`] (256); config load
+    /// REJECTS a value above the 4096 ceiling
+    /// ([`TOKEN_CLAIMS_PERMISSION_CLAIM_MAX_COUNT_CEILING`]). `0` does NOT mean
+    /// unlimited, and this setting has no unlimited value: `0` means no permission
+    /// claim is ever emitted, which is a valid, safe posture, but set
+    /// `permission_claim_warn_count = 0` alongside it or the load is refused,
+    /// because config load also rejects a threshold above the maximum it warns about
+    /// and the shipped 192 threshold would then exceed this maximum.
+    ///
+    /// This bounds the CLAIM, never the model: it is not a cap on how many
+    /// permissions an environment may define, how many a role may hold, or how many
+    /// an organization's roles collectively grant, all of which are uncapped by
+    /// covenant, with no count column, quota row, or count CHECK anywhere for them.
+    /// There is no `max_permissions_per_role` and there never will be.
+    pub permission_claim_max_count: u32,
+
+    /// The approach threshold over the permission claim's element count. NOTHING
+    /// CONSULTS THIS KEY YET: setting it changes no response and no token on this
+    /// build, because the permissions claim and its budget enforcement land with the
+    /// claim itself (issue #413 tracks deleting this sentence when the mint
+    /// activates the claim). A claim within `permission_claim_max_count` but above
+    /// this is reported as approaching the budget; nothing is withheld and no
+    /// request is refused at this threshold. Default
+    /// [`TOKEN_CLAIMS_DEFAULT_PERMISSION_CLAIM_WARN_COUNT`] (192); config load
+    /// REJECTS a value above `permission_claim_max_count`, because a threshold above
+    /// the bound it warns about could never fire. `0` does NOT mean unlimited and
+    /// does not disable the warning, and there is no unlimited value: it means every
+    /// emitted permission claim is reported as approaching, and it is the value to
+    /// set alongside `permission_claim_max_count = 0`. Like the maximum, it bounds
+    /// only what one CLAIM carries and caps no stored count.
+    pub permission_claim_warn_count: u32,
+
+    /// What the mint does when a resolved permission set will not fit the budget.
+    /// NOTHING CONSULTS THIS KEY YET: setting it changes no response and no token on
+    /// this build, because the permissions claim and its budget enforcement land
+    /// with the claim itself (issue #413 tracks deleting this sentence when the mint
+    /// activates the claim). Both values WITHHOLD the COMPLETE set and say so on the
+    /// wire; neither truncates, and neither refuses the request. `roles_only` (the
+    /// default) tells the resource server to authorize from the `roles` claim it
+    /// already receives; `pdp_required` tells it to consult the policy decision point
+    /// instead. Config load REJECTS any other value: the enum is closed, so a typo
+    /// is a startup failure rather than a silent fallback to the default.
+    ///
+    /// See [`PermissionOverflow`]: its having exactly two variants, with no
+    /// `truncate` among them, is what makes silent truncation unrepresentable
+    /// rather than merely unconfigured.
+    pub permission_claim_overflow: PermissionOverflow,
+}
+
+impl Default for TokenClaimsConfig {
+    fn default() -> Self {
+        Self {
+            access_token_max_bytes: TOKEN_CLAIMS_DEFAULT_ACCESS_TOKEN_MAX_BYTES,
+            access_token_warn_bytes: TOKEN_CLAIMS_DEFAULT_ACCESS_TOKEN_WARN_BYTES,
+            permission_claim_max_count: TOKEN_CLAIMS_DEFAULT_PERMISSION_CLAIM_MAX_COUNT,
+            permission_claim_warn_count: TOKEN_CLAIMS_DEFAULT_PERMISSION_CLAIM_WARN_COUNT,
+            permission_claim_overflow: PermissionOverflow::RolesOnly,
+        }
+    }
+}
+
+impl TokenClaimsConfig {
+    /// This section with every maximum forced inside its ceiling and every approach
+    /// threshold forced to at most the maximum it warns about.
+    ///
+    /// Config load already REFUSES anything outside these bounds, so on the boot
+    /// path this is a no-op. It exists for the state builders on both planes, which
+    /// call it as defense in depth: a state can also be built directly from a
+    /// hand-constructed [`TokenClaimsConfig`] that never passed [`Config::validate`]
+    /// (every test harness does exactly that), and a budget that quietly exceeded
+    /// its ceiling there would be a bound that is not a bound.
+    ///
+    /// ONE shared clamp IMPLEMENTATION rather than a copy per plane, so there is a
+    /// single definition of what the ceilings are and what a threshold is clamped
+    /// against; the alternative would restate five bounds in two crates and let a
+    /// later edit move only one of them.
+    ///
+    /// That is a claim about the CLAMP and not about the installed values. Each
+    /// plane stores its own copy of the section, so what makes the two planes agree
+    /// is the boot path handing both of them the same `[token_claims]` section; this
+    /// method cannot and does not reconcile two budgets that were installed
+    /// separately.
+    #[must_use]
+    pub fn clamped(&self) -> Self {
+        let access_token_max_bytes = self
+            .access_token_max_bytes
+            .min(TOKEN_CLAIMS_ACCESS_TOKEN_MAX_BYTES_CEILING);
+        let permission_claim_max_count = self
+            .permission_claim_max_count
+            .min(TOKEN_CLAIMS_PERMISSION_CLAIM_MAX_COUNT_CEILING);
+        Self {
+            access_token_max_bytes,
+            // Each threshold is clamped to the ALREADY clamped maximum, not to the
+            // submitted one, so lowering a maximum can never leave a threshold
+            // stranded above the bound it is supposed to warn about.
+            access_token_warn_bytes: self.access_token_warn_bytes.min(access_token_max_bytes),
+            permission_claim_max_count,
+            permission_claim_warn_count: self
+                .permission_claim_warn_count
+                .min(permission_claim_max_count),
+            permission_claim_overflow: self.permission_claim_overflow,
         }
     }
 }
@@ -3928,8 +4197,63 @@ impl Config {
         validate_password_policy(&self.password_policy)?;
         validate_diagnostics(&self.diagnostics)?;
         validate_organizations(&self.organizations)?;
+        validate_token_claims(&self.token_claims)?;
         Ok(())
     }
+}
+
+/// Validate the token claim budget (issue #98). Each maximum has a hard ceiling
+/// because it bounds a cost paid on the latency-sensitive token-issuance path and
+/// then again by every resource server on every call that presents the token, and
+/// each approach threshold must sit at or below the maximum it warns about, because
+/// a threshold above its bound could never fire.
+///
+/// There is no lower bound on any of them: `0` is valid on every numeric key and
+/// means the strictest posture (no permission claim is ever emitted), never
+/// "unlimited". None of these settings has an unlimited value, which is what makes
+/// each one a bound.
+///
+/// Note what this does NOT validate, because there is nothing to validate: no count
+/// of permissions, roles, or role-to-permission mappings is capped anywhere in
+/// IronAuth. Every key here bounds a CLAIM, not the model behind it.
+fn validate_token_claims(token_claims: &TokenClaimsConfig) -> Result<(), ConfigError> {
+    if token_claims.access_token_max_bytes > TOKEN_CLAIMS_ACCESS_TOKEN_MAX_BYTES_CEILING {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "token_claims.access_token_max_bytes ({}) must not exceed \
+                 {TOKEN_CLAIMS_ACCESS_TOKEN_MAX_BYTES_CEILING} bytes",
+                token_claims.access_token_max_bytes
+            ),
+        });
+    }
+    if token_claims.access_token_warn_bytes > token_claims.access_token_max_bytes {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "token_claims.access_token_warn_bytes ({}) must not exceed \
+                 token_claims.access_token_max_bytes ({})",
+                token_claims.access_token_warn_bytes, token_claims.access_token_max_bytes
+            ),
+        });
+    }
+    if token_claims.permission_claim_max_count > TOKEN_CLAIMS_PERMISSION_CLAIM_MAX_COUNT_CEILING {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "token_claims.permission_claim_max_count ({}) must not exceed \
+                 {TOKEN_CLAIMS_PERMISSION_CLAIM_MAX_COUNT_CEILING}",
+                token_claims.permission_claim_max_count
+            ),
+        });
+    }
+    if token_claims.permission_claim_warn_count > token_claims.permission_claim_max_count {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "token_claims.permission_claim_warn_count ({}) must not exceed \
+                 token_claims.permission_claim_max_count ({})",
+                token_claims.permission_claim_warn_count, token_claims.permission_claim_max_count
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Validate the organization group nesting bound (issue #97). The depth has a hard
@@ -5936,6 +6260,324 @@ mod tests {
         assert!(
             Config::from_toml_str("[organizations]\nmax_grup_depth = 4\n", "<inline>").is_err(),
             "a misspelled key in [organizations] must fail the load"
+        );
+    }
+
+    #[test]
+    fn token_claims_section_ships_a_consistent_default_budget() {
+        // Defaults (issue #98): a 4096-byte token budget warned at 3072, a 256
+        // element claim budget warned at 192, and the roles-only overflow mode.
+        let config = Config::from_toml_str("", "<inline>").expect("valid").config;
+        assert_eq!(
+            config.token_claims.access_token_max_bytes,
+            TOKEN_CLAIMS_DEFAULT_ACCESS_TOKEN_MAX_BYTES
+        );
+        assert_eq!(
+            config.token_claims.access_token_warn_bytes,
+            TOKEN_CLAIMS_DEFAULT_ACCESS_TOKEN_WARN_BYTES
+        );
+        assert_eq!(
+            config.token_claims.permission_claim_max_count,
+            TOKEN_CLAIMS_DEFAULT_PERMISSION_CLAIM_MAX_COUNT
+        );
+        assert_eq!(
+            config.token_claims.permission_claim_warn_count,
+            TOKEN_CLAIMS_DEFAULT_PERMISSION_CLAIM_WARN_COUNT
+        );
+        assert_eq!(
+            config.token_claims.permission_claim_overflow,
+            PermissionOverflow::RolesOnly
+        );
+        // Each shipped default is internally consistent: a threshold never sits
+        // above the bound it warns about, so the shipped posture loads.
+        assert!(
+            config.token_claims.access_token_warn_bytes
+                <= config.token_claims.access_token_max_bytes
+        );
+        assert!(
+            config.token_claims.permission_claim_warn_count
+                <= config.token_claims.permission_claim_max_count
+        );
+
+        // Both maxima are accepted AT their ceilings.
+        let at_ceiling = format!(
+            "[token_claims]\naccess_token_max_bytes = \
+             {TOKEN_CLAIMS_ACCESS_TOKEN_MAX_BYTES_CEILING}\npermission_claim_max_count = \
+             {TOKEN_CLAIMS_PERMISSION_CLAIM_MAX_COUNT_CEILING}\n"
+        );
+        let config = Config::from_toml_str(&at_ceiling, "<inline>")
+            .expect("both ceilings are valid")
+            .config;
+        assert_eq!(
+            config.token_claims.access_token_max_bytes,
+            TOKEN_CLAIMS_ACCESS_TOKEN_MAX_BYTES_CEILING
+        );
+        assert_eq!(
+            config.token_claims.permission_claim_max_count,
+            TOKEN_CLAIMS_PERMISSION_CLAIM_MAX_COUNT_CEILING
+        );
+
+        // Zero is VALID on every numeric key and means the STRICTEST posture (no
+        // permission claim is ever emitted). It is deliberately not rejected and
+        // deliberately does not mean "unlimited": none of these settings has an
+        // unlimited value, which is what makes each one a bound.
+        let zeros = "[token_claims]\naccess_token_max_bytes = 0\naccess_token_warn_bytes = \
+                     0\npermission_claim_max_count = 0\npermission_claim_warn_count = 0\n";
+        let strict = Config::from_toml_str(zeros, "<inline>")
+            .expect("zero is valid on every numeric key")
+            .config;
+        assert_eq!(strict.token_claims.access_token_max_bytes, 0);
+        assert_eq!(strict.token_claims.permission_claim_max_count, 0);
+    }
+
+    #[test]
+    fn token_claims_refuses_every_out_of_bound_budget_at_load() {
+        // Each of the four refusals is a boot-time ConfigError::Invalid naming the
+        // key path, the offending value, and the bound, so an operator reads the
+        // fix out of the message rather than the source.
+        let over_bytes = format!(
+            "[token_claims]\naccess_token_max_bytes = {}\n",
+            TOKEN_CLAIMS_ACCESS_TOKEN_MAX_BYTES_CEILING + 1
+        );
+        let err = Config::from_toml_str(&over_bytes, "ironauth.toml")
+            .expect_err("a token budget above the ceiling is rejected");
+        let ConfigError::Invalid { message } = err else {
+            panic!("an over-ceiling token budget is a boot-time Invalid");
+        };
+        assert_eq!(
+            message,
+            format!(
+                "token_claims.access_token_max_bytes ({}) must not exceed \
+                 {TOKEN_CLAIMS_ACCESS_TOKEN_MAX_BYTES_CEILING} bytes",
+                TOKEN_CLAIMS_ACCESS_TOKEN_MAX_BYTES_CEILING + 1
+            )
+        );
+
+        let warn_over_max =
+            "[token_claims]\naccess_token_max_bytes = 2048\naccess_token_warn_bytes = 2049\n";
+        let err = Config::from_toml_str(warn_over_max, "ironauth.toml")
+            .expect_err("a warn threshold above the maximum is rejected");
+        let ConfigError::Invalid { message } = err else {
+            panic!("a warn threshold above the maximum is a boot-time Invalid");
+        };
+        assert_eq!(
+            message,
+            "token_claims.access_token_warn_bytes (2049) must not exceed \
+             token_claims.access_token_max_bytes (2048)"
+        );
+
+        let over_count = format!(
+            "[token_claims]\npermission_claim_max_count = {}\n",
+            TOKEN_CLAIMS_PERMISSION_CLAIM_MAX_COUNT_CEILING + 1
+        );
+        let err = Config::from_toml_str(&over_count, "ironauth.toml")
+            .expect_err("a claim element budget above the ceiling is rejected");
+        let ConfigError::Invalid { message } = err else {
+            panic!("an over-ceiling claim element budget is a boot-time Invalid");
+        };
+        assert_eq!(
+            message,
+            format!(
+                "token_claims.permission_claim_max_count ({}) must not exceed \
+                 {TOKEN_CLAIMS_PERMISSION_CLAIM_MAX_COUNT_CEILING}",
+                TOKEN_CLAIMS_PERMISSION_CLAIM_MAX_COUNT_CEILING + 1
+            )
+        );
+
+        let count_warn_over_max = "[token_claims]\npermission_claim_max_count = \
+                                   16\npermission_claim_warn_count = 17\n";
+        let err = Config::from_toml_str(count_warn_over_max, "ironauth.toml")
+            .expect_err("a warn count above the maximum is rejected");
+        let ConfigError::Invalid { message } = err else {
+            panic!("a warn count above the maximum is a boot-time Invalid");
+        };
+        assert_eq!(
+            message,
+            "token_claims.permission_claim_warn_count (17) must not exceed \
+             token_claims.permission_claim_max_count (16)"
+        );
+    }
+
+    #[test]
+    fn lowering_a_maximum_alone_is_refused_because_the_sibling_threshold_outgrows_it() {
+        // The zero-is-strictest posture is reachable only by setting the MAXIMUM and
+        // its sibling THRESHOLD together. Setting the maximum alone leaves the
+        // shipped threshold default above it, which is exactly the case the load
+        // already refuses, so `access_token_max_bytes = 0` on its own does not boot.
+        // The field doc says so; this is what holds it, and it is the general shape
+        // of lowering ANY maximum below its threshold, not a zero special case.
+        let bytes_only = "[token_claims]\naccess_token_max_bytes = 0\n";
+        let err = Config::from_toml_str(bytes_only, "ironauth.toml")
+            .expect_err("a maximum below the shipped threshold does not load alone");
+        let ConfigError::Invalid { message } = err else {
+            panic!("lowering a maximum alone is a boot-time Invalid");
+        };
+        // The message names BOTH keys and BOTH values, so the operator reads the fix
+        // (set the threshold too) out of the failure rather than out of the source.
+        assert_eq!(
+            message,
+            format!(
+                "token_claims.access_token_warn_bytes \
+                 ({TOKEN_CLAIMS_DEFAULT_ACCESS_TOKEN_WARN_BYTES}) must not exceed \
+                 token_claims.access_token_max_bytes (0)"
+            )
+        );
+
+        let count_only = "[token_claims]\npermission_claim_max_count = 0\n";
+        let err = Config::from_toml_str(count_only, "ironauth.toml")
+            .expect_err("a maximum below the shipped threshold does not load alone");
+        let ConfigError::Invalid { message } = err else {
+            panic!("lowering a maximum alone is a boot-time Invalid");
+        };
+        assert_eq!(
+            message,
+            format!(
+                "token_claims.permission_claim_warn_count \
+                 ({TOKEN_CLAIMS_DEFAULT_PERMISSION_CLAIM_WARN_COUNT}) must not exceed \
+                 token_claims.permission_claim_max_count (0)"
+            )
+        );
+
+        // And the pair the doc prescribes loads, so the documented fix really is the
+        // fix and the strictest posture stays reachable.
+        let paired = "[token_claims]\naccess_token_max_bytes = 0\naccess_token_warn_bytes = \
+                      0\npermission_claim_max_count = 0\npermission_claim_warn_count = 0\n";
+        let strict = Config::from_toml_str(paired, "ironauth.toml")
+            .expect("setting each maximum with its sibling threshold loads")
+            .config;
+        assert_eq!(strict.token_claims.access_token_warn_bytes, 0);
+        assert_eq!(strict.token_claims.permission_claim_warn_count, 0);
+    }
+
+    #[test]
+    fn the_token_claims_budget_numbers_and_wire_strings_are_pinned_literally() {
+        // Every other assertion in this module compares a constant against a
+        // constant, so it holds whatever the constants say and pins none of the
+        // numbers its own comment names. These six literals are what the CHANGELOG,
+        // the field docs and the generated operator reference quote, so moving one
+        // must be a deliberate edit here rather than a silent change to an
+        // operator-visible number. The two CEILINGS in particular reach the
+        // generated docs only as intra-doc link text, so no docs gate sees them.
+        assert_eq!(TOKEN_CLAIMS_ACCESS_TOKEN_MAX_BYTES_CEILING, 32_768);
+        assert_eq!(TOKEN_CLAIMS_PERMISSION_CLAIM_MAX_COUNT_CEILING, 4_096);
+        assert_eq!(TOKEN_CLAIMS_DEFAULT_ACCESS_TOKEN_MAX_BYTES, 4_096);
+        assert_eq!(TOKEN_CLAIMS_DEFAULT_ACCESS_TOKEN_WARN_BYTES, 3_072);
+        assert_eq!(TOKEN_CLAIMS_DEFAULT_PERMISSION_CLAIM_MAX_COUNT, 256);
+        assert_eq!(TOKEN_CLAIMS_DEFAULT_PERMISSION_CLAIM_WARN_COUNT, 192);
+
+        // The DEFAULT variant's wire string, which is what an operator types and
+        // what the generated reference prints as the default. Nothing else parses
+        // it: the closed-enum test pins `pdp_required` and the default test reads
+        // the variant off an empty config, so renaming this one string alone changed
+        // no test.
+        let roles_only = Config::from_toml_str(
+            "[token_claims]\npermission_claim_overflow = \"roles_only\"\n",
+            "<inline>",
+        )
+        .expect("roles_only is the shipped wire string")
+        .config;
+        assert_eq!(
+            roles_only.token_claims.permission_claim_overflow,
+            PermissionOverflow::RolesOnly
+        );
+    }
+
+    #[test]
+    fn the_permission_overflow_mode_is_a_closed_two_value_enum() {
+        // The overflow mode is a CLOSED enum of exactly two values. There is no
+        // `truncate`, and a value outside the pair fails the load rather than
+        // falling back to a default.
+        let pdp = Config::from_toml_str(
+            "[token_claims]\npermission_claim_overflow = \"pdp_required\"\n",
+            "<inline>",
+        )
+        .expect("pdp_required is valid")
+        .config;
+        assert_eq!(
+            pdp.token_claims.permission_claim_overflow,
+            PermissionOverflow::PdpRequired
+        );
+        assert!(
+            Config::from_toml_str(
+                "[token_claims]\npermission_claim_overflow = \"truncate\"\n",
+                "<inline>"
+            )
+            .is_err(),
+            "there is no truncate overflow mode and a config naming one must not load"
+        );
+
+        // The section rejects unknown keys, so a typo is a startup failure rather
+        // than a silently ignored budget.
+        assert!(
+            Config::from_toml_str("[token_claims]\naccess_token_max_byte = 4096\n", "<inline>")
+                .is_err(),
+            "a misspelled key in [token_claims] must fail the load"
+        );
+        // And a key named for the MODEL rather than for a claim is not merely
+        // absent, it is unloadable. The covenant is that no such cap exists.
+        assert!(
+            Config::from_toml_str("[token_claims]\nmax_permissions_per_role = 8\n", "<inline>")
+                .is_err(),
+            "there is no per-role permission cap and a config naming one must not load"
+        );
+    }
+
+    #[test]
+    fn the_token_claims_clamp_forces_every_bound_back_inside_its_ceiling() {
+        // `clamped` is what both state builders apply as defense in depth, so it is
+        // exercised on values config load would have refused outright: a state can
+        // be built from a hand-constructed section that never passed `validate`.
+        let raw = TokenClaimsConfig {
+            access_token_max_bytes: TOKEN_CLAIMS_ACCESS_TOKEN_MAX_BYTES_CEILING + 5_000,
+            access_token_warn_bytes: u32::MAX,
+            permission_claim_max_count: TOKEN_CLAIMS_PERMISSION_CLAIM_MAX_COUNT_CEILING + 1_000,
+            permission_claim_warn_count: u32::MAX,
+            permission_claim_overflow: PermissionOverflow::PdpRequired,
+        };
+        let clamped = raw.clamped();
+        assert_eq!(
+            clamped.access_token_max_bytes,
+            TOKEN_CLAIMS_ACCESS_TOKEN_MAX_BYTES_CEILING
+        );
+        assert_eq!(
+            clamped.permission_claim_max_count,
+            TOKEN_CLAIMS_PERMISSION_CLAIM_MAX_COUNT_CEILING
+        );
+        // Each threshold lands on the CLAMPED maximum, not on the submitted one, so
+        // no threshold is left stranded above the bound it warns about.
+        assert_eq!(
+            clamped.access_token_warn_bytes,
+            TOKEN_CLAIMS_ACCESS_TOKEN_MAX_BYTES_CEILING
+        );
+        assert_eq!(
+            clamped.permission_claim_warn_count,
+            TOKEN_CLAIMS_PERMISSION_CLAIM_MAX_COUNT_CEILING
+        );
+        // The overflow mode is carried through untouched; it has no ceiling.
+        assert_eq!(
+            clamped.permission_claim_overflow,
+            PermissionOverflow::PdpRequired
+        );
+
+        // A section already inside every bound is returned unchanged, so the clamp
+        // is a no-op on the boot path (config load has already refused the rest).
+        let shipped = TokenClaimsConfig::default();
+        let clamped = shipped.clamped();
+        assert_eq!(
+            clamped.access_token_max_bytes,
+            shipped.access_token_max_bytes
+        );
+        assert_eq!(
+            clamped.access_token_warn_bytes,
+            shipped.access_token_warn_bytes
+        );
+        assert_eq!(
+            clamped.permission_claim_max_count,
+            shipped.permission_claim_max_count
+        );
+        assert_eq!(
+            clamped.permission_claim_warn_count,
+            shipped.permission_claim_warn_count
         );
     }
 

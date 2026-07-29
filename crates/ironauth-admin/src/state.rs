@@ -19,7 +19,7 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use ironauth_config::{AdminConfig, SecretError, SecretString};
+use ironauth_config::{AdminConfig, SecretError, SecretString, TokenClaimsConfig};
 use ironauth_env::Env;
 use ironauth_jose::{JwsAlgorithm, TrustedKey, VerificationPolicy, verify};
 use ironauth_oidc::IssuerRegistry;
@@ -176,6 +176,13 @@ struct Inner {
     // behaves like a default deployment. Bounds tree DEPTH only; nothing counted is
     // capped.
     max_group_depth: u32,
+    // The deployment-wide token claim budget (issue #98), installed by the boot path
+    // from the top-level `[token_claims]` config section. The management plane reads it
+    // to report the approach warning a write's resolved permission set earns against the
+    // budget; it never refuses a write. Defaults to the shipped defaults so a
+    // directly-built state behaves like a default deployment. Bounds a TOKEN's size and
+    // what ONE claim carries; nothing stored is capped.
+    token_claims: TokenClaimsConfig,
     // Admin sudo mode (session privilege separation, issue #73): whether admin
     // mutations require a recent recorded re-authentication, and the freshness window in
     // seconds. Off by default; when off the mutation guard is a no-op and the admin
@@ -295,6 +302,7 @@ impl AdminState {
                 migration_hook: None,
                 federation: None,
                 max_group_depth: ironauth_config::ORGANIZATIONS_DEFAULT_MAX_GROUP_DEPTH,
+                token_claims: TokenClaimsConfig::default(),
                 sudo_mode_enabled: config.sudo_mode_enabled,
                 sudo_mode_window_secs: config.sudo_mode_window_secs,
                 signup_quarantine_enabled: false,
@@ -551,6 +559,44 @@ impl AdminState {
     #[must_use]
     pub fn max_group_depth(&self) -> u32 {
         self.inner.max_group_depth
+    }
+
+    /// Install the deployment-wide token claim budget (issue #98).
+    ///
+    /// The boot path is the only caller and passes the whole `[token_claims]` section
+    /// straight from the loaded config, the SAME section it installs on the data plane
+    /// through `OidcState::with_token_claims`. The WHOLE section rather than a scalar
+    /// builder per key: the five keys are one budget, only meaningful together, and a
+    /// per-key builder would let a caller install a threshold without the maximum it is
+    /// measured against. A BUILDER rather than an [`AdminConfig`] field because the
+    /// section is top level, not `[admin]`: duplicating it under `[admin]` would give one
+    /// budget two operator-visible names that could disagree.
+    ///
+    /// The section is re-clamped through [`TokenClaimsConfig::clamped`] here as defense in
+    /// depth. Config load already refuses anything outside the ceilings, so this is a
+    /// no-op on the boot path; it matters because a state can also be built directly from
+    /// a hand-constructed section that never passed validation.
+    ///
+    /// The budget bounds a TOKEN's size and what ONE claim carries. It caps nothing this
+    /// plane writes: no management endpoint refuses a create or an attach because of any
+    /// count or size, and the only statuses the budget can produce here are 200 and 201
+    /// carrying a warning field.
+    #[must_use]
+    pub fn with_token_claims(mut self, config: &TokenClaimsConfig) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.token_claims = config.clamped();
+        }
+        self
+    }
+
+    /// The configured token claim budget (issue #98), read by the management plane to
+    /// report the approach warning a resolved permission set earns. Defaults to the
+    /// shipped [`TokenClaimsConfig::default`] when the boot path installed nothing, so a
+    /// state built directly (for example in a test) behaves like a default deployment
+    /// rather than pinning every bound to zero.
+    #[must_use]
+    pub fn token_claims(&self) -> &TokenClaimsConfig {
+        &self.inner.token_claims
     }
 
     /// Share the inbound lazy-migration hook (issue #56) with the management plane, so the

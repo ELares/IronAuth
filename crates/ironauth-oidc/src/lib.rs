@@ -232,6 +232,7 @@ pub use password::{
     Argon2Params, PasswordError, hash_password, hash_password_with, needs_rehash, verify_absent,
     verify_password,
 };
+pub use policy_trace::ID_TOKEN_BLOAT_THRESHOLD_BYTES;
 pub use probe::{
     ProbeReport, available_memory_kib, default_memory_budget_kib, run_probe, total_memory_kib,
 };

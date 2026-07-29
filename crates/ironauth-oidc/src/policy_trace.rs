@@ -33,7 +33,15 @@ use crate::step_up::{AuthnRequirement, Satisfaction};
 /// crosses it carries an unusual amount of claims, which the M9 warnings read surfaces
 /// so an operator can see a claim mapping or a scope set inflating the token. It is a
 /// growth signal, never a limit: the token is minted and returned unchanged regardless.
-const ID_TOKEN_BLOAT_THRESHOLD_BYTES: usize = 3072;
+///
+/// PUBLIC so the parity with the access-token budget's shipped approach threshold
+/// (`ironauth_config::TOKEN_CLAIMS_DEFAULT_ACCESS_TOKEN_WARN_BYTES`, issue #98) can be
+/// asserted from the one crate that can see both. The two numbers are deliberately
+/// EQUAL so an operator meets ONE number across both token kinds rather than two that
+/// mean the same thing and can disagree; the assertion lives in
+/// `ironauth-admin`'s `error` test module, beside the session-TTL and group-depth
+/// ceiling agreements. Moving either number alone turns it red.
+pub const ID_TOKEN_BLOAT_THRESHOLD_BYTES: usize = 3072;
 
 /// The bounded outcome of a claim mapping evaluation, for the trace (issue #91). Either
 /// the mapping resolved (with the number of traits it produced) or it failed closed

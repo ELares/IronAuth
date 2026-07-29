@@ -16,7 +16,7 @@ use ironauth_config::{
     ADVANCED_RECOVERY_FEATURE, Config, DiagnosticsConfig, FEDCM_FEATURE,
     FIRST_PARTY_CHALLENGE_FEATURE, FeatureRegistry, GLOBAL_TOKEN_REVOCATION_FEATURE, Loaded,
     OidcConfig, PasswordHashingConfig, PasswordPolicyConfig, QuotaConfig, RISK_SIGNALS_FEATURE,
-    SIGNUP_QUARANTINE_FEATURE, ScreeningFailurePolicy, ScreeningProvider,
+    SIGNUP_QUARANTINE_FEATURE, ScreeningFailurePolicy, ScreeningProvider, TokenClaimsConfig,
 };
 use ironauth_env::Env;
 use ironauth_jose::MasterKey;
@@ -325,6 +325,10 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
                 // needs the SAME value the management plane installs, because the
                 // effective-role resolution the mint path runs is bounded by it.
                 config.organizations.max_group_depth,
+                // The token claim budget (issue #98): the data plane needs the SAME
+                // section the management plane installs, because the mint enforces the
+                // budget the management API reports the approach warning against.
+                config.token_claims.clone(),
             ))
         } else {
             None
@@ -364,6 +368,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             policy_config,
             diagnostics_config,
             max_group_depth,
+            token_claims_config,
         )) = oidc_inputs
         {
             let issuer_base = server.base_url();
@@ -386,6 +391,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
                 &policy_config,
                 &diagnostics_config,
                 max_group_depth,
+                &token_claims_config,
                 migration_hook,
                 federation_runtime,
             )
@@ -525,6 +531,11 @@ async fn build_management_router(
             // AdminConfig: one bound, one operator-visible name. It bounds tree DEPTH
             // only and caps nothing that is counted.
             let state = state.with_max_group_depth(config.organizations.max_group_depth);
+            // The token claim budget (issue #98) lives in `[token_claims]`, not `[admin]`,
+            // for the same reason: one budget, one operator-visible name, the SAME section
+            // the data plane installs. The management plane reads it only to report an
+            // approach warning; it never refuses a write because of it.
+            let state = state.with_token_claims(&config.token_claims);
             // Share a data-plane issuer registry (issue #93) so the compatibility wizard can
             // resolve an environment's actually signable ID-token algorithms and write the
             // per-client column through the data plane (the only role that can). Absent a
@@ -751,6 +762,7 @@ async fn build_oidc_router(
     policy_config: &PasswordPolicyConfig,
     diagnostics_config: &DiagnosticsConfig,
     max_group_depth: u32,
+    token_claims_config: &TokenClaimsConfig,
     migration_hook: Option<Arc<LazyMigrationHook>>,
     federation_runtime: Option<Arc<FederationRuntime>>,
 ) -> Option<Router> {
@@ -871,6 +883,11 @@ async fn build_oidc_router(
         // installs. It bounds the ancestor walk the mint-path effective-role resolution
         // performs, and caps nothing that is counted.
         .with_max_group_depth(max_group_depth)
+        // The token claim budget (issue #98) lives in `[token_claims]`, not `[oidc]`, so
+        // it is installed by the builder rather than riding OidcConfig: one budget, one
+        // operator-visible name, the SAME section the management plane installs. It
+        // bounds a TOKEN's size and what ONE claim carries, and caps nothing stored.
+        .with_token_claims(token_claims_config)
         .with_quota_enforcer(quota_enforcer)
         .with_hashing_pool(hashing_pool)
         .with_password_policy(password_policy, screening_failure, screen_on_login)

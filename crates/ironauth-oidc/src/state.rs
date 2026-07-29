@@ -26,7 +26,7 @@ use tokio::sync::Semaphore;
 use ironauth_config::{
     AdvancedRecoveryConfig, ClientAssertionAudience, ClientCredentialsAudience,
     ConsentLockdownConfig, DiagnosticVerbosity, DiagnosticsConfig, OidcConfig, QuarantineConfig,
-    RegistrationMode,
+    RegistrationMode, TokenClaimsConfig,
 };
 use ironauth_env::Env;
 use ironauth_jose::{
@@ -311,6 +311,15 @@ pub struct OidcState {
     // directly-built state (every test harness) behaves like a default deployment rather
     // than pinning the walk to zero. Bounds tree DEPTH only; nothing counted is capped.
     max_group_depth: u32,
+    // The deployment-wide token claim budget (issue #98), installed by the boot path from
+    // the TOP-LEVEL `[token_claims]` config section. Kept OUTSIDE `Inner` and set through
+    // the builder for the SAME top-level-config reason as the diagnostics knobs and the
+    // group depth; the SAME section is installed on the management plane through
+    // `AdminState::with_token_claims`, so one budget has one operator-visible name.
+    // Defaults to the shipped defaults, so a directly-built state (every test harness)
+    // behaves like a default deployment rather than pinning the budget to zero. Bounds a
+    // TOKEN's size and one CLAIM's element count; nothing stored is capped.
+    token_claims: TokenClaimsConfig,
     // The per-tenant/per-environment quota enforcer (issue #50), the data plane's
     // tenant-fairness layer. Kept OUTSIDE `Inner` and installed by the boot path
     // (built from the [quota] config, seeded with the SAME env clock), so a spend
@@ -898,6 +907,7 @@ impl OidcState {
             diagnostics_verbosity: DiagnosticVerbosity::Standard,
             diagnostic_retention_micros: default_diagnostic_retention_micros(),
             max_group_depth: ironauth_config::ORGANIZATIONS_DEFAULT_MAX_GROUP_DEPTH,
+            token_claims: TokenClaimsConfig::default(),
             quota: None,
             migration_hook: None,
             hashing_pool: None,
@@ -1255,6 +1265,41 @@ impl OidcState {
     #[must_use]
     pub fn max_group_depth(&self) -> u32 {
         self.max_group_depth
+    }
+
+    /// Install the deployment-wide token claim budget (issue #98).
+    ///
+    /// The boot path is the only caller and passes the whole `[token_claims]` section
+    /// straight from the loaded config, the SAME section it installs on the management
+    /// plane through `AdminState::with_token_claims`. The WHOLE section rather than a
+    /// scalar builder per key, exactly as [`OidcState::with_diagnostics`] takes the whole
+    /// `[diagnostics]` section: the five keys are one budget and are only meaningful
+    /// together, and a per-key builder would let a caller install a threshold without the
+    /// maximum it is measured against. A BUILDER rather than an [`OidcConfig`] field
+    /// because the section is top level, not `[oidc]`: duplicating it under `[oidc]` would
+    /// give one budget two operator-visible names that could disagree.
+    ///
+    /// The section is re-clamped through [`TokenClaimsConfig::clamped`] here as defense in
+    /// depth. Config load already refuses anything outside the ceilings, so this is a
+    /// no-op on the boot path; it matters because a state can also be built directly from
+    /// a hand-constructed section that never passed validation.
+    ///
+    /// This bounds a TOKEN's size and what ONE claim carries. It caps nothing that is
+    /// stored: the number of permissions an environment defines, the number a role holds,
+    /// and the number an organization's roles collectively grant are uncapped by covenant.
+    #[must_use]
+    pub fn with_token_claims(mut self, config: &TokenClaimsConfig) -> Self {
+        self.token_claims = config.clamped();
+        self
+    }
+
+    /// The configured token claim budget (issue #98). Defaults to the shipped
+    /// [`TokenClaimsConfig::default`] when the boot path installed nothing, so a state
+    /// built directly (for example in a test) behaves like a default deployment rather
+    /// than pinning every bound to zero.
+    #[must_use]
+    pub fn token_claims(&self) -> &TokenClaimsConfig {
+        &self.token_claims
     }
 
     /// Whether the `/authorize` login and registration interaction redirects should retarget onto

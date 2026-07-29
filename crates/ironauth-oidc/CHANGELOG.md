@@ -6,6 +6,16 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- `ID_TOKEN_BLOAT_THRESHOLD_BYTES` (3072) is now PUBLIC (issue #98). It was already the
+  shipped ID-token growth signal threshold and its value is unchanged; only its
+  visibility moves. The access-token budget's approach threshold
+  (`ironauth_config::TOKEN_CLAIMS_DEFAULT_ACCESS_TOKEN_WARN_BYTES`) is deliberately the
+  SAME number, so an operator meets ONE number across both token kinds rather than two
+  that mean the same thing and can disagree. That parity was stated in four places in
+  prose and enforced by nothing: mutating either number alone left both crates green.
+  Exporting the constant lets `ironauth-admin`, the one crate that sees both, assert them
+  equal, beside the existing session-TTL and group-depth ceiling agreements. Nothing
+  about the signal's behaviour changes: it remains a growth signal and never a limit.
 - OAuth 2.0 Authorization Challenge Endpoint (draft-ietf-oauth-first-party-apps-03) behind an
   experimental flag (issue #93, Bet 3, PR1, EXPLORATORY, the browserless first-party native login
   surface). The `first-party-challenge` experimental feature (ack version
