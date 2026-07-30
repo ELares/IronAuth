@@ -31,6 +31,14 @@
 //! `scope_is_fenced`'s `Err(_) => true` to `false` survived the whole `ironauth-oidc`
 //! suite until that test existed.
 //!
+//! One test here drives the CONTROL PLANE ITSELF rather than seeding a serving state:
+//! `a_restored_tenant_that_is_still_suspended_serves_nothing` runs the real suspend ->
+//! grace delete -> restore sequence through the audited tenant repository and then asks
+//! the data plane what it will serve (issue #432). The others deliberately set the
+//! serving state directly, which is why the defect that test pins (a restore writing a
+//! literal `active` over a suspended tenant's fence) was invisible to every one of them:
+//! they never let a control-plane transition choose the state they assert on.
+//!
 //! Every test here MUST use `Harness::start_store_backed()`. The default
 //! `Harness::start()` installs a static issuer registry that never reads
 //! `environment_states`, so a suspended scope keeps serving on it and a lifecycle test
@@ -38,17 +46,40 @@
 
 mod common;
 
+use std::time::Duration;
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use common::{
     Harness, PKCE_CHALLENGE, PKCE_VERIFIER, REDIRECT_URI, enc, form, json, location_param,
 };
-use ironauth_store::Scope;
+use ironauth_store::{ActingTenantRepo, CorrelationId, OperatorId, Scope};
+use sqlx::Row;
+
+/// The offboarding retention window these tests restore inside. The harness clock is
+/// frozen, so any window longer than zero keeps the restore on offer.
+const RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// Fetch the mounted JWKS for `scope` and return the HTTP status.
 async fn jwks_status(harness: &Harness, scope: &Scope) -> StatusCode {
+    jwks(harness, scope).await.0
+}
+
+/// Fetch the mounted JWKS for `scope` and return its status AND body, so a test that
+/// claims a lifecycle round trip left the signing key alone can compare the published
+/// key set itself rather than infer it from a 200.
+async fn jwks(harness: &Harness, scope: &Scope) -> (StatusCode, String) {
     let uri = format!("/t/{}/e/{}/jwks.json", scope.tenant(), scope.environment());
-    status_of(harness, &uri).await
+    let (status, _headers, body) = harness
+        .send(
+            Request::builder()
+                .method("GET")
+                .uri(&uri)
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await;
+    (status, body)
 }
 
 /// Fetch the appended-form discovery document for `scope` and return the status.
@@ -118,6 +149,112 @@ async fn set_serving(harness: &Harness, scope: &Scope, status: &str) {
         .db()
         .set_environment_serving_state(*scope, status)
         .await;
+}
+
+/// The operator that owns `scope`'s tenant, read as the owner: the harness seeds the
+/// operator -> tenant -> environment chain directly and keeps the operator id to
+/// itself, and the control-plane tenant repository is addressed per operator.
+async fn operator_of(harness: &Harness, scope: &Scope) -> OperatorId {
+    let raw: String = sqlx::query("SELECT operator_id FROM tenants WHERE id = $1")
+        .bind(scope.tenant().to_string())
+        .fetch_one(harness.db().owner_pool())
+        .await
+        .expect("the harness tenant row is present")
+        .get("operator_id");
+    OperatorId::parse(&raw).expect("operator id parses")
+}
+
+/// The acting, audited control-plane tenant repository for `operator`, over the
+/// CONTROL-plane store, exactly as the management API reaches it.
+fn tenants(harness: &Harness, operator: OperatorId) -> ActingTenantRepo<'_> {
+    harness
+        .db()
+        .control_store()
+        .management()
+        .acting(
+            harness.db().test_actor(harness.env()),
+            CorrelationId::generate(harness.env()),
+        )
+        .tenants(operator)
+}
+
+#[tokio::test]
+async fn a_restored_tenant_that_is_still_suspended_serves_nothing() {
+    // Issue #432, at the surface the fence exists for. The other tests here set the
+    // serving state directly; this one drives the REAL control-plane lifecycle calls
+    // (suspend -> grace delete -> restore) and then asks the data plane what it will
+    // serve. The defect: `restore` wrote a literal `active` serving state for every
+    // environment, so a tenant whose `tenants.status` still read `suspended` came back
+    // serving JWKS and discovery with nobody having lifted the suspension.
+    let harness = Harness::start_store_backed().await;
+    let scope = harness.scope();
+    let operator = operator_of(&harness, &scope).await;
+
+    // The control: active and serving, which also WARMS the registry cache. The
+    // published key set is kept, so the claim that the round trip below never touches
+    // the signing key is carried by a comparison rather than by a 200.
+    let (status, published_keys) = jwks(&harness, &scope).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an active environment serves its JWKS"
+    );
+
+    // Suspend through the control plane: fenced on the next request.
+    tenants(&harness, operator)
+        .suspend(harness.env(), &scope.tenant(), None)
+        .await
+        .expect("suspend");
+    assert_eq!(
+        jwks_status(&harness, &scope).await,
+        StatusCode::NOT_FOUND,
+        "a suspended tenant is fenced off the JWKS surface"
+    );
+
+    // Grace-delete and then RESTORE inside the retention window. The restore undoes
+    // the delete; it must not undo the suspension too.
+    tenants(&harness, operator)
+        .delete(harness.env(), &scope.tenant())
+        .await
+        .expect("grace delete");
+    tenants(&harness, operator)
+        .restore(harness.env(), &scope.tenant(), RETENTION, None)
+        .await
+        .expect("restore in window");
+
+    assert_eq!(
+        jwks_status(&harness, &scope).await,
+        StatusCode::NOT_FOUND,
+        "a restored tenant whose status is still suspended serves no JWKS"
+    );
+    assert_eq!(
+        discovery_status(&harness, &scope).await,
+        StatusCode::NOT_FOUND,
+        "and no discovery document: the restore did not lift the suspension"
+    );
+
+    // The explicit RESUME is what lifts it, and it still does after a restore: the
+    // fence a restore preserves is not a permanent one.
+    tenants(&harness, operator)
+        .resume(harness.env(), &scope.tenant(), None)
+        .await
+        .expect("resume");
+    let (status, keys_after) = jwks(&harness, &scope).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a resumed tenant serves its JWKS again"
+    );
+    assert_eq!(
+        keys_after, published_keys,
+        "and serves the SAME key set: suspend, delete, restore, and resume never \
+         touched the signing key"
+    );
+    assert_eq!(
+        discovery_status(&harness, &scope).await,
+        StatusCode::OK,
+        "and serves discovery again"
+    );
 }
 
 #[tokio::test]

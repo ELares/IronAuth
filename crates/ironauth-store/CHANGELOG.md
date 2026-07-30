@@ -6,6 +6,44 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **`ActingTenantRepo::restore` no longer lifts a suspension** (issue #432). A restore
+  undoes the grace DELETE without touching the tenant's lifecycle status. It used to upsert
+  a literal `active` serving state for every environment of the tenant, so a tenant that was
+  SUSPENDED before the offboarding came back with `tenants.status = suspended` (what a
+  subsequent tenant READ reports, `GET /v1/tenants/{id}` included) and a SERVING data plane:
+  the suspension silently stopped being enforced, with no operator having resumed anything.
+  `restore` now derives each environment's serving state from the status the restore itself
+  committed (the tombstone-clearing UPDATE RETURNS it, so the derivation costs one round
+  trip instead of a second in-transaction read of a row this transaction has already
+  row-locked), through the new `serving_state_for`. That mapping is an exhaustive match on
+  `TenantStatus` rather than a condition, so a third variant breaks the build here instead
+  of defaulting a new status into a serving data plane. BEHAVIOR CHANGE for the suspended
+  case only: restoring an ACTIVE tenant serves again exactly as before, and `resume` still
+  lifts the suspension of a restored tenant. The other three `environment_states` writers
+  were audited and left alone: `transition` already binds the state its own target status
+  implies, and both deletes only ever fence. Pinned by
+  `a_restore_returns_a_suspended_tenant_to_its_fence` (store) and, at the HTTP surface the
+  fence exists for, by `a_restored_tenant_that_is_still_suspended_serves_nothing` (JWKS and
+  discovery, over the store-backed harness, driving the real control-plane suspend, delete,
+  and restore).
+  - Scope, stated because two nearby surfaces are NOT covered. The restore ENDPOINT still
+    answers `{"status":"active"}` from a literal built before the store call, so its 200 (and
+    the Idempotency-Key replay body stored with it) already disagreed with `tenants.status`
+    for a restored suspended tenant, and after this entry it disagrees with the data plane
+    too. The response bytes are unchanged here, and #438 records them with the measurement,
+    alongside why the fix is a signature change rather than a one-liner. A restore also
+    still revives environments that had been deleted individually before the tenant was
+    offboarded, because it clears every environment tombstone unconditionally and derives one
+    serving state from the tenant status alone; that too is pre-existing and unchanged here,
+    and #439 records it.
+- **`transition`'s upsert conflict arm is now pinned** (issue #432, coverage). Nothing
+  asserted on it: forcing the `ON CONFLICT ... DO UPDATE` arm to a literal `'active'`
+  survived the whole store suite, because the fence tests stop after ONE resume, whose
+  correct serving state is also what the broken arm writes. The first transition of a fresh
+  tenant takes the INSERT arm, so a SECOND suspension is the shape that separates them.
+  `a_resumed_tenant_is_fenced_again_when_suspended_a_second_time` drives suspend, resume,
+  suspend across two environments and fails on that mutant. The shipped code was already
+  correct; this closes the hole a future edit could fall into.
 - **`OrgRolePermissionRepo::count_live_for_role`** (issue #425): how many live mappings ONE
   role carries inside one organization, the count behind the budget verdict the management
   attach response now reports. A COUNT rather than a length taken off `list_for_role`,
