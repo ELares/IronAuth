@@ -259,6 +259,17 @@ impl Harness {
     /// flows include a `code_challenge`. Tests that want the production default
     /// (PKCE required for confidential clients too) build the config explicitly and
     /// call [`Harness::start_with`].
+    ///
+    /// # NOT usable for a scope-lifecycle test (issue #406)
+    ///
+    /// This harness installs a STATIC issuer registry, so it never reads
+    /// `environment_states` and the data-plane serving fence (issue #46) DOES NOT
+    /// EXIST on it. A scope suspended under this harness keeps serving: it was
+    /// measured minting a full 200 with a signed, claim-bearing access token from an
+    /// outstanding code after the suspend. Any test of suspend, resume, tenant
+    /// offboarding, or environment deletion MUST use
+    /// [`Harness::start_store_backed`], or it passes while exercising no fence at all
+    /// and reports the opposite of the truth.
     pub async fn start() -> Self {
         Self::start_with(OidcConfig {
             require_pkce_for_confidential_clients: false,
@@ -471,6 +482,11 @@ impl Harness {
     /// use. The per-environment JWKS surface is mounted alongside the protocol
     /// router, so a test can fetch the published key set the mint actually signs
     /// with. Confidential PKCE is relaxed, exactly like [`Harness::start`].
+    ///
+    /// This is the ONLY harness on which the data-plane serving fence (issue #46)
+    /// exists, because that fence is a read the store-backed registry performs on
+    /// every resolution. See [`Harness::start`] for what silently goes wrong when a
+    /// lifecycle test reaches for the default instead.
     pub async fn start_store_backed() -> Self {
         Self::start_store_backed_with(OidcConfig {
             require_pkce_for_confidential_clients: false,

@@ -34883,6 +34883,135 @@ impl OrgGroupRepo<'_> {
 /// Rules 2 and 3 of `resolution_excludes_every_soft_deleted_row_on_the_path` are what
 /// say so.
 ///
+/// # Which LIFECYCLES this seed fences, and which it deliberately does not (issue #406)
+///
+/// The seed is where a lifecycle fence belongs, because all four projections run over
+/// this one preamble and inherit whatever it refuses. This census exists because the
+/// previous version of this doc said what the statement fences and said nothing about
+/// what it does not, so a reader could not tell a deliberate omission from an oversight.
+/// Every entry below was measured, and the measurement is named.
+///
+/// FENCED HERE, the ORGANIZATION'S lifecycle: `o.state = 'active' AND o.deleted_at IS
+/// NULL` on the join above. A disabled or soft-deleted organization resolves the EMPTY
+/// set on every projection. It has to be here rather than at either mint hook, for the
+/// reason [`OrgGroupRepo::effective_roles`] gives in full: the refresh grant never runs
+/// the authorize-time organization resolution, and a code exchange on an already-bound
+/// session returns from it early, so neither hook is in a position to check it.
+/// `a_disabled_organization_stops_minting_its_roles_on_both_hooks` and
+/// `a_soft_deleted_organization_stops_minting_its_roles_too` in
+/// `crates/ironauth-oidc/tests/org_roles_claim.rs` drive it through both hooks.
+///
+/// FENCED HERE, the USER'S TOMBSTONE: `u.deleted_at IS NULL` on the `users` join. A
+/// soft-deleted user resolves the empty set. The user delete path does NOT cascade
+/// `org_memberships`, so a tombstoned user with a live membership is reachable through
+/// ordinary operation rather than through corrupt data, and before this predicate the
+/// admin effective-roles view reported that user's roles in full. What makes the
+/// tombstone the right thing to fence is that it is PERMANENT: no future token can ever
+/// carry those roles, because both grants that resolve them refuse a deleted subject
+/// (see the `state` entry below for why that is the honest scope of the claim), so a
+/// view that reports them is reporting an outcome that cannot occur.
+/// `a_soft_deleted_user_resolves_to_nothing_on_all_three_projections` in
+/// `crates/ironauth-store/tests/org_assignments.rs` drives the role, group and
+/// provenance projections and asserts the assignment rows survive underneath the
+/// tombstone (so this is a fence on live state, not a cascade);
+/// `a_soft_deleted_user_resolves_to_no_permissions` in
+/// `crates/ironauth-store/tests/effective_permissions.rs` drives the fourth; and
+/// `a_user_who_cannot_authenticate_still_resolves_their_roles`, beside the first, pins
+/// the boundary from the other side.
+///
+/// It is an INNER join, and deliberately. The state a reader worries about with an
+/// INNER join, a membership naming a user row that does not exist at all, is not merely
+/// unproduced by the write paths: it is IMPOSSIBLE, so the join adds no refusal there
+/// to reason about. `org_memberships.user_id` carries a foreign key into `users (id)`
+/// (migration `0084_org_membership.sql`, whose own comment says so), which reads on the
+/// live schema as `org_memberships_user_id_fkey :: FOREIGN KEY (user_id) REFERENCES
+/// users(id)`; an owner-pool INSERT naming an absent user is refused with SQLSTATE
+/// `23503`. The organization join beside it rests on the same footing
+/// (`org_memberships_organization_id_fkey`). What the INNER join therefore adds is the
+/// tombstone predicate and the scope predicates carried with it (`u.tenant_id = $1 AND
+/// u.environment_id = $2`), which is the same posture the organization join takes.
+///
+/// NOT FENCED HERE, and deliberately, the USER'S `state`: a user who cannot
+/// authenticate (`blocked`, `disabled`, `pending_verification`, `waitlisted`) still
+/// resolves their roles. Do NOT "finish the job" by adding a
+/// [`UserState::can_authenticate`] predicate beside the tombstone one. The asymmetry is
+/// the point, and the deciding case is the INVITEE: `pending_verification` is the state
+/// an invitation accept activates, and a membership, a group binding and a role can all
+/// be attached to a user sitting in it. That the state is CONSTRUCTIBLE with assignments
+/// hanging off it is measured (`an_invitation_accept_revives_a_membership_with_nothing_attached`
+/// in `crates/ironauth-store/tests/org_assignments.rs` builds exactly that fixture, and
+/// so does `a_user_who_cannot_authenticate_still_resolves_their_roles` beside it); that
+/// a product flow ROUTINELY produces it is a design expectation about pre-provisioning
+/// rather than something either test observes, and it is stated that way on purpose.
+/// The states are TEMPORARY and expected: the accept activates the user and the roles
+/// then apply exactly as granted. Fencing them would blank the effective-roles view for
+/// an administrator who is pre-provisioning an invitee, which is the workflow the view
+/// exists to serve.
+///
+/// Little is bought on the token path in exchange for that cost, because a user in any
+/// of these states obtains no token BY EITHER OF THE TWO GRANTS THAT RESOLVE ROLES: the
+/// refresh grant re-checks the lifecycle explicitly, and the code exchange is refused
+/// upstream by the session cascade that block, disable and delete perform.
+/// `a_fenced_user_cannot_mint_new_tokens_through_a_surviving_offline_token`,
+/// `a_fenced_user_cannot_exchange_an_outstanding_authorization_code` and
+/// `a_fenced_user_cannot_exchange_an_offline_access_authorization_code` in
+/// `crates/ironauth-oidc/tests/refresh.rs` are what say so, and those two grants are
+/// the ONLY call sites of `resolve_effective_roles`, so they are the only grants a
+/// predicate here could have protected.
+///
+/// The stronger sentence, that such a user obtains no token by ANY grant, is FALSE and
+/// must not be written here. The `urn:ietf:params:oauth:grant-type:jwt-bearer` grant
+/// mints under an OPERATOR-AUTHORED subject mapping and does not liveness-check the
+/// mapped principal, which `crates/ironauth-oidc/src/jwt_bearer.rs` records against
+/// `resolve_mapped_principal` as an accepted residual. Measured on the unmutated tree:
+/// mapping a real `usr_` id as the principal and then blocking, then soft-deleting,
+/// that user still answers `200` with a signed access token carrying that `sub` in all
+/// three states. It does not disturb the decision above (that token carries neither a
+/// roles nor a permissions claim, so nothing this statement resolves rides on it), but
+/// the census must not launder it into a blanket claim.
+///
+/// NOT FENCED HERE, and enforced UPSTREAM instead, the ENVIRONMENT'S and the TENANT'S
+/// lifecycle. An environment is the SCOPE this whole statement runs inside, so a
+/// deactivated environment must stop issuing tokens at all rather than issue role-less
+/// ones. It does, for the ENVIRONMENT: the control plane writes
+/// `environment_states.serving_status = 'suspended'`, and `ironauth_oidc`'s
+/// `scope_is_fenced` consults it on EVERY issuer resolution, which the token mint
+/// reaches through its issuer-entry lookup, FAIL CLOSED on a store read error.
+/// `crates/ironauth-oidc/tests/lifecycle_fence.rs` drives all of that:
+/// `a_suspended_scope_mints_no_token_from_an_outstanding_code` over the token mint,
+/// `a_deleted_scope_stops_serving_immediately` over the offboarding write, and
+/// `a_fence_read_error_fences_rather_than_serving` over the error arm (which before it
+/// was written could be flipped to fail OPEN with the entire `ironauth-oidc` suite
+/// still green, measured).
+///
+/// There are FOUR writers of that column, not three. `ManagementStore::tenants`'s
+/// `suspend` (with its `resume` counterpart), the tenant `delete` (which marks every
+/// one of the tenant's environments), the environment `delete`, and, easy to miss,
+/// [`ActingTenantRepo::restore`], which upserts `'active'` for every environment of the
+/// tenant unconditionally. All four upsert in the same audited transaction as the
+/// lifecycle change.
+///
+/// The TENANT dimension therefore does NOT ride the environment fence in every
+/// sequence, and this census must not claim it does. `restore` leaves `tenants.status`
+/// untouched, so suspend, then grace delete, then restore inside the retention window
+/// ends with `tenants.status = suspended` and `serving_status = active` (measured, in
+/// that order). `environment_state()` reads only `serving_status`, and nothing in
+/// `ironauth_oidc` reads `tenants.status`, so nothing re-fences it and the data plane
+/// serves a suspended tenant. That is PRE-EXISTING behavior, tracked in issue #432, and
+/// deliberately not widened into by this change; it is recorded here because the
+/// decision below leans on the upstream fence and the reader is owed its real shape.
+///
+/// A fence added here as well would still be the weaker of the two on the TOKEN path
+/// (it would mint a valid, signed, role-less token for a suspended tenant instead of
+/// refusing), so it is deliberately absent rather than missing. Note where that does
+/// NOT hold: the same four projections also serve the admin console, and
+/// [`ManagementCredentialRepo::authenticate`] checks only `deleted_at` on the tenant
+/// and the environment, never `t.status`, so a suspended tenant's console still
+/// resolves roles through this statement. The decision stands on the PERMANENCE
+/// criterion the tombstone entry above sets out (a suspension is reversible, so a view
+/// that reports roles is not reporting an impossible outcome), not on the upstream
+/// fence covering every reader.
+///
 /// Binds: `$1` tenant, `$2` environment, `$3` organization, `$4` user, `$5` the walk
 /// bound (`max_group_depth`, one LOWER than the write walks use; see
 /// [`OrgGroupRepo::effective_roles`] for why a read must not reach a level a write
@@ -34894,6 +35023,9 @@ const EFFECTIVE_CLOSURE_CTE: &str = "WITH RECURSIVE membership AS ( \
            JOIN organizations o ON o.id = m.organization_id \
             AND o.tenant_id = $1 AND o.environment_id = $2 \
             AND o.state = 'active' AND o.deleted_at IS NULL \
+           JOIN users u ON u.id = m.user_id \
+            AND u.tenant_id = $1 AND u.environment_id = $2 \
+            AND u.deleted_at IS NULL \
           WHERE m.tenant_id = $1 AND m.environment_id = $2 \
             AND m.organization_id = $3 AND m.user_id = $4 \
             AND m.state = 'active' AND m.deleted_at IS NULL \

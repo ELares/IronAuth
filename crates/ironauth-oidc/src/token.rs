@@ -1566,9 +1566,88 @@ async fn issue_refresh_for_code(
 /// non-offline refresh families; but an `offline_access` family DELIBERATELY survives
 /// that cascade (issue #21), so without this re-check a user fenced AFTER the family
 /// was opened could keep minting fresh access tokens through the surviving token, and
-/// the account would not actually be fenced. This is the authoritative single-point
-/// fence: the invariant is that after block/disable/delete a user obtains NO new
-/// tokens by ANY path (authorize, refresh, or an existing offline token).
+/// the account would not actually be fenced.
+///
+/// # What this function is, and what fences the OTHER grant (issue #406)
+///
+/// The invariant is that after block/disable/delete a user obtains NO new tokens by ANY
+/// path (authorize, refresh, or an existing offline token). This function is NOT the
+/// single point that delivers it, and an earlier version of this comment called itself
+/// "the authoritative single-point fence", which was false in the way that matters:
+/// there is exactly ONE call site, [`refresh_token_grant`], so the sentence described
+/// a fence covering the refresh grant as though it covered the code exchange too. The
+/// invariant does hold on the code exchange, but by a DIFFERENT and unrelated
+/// mechanism, and a reader who did not know that could either add a redundant read to
+/// the hottest path in the product or, worse, remove the real fence believing this one
+/// covered them.
+///
+/// What actually fences the CODE EXCHANGE is the SESSION cascade: delete, block, and
+/// disable each revoke every one of the subject's `sessions` rows, and the
+/// `client_sessions` derived from them, in the same audited transaction as the
+/// lifecycle write. How many reads of that revoked state stand between a fenced
+/// subject and a token DEPENDS ON THE REQUESTED SCOPE, which is the part that is easy
+/// to get wrong and that an earlier version of this comment did get wrong (it said
+/// "three", on every scope).
+///
+/// On an ordinary `openid` exchange there are FOUR:
+///
+///   1. [`resolve_code_exchange_sid`]'s session liveness read, which refuses
+///      `invalid_grant` BEFORE the mint resolves any role or permission.
+///   2. `ClientSessionRepo::ensure_sid`, called from that SAME function: its INSERT
+///      selects from `sessions` under the same liveness guard and answers `NotFound`
+///      for a dead session, which maps to `server_error`, still before the mint. Rungs
+///      1 and 2 are therefore NOT independent; ONE edit deletes both.
+///   3. `RefreshFamilyRepo::issue`'s `FOR UPDATE` `lock_bound_session_live`.
+///   4. The session EXISTS predicate on that same statement's `INSERT ... SELECT`.
+///
+/// Rungs 3 and 4 each refuse on their own, measured: with rungs 1, 2 and 3 neutered the
+/// exchange is still refused, and so it is with rungs 1, 2 and 4 neutered. Only with
+/// all four gone does a token reach the client, and it was measured doing so, a `200`
+/// carrying an access token, an ID token and a refresh token for a soft-deleted
+/// subject.
+///
+/// On an `offline_access` exchange there are TWO. An offline family deliberately
+/// survives the session cascade (issue #21), so `issue` skips the lock under
+/// `if !family.offline && ...` and its INSERT predicate
+/// `AND ($9 OR g.session_ref IS NULL OR EXISTS(...))` is satisfied outright by
+/// `$9 = family.offline`. Rungs 3 and 4 do not run at all, and the WHOLE fence is the
+/// two reads inside [`resolve_code_exchange_sid`], one edit apart.
+///
+/// Both scopes are pinned, separately, by
+/// `a_fenced_user_cannot_exchange_an_outstanding_authorization_code` and
+/// `a_fenced_user_cannot_exchange_an_offline_access_authorization_code` in
+/// `crates/ironauth-oidc/tests/refresh.rs`. Separately, because the `openid` test alone
+/// is VACUOUS for the edit that matters: with [`resolve_code_exchange_sid`] neutered
+/// the ENTIRE `ironauth-oidc` suite stayed green, measured, and the `offline_access`
+/// variant is the one test that turns that mutant red.
+///
+/// Rungs 3 and 4 are not equivalent to rungs 1 and 2 even where they do run, because
+/// they fire AFTER the atomic redeem: they DISCARD a token that was already minted and
+/// recorded rather than preventing the mint. Measured on the `openid` path, a refused
+/// exchange on the shipped tree leaves the code's `consumed_at` UNSET and writes zero
+/// `issued_tokens` rows, zero `refresh_families`, zero `token_size_events` and no
+/// `authorization_code.redeem` audit row; under a mutant where only rung 3 fires the
+/// SAME refusal leaves `consumed_at` SET, two `issued_tokens` rows and one
+/// `authorization_code.redeem` audit row asserting a successful redemption. The client
+/// is refused either way. The store is not in the same state, and the audit trail
+/// records the opposite thing.
+///
+/// # The residual, stated rather than argued from a rung count
+///
+/// The choice NOT to add an explicit lifecycle read to the code exchange is still the
+/// right one, but not for the "already true three times over" reason the earlier
+/// version of this comment gave. It rests on this: the two reads that fence the offline
+/// path both run before anything is minted, both fail closed, and both are now pinned
+/// by a test on the exact scope where nothing else backs them up. The residual is that
+/// those two live in ONE function, so a single careless edit removes the entire
+/// code-exchange fence for an `offline_access` grant, and one test is what stands
+/// between that edit and a merge. That margin is thinner than the refresh grant's, and
+/// it belongs in the open rather than behind a number.
+///
+/// The two grants are therefore fenced by two different mechanisms, deliberately. The
+/// refresh grant NEEDS this explicit check precisely because an `offline_access` family
+/// survives the session cascade by design (issue #21), so the mechanism that covers the
+/// code exchange cannot reach it.
 ///
 /// Fails CLOSED (`invalid_grant`) when the subject is not authenticatable (blocked,
 /// disabled, pending-verification) or is absent/deleted, and treats a store fault as

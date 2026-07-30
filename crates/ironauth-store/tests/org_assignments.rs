@@ -199,6 +199,20 @@ async fn create_user(db: &TestDatabase, env: &Env, scope: Scope, identifier: &st
         .expect("create active user")
 }
 
+/// Soft-delete `user` through the management API (issue #52): the operator's delete
+/// action. It writes the `users` tombstone and cascades that user's sessions and
+/// refresh families, and it does NOT touch `org_memberships` or any assignment row
+/// underneath, which is what the tombstone fence in the closure seed exists to observe.
+async fn delete_user(db: &TestDatabase, env: &Env, scope: Scope, user: &UserId) {
+    db.control_store()
+        .scoped(scope)
+        .acting(actor(env), CorrelationId::generate(env))
+        .users()
+        .delete(env, user, false, None)
+        .await
+        .expect("soft delete user");
+}
+
 /// Bind `user` into `org`, returning the live membership id.
 async fn add_membership(
     db: &TestDatabase,
@@ -1734,6 +1748,217 @@ async fn a_disabled_or_deleted_organization_resolves_to_nothing_on_all_three_pro
         roles_of(&db, &env, scope, &bystander, &other_user, DEFAULT_DEPTH).await,
         set(&["keeper"]),
         "and the sibling organization is still untouched"
+    );
+}
+
+#[tokio::test]
+async fn a_soft_deleted_user_resolves_to_nothing_on_all_three_projections() {
+    // The USER'S tombstone (issue #406), the direct sibling of the organization test
+    // above and fenced in the same place for the same reason: the membership seed of
+    // the shared closure, so all four projections inherit it and a fifth gets it for
+    // free.
+    //
+    // Reachable through ordinary operation rather than through corrupt data, which is
+    // what makes it worth a fence. A user delete writes the `users` tombstone and
+    // cascades that user's SESSIONS and refresh families; it does NOT cascade
+    // `org_memberships`, so the membership row, the group binding, and every
+    // assignment stay live and readable underneath a deleted user. Before this fence
+    // the admin effective-roles console reported that user's full role set.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let org = create_org(&db, &env, scope, "Globex").await;
+    let group = create_group(&db, &env, scope, &org, "engineering", None).await;
+    let group_role = create_role(&db, &env, scope, &org, "engineer").await;
+    let direct_role = create_role(&db, &env, scope, &org, "founder").await;
+    grant_group_role(&db, &env, scope, &org, &group, &group_role)
+        .await
+        .expect("grant to group");
+    let (user, membership) = create_member(&db, &env, scope, &org, "dev@example.test").await;
+    bind_member(&db, &env, scope, &org, &group, &membership)
+        .await
+        .expect("bind into group");
+    grant_direct_role(&db, &env, scope, &org, &membership, &direct_role)
+        .await
+        .expect("direct grant");
+
+    // A SECOND member of the SAME organization, so the fence is proved to be per user
+    // rather than a collapse of the organization's whole resolution.
+    let (bystander, bystander_membership) =
+        create_member(&db, &env, scope, &org, "ops@example.test").await;
+    grant_direct_role(&db, &env, scope, &org, &bystander_membership, &direct_role)
+        .await
+        .expect("bystander direct grant");
+
+    // The control: everything resolves while the user is live.
+    assert_eq!(
+        roles_of(&db, &env, scope, &org, &user, DEFAULT_DEPTH).await,
+        set(&["engineer", "founder"]),
+        "the fixture resolves before the delete"
+    );
+    assert_eq!(
+        groups_of(&db, scope, &org, &user, DEFAULT_DEPTH).await,
+        set(&["engineering"])
+    );
+    assert_eq!(
+        grant_slugs_of(&db, scope, &org, &user, DEFAULT_DEPTH).await,
+        vec!["engineer".to_owned(), "founder".to_owned()]
+    );
+
+    delete_user(&db, &env, scope, &user).await;
+
+    // Every projection answers the EMPTY set, and not an error: a deleted user is an
+    // operator state, not a store fault, exactly as a disabled organization is.
+    assert!(
+        roles_of(&db, &env, scope, &org, &user, DEFAULT_DEPTH)
+            .await
+            .is_empty(),
+        "a soft-deleted user holds no role"
+    );
+    assert!(
+        groups_of(&db, scope, &org, &user, DEFAULT_DEPTH)
+            .await
+            .is_empty(),
+        "and is in no group"
+    );
+    assert!(
+        grant_slugs_of(&db, scope, &org, &user, DEFAULT_DEPTH)
+            .await
+            .is_empty(),
+        "and the provenance view agrees, rather than showing paths no token will assert"
+    );
+
+    // The assignment rows themselves were never touched by the delete, which is what
+    // says this is a fence on live state rather than a destructive cascade, and is
+    // also why the fence has to exist.
+    assert_eq!(
+        live_attachment_count(&db, scope, "org_membership_roles", &membership).await,
+        1,
+        "the direct role assignment is still a live row under the tombstone"
+    );
+    assert_eq!(
+        live_attachment_count(&db, scope, "org_group_members", &membership).await,
+        1,
+        "and so is the group binding"
+    );
+
+    assert_eq!(
+        roles_of(&db, &env, scope, &org, &bystander, DEFAULT_DEPTH).await,
+        set(&["founder"]),
+        "another member of the same organization is untouched"
+    );
+}
+
+#[tokio::test]
+async fn a_user_who_cannot_authenticate_still_resolves_their_roles() {
+    // The DELIBERATE non-fence (issue #406), pinned so that a future reader tempted to
+    // "finish the job" beside the tombstone predicate finds out here rather than in
+    // production. The closure fences `users.deleted_at`, and it deliberately does NOT
+    // fence `users.state`.
+    //
+    // The deciding case is the INVITEE. `pending_verification` is the state an
+    // invitation accept activates, and a membership, a group binding and a role can all
+    // hang off a user sitting in it. What THIS test shows is that the state is
+    // CONSTRUCTIBLE with grants attached and that the closure resolves them: the fixture
+    // below builds it by hand through `admin_create`, so it is evidence about the
+    // statement, not an observation of a product flow routinely producing it. That the
+    // flow does is a design expectation about pre-provisioning, and the conclusion rests
+    // on the cost either way: an administrator pre-provisioning an invitee must be able
+    // to SEE what they just granted, so a `can_authenticate()` predicate here would
+    // blank the console for the workflow the view exists to serve. The tombstone is
+    // different in kind: it is permanent, so a view reporting its roles reports an
+    // outcome that can never occur, while this one is temporary and expected.
+    //
+    // Little is lost on the token path by leaving it out, because a user in any of
+    // these states obtains no token by EITHER OF THE TWO GRANTS THAT RESOLVE ROLES: the
+    // refresh grant re-checks the lifecycle explicitly, and the code exchange is
+    // refused upstream by the session cascade that block, disable and delete perform.
+    // Those two are the only call sites of `resolve_effective_roles`. The broader claim,
+    // that such a user gets no token by ANY grant, is false: the jwt-bearer assertion
+    // grant mints under an operator-authored subject mapping without liveness-checking
+    // the mapped principal, an accepted residual `ironauth-oidc/src/jwt_bearer.rs`
+    // documents on `resolve_mapped_principal`, and it was measured answering 200 with a
+    // signed token for a blocked and then a soft-deleted principal. That token carries
+    // no roles or permissions claim, so this decision is unaffected; the SENTENCE would
+    // have been wrong.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let org = create_org(&db, &env, scope, "Globex").await;
+    let role = create_role(&db, &env, scope, &org, "founder").await;
+
+    // The invitee, seeded BY HAND into the state an invitation accept activates (the
+    // accept path itself is proven elsewhere; what is under test here is what the
+    // closure answers for a user in that state, whatever put them there).
+    let invitee = db
+        .control_store()
+        .scoped(scope)
+        .acting(actor(&env), CorrelationId::generate(&env))
+        .users()
+        .admin_create(
+            &env,
+            NewAdminUser {
+                id: None,
+                identifier: "invitee@example.test",
+                password_hash: None,
+                claims_json: None,
+                external_id: None,
+                state: UserState::PendingVerification,
+                foreign_password_hash: None,
+                foreign_password_algo: None,
+                traits_json: None,
+                traits_schema_version: None,
+            },
+            now_micros(&env),
+            None,
+        )
+        .await
+        .expect("create the pending user");
+    let invitee_membership = add_membership(&db, &env, scope, &org, &invitee)
+        .await
+        .expect("bind the invitee into the organization");
+    grant_direct_role(&db, &env, scope, &org, &invitee_membership, &role)
+        .await
+        .expect("pre-provision the invitee's role");
+
+    assert_eq!(
+        roles_of(&db, &env, scope, &org, &invitee, DEFAULT_DEPTH).await,
+        set(&["founder"]),
+        "an administrator pre-provisioning an invitee can see the role they just granted"
+    );
+
+    // The same for a user an operator has BLOCKED, which is the state the temptation
+    // to add a `can_authenticate()` predicate actually comes from. It resolves too,
+    // and that is deliberate.
+    let (blocked, blocked_membership) =
+        create_member(&db, &env, scope, &org, "blocked@example.test").await;
+    grant_direct_role(&db, &env, scope, &org, &blocked_membership, &role)
+        .await
+        .expect("grant to the soon-to-be-blocked member");
+    db.control_store()
+        .scoped(scope)
+        .acting(actor(&env), CorrelationId::generate(&env))
+        .users()
+        .set_state(&env, &blocked, UserState::Blocked, None, false, None)
+        .await
+        .expect("block the user");
+    assert_eq!(
+        roles_of(&db, &env, scope, &org, &blocked, DEFAULT_DEPTH).await,
+        set(&["founder"]),
+        "a blocked user still resolves; the token path fences them elsewhere"
+    );
+
+    // And the boundary that separates the two decisions: deleting the very same
+    // blocked user DOES stop the resolution. State and tombstone are different
+    // answers on purpose, and this is the line between them.
+    delete_user(&db, &env, scope, &blocked).await;
+    assert!(
+        roles_of(&db, &env, scope, &org, &blocked, DEFAULT_DEPTH)
+            .await
+            .is_empty(),
+        "the tombstone fences where the state deliberately does not"
     );
 }
 

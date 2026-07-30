@@ -803,3 +803,306 @@ async fn a_fenced_user_cannot_mint_new_tokens_through_a_surviving_offline_token(
         "a normal active user's refresh is unaffected by another user's fence"
     );
 }
+
+/// Issue an OUTSTANDING authorization code for a fresh, active user against a trusted
+/// first-party (implicit-consent) confidential client, over `scope`, returning
+/// `(subject, client_id, secret, code)`. The code is deliberately NOT exchanged, so
+/// the caller can fence the user and then present it.
+///
+/// `scope` is a PARAMETER rather than a constant because the two grants under it are
+/// fenced by DIFFERENT numbers of layers: an `offline_access` authorization opens an
+/// offline family, and an offline family skips the refresh-family open's own session
+/// guard by design (issue #21). See
+/// `a_fenced_user_cannot_exchange_an_offline_access_authorization_code` for what that
+/// costs and why both scopes are driven.
+async fn outstanding_code_for_new_user(
+    harness: &Harness,
+    scope: &str,
+) -> (String, String, String, String) {
+    let (client, secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let client_id = client.to_string();
+    harness
+        .configure_client_policy(&client, "implicit", false, true, None)
+        .await;
+    let subject = harness.seed_unique_user().await;
+    let cookie = harness.session_cookie(&subject).await;
+    let (status, _loc, code) = authorize_scope(harness, &client_id, scope, &cookie).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let code = code.expect("a first-party authorization issues a code");
+    (subject, client_id, secret, code)
+}
+
+/// The `authorization_code` exchange form for `code` (the client authenticates
+/// through its Basic header, so no `client_id` parameter is carried here).
+fn code_exchange_form(code: &str) -> String {
+    form(&[
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("redirect_uri", REDIRECT_URI),
+    ])
+}
+
+#[tokio::test]
+async fn a_fenced_user_cannot_exchange_an_outstanding_authorization_code() {
+    // The OTHER half of the issue #52 invariant, on the OTHER grant (issue #406): after
+    // block/disable/delete a user obtains NO new tokens by ANY path. The sibling test
+    // above pins the refresh grant, which is fenced by an explicit lifecycle re-check.
+    // This pins the CODE EXCHANGE, and it exists because that half was true but
+    // UNMEASURED, which on this milestone is the shape a defect takes.
+    //
+    // # Why this is not a redundant test of the same check
+    //
+    // The two grants are fenced by two DIFFERENT mechanisms, and the code exchange has
+    // no user-lifecycle check anywhere in it. What refuses here is the SESSION cascade:
+    // delete, block, and disable each revoke every one of the subject's `sessions` rows
+    // (and the `client_sessions` derived from them) in the same audited transaction as
+    // the lifecycle write, and the mint's `sid` resolution refuses a code whose
+    // `session_ref` no longer resolves to a live session, BEFORE it resolves any role
+    // or permission. Nothing in the code exchange states that dependency, so nothing
+    // but this test would notice it being broken. It is deliberately a test rather than
+    // a second explicit check, because that check would be another scoped store read on
+    // the hottest path in the product to re-establish a property already true twice
+    // over.
+    //
+    // # Non-vacuity, measured, and the rung count is FOUR rather than three
+    //
+    // On THIS scope (`openid`, no `offline_access`) the cascade is read in FOUR places,
+    // which is exactly the shape that survives a careless mutation and proves nothing,
+    // so they were killed in turn. Two of the four are NOT independent: rungs 1 and 2
+    // both live inside `resolve_code_exchange_sid`, so one edit deletes both.
+    //
+    //   1. `resolve_code_exchange_sid`'s session liveness read, which refuses
+    //      `invalid_grant` BEFORE the mint resolves any role or permission.
+    //   2. `ClientSessionRepo::ensure_sid`, called from that SAME function: its INSERT
+    //      selects from `sessions` under the same liveness guard and answers `NotFound`
+    //      for a dead session, which maps to `server_error`, still before the mint.
+    //   3. `RefreshFamilyRepo::issue`'s `FOR UPDATE` `lock_bound_session_live`.
+    //   4. The session EXISTS predicate on that same statement's `INSERT ... SELECT`.
+    //
+    // Each mutant below was run synchronously against a fresh cluster:
+    //
+    //   * Rungs 1 and 2 gone, which is ONE edit: this test stays GREEN, and so does the
+    //     whole `ironauth-oidc` suite. Rungs 3 and 4 refuse with `SessionNotLive`, which
+    //     maps to the same `invalid_grant`, but they run AFTER the code is consumed and
+    //     the tokens are signed, so they DISCARD a minted token rather than preventing
+    //     the mint. That is why
+    //     `a_fenced_user_cannot_exchange_an_offline_access_authorization_code` exists
+    //     below: on an offline family rungs 3 and 4 do not run at all, so it is that
+    //     test, and nothing else in the suite, that goes RED on this mutant.
+    //   * Rungs 1, 2 and 3 gone: still GREEN, rung 4 alone refusing.
+    //   * Rungs 1, 2 and 4 gone: still GREEN, rung 3 alone refusing.
+    //   * All four gone: a `200` carrying a full access token and ID token for a
+    //     soft-deleted subject, and this test goes red on `access_token` below.
+    //
+    // So the assertions here are load bearing, and the rung a reader would assume is
+    // doing the work is neither the only one nor, on the offline scope, present at all.
+    let harness = Harness::start().await;
+
+    // The control, first: an untouched active user's outstanding code exchanges
+    // normally, so a later refusal is attributable to the fence and not to the fixture.
+    let (_active, client_id, secret, code) =
+        outstanding_code_for_new_user(&harness, "openid").await;
+    let (status, _, body) = harness
+        .token_with_auth(
+            &code_exchange_form(&code),
+            Some(&basic_header(&client_id, &secret)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "active user code exchange: {body}");
+    assert!(
+        json(&body)["access_token"].is_string(),
+        "an active user's outstanding code mints an access token"
+    );
+
+    // DELETED between the authorization and the exchange. The code is still live and
+    // unredeemed, and its bindings (client, redirect_uri, scope) all still match.
+    let (subject, client_id, secret, code) =
+        outstanding_code_for_new_user(&harness, "openid").await;
+    harness.delete_user(&subject).await;
+    let (status, _, body) = harness
+        .token_with_auth(
+            &code_exchange_form(&code),
+            Some(&basic_header(&client_id, &secret)),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "deleted user code exchange: {body}"
+    );
+    assert_eq!(json(&body)["error"], "invalid_grant");
+    assert!(
+        json(&body).get("access_token").is_none(),
+        "a deleted user's code exchange mints no access token"
+    );
+    assert!(
+        json(&body).get("id_token").is_none(),
+        "and no id token either"
+    );
+    assert!(
+        json(&body).get("refresh_token").is_none(),
+        "and opens no refresh family, which would outlive the code by far"
+    );
+
+    // BLOCKED, the reversible fence, on its own fresh outstanding code.
+    let (subject, client_id, secret, code) =
+        outstanding_code_for_new_user(&harness, "openid").await;
+    harness
+        .set_user_state(&subject, ironauth_store::UserState::Blocked)
+        .await;
+    let (status, _, body) = harness
+        .token_with_auth(
+            &code_exchange_form(&code),
+            Some(&basic_header(&client_id, &secret)),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "blocked user code exchange: {body}"
+    );
+    assert_eq!(json(&body)["error"], "invalid_grant");
+    assert!(
+        json(&body).get("access_token").is_none(),
+        "a blocked user's code exchange mints no access token"
+    );
+
+    // A separate, untouched user's outstanding code still exchanges: the fence is
+    // targeted at the fenced subject rather than a blanket break of the code grant.
+    let (_other, other_client, other_secret, other_code) =
+        outstanding_code_for_new_user(&harness, "openid").await;
+    let (status, _, body) = harness
+        .token_with_auth(
+            &code_exchange_form(&other_code),
+            Some(&basic_header(&other_client, &other_secret)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "untouched user exchange: {body}");
+    assert!(
+        json(&body)["access_token"].is_string(),
+        "another user's fence does not affect this exchange"
+    );
+}
+
+#[tokio::test]
+async fn a_fenced_user_cannot_exchange_an_offline_access_authorization_code() {
+    // The SAME invariant as the test above, on the scope where the ladder is SHORTEST
+    // (issue #406). The sibling authorises `openid` only, and that is precisely the
+    // path that still carries the refresh-family open's two session guards; on an
+    // `offline_access` authorization NEITHER of them runs, because an offline family
+    // deliberately survives the session cascade (issue #21).
+    //
+    // `RefreshFamilyRepo::issue` skips the `FOR UPDATE` `lock_bound_session_live` under
+    // `if !family.offline && ...`, and its `INSERT ... SELECT` predicate
+    // `AND ($9 OR g.session_ref IS NULL OR EXISTS(...))` is satisfied outright by
+    // `$9 = family.offline`. So on this scope the whole fence is the TWO reads inside
+    // `resolve_code_exchange_sid`, and those two are one edit apart.
+    //
+    // # Non-vacuity, measured
+    //
+    // With `resolve_code_exchange_sid` neutered (one edit, both reads gone) the whole
+    // `ironauth-oidc` suite stays GREEN except THIS test, which goes red on the status
+    // assertion with a `200` carrying a signed access token and a refresh token for a
+    // soft-deleted subject. That asymmetry is the reason this variant exists: without
+    // it, the only fence the code exchange has on its most dangerous scope, the one
+    // whose refresh family outlives every logout, is pinned by nothing.
+    let harness = Harness::start().await;
+
+    // The control: an active user's outstanding offline code exchanges, and really
+    // does open an offline family (the refresh token proves the scope took effect),
+    // so a later refusal is attributable to the fence rather than to the fixture.
+    let (_active, client_id, secret, code) =
+        outstanding_code_for_new_user(&harness, "openid offline_access").await;
+    let (status, _, body) = harness
+        .token_with_auth(
+            &code_exchange_form(&code),
+            Some(&basic_header(&client_id, &secret)),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "active user offline code exchange: {body}"
+    );
+    assert!(
+        json(&body)["access_token"].is_string(),
+        "an active user's outstanding offline code mints an access token"
+    );
+    assert!(
+        json(&body)["refresh_token"].is_string(),
+        "and opens the offline family this test is about"
+    );
+
+    // DELETED between the authorization and the exchange, on a fresh outstanding code.
+    let (subject, client_id, secret, code) =
+        outstanding_code_for_new_user(&harness, "openid offline_access").await;
+    harness.delete_user(&subject).await;
+    let (status, _, body) = harness
+        .token_with_auth(
+            &code_exchange_form(&code),
+            Some(&basic_header(&client_id, &secret)),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "deleted user offline code exchange: {body}"
+    );
+    assert_eq!(json(&body)["error"], "invalid_grant");
+    assert!(
+        json(&body).get("access_token").is_none(),
+        "a deleted user's offline code exchange mints no access token"
+    );
+    assert!(
+        json(&body).get("id_token").is_none(),
+        "and no id token either"
+    );
+    assert!(
+        json(&body).get("refresh_token").is_none(),
+        "and above all opens no OFFLINE family, which no logout cascade would ever reach"
+    );
+
+    // BLOCKED, the reversible fence, on its own fresh outstanding offline code.
+    let (subject, client_id, secret, code) =
+        outstanding_code_for_new_user(&harness, "openid offline_access").await;
+    harness
+        .set_user_state(&subject, ironauth_store::UserState::Blocked)
+        .await;
+    let (status, _, body) = harness
+        .token_with_auth(
+            &code_exchange_form(&code),
+            Some(&basic_header(&client_id, &secret)),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "blocked user offline code exchange: {body}"
+    );
+    assert_eq!(json(&body)["error"], "invalid_grant");
+    assert!(
+        json(&body).get("refresh_token").is_none(),
+        "a blocked user's offline code exchange opens no family either"
+    );
+
+    // A separate, untouched user's outstanding offline code still exchanges.
+    let (_other, other_client, other_secret, other_code) =
+        outstanding_code_for_new_user(&harness, "openid offline_access").await;
+    let (status, _, body) = harness
+        .token_with_auth(
+            &code_exchange_form(&other_code),
+            Some(&basic_header(&other_client, &other_secret)),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "untouched user offline exchange: {body}"
+    );
+    assert!(
+        json(&body)["refresh_token"].is_string(),
+        "another user's fence does not affect this offline family"
+    );
+}

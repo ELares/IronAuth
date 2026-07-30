@@ -1437,6 +1437,73 @@ async fn a_soft_deleted_organization_resolves_to_no_permissions_too() {
 }
 
 #[tokio::test]
+async fn a_soft_deleted_user_resolves_to_no_permissions() {
+    // The USER'S tombstone (issue #406) on the FOURTH projection. The fence lives in
+    // the membership seed of the shared closure, so this projection inherits it by
+    // construction rather than by its own predicate; that inheritance is the whole
+    // design claim, and it is only a claim until each projection is driven.
+    //
+    // A permission is the sharpest of the four to leave unfenced, because it names an
+    // API capability rather than a label: a console reporting `billing.admin` for a
+    // deleted account is reporting authority that account can never again exercise.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let org = create_org(&db, &env, scope, "Globex").await;
+    let group = create_group(&db, &env, scope, &org, "engineering", None).await;
+    let group_role = create_role(&db, &env, scope, &org, "engineer").await;
+    let direct_role = create_role(&db, &env, scope, &org, "founder").await;
+    let deploy = create_permission(&db, &env, scope, "deploy.write").await;
+    let billing = create_permission(&db, &env, scope, "billing.admin").await;
+    attach(&db, &env, scope, &org, &group_role, &deploy).await;
+    attach(&db, &env, scope, &org, &direct_role, &billing).await;
+    grant_group_role(&db, &env, scope, &org, &group, &group_role).await;
+
+    let (user, membership) = create_member(&db, &env, scope, &org, "dev@example.test").await;
+    bind_member(&db, &env, scope, &org, &group, &membership).await;
+    grant_direct_role(&db, &env, scope, &org, &membership, &direct_role).await;
+
+    // A second member of the SAME organization, holding the same permissions through
+    // the same rows: the fence must be per user, not a collapse of the organization.
+    let (bystander, bystander_membership) =
+        create_member(&db, &env, scope, &org, "ops@example.test").await;
+    grant_direct_role(&db, &env, scope, &org, &bystander_membership, &direct_role).await;
+
+    assert_eq!(
+        permissions_of(&db, scope, &org, &user, DEFAULT_DEPTH).await,
+        set(&["billing.admin", "deploy.write"]),
+        "the fixture resolves while the user is live"
+    );
+
+    db.control_store()
+        .scoped(scope)
+        .acting(actor(&env), CorrelationId::generate(&env))
+        .users()
+        .delete(&env, &user, false, None)
+        .await
+        .expect("soft delete user");
+
+    assert!(
+        permissions_of(&db, scope, &org, &user, DEFAULT_DEPTH)
+            .await
+            .is_empty(),
+        "a soft-deleted user holds no permission"
+    );
+    assert!(
+        roles_of(&db, scope, &org, &user, DEFAULT_DEPTH)
+            .await
+            .is_empty(),
+        "and the role set it derives from is empty too, so the two agree"
+    );
+    assert_eq!(
+        permissions_of(&db, scope, &org, &bystander, DEFAULT_DEPTH).await,
+        set(&["billing.admin"]),
+        "another member of the same organization is untouched"
+    );
+}
+
+#[tokio::test]
 async fn the_projection_never_crosses_organization_via_a_corrupt_mapping_row() {
     // The organization fence the fourth projection adds, `rp.organization_id`, over the
     // two shapes of corruption it has to survive. It is the ONLY thing in the statement
