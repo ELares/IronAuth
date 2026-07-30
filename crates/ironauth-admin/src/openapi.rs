@@ -359,6 +359,7 @@ use crate::views::{
         crate::org_effective_roles::EffectiveRolesView,
         crate::org_effective_roles::EffectiveRoleView,
         crate::org_effective_roles::EffectiveRoleSourceView,
+        crate::org_effective_roles::PermissionBudgetView,
         ResourceTypeView,
         ResourceTypesList,
         ManagementKeyView,

@@ -5,7 +5,7 @@
 //!
 //! Migration 0091 shipped a vocabulary of names and 0092 shipped the mapping that
 //! gives a name authorization meaning. This is the read that turns those rows into an
-//! answer, and a later PR of this issue emits that answer into an access token, so
+//! answer, and `ironauth_oidc`'s mint emits that answer into an access token, so
 //! everything here is about what the answer must be and about what must stop it.
 //!
 //! What this file pins, in the order the tests appear:

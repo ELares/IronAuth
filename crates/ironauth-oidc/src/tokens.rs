@@ -62,7 +62,8 @@ use std::time::{Duration, SystemTime};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ironauth_jose::{
-    Confirmation, EmissionOptions, SigningKey, SigningPolicy, sign_jws_with_policy,
+    Confirmation, EmissionOptions, SigningKey, SigningPolicy, compact_len, protected_header,
+    sign_jws_with_policy,
 };
 use ironauth_store::{
     IssuedTokenId, RefreshTokenId, Scope, TokenFormat, opaque_access_token_digest,
@@ -71,6 +72,7 @@ use ironauth_store::{
 use serde_json::json;
 
 use crate::authn;
+use crate::permission_budget::{self, PermissionBudget, PermissionBudgetOutcome, PermissionStatus};
 use crate::state::OidcState;
 use crate::subject;
 
@@ -132,10 +134,16 @@ const OPAQUE_ACCESS_TOKEN_BYTES: usize = 32;
 /// - **Hash / session claims** (OIDC): `at_hash`/`c_hash`/`sid`. IronAuth computes and
 ///   emits these itself where they belong; a self-asserted value carries security
 ///   meaning it must never be allowed to forge.
-/// - **Authorization claims**: `org_id` (issue #94) and `roles` (issue #97). These are
-///   the only claims in the set a resource server makes an ACCESS decision on, so a
-///   self-asserted one is a privilege escalation rather than a cosmetic lie. Both are
-///   resolved by the issuer from an authoritative store read.
+/// - **Authorization claims**: `org_id` (issue #94), `roles` (issue #97), and
+///   `permissions`/`permissions_status` (issue #98). These are the only claims in the
+///   set a resource server makes an ACCESS decision on, so a self-asserted one is a
+///   privilege escalation rather than a cosmetic lie. All are resolved by the issuer
+///   from an authoritative store read. A PERMISSION is the most direct instance of
+///   that sentence in the product: it names an API capability, so a forged one is a
+///   capability nobody granted. `permissions_status` is protected for a DIFFERENT
+///   reason, and it is the one a reader is likely to miss: the marker grants nothing,
+///   but forging its ABSENCE, or forging a weaker value, DOWNGRADES the resource
+///   server's behaviour by convincing it that a WITHHELD set was simply empty.
 pub(crate) const PROTECTED_ACCESS_TOKEN_CLAIMS: &[&str] = &[
     // Protocol claims (RFC 9068 section 2.2 + RFC 7519 registered).
     "iss",
@@ -170,6 +178,16 @@ pub(crate) const PROTECTED_ACCESS_TOKEN_CLAIMS: &[&str] = &[
     // the group ancestry, and is issuer-set only. A client custom claim must never
     // self-assert a role.
     "roles",
+    // Organization permissions (issue #98): `permissions` is resolved FRESH at
+    // issuance from an authoritative store read over the mappings of the roles the
+    // subject effectively holds, and is issuer-set only. A client custom claim must
+    // never self-assert an API capability.
+    "permissions",
+    // The budget verdict (issue #98). Protected for a reason distinct from the claim
+    // above: a client that could self-assert `permissions_status` could SUPPRESS a
+    // `pdp_required` marker and convince a resource server that a withheld set was
+    // simply an empty one, which is a downgrade the resource server cannot detect.
+    "permissions_status",
 ];
 
 /// The resolved target for an access token: the audience(s) it is minted for, the
@@ -193,6 +211,27 @@ pub struct AccessTokenTarget {
     pub format: TokenFormat,
     /// The access-token lifetime.
     pub ttl: Duration,
+    /// Whether EVERY audience this token is minted for has opted in to the issue #98
+    /// permission claim (`resource_servers.permission_claims_enabled`).
+    ///
+    /// UNANIMITY OR SUPPRESS. Computed in
+    /// [`OidcState::resolve_access_token_target`](crate::OidcState::resolve_access_token_target)
+    /// by folding the per-resource-server opt-in with AND, alongside the existing
+    /// format-unanimity and shortest-TTL folds. A token targeting a mix of opted-in
+    /// and opted-out resource servers carries NO permission claim and NO
+    /// `permissions_status`: there is no per-audience claim shape inside one token,
+    /// emitting anyway would be a cross-audience privilege leak, and refusing with
+    /// `invalid_target` would be a behaviour change to a shipped path. The
+    /// suppression is SILENT and deliberately not reported as an overflow, because it
+    /// is a configuration fact the opted-in resource server can determine for itself
+    /// from its own opt-in state plus the `aud` array.
+    ///
+    /// `false` for the no-resource branch BY CONSTRUCTION: that branch returns early
+    /// without reading `resource_servers` at all, so there is no row to carry an
+    /// opt-in. Every grant that passes no resource (device, client-credentials,
+    /// jwt-bearer) therefore can never carry permissions, which is the issue #99
+    /// boundary rather than an accident.
+    pub permission_claims: bool,
 }
 
 impl AccessTokenTarget {
@@ -214,6 +253,26 @@ impl AccessTokenTarget {
     #[must_use]
     pub fn primary_audience(&self) -> &str {
         self.audiences.first().map_or("", String::as_str)
+    }
+
+    /// Whether a mint for this target can put a permission claim on the wire at all
+    /// (issue #98): the audiences UNANIMOUSLY opted in AND the selected format is one
+    /// that carries claims.
+    ///
+    /// The FORMAT half is not a second policy, it is the same statement
+    /// [`mint_access`] makes by answering [`PermissionBudgetOutcome::NotApplicable`]
+    /// on the opaque branch without reading the resolved set: a reference token
+    /// carries no claims, so there is nothing for an opt-in to apply to. It is
+    /// checked HERE, up front, because the caller that resolves the permission set
+    /// runs before the mint, and an `opaque` resource server that is opted in
+    /// (reachable through a config promotion, which writes both columns with no
+    /// management handler in the path) would otherwise pay a store round trip on
+    /// every exchange for a set the mint then discards. Worse than the cost: that
+    /// read can FAIL, which would turn a combination the threat model documents as
+    /// INERT into a 500 that the same request without the opt-in survives.
+    #[must_use]
+    pub fn emits_permission_claims(&self) -> bool {
+        matches!(self.format, TokenFormat::AtJwt) && self.permission_claims
     }
 }
 
@@ -270,6 +329,26 @@ pub struct IssuedTokens {
     pub id_jti: IssuedTokenId,
     /// The access-token lifetime in seconds (the `expires_in` of the response).
     pub expires_in_secs: i64,
+    /// What the permission budget decided for the access token (issue #98), handed
+    /// back so the ASYNC caller can record the operator-visible event. The claim
+    /// shape is already decided and already signed by the time this is seen.
+    pub permission_budget: PermissionBudgetOutcome,
+}
+
+/// One access token minted on its own (the refresh grant), plus the two things the
+/// async caller needs beside it.
+///
+/// A struct rather than a widening tuple because the third member is the budget
+/// verdict and an unnamed `.2` at the call site would say nothing about it.
+pub struct MintedRefreshAccess {
+    /// The minted access token (an `at+jwt` or an opaque reference token).
+    pub access: MintedAccessToken,
+    /// The access-token lifetime in seconds (the `expires_in` of the response).
+    pub expires_in_secs: i64,
+    /// What the permission budget decided (issue #98), for the event the async
+    /// caller records. Recording from the refresh hook is NEW observability: the
+    /// sink this feeds has never seen the refresh grant.
+    pub permission_budget: PermissionBudgetOutcome,
 }
 
 /// Everything the claims need that is specific to one exchange.
@@ -353,6 +432,34 @@ pub struct MintRequest<'a> {
     /// carry no roles either, by OMISSION from their own distinct claim builder:
     /// machine roles are issue #99 and must land on both machine paths deliberately.
     pub roles: Option<&'a BTreeSet<String>>,
+    /// The subject's effective organization PERMISSIONS at THIS issuance (issue #98),
+    /// emitted as the `permissions` claim on the ACCESS TOKEN ONLY.
+    ///
+    /// Resolved FRESH from the store on every code exchange and every refresh, on
+    /// exactly the terms [`MintRequest::roles`] documents and for a stronger version
+    /// of the same reason: a permission names an API CAPABILITY, so freezing one
+    /// would make a revocation invisible for a whole refresh-family lifetime. A
+    /// [`BTreeSet`], so the emitted array is totally ordered and two issuances against
+    /// identical stored state are byte-identical, which is what makes a BYTE budget
+    /// over it meaningful at all.
+    ///
+    /// [`None`] when the exchange resolved no organization context OR when the
+    /// target's audiences did not UNANIMOUSLY opt in (see
+    /// [`AccessTokenTarget::permission_claims`]); the claim is then ABSENT and no
+    /// `permissions_status` is emitted either. [`Some`] of an EMPTY set is distinct
+    /// and emits an empty array, meaning "in this organization, holding nothing".
+    ///
+    /// This is NEVER a partial set. When the budget will not accommodate it the WHOLE
+    /// claim is withheld and `permissions_status` says so; see
+    /// [`crate::permission_budget`]. `mint_access` and not
+    /// [`build_access_token_claims`] is what reads this field, because which of the
+    /// three claim shapes ships is a budget decision and the budget needs a
+    /// serialized size to make it.
+    ///
+    /// The client-credentials and jwt-bearer paths carry no permissions either, by
+    /// OMISSION from their own distinct claim builder: machine principals are issue
+    /// #99 and must land on both machine paths deliberately.
+    pub permissions: Option<&'a BTreeSet<String>>,
     /// The access-token hash for a front-channel ID token (issue #17). The token
     /// endpoint always passes [`None`]: a token-endpoint ID token never carries
     /// `at_hash`.
@@ -404,10 +511,16 @@ pub enum IdTokenError {
 /// cap and the conditional claim rules. Pure: it takes the already-resolved
 /// instants and identifiers, so it is exercised without a store or a signer.
 ///
-/// [`MintRequest::roles`] is DELIBERATELY not read here (issue #97): the effective
-/// organization role set rides the ACCESS token only. Do not "fix" the asymmetry with
-/// `org_id` by adding an emission; the reasoning is on the field's doc comment, and
-/// `the_id_token_never_carries_roles` pins the omission.
+/// [`MintRequest::roles`] is DELIBERATELY not read here (issue #97), and neither is
+/// [`MintRequest::permissions`] (issue #98): both ride the ACCESS token only. Do not
+/// "fix" the asymmetry with `org_id` by adding an emission; the reasoning is on those
+/// fields' doc comments, and `the_id_token_never_carries_roles` and
+/// `the_id_token_never_carries_permissions` pin the two omissions.
+///
+/// A `permissions` or `permissions_status` arriving through the client-influenced
+/// extra-claims bag is DROPPED by the explicit reserved-name filter below, not
+/// stamped in. That filter and not insertion order is what protects the no-org case,
+/// where the protocol sets no such claim at all.
 ///
 /// # Errors
 ///
@@ -527,6 +640,38 @@ pub(crate) fn build_id_token_claims(
     Ok(claims)
 }
 
+/// WHICH permission claim an access token carries (issue #98): the three, and only
+/// three, states a resource server can observe on the wire.
+///
+/// A total enum rather than a pair of options, because the states are mutually
+/// exclusive and "both `permissions` and `permissions_status`" must be unwritable
+/// rather than merely unwritten. There is deliberately no variant carrying a PARTIAL
+/// set either, though that one is a weaker guarantee and is worth stating as the
+/// weaker thing it is: [`PermissionClaim::Set`] takes any [`BTreeSet`], so an emitter
+/// that shortened the set itself would still compile. What the missing variant buys is
+/// that truncating has to be a deliberate act at the call site rather than a shape this
+/// type offers. The behaviour is held by the mint's tests; see `docs/THREAT-MODEL.md`.
+///
+/// The three states and what each TELLS the resource server:
+///
+/// | State | `permissions` | `permissions_status` | Meaning |
+/// |---|---|---|---|
+/// | [`PermissionClaim::Absent`] | absent | absent | No organization context, OR the target's audiences did not unanimously opt in. |
+/// | [`PermissionClaim::Set`] | present (possibly `[]`) | absent | The COMPLETE resolved set. `[]` means "in an organization, holding nothing". |
+/// | [`PermissionClaim::Withheld`] | absent | present | The set was withheld for a BUDGET reason, and the value says what to do instead. |
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PermissionClaim<'a> {
+    /// Emit neither claim. Also the state a MIXED opt-in target reaches, which is why
+    /// this variant carries no reason: a suppression for a configuration reason must
+    /// be indistinguishable on the wire from "no organization context", and must NOT
+    /// be reported as an overflow.
+    Absent,
+    /// Emit the COMPLETE set as `permissions`.
+    Set(&'a BTreeSet<String>),
+    /// Emit no `permissions` and say why in `permissions_status`.
+    Withheld(PermissionStatus),
+}
+
 /// Build the RFC 9068 access-token claim set for an `at+jwt` (issue #29). Pure,
 /// so it is exercised without a store or a signer.
 ///
@@ -540,12 +685,23 @@ pub(crate) fn build_id_token_claims(
 /// a request parameter) and, when the authentication instant was frozen onto the
 /// code as due, `auth_time`. Claims hygiene: no PII beyond these protocol claims
 /// (no `email`/`name`/`address`/`phone`); scope-derived claims stay at `UserInfo`.
+///
+/// `permission` is an EXPLICIT parameter rather than a read of
+/// [`MintRequest::permissions`] (issue #98), and the asymmetry with `roles` is
+/// deliberate. Which of the three [`PermissionClaim`] shapes ships is a BUDGET
+/// decision, and the budget's input is the serialized size of the very claim set
+/// being decided, so the decision cannot be made from inside this function; it is
+/// made in [`mint_access`], which calls this twice and signs one of the results. A
+/// parameter makes that visible at every call site, where a silent read of a request
+/// field would let a caller believe a resolved set is emitted when the budget
+/// withheld it.
 pub(crate) fn build_access_token_claims(
     request: &MintRequest<'_>,
     iat: i64,
     exp: i64,
     jti: &str,
     audience: &serde_json::Value,
+    permission: PermissionClaim<'_>,
 ) -> serde_json::Value {
     let mut claims = json!({
         "iss": request.issuer,
@@ -592,6 +748,26 @@ pub(crate) fn build_access_token_claims(
     // which its distinct builder guarantees by omission.
     if let Some(roles) = request.roles {
         claims["roles"] = json!(roles.iter().collect::<Vec<_>>());
+    }
+    // permissions / permissions_status (issue #98): the subject's effective API
+    // capabilities, RESOLVED FRESH at this issuance exactly as `roles` is, and
+    // emitted on the ACCESS token only. Both names are in
+    // PROTECTED_ACCESS_TOKEN_CLAIMS, so no client-influenced bag can self-assert
+    // either on any path. The set is emitted in the BTreeSet's total order, which is
+    // what makes the byte budget's measurement reproducible.
+    //
+    // Which shape ships is decided by the caller, never here: see `PermissionClaim`
+    // for the three observable wire states and what each tells a resource server. The
+    // two claims are MUTUALLY EXCLUSIVE by construction (the match has no arm setting
+    // both), so a resource server never has to reconcile a set with a status.
+    match permission {
+        PermissionClaim::Absent => {}
+        PermissionClaim::Set(permissions) => {
+            claims["permissions"] = json!(permissions.iter().collect::<Vec<_>>());
+        }
+        PermissionClaim::Withheld(status) => {
+            claims["permissions_status"] = json!(status.as_str());
+        }
     }
     // cnf (RFC 7800 / RFC 9449, issue #368): bind the access token to the DPoP proof
     // key when a valid proof accompanied issuance. `cnf` is issuer-reserved (it is in
@@ -641,12 +817,19 @@ pub struct ClientCredentialsMintRequest<'a> {
 /// asserting an authentication context would be false. It reuses the SAME signing
 /// core and opaque mint as every other access token; only the claim set differs.
 ///
-/// It likewise carries NO `org_id` (issue #94) and NO `roles` (issue #97). That
-/// omission IS the machine-principal guarantee: a machine token asserts no human
-/// organization context and no human authorization role. Attaching roles to an
-/// `sva_` service-account principal is issue #99 and needs its own field here, so it
-/// lands on BOTH machine paths (client-credentials and jwt-bearer) at once and
-/// deliberately, rather than leaking in through this builder.
+/// It likewise carries NO `org_id` (issue #94), NO `roles` (issue #97), and NO
+/// `permissions` or `permissions_status` (issue #98). That omission IS the
+/// machine-principal guarantee: a machine token asserts no human organization
+/// context, no human authorization role, and no human API capability. Attaching any
+/// of them to an `sva_` service-account principal is issue #99 and needs its own
+/// field here, so it lands on BOTH machine paths (client-credentials and jwt-bearer)
+/// at once and deliberately, rather than leaking in through this builder.
+///
+/// The omission is structural twice over, which is worth stating because one layer
+/// alone would be thin. This builder takes a [`ClientCredentialsMintRequest`], which
+/// has no permission field to read; and the M2M grants pass no RFC 8707 resource, so
+/// [`AccessTokenTarget::permission_claims`] is `false` for them even if one day they
+/// did.
 ///
 /// The per-client STATIC custom claims are merged last, and a custom claim can NEVER
 /// override a protected registered claim: any name in [`PROTECTED_ACCESS_TOKEN_CLAIMS`]
@@ -832,13 +1015,14 @@ pub fn mint(
     )
     .map_err(|_| ())?;
 
-    let access = mint_access(state, signer, policy, request, target, now)?;
+    let (access, permission_budget) = mint_access(state, signer, policy, request, target, now)?;
 
     Ok(IssuedTokens {
         access,
         id_token,
         id_jti,
         expires_in_secs: access_ttl_secs,
+        permission_budget,
     })
 }
 
@@ -860,16 +1044,33 @@ pub fn mint_access_token(
     policy: &SigningPolicy,
     request: &MintRequest<'_>,
     target: &AccessTokenTarget,
-) -> Result<(MintedAccessToken, i64), ()> {
+) -> Result<MintedRefreshAccess, ()> {
     let now = state.now();
-    let access = mint_access(state, signer, policy, request, target, now)?;
-    Ok((access, secs(target.ttl)))
+    let (access, permission_budget) = mint_access(state, signer, policy, request, target, now)?;
+    Ok(MintedRefreshAccess {
+        access,
+        expires_in_secs: secs(target.ttl),
+        permission_budget,
+    })
 }
 
 /// Mint the access token for `target`, in whichever format it selects (issue #29,
 /// #21). Shared by the code exchange ([`mint`]) and the refresh grant
 /// ([`mint_access_token`]), so a refreshed access token is byte-shaped identically
 /// to a freshly issued one.
+///
+/// Also returns what the permission budget decided (issue #98), for the event the
+/// async caller records.
+///
+/// # An OPAQUE access token can never carry permissions
+///
+/// The opaque branch answers [`PermissionBudgetOutcome::NotApplicable`] unconditionally
+/// and does not even look at [`MintRequest::permissions`]. That is not a policy this
+/// function applies, it is a restatement of what [`mint_opaque_access`] is: a
+/// reference token carries NO claims at all, and `IntrospectionClaims` has no
+/// extension point to put one in. Permissions are an `at+jwt` feature or they do not
+/// exist. `an_opaque_access_token_can_never_carry_permissions` asserts it rather than
+/// leaving it to be inferred from the absence of code.
 fn mint_access(
     state: &OidcState,
     signer: &SigningKey,
@@ -877,37 +1078,114 @@ fn mint_access(
     request: &MintRequest<'_>,
     target: &AccessTokenTarget,
     now: SystemTime,
-) -> Result<MintedAccessToken, ()> {
+) -> Result<(MintedAccessToken, PermissionBudgetOutcome), ()> {
     let iat = epoch_secs(now);
     let access_exp = iat.saturating_add(secs(target.ttl));
     match target.format {
         // RFC 9068 at+jwt: the header typ is `at+jwt` and the claims carry the
         // section 2.2 set, signed through the same policy-enforced core as the ID
         // token, so an algorithm the policy forbids is refused before signing.
-        TokenFormat::AtJwt => {
-            let jti = IssuedTokenId::generate(state.env(), &request.scope);
-            let claims = build_access_token_claims(
-                request,
-                iat,
-                access_exp,
-                &jti.to_string(),
-                &target.aud_claim(),
-            );
-            let token = sign_jws_with_policy(
-                policy,
-                signer,
-                &serde_json::to_vec(&claims).map_err(|_| ())?,
-                &EmissionOptions::new().with_typ("at+jwt"),
-            )
-            .map_err(|_| ())?;
-            Ok(MintedAccessToken::Jwt { token, jti })
-        }
+        TokenFormat::AtJwt => mint_at_jwt(state, signer, policy, request, target, iat, access_exp),
         // Opaque: a scope-declaring reference token; only its digest and metadata
         // are stored (the caller records them in the redeem transaction). The token
         // embeds its own `jti` as the routing handle, so the digest is over the
         // WHOLE token (handle + secret) the client presents.
-        TokenFormat::Opaque => Ok(mint_opaque_access(state, &request.scope, target, now)),
+        TokenFormat::Opaque => Ok((
+            mint_opaque_access(state, &request.scope, target, now),
+            PermissionBudgetOutcome::NotApplicable,
+        )),
     }
+}
+
+/// Mint the RFC 9068 `at+jwt` access token, applying the issue #98 permission budget
+/// to decide which of the three [`PermissionClaim`] shapes it carries.
+///
+/// # The algorithm, and why the size is measured rather than estimated
+///
+/// With no resolved permission set (no organization context, or a target whose
+/// audiences did not unanimously opt in) nothing here runs: the claims are built
+/// once, exactly as before issue #98, and the outcome is
+/// [`PermissionBudgetOutcome::NotApplicable`]. This is the overwhelmingly common
+/// path and it pays nothing.
+///
+/// With a set in play:
+///
+/// 1. Build and serialize the claims WITHOUT `permissions` and WITH the
+///    `permissions_status` a withholding would carry. That is precisely the token
+///    that SHIPS if the budget withholds, so measuring it is the honest value for
+///    [`PermissionBudgetOutcome::Withheld::roles_only_token_bytes`]; measuring a
+///    form that omitted the status too would under-report by the status claim's own
+///    bytes.
+/// 2. Hand the ELEMENT count and that measurement to
+///    [`crate::permission_budget::decide`], with the full-token measurement as a
+///    THUNK. The element bound settles a large set without serializing it at all.
+/// 3. If the thunk ran, its serialized bytes are RETAINED and reused for signing, so
+///    a mint costs at most two serializations, never three.
+///
+/// The sizes are [`compact_len`] over [`protected_header`] and the payload, which is
+/// EXACT rather than an estimate: `sign_jws` composes its compact form from these
+/// same bytes through that same header builder. An estimate would be a lie in the
+/// direction that matters, because it would withhold a claim that in fact fit.
+///
+/// The budget is read from the state's `[token_claims]` section here rather than
+/// threaded in on [`MintRequest`]. One source, no wiring point for a caller to miss,
+/// and no way for two call sites to hand the mint two different budgets.
+fn mint_at_jwt(
+    state: &OidcState,
+    signer: &SigningKey,
+    policy: &SigningPolicy,
+    request: &MintRequest<'_>,
+    target: &AccessTokenTarget,
+    iat: i64,
+    exp: i64,
+) -> Result<(MintedAccessToken, PermissionBudgetOutcome), ()> {
+    let jti = IssuedTokenId::generate(state.env(), &request.scope);
+    let jti_text = jti.to_string();
+    let audience = target.aud_claim();
+    let options = EmissionOptions::new().with_typ("at+jwt");
+    let build = |permission: PermissionClaim<'_>| {
+        build_access_token_claims(request, iat, exp, &jti_text, &audience, permission)
+    };
+
+    let (payload, outcome) = match request.permissions {
+        None => (
+            serde_json::to_vec(&build(PermissionClaim::Absent)).map_err(|_| ())?,
+            PermissionBudgetOutcome::NotApplicable,
+        ),
+        Some(permissions) => {
+            let budget = PermissionBudget::from_config(state.token_claims());
+            let status = PermissionStatus::from(budget.overflow);
+            // The header the signing core will build, from the SAME function it
+            // builds it with, so a predicted length equals the minted one by
+            // construction rather than by two call sites happening to agree.
+            let header = protected_header(signer, &options).map_err(|_| ())?;
+            let signature_len = signer.signature_len();
+            let withheld =
+                serde_json::to_vec(&build(PermissionClaim::Withheld(status))).map_err(|_| ())?;
+            let withheld_len = compact_len(&header, &withheld, signature_len);
+            let mut full: Option<Vec<u8>> = None;
+            let outcome =
+                permission_budget::decide(&budget, Some(permissions.len()), withheld_len, || {
+                    let bytes = serde_json::to_vec(&build(PermissionClaim::Set(permissions)))
+                        .map_err(|_| ())?;
+                    let len = compact_len(&header, &bytes, signature_len);
+                    full = Some(bytes);
+                    Ok(len)
+                })?;
+            match outcome {
+                // The thunk necessarily ran to reach this variant, so the retained
+                // bytes are present; `ok_or` rather than an unwrap keeps the
+                // unreachable case a fail-closed error instead of a panic on the
+                // issuance path.
+                PermissionBudgetOutcome::Emitted { .. } => (full.ok_or(())?, outcome),
+                PermissionBudgetOutcome::Withheld { .. }
+                | PermissionBudgetOutcome::NotApplicable => (withheld, outcome),
+            }
+        }
+    };
+
+    let token = sign_jws_with_policy(policy, signer, &payload, &options).map_err(|_| ())?;
+    Ok((MintedAccessToken::Jwt { token, jti }, outcome))
 }
 
 /// Mint an OPAQUE access token for `target` (issue #29): the scope-declaring
@@ -1074,6 +1352,7 @@ mod tests {
             sid: None,
             org_id: None,
             roles: None,
+            permissions: None,
             at_hash: None,
             c_hash: None,
             extra_claims: empty_extra(),
@@ -1216,7 +1495,14 @@ mod tests {
             id_claims["org_id"], "org_real",
             "the protocol org_id wins over a forged custom claim"
         );
-        let at_claims = build_access_token_claims(&req, 1, 2, "tok", &json!("cli_example"));
+        let at_claims = build_access_token_claims(
+            &req,
+            1,
+            2,
+            "tok",
+            &json!("cli_example"),
+            PermissionClaim::Absent,
+        );
         assert_eq!(
             at_claims["org_id"], "org_real",
             "access token carries org_id"
@@ -1240,7 +1526,14 @@ mod tests {
             id_none.get("org_id").is_none(),
             "a no-org id token drops a forged org_id from the extra-claims bag"
         );
-        let at_none = build_access_token_claims(&req, 1, 2, "tok", &json!("cli_example"));
+        let at_none = build_access_token_claims(
+            &req,
+            1,
+            2,
+            "tok",
+            &json!("cli_example"),
+            PermissionClaim::Absent,
+        );
         assert!(
             at_none.get("org_id").is_none(),
             "a no-org access token never carries org_id"
@@ -1256,13 +1549,27 @@ mod tests {
         let roles = role_set(&["viewer", "admin", "billing.reader"]);
         let mut req = request("usr_abc", "pwd");
         req.roles = Some(&roles);
-        let claims = build_access_token_claims(&req, 1, 2, "tok", &json!("cli_example"));
+        let claims = build_access_token_claims(
+            &req,
+            1,
+            2,
+            "tok",
+            &json!("cli_example"),
+            PermissionClaim::Absent,
+        );
         assert_eq!(
             claims["roles"],
             json!(["admin", "billing.reader", "viewer"]),
             "roles are emitted sorted, not in insertion order"
         );
-        let again = build_access_token_claims(&req, 1, 2, "tok", &json!("cli_example"));
+        let again = build_access_token_claims(
+            &req,
+            1,
+            2,
+            "tok",
+            &json!("cli_example"),
+            PermissionClaim::Absent,
+        );
         assert_eq!(
             serde_json::to_string(&claims).expect("serialize"),
             serde_json::to_string(&again).expect("serialize"),
@@ -1278,7 +1585,14 @@ mod tests {
         // an empty set means "a member of this organization holding no roles", which is
         // a positive, resolved answer and emits `[]`.
         let mut req = request("usr_abc", "pwd");
-        let absent = build_access_token_claims(&req, 1, 2, "tok", &json!("cli_example"));
+        let absent = build_access_token_claims(
+            &req,
+            1,
+            2,
+            "tok",
+            &json!("cli_example"),
+            PermissionClaim::Absent,
+        );
         assert!(
             absent.get("roles").is_none(),
             "no org context emits NO roles claim, not an empty array"
@@ -1286,7 +1600,14 @@ mod tests {
 
         let empty = role_set(&[]);
         req.roles = Some(&empty);
-        let present = build_access_token_claims(&req, 1, 2, "tok", &json!("cli_example"));
+        let present = build_access_token_claims(
+            &req,
+            1,
+            2,
+            "tok",
+            &json!("cli_example"),
+            PermissionClaim::Absent,
+        );
         assert_eq!(
             present["roles"],
             json!([] as [&str; 0]),
@@ -1329,7 +1650,14 @@ mod tests {
         );
 
         // The access token carries the ISSUER's set, never the forged one.
-        let at_claims = build_access_token_claims(&req, 1, 2, "tok", &json!("cli_example"));
+        let at_claims = build_access_token_claims(
+            &req,
+            1,
+            2,
+            "tok",
+            &json!("cli_example"),
+            PermissionClaim::Absent,
+        );
         assert_eq!(
             at_claims["roles"],
             json!(["viewer"]),
@@ -1345,7 +1673,14 @@ mod tests {
             id_none.get("roles").is_none(),
             "a no-org id token drops a forged roles claim from the extra bag"
         );
-        let at_none = build_access_token_claims(&req, 1, 2, "tok", &json!("cli_example"));
+        let at_none = build_access_token_claims(
+            &req,
+            1,
+            2,
+            "tok",
+            &json!("cli_example"),
+            PermissionClaim::Absent,
+        );
         assert!(
             at_none.get("roles").is_none(),
             "a no-org access token never carries roles"
@@ -1375,8 +1710,273 @@ mod tests {
         // org_id DOES ride both, so the asymmetry is real and not an accident of the
         // request being empty.
         assert_eq!(id_claims["org_id"], "org_real");
-        let at_claims = build_access_token_claims(&req, 1, 2, "tok", &json!("cli_example"));
+        let at_claims = build_access_token_claims(
+            &req,
+            1,
+            2,
+            "tok",
+            &json!("cli_example"),
+            PermissionClaim::Absent,
+        );
         assert_eq!(at_claims["roles"], json!(["admin", "viewer"]));
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #98: the permission claims
+    // -----------------------------------------------------------------------
+
+    /// An owned permission set, built in a NON-alphabetical insertion order so an
+    /// assertion on the emitted order is about the [`BTreeSet`] rather than about how
+    /// the test wrote it down.
+    fn permission_set(slugs: &[&str]) -> BTreeSet<String> {
+        slugs.iter().map(|slug| (*slug).to_owned()).collect()
+    }
+
+    #[test]
+    fn the_three_permission_wire_states_are_mutually_exclusive_and_distinguishable() {
+        // Issue #98: the WHOLE contract with a resource server is that these three are
+        // different answers. Driven over the one pure function that decides the wire
+        // shape, so the exclusivity is a property of the emitter and not of any caller
+        // happening to pass sensible arguments.
+        let held = permission_set(&["orders.write", "billing.read"]);
+        let empty = permission_set(&[]);
+        let req = request("usr_abc", "pwd");
+
+        // 1. ABSENT: no organization context, or a target that did not unanimously opt
+        //    in. NEITHER claim. A mixed-audience suppression reaches exactly this state
+        //    and must be indistinguishable from it.
+        let absent = build_access_token_claims(
+            &req,
+            1,
+            2,
+            "tok",
+            &json!("cli_example"),
+            PermissionClaim::Absent,
+        );
+        assert!(absent.get("permissions").is_none(), "{absent}");
+        assert!(absent.get("permissions_status").is_none(), "{absent}");
+
+        // 2. SET: the complete answer, in the set's total order. The empty set is the
+        //    SAME state and not the absent one: it says "in this organization, holding
+        //    nothing", which is a resolved answer.
+        let full = build_access_token_claims(
+            &req,
+            1,
+            2,
+            "tok",
+            &json!("cli_example"),
+            PermissionClaim::Set(&held),
+        );
+        assert_eq!(
+            full["permissions"],
+            json!(["billing.read", "orders.write"]),
+            "sorted, not in insertion order: {full}"
+        );
+        assert!(
+            full.get("permissions_status").is_none(),
+            "an emitted set carries NO status: {full}"
+        );
+        let none_held = build_access_token_claims(
+            &req,
+            1,
+            2,
+            "tok",
+            &json!("cli_example"),
+            PermissionClaim::Set(&empty),
+        );
+        assert_eq!(none_held["permissions"], json!([] as [&str; 0]));
+        assert!(none_held.get("permissions").is_some());
+
+        // 3. WITHHELD: the status, and NO set. Never a prefix: the withheld state
+        //    carries no set to shorten, so this arm cannot emit one at all.
+        for (status, wire) in [
+            (PermissionStatus::BudgetExceeded, "budget_exceeded"),
+            (PermissionStatus::PdpRequired, "pdp_required"),
+        ] {
+            let withheld = build_access_token_claims(
+                &req,
+                1,
+                2,
+                "tok",
+                &json!("cli_example"),
+                PermissionClaim::Withheld(status),
+            );
+            assert_eq!(withheld["permissions_status"], wire, "{withheld}");
+            assert!(
+                withheld.get("permissions").is_none(),
+                "a withholding emits no set, complete or partial: {withheld}"
+            );
+        }
+
+        // Two builds of the same state are byte-identical, which is what makes the byte
+        // budget's measurement mean anything.
+        let again = build_access_token_claims(
+            &req,
+            1,
+            2,
+            "tok",
+            &json!("cli_example"),
+            PermissionClaim::Set(&held),
+        );
+        assert_eq!(
+            serde_json::to_string(&full).expect("serialize"),
+            serde_json::to_string(&again).expect("serialize"),
+        );
+    }
+
+    #[test]
+    fn a_client_custom_claim_can_never_forge_permissions_or_their_status() {
+        // Issue #98: BOTH names are protected, for two DIFFERENT reasons. `permissions`
+        // names an API capability, so a forged one is a capability nobody granted.
+        // `permissions_status` grants nothing, but forging its ABSENCE, or a weaker
+        // value, convinces a resource server that a WITHHELD set was simply an empty
+        // one, which is a downgrade it cannot detect.
+        //
+        // Proved through the real forgery paths rather than asserted from the denylist,
+        // and in the direction that actually needs the denylist entry: with NO
+        // issuer-set value, where insertion-order "protocol wins" protects nothing.
+        let hostile = json!({
+            "permissions": ["billing.admin"],
+            "permissions_status": "pdp_required",
+            "department": "payments",
+        })
+        .as_object()
+        .cloned()
+        .expect("object");
+        let held = permission_set(&["orders.read"]);
+        let mut req = request("usr_abc", "pwd");
+        req.extra_claims = &hostile;
+
+        // The ID token never carries either claim, so both must be DROPPED there rather
+        // than stamped in as the only permission claim a relying party would ever see.
+        let id_claims = build_id_token_claims(&req, 1, 2, "tok").expect("claims");
+        assert!(
+            id_claims.get("permissions").is_none(),
+            "the id token drops a forged permissions claim: {id_claims}"
+        );
+        assert!(
+            id_claims.get("permissions_status").is_none(),
+            "and a forged status: {id_claims}"
+        );
+        assert_eq!(
+            id_claims["department"], "payments",
+            "a benign extra claim still lands, so the drop is TARGETED"
+        );
+
+        // The access token carries the ISSUER's decision, never the forged one. The
+        // code flow merges no client custom claims into the access token at all, so the
+        // guarantee here is that the builder's own output is unaffected by the bag.
+        let at_claims = build_access_token_claims(
+            &req,
+            1,
+            2,
+            "tok",
+            &json!("cli_example"),
+            PermissionClaim::Set(&held),
+        );
+        assert_eq!(
+            at_claims["permissions"],
+            json!(["orders.read"]),
+            "the issuer-resolved set wins: {at_claims}"
+        );
+        assert!(
+            at_claims.get("permissions_status").is_none(),
+            "and the forged status never appears beside it: {at_claims}"
+        );
+
+        // The MACHINE path merges a client's STORED custom claims, so it is the fold
+        // where a stored `{"permissions": [...]}` would actually be reachable. It is
+        // dropped by the same explicit reserved-name filter.
+        let cc_request = ClientCredentialsMintRequest {
+            scope: req.scope,
+            issuer: "https://issuer.test/t/x/e/y",
+            subject: "sva_machine",
+            client_id: "cli_example",
+            oauth_scope: None,
+            custom_claims: &hostile,
+        };
+        let cc_claims = build_client_credentials_access_token_claims(
+            &cc_request,
+            1,
+            2,
+            "tok",
+            &json!("cli_example"),
+        );
+        assert!(
+            cc_claims.get("permissions").is_none(),
+            "a machine token drops a stored permissions claim: {cc_claims}"
+        );
+        assert!(
+            cc_claims.get("permissions_status").is_none(),
+            "and a stored status: {cc_claims}"
+        );
+        assert_eq!(
+            cc_claims["department"], "payments",
+            "the machine drop is targeted too"
+        );
+
+        for protected in ["permissions", "permissions_status"] {
+            assert!(
+                PROTECTED_ACCESS_TOKEN_CLAIMS.contains(&protected),
+                "{protected} is a protected access-token claim"
+            );
+        }
+    }
+
+    #[test]
+    fn the_id_token_never_carries_permissions() {
+        // Issue #98, the same divergence from org_id that `roles` makes and for the
+        // same reasons. Even with a fully resolved, non-empty set the ID token stays
+        // lean. If this fails because someone added an emission to
+        // build_id_token_claims, read that function's doc comment before "fixing" it.
+        let held = permission_set(&["orders.write"]);
+        let mut req = request("usr_abc", "pwd");
+        req.org_id = Some("org_real");
+        req.permissions = Some(&held);
+        let id_claims = build_id_token_claims(&req, 1, 2, "tok").expect("claims");
+        assert!(
+            id_claims.get("permissions").is_none(),
+            "the id token carries NO permissions claim: {id_claims}"
+        );
+        assert!(
+            id_claims.get("permissions_status").is_none(),
+            "and no status: {id_claims}"
+        );
+        // org_id DOES ride both, so the asymmetry is real rather than an accident of an
+        // empty request.
+        assert_eq!(id_claims["org_id"], "org_real");
+    }
+
+    #[test]
+    fn the_machine_claim_builder_has_no_permission_field_to_read() {
+        // The issue #99 boundary at the type level: a client-credentials token is built
+        // from a request that carries no permission set, so the omission is structural
+        // and not a policy this builder applies. A plain, fully populated machine
+        // request emits neither claim.
+        let request = ClientCredentialsMintRequest {
+            scope: {
+                let (env, _) = Env::deterministic(SystemTime::UNIX_EPOCH, 1);
+                Scope::new(TenantId::generate(&env), EnvironmentId::generate(&env))
+            },
+            issuer: "https://issuer.test/t/x/e/y",
+            subject: "sva_machine",
+            client_id: "cli_example",
+            oauth_scope: Some("api"),
+            custom_claims: empty_extra(),
+        };
+        let claims = build_client_credentials_access_token_claims(
+            &request,
+            1,
+            2,
+            "tok",
+            &json!("cli_example"),
+        );
+        for absent in ["permissions", "permissions_status", "roles", "org_id"] {
+            assert!(
+                claims.get(absent).is_none(),
+                "a machine token carries no {absent}: {claims}"
+            );
+        }
     }
 
     #[test]
@@ -1407,7 +2007,14 @@ mod tests {
         // required claim, well formed, plus scope and the derived acr.
         let mut req = request("usr_abc", "pwd");
         req.oauth_scope = Some("openid profile");
-        let claims = build_access_token_claims(&req, 1000, 1300, "tok_at", &json!("cli_example"));
+        let claims = build_access_token_claims(
+            &req,
+            1000,
+            1300,
+            "tok_at",
+            &json!("cli_example"),
+            PermissionClaim::Absent,
+        );
         assert_eq!(claims["iss"], "https://issuer.test/t/x/e/y");
         assert_eq!(claims["exp"], 1300);
         assert_eq!(claims["sub"], "usr_abc");
@@ -1430,11 +2037,25 @@ mod tests {
         // a resource server passes its own audience. client_id is ALWAYS the OAuth
         // client, whatever the audience is.
         let req = request("usr_abc", "pwd");
-        let default = build_access_token_claims(&req, 1, 2, "tok", &json!("cli_example"));
+        let default = build_access_token_claims(
+            &req,
+            1,
+            2,
+            "tok",
+            &json!("cli_example"),
+            PermissionClaim::Absent,
+        );
         assert_eq!(default["aud"], "cli_example");
         assert_eq!(default["client_id"], "cli_example");
 
-        let rs = build_access_token_claims(&req, 1, 2, "tok", &json!("https://api.example/orders"));
+        let rs = build_access_token_claims(
+            &req,
+            1,
+            2,
+            "tok",
+            &json!("https://api.example/orders"),
+            PermissionClaim::Absent,
+        );
         assert_eq!(rs["aud"], "https://api.example/orders");
         assert_eq!(rs["client_id"], "cli_example", "client_id stays the client");
     }
@@ -1445,13 +2066,27 @@ mod tests {
         // was frozen onto the code as due, exactly like the ID token.
         let mut req = request("usr_abc", "pwd");
         assert!(
-            build_access_token_claims(&req, 1, 2, "tok", &json!("cli_example"))
-                .get("auth_time")
-                .is_none(),
+            build_access_token_claims(
+                &req,
+                1,
+                2,
+                "tok",
+                &json!("cli_example"),
+                PermissionClaim::Absent
+            )
+            .get("auth_time")
+            .is_none(),
             "auth_time is absent when not frozen onto the code"
         );
         req.auth_time_unix_micros = Some(1_700_000_123_456_789);
-        let claims = build_access_token_claims(&req, 1, 2, "tok", &json!("cli_example"));
+        let claims = build_access_token_claims(
+            &req,
+            1,
+            2,
+            "tok",
+            &json!("cli_example"),
+            PermissionClaim::Absent,
+        );
         assert_eq!(claims["auth_time"], 1_700_000_123_i64);
     }
 
@@ -1462,7 +2097,14 @@ mod tests {
         let mut req = request("usr_abc", "pwd");
         req.oauth_scope = Some("openid profile email address phone");
         req.auth_time_unix_micros = Some(1_700_000_000_000_000);
-        let claims = build_access_token_claims(&req, 1, 2, "tok", &json!("cli_example"));
+        let claims = build_access_token_claims(
+            &req,
+            1,
+            2,
+            "tok",
+            &json!("cli_example"),
+            PermissionClaim::Absent,
+        );
         let object = claims.as_object().expect("object");
         // The payload is exactly the protocol claim set, nothing else.
         let mut names: Vec<&str> = object.keys().map(String::as_str).collect();
@@ -1580,6 +2222,12 @@ mod tests {
             // authorization role. Machine roles are issue #99 and must land on both
             // machine paths deliberately, never through a stored custom claim.
             "roles": ["admin", "owner"],
+            // Organization permissions (issue #98): a machine token asserts no human
+            // API capability, and a forged `permissions_status` would let a client
+            // suppress a withholding marker. Both are on the same #99 footing as
+            // `roles` above.
+            "permissions": ["billing.admin"],
+            "permissions_status": "pdp_required",
             // A benign business claim, which is admitted.
             "department": "payments"
         })
@@ -1625,6 +2273,8 @@ mod tests {
             "sid",
             "org_id",
             "roles",
+            "permissions",
+            "permissions_status",
         ] {
             assert!(
                 claims.get(reserved_absent).is_none(),

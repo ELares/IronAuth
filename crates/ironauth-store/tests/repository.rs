@@ -1498,7 +1498,7 @@ async fn a_recorded_budget_event_is_retention_pruned() {
     //
     // Read this test the right way round. It measures DATA LOSS on a row that records a
     // withheld permission claim, and that is acceptable ONLY because the token itself
-    // carries `permissions_status` once the mint is wired, making the wire contract the
+    // carries `permissions_status`, making the wire contract the
     // durable record. If this row were the sole record, this test would be describing a bug
     // that defeats issue #98's covenant rather than a documented bound.
     let db = TestDatabase::start().await;

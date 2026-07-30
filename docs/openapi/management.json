@@ -8918,7 +8918,7 @@
         ],
         "responses": {
           "200": {
-            "description": "The resolved roles, one entry per grant path. This is what the NEXT token issuance would carry; tokens already issued are NOT affected by a recent change. A DISABLED organization mints no roles, so this is empty for every one of its members until it is re-enabled (the assignment lists still show the configuration). Not paginated: a bounded read of one membership's whole set",
+            "description": "The resolved roles, one entry per grant path, plus the resolved permission SET and the advisory budget verdict over it (issue #98). This is what the NEXT token issuance would carry; tokens already issued are NOT affected by a recent change. A DISABLED organization mints nothing, so both are empty for every one of its members until it is re-enabled (the assignment lists still show the configuration). Not paginated and never truncated, whatever the budget says: an operator must always be able to see what a token will not carry",
             "content": {
               "application/json": {
                 "schema": {
@@ -15101,7 +15101,7 @@
       },
       "DiagnosticsWarningsList": {
         "type": "object",
-        "description": "The environment's operational warnings (issue #91), COMPUTED LIVE from the existing\nseams (the connector health registry and the token size event sink). Nothing here is a\nstored, staleness prone materialization except the token size events, which are already\nbounded and retention pruned.\n\nThe permission budget warnings (issue #98) are read from the SAME event sink, though\nthrough a SEPARATE clamped window per event family, so one noisy family cannot evict\nthe other. They inherit that bound and that pruning: they are an operator's CONVENIENCE\nview of a withholding and never its record of record, because the token itself carries\n`permissions_status` once the mint is wired, so a warning aged out of this list does\nnot mean the withholding went unrecorded.",
+        "description": "The environment's operational warnings (issue #91), COMPUTED LIVE from the existing\nseams (the connector health registry and the token size event sink). Nothing here is a\nstored, staleness prone materialization except the token size events, which are already\nbounded and retention pruned.\n\nThe permission budget warnings (issue #98) are read from the SAME event sink, though\nthrough a SEPARATE clamped window per event family, so one noisy family cannot evict\nthe other. They inherit that bound and that pruning: they are an operator's CONVENIENCE\nview of a withholding and never its record of record, because the token itself carries\n`permissions_status`, so a warning aged out of this list does not mean the withholding\nwent unrecorded.",
         "required": [
           "items"
         ],
@@ -15155,15 +15155,28 @@
         "type": "object",
         "description": "The resolved roles of one organization membership.",
         "required": [
-          "roles"
+          "roles",
+          "permissions",
+          "permission_budget"
         ],
         "properties": {
+          "permission_budget": {
+            "$ref": "#/components/schemas/PermissionBudgetView",
+            "description": "What the budget would say about `permissions` at the next issuance. Advisory;\nsee [`PermissionBudgetView`], in particular for which half of the budget it\nevaluates."
+          },
+          "permissions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Every permission slug the membership effectively holds (issue #98), in the\nstore's total order, DEDUPLICATED: unlike `roles` above this is a SET and not a\nlist of grant paths, because that is what the token claim is and because a\npermission's provenance is the role that carries it, which the list above\nalready names.\n\nThe WHOLE set, never truncated and never paged, however large and whatever\n`permission_budget` says about it. That is a structural property and not a\ncourtesy: an operator must always be able to see what a token will not carry,\nso the one surface that could show them is the one surface that must never\nshorten the answer."
+          },
           "roles": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/EffectiveRoleView"
             },
-            "description": "Every grant path, ordered by `(slug, source, via_group_id)`, so two reads of\nunchanged state are byte-identical. NOT deduplicated by slug: a role held both\ndirectly and through a group appears twice, which is what tells an operator\nthat withdrawing one grant will not take it away, and a role that is also the\norganization's default appears with a `default` entry that no withdrawal\ntouches at all.\n\nAn OBJECT wraps this array rather than the array being the whole body, so a\nlater `permissions` field (issue #98) is a pure addition.\n\nThe whole set, never a page: this is a bounded read (see the module docs),\nand there is no cap on how many roles a member may hold."
+            "description": "Every grant path, ordered by `(slug, source, via_group_id)`, so two reads of\nunchanged state are byte-identical. NOT deduplicated by slug: a role held both\ndirectly and through a group appears twice, which is what tells an operator\nthat withdrawing one grant will not take it away, and a role that is also the\norganization's default appears with a `default` entry that no withdrawal\ntouches at all.\n\nAn OBJECT wraps this array rather than the array being the whole body, which\nis what let issue #98 add `permissions` and `permission_budget` beside it as a\npure addition.\n\nThe whole set, never a page: this is a bounded read (see the module docs),\nand there is no cap on how many roles a member may hold."
           }
         }
       },
@@ -17093,6 +17106,61 @@
           }
         },
         "additionalProperties": false
+      },
+      "PermissionBudgetView": {
+        "type": "object",
+        "description": "What the permission budget would say about this membership's resolved permission\nset (issue #98). ADVISORY ONLY.\n\nNothing here refuses a write and no number here is a cap on what may be STORED. It\nreports what the NEXT token issuance would carry, in the same units the\n`[token_claims]` configuration is written in.\n\n# The one thing this does NOT answer, said plainly\n\nThe budget has TWO bounds, an element count and a compact-token BYTE size, and\nthis view evaluates only the first. `approaching` and `overflow` are the ELEMENT\nverdict. The byte verdict is not withheld out of caution, it is genuinely not\ncomputable here: an exact compact-token size needs the environment's signing key\n(for the protected header and the signature width) and the whole rest of the\nexchange (the audience set, the granted scope, any `cnf` binding), none of which\nexists on a management read of a membership. The alternative would be an ESTIMATE,\nand an estimated byte verdict is a lie in exactly the direction that matters: it\nwould tell an operator a set fits when the mint will withhold it. So the byte\nBOUNDS are reported as the configured numbers, for context, and the byte VERDICT\nbelongs to the mint, which measures rather than estimates and puts\n`permissions_status` on the token when it withholds.",
+        "required": [
+          "permission_count",
+          "max_permission_count",
+          "warn_permission_count",
+          "max_token_bytes",
+          "warn_token_bytes",
+          "approaching"
+        ],
+        "properties": {
+          "approaching": {
+            "type": "boolean",
+            "description": "`true` when the set is PAST `warn_permission_count` but still within\n`max_permission_count`. The ELEMENT verdict only."
+          },
+          "max_permission_count": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The configured largest element count ONE permission claim may carry.",
+            "minimum": 0
+          },
+          "max_token_bytes": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The configured largest compact access token, in bytes, that may carry a\npermission claim. Reported for context; see the type docs for why no byte\nverdict is computed here.",
+            "minimum": 0
+          },
+          "overflow": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The `permissions_status` value the next token would carry, present ONLY when\nthe set is past `max_permission_count`. Absent (rather than null) otherwise.\n\nIts presence means the next token will carry NO `permissions` claim. It does\nNOT mean anything was refused here: this membership still holds every one of\nthose permissions, the management plane still reports them all, and every\nattach that produced them answered 201.",
+            "example": "budget_exceeded"
+          },
+          "permission_count": {
+            "type": "integer",
+            "description": "How many permissions the membership effectively holds. A count, never a cap:\nnothing refuses a permission because of it.",
+            "minimum": 0
+          },
+          "warn_permission_count": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The configured element count above which an emitted claim is reported as\napproaching the budget.",
+            "minimum": 0
+          },
+          "warn_token_bytes": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The configured compact-token size above which an emitted claim is reported as\napproaching the budget. Context only, as above.",
+            "minimum": 0
+          }
+        }
       },
       "PermissionList": {
         "type": "object",

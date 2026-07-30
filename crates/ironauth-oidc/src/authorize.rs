@@ -966,6 +966,9 @@ async fn mint_front_channel_id_token(
         // flow's access token is minted at the token endpoint, which resolves roles
         // fresh at that point.
         roles: None,
+        // Permissions (issue #98) likewise ride the ACCESS token only, so they are
+        // inert on the front channel for exactly the reason above.
+        permissions: None,
         at_hash: None,
         c_hash: c_hash.as_deref(),
         extra_claims: &extra_claims,

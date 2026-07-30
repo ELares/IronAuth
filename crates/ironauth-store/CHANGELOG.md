@@ -43,12 +43,13 @@ range per docs/RELEASING.md.
   (the shared window IS entirely evicted, the per-kind windows are not). Honest scope,
   stated in the migration header and in the module docs: these rows are retention pruned and
   each read is clamped, so they are an operator's CONVENIENCE view of a withholding and
-  never its record of record; the durable record is the token's own `permissions_status`
-  once the mint is wired. `a_recorded_budget_event_is_retention_pruned` measures the pruning
+  never its record of record; the durable record is the token's own `permissions_status`.
+  `a_recorded_budget_event_is_retention_pruned` measures the pruning
   half on a budget row rather than asserting it, and the migration header now states the
   `retention_secs = 0` consequence outright (at 0 every row expires as it is written, so
-  this sink holds at most one budget row per scope). Nothing writes the columns on this
-  build.
+  this sink holds at most one budget row per scope). The columns are WRITTEN by
+  `ironauth_oidc`'s mint hooks as of issue #98 PR 13; the entry above described the state
+  of the tree when the migration landed.
 
 - Per-audience PERMISSION-CLAIM opt-in (issue #98, PR 11): migration 0094 adds
   `resource_servers.permission_claims_enabled boolean NOT NULL DEFAULT false` and the
@@ -72,7 +73,9 @@ range per docs/RELEASING.md.
   `ManagementStore` / `ActingManagementStore` accessors, plus two registered cross-scope
   IDOR probes (`resource_servers.get`, `resource_servers.set_permission_claims`). The
   data plane gains NOTHING: it keeps SELECT and holds no UPDATE on this table at all.
-  Nothing reads the column on the mint path yet, so it is INERT on real data.
+  The mint READS the column as of issue #98 PR 13 (it folds with AND across every
+  targeted audience); the sentence above described the state of the tree when the
+  migration landed.
 
 - Char-boundary panic in redirect matching (issue #418, entered retroactively with issue
   #419): `redirect::strip_http_scheme_ci` sliced a `str` at the constant byte 7 behind a

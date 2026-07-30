@@ -334,7 +334,7 @@ async fn a_permission_round_trips_through_the_read_repository_on_both_planes() {
     assert_eq!(by_slug, record);
 
     // The DATA plane reads it too: the grant migration 0091 makes in the creating
-    // migration, which a later PR's token-issuance resolution depends on. Without it
+    // migration, which the token-issuance resolution depends on. Without it
     // that path would fail with SQLSTATE 42501.
     let data = db.store().scoped(scope).permissions();
     assert_eq!(
@@ -530,7 +530,7 @@ async fn a_permission_and_an_entitlement_may_share_one_slug() {
     );
 
     // The LIST is kind-addressed too, so an entitlement can never arrive through a
-    // caller that asked for permissions. That separation is what a later PR's
+    // caller that asked for permissions. That separation is what the
     // `kind = 'permission'` projection filter rests on.
     let permissions = repo
         .list(PermissionEntryKind::Permission, 50, None)
@@ -597,8 +597,8 @@ const DEFINED: usize = 250;
 async fn an_environment_may_define_unlimited_permissions_and_the_list_pages_them() {
     // The covenant, made mechanical: there is no count constraint, no quota, and no
     // gate. The page size is clamped like every management list, which is a
-    // PAGINATION bound and not a cap on the set. The byte budget a later PR of this
-    // issue adds bounds ONE TOKEN and has nothing to do with this table.
+    // PAGINATION bound and not a cap on the set. The byte budget issue #98 ships
+    // bounds ONE TOKEN and has nothing to do with this table.
     //
     // Every row here is written through the AUDITED WRITE REPOSITORY rather than with
     // direct SQL, because that is where a cap would have to live. A covenant test that
@@ -1313,7 +1313,7 @@ async fn a_stored_kind_outside_the_closed_set_fails_the_read_closed() {
         "an unrecognized stored kind must fail the read, never decode as a permission"
     );
     // The kind-ADDRESSED reads never select it in the first place, which is the
-    // other half of the same guarantee and the one a later PR's
+    // other half of the same guarantee and the one the
     // `kind = 'permission'` projection filter relies on: an unclassified row is
     // excluded in SQL, so it cannot reach a list or a slug lookup at all. Both kinds
     // are asserted, so "excluded" means excluded from EVERY addressed read and not
@@ -1779,7 +1779,7 @@ async fn the_grants_are_exactly_what_the_write_path_needs_and_nothing_more() {
     );
 
     // The DATA plane holds no UPDATE on any column at all. It resolves permissions
-    // onto the token-issuance path in a later PR and must never be able to define or
+    // onto the token-issuance path and must never be able to define or
     // relabel the capability names it is about to emit.
     assert_eq!(
         updatable_columns(&db, "ironauth_app").await,
@@ -1843,9 +1843,9 @@ async fn a_deleted_slug_is_free_again_and_a_re_create_mints_a_fresh_id() {
     .expect("a deleted slug is free again");
     assert_ne!(
         first, second,
-        "a re-create mints a FRESH id and is never a revival: the mapping table a \
-         later PR adds hangs role grants off the id, so reviving would silently \
-         restore every grant that pointed at the dead row"
+        "a re-create mints a FRESH id and is never a revival: the mapping table \
+         hangs role grants off the id, so reviving would silently restore every \
+         grant that pointed at the dead row"
     );
 
     // Exactly ONE live row holds the slug, and the dead one is still there.

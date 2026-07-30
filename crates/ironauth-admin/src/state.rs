@@ -579,8 +579,15 @@ impl AdminState {
     ///
     /// The budget bounds a TOKEN's size and what ONE claim carries. It caps nothing this
     /// plane writes: no management endpoint refuses a create or an attach because of any
-    /// count or size, and the only statuses the budget can produce here are 200 and 201
-    /// carrying a warning field.
+    /// count or size, so the budget produces no 4xx and no 5xx anywhere on this plane.
+    ///
+    /// Where it IS reported is ONE place and not two, which is worth stating exactly
+    /// because the natural reading of the sentence above is wrong. The effective-roles
+    /// READ carries the verdict, as the `permission_budget` object on its 200. The
+    /// role-to-permission ATTACH does not: its 201 returns `OrgRolePermissionView`, which
+    /// has no budget field, so an operator who crosses a threshold learns it from the
+    /// read rather than from the write that caused it. Adding the verdict to the attach
+    /// response is tracked in issue #425.
     #[must_use]
     pub fn with_token_claims(mut self, config: &TokenClaimsConfig) -> Self {
         if let Some(inner) = Arc::get_mut(&mut self.inner) {

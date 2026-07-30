@@ -6,6 +6,37 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- The effective-roles view gains `permissions` and `permission_budget` (issue #98, PR 13),
+  as a pure addition under the object wrapper issue #97 shipped for exactly this. The
+  permission set is the WHOLE resolved set, un-paginated and un-truncated, read through the
+  same repository, key and depth bound the mint uses, so the console and the token cannot
+  answer differently for one membership. `permission_budget` is ADVISORY: it refuses
+  nothing, and no endpoint anywhere in issue #98 answers 4xx or 5xx for a count or a size
+  reason. It evaluates the ELEMENT half of the budget only, and says so in the schema: an
+  exact compact-token byte size needs the environment's signing key and the whole rest of
+  the exchange, so an estimate here would be a lie in exactly the direction that matters.
+  The byte VERDICT belongs to the mint, which measures. Two properties the view's own docs
+  rest on are now measured rather than argued. The element comparisons are STRICTLY
+  greater-than, the same way the mint's are, which matters only at the boundary and is
+  driven there by `a_count_exactly_at_the_warn_threshold_is_not_yet_approaching` (at the
+  threshold nothing is approaching, one past it something is); an off-by-one here is the
+  worst possible place for the console and the token to disagree, and every other fixture
+  in the suite sits clear of a threshold. And the depth bound really is the CONFIGURED one
+  on both planes, which is what the claim that the console and the token cannot answer
+  differently rests on: `the_effective_roles_view_resolves_permissions_through_the_full_ancestor_walk`
+  resolves a capability inherited two group levels up, beside `ironauth-oidc`'s
+  `the_configured_group_depth_is_the_bound_the_permission_resolution_uses` on the mint.
+- CORRECTION to a sentence that shipped with PR 9 and was never true: the budget's
+  management-plane statuses were described as "200 and 201 carrying a warning field". The
+  200 half is right (the effective-roles read carries `permission_budget`); the 201 half is
+  not, because the role-to-permission attach returns `OrgRolePermissionView`, which has no
+  budget field. The covenant is intact either way (the budget produces no 4xx and no 5xx
+  anywhere on this plane), so this is a missing surface and not a defect: the sentence is
+  corrected on `AdminState::with_token_claims` and in `[token_claims]`'s own section doc
+  (regenerating `docs/CONFIG.md` and `docs/config-schema.json`), the attach 201's lack of a
+  budget field is now ASSERTED so a later change has to say so, and issue #425 tracks adding
+  it.
+
 - Two new operational warning kinds, `permission_budget_overflow` and
   `permission_budget_approaching`, on `GET .../diagnostics/warnings` (issue #98, PR 12),
   read out of the SAME `token_size_events` sink the `token_size` kind already reads and

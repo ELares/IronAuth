@@ -6168,7 +6168,7 @@ async fn org_role_permissions_carries_its_isolation_indexes_and_least_privilege_
     // The two lookup indexes, their COLUMN ORDER, and their predicates. Order is the
     // whole point: an index present but ordered wrongly leaves the reads on a
     // sequential scan while every functional assertion stays green. The role index is
-    // on the token-issuance path (it is the join a later PR's effective-permission
+    // on the token-issuance path (it is the join the effective-permission
     // resolution performs); the permission index is the blast-radius answer an
     // operator wants before deleting a permission.
     for (index, endpoint) in [

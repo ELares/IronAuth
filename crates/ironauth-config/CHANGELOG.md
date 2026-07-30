@@ -6,6 +6,36 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- The `[token_claims]` budget keys are LIVE (issue #98, PR 13): the mint reads them on every
+  `at+jwt` access token that carries a resolved permission set, and the management plane
+  reports the same verdict against them. Issue #413 is DISCHARGED; the six
+  "NOTHING CONSULTS THESE KEYS YET" paragraphs the section shipped with are deleted and
+  `docs/CONFIG.md` plus `docs/config-schema.json` are regenerated.
+- `PermissionOverflow::permissions_status` returns the `permissions_status` claim value a
+  withholding under each mode puts on the wire. It exists so the two strings are spelled in
+  ONE place across both planes: the data plane stamps the value into the access token and
+  the management plane reports which value the next token will carry, and two independent
+  `match` arms in two crates would be two chances to drift. Single-sourcing is the whole
+  justification, so it is now pinned HERE, in the crate that owns the strings, rather than
+  only through the two crates that delegate:
+  `the_overflow_mode_owns_the_two_wire_strings_both_planes_read` fixes both values and
+  additionally requires the markers to be DISTINCT per mode, because a mapping that
+  collapsed two modes onto one string would leave a resource server unable to tell
+  "authorize from roles" from "consult the policy decision point".
+- `PermissionOverflow::ALL` and `DiagnosticVerbosity::ALL`: the single definition of "every
+  variant" for each closed enum, so a caller that must cover them all iterates the enum's
+  own list instead of writing a literal in another crate. Two crates were doing exactly
+  that, and the comments above both literals claimed a compile-time exhaustiveness the
+  arrangement did not have: a total `match` beside a hand-written array is satisfied by
+  adding an arm, leaving the array one variant short and the loop quietly narrower. The
+  completeness of these two arrays is now a MEASUREMENT rather than a convention.
+  `the_overflow_mode_list_holds_every_variant_the_schema_declares` and its verbosity twin
+  compare each array against the variant list `schemars` DERIVES from the enum itself, which
+  is an independent witness: the derive macro sees the real variant list and a hand-written
+  expectation does not. Adding a variant without extending `ALL` turns those tests red, and
+  extending `ALL` then breaks the total `match` in `ironauth-oidc` that gives each variant a
+  slot, so both halves have to be dealt with before anything builds and passes.
+
 - Token claim budget for issue #98: the new top-level `[token_claims]` section
   (`TokenClaimsConfig`) with `token_claims.access_token_max_bytes` (default
   `TOKEN_CLAIMS_DEFAULT_ACCESS_TOKEN_MAX_BYTES` = 4096, refused above the
@@ -27,7 +57,8 @@ range per docs/RELEASING.md.
   count CHECK exists anywhere for permissions, roles, or their mappings. `PermissionOverflow`
   has no `truncate` variant and will not get one: a partial permission set is
   indistinguishable to a resource server from a complete one, so its having exactly two
-  variants is what makes silent truncation unrepresentable rather than merely unconfigured.
+  variants is what makes truncation UNCONFIGURABLE. It does not by itself make a truncating
+  emitter unwritable, and the enum's doc now says where that boundary falls.
   `0` is valid on every numeric key and means the STRICTEST posture (no NON-EMPTY
   permission claim is ever emitted), never unlimited; none of them has an unlimited
   value. Setting a

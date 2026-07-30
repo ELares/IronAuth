@@ -1075,5 +1075,18 @@ name = "org_roles_claim"
 path = "tests/org_roles_claim.rs"
 required-features = ["testing"]
 
+# The effective organization PERMISSIONS claim end to end (issue #98, the activation
+# PR): the two claims a resource server reads, decoded from real minted tokens. Pins
+# the THREE observable wire states apart, the unanimity-or-suppress fold over a
+# multi-audience target (both halves), freshness on both hooks in both directions, the
+# no-silent-drop covenant over the cross product of both overflow modes and all three
+# diagnostics verbosities, the byte bound measured against the token that actually
+# ships, the opaque and machine-grant boundaries, and the fail-closed refusal on a
+# store fault with the code and the refresh family left unburned.
+[[test]]
+name = "org_permissions_claim"
+path = "tests/org_permissions_claim.rs"
+required-features = ["testing"]
+
 [lints]
 workspace = true

@@ -23,12 +23,15 @@
 //! [`PermissionBudgetOutcome`] accordingly has no variant carrying a partial set.
 //!
 //! Be precise about how much of the no-truncation guarantee lives HERE, because
-//! half of it does not. This module's outcome carries no permission set at all,
+//! most of it does not. This module's outcome carries no permission set at all,
 //! complete or partial, so it constrains nothing about what a caller serializes.
-//! What makes silent truncation unrepresentable rather than merely unconfigured is
-//! that `ironauth_config::PermissionOverflow` offers no `truncate` mode and a
-//! config naming one fails to LOAD, which is proven where that enum lives, by
-//! `ironauth_config`'s `the_permission_overflow_mode_is_a_closed_two_value_enum`.
+//! What is UNCONFIGURABLE is a truncate MODE: `ironauth_config::PermissionOverflow`
+//! offers none and a config naming one fails to LOAD, which is proven where that
+//! enum lives, by `ironauth_config`'s
+//! `the_permission_overflow_mode_is_a_closed_two_value_enum`. That the mint does
+//! not truncate anyway is neither this module's property nor the type system's: a
+//! truncating emitter would compile. It is held by the mint's own tests, which
+//! `docs/THREAT-MODEL.md` names.
 //!
 //! # Withholding does not promise the token fits
 //!
@@ -51,17 +54,9 @@
 //! decision before anything is serialized, so that number does not exist on that
 //! path and the type offers no slot to put one.
 //!
-//! INERT on this build: nothing calls [`decide`] yet. The mint hooks, the claims
-//! themselves, and the event recording land in later PRs of issue #98. Issue #416
-//! tracks deleting this paragraph and the allow below once the mint wires it.
-
-// Every item here is `pub(crate)` and reached only from this module's own tests
-// until the mint hooks are wired (issue #416 tracks removing this allow with
-// them). The budget core lands ahead of its call sites on purpose: it is the piece
-// whose exactness has to be proven before anything is allowed to depend on it, and
-// proving it in its own PR keeps the activation PR about wiring rather than about
-// arithmetic.
-#![allow(dead_code)]
+//! LIVE: [`decide`] is called from `crate::tokens::mint_at_jwt`, on both the code
+//! exchange and the refresh grant, and its verdict is what shapes the emitted claim
+//! and what `crate::token::record_budget_outcome` records (issue #98, PR 13).
 
 use ironauth_config::{PermissionOverflow, TokenClaimsConfig};
 
@@ -128,12 +123,18 @@ pub(crate) enum PermissionStatus {
 }
 
 impl PermissionStatus {
-    /// The wire value. Closed vocabulary, chosen once: a marker whose value later
-    /// had to change would be a wire break for everyone who consumed it meanwhile.
+    /// The wire value, DELEGATED to [`PermissionOverflow::permissions_status`] rather
+    /// than spelled again here.
+    ///
+    /// This enum and that one are 1:1 and deliberately distinct types (one is an
+    /// operator's configured MODE, the other is the wire MARKER a withholding puts on
+    /// a token), but they must never disagree about the two strings. Delegating makes
+    /// that structural: there is exactly one place the vocabulary is written down, and
+    /// the management plane, which cannot see this type, reads it from the same place.
     pub const fn as_str(self) -> &'static str {
         match self {
-            PermissionStatus::BudgetExceeded => "budget_exceeded",
-            PermissionStatus::PdpRequired => "pdp_required",
+            PermissionStatus::BudgetExceeded => PermissionOverflow::RolesOnly.permissions_status(),
+            PermissionStatus::PdpRequired => PermissionOverflow::PdpRequired.permissions_status(),
         }
     }
 }
@@ -559,8 +560,9 @@ mod tests {
         // The deliberate non-goal issue #98 names: withholding falls back to
         // `roles`, and the roles set is uncapped by covenant, so the token that
         // SHIPS after a withholding can itself exceed the byte budget. Nothing
-        // here refuses or trims it; the outcome carries the number so a later PR's
-        // recorder can compute a distinct event reason from it. Without this the
+        // here refuses or trims it; the outcome carries the number, and
+        // `crate::token::record_budget_outcome` computes the distinct
+        // `roles_only_still_oversize` event reason from it. Without this the
         // roles-only size would not exist on the outcome at all.
         let budget = budget();
         let oversize_base = budget.max_token_bytes + 20;

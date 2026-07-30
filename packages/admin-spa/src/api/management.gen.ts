@@ -2564,8 +2564,8 @@ export interface components {
          *     through a SEPARATE clamped window per event family, so one noisy family cannot evict
          *     the other. They inherit that bound and that pruning: they are an operator's CONVENIENCE
          *     view of a withholding and never its record of record, because the token itself carries
-         *     `permissions_status` once the mint is wired, so a warning aged out of this list does
-         *     not mean the withholding went unrecorded.
+         *     `permissions_status`, so a warning aged out of this list does not mean the withholding
+         *     went unrecorded.
          */
         DiagnosticsWarningsList: {
             /**
@@ -2611,6 +2611,26 @@ export interface components {
         /** @description The resolved roles of one organization membership. */
         EffectiveRolesView: {
             /**
+             * @description What the budget would say about `permissions` at the next issuance. Advisory;
+             *     see [`PermissionBudgetView`], in particular for which half of the budget it
+             *     evaluates.
+             */
+            permission_budget: components["schemas"]["PermissionBudgetView"];
+            /**
+             * @description Every permission slug the membership effectively holds (issue #98), in the
+             *     store's total order, DEDUPLICATED: unlike `roles` above this is a SET and not a
+             *     list of grant paths, because that is what the token claim is and because a
+             *     permission's provenance is the role that carries it, which the list above
+             *     already names.
+             *
+             *     The WHOLE set, never truncated and never paged, however large and whatever
+             *     `permission_budget` says about it. That is a structural property and not a
+             *     courtesy: an operator must always be able to see what a token will not carry,
+             *     so the one surface that could show them is the one surface that must never
+             *     shorten the answer.
+             */
+            permissions: string[];
+            /**
              * @description Every grant path, ordered by `(slug, source, via_group_id)`, so two reads of
              *     unchanged state are byte-identical. NOT deduplicated by slug: a role held both
              *     directly and through a group appears twice, which is what tells an operator
@@ -2618,8 +2638,9 @@ export interface components {
              *     organization's default appears with a `default` entry that no withdrawal
              *     touches at all.
              *
-             *     An OBJECT wraps this array rather than the array being the whole body, so a
-             *     later `permissions` field (issue #98) is a pure addition.
+             *     An OBJECT wraps this array rather than the array being the whole body, which
+             *     is what let issue #98 add `permissions` and `permission_budget` beside it as a
+             *     pure addition.
              *
              *     The whole set, never a page: this is a bounded read (see the module docs),
              *     and there is no cap on how many roles a member may hold.
@@ -3718,6 +3739,76 @@ export interface components {
              * @default null
              */
             target_latency_ms: number | null;
+        };
+        /**
+         * @description What the permission budget would say about this membership's resolved permission
+         *     set (issue #98). ADVISORY ONLY.
+         *
+         *     Nothing here refuses a write and no number here is a cap on what may be STORED. It
+         *     reports what the NEXT token issuance would carry, in the same units the
+         *     `[token_claims]` configuration is written in.
+         *
+         *     # The one thing this does NOT answer, said plainly
+         *
+         *     The budget has TWO bounds, an element count and a compact-token BYTE size, and
+         *     this view evaluates only the first. `approaching` and `overflow` are the ELEMENT
+         *     verdict. The byte verdict is not withheld out of caution, it is genuinely not
+         *     computable here: an exact compact-token size needs the environment's signing key
+         *     (for the protected header and the signature width) and the whole rest of the
+         *     exchange (the audience set, the granted scope, any `cnf` binding), none of which
+         *     exists on a management read of a membership. The alternative would be an ESTIMATE,
+         *     and an estimated byte verdict is a lie in exactly the direction that matters: it
+         *     would tell an operator a set fits when the mint will withhold it. So the byte
+         *     BOUNDS are reported as the configured numbers, for context, and the byte VERDICT
+         *     belongs to the mint, which measures rather than estimates and puts
+         *     `permissions_status` on the token when it withholds.
+         */
+        PermissionBudgetView: {
+            /**
+             * @description `true` when the set is PAST `warn_permission_count` but still within
+             *     `max_permission_count`. The ELEMENT verdict only.
+             */
+            approaching: boolean;
+            /**
+             * Format: int32
+             * @description The configured largest element count ONE permission claim may carry.
+             */
+            max_permission_count: number;
+            /**
+             * Format: int32
+             * @description The configured largest compact access token, in bytes, that may carry a
+             *     permission claim. Reported for context; see the type docs for why no byte
+             *     verdict is computed here.
+             */
+            max_token_bytes: number;
+            /**
+             * @description The `permissions_status` value the next token would carry, present ONLY when
+             *     the set is past `max_permission_count`. Absent (rather than null) otherwise.
+             *
+             *     Its presence means the next token will carry NO `permissions` claim. It does
+             *     NOT mean anything was refused here: this membership still holds every one of
+             *     those permissions, the management plane still reports them all, and every
+             *     attach that produced them answered 201.
+             * @example budget_exceeded
+             */
+            overflow?: string | null;
+            /**
+             * @description How many permissions the membership effectively holds. A count, never a cap:
+             *     nothing refuses a permission because of it.
+             */
+            permission_count: number;
+            /**
+             * Format: int32
+             * @description The configured element count above which an emitted claim is reported as
+             *     approaching the budget.
+             */
+            warn_permission_count: number;
+            /**
+             * Format: int32
+             * @description The configured compact-token size above which an emitted claim is reported as
+             *     approaching the budget. Context only, as above.
+             */
+            warn_token_bytes: number;
         };
         /** @description A page of permissions. */
         PermissionList: {
@@ -10664,7 +10755,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description The resolved roles, one entry per grant path. This is what the NEXT token issuance would carry; tokens already issued are NOT affected by a recent change. A DISABLED organization mints no roles, so this is empty for every one of its members until it is re-enabled (the assignment lists still show the configuration). Not paginated: a bounded read of one membership's whole set */
+            /** @description The resolved roles, one entry per grant path, plus the resolved permission SET and the advisory budget verdict over it (issue #98). This is what the NEXT token issuance would carry; tokens already issued are NOT affected by a recent change. A DISABLED organization mints nothing, so both are empty for every one of its members until it is re-enabled (the assignment lists still show the configuration). Not paginated and never truncated, whatever the budget says: an operator must always be able to see what a token will not carry */
             200: {
                 headers: {
                     [name: string]: unknown;

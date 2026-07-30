@@ -606,6 +606,10 @@ async fn mint_device_tokens(
             // the claim is ABSENT rather than a flattened cross-org set. Symmetric with
             // `org_id` above; when the device grant gains an org context this follows it.
             roles: None,
+            // And no permissions (issue #98), twice over: no organization context, and
+            // the device grant passes NO RFC 8707 resource, so its target's
+            // `permission_claims` is false by construction.
+            permissions: None,
             at_hash: None,
             c_hash: None,
             extra_claims: &extra_claims,

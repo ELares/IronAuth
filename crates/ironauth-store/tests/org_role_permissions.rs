@@ -503,7 +503,7 @@ async fn a_permission_is_attached_to_a_role_listed_both_ways_and_detached() {
     );
 
     // The DATA plane reads it too: the grant migration 0092 makes in the creating
-    // migration, which a later PR's effective-permission resolution depends on.
+    // migration, which the effective-permission resolution depends on.
     // Without it that path would fail with SQLSTATE 42501 on the token-issuance path.
     let data = db.store().scoped(scope).org_role_permissions();
     assert_eq!(
@@ -1054,7 +1054,7 @@ async fn an_attach_refuses_a_deleted_role_and_a_deleted_permission() {
     // And the ASYMMETRY that makes this table's liveness story worth stating: deleting
     // an endpoint AFTER the attach does NOT cascade here. The mapping row stays LIVE,
     // and what stops the grant taking effect is the endpoint's own liveness filter in
-    // the resolution projection a later PR adds. So a live mapping row is not by
+    // the resolution projection. So a live mapping row is not by
     // itself a live grant, and this test pins the schema behaviour that fact rests on.
     db.control_store()
         .management()
@@ -2097,7 +2097,7 @@ async fn a_role_may_carry_unlimited_permissions_and_a_permission_unlimited_roles
     // constraint, no quota, and no gate on how many permissions a role carries or on
     // how many roles carry one permission. The page size is clamped like every
     // management list, which is a PAGINATION bound and not a cap on the set. The byte
-    // budget a later PR of this issue adds bounds ONE TOKEN and has nothing to do with
+    // budget issue #98 ships bounds ONE TOKEN and has nothing to do with
     // this table.
     //
     // Every row here is written through the AUDITED WRITE REPOSITORY rather than with

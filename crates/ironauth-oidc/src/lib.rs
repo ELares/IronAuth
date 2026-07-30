@@ -120,8 +120,9 @@ mod migration;
 mod pages;
 mod par;
 mod password;
-/// The pure permission-claim budget (issue #98). INERT on this build: nothing
-/// calls it yet, and the mint hooks are wired in a later PR.
+/// The pure permission-claim budget (issue #98). LIVE: `tokens::mint_at_jwt` calls
+/// it on every `at+jwt` access token that carries a resolved permission set, on both
+/// the code exchange and the refresh grant.
 mod permission_budget;
 mod phone;
 mod pkce;

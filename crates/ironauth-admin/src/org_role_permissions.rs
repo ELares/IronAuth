@@ -98,8 +98,10 @@
 //! carry one permission; a project covenant forbids such a cap and migration 0092
 //! carries none for this module to enforce. The page size on the list is clamped like
 //! every management list, which bounds ONE RESPONSE and never the number of stored
-//! rows. The byte budget a later PR of this issue adds bounds ONE TOKEN, never this
-//! table.
+//! rows. The byte and count budget issue #98 ships bounds ONE TOKEN, never this
+//! table: an attach past it still answers 201, and
+//! `the_management_plane_never_truncates_a_permission_set_past_the_budget` measures
+//! exactly that.
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};

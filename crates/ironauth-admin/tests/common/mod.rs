@@ -96,6 +96,35 @@ impl Harness {
         }
     }
 
+    /// Start a fresh database and router with an explicit `[token_claims]` budget
+    /// (issue #98), so a test can drive the effective-roles view's budget verdict with
+    /// a handful of permissions instead of the shipped default's 257.
+    ///
+    /// The budget bounds what one TOKEN CLAIM carries. It caps nothing that is stored,
+    /// and no endpoint on this plane may refuse a write because of it, which is
+    /// precisely what the tests using this constructor exist to prove.
+    pub async fn start_with_token_claims(
+        default_page_size: u32,
+        token_claims: &ironauth_config::TokenClaimsConfig,
+    ) -> Self {
+        let db = TestDatabase::start().await;
+        let config = AdminConfig {
+            bootstrap_operator_token: Some(Secret::Literal(SecretString::new(OPERATOR_TOKEN))),
+            max_page_size: 200,
+            default_page_size,
+            ..AdminConfig::default()
+        };
+        let state = AdminState::new(db.control_store().clone(), Env::system(), &config)
+            .expect("admin state builds")
+            .with_token_claims(token_claims);
+        let router = management_router(state);
+        Self {
+            db,
+            router,
+            outbound_scope: None,
+        }
+    }
+
     /// Start a fresh database and router with the experimental signup fraud-review-queue
     /// surface ARMED (issue #82, PR 2), so the review-queue endpoints answer instead of 404.
     /// `armed = false` leaves the feature off (its default), so a test can assert the
