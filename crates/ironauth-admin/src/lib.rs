@@ -46,6 +46,7 @@ mod backfill;
 mod bans;
 mod brand_assets;
 mod client_admin_grants;
+mod client_scopes;
 mod config;
 mod connectors;
 mod consents;
@@ -502,6 +503,17 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/signing-algorithm",
             put(signing_algorithm::set_client_signing_algorithm),
+        )
+        // The per-client OAuth scope allowlist (issue #98): which scope tokens a
+        // machine grant may request for this client. Another static suffix under the
+        // client, a sibling of `.../signing-algorithm`. ENVIRONMENT level and taking
+        // no organization, because a `clients` row carries none. The PUT writes
+        // exactly one column and is sudo gated; the GET is not, matching every other
+        // read on this surface.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/allowed-scopes",
+            get(client_scopes::get_client_allowed_scopes)
+                .put(client_scopes::set_client_allowed_scopes),
         )
         // Declarative federation connectors (issue #75): CRUD plus a capability-matrix
         // read endpoint. The static `.../capabilities` suffix is a sibling of the

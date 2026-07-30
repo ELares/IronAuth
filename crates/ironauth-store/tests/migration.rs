@@ -598,8 +598,8 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
     );
     assert_eq!(
         report.already_applied(),
-        95,
-        "the production chain is exactly ninety-five migrations (isolation, audit log, management \
+        96,
+        "the production chain is exactly ninety-six migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -624,10 +624,10 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
          context, organization roles, organization groups, organization group members, \
          organization role assignments, organization authentication policies, permission \
          vocabulary, role-to-permission mapping, organization default role, resource-server \
-         permission claims, token size event budget columns)"
+         permission claims, token size event budget columns, client allowed scopes)"
     );
 
-    // The ledger holds exactly versions 1 through 95.
+    // The ledger holds exactly versions 1 through 96.
     assert_eq!(
         applied_versions(pool).await,
         vec![
@@ -635,7 +635,7 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
             46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67,
             68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89,
-            90, 91, 92, 93, 94, 95
+            90, 91, 92, 93, 94, 95, 96
         ]
     );
     let phase_of = |version: i64| async move {
@@ -6666,4 +6666,116 @@ async fn token_size_events_carries_the_budget_columns_under_the_existing_grants(
             "the {column} vocabulary is pinned in Rust, not by a CHECK"
         );
     }
+}
+
+/// The per-client SCOPE allowlist: the column, and the one column-scoped grant
+/// without which the management setter fails 42501 (issue #98, migration 0096).
+///
+/// Its own test rather than more lines in the production-chain assertions, for the
+/// stack-budget reason the 0090, 0093, and 0094 tests record.
+#[tokio::test]
+async fn clients_carries_the_scope_allowlist_and_its_control_column_grant() {
+    let db = TestDatabase::start().await;
+    let pool = db.owner_pool();
+
+    // EXPAND: one additive nullable column, which Postgres adds without rewriting the
+    // table, and one new grant.
+    let phase: String = sqlx::query("SELECT phase FROM _schema_migrations WHERE version = 96")
+        .fetch_one(pool)
+        .await
+        .expect("0096 is in the ledger")
+        .get("phase");
+    assert_eq!(phase, "expand");
+
+    assert!(
+        column_exists(pool, "clients", "allowed_scopes").await,
+        "clients.allowed_scopes exists after 0096"
+    );
+    assert_eq!(
+        column_data_type(pool, "clients", "allowed_scopes").await,
+        "jsonb",
+        "the allowlist is jsonb, so Postgres refuses a value that is not JSON at all"
+    );
+    // NULLABLE and DEFAULT-less. NULL is a MEANINGFUL state here ("no allowlist
+    // configured"), which is exactly what every client registered before 0096 must
+    // read as, so there is no default to apply and nothing to backfill. Contrast
+    // 0094, whose boolean needed a NOT NULL DEFAULT precisely because it had no
+    // meaningful third state.
+    assert!(
+        !column_is_not_null(pool, "clients", "allowed_scopes").await,
+        "clients.allowed_scopes must be NULLABLE: NULL is the no-allowlist state"
+    );
+    assert_eq!(
+        column_default(pool, "clients", "allowed_scopes").await,
+        None,
+        "no DEFAULT: an existing client keeps the NULL no-allowlist reading"
+    );
+
+    // THE grant this migration exists for. Every UPDATE grant `clients` carries for
+    // the control role is COLUMN-scoped (0018's quarantined/verified_at, 0076's
+    // first_party) and there has never been a table-wide one, so a column added later
+    // is invisible to all of them.
+    // `the_control_column_grant_is_load_bearing_for_allowed_scopes` in
+    // tests/repository.rs revokes this and measures the 42501 end to end; this is the
+    // static half.
+    assert!(
+        role_has_column_privilege(
+            pool,
+            "ironauth_control",
+            "clients",
+            "allowed_scopes",
+            "UPDATE"
+        )
+        .await,
+        "ironauth_control must hold column-scoped UPDATE on clients.allowed_scopes"
+    );
+    // ADDITIVE to 0018 and 0076: Postgres unions column grants, so a re-GRANT that
+    // REPLACED them would leave the quarantine lift and the first-party
+    // classification unwritable while the new column worked.
+    for column in ["quarantined", "verified_at", "first_party"] {
+        assert!(
+            role_has_column_privilege(pool, "ironauth_control", "clients", column, "UPDATE").await,
+            "the earlier column-scoped UPDATE on clients.{column} must survive 0096"
+        );
+    }
+    // Every ADDRESSING column stays immutable by GRANT for the control role: one able
+    // to rewrite `tenant_id` could move a client across the isolation fence.
+    for column in ["id", "tenant_id", "environment_id", "secret_hash"] {
+        assert!(
+            !role_has_column_privilege(pool, "ironauth_control", "clients", column, "UPDATE").await,
+            "clients.{column} must still be immutable by GRANT for the control role"
+        );
+    }
+
+    // The DATA plane gains NOTHING, and this is the deliberate divergence from the
+    // twin: 0019 granted `UPDATE (allowed_resources)` to ironauth_app, and 0096 grants
+    // the scope allowlist to the control role alone. A data plane able to widen the
+    // set of scopes the machine token it is about to mint may carry defeats the point
+    // of having an allowlist.
+    assert!(
+        !role_has_column_privilege(pool, "ironauth_app", "clients", "allowed_scopes", "UPDATE")
+            .await,
+        "the data plane must NOT hold UPDATE on clients.allowed_scopes"
+    );
+    // It keeps the SELECT the machine-grant paths read the allowlist through. 0018
+    // narrowed only UPDATE, so the table-wide SELECT 0001 granted still covers a
+    // column added later.
+    assert!(
+        role_has_table_privilege(pool, "ironauth_app", "clients", "SELECT").await,
+        "the data plane keeps the SELECT the mint reads this column through"
+    );
+    assert!(
+        role_has_table_privilege(pool, "ironauth_control", "clients", "SELECT").await,
+        "the control plane keeps the SELECT the management read-back needs"
+    );
+    // And neither role gained a TABLE-wide UPDATE, which is the failure mode 0018's
+    // header calls out by name.
+    assert!(
+        !role_has_table_privilege(pool, "ironauth_control", "clients", "UPDATE").await,
+        "0096 must not widen the control role to a table-wide UPDATE on clients"
+    );
+    assert!(
+        !role_has_table_privilege(pool, "ironauth_app", "clients", "UPDATE").await,
+        "0096 must not widen the data role to a table-wide UPDATE on clients"
+    );
 }

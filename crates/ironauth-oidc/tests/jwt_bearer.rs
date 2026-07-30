@@ -902,6 +902,227 @@ async fn a_user_or_oidc_scope_is_rejected_as_invalid_scope() {
     );
 }
 
+/// An assertion string that is not a JWT at all, so every request carrying it fails
+/// at the very first step of assertion validation whatever else it asks for.
+const GARBAGE_ASSERTION: &str = "not.a.jwt";
+
+/// Set the PRESENTING (harness) client's per-client scope allowlist (issue #98).
+///
+/// Through the CONTROL plane, because migration 0096 grants the column-scoped
+/// `UPDATE (allowed_scopes)` to `ironauth_control` alone: the plane that mints the
+/// token cannot widen what that token may carry, so there is no data-plane door to
+/// write through even in a test.
+async fn set_allowlist(h: &Harness, allowed: Option<&[String]>) {
+    h.db()
+        .control_store()
+        .management()
+        .acting(
+            h.db().test_actor(h.env()),
+            ironauth_store::CorrelationId::generate(h.env()),
+        )
+        .client_scope_policies(h.scope())
+        .set(h.env(), h.client_id(), allowed)
+        .await
+        .expect("set the presenting client's scope allowlist");
+}
+
+/// Present a jwt-bearer request carrying `assertion` and `scope`.
+async fn present_with_scope(
+    h: &Harness,
+    client_id: &str,
+    assertion: &str,
+    scope: &str,
+) -> (StatusCode, axum::http::HeaderMap, String) {
+    let body = form(&[
+        ("grant_type", JWT_BEARER_GRANT),
+        ("assertion", assertion),
+        ("client_id", client_id),
+        ("scope", scope),
+    ]);
+    h.token(&body).await
+}
+
+#[tokio::test]
+async fn the_presenting_clients_scope_allowlist_governs_this_grant_too() {
+    // Issue #98: the allowlist that applies on this grant is the PRESENTING client's,
+    // which is the client the token is minted for. Enforcement, then the wire answer,
+    // then the ordering property the answer depends on.
+    let h = Harness::start().await;
+    let client_id = seed_trust(&h).await;
+    set_allowlist(&h, Some(&["read:orders".to_owned()])).await;
+    let key = issuer_key();
+
+    // Inside the allowlist: issued, and the granted scope is echoed.
+    let inside = assertion(
+        &key,
+        EXTERNAL_ISSUER,
+        EXTERNAL_SUBJECT,
+        h.issuer(),
+        3600,
+        "jti-allow-inside",
+    );
+    let (status, _h, resp) = present_with_scope(&h, &client_id, &inside, "read:orders").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an allowlisted scope issues: {resp}"
+    );
+    assert_eq!(json(&resp)["scope"], "read:orders");
+
+    // Outside it: refused. The wire answer is this grant's UNIFORM invalid_grant, NOT
+    // invalid_scope, because a public presenting client reaches this check with no
+    // credential at all (`a_public_presenting_client_cannot_enumerate_the_scope_allowlist`
+    // is the adversarial half). The specific reason goes out of band instead.
+    let outside = assertion(
+        &key,
+        EXTERNAL_ISSUER,
+        EXTERNAL_SUBJECT,
+        h.issuer(),
+        3600,
+        "jti-allow-outside",
+    );
+    let (status, _h, resp) = present_with_scope(&h, &client_id, &outside, "admin").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a scope outside the allowlist is refused: {resp}"
+    );
+    assert_eq!(
+        json(&resp)["error"],
+        "invalid_grant",
+        "the refusal is this grant's uniform answer, not invalid_scope: {resp}"
+    );
+    assert!(
+        h.client_auth_diagnostics(&client_id)
+            .await
+            .iter()
+            .any(|d| d.failure_reason == "scope_not_allowlisted"),
+        "the operator still learns the specific reason, out of band"
+    );
+
+    // And the refusal ran BEFORE the assertion was touched, so it did not spend the
+    // single-use jti: the SAME assertion still redeems for an allowlisted scope.
+    let (status, _h, resp) = present_with_scope(&h, &client_id, &outside, "read:orders").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the refused request never spent the assertion's jti: {resp}"
+    );
+
+    // Clearing the allowlist restores the pre-#98 behaviour: anything the floor allows.
+    set_allowlist(&h, None).await;
+    let cleared = assertion(
+        &key,
+        EXTERNAL_ISSUER,
+        EXTERNAL_SUBJECT,
+        h.issuer(),
+        3600,
+        "jti-allow-cleared",
+    );
+    let (status, _h, resp) = present_with_scope(&h, &client_id, &cleared, "admin").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "with no allowlist configured `admin` is fine again: {resp}"
+    );
+}
+
+#[tokio::test]
+async fn a_public_presenting_client_cannot_enumerate_the_scope_allowlist() {
+    // The adversarial half, and the reason the refusal above is invalid_grant.
+    //
+    // This grant deliberately permits a PUBLIC (`none`) presenting client, because the
+    // ASSERTION is the authorization grant rather than a client secret, and it runs the
+    // scope check BEFORE the assertion is touched so an out-of-policy request cannot
+    // spend a single-use jti. Together those mean a caller holding NO credential and a
+    // garbage assertion reaches the allowlist check. While an allowlist refusal answered
+    // invalid_scope and everything downstream answered invalid_grant, that caller could
+    // separate an allowlisted scope from a non-allowlisted one ONE REQUEST AT A TIME and
+    // read operator-written configuration off the wire.
+    //
+    // The proof is a differential: the SAME garbage assertion, two scopes that the
+    // server demonstrably treats differently (the diagnostics below prove it took two
+    // different paths), and a BYTE-IDENTICAL response.
+    let h = Harness::start().await;
+    let client_id = seed_trust(&h).await;
+    set_allowlist(&h, Some(&["read:orders".to_owned()])).await;
+
+    let (allowed_status, allowed_headers, allowed_body) =
+        present_with_scope(&h, &client_id, GARBAGE_ASSERTION, "read:orders").await;
+    let (refused_status, refused_headers, refused_body) =
+        present_with_scope(&h, &client_id, GARBAGE_ASSERTION, "admin").await;
+
+    assert_eq!(
+        allowed_status, refused_status,
+        "the status must not separate an allowlisted scope from a rejected one"
+    );
+    assert_eq!(
+        allowed_body, refused_body,
+        "the body must not separate them either: {allowed_body} vs {refused_body}"
+    );
+    assert_eq!(
+        allowed_headers, refused_headers,
+        "and no header may separate them"
+    );
+    assert_eq!(
+        json(&allowed_body)["error"],
+        "invalid_grant",
+        "both are the uniform invalid_grant: {allowed_body}"
+    );
+
+    // The server DID take two different paths, so the equality above is uniformity and
+    // not an accident of both requests failing the same way. Out of band, where only an
+    // operator can read it, the two are fully distinguished.
+    let reasons: Vec<String> = h
+        .client_auth_diagnostics(&client_id)
+        .await
+        .iter()
+        .map(|d| d.failure_reason.clone())
+        .collect();
+    assert!(
+        reasons.iter().any(|r| r == "scope_not_allowlisted"),
+        "the non-allowlisted scope is diagnosed as such: {reasons:?}"
+    );
+    assert!(
+        reasons.iter().any(|r| r == "assertion_issuer_untrusted"),
+        "the allowlisted scope got past the allowlist and died on the assertion: {reasons:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_denylist_floor_still_answers_invalid_scope_on_this_grant() {
+    // The ONE deliberate exception to the uniformity above, pinned so it cannot be
+    // widened by accident. `DISALLOWED_M2M_SCOPES` is a PUBLIC compile-time constant,
+    // identical for every client and every deployment, so the spec-exact invalid_scope
+    // discloses nothing; it predates the per-client allowlist and stays. What must not
+    // happen is the floor answer leaking onto the per-client half, so this asserts the
+    // floor answers invalid_scope EVEN WHEN the same request would also miss a
+    // configured allowlist, and even when the allowlist NAMES the floor value.
+    let h = Harness::start().await;
+    let client_id = seed_trust(&h).await;
+    set_allowlist(&h, Some(&["read:orders".to_owned()])).await;
+
+    for scope in ["openid", "offline_access"] {
+        let (status, _h, resp) = present_with_scope(&h, &client_id, GARBAGE_ASSERTION, scope).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "scope `{scope}`: {resp}");
+        assert_eq!(
+            json(&resp)["error"],
+            "invalid_scope",
+            "the public floor keeps its spec-exact answer for `{scope}`: {resp}"
+        );
+    }
+
+    // An allowlist that NAMES a floor value still refuses it, and still as the floor.
+    set_allowlist(&h, Some(&["openid".to_owned()])).await;
+    let (status, _h, resp) = present_with_scope(&h, &client_id, GARBAGE_ASSERTION, "openid").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+    assert_eq!(
+        json(&resp)["error"],
+        "invalid_scope",
+        "the floor runs first and answers first: {resp}"
+    );
+}
+
 #[tokio::test]
 async fn the_exp_skew_boundary_is_accepted_and_one_second_past_is_rejected() {
     // FIX 3 (test rigor): under an ADVANCING clock (not the frozen-epoch default), an

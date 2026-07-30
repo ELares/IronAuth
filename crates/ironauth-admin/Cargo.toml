@@ -429,5 +429,19 @@ name = "signing_algorithm"
 path = "tests/signing_algorithm.rs"
 required-features = ["testing"]
 
+# The per-client SCOPE allowlist over HTTP (issue #98, PR 15): the GET and the PUT
+# over `clients.allowed_scopes`, the three states (`null` = no allowlist, an array
+# restricts, `[]` admits nothing) round-tripped so the empty array cannot silently
+# collapse into the clear, the ABSENT-key 400 that keeps `{}` from being a legal
+# no-op, the unmatchable-entry refusal alongside a corpus proving no CHARSET is
+# policed, byte-identical anti-oracle uniformity across every shape of unreachable id
+# on BOTH verbs plus the ordering that keeps a body refusal from being an existence
+# oracle, the environment-scoped-key confinement, and the fail-safe read that surfaces
+# a corrupted stored value as `[]` rather than as unrestricted. Needs a real database.
+[[test]]
+name = "client_scopes"
+path = "tests/client_scopes.rs"
+required-features = ["testing"]
+
 [lints]
 workspace = true

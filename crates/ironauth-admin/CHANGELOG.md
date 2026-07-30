@@ -6,6 +6,52 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The per-client scope-allowlist management surface** (issue #98, PR 15): `GET` and `PUT`
+  on `.../clients/{client_id}/allowed-scopes` (`getClientAllowedScopes`,
+  `setClientAllowedScopes`), a static suffix under the client and a sibling of
+  `.../signing-algorithm`. ENVIRONMENT level and taking no organization, because a `clients`
+  row carries none, so `resolve_scope` plus the typed `ClientId` are the two layers and
+  there is no cross-parent guard to forget. THREE addressing failures and not the usual
+  four: `clients` has no soft delete, so a deleted client reads exactly like one that was
+  never registered, and malformed / foreign / absent are one uniform 404 on BOTH verbs. The
+  body refusal runs AFTER the address resolves, so a 400 is never visible for a client the
+  caller cannot address.
+- The PUT is sudo gated (`a_client_scope_allowlist_write_is_sudo_gated`); the GET is not,
+  matching every other read on this surface. The write goes through
+  `state.store().management()`, because migration 0096 grants the column-scoped UPDATE to
+  the control role alone, so this endpoint needs none of `signing_algorithm`'s cross-role
+  idempotency machinery. No `Idempotency-Key`: an absolute-value PUT addressed by an
+  existing client is naturally idempotent.
+- `allowed_scopes` is REQUIRED in the body and MAY be `null`, and the distinction is the
+  whole shape of it. An ABSENT key is a 400 that names the field, because `{}` would
+  otherwise be a legal request that did nothing and a caller could not tell it apart from
+  one that was applied. A PRESENT `null` is the explicit clear. An empty array is a real,
+  maximally restrictive value and is never collapsed into the clear. The published schema
+  SAYS required (`#[schema(required = true)]`) rather than leaving utoipa to infer it. The
+  field is `Option<Option<T>>` under the `named_field` seam and utoipa reads the outer
+  `Option` as "optional field", so the generated document would have carried no `required`
+  array and a generated client would have let a caller omit a key the server answers 400
+  for. The two other bodies in this crate on that seam are genuinely optional, so the
+  inferred shape is right for them and only this one contradicted its own server;
+  `the_set_allowed_scopes_body_declares_its_required_field` pins it, because the drift is
+  silent everywhere else.
+- ONE well-formedness rule, and it is deliberately NOT charset validation: an entry that is
+  empty or carries whitespace is a typed 400 naming it, because the matcher splits a REQUEST
+  on whitespace so such an entry could never match and would be silently dead configuration.
+  Nothing else about a scope token is policed; `read:orders`, `urn:x:y`, `*`, and non-ASCII
+  all pass, which a test asserts alongside the refusals so a reader can see that no
+  character class is being narrowed.
+- The read reports what is IN FORCE, never a repaired value: a stored value the server could
+  not parse reads as `[]` (the store's fail-safe parse), and the GET answers `[]`. Answering
+  `null` would tell an operator their client is unrestricted while every one of its SCOPED
+  machine tokens is refused, which is the most misleading answer available. A request
+  carrying no `scope` still mints, since `scope` is optional.
+- Console: a "Machine grant scope allowlist" panel on the clients surface, one scope token
+  per line (the only editor shape that can express the empty list distinctly from a single
+  blank token), with SEPARATE "Set allowlist" and confirm-gated "Clear the allowlist"
+  buttons rather than one that guesses, because `[]` and `null` are one keystroke apart and
+  mean opposite things. Its vitest suite drives both bodies.
+
 - The effective-roles view gains `permissions` and `permission_budget` (issue #98, PR 13),
   as a pure addition under the object wrapper issue #97 shipped for exactly this. The
   permission set is the WHOLE resolved set, un-paginated and un-truncated, read through the

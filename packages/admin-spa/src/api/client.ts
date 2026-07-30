@@ -194,6 +194,14 @@ export type SigningRecommendationView =
 export type ClientSigningAlgorithmView =
   components["schemas"]["ClientSigningAlgorithmView"];
 
+// The per-client OAuth SCOPE allowlist shape (issue #98). `allowed_scopes` is
+// `null` when no allowlist is configured (every scope passes the machine-grant
+// denylist floor), an array to restrict to exactly its members, and `[]` to admit
+// nothing. Re-exported from the generated schema so the panel never hand maintains a
+// shape the management contract already owns.
+export type ClientAllowedScopesView =
+  components["schemas"]["ClientAllowedScopesView"];
+
 // The recorded client-authentication failure diagnostic the admin flow inspector
 // reads (issue #91). Re-exported from the generated schema so the diagnostics view
 // never hand maintains a shape the management contract already owns. It carries ONLY
@@ -1021,6 +1029,78 @@ export async function setClientSigningAlgorithm(
         header: { "Idempotency-Key": idempotencyKey() },
       },
       body: { algorithm },
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+// ---- The per-client scope allowlist operations (issue #98) ------------------
+//
+// The allowlist panel (src/ui/ClientsView.tsx) calls these named wrappers, never a
+// path, so the single funnel holds: each literal below is a path the committed
+// docs/openapi/management.json documents, and each throws a ManagementError carrying
+// the verbatim ErrorBody on a non 2xx (the same bodyless-non-2xx guard as above),
+// which the ErrorView boundary renders unchanged, including the RFC 9470 sudo
+// challenge the WRITE is gated behind.
+//
+// The three states are carried end to end and never collapsed in TypeScript: `null`
+// means NO allowlist is configured, an array RESTRICTS to exactly its members, and
+// `[]` admits nothing. A read of a value the server could not parse answers `[]`,
+// which is what the token endpoint will enforce, so the panel shows the operator
+// what is in force rather than a repaired value.
+
+// Read one client's scope allowlist (operationId getClientAllowedScopes).
+export async function getClientAllowedScopes(
+  tenantId: string,
+  environmentId: string,
+  clientId: string,
+): Promise<ClientAllowedScopesView> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.GET(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/allowed-scopes",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          client_id: clientId,
+        },
+      },
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+// Set or CLEAR one client's scope allowlist (operationId setClientAllowedScopes).
+// `allowedScopes` is the array to store, or `null` to clear the allowlist; the key is
+// always sent, because the server refuses a body that OMITS it with a 400 (an empty
+// object would otherwise be a legal request that did nothing). No Idempotency-Key:
+// this is an absolute-value PUT addressed by an existing client, so applying the same
+// body twice reaches the same state, matching the server, which documents none.
+export async function setClientAllowedScopes(
+  tenantId: string,
+  environmentId: string,
+  clientId: string,
+  allowedScopes: string[] | null,
+): Promise<ClientAllowedScopesView> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.PUT(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/allowed-scopes",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          client_id: clientId,
+        },
+      },
+      body: { allowed_scopes: allowedScopes },
     },
   );
   if (error !== undefined || !response.ok || data === undefined) {

@@ -93,6 +93,20 @@ use crate::views::{
                                                   PATCH writes exactly one column, the \
                                                   permission-claim opt-in, and refuses to enable \
                                                   it on an `opaque` resource server"),
+        (name = "client-scopes", description = "The per-client OAuth SCOPE allowlist \
+                                                (issue #98): which scope tokens a \
+                                                machine grant (`client_credentials`, \
+                                                `jwt-bearer`) may request for one \
+                                                client. `null` means no allowlist is \
+                                                configured and every scope passes the \
+                                                machine-grant denylist floor; an array \
+                                                restricts to exactly its members; `[]` \
+                                                admits nothing. A DELEGATION \
+                                                restriction on what a machine may ASK \
+                                                FOR, never the RBAC permission set \
+                                                (machine principal permissions are \
+                                                issue #99), and it can never re-admit \
+                                                `openid` or `offline_access`"),
         (name = "org-role-permissions", description = "The role-to-permission mapping \
                                                        (issue #98): which permissions of the \
                                                        ENVIRONMENT'S vocabulary one \
@@ -194,6 +208,8 @@ use crate::views::{
         crate::permissions::get_permission,
         crate::permissions::update_permission,
         crate::permissions::delete_permission,
+        crate::client_scopes::get_client_allowed_scopes,
+        crate::client_scopes::set_client_allowed_scopes,
         crate::resource_servers::list_resource_servers,
         crate::resource_servers::get_resource_server,
         crate::resource_servers::update_resource_server_permission_claims,
@@ -331,6 +347,8 @@ use crate::views::{
         crate::permissions::PermissionList,
         crate::permissions::CreatePermissionRequest,
         crate::permissions::UpdatePermissionRequest,
+        crate::client_scopes::ClientAllowedScopesView,
+        crate::client_scopes::SetClientAllowedScopesRequest,
         crate::resource_servers::ResourceServerView,
         crate::resource_servers::ResourceServerList,
         crate::resource_servers::UpdateResourceServerRequest,

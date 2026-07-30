@@ -842,6 +842,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0095_token_size_event_budget_columns.sql"),
         },
+        Migration {
+            version: 96,
+            name: "client_allowed_scopes",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0096_client_allowed_scopes.sql"),
+        },
     ]
 }
 

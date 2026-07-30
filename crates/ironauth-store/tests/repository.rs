@@ -1658,3 +1658,353 @@ async fn the_per_kind_read_gives_each_event_family_its_own_clamped_window() {
         "and it holds only its own family"
     );
 }
+
+/// The per-client scope allowlist (issue #98, migration 0096) round-trips through its
+/// three states, written by the CONTROL plane and read by the DATA plane.
+///
+/// The two planes matter here and are exercised rather than assumed: 0096 grants the
+/// column-scoped `UPDATE` to `ironauth_control` alone (unlike the twin
+/// `allowed_resources`, whose 0019 grant went to the data plane), so the write must go
+/// through the management door and the mint's read must still see it.
+#[tokio::test]
+async fn the_client_scope_allowlist_round_trips_null_empty_and_members() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let id = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .clients()
+        .create(&env, "acme worker")
+        .await
+        .expect("create");
+
+    // A freshly created client has NO allowlist: the column is NULL, which is the
+    // state every client registered before 0096 is in.
+    let policy = db
+        .store()
+        .scoped(scope)
+        .client_scope_policies()
+        .get(&id)
+        .await
+        .expect("read the fresh policy");
+    assert_eq!(
+        policy.allowed_scopes, None,
+        "a client with no allowlist configured reads None, not Some(vec![])"
+    );
+
+    let setter = db
+        .control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .client_scope_policies(scope);
+
+    // A populated allowlist round-trips, order preserved.
+    setter
+        .set(
+            &env,
+            &id,
+            Some(&["read:orders".to_owned(), "write:orders".to_owned()]),
+        )
+        .await
+        .expect("set the allowlist");
+    let policy = db
+        .store()
+        .scoped(scope)
+        .client_scope_policies()
+        .get(&id)
+        .await
+        .expect("read the set policy");
+    assert_eq!(
+        policy.allowed_scopes,
+        Some(vec!["read:orders".to_owned(), "write:orders".to_owned()])
+    );
+
+    // The EMPTY allowlist is a real, distinct value stored as `[]`, never collapsed
+    // into the NULL clear: it means "this client may request no scope at all".
+    setter.set(&env, &id, Some(&[])).await.expect("set empty");
+    let policy = db
+        .store()
+        .scoped(scope)
+        .client_scope_policies()
+        .get(&id)
+        .await
+        .expect("read the empty policy");
+    assert_eq!(
+        policy.allowed_scopes,
+        Some(Vec::new()),
+        "Some(empty) must NOT read back as None: they mean opposite things"
+    );
+
+    // Clearing writes NULL back, returning the client to "no allowlist".
+    setter.set(&env, &id, None).await.expect("clear");
+    let policy = db
+        .store()
+        .scoped(scope)
+        .client_scope_policies()
+        .get(&id)
+        .await
+        .expect("read the cleared policy");
+    assert_eq!(policy.allowed_scopes, None);
+
+    // Every one of those three writes (two sets and the clear) is audited under one
+    // stable action.
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_log WHERE action = 'client.allowed_scopes.set'",
+    )
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("count audit rows");
+    assert_eq!(
+        rows, 3,
+        "each of the two sets and the clear writes exactly one audit row"
+    );
+}
+
+/// A MALFORMED stored allowlist reads as the EMPTY allowlist (deny everything), never
+/// as the unrestricted `None`.
+///
+/// This is the fail-safe direction and it is the one line of this feature a reviewer
+/// should check. `ClientScopePolicyRepo::get` parses with
+/// `serde_json::from_str::<Vec<String>>(..).unwrap_or_default()`, and
+/// `unwrap_or_default()` on a `Vec` is the empty vector, so an unparsable value costs
+/// the client every SCOPED machine token and costs nobody any authority. A request
+/// carrying no `scope` still mints, since `scope` is optional, so the loss is every
+/// scope the client can ask for rather than its ability to obtain a token. Flipping that
+/// fallback to `None` (the unrestricted reading) makes every case below fail, which
+/// was measured rather than assumed.
+///
+/// The values are written through the OWNER pool as raw `jsonb`, because no setter can
+/// produce them: `ActingClientScopePolicyRepo::set` serializes a `&[String]` and can
+/// only ever write a well-formed array. They stand in for a hand-edited row, a
+/// restore from an older or newer format, and storage corruption.
+///
+/// The column is `jsonb`, so Postgres refuses a value that is not JSON at all and the
+/// crudest malformation cannot be planted here. That does not make the parse
+/// redundant, which is exactly what the corpus below shows: every one of these is
+/// valid `jsonb` and none is an array of strings.
+#[tokio::test]
+async fn a_malformed_allowlist_denies_everything() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let id = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .clients()
+        .create(&env, "acme worker")
+        .await
+        .expect("create");
+
+    for malformed in [
+        // A JSON object where an array belongs (a plausible future format change).
+        r#"{"scopes": ["read:orders"]}"#,
+        // An array of the WRONG element type.
+        "[1, 2, 3]",
+        // A nested array.
+        r#"[["read:orders"]]"#,
+        // A bare string, which is what a naive writer might store.
+        r#""read:orders""#,
+        // A scalar and a JSON null, both valid jsonb.
+        "42",
+        "true",
+        "null",
+    ] {
+        sqlx::query("UPDATE clients SET allowed_scopes = $1::jsonb WHERE id = $2")
+            .bind(malformed)
+            .bind(id.to_string())
+            .execute(db.owner_pool())
+            .await
+            .expect("plant the malformed value");
+
+        let policy = db
+            .store()
+            .scoped(scope)
+            .client_scope_policies()
+            .get(&id)
+            .await
+            .expect("a malformed value must still READ, not error");
+        assert_eq!(
+            policy.allowed_scopes,
+            Some(Vec::new()),
+            "the malformed value `{malformed}` must read as the EMPTY allowlist \
+             (deny everything), never as None (unrestricted)"
+        );
+        assert!(
+            policy.allowed_scopes.is_some(),
+            "reading `{malformed}` as None would make a corrupted row an UNRESTRICTED \
+             client, which is the failure direction this whole column exists to avoid"
+        );
+    }
+}
+
+/// A write addressed to a client of ANOTHER scope, and one addressed to a well-formed
+/// id of the caller's own scope that names no row, are both the uniform not-found and
+/// audit nothing.
+///
+/// The second half is what pins the write path's last line of defence: with the scope
+/// predicates gone, forced row-level security makes the statement match zero rows and
+/// report SUCCESS, so the `rows_affected() == 0` check is the only thing that turns
+/// that into a denial.
+#[tokio::test]
+async fn an_allowlist_write_matching_no_row_is_not_found_and_audits_nothing() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope_a = db.seed_scope(&env).await;
+    let scope_b = db.seed_scope(&env).await;
+
+    // A real client of scope B, addressed from scope A.
+    let victim = db
+        .store()
+        .scoped(scope_b)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .clients()
+        .create(&env, "victim")
+        .await
+        .expect("create the victim");
+    let setter = db
+        .control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .client_scope_policies(scope_a);
+    assert!(matches!(
+        setter
+            .set(&env, &victim, Some(&["read:orders".to_owned()]))
+            .await,
+        Err(StoreError::NotFound)
+    ));
+
+    // A well-formed id OF SCOPE A that names no row: the guard passes, the statement
+    // runs, and only the rows_affected check can refuse it.
+    let absent = ClientId::generate(&env, &scope_a);
+    assert!(matches!(
+        setter
+            .set(&env, &absent, Some(&["read:orders".to_owned()]))
+            .await,
+        Err(StoreError::NotFound)
+    ));
+
+    // The victim's allowlist is untouched, and neither refusal wrote an audit row.
+    let policy = db
+        .store()
+        .scoped(scope_b)
+        .client_scope_policies()
+        .get(&victim)
+        .await
+        .expect("the victim survives in its own scope");
+    assert_eq!(policy.allowed_scopes, None);
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_log WHERE action = 'client.allowed_scopes.set'",
+    )
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("count audit rows");
+    assert_eq!(rows, 0, "a refused write audits nothing");
+}
+
+/// THE GRANT IS LOAD BEARING, NOT DECORATION (issue #98, migration 0096).
+///
+/// Every `UPDATE` grant `clients` carries for the control role is COLUMN-scoped
+/// (0018's `quarantined`/`verified_at`, 0076's `first_party`), and a column-scoped
+/// grant ENUMERATES columns, so a column added later is invisible to all of them.
+/// Without 0096's `GRANT UPDATE (allowed_scopes) ON clients TO ironauth_control` the
+/// management setter is refused by Postgres.
+///
+/// Demonstrated rather than asserted: revoke exactly that one grant, show the READ
+/// still works (0018's table-wide `SELECT` is unaffected), show the write fail with
+/// SQLSTATE 42501 and the column unchanged, restore the grant, and show the identical
+/// call succeed. Without the restore half the test would pass against a setter that
+/// was broken for some entirely other reason, and a MISSPELLED column name in the
+/// migration would surface as 42703 rather than 42501.
+#[tokio::test]
+async fn the_control_column_grant_is_load_bearing_for_allowed_scopes() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let id = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .clients()
+        .create(&env, "acme worker")
+        .await
+        .expect("create");
+
+    // The owner pool is the schema owner, so this leaves the database in exactly the
+    // state an operator who applied 0018 and 0076 and skipped 0096 would have.
+    sqlx::query("REVOKE UPDATE (allowed_scopes) ON clients FROM ironauth_control")
+        .execute(db.owner_pool())
+        .await
+        .expect("revoke the 0096 column grant");
+
+    let setter = db
+        .control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .client_scope_policies(scope);
+    let error = setter
+        .set(&env, &id, Some(&["read:orders".to_owned()]))
+        .await
+        .expect_err("the setter must be refused without the column grant");
+    let sqlstate = match &error {
+        StoreError::Database(sqlx::Error::Database(database)) => database
+            .code()
+            .map(std::borrow::Cow::into_owned)
+            .expect("the refusal carries a SQLSTATE"),
+        other => panic!("expected a database error, got {other:?}"),
+    };
+    assert_eq!(
+        sqlstate, "42501",
+        "the missing column grant must surface as insufficient_privilege"
+    );
+
+    // The READ is unaffected: 0018 granted the control role a TABLE-wide SELECT, which
+    // covers a column added later, and 0096 narrowed only UPDATE.
+    let policy = db
+        .control_store()
+        .management()
+        .client_scope_policies(scope)
+        .get(&id)
+        .await
+        .expect("the control-plane read needs no new grant");
+    assert_eq!(
+        policy.allowed_scopes, None,
+        "the refused write left the column untouched"
+    );
+
+    // RESTORE the grant, and the SAME call now succeeds.
+    sqlx::query("GRANT UPDATE (allowed_scopes) ON clients TO ironauth_control")
+        .execute(db.owner_pool())
+        .await
+        .expect("restore the 0096 column grant");
+    db.control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .client_scope_policies(scope)
+        .set(&env, &id, Some(&["read:orders".to_owned()]))
+        .await
+        .expect("with the grant restored the same call succeeds");
+    let policy = db
+        .store()
+        .scoped(scope)
+        .client_scope_policies()
+        .get(&id)
+        .await
+        .expect("read back");
+    assert_eq!(policy.allowed_scopes, Some(vec!["read:orders".to_owned()]));
+
+    // And the refused write audited nothing: the audit row and the data change share
+    // one transaction, so a refusal rolls both back.
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_log WHERE action = 'client.allowed_scopes.set'",
+    )
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("count audit rows");
+    assert_eq!(rows, 1, "only the successful write is audited");
+}

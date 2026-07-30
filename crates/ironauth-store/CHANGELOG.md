@@ -6,6 +6,76 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The per-client OAuth SCOPE allowlist** (issue #98, PR 15): migration 0096 adds one
+  nullable `clients.allowed_scopes jsonb`, the deliberate twin of `clients.allowed_resources`
+  (0019) with the same three states. NULL means NO allowlist is configured and every scope
+  passes the machine-grant denylist floor, which is what every client already registered
+  reads as, so the migration changes the behaviour of nothing; a non-NULL array RESTRICTS
+  the client to exactly its members; and `[]` is a real, maximally restrictive value meaning
+  the client may request no scope at all, stored distinctly from the NULL clear.
+  `DISALLOWED_M2M_SCOPES` has been a two-value denylist since issue #23 and its own doc said
+  the full per-client allowlist was M10's business; this is that column.
+- **THE PARSE FAILS SAFE, and that direction is the whole point.**
+  `ClientScopePolicyRepo::get` parses a stored value with
+  `serde_json::from_str::<Vec<String>>(..).unwrap_or_default()`, and `unwrap_or_default()`
+  on a `Vec` is the EMPTY vector, so a value that does not parse as an array of strings
+  reads as `Some(vec![])`: an allowlist that admits NOTHING. The other fallback (`None`,
+  unrestricted) is one token away in that expression and would turn every corrupted,
+  hand-edited, or format-mismatched row into an UNRESTRICTED client, a widening produced by
+  corruption. Failing to the empty allowlist costs the client every SCOPED machine token and
+  costs nobody any authority. A request carrying no `scope` still mints, since `scope` is
+  optional, so the loss is every scope the client can ask for rather than the token itself. `a_malformed_allowlist_denies_everything` drives seven malformed
+  shapes and was measured RED with the fallback flipped. `jsonb` rather than the twin's
+  `text` is a small deliberate divergence: Postgres refuses a value that is not JSON at all,
+  so the crudest malformation cannot be stored, but `{"a": 1}`, `[1, 2]`, and `"openid"` are
+  all valid `jsonb` and none is an array of strings, which is why the shape check is still
+  the reader's job and is exactly what that corpus drives.
+- **THE GRANT IS LOAD BEARING, NOT DECORATION.** Every `UPDATE` grant `clients` carries for
+  the control role is COLUMN-scoped (0018's `quarantined`/`verified_at`, 0076's
+  `first_party`) and there has never been a table-wide one, so a column added later is
+  invisible to all of them. Demonstrated rather than asserted:
+  `the_control_column_grant_is_load_bearing_for_allowed_scopes` revokes exactly this grant,
+  shows the READ still works (0018's table-wide SELECT is unaffected), shows the setter fail
+  SQLSTATE 42501 with the column unchanged and no audit row, restores it, and shows the
+  identical call succeed. A misspelled column name would surface as 42703.
+- **The write is CONTROL plane only, unlike the twin.** 0019 granted
+  `UPDATE (allowed_resources)` to `ironauth_app`; 0096 grants the scope allowlist to
+  `ironauth_control` alone, so the plane that MINTS a machine token cannot widen the set of
+  scopes that token may carry. The setter therefore lives on a new
+  `ActingClientScopePolicyRepo`, reachable through
+  `ActingManagementStore::client_scope_policies` and nowhere else; a data-plane door would
+  compile and then fail 42501. The READ (`ClientScopePolicyRepo`) has two doors,
+  `ScopedStore::client_scope_policies` for the mint and
+  `ManagementStore::client_scope_policies` for the management read-back, so the two planes
+  cannot disagree about what a stored value means. Both are NARROW repositories over one
+  column rather than a `ClientRepo` door onto the control plane.
+- New `ClientAuthDiagnosticReason::ScopeNotAllowlisted` (`scope_not_allowlisted`). It exists
+  so the jwt-bearer grant's WIRE answer can stay uniform: that grant permits a PUBLIC
+  presenting client and checks the scope before the assertion is touched, so answering
+  `invalid_scope` for an allowlist refusal would let an unauthenticated caller enumerate
+  operator-written configuration one token at a time. The refusal is the uniform
+  `invalid_grant` and the specific reason lands in the diagnostics sink instead. The
+  `client_credentials` grant records nothing like it and does not need to, because its
+  `invalid_scope` is only ever read by the authenticated owner of the allowlist.
+- New audit action `Action::ClientAllowedScopesSet` (`client.allowed_scopes.set`), written in
+  the same transaction as the column change, so a refused or scope-mismatched write leaves
+  no trace suggesting it ran.
+- Two new IDOR probes registered in `register_management_probes`:
+  `client_scope_policies.get` and `client_scope_policies.set`. The mutating one is probed in
+  the WIDENING direction (it writes a non-empty allowlist onto a victim planted NULL) because
+  `None` is the one value a landed write cannot produce, so the survival assertion is
+  unambiguous. Note the damage direction: a victim with NULL has the WIDEST possible policy,
+  so a cross-scope write RESTRICTS it, silently cutting a foreign environment's machine
+  clients down to scopes their operator never wrote.
+- **PROMOTION carries nothing here, and neither does the twin.** `ResourceType::Client`
+  classifies as `Promotable` but is deliberately ABSENT from `PROMOTED_RESOURCE_TYPES`,
+  because a client id embeds its `(tenant, environment)` and a snapshot key cannot address
+  the same logical client across two environments; the engine leaves the target's clients
+  untouched. There is therefore no client apply site for this column to be added to.
+  `ClientSnapshot` carries no per-client policy column at all (not `allowed_resources`, not
+  `resource_indicator_policy`), and this one joins them in staying out of the export, so
+  `docs/snapshot/snapshot.schema.json` is unchanged.
+
 - Permission-budget dimensions on the token size event sink (issue #98, PR 12): migration
   0095 adds five NULLABLE columns to `token_size_events` (`reason text`, `audience text`,
   `organization_id text`, `permission_count bigint`, `permission_status text`), so the sink
