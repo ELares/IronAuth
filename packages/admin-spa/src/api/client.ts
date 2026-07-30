@@ -146,6 +146,55 @@ export type AssignOrgMembershipRoleRequest =
   components["schemas"]["AssignOrgMembershipRoleRequest"];
 export type EffectiveRoleView = components["schemas"]["EffectiveRoleView"];
 export type EffectiveRolesView = components["schemas"]["EffectiveRolesView"];
+// The GENERATED union of grant-path sources, re-exported so a view that puts a
+// human label on each one can be keyed on the union itself rather than on `string`.
+// That is the difference between a fourth variant being a compile error and a
+// fourth variant silently taking whatever a fallback branch says: `default` was
+// added to this union by issue #98 PR 6 and the console mislabelled it as a direct
+// grant for the rest of the issue, because the label was a `string` ternary.
+export type EffectiveRoleSourceView =
+  components["schemas"]["EffectiveRoleSourceView"];
+
+// The shapes the PERMISSION surfaces read (issue #98). Re-exported from the
+// generated schema so no view hand maintains a shape the management contract
+// already owns, and grouped by the scope each one belongs to, because getting that
+// wrong is the mistake this issue can most easily ship:
+//
+//   PermissionView / CreatePermissionRequest / UpdatePermissionRequest are the
+//   ENVIRONMENT wide vocabulary. A slug here is what a token claim carries, so it
+//   is immutable and UpdatePermissionRequest carries `slug` and `kind` only so
+//   that naming either is a typed 400 rather than a 200 that ignored it.
+//
+//   OrgRolePermissionView / AssignOrgRolePermissionRequest are the ORGANIZATION
+//   scoped mapping from one role to one vocabulary entry. The row carries the
+//   permission ID, never its slug: the slug belongs to the vocabulary.
+//
+//   SetOrgDefaultRoleRequest designates the default role of ONE organization, a
+//   single valued property answered with the OrgRoleView that now holds it.
+//
+//   ResourceServerView / UpdateResourceServerRequest are the ENVIRONMENT scoped
+//   claim opt-in. Only `permission_claims_enabled` is writable there, and it is
+//   REQUIRED, so an empty body cannot be a request that silently did nothing.
+//
+//   PermissionBudgetView is the ADVISORY verdict the effective-roles read carries.
+//   It refuses no write and caps nothing that may be STORED; it reports what the
+//   NEXT token issuance would carry, and only the ELEMENT half of the budget.
+export type PermissionView = components["schemas"]["PermissionView"];
+export type CreatePermissionRequest =
+  components["schemas"]["CreatePermissionRequest"];
+export type UpdatePermissionRequest =
+  components["schemas"]["UpdatePermissionRequest"];
+export type OrgRolePermissionView =
+  components["schemas"]["OrgRolePermissionView"];
+export type AssignOrgRolePermissionRequest =
+  components["schemas"]["AssignOrgRolePermissionRequest"];
+export type SetOrgDefaultRoleRequest =
+  components["schemas"]["SetOrgDefaultRoleRequest"];
+export type ResourceServerView = components["schemas"]["ResourceServerView"];
+export type UpdateResourceServerRequest =
+  components["schemas"]["UpdateResourceServerRequest"];
+export type PermissionBudgetView =
+  components["schemas"]["PermissionBudgetView"];
 
 // The request and result shapes the connectors and clients (DCR) surfaces read
 // (issue #90, PR 6). Both surfaces are ENVIRONMENT scoped, so every wrapper below
@@ -2605,21 +2654,59 @@ export async function unassignOrgMembershipRole(
   }
 }
 
-// Resolve every role one membership effectively holds, WITH PROVENANCE
-// (operationId getOrgMembershipEffectiveRoles). One entry per grant path, NOT
-// deduplicated by slug: a role held both directly and through a group appears
-// twice, and that is exactly what tells an operator that withdrawing one grant
-// will not take the role away. This wrapper returns the array unchanged, and no
-// caller may collapse it.
+// Whether a value is a readable PermissionBudgetView (issue #98).
 //
-// Not paginated: the contract returns the whole bounded set, so there is no tail
-// to drop and no cursor to surface.
+// Every counted field is REQUIRED by the contract, and `overflow` is present ONLY
+// when the set is past the maximum, so an absent or null `overflow` is the legal
+// within-budget answer while a non string one is a body this app cannot read.
+// Anything failing this check is a budget the console must NOT interpret: see the
+// refusal in getOrgMembershipEffectiveRoles for why a benign default is unsafe.
+//
+// An EMPTY `overflow` string is refused with the rest, which is the one part of
+// this check no server answer reaches: the field is either absent or one of two
+// non empty `permissions_status` values. It is refused rather than ignored because
+// the two ways of absorbing it are both worse. Treating it as "no overflow" would
+// report a withholding as within budget, the exact downgrade this whole guard
+// exists to prevent; letting it through renders a sentence naming a status that
+// has no name. Unreadable is the honest reading, and unreadable is reported.
+function isReadablePermissionBudget(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const budget = value as Record<string, unknown>;
+  const overflow = budget.overflow;
+  return (
+    typeof budget.approaching === "boolean" &&
+    typeof budget.permission_count === "number" &&
+    typeof budget.max_permission_count === "number" &&
+    typeof budget.warn_permission_count === "number" &&
+    typeof budget.max_token_bytes === "number" &&
+    typeof budget.warn_token_bytes === "number" &&
+    (overflow === undefined ||
+      overflow === null ||
+      (typeof overflow === "string" && overflow !== ""))
+  );
+}
+
+// Resolve every role one membership effectively holds, WITH PROVENANCE, together
+// with the permission UNION those roles carry and the advisory budget verdict for
+// it (operationId getOrgMembershipEffectiveRoles).
+//
+// `roles` is one entry per grant path, NOT deduplicated by slug: a role held both
+// directly and through a group appears twice, and that is exactly what tells an
+// operator that withdrawing one grant will not take the role away. `permissions`
+// is the opposite, a deduplicated SET, because that is what a token claim is.
+// This wrapper returns the whole object unchanged, and no caller may collapse
+// either list.
+//
+// Not paginated: the contract returns both sets whole, so there is no tail to
+// drop and no cursor to surface.
 export async function getOrgMembershipEffectiveRoles(
   tenantId: string,
   environmentId: string,
   organizationId: string,
   membershipId: string,
-): Promise<EffectiveRoleView[]> {
+): Promise<EffectiveRolesView> {
   const client = createManagementClient();
   const { data, error, response } = await client.GET(
     "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships/{membership_id}/effective-roles",
@@ -2653,5 +2740,413 @@ export async function getOrgMembershipEffectiveRoles(
       response.status,
     );
   }
-  return data.roles;
+  // The SAME property, extended to the two fields issue #98 added, because each
+  // has its own indistinguishable-from-benign reading and the contract makes both
+  // REQUIRED.
+  //
+  // A permission list that cannot be read must not become `[]`: that renders
+  // "this member holds no permissions", which is the identical silent
+  // authorization downgrade one field over. Every element must be a string
+  // because the list IS the claim, and a non string entry means the body is not
+  // the resolved set this app can show.
+  if (
+    !Array.isArray(data.permissions) ||
+    !data.permissions.every((entry) => typeof entry === "string")
+  ) {
+    throw new ManagementError(
+      {
+        error: "malformed_response",
+        message:
+          "The effective roles response did not carry a readable permission list, so the resolved permission set could not be read. It is not being reported as empty.",
+      },
+      response.status,
+    );
+  }
+  // And a budget that cannot be read must not become a benign verdict. Defaulting
+  // it to no overflow would tell an operator the next token WILL carry these
+  // permissions when the mint may be about to withhold them, which is a downgrade
+  // in the one direction that matters: they would stop looking. Absent is not
+  // within budget, it is unknown, and unknown is reported.
+  if (!isReadablePermissionBudget(data.permission_budget)) {
+    throw new ManagementError(
+      {
+        error: "malformed_response",
+        message:
+          "The effective roles response did not carry a readable permission budget, so whether the next token would withhold the permission claim could not be read. It is not being reported as within budget.",
+      },
+      response.status,
+    );
+  }
+  return data;
+}
+
+// ---- The permission operations (issue #98) ----------------------------------
+//
+// Four surfaces at THREE different scopes, and the scope of each is the thing to
+// keep straight, because a panel placed at the wrong one is the mistake that would
+// read plausibly and be wrong:
+//
+//   The VOCABULARY (src/ui/PermissionsView.tsx) is ENVIRONMENT scoped. A
+//   permission slug is defined once per environment and every organization in it
+//   maps its roles onto the same vocabulary, so this belongs to the environment
+//   section and not to any organization panel.
+//
+//   The role MAPPING (src/ui/OrgRolePermissionsView.tsx) is ORGANIZATION scoped,
+//   nested in one role, because a role is meaningless without an organization.
+//
+//   The DEFAULT ROLE designation (src/ui/OrgDefaultRoleView.tsx) is a single
+//   valued property of ONE organization.
+//
+//   The claim OPT-IN (src/ui/PermissionsView.tsx) belongs to a registered resource
+//   server, which is ENVIRONMENT scoped like the vocabulary.
+//
+// Each wrapper below is a named function calling a path the committed
+// docs/openapi/management.json documents, never a path assembled by a caller, so
+// the single funnel holds. Each throws a ManagementError carrying the verbatim
+// ErrorBody on a non 2xx (the same bodyless-non-2xx guard as the reads above),
+// which the ErrorView boundary renders unchanged. That matters particularly here
+// because two refusals are worded precisely by the server and rewording them would
+// cost the operator the reason: the 422 on attaching a permission that is not a
+// live entry of THIS environment, and the 422 on enabling the claim for a resource
+// server whose token format cannot carry one.
+//
+// The list reads are KEYSET paginated and return { items, nextCursor } so a view
+// can surface a "more exist" indicator rather than SILENTLY DROPPING the tail.
+
+// List the permissions one role grants (operationId listOrgRolePermissions).
+//
+// A row here is a MAPPING and not by itself a live grant: deleting the vocabulary
+// entry leaves the mapping row but stops the resolution, which the effective-roles
+// read is the authority on.
+export async function fetchOrgRolePermissions(
+  tenantId: string,
+  environmentId: string,
+  organizationId: string,
+  roleId: string,
+): Promise<KeysetPage<OrgRolePermissionView>> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.GET(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}/permissions",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          organization_id: organizationId,
+          role_id: roleId,
+        },
+      },
+    },
+  );
+  if (error !== undefined || !response.ok) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return { items: data?.items ?? [], nextCursor: data?.next_cursor ?? null };
+}
+
+// Attach a vocabulary entry to a role (operationId assignOrgRolePermission).
+// Idempotency-Key guarded so a retried submit attaches it once.
+export async function assignOrgRolePermission(
+  tenantId: string,
+  environmentId: string,
+  organizationId: string,
+  roleId: string,
+  request: AssignOrgRolePermissionRequest,
+): Promise<OrgRolePermissionView> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.POST(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}/permissions",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          organization_id: organizationId,
+          role_id: roleId,
+        },
+        header: { "Idempotency-Key": idempotencyKey() },
+      },
+      body: request,
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+// Detach a vocabulary entry from a role (operationId unassignOrgRolePermission).
+// Addressed by the (role, permission) PAIR, never by the mapping row id, which the
+// contract carries for audit correlation and no endpoint accepts.
+export async function unassignOrgRolePermission(
+  tenantId: string,
+  environmentId: string,
+  organizationId: string,
+  roleId: string,
+  permissionId: string,
+): Promise<void> {
+  const client = createManagementClient();
+  const { error, response } = await client.DELETE(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}/permissions/{permission_id}",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          organization_id: organizationId,
+          role_id: roleId,
+          permission_id: permissionId,
+        },
+      },
+    },
+  );
+  if (error !== undefined || !response.ok) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+}
+
+// Designate the default role of one organization (operationId setOrgDefaultRole).
+// An idempotent replacement of a single valued property: a second designation MOVES
+// it rather than being refused, so no Idempotency-Key, matching the contract, which
+// documents none. Answered with the role that now holds the designation.
+export async function setOrgDefaultRole(
+  tenantId: string,
+  environmentId: string,
+  organizationId: string,
+  request: SetOrgDefaultRoleRequest,
+): Promise<OrgRoleView> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.PUT(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/default-role",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          organization_id: organizationId,
+        },
+      },
+      body: request,
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+// Clear the default role designation (operationId clearOrgDefaultRole). NOTHING is
+// deleted: the role stays a live role of the organization and every direct and
+// group grant of it stands. What stops is the resolution that gave it to every
+// member without a row. A 204 carries no body, so the guard reads the bodyless 2xx
+// as success and any non 2xx as the verbatim failure.
+export async function clearOrgDefaultRole(
+  tenantId: string,
+  environmentId: string,
+  organizationId: string,
+): Promise<void> {
+  const client = createManagementClient();
+  const { error, response } = await client.DELETE(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/default-role",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          organization_id: organizationId,
+        },
+      },
+    },
+  );
+  if (error !== undefined || !response.ok) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+}
+
+// List the permission vocabulary of one environment (operationId listPermissions).
+export async function fetchPermissions(
+  tenantId: string,
+  environmentId: string,
+): Promise<KeysetPage<PermissionView>> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.GET(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/permissions",
+    { params: { path: { tenant_id: tenantId, environment_id: environmentId } } },
+  );
+  if (error !== undefined || !response.ok) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return { items: data?.items ?? [], nextCursor: data?.next_cursor ?? null };
+}
+
+// Read one vocabulary entry (operationId getPermission). The detail panel reads
+// this fresh rather than reusing the list row, so a relabel made in another console
+// session is visible.
+export async function getPermission(
+  tenantId: string,
+  environmentId: string,
+  permissionId: string,
+): Promise<PermissionView> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.GET(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/permissions/{permission_id}",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          permission_id: permissionId,
+        },
+      },
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+// Define a permission in an environment (operationId createPermission).
+// Idempotency-Key guarded so a retried submit defines it once. The slug is never
+// case folded and its inner punctuation is never rewritten, here or in the form
+// that calls this: a non canonical value is refused by the server with the rule
+// stated, and repairing it in the browser would store a slug the operator did not
+// write while a token claim carries it. The form does trim SURROUNDING whitespace,
+// which no canonical slug can contain, so that one repair cannot turn a refusal
+// into a different stored value.
+export async function createPermission(
+  tenantId: string,
+  environmentId: string,
+  request: CreatePermissionRequest,
+): Promise<PermissionView> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.POST(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/permissions",
+    {
+      params: {
+        path: { tenant_id: tenantId, environment_id: environmentId },
+        header: { "Idempotency-Key": idempotencyKey() },
+      },
+      body: request,
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+// Relabel a permission (operationId updatePermission): an RFC 7396 style partial
+// edit over the display name only. `slug` and `kind` are IMMUTABLE and the server
+// refuses either KEY being present at all, null included, so this app must never
+// put one on the body: the slug is a direct authorization input and a rename under
+// live mappings would silently repoint every grant that names it.
+export async function updatePermission(
+  tenantId: string,
+  environmentId: string,
+  permissionId: string,
+  request: UpdatePermissionRequest,
+): Promise<PermissionView> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.PATCH(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/permissions/{permission_id}",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          permission_id: permissionId,
+        },
+      },
+      body: request,
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+// Delete a permission (operationId deletePermission): a soft delete. Every role
+// mapping that names it stops resolving. A 204 carries no body, so the guard reads
+// the bodyless 2xx as success and any non 2xx as the verbatim failure.
+export async function deletePermission(
+  tenantId: string,
+  environmentId: string,
+  permissionId: string,
+): Promise<void> {
+  const client = createManagementClient();
+  const { error, response } = await client.DELETE(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/permissions/{permission_id}",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          permission_id: permissionId,
+        },
+      },
+    },
+  );
+  if (error !== undefined || !response.ok) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+}
+
+// List the registered resource servers of one environment (operationId
+// listResourceServers). The console needs this to find a resource server by its ID:
+// an audience is an absolute URI containing a colon and a slash and cannot be a
+// path segment, so the opt-in below is addressed by the `rsv_` id.
+export async function fetchResourceServers(
+  tenantId: string,
+  environmentId: string,
+): Promise<KeysetPage<ResourceServerView>> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.GET(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/resource-servers",
+    { params: { path: { tenant_id: tenantId, environment_id: environmentId } } },
+  );
+  if (error !== undefined || !response.ok) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return { items: data?.items ?? [], nextCursor: data?.next_cursor ?? null };
+}
+
+// Set one resource server's permission-claim opt-in (operationId
+// updateResourceServerPermissionClaims).
+//
+// The body carries EXACTLY the one editable field, by two separate rules that
+// happen to agree. It is REQUIRED, so an omitted value is a 400 rather than a
+// request that quietly did nothing; and `token_format`, `audience` and
+// `access_token_ttl_secs` are refused if PRESENT AT ALL, null included, because
+// this surface cannot write them. The interaction between the token format and this
+// opt-in is the whole subject of the endpoint, so a caller who believes they also
+// changed the format must be refused rather than told 200. This wrapper therefore
+// takes a boolean and builds the one key body itself; there is no partial edit to
+// pass through. The answer to a JWT-only claim on an opaque token is the server's
+// 422, rendered verbatim, never a guess made here.
+export async function setResourceServerPermissionClaims(
+  tenantId: string,
+  environmentId: string,
+  resourceServerId: string,
+  permissionClaimsEnabled: boolean,
+): Promise<ResourceServerView> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.PATCH(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/resource-servers/{resource_server_id}",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          resource_server_id: resourceServerId,
+        },
+      },
+      body: { permission_claims_enabled: permissionClaimsEnabled },
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
 }

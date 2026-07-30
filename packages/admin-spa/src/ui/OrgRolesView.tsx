@@ -12,6 +12,12 @@
 // hooks and views as the rest of the console, and renders every failure through
 // the verbatim ErrorView boundary, including the RFC 9470 sudo path on a max_age
 // challenge.
+//
+// The role detail also mounts the issue #98 panel for the permissions that one
+// role grants (src/ui/OrgRolePermissionsView.tsx), which is nested here because a
+// role-to-permission mapping is org scoped exactly as the role is. The permission
+// VOCABULARY those mappings draw on is environment scoped and lives in its own
+// section (src/ui/PermissionsView.tsx), not here.
 
 import { useState } from "preact/hooks";
 import {
@@ -31,6 +37,7 @@ import {
   MorePageNote,
   MutationFeedback,
 } from "./ResourceView";
+import { OrgRolePermissionsPanel } from "./OrgRolePermissionsView";
 import { type OrgScope, inputValue, sudoFor } from "./orgPanels";
 import { useAsyncResource, useMutation } from "./useResource";
 
@@ -262,6 +269,17 @@ function OrgRoleDetail({
               <dd>
                 <code>{role.slug}</code>
               </dd>
+              <dt>Default role</dt>
+              <dd>
+                {/* "live active" and not "every member", which is the qualifier the
+                    contract carries on `is_default` and the one every other string
+                    on these surfaces repeats: resolution needs a live enabled
+                    organization AND an active membership, so a suspended member
+                    resolves this role no more than any other. */}
+                {role.is_default
+                  ? "yes, every live active member of the organization resolves it"
+                  : "no"}
+              </dd>
               <dt>Created</dt>
               <dd>{new Date(role.created_at_unix_ms).toISOString()}</dd>
             </dl>
@@ -301,6 +319,12 @@ function OrgRoleDetail({
             <MutationFeedback
               state={mutation.state}
               sudo={sudoFor(mutation.retry)}
+            />
+            <OrgRolePermissionsPanel
+              tenantId={tenantId}
+              environmentId={environmentId}
+              organizationId={organizationId}
+              roleId={roleId}
             />
           </div>
         )}

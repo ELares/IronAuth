@@ -22,6 +22,12 @@ export const SECTIONS: ReadonlyArray<Section> = [
   { href: "/users", label: "Users" },
   { href: "/connectors", label: "Connectors" },
   { href: "/organizations", label: "Organizations" },
+  // The permission vocabulary and the per audience claim opt-in (issue #98). An
+  // ENVIRONMENT scoped section and not an organization panel: one vocabulary is
+  // shared by every organization in the environment, and the ORG scoped half of
+  // issue #98 (which role carries which permission) lives in the role detail under
+  // Organizations.
+  { href: "/permissions", label: "Permissions" },
   { href: "/invitations", label: "Invitations" },
   { href: "/diagnostics", label: "Diagnostics" },
 ];

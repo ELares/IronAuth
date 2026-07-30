@@ -22,6 +22,13 @@
 // and each member row opens that member's direct role grants and resolved
 // effective roles (src/ui/MemberRolesView.tsx). Those surfaces are org scoped and
 // meaningless without an organization, so they live here rather than in the nav.
+//
+// Issue #98 adds one more of that kind: the DEFAULT ROLE designation
+// (src/ui/OrgDefaultRoleView.tsx), a single valued property of one organization.
+// Its counterparts that are ENVIRONMENT scoped, the permission vocabulary and the
+// resource-server claim opt-in, are deliberately NOT here: they live in their own
+// nav section (src/ui/PermissionsView.tsx), because one vocabulary is shared by
+// every organization in the environment and a panel here would say otherwise.
 
 import { useLocation } from "preact-iso";
 import { useState } from "preact/hooks";
@@ -50,6 +57,7 @@ import {
   MutationFeedback,
 } from "./ResourceView";
 import { MembershipRolesPanel } from "./MemberRolesView";
+import { OrgDefaultRolePanel } from "./OrgDefaultRoleView";
 import { OrgGroupsPanel } from "./OrgGroupsView";
 import { OrgRolesPanel } from "./OrgRolesView";
 import { useAsyncResource, useMutation } from "./useResource";
@@ -352,6 +360,12 @@ function OrganizationDetailFor({
               environmentId={environmentId}
               organizationId={organizationId}
               organizationActive={org.active}
+            />
+
+            <OrgDefaultRolePanel
+              tenantId={tenantId}
+              environmentId={environmentId}
+              organizationId={organizationId}
             />
 
             <OrgRolesPanel
