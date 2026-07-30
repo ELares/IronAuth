@@ -139,6 +139,146 @@ async fn remove_then_readd_revives_the_membership() {
     assert_eq!(value["items"].as_array().expect("items").len(), 1);
 }
 
+/// Issue #395: a re-add REVIVES the removed row, which keeps its ORIGINAL id, so the
+/// 201 must report THAT id and not the one the handler minted for the insert it did
+/// not perform. A minted id is a phantom: it is never persisted, so every endpoint
+/// keyed on an `omb_` id answers the uniform 404 for it and a caller who follows the
+/// create response is stuck.
+///
+/// Issue #435 is the same defect in `metadata` and `created_at_unix_ms`, the two other
+/// fields a revive can make disagree with the request. All six are therefore asserted
+/// against the ROW here (the roster entry), never against the request that produced
+/// it, so an assertion can only pass when the response really does describe what was
+/// persisted. The first add deliberately carries metadata the re-add omits, and the
+/// revive keeps the original `created_at`, so a response rendered from REQUEST state
+/// disagrees with the roster in exactly those two.
+#[tokio::test]
+async fn readd_reports_the_revived_membership_row_which_resolves() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = tenant_env(&h).await;
+    let org = create_org(&h, &tenant, &environment, "k-org").await;
+    let user = create_user(&h, &tenant, &environment, "phantom@x.test", "k-user").await;
+    let base =
+        format!("/v1/tenants/{tenant}/environments/{environment}/organizations/{org}/memberships");
+    // The first add SETS metadata; the re-add OMITS it, so the revived row keeps the
+    // metadata the first add stored (the UPDATE coalesces a NULL bind).
+    let first = serde_json::json!({ "user_id": user, "metadata": { "a": 1 } }).to_string();
+    let readd = serde_json::json!({ "user_id": user }).to_string();
+
+    // Add, keep the id the create reported, then remove.
+    let (status, _, response) = h.post(&base, "k-add-1", &first).await;
+    assert_eq!(status, StatusCode::CREATED, "first add: {response}");
+    let original = serde_json::from_str::<Value>(&response).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    let (status, _, _) = h.delete(&format!("{base}/{original}")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // Re-add: the SAME row comes back, so the reported id must be the SAME id.
+    let (status, _, created) = h.post(&base, "k-add-2", &readd).await;
+    assert_eq!(status, StatusCode::CREATED, "re-add: {created}");
+    let value: Value = serde_json::from_str(&created).expect("json");
+    let readded = value["id"].as_str().expect("id").to_owned();
+    assert_eq!(
+        readded, original,
+        "the re-add must report the REVIVED row's id, not a freshly minted one: {created}"
+    );
+
+    // The reported id RESOLVES: an endpoint keyed on an `omb_` id answers 200 for it,
+    // rather than the 404 a phantom id gets everywhere.
+    let (status, _, response) = h.get(&format!("{base}/{readded}/effective-roles")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the reported id must resolve: {response}"
+    );
+
+    // And the 201 describes THE ROW, field for field (issue #435). The org's single
+    // live member read back from the database must be the very object the create
+    // returned: same id, organization, user, state, metadata and creation time. Every
+    // one of those is compared against the PERSISTED value, so a field rendered from
+    // request state instead (the omitted metadata, or the re-add's clock rather than
+    // the row's original `created_at`) fails here.
+    let (status, _, response) = h.get(&base).await;
+    assert_eq!(status, StatusCode::OK, "list members: {response}");
+    let list: Value = serde_json::from_str(&response).expect("json");
+    let items = list["items"].as_array().expect("items");
+    assert_eq!(items.len(), 1, "one live member: {response}");
+    // Field by field FIRST, so a failure names the field it was, and then as whole
+    // objects, so a field added to the view later is covered without anyone
+    // remembering to add a line for it here.
+    assert_eq!(
+        items[0]["id"], value["id"],
+        "the roster names the reported id"
+    );
+    assert_eq!(items[0]["organization_id"], value["organization_id"]);
+    assert_eq!(items[0]["user_id"], value["user_id"]);
+    assert_eq!(items[0]["state"], value["state"]);
+    assert_eq!(
+        items[0]["metadata"], value["metadata"],
+        "the revived row KEPT the first add's metadata; the 201 must report that"
+    );
+    assert_eq!(
+        items[0]["created_at_unix_ms"], value["created_at_unix_ms"],
+        "the revived row kept its ORIGINAL creation time; the 201 must report that"
+    );
+    assert_eq!(
+        items[0], value,
+        "the 201 must describe the persisted row, field for field"
+    );
+
+    // The STORED idempotent response is not a phantom either: replaying the re-add
+    // (same Idempotency-Key) serves back the very same bytes, so every field above
+    // holds for the replay too, forever.
+    let (status, _, replay) = h.post(&base, "k-add-2", &readd).await;
+    assert_eq!(status, StatusCode::CREATED, "replayed re-add: {replay}");
+    assert_eq!(
+        replay, created,
+        "the replay must serve the original response byte for byte"
+    );
+}
+
+/// The FRESH-insert half of the same contract. The revive path is where a response
+/// built from request state goes wrong, so it is the path the fix is argued from, but
+/// the stored Idempotency-Key body is now produced by a renderer the store invokes
+/// rather than by the handler, and that renderer runs on BOTH arms. A first create
+/// therefore has to keep replaying its own bytes, and describe its own row, exactly
+/// as before.
+#[tokio::test]
+async fn a_first_create_replays_its_own_response_and_describes_its_row() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = tenant_env(&h).await;
+    let org = create_org(&h, &tenant, &environment, "k-org").await;
+    let user = create_user(&h, &tenant, &environment, "fresh@x.test", "k-user").await;
+    let base =
+        format!("/v1/tenants/{tenant}/environments/{environment}/organizations/{org}/memberships");
+    let body = serde_json::json!({ "user_id": user, "metadata": { "seat": "b" } }).to_string();
+
+    let (status, _, created) = h.post(&base, "k-add", &body).await;
+    assert_eq!(status, StatusCode::CREATED, "first add: {created}");
+    let value: Value = serde_json::from_str(&created).expect("json");
+
+    // The 201 describes the row that was inserted, read back from the database.
+    let (status, _, response) = h.get(&base).await;
+    assert_eq!(status, StatusCode::OK, "list members: {response}");
+    let list: Value = serde_json::from_str(&response).expect("json");
+    let items = list["items"].as_array().expect("items");
+    assert_eq!(items.len(), 1, "one live member: {response}");
+    assert_eq!(
+        items[0], value,
+        "the 201 of a FRESH insert must describe the persisted row too"
+    );
+
+    // Replaying the same Idempotency-Key serves the stored bytes back unchanged.
+    let (status, _, replay) = h.post(&base, "k-add", &body).await;
+    assert_eq!(status, StatusCode::CREATED, "replayed first add: {replay}");
+    assert_eq!(
+        replay, created,
+        "the replay must serve the original response byte for byte"
+    );
+}
+
 #[tokio::test]
 async fn delete_via_the_wrong_organization_path_is_not_found_and_does_not_remove() {
     let h = Harness::start(50).await;

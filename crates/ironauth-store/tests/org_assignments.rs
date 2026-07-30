@@ -238,6 +238,9 @@ async fn add_membership(
             None,
         )
         .await
+        // The create returns the RESOLVED row (issues #395, #435); these helpers only
+        // want its id.
+        .map(|record| record.id)
 }
 
 /// Create a fresh active user and bind it into `org`, returning `(user, membership)`.

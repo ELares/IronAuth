@@ -14,14 +14,23 @@
 //! the original response); a distinct SECOND add of a user already a member is a 409.
 //! Remove is a soft deactivation: the first remove of a live membership is a 204, and
 //! a repeat remove (like a remove of an absent one) is the uniform 404.
+//!
+//! Because remove is a soft deactivation, adding a REMOVED member back REVIVES the
+//! same row, which keeps its original id, its original creation time and, when the
+//! re-add supplies none, its existing metadata. The 201 therefore describes the ROW
+//! the store RESOLVED and never the request this module built it from (issues #395
+//! and #435): a minted id would be persisted nowhere, so every endpoint keyed on an
+//! `omb_` id would answer the uniform 404 for the very identifier the create just
+//! handed back, and a request-derived creation time would anchor a cursor at a value
+//! no row has.
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::Response;
 use ironauth_store::{
-    CorrelationId, IdempotencyWrite, NewMembership, OrgMembershipId, OrganizationId, Scope,
-    StoreError, UserId,
+    CorrelationId, NewMembership, OrgMembershipId, OrgMembershipRecord, OrganizationId,
+    ResolvedIdempotencyWrite, Scope, StoreError, UserId,
 };
 
 use crate::auth::Principal;
@@ -132,26 +141,28 @@ pub async fn create_membership(
 
     let created_at_micros = state.now_unix_micros();
     let membership_id = OrgMembershipId::generate(state.env(), &scope);
-    let metadata = request
-        .metadata
-        .clone()
-        .unwrap_or_else(|| serde_json::json!({}));
-    let view = MembershipView {
-        id: membership_id.to_string(),
-        organization_id: org_id.to_string(),
-        user_id: user_id.to_string(),
-        state: "active".to_owned(),
-        metadata: metadata.clone(),
-        created_at_unix_ms: created_at_micros / 1000,
+    // The response describes the ROW the STORE resolves, never the request that asked
+    // for it (issues #395 and #435). A re-add REVIVES the removed row, and a revived
+    // row keeps its ORIGINAL id, its ORIGINAL creation time, and the metadata it
+    // already carried when the re-add supplies none: a response built from request
+    // state names an id that was never persisted (every endpoint keyed on an `omb_`
+    // id answers the uniform 404 for it, so an integrator who follows the create
+    // response is stuck) and reports two fields that disagree with every read. So the
+    // view is built by the SAME `from_record` every read uses, over the row the write
+    // returned. This renderer is used twice, for the same reason and with the same
+    // argument: once by the store, to fill the Idempotency-Key record inside the
+    // write's own transaction, and once here for the 201 itself. A replay therefore
+    // serves the same real resource the original create returned.
+    let render = |record: &OrgMembershipRecord| {
+        serde_json::to_string(&MembershipView::from_record(record.clone()))
     };
-    let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
 
-    let write = IdempotencyWrite {
+    let write = ResolvedIdempotencyWrite {
         credential_ref: &credential_ref,
         key: &key,
         request_fingerprint: &fingerprint,
         response_status: 201,
-        response_body: &body_string,
+        response_body: &render,
     };
     let result = state
         .store()
@@ -172,7 +183,13 @@ pub async fn create_membership(
         .await;
 
     match result {
-        Ok(_) => Ok(json(StatusCode::CREATED, body_string)),
+        // The RESOLVED row: the revived one on a re-add, the freshly inserted one
+        // otherwise. Rendered here exactly as it was rendered into the stored
+        // idempotency record, so the 201 and its replays are the same bytes.
+        Ok(resolved) => {
+            let body_string = render(&resolved).map_err(|_| ApiError::Internal)?;
+            Ok(json(StatusCode::CREATED, body_string))
+        }
         Err(StoreError::Conflict) => Err(ApiError::Conflict(
             "the user is already a member of this organization".to_owned(),
         )),
