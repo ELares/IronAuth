@@ -50,9 +50,23 @@
 //! - **The `jwks_uri` fetch path.** A registered issuer's `jwks_uri` resolves through
 //!   the SAME SSRF-hardened [`crate::client_keys::ClientKeyResolver`] a
 //!   `private_key_jwt` client's keys do.
-//! - **The diagnostics channel.** Every FAILURE returns the uniform, opaque
+//! - **The diagnostics channel.** Every failure of the assertion, the subject
+//!   mapping, or the per-client SCOPE ALLOWLIST returns the uniform, opaque
 //!   `invalid_grant` on the wire and records a rich, structured reason OUT OF BAND
 //!   in the SAME `client_auth_diagnostics` sink client authentication uses.
+//!
+//!   THREE failures are deliberately NOT uniform with those, and naming them is the
+//!   point of saying "every" so precisely. A malformed request is `invalid_request`
+//!   and a CONFIDENTIAL client's own authentication failure is `invalid_client`,
+//!   both spec-mandated and both decided before the assertion is looked at. And a
+//!   requested scope on the [`crate::client_credentials`] `DISALLOWED_M2M_SCOPES`
+//!   FLOOR answers `invalid_scope`, because that denylist is a PUBLIC COMPILE-TIME
+//!   CONSTANT: the spec-exact answer discloses nothing a caller could not read in
+//!   the source. A refusal by the PER-CLIENT allowlist is not in that company. It is
+//!   operator-written configuration, this grant permits a PUBLIC presenting client,
+//!   and the scope check runs BEFORE the assertion is touched, so `invalid_scope`
+//!   there would be an unauthenticated read of that configuration one token at a
+//!   time. It joins the uniform `invalid_grant` instead ([`resolve_machine_scope`]).
 //!
 //! # The jti replay scoping choice
 //!
@@ -84,7 +98,7 @@ use crate::client_auth::{
     self, ASYMMETRIC_ALGS, ClientAuthError, ClientAuthInputs, parse_presented,
     peek_assertion_header,
 };
-use crate::client_credentials::validate_m2m_scope;
+use crate::client_credentials::{M2mScopeRefusal, load_scope_policy, validate_m2m_scope};
 use crate::error::TokenError;
 use crate::state::OidcState;
 use crate::token::{TokenParams, map_store_error, token_ok};
@@ -104,8 +118,12 @@ const JWT_BEARER_METHOD_MARKER: &str = "jwt-bearer";
 /// [`TokenError::InvalidRequest`] when the `assertion` is absent;
 /// [`TokenError::InvalidClient`] when the presenting client fails authentication
 /// independently; [`TokenError::InvalidGrant`] (uniform, with the specific reason
-/// recorded out of band) for every assertion-validation or subject-mapping failure;
-/// [`TokenError::ServerError`] on a signing or persistence fault.
+/// recorded out of band) for every assertion-validation or subject-mapping failure
+/// AND for a per-client scope-allowlist refusal, which is folded in there
+/// deliberately (see [`resolve_machine_scope`]); [`TokenError::InvalidScope`] for the
+/// public `DISALLOWED_M2M_SCOPES` floor, the one refusal that keeps the spec-exact
+/// code; [`TokenError::ServerError`] on a signing, persistence, or allowlist-read
+/// fault.
 pub async fn jwt_bearer_grant(
     state: &OidcState,
     headers: &HeaderMap,
@@ -160,11 +178,23 @@ pub async fn jwt_bearer_grant(
     // 3. Validate the requested `scope` against the SHARED machine-grant policy
     //    (issue #23's `validate_m2m_scope`, reused here): a mapped-identity
     //    assertion-grant token is a machine token with no interactive user, so
-    //    `openid`/`offline_access` are out of policy (invalid_scope). Do this BEFORE
-    //    touching the assertion so an out-of-policy scope never spends the assertion's
-    //    single-use jti. The returned value is the normalized (whitespace-collapsed)
-    //    granted scope, echoed into the issued token.
-    let requested_scope = validate_m2m_scope(params.scope.as_deref())?;
+    //    `openid`/`offline_access` are out of policy (invalid_scope). Issue #98 adds
+    //    the per-client allowlist beneath that floor; the client whose allowlist
+    //    applies is the PRESENTING one, which is the client this token is minted for.
+    //    Do this BEFORE touching the assertion so an out-of-policy scope never spends
+    //    the assertion's single-use jti, which is why the allowlist read sits here too
+    //    rather than later. That ordering is also why the allowlist refusal cannot
+    //    answer `invalid_scope`: nothing has authenticated the caller yet on this
+    //    grant. `resolve_machine_scope` owns that mapping.
+    let requested_scope = resolve_machine_scope(
+        state,
+        scope,
+        &client_id_str,
+        via_basic,
+        params.scope.as_deref(),
+        assertion,
+    )
+    .await?;
 
     // 4-5. Validate the assertion against a registered external issuer and map its
     //       subject to an IronAuth principal. A validation/mapping failure is the
@@ -189,6 +219,73 @@ pub async fn jwt_bearer_grant(
         requested_scope.as_deref(),
     )
     .await
+}
+
+/// Read the PRESENTING client's per-client scope allowlist (issue #98) and validate
+/// the requested `scope` against the shared machine-grant policy, returning the
+/// normalized granted scope.
+///
+/// # The wire answer is NOT the one `client_credentials` gives, and the difference is a security control
+///
+/// This grant deliberately permits a PUBLIC (`none`) presenting client, because the
+/// ASSERTION is the authorization grant rather than a client secret, and the scope
+/// check runs before the assertion is touched so an out-of-policy request cannot
+/// spend a single-use `jti`. Those two facts together mean a caller holding NO
+/// credential and a garbage assertion reaches this check. If an allowlist refusal
+/// answered `invalid_scope` while everything downstream answered `invalid_grant`, that
+/// caller could separate an allowlisted scope from a non-allowlisted one one request
+/// at a time and read the client's operator-written configuration off the wire.
+///
+/// So an allowlist refusal joins this grant's uniform `invalid_grant` and records
+/// [`ClientAuthDiagnosticReason::ScopeNotAllowlisted`] out of band through the SAME
+/// [`record_diagnostic`] channel every other jwt-bearer failure uses: the operator
+/// still learns exactly what happened, and the caller learns nothing.
+///
+/// The FLOOR refusal keeps the spec-exact `invalid_scope`. `DISALLOWED_M2M_SCOPES` is
+/// a public compile-time constant, identical for every client and every deployment, so
+/// answering it discloses nothing; the two-valued `openid`/`offline_access` answer
+/// predates the allowlist and stays.
+///
+/// A CONFIDENTIAL client is not exposed either way: `authenticate_client` has already
+/// refused it with `invalid_client` before this runs.
+///
+/// # Errors
+///
+/// [`TokenError::InvalidClient`] if the authenticated client id no longer parses in
+/// scope, or the allowlist read finds no such client;
+/// [`TokenError::InvalidScope`] for a floor refusal; [`TokenError::InvalidGrant`] for
+/// an allowlist refusal; [`TokenError::ServerError`] if the allowlist read faults
+/// (it fails CLOSED, never as an unrestricted issuance).
+async fn resolve_machine_scope(
+    state: &OidcState,
+    scope: Scope,
+    client_id: &str,
+    via_basic: bool,
+    requested: Option<&str>,
+    assertion: &str,
+) -> Result<Option<String>, TokenError> {
+    let presenting_id = state
+        .store()
+        .scoped(scope)
+        .client_scope_policies()
+        .parse_id(client_id)
+        .map_err(|_| TokenError::InvalidClient { via_basic })?;
+    let policy = load_scope_policy(state, scope, &presenting_id, via_basic).await?;
+    match validate_m2m_scope(requested, &policy) {
+        Ok(granted) => Ok(granted),
+        Err(M2mScopeRefusal::Floor) => Err(TokenError::InvalidScope),
+        Err(M2mScopeRefusal::Allowlist) => {
+            record_diagnostic(
+                state,
+                scope,
+                client_id,
+                assertion,
+                ClientAuthDiagnosticReason::ScopeNotAllowlisted,
+            )
+            .await;
+            Err(TokenError::InvalidGrant)
+        }
+    }
 }
 
 /// Why the jwt-bearer grant could not issue a token, split so the caller maps each

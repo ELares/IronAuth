@@ -370,6 +370,145 @@ async fn an_out_of_policy_scope_is_invalid_scope() {
     }
 }
 
+/// Take the data plane's read of `clients.allowed_scopes` away, and NOTHING else.
+///
+/// Postgres ignores a column-level `REVOKE` while a table-level `GRANT` still covers
+/// the column, so the table grant is dropped and immediately re-granted over every
+/// OTHER column of `clients`, enumerated from the catalogue so the fixture cannot rot
+/// when a migration adds one. A blunt table-wide revoke would be the wrong injection
+/// here: it fails the CLIENT AUTHENTICATION two steps earlier and would leave the
+/// allowlist read entirely unexercised, which is precisely how a fail-open regression
+/// on that read stays invisible.
+async fn revoke_allowed_scopes_read(harness: &Harness) {
+    sqlx::query(
+        "DO $$
+         DECLARE cols text;
+         BEGIN
+           SELECT string_agg(quote_ident(column_name), ', ' ORDER BY column_name)
+             INTO cols
+             FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = 'clients'
+              AND column_name <> 'allowed_scopes';
+           EXECUTE 'REVOKE SELECT ON clients FROM ironauth_app';
+           EXECUTE format('GRANT SELECT (%s) ON clients TO ironauth_app', cols);
+         END $$;",
+    )
+    .execute(harness.db().owner_pool())
+    .await
+    .expect("revoke the data plane's read of clients.allowed_scopes");
+}
+
+/// Give it back, restoring the table-wide read.
+async fn restore_clients_read(harness: &Harness) {
+    sqlx::query("GRANT SELECT ON clients TO ironauth_app")
+        .execute(harness.db().owner_pool())
+        .await
+        .expect("restore the data plane's read of clients");
+}
+
+/// The allowlist read FAILS CLOSED on a store fault (issue #98).
+///
+/// `load_scope_policy` is deliberately unlike `load_custom_claims` next door: an
+/// under-claimed custom claim costs the client a claim, while an UNREAD allowlist
+/// would cost the deployment its delegation restriction and mint a token with
+/// whatever scope was asked for. The doc comment has said so since the read was
+/// written; this is the assertion. It was measured, twice: with the error mapping
+/// replaced by a fail-OPEN `.or_else(|_| Ok(ClientScopePolicy { allowed_scopes: None }))`
+/// every other test in this file, all 23 in `tests/jwt_bearer.rs`, and all 613 crate
+/// unit tests still pass. These two are the only things in the crate that notice. It is
+/// a DIFFERENT layer from the parse fail-safe (a value that read back WRONG), which is
+/// well covered: this is the read never completing at all.
+#[tokio::test]
+async fn a_store_fault_reading_the_scope_allowlist_refuses_the_token() {
+    let harness = Harness::start().await;
+    let (client, secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let client_id = client.to_string();
+    let auth = basic_header(&client_id, &secret);
+
+    // A control exchange first, so the refusal below is caused by the revoke and not by
+    // the fixture.
+    let (status, _headers, body) = harness
+        .token_with_auth(&cc_form(Some("read:orders")), Some(&auth))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the control exchange issues: {body}"
+    );
+
+    revoke_allowed_scopes_read(&harness).await;
+
+    // SQLSTATE 42501 inside the allowlist read, which is a `server_error` and no token.
+    let (status, _headers, body) = harness
+        .token_with_auth(&cc_form(Some("read:orders")), Some(&auth))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "an unread allowlist refuses the issuance: {body}"
+    );
+    assert_eq!(json(&body)["error"], "server_error");
+    assert!(!body.contains("access_token"), "no token is issued: {body}");
+
+    // And with NO scope requested either. This is the arm that matters most, because it
+    // is the one a fail-open fallback would sail straight through: the read happens
+    // before the request is looked at, so a fault refuses whatever was asked for.
+    let (status, _headers, body) = harness.token_with_auth(&cc_form(None), Some(&auth)).await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a scopeless request is refused too: {body}"
+    );
+    assert_eq!(json(&body)["error"], "server_error");
+    assert!(!body.contains("access_token"), "no token is issued: {body}");
+
+    // Restore, and prove the refusal was the revoke and nothing else.
+    restore_clients_read(&harness).await;
+    let (status, _headers, body) = harness
+        .token_with_auth(&cc_form(Some("read:orders")), Some(&auth))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the same request issues again once the read is restored: {body}"
+    );
+    assert_eq!(json(&body)["scope"], "read:orders");
+}
+
+/// The jwt-bearer grant reads the SAME allowlist through the SAME helper, so it fails
+/// closed the same way. Asserted rather than inferred, because that grant maps the
+/// allowlist REFUSAL to a different wire error than this one does, and a reader who
+/// knows that could reasonably wonder whether it maps the FAULT differently too. It
+/// does not: a fault is `server_error` on both, and only a policy refusal differs.
+#[tokio::test]
+async fn a_store_fault_reading_the_scope_allowlist_refuses_the_assertion_grant_too() {
+    let harness = Harness::start().await;
+    let public = harness.client_id().to_string();
+
+    revoke_allowed_scopes_read(&harness).await;
+
+    let (status, _headers, body) = harness
+        .token(&form(&[
+            ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
+            ("assertion", "not.a.jwt"),
+            ("client_id", &public),
+            ("scope", "read:orders"),
+        ]))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "an unread allowlist refuses the assertion grant: {body}"
+    );
+    assert_eq!(json(&body)["error"], "server_error");
+    assert!(!body.contains("access_token"), "no token is issued: {body}");
+
+    restore_clients_read(&harness).await;
+}
+
 /// The default audience is configurable per environment: with `issuer`, the token's
 /// `aud` is the per-environment issuer rather than the client id.
 #[tokio::test]

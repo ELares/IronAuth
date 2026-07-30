@@ -30,6 +30,44 @@ fn spec_is_openapi_3_1() {
     assert_eq!(spec()["openapi"], "3.1.0");
 }
 
+/// The published body schema must not contradict its own server (issue #98, PR 15).
+///
+/// `SetClientAllowedScopesRequest.allowed_scopes` is `Option<Option<T>>` under the
+/// `named_field` seam, and utoipa reads the OUTER `Option` as "optional field" the way
+/// it does everywhere else. Without an explicit `required = true` the document carries
+/// no `required` array at all, so a generated client would let a caller omit a key the
+/// server answers 400 for (`tests/client_scopes.rs`
+/// `an_absent_allowed_scopes_key_is_a_400_and_is_not_the_explicit_null` drives that 400
+/// over HTTP). Pinned here because the failure is SILENT in every other lane: the spec
+/// regenerates cleanly either way, the freshness gate stays green, and only a code
+/// generator downstream ever notices.
+#[test]
+fn the_set_allowed_scopes_body_declares_its_required_field() {
+    let doc = spec();
+    let schema = &doc["components"]["schemas"]["SetClientAllowedScopesRequest"];
+    let required: Vec<&str> = schema["required"]
+        .as_array()
+        .map(|values| values.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    assert_eq!(
+        required,
+        vec!["allowed_scopes"],
+        "the body's one field is documented as REQUIRED, matching the server's 400"
+    );
+
+    // And the value stays NULLABLE, which is the other half of the shape: the explicit
+    // clear is `{"allowed_scopes": null}`. A required key with a nullable value, never
+    // an optional key. Collapsing either half would delete the distinction the whole
+    // body is built on.
+    let kinds = &schema["properties"]["allowed_scopes"]["type"];
+    assert!(
+        kinds
+            .as_array()
+            .is_some_and(|values| values.iter().any(|value| value == "null")),
+        "a present `null` is the documented clear: {kinds}"
+    );
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn operation_ids_are_the_stable_set() {
@@ -92,6 +130,7 @@ fn operation_ids_are_the_stable_set() {
             "exportIdentities",
             "extendSignupQuarantine",
             "getClientAdminConsent",
+            "getClientAllowedScopes",
             "getClientAuthDiagnostics",
             "getConnector",
             "getConnectorCapabilities",
@@ -168,6 +207,7 @@ fn operation_ids_are_the_stable_set() {
             "setBrandFavicon",
             "setBrandLogo",
             "setClientAdminConsent",
+            "setClientAllowedScopes",
             "setClientSigningAlgorithm",
             "setLocale",
             "setOrgDefaultRole",
@@ -356,6 +396,7 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/admin-consent",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/signup-form",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/allowed-scopes",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/config/snapshot",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/connectors",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/connectors/{connector_id}",
@@ -458,6 +499,7 @@ fn documented_paths_are_the_expected_set() {
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/signup-form",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}/favicon",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}/logo",
+            "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/allowed-scopes",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/signing-algorithm",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/connectors/{connector_id}",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/locales/{locale}",
@@ -504,7 +546,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        141,
+        143,
         "the documented route count is pinned"
     );
 

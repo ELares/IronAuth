@@ -141,6 +141,19 @@ impl<'a> ScopedStore<'a> {
         }
     }
 
+    /// The read-only per-client scope-allowlist repository for this scope (issue
+    /// #98): the machine-grant paths read a client's allowlist before minting. There
+    /// is deliberately no data-plane WRITE counterpart; the setter lives on
+    /// [`ActingManagementStore::client_scope_policies`] because migration 0096 grants
+    /// the column-scoped `UPDATE` to the control role alone.
+    #[must_use]
+    pub fn client_scope_policies(&self) -> ClientScopePolicyRepo<'a> {
+        ClientScopePolicyRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
     /// The read-only per-scope step-up policy repository for this scope (RFC 9470,
     /// issue #72): list the tenant's per-scope authentication requirements. The
     /// managing writes live on [`ActingStore::scope_step_up_policies`].
@@ -2102,6 +2115,33 @@ pub struct ClientResourcePolicy {
     pub require_resource_indicator: bool,
 }
 
+/// A client's per-client OAuth SCOPE allowlist, read within scope (issue #98).
+///
+/// The machine-grant paths (`client_credentials` and `jwt-bearer`) read this to
+/// decide which scope tokens the client may request. Shaped as the deliberate twin
+/// of [`ClientResourcePolicy`]: one nullable allowlist with the same three states
+/// and the same fail-safe reading.
+///
+/// # This is a DELEGATION restriction, not the RBAC permission set
+///
+/// It bounds what a machine may ASK FOR. It is not issue #98's permission set: a
+/// client-credentials token has a machine `sub` and no human organization context,
+/// so the permission union has nothing to resolve against and is unreachable from
+/// that grant. Machine principal roles and permissions are issue #99.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientScopePolicy {
+    /// The scope tokens this client may request. [`None`] means NO per-client
+    /// allowlist is configured, in which case every requested scope passes (subject
+    /// to the machine-grant denylist floor, which this never relaxes); a [`Some`] set
+    /// RESTRICTS the client to exactly its entries. An empty [`Some`] set means the
+    /// client may request NO scope at all.
+    ///
+    /// A stored value that does not parse as an array of strings reads as
+    /// `Some(vec![])`, the EMPTY allowlist. See [`ClientScopePolicyRepo::get`] for
+    /// why the fallback points that way.
+    pub allowed_scopes: Option<Vec<String>>,
+}
+
 /// The client-authentication metadata for a client, read within scope (issue
 /// #20). The token endpoint uses it to enforce the client's registered
 /// authentication method and verify a presented secret against the stored hash.
@@ -2692,6 +2732,172 @@ impl ClientRepo<'_> {
             verified_at_unix_micros: row.get::<Option<i64>, _>("verified_at_us"),
             first_party: row.get("first_party"),
         })
+    }
+}
+
+/// The read-only per-client scope-allowlist repository for a scope (issue #98).
+///
+/// Reachable through [`ScopedStore::client_scope_policies`] on the DATA plane (the
+/// machine-grant paths read it before minting) and through
+/// [`ManagementStore::client_scope_policies`] on the CONTROL plane (the management
+/// read-back). One implementation, two doors, so the two planes can never disagree
+/// about what a stored value means. Both planes hold `SELECT` on `clients`.
+///
+/// It is a NARROW repository rather than another method on [`ClientRepo`] on
+/// purpose: opening a whole-[`ClientRepo`] door onto the control plane would hand
+/// the management surface every other client read as a side effect of needing one
+/// column.
+pub struct ClientScopePolicyRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl ClientScopePolicyRepo<'_> {
+    /// Parse an untrusted client identifier under this repository's scope.
+    ///
+    /// The oracle-free boundary for request handlers: a malformed identifier and one
+    /// belonging to another tenant both return the uniform [`StoreError::NotFound`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier is malformed or out of scope.
+    pub fn parse_id(&self, raw: &str) -> Result<ClientId, StoreError> {
+        Ok(ClientId::parse_in_scope(raw, &self.scope)?)
+    }
+
+    /// Read a client's per-client scope allowlist within scope (issue #98). A client
+    /// absent in this scope (or minted in another) is the uniform
+    /// [`StoreError::NotFound`].
+    ///
+    /// # The parse FAILS SAFE, and the direction is the whole point
+    ///
+    /// A NULL column is [`None`], "no allowlist configured". A present one is parsed
+    /// as an array of strings, and a value that does not parse that way reads as
+    /// `Some(vec![])`: the EMPTY allowlist, which admits NOTHING.
+    ///
+    /// The opposite fallback is one token away in this expression and would be a
+    /// disaster: it would turn every corrupted, hand-edited, or
+    /// future-format-mismatched stored value into an UNRESTRICTED client, so a
+    /// storage fault would silently WIDEN what a machine may request. Failing to the
+    /// empty allowlist costs the client every SCOPED machine token and costs nobody
+    /// any authority, which is the direction a fence should fail in. A request that
+    /// carries no `scope` still mints, because `scope` is optional, so the loss is
+    /// every scope the client can ask for rather than its ability to get a token.
+    /// `a_malformed_allowlist_denies_everything` in
+    /// `crates/ironauth-store/tests/repository.rs` pins it, and it was measured RED
+    /// with the fallback flipped to [`None`].
+    ///
+    /// The column is `jsonb`, so Postgres refuses a value that is not JSON at all and
+    /// the crudest malformation cannot reach here. That does not make the check
+    /// redundant: `{"a": 1}`, `[1, 2]`, and `"openid"` are all valid `jsonb` and none
+    /// is an array of strings.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier is out of this scope or no client
+    /// matches; [`StoreError::Database`] on a persistence failure.
+    pub async fn get(&self, id: &ClientId) -> Result<ClientScopePolicy, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        // Read the jsonb back as text so the store owns the shape decision in Rust,
+        // exactly as `custom_token_claims` does.
+        let row = sqlx::query(
+            "SELECT allowed_scopes::text AS allowed_scopes FROM clients \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        let allowed_scopes = row
+            .get::<Option<String>, _>("allowed_scopes")
+            .map(|text| serde_json::from_str::<Vec<String>>(&text).unwrap_or_default());
+        Ok(ClientScopePolicy { allowed_scopes })
+    }
+}
+
+/// The mutating per-client scope-allowlist repository for a scope (issue #98).
+///
+/// Reachable through [`ActingManagementStore::client_scope_policies`] and NOWHERE
+/// else. Migration 0096 grants the column-scoped `UPDATE (allowed_scopes)` to
+/// `ironauth_control` alone, deliberately unlike the twin `allowed_resources` (0019
+/// grants that one to `ironauth_app`): the plane that MINTS a machine token must not
+/// also be able to widen the set of scopes that token may carry. A data-plane door
+/// would compile and then fail SQLSTATE 42501 at runtime, so there is none.
+pub struct ActingClientScopePolicyRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingClientScopePolicyRepo<'_> {
+    /// Set (or clear) a client's per-client scope allowlist (issue #98). Writes a
+    /// `client.allowed_scopes.set` audit row in the same transaction.
+    ///
+    /// `allowed_scopes` is [`None`] to CLEAR the allowlist (the client may then
+    /// request any scope the machine-grant denylist floor permits), or [`Some`] to
+    /// set the exact allowlist. An empty slice is a real, maximally restrictive
+    /// value stored as `[]`, distinct from the NULL clear.
+    ///
+    /// Only the one column is touched, under migration 0096's column-scoped grant.
+    /// A `rows_affected() == 0` is converted to [`StoreError::NotFound`] rather than
+    /// reported as a silent success: with the scope predicates gone, forced row-level
+    /// security makes the statement match no row and report success, so this check is
+    /// the write path's last line of defence.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id is out of scope or no client matches;
+    /// [`StoreError::Database`] on a persistence failure (including SQLSTATE 42501 if
+    /// migration 0096's column grant is missing).
+    pub async fn set(
+        &self,
+        env: &Env,
+        id: &ClientId,
+        allowed_scopes: Option<&[String]>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        // The store owns the JSON encoding, matching `set_resource_indicator_policy`.
+        // A `Some(empty)` allowlist is a real value, so it is stored as `[]` and stays
+        // distinct from the NULL "no allowlist".
+        let allowed_json = allowed_scopes
+            .map(|values| serde_json::to_string(values).unwrap_or_else(|_| "[]".to_owned()));
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ClientAllowedScopesSet,
+                target: id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "UPDATE clients SET allowed_scopes = $1::jsonb \
+                     WHERE id = $2 AND tenant_id = $3 AND environment_id = $4",
+                )
+                .bind(allowed_json.as_deref())
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
     }
 }
 
@@ -10328,6 +10534,18 @@ pub enum ClientAuthDiagnosticReason {
     /// names no registered subject-mapping rule (or the rule's optional claim gate
     /// did not match): the subject is rejected, never auto-provisioned (issue #26).
     AssertionSubjectUnmapped,
+    /// A JWT bearer assertion grant request named a `scope` outside the PRESENTING
+    /// client's configured per-client allowlist (issue #98).
+    ///
+    /// This one exists so the wire can stay uniform. That grant permits a PUBLIC
+    /// presenting client and runs the scope check before the assertion is touched,
+    /// so an `invalid_scope` answer would let an unauthenticated caller enumerate
+    /// operator-written configuration one scope token at a time. The refusal is the
+    /// uniform `invalid_grant` and the specific reason lands HERE instead. The
+    /// `client_credentials` grant records nothing like this and does not need to:
+    /// it answers `invalid_scope` only after the client has authenticated as the
+    /// owner of the allowlist in question.
+    ScopeNotAllowlisted,
 }
 
 impl ClientAuthDiagnosticReason {
@@ -10354,6 +10572,7 @@ impl ClientAuthDiagnosticReason {
             }
             ClientAuthDiagnosticReason::AssertionIssuerUntrusted => "assertion_issuer_untrusted",
             ClientAuthDiagnosticReason::AssertionSubjectUnmapped => "assertion_subject_unmapped",
+            ClientAuthDiagnosticReason::ScopeNotAllowlisted => "scope_not_allowlisted",
         }
     }
 }
@@ -32723,6 +32942,23 @@ impl<'a> ManagementStore<'a> {
         }
     }
 
+    /// The read-only per-client scope-allowlist repository for `scope` (issue #98),
+    /// reached from the control plane. The identical accessor on [`ScopedStore`] is
+    /// what the machine-grant MINT reads through; this one exists so the management
+    /// read-back and the cross-scope IDOR probes reach the same repository through
+    /// the control plane's own door, exactly as
+    /// [`ManagementStore::resource_servers`] does.
+    ///
+    /// It is a NARROW door: the control plane gets this one column and not the whole
+    /// of [`ClientRepo`].
+    #[must_use]
+    pub fn client_scope_policies(&self, scope: Scope) -> ClientScopePolicyRepo<'a> {
+        ClientScopePolicyRepo {
+            store: self.store,
+            scope,
+        }
+    }
+
     /// The read-only per-organization authentication policy repository for `scope`
     /// (issue #95). Policies are environment-scoped, so the repository is
     /// constructible only from a `(tenant, environment)` scope and binds row-level
@@ -32943,6 +33179,24 @@ impl<'a> ActingManagementStore<'a> {
     #[must_use]
     pub fn resource_servers(&self, scope: Scope) -> ActingResourceServerRepo<'a> {
         ActingResourceServerRepo {
+            store: self.store,
+            acting: self.acting,
+            scope,
+        }
+    }
+
+    /// The mutating per-client scope-allowlist repository for `scope` (issue #98):
+    /// set or clear a client's OAuth scope allowlist, audited.
+    ///
+    /// There is no data-plane counterpart and there never will be: migration 0096
+    /// grants the column-scoped `UPDATE (allowed_scopes)` to the control role alone,
+    /// because a data plane able to widen the set of scopes the machine token it is
+    /// about to mint may carry is exactly what that separation exists to prevent.
+    /// This is a deliberate divergence from the twin `allowed_resources`, whose 0019
+    /// grant went to the data plane.
+    #[must_use]
+    pub fn client_scope_policies(&self, scope: Scope) -> ActingClientScopePolicyRepo<'a> {
+        ActingClientScopePolicyRepo {
             store: self.store,
             acting: self.acting,
             scope,

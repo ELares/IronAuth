@@ -6,6 +6,65 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The jwt-bearer grant answers an allowlist refusal with `invalid_grant`, not
+  `invalid_scope`** (issue #98, PR 15). That grant deliberately permits a PUBLIC (`none`)
+  presenting client, because the ASSERTION is the authorization grant rather than a client
+  secret, and it runs the scope check BEFORE the assertion is touched so an out-of-policy
+  request cannot spend a single-use `jti`. Together those put a caller holding NO credential
+  and a garbage assertion at the allowlist check, where an `invalid_scope` answer would
+  separate an allowlisted scope from a non-allowlisted one one request at a time. A
+  two-valued version of that answer predates this column, but it only ever read out
+  `DISALLOWED_M2M_SCOPES`, a public compile-time constant; what is new is a wire answer that
+  depends on PER-CLIENT, OPERATOR-WRITTEN configuration. So the allowlist refusal joins this
+  grant's uniform `invalid_grant` and records the new `scope_not_allowlisted` reason out of
+  band through the same diagnostics channel every other jwt-bearer failure uses. The FLOOR
+  refusal keeps its spec-exact `invalid_scope` as the one deliberate exception, and the
+  module doc now names that exception instead of claiming uniformity it does not have.
+  `client_credentials` is UNCHANGED: RFC 6749 4.4 requires client authentication, so the
+  only reader of its `invalid_scope` is the client whose allowlist it is.
+  `a_public_presenting_client_cannot_enumerate_the_scope_allowlist` proves it as a
+  differential (same garbage assertion, two scopes, byte-identical status, body, and
+  headers, while the recorded diagnostics show the server took two different paths).
+- `validate_m2m_scope` therefore returns a typed `M2mScopeRefusal` (`Floor` or `Allowlist`)
+  rather than a wire `TokenError`. One shared policy helper, two grants that are not equally
+  exposed, and the mapping decided at each call site under an exhaustive match, so a third
+  refusal kind cannot be added without both grants deciding what it says.
+- **`validate_m2m_scope` takes the per-client scope allowlist** (issue #98, PR 15). The
+  machine-grant scope check is now two layers in a fixed order, and THE ORDER IS THE
+  SECURITY PROPERTY: `DISALLOWED_M2M_SCOPES` runs FIRST and unconditionally, then the
+  client's configured allowlist narrows further. So an operator who writes `openid` into a
+  client's allowlist gets a client that can request NOTHING, not a client that can request
+  an ID token. The denylist is a FLOOR BENEATH the allowlist and is never replaced by it, so
+  a configuration mistake cannot buy back a refusal the protocol layer makes.
+  `an_allowlist_naming_openid_is_still_refused` pins it directly.
+- Both machine grants read the policy: `client_credentials` reads it for the authenticated
+  client, and `jwt-bearer` reads it for the PRESENTING client (the one the token is minted
+  for), before touching the assertion so an out-of-policy scope never spends the assertion's
+  single-use `jti`. The read FAILS CLOSED, deliberately unlike `load_custom_claims` next
+  door: an under-claimed custom claim costs the client a claim, but an unread allowlist
+  would cost the deployment its delegation restriction, so a store fault is `server_error`
+  and a client that no longer resolves is `invalid_client`, never a silently unrestricted
+  issuance. That fail-closed mapping is now PINNED rather than merely documented:
+  `a_store_fault_reading_the_scope_allowlist_refuses_the_token` and its jwt-bearer twin
+  revoke the data plane's `SELECT` on that column ONLY (a table-wide revoke fails client
+  authentication two steps earlier and leaves the read unexercised) and assert both a scoped
+  and a SCOPELESS request answer `server_error` with no token. It needed pinning: a
+  fail-OPEN fallback on that read passed the entire suite before these tests existed.
+- **Three things this deliberately does NOT do**, because the natural reading of "the scope
+  allowlist landed" is that they were done. (1) It is not the RBAC permission set: MACHINE
+  PRINCIPAL ROLES AND PERMISSIONS ARE ISSUE #99. A client-credentials token has a machine
+  `sub` and no human organization context, so issue #98's permission union is unreachable
+  from that grant, and `ClientCredentialsMintRequest` stays permission free. (2) No scope
+  REGISTRY is built; discovery still serves a hard-coded `SCOPES_SUPPORTED` and the
+  allowlist validates a request against ITSELF. (3) No scope CHARSET validation:
+  `parse_scope_set` is still `split_whitespace()` and nothing anywhere validates a scope
+  token's characters. The resulting asymmetry is worth stating because it is a live source
+  of confusion: `read:orders` is a legal scope token in IronAuth today while being an
+  ILLEGAL permission slug under issue #98's permission grammar. The two vocabularies are
+  deliberately different and neither is being converged onto the other. There is also no
+  per-(client, audience) cross product; the allowlist is per client, matching
+  `allowed_resources`.
+
 - **The `permissions` and `permissions_status` access-token claims** (issue #98, PR 13, the
   ACTIVATION change). Everything issue #98 shipped before this was inert or admin only; this
   is where a token changes shape. `permissions` carries the subject's effective API

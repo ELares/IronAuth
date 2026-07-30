@@ -90,6 +90,11 @@ fn resource_servers_path(tenant: &str, environment: &str) -> String {
     format!("/v1/tenants/{tenant}/environments/{environment}/resource-servers")
 }
 
+/// The per-client scope-allowlist path (issue #98, PR 15).
+fn allowed_scopes_path(tenant: &str, environment: &str, client: &str) -> String {
+    format!("/v1/tenants/{tenant}/environments/{environment}/clients/{client}/allowed-scopes")
+}
+
 /// The `id` of a JSON response body.
 fn id_of(response: &str) -> String {
     serde_json::from_str::<serde_json::Value>(response).expect("json")["id"]
@@ -1037,6 +1042,105 @@ async fn a_resource_server_opt_in_write_is_sudo_gated() {
         ],
         "the elevated opt-in is audited"
     );
+}
+
+/// The per-client SCOPE ALLOWLIST write (issue #98, PR 15) is sudo gated.
+///
+/// It is the one mutating handler that surface adds, and it deserves its own probe
+/// for the same reason the resource-server opt-in above does, in the opposite
+/// direction: a stolen console cookie that could write an allowlist without
+/// re-authentication would cut a machine client down to whatever scopes the attacker
+/// named, breaking every token it issues, or (on a client already restricted) widen
+/// it. Both directions are damage and neither should be reachable without a fresh
+/// elevation.
+///
+/// The scope is narrower than
+/// `a_stale_credential_cannot_mutate_but_can_read_and_no_header_forges_elevation`:
+/// this test sends no forged header and uses no stale credential, it only lets the
+/// window lapse.
+///
+/// The client is seeded through the STORE, because the management contract documents
+/// no client create, so unlike the sibling tests here the seed needs no open window.
+///
+/// The READ is deliberately NOT gated and is exercised with the window lapsed, which
+/// is also what makes "wrote nothing" observable without elevating first.
+#[tokio::test]
+async fn a_client_scope_allowlist_write_is_sudo_gated() {
+    let (harness, clock) = Harness::start_with_sudo(600).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k1").await;
+    let elevate = elevate_path(&tenant, &env);
+
+    let system = ironauth_env::Env::system();
+    let scope = scope_of(&tenant, &env);
+    let client = harness
+        .store()
+        .scoped(scope)
+        .acting(
+            harness.test_actor(&system),
+            ironauth_store::CorrelationId::generate(&system),
+        )
+        .clients()
+        .create(&system, "acme worker")
+        .await
+        .expect("seed the client");
+    let path = allowed_scopes_path(&tenant, &env, &client.to_string());
+    let body = serde_json::json!({ "allowed_scopes": ["read:orders"] }).to_string();
+
+    clock.advance(Duration::from_secs(601));
+
+    // --- With the window lapsed, the write is challenged. ---
+    let (status, _, resp) = harness.put(&path, &body).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "setClientAllowedScopes is challenged without an elevation: {resp}"
+    );
+    assert!(resp.contains("insufficient_user_authentication"), "{resp}");
+
+    // Nothing executed. The read is ungated, so this is observable without elevating
+    // first, and it asserts on the VALUE: `clients` has no soft delete, so a leaked
+    // write changes one column in place and leaves the row perfectly readable.
+    let (status, _, stored) = harness.get(&path).await;
+    assert_eq!(status, StatusCode::OK, "the get is ungated: {stored}");
+    assert!(
+        stored.contains("\"allowed_scopes\":null"),
+        "the challenged write stored nothing: {stored}"
+    );
+    // And it is unattributed in the audit log too, which is the half the state read
+    // cannot see: a refused mutation must leave no trace suggesting it ran.
+    assert_eq!(
+        allowed_scopes_audit(&harness, scope).await,
+        Vec::<String>::new(),
+        "a challenged allowlist write must write no audit row"
+    );
+
+    // --- After a fresh elevation, the same request succeeds. ---
+    let (status, _, resp) = harness.post(&elevate, "e2", "{}").await;
+    assert_eq!(status, StatusCode::OK, "re-elevate: {resp}");
+    let (status, _, resp) = harness.put(&path, &body).await;
+    assert_eq!(status, StatusCode::OK, "elevated write: {resp}");
+    assert!(
+        resp.contains("read:orders"),
+        "the elevated write landed: {resp}"
+    );
+    // The ELEVATED write does audit, so the assertion above is a real absence rather
+    // than an action this suite can never observe.
+    assert_eq!(
+        allowed_scopes_audit(&harness, scope).await,
+        vec!["client.allowed_scopes.set"],
+        "the elevated write is audited"
+    );
+}
+
+/// Every `client.allowed_scopes.*` audit action recorded in `scope`, sorted.
+async fn allowed_scopes_audit(harness: &Harness, scope: Scope) -> Vec<String> {
+    let mut actions: Vec<String> = audit_actions(harness, scope)
+        .await
+        .into_iter()
+        .filter(|action| action.starts_with("client.allowed_scopes."))
+        .collect();
+    actions.sort();
+    actions
 }
 
 /// Every `resource_server.*` audit action recorded in `scope`, sorted: the audit

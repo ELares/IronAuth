@@ -38,6 +38,10 @@
 //! [`resolve_scope`] and addresses a row through [`parse_resource_server_id`] and
 //! [`require_live_resource_server`].
 //!
+//! The per-client scope allowlist (issue #98) is the third: a `clients` row carries no
+//! organization, so `client_scopes.rs` calls [`resolve_scope`] and addresses a row
+//! through [`require_client_scope_policy`].
+//!
 //! It lives here anyway, and the reason is the paragraph above rather than the
 //! module's name: [`resolve_scope`] is the ONE copy of the
 //! [`Principal::require_environment`] call that confines a management key, and the
@@ -58,8 +62,9 @@
 //! that it reads as a decision rather than an accident.
 
 use ironauth_store::{
-    ActorRef, OrgGroupId, OrgMembershipId, OrgMembershipRecord, OrgRoleId, OrgRoleRecord,
-    OrganizationId, PermissionId, PermissionRecord, ResourceServerId, ResourceServerRecord, Scope,
+    ActorRef, ClientId, ClientScopePolicy, OrgGroupId, OrgMembershipId, OrgMembershipRecord,
+    OrgRoleId, OrgRoleRecord, OrganizationId, PermissionId, PermissionRecord, ResourceServerId,
+    ResourceServerRecord, Scope,
 };
 
 use crate::auth::Principal;
@@ -300,6 +305,38 @@ pub async fn require_live_resource_server(
         .resource_servers(scope)
         .get(&id)
         .await?)
+}
+
+/// Resolve an OAuth client of THIS environment and read its scope allowlist (issue
+/// #98), returning both its typed id and the policy.
+///
+/// The read IS the address resolution, so there is nothing to forget: a caller cannot
+/// hold a `ClientId` this function produced without the client having resolved.
+///
+/// The addressing failures collapse to one answer: a malformed id and one minted in
+/// another `(tenant, environment)` fail to parse in scope, and an absent one is the
+/// repository's own not-found. There are THREE such failures and not the usual four,
+/// for the same reason `resource_servers` has three: `clients` carries no
+/// `deleted_at`, so `ActingClientRepo::delete` removes the row outright and a deleted
+/// client reads exactly like one that never existed.
+///
+/// It goes through the NARROW control-plane door
+/// ([`ironauth_store::ManagementStore::client_scope_policies`]) rather than a whole
+/// [`ironauth_store::ClientRepo`], so this surface can read one column of a client
+/// and nothing else.
+///
+/// # Errors
+///
+/// [`ApiError::NotFound`] if the id is malformed, out of scope, or absent.
+pub async fn require_client_scope_policy(
+    state: &AdminState,
+    scope: Scope,
+    client_id: &str,
+) -> Result<(ClientId, ClientScopePolicy), ApiError> {
+    let policies = state.store().management().client_scope_policies(scope);
+    let id = policies.parse_id(client_id)?;
+    let policy = policies.get(&id).await?;
+    Ok((id, policy))
 }
 
 /// Resolve a group as a LIVE group of THIS organization: the cross-parent guard a

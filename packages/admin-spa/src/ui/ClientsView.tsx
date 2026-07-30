@@ -25,6 +25,7 @@
 
 import { useState } from "preact/hooks";
 import {
+  type ClientAllowedScopesView,
   type ClientVerificationView,
   type CreateDcrPolicyRequest,
   type CreateInitialAccessTokenRequest,
@@ -35,7 +36,9 @@ import {
   createDcrPolicy,
   fetchDcrPolicies,
   fetchSigningRecommendations,
+  getClientAllowedScopes,
   getDcrClient,
+  setClientAllowedScopes,
   setClientSigningAlgorithm,
   verifyDcrClient,
 } from "../api/client";
@@ -104,6 +107,7 @@ function ClientsForScope({
         tenantId={tenantId}
         environmentId={environmentId}
       />
+      <AllowedScopesPanel tenantId={tenantId} environmentId={environmentId} />
       <DcrPoliciesPanel tenantId={tenantId} environmentId={environmentId} />
       <DcrInitialAccessTokenPanel
         tenantId={tenantId}
@@ -268,6 +272,199 @@ function SigningAlgorithmWizardForm({
       >
         Set signing algorithm
       </button>
+      <MutationFeedback state={mutation.state} sudo={sudo} />
+    </form>
+  );
+}
+
+// The per client OAuth SCOPE allowlist (issue #98): which scope tokens a machine
+// grant (client_credentials, jwt-bearer) may request for one client.
+//
+// THREE states, and the panel keeps them distinct because the server does:
+//
+//   * no allowlist   the field is empty and "Clear the allowlist" was used, or the
+//                    client was never configured. Every scope passes the machine
+//                    grant denylist floor.
+//   * a list         the client may request exactly these tokens.
+//   * the EMPTY list the client may request no scope at all. Reached by submitting
+//                    an empty field with "Set", NOT by clearing.
+//
+// The last two are one keystroke apart and mean opposite things, so the panel offers
+// two separate buttons rather than one that guesses. A read that answers the empty
+// list on a client the operator believes is unrestricted is not a bug in this panel:
+// the server reads a stored value it cannot parse as the empty allowlist (deny
+// everything), and the panel shows what is in force rather than a repaired value.
+//
+// What this is NOT, because the console is where the confusion would land: it is a
+// DELEGATION restriction on what a machine may ask for. It is not the permission set
+// (machine principal permissions are issue #99), and it can never re admit openid or
+// offline_access, which the token endpoint refuses whatever this list says.
+function AllowedScopesPanel({
+  tenantId,
+  environmentId,
+}: {
+  tenantId: string;
+  environmentId: string;
+}) {
+  const [clientId, setClientId] = useState("");
+  const [lookupId, setLookupId] = useState<string | null>(null);
+
+  function onSubmit(event: Event): void {
+    event.preventDefault();
+    const trimmed = clientId.trim();
+    setLookupId(trimmed === "" ? null : trimmed);
+  }
+
+  return (
+    <div class="resource-subsection">
+      <h3>Machine grant scope allowlist</h3>
+      <p class="resource-note">
+        Which scope tokens a client may request on a machine grant. Leave it unset
+        and every scope is allowed; set a list and the client is restricted to
+        exactly those tokens; set an EMPTY list and it may request none. `openid`
+        and `offline_access` are refused on a machine grant whatever this list says,
+        and this is not the permission set.
+      </p>
+      <form
+        class="resource-form"
+        onSubmit={onSubmit}
+        aria-label="Look up a client scope allowlist"
+      >
+        <div class="resource-field">
+          <label for="allowed-scopes-client-id">Client id</label>
+          <input
+            id="allowed-scopes-client-id"
+            type="text"
+            value={clientId}
+            onInput={(event) => setClientId(inputValue(event))}
+          />
+        </div>
+        <button type="submit" class="resource-btn resource-btn-primary">
+          Load allowlist
+        </button>
+      </form>
+      {lookupId === null ? null : (
+        <AllowedScopesEditor
+          key={lookupId}
+          tenantId={tenantId}
+          environmentId={environmentId}
+          clientId={lookupId}
+        />
+      )}
+    </div>
+  );
+}
+
+function AllowedScopesEditor({
+  tenantId,
+  environmentId,
+  clientId,
+}: {
+  tenantId: string;
+  environmentId: string;
+  clientId: string;
+}) {
+  const { state } = useAsyncResource<ClientAllowedScopesView>(
+    () => getClientAllowedScopes(tenantId, environmentId, clientId),
+    [tenantId, environmentId, clientId],
+  );
+  return (
+    <AsyncBoundary state={state} loadingLabel="Loading the allowlist">
+      {(view) => (
+        <AllowedScopesForm
+          tenantId={tenantId}
+          environmentId={environmentId}
+          clientId={clientId}
+          view={view}
+        />
+      )}
+    </AsyncBoundary>
+  );
+}
+
+function AllowedScopesForm({
+  tenantId,
+  environmentId,
+  clientId,
+  view,
+}: {
+  tenantId: string;
+  environmentId: string;
+  clientId: string;
+  view: ClientAllowedScopesView;
+}) {
+  // One scope token per line, which is the only editor shape that can express the
+  // empty list distinctly from a single blank token. A space separated field could
+  // not, and a space inside one entry is exactly what the server refuses.
+  const [text, setText] = useState((view.allowed_scopes ?? []).join("\n"));
+  const mutation = useMutation();
+  const scope = activeScope.value;
+  const sudo: SudoRecovery | undefined =
+    scope === null ? undefined : { scope, retry: mutation.retry };
+
+  function entries(): string[] {
+    return text
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line !== "");
+  }
+
+  function onSet(event: Event): void {
+    event.preventDefault();
+    const list = entries();
+    void mutation.run(async () => {
+      await setClientAllowedScopes(tenantId, environmentId, clientId, list);
+    }, `Allowlist set to ${list.length} scope${list.length === 1 ? "" : "s"}.`);
+  }
+
+  function onClear(): void {
+    void mutation.run(async () => {
+      await setClientAllowedScopes(tenantId, environmentId, clientId, null);
+      setText("");
+    }, "Allowlist cleared: every scope now passes the machine grant floor.");
+  }
+
+  return (
+    <form
+      class="resource-form"
+      onSubmit={onSet}
+      aria-label="Set the scope allowlist for a client"
+    >
+      <dl class="resource-detail" aria-label="Stored allowlist">
+        <dt>Currently</dt>
+        <dd>
+          {view.allowed_scopes === null || view.allowed_scopes === undefined
+            ? "no allowlist: every scope passes the machine grant floor"
+            : view.allowed_scopes.length === 0
+              ? "the empty allowlist: this client may request no scope at all"
+              : view.allowed_scopes.join(", ")}
+        </dd>
+      </dl>
+      <div class="resource-field">
+        <label for="allowed-scopes-list">Allowed scopes (one per line)</label>
+        <textarea
+          id="allowed-scopes-list"
+          rows={5}
+          value={text}
+          onInput={(event) =>
+            setText((event.target as HTMLTextAreaElement).value)
+          }
+        />
+      </div>
+      <button
+        type="submit"
+        class="resource-btn resource-btn-primary"
+        disabled={mutation.state.pending}
+      >
+        Set allowlist
+      </button>
+      <ConfirmButton
+        label="Clear the allowlist"
+        prompt="Clearing removes the restriction entirely: this client will then be able to request any scope the machine grant floor allows. To let it request NOTHING, submit an EMPTY list with Set instead."
+        confirmLabel="Confirm clear"
+        onConfirm={onClear}
+        disabled={mutation.state.pending}
+      />
       <MutationFeedback state={mutation.state} sudo={sudo} />
     </form>
   );

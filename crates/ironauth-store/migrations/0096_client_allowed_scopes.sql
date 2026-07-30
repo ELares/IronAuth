@@ -1,0 +1,144 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+--
+-- The per-client OAuth scope allowlist (issue #98, milestone M10).
+--
+-- `DISALLOWED_M2M_SCOPES` (crates/ironauth-oidc/src/client_credentials.rs) has been
+-- a two-value DENYLIST (`openid`, `offline_access`) since issue #23, and its own doc
+-- said the full per-client allowlist was M10's business. This is that column: one
+-- nullable `jsonb` array on `clients` naming the scope tokens a machine grant may
+-- ask this client for.
+--
+-- ---------------------------------------------------------------------------
+-- (1) NULL is "no allowlist", a non-NULL array RESTRICTS.
+-- ---------------------------------------------------------------------------
+-- The exact reading `clients.allowed_resources` (0019:55) already carries, so an
+-- operator who has learned one has learned the other:
+--
+--   * NULL          no per-client allowlist is configured. Every requested scope
+--                   passes, subject to the denylist floor below. This is what every
+--                   client already registered reads as, so the migration changes the
+--                   behaviour of exactly nothing.
+--   * a JSON array  the client may request EXACTLY the tokens it names. `[]` is a
+--                   real, maximally restrictive value: the client may request no
+--                   scope at all.
+--
+-- ---------------------------------------------------------------------------
+-- (2) The FAIL-SAFE parse, which is the whole point of the column.
+-- ---------------------------------------------------------------------------
+-- The reader (`ClientScopePolicyRepo::get`) parses a non-NULL value with
+-- `serde_json::from_str::<Vec<String>>(..).unwrap_or_default()`, mirroring
+-- `ClientRepo::resource_policy`. `unwrap_or_default()` on a `Vec<String>` is the
+-- EMPTY vector, so a stored value that does not parse as an array of strings reads
+-- as `Some(vec![])`: an allowlist that admits NOTHING.
+--
+-- The direction is the point. The other fallback (`None`, "no allowlist") is one
+-- character away in Rust and would turn every unreadable stored value into an
+-- UNRESTRICTED client, which is a widening produced by corruption. Failing to the
+-- empty allowlist means a malformed value costs the client every SCOPED machine
+-- token and costs nobody any authority. Be exact about the scope of that loss: a
+-- request carrying NO `scope` still mints, because `scope` is optional in OAuth and
+-- a scopeless token is the least authority token there is. Corruption therefore
+-- costs the client every scope it can ask for, not its ability to get a token. `a_malformed_allowlist_denies_everything` in
+-- crates/ironauth-store/tests/repository.rs pins it, and it was verified to go RED
+-- when the fallback is flipped to the unrestricted reading.
+--
+-- `jsonb` rather than the twin's `text` is a deliberate small divergence. Postgres
+-- validates JSON SYNTAX on write, so the crudest malformation (a value that is not
+-- JSON at all) cannot be stored here, which `allowed_resources` cannot say. It does
+-- NOT make the fail-safe parse redundant: `{"a": 1}`, `[1, 2]`, and `"openid"` are
+-- all valid `jsonb` and none of them is an array of strings, so the shape check is
+-- still the reader's job and is still what the test drives.
+--
+-- ---------------------------------------------------------------------------
+-- (3) The GRANT is required. Verified against the grants already written.
+-- ---------------------------------------------------------------------------
+-- The rule 0095 recorded: a new column needs a new grant exactly when an EXISTING
+-- grant on that table is column scoped for the privilege the new column needs. It is
+-- a property of the grants already written, never of the column. Applied here, to
+-- every `UPDATE` grant `clients` carries for the CONTROL role:
+--
+--   0018:234  GRANT UPDATE (quarantined, verified_at) ON clients TO ironauth_control;
+--   0076:73   GRANT UPDATE (first_party)              ON clients TO ironauth_control;
+--
+-- Both enumerate columns and there has never been a table-wide `UPDATE` on `clients`
+-- for `ironauth_control` (0018:233 grants it table-wide `SELECT` and nothing more).
+-- A column-scoped grant does not cover a column added later, so without the statement
+-- below the management setter would fail SQLSTATE 42501 on its first call. That is
+-- demonstrated rather than asserted:
+-- `the_control_column_grant_is_load_bearing_for_allowed_scopes` in
+-- crates/ironauth-store/tests/repository.rs revokes exactly this grant, shows the
+-- READ still work (0018's table-wide SELECT is unaffected), shows the setter fail
+-- 42501 with the column unchanged and no audit row, restores it, and shows the
+-- identical call succeed. A misspelled column name would surface as 42703 instead.
+-- The static half (the grant matrix, positive and negative) is swept by
+-- `clients_carries_the_scope_allowlist_and_its_control_column_grant` in
+-- crates/ironauth-store/tests/migration.rs.
+--
+-- The DATA plane is deliberately granted nothing here, unlike the twin (0019:72
+-- grants `UPDATE (allowed_resources, resource_indicator_policy)` to `ironauth_app`).
+-- The allowlist is set from the management API alone, so the plane that MINTS the
+-- machine token cannot also widen the set of scopes that token may carry. The data
+-- plane keeps the `SELECT` it already holds (0018's column-scoped re-grant narrowed
+-- only `UPDATE`), which is all the mint needs.
+--
+-- ---------------------------------------------------------------------------
+-- (4) The allowlist NEVER re-admits a denylisted scope.
+-- ---------------------------------------------------------------------------
+-- `openid` and `offline_access` stay refused for a machine grant whatever this column
+-- says. The denylist is a FLOOR BENEATH the allowlist, evaluated first and never
+-- replaced by it, so an operator who writes `["openid"]` into this column gets a
+-- client that can request nothing, not a client that can request an ID token.
+-- `an_allowlist_naming_openid_is_still_refused` in
+-- crates/ironauth-oidc/src/client_credentials.rs pins it.
+--
+-- ---------------------------------------------------------------------------
+-- (5) What this column is NOT.
+-- ---------------------------------------------------------------------------
+-- It is a DELEGATION restriction on what a machine may ASK FOR. It is not the issue
+-- #98 RBAC permission set: a client-credentials token has a machine `sub` and no
+-- human organization context, so the permission union has nothing to resolve
+-- against. Machine principal roles and permissions are issue #99.
+--
+-- It also validates against ITSELF and against no registry. Discovery still serves a
+-- hard-coded `SCOPES_SUPPORTED`, and nothing anywhere validates a scope token's
+-- CHARACTERS (`parse_scope_set` is `split_whitespace()`). The resulting asymmetry is
+-- worth stating because it confuses readers: `read:orders` is a legal scope token in
+-- IronAuth today while being an ILLEGAL permission slug under issue #98's grammar.
+-- The two vocabularies are deliberately different.
+--
+-- Finally, it is PER CLIENT and there is no per (client, audience) cross product. That
+-- matches the twin, `allowed_resources`. A model where each API declares its own scopes
+-- and each client is granted a subset per API is a larger thing and is deliberately not
+-- issue #98, so a reader expecting one will not find it here.
+--
+-- ---------------------------------------------------------------------------
+-- (6) Promotion carries nothing here, and that is the twin's behaviour.
+-- ---------------------------------------------------------------------------
+-- `ResourceType::Client` classifies as `Promotable` (classification.rs), but it is
+-- deliberately ABSENT from `PROMOTED_RESOURCE_TYPES` (promotion.rs): a client id
+-- embeds its `(tenant, environment)`, so a client's snapshot key cannot address the
+-- same logical client across two environments and the engine leaves the target's
+-- clients untouched. There is therefore no client apply site for this column to be
+-- added to. `ClientSnapshot` carries neither `allowed_resources` nor
+-- `resource_indicator_policy` nor any other per-client policy column, and this one
+-- joins them in staying out of the export, so the published snapshot schema is
+-- unchanged.
+--
+-- Migration safety obligation (see migrate.rs): `clients` is an EXISTING
+-- tenant-scoped table that already ENABLEs and FORCEs row-level security, already
+-- carries the (tenant, environment) isolation policy, and is already registered in
+-- scripts/query-audit.sh, so this migration inherits all of that and adds no new
+-- obligation. Every statement is additive (one nullable column, which Postgres adds
+-- without rewriting the table, plus one column-scoped grant; nothing is altered,
+-- dropped, or revoked), so this migration is an EXPAND.
+
+-- The scope tokens this client may request on a machine grant. NULL means no
+-- allowlist is configured and every scope passes the denylist floor; a non-NULL
+-- array restricts the client to exactly its members, and `[]` admits nothing.
+ALTER TABLE clients ADD COLUMN allowed_scopes jsonb;
+
+-- Column-scoped UPDATE for the CONTROL role only (see section 3). Never a
+-- table-wide UPDATE, per the issue #31 lesson: a table-wide grant would silently
+-- cover every clients column added after it, including the quarantine columns 0018
+-- exists to keep out of reach.
+GRANT UPDATE (allowed_scopes) ON clients TO ironauth_control;

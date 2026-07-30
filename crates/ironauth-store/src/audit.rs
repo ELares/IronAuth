@@ -693,6 +693,12 @@ pub enum Action {
     /// per-client allowed-resource allowlist and the no-resource behavior
     /// (default audience or refusal).
     ClientResourceIndicatorPolicySet,
+    /// A client's per-client OAuth SCOPE allowlist was set or cleared (issue #98):
+    /// which scope tokens the client may request on a machine grant. A DELEGATION
+    /// restriction, never the RBAC permission set (machine principal permissions are
+    /// issue #99), and never able to re-admit a scope the machine-grant denylist
+    /// floor refuses.
+    ClientAllowedScopesSet,
     /// A device-authorization device code and user code were issued (issue #24, RFC
     /// 8628 section 3.2). The back-channel row a constrained device polls against and
     /// a human approves through the verification page.
@@ -1306,6 +1312,7 @@ impl Action {
             }
             Action::JwtBearerAssertionIssue => "jwt_bearer_assertion.issue",
             Action::ClientResourceIndicatorPolicySet => "client.resource_indicator_policy.set",
+            Action::ClientAllowedScopesSet => "client.allowed_scopes.set",
             Action::DeviceCodeIssue => "device_code.issue",
             Action::DeviceCodeApprove => "device_code.approve",
             Action::DeviceCodeDeny => "device_code.deny",

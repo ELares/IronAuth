@@ -297,6 +297,24 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/allowed-scopes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read one client's scope allowlist. */
+        get: operations["getClientAllowedScopes"];
+        /** Set (or clear) one client's scope allowlist. */
+        put: operations["setClientAllowedScopes"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/signing-algorithm": {
         parameters: {
             query?: never;
@@ -1978,6 +1996,25 @@ export interface components {
             client_id: string;
             /** @description The space-separated OAuth scope set the admin pre-authorized. */
             scope: string;
+        };
+        /** @description One client's scope-allowlist state. */
+        ClientAllowedScopesView: {
+            /**
+             * @description The scope tokens this client may request on a machine grant, or `null` when no
+             *     allowlist is configured (every scope passes the machine-grant denylist floor).
+             *     An empty array is a real value meaning the client may request no scope at all.
+             *
+             *     A stored value the server cannot parse reads as the EMPTY array here, because
+             *     that is what the mint will enforce. The read reports what is in force, never a
+             *     repaired value.
+             * @example [
+             *       "read:orders",
+             *       "write:orders"
+             *     ]
+             */
+            allowed_scopes?: string[] | null;
+            /** @description The client identifier (`cli_...`). */
+            client_id: string;
         };
         /**
          * @description One recorded client authentication failure diagnostic (issue #91).
@@ -4254,6 +4291,24 @@ export interface components {
             /** @description The space-separated OAuth scope set the admin pre-authorizes for the client. */
             scope: string;
         };
+        /**
+         * @description The body of a set-allowed-scopes request.
+         *
+         *     One REQUIRED field whose value MAY be `null`, and the distinction is the whole
+         *     shape of this body. An absent `allowed_scopes` is a 400 that names it, because an
+         *     empty object would otherwise be a legal request that does nothing and a caller who
+         *     sent one could not tell it apart from a request that was applied. A PRESENT
+         *     `allowed_scopes: null` is the explicit CLEAR.
+         */
+        SetClientAllowedScopesRequest: {
+            /**
+             * @description The scope tokens this client may request, or `null` to clear the allowlist
+             *     (after which every scope passes the machine-grant denylist floor). An empty
+             *     array is a real value: the client may then request no scope at all. REQUIRED:
+             *     omitting the key is a 400, and it is NOT the same as sending `null`.
+             */
+            allowed_scopes: string[] | null;
+        };
         /** @description The body of a set-signing-algorithm request. */
         SetClientSigningAlgorithmRequest: {
             /**
@@ -6417,6 +6472,127 @@ export interface operations {
                 };
             };
             /** @description Not found (absent, not a DCR client, or in another scope) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    getClientAllowedScopes: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The client identifier (cli_...) */
+                client_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The client's scope allowlist */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ClientAllowedScopesView"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found (absent, malformed, or another scope's) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    setClientAllowedScopes: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The client identifier (cli_...) */
+                client_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetClientAllowedScopesRequest"];
+            };
+        };
+        responses: {
+            /** @description The updated scope allowlist */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ClientAllowedScopesView"];
+                };
+            };
+            /** @description Malformed request, a body omitting allowed_scopes, or an entry that is empty or carries whitespace */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential, or a lapsed sudo elevation (the RFC 9470 insufficient_user_authentication challenge) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found (absent, malformed, or another scope's) */
             404: {
                 headers: {
                     [name: string]: unknown;

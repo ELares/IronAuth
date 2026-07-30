@@ -173,6 +173,21 @@ async fn management_probes_deny_cross_tenant_and_cross_environment_uniformly() {
     let victim_server_b = plant_resource_server(control, &env, scope_b).await;
     let victim_server_a2 = plant_resource_server(control, &env, scope_a2).await;
 
+    // The per-client SCOPE allowlist (issue #98): plant a victim client in each
+    // foreign scope, with NO allowlist configured (the state a freshly registered
+    // client is in, and the only state a create can produce). `client_scope_policies.set`
+    // is a MUTATING probe that writes a NON-empty allowlist, so a leak leaves an
+    // observable `Some([..])` on a row planted `None`, and the survival assertion
+    // below reads the allowlist rather than only the row's existence.
+    //
+    // These are planted through the DATA-plane store, unlike every other victim in
+    // this test. The control role holds no INSERT on `clients` (0018 gave it
+    // table-wide SELECT and three column-scoped UPDATEs and nothing more), so a
+    // control-plane create would fail 42501. The probes still run on the CONTROL
+    // store, which is what the management surface uses.
+    let victim_client_b = plant_client(db.store(), &env, scope_b).await;
+    let victim_client_a2 = plant_client(db.store(), &env, scope_a2).await;
+
     // A well-formed key id in the caller's OWN scope that was never stored.
     let absent_in_a = ManagementKeyId::generate(&env, &scope_a).to_string();
 
@@ -213,6 +228,8 @@ async fn management_probes_deny_cross_tenant_and_cross_environment_uniformly() {
             "org_role_permissions.unassign",
             "resource_servers.get",
             "resource_servers.set_permission_claims",
+            "client_scope_policies.get",
+            "client_scope_policies.set",
         ],
         "every management resolve-by-id operation is registered",
     );
@@ -240,6 +257,8 @@ async fn management_probes_deny_cross_tenant_and_cross_environment_uniformly() {
         victim_mapping_a2.to_string(),
         victim_server_b.to_string(),
         victim_server_a2.to_string(),
+        victim_client_b.to_string(),
+        victim_client_a2.to_string(),
         absent_in_a.clone(),
     ];
     let foreign_refs: Vec<&str> = foreign.iter().map(String::as_str).collect();
@@ -466,6 +485,27 @@ async fn management_probes_deny_cross_tenant_and_cross_environment_uniformly() {
         );
     }
 
+    // The victim CLIENTS must still read NO allowlist. This assertion, and not a
+    // liveness read, is what makes the mutating probe non-vacuous: a leaked
+    // `client_scope_policies.set` leaves the client perfectly readable while having
+    // cut a foreign environment's machine client down to an allowlist its operator
+    // never wrote, which silently breaks every machine token that client issues.
+    // `None` is the one value a landed write cannot produce, which is why the probe
+    // writes a non-empty allowlist rather than an empty one.
+    for (scope, client) in [(scope_b, &victim_client_b), (scope_a2, &victim_client_a2)] {
+        let policy = control
+            .management()
+            .client_scope_policies(scope)
+            .get(client)
+            .await
+            .expect("the victim client must survive the probes in its OWN scope");
+        assert_eq!(
+            policy.allowed_scopes, None,
+            "the victim client must still have NO allowlist: a cross-scope \
+             client_scope_policies.set that landed would read Some here"
+        );
+    }
+
     // The victim POLICIES must survive both probes AND still carry their own
     // document. A liveness-only assertion would miss the sharper leak: a cross-scope
     // `set` that landed would leave the policy readable while having REPLACED the
@@ -521,6 +561,31 @@ async fn plant_role_permission(
         .await
         .expect("plant victim role-permission mapping");
     id
+}
+
+/// Plant an OAuth client in `scope` via the DATA-plane store, returning its id
+/// (issue #98).
+///
+/// The data plane, unlike every other planter here, because the control role holds no
+/// INSERT on `clients`: 0018 gave it table-wide SELECT plus three column-scoped
+/// UPDATEs and nothing more, so a control-plane create fails SQLSTATE 42501. The
+/// probes themselves still run on the control store.
+///
+/// A freshly created client has `allowed_scopes` NULL, which is the only state a
+/// create can produce and the exact state the survival assertion looks for.
+async fn plant_client(
+    store: &ironauth_store::Store,
+    env: &Env,
+    scope: Scope,
+) -> ironauth_store::ClientId {
+    let actor = ActorRef::service(ServiceId::generate(env));
+    store
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(env))
+        .clients()
+        .create(env, "victim machine client")
+        .await
+        .expect("plant victim client")
 }
 
 /// Plant a registered resource server in `scope` via the control store, returning

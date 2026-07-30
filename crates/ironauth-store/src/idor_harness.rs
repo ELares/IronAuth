@@ -153,6 +153,11 @@ impl IdorHarness {
     /// resource-server registry (`resource_servers.get` and
     /// `resource_servers.set_permission_claims`, the read and the one mutation the
     /// issue #98 management surface exposes over the audience-to-format registry),
+    /// its per-client SCOPE allowlist (`client_scope_policies.get` and
+    /// `client_scope_policies.set`, the read and the one mutation the issue #98
+    /// management surface exposes over `clients.allowed_scopes`; a NARROW door onto
+    /// one column of `clients`, not the whole client repository, which is why these
+    /// are distinct from the data-plane `clients.get` / `clients.delete` probes),
     /// the two-thirds of the four-level resource model
     /// that is tenant-and-environment scoped (operators, tenants, and environments
     /// are LEVEL tables whose isolation is exercised by the management-plane tests
@@ -186,6 +191,8 @@ impl IdorHarness {
         self.register(Box::new(OrgRolePermissionUnassignProbe));
         self.register(Box::new(ResourceServerGetProbe));
         self.register(Box::new(ResourceServerSetPermissionClaimsProbe));
+        self.register(Box::new(ClientScopePolicyGetProbe));
+        self.register(Box::new(ClientScopePolicySetProbe));
         self
     }
 
@@ -1315,6 +1322,102 @@ impl IsolationProbe for ResourceServerSetPermissionClaimsProbe {
                 .acting(actor, correlation)
                 .resource_servers(caller);
             match servers.set_permission_claims(&env, &id, true).await {
+                Ok(()) => ProbeOutcome::Leaked,
+                Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `ClientScopePolicyRepo::get` (issue #98). `store` must
+/// authenticate as `ironauth_control`. A client registered in another scope must
+/// resolve as the uniform not-found under the caller's scope, indistinguishable from
+/// an absent one.
+///
+/// The DATA plane already has `clients.get` and `clients.delete` probes. This one is
+/// registered separately because it is a DIFFERENT door on a different plane: the
+/// management surface reaches `clients.allowed_scopes` through
+/// `ManagementStore::client_scope_policies`, a narrow repository that exists so the
+/// control plane gets one column and not the whole of `ClientRepo`. A narrow door is
+/// still a door, and it needs its own probe.
+///
+/// The row it reads is a client's delegation policy: which scope tokens that machine
+/// may ask for. A leak is a read of how a sibling environment's clients are
+/// constrained, one id at a time.
+struct ClientScopePolicyGetProbe;
+
+impl IsolationProbe for ClientScopePolicyGetProbe {
+    fn name(&self) -> &'static str {
+        "client_scope_policies.get"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            let policies = store.management().client_scope_policies(caller);
+            let Ok(id) = policies.parse_id(foreign_id) else {
+                return ProbeOutcome::Denied;
+            };
+            match policies.get(&id).await {
+                Ok(_) => ProbeOutcome::Leaked,
+                Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `ActingClientScopePolicyRepo::set` (issue #98). `store` must
+/// authenticate as `ironauth_control`.
+///
+/// The MUTATING half, and the sharper of the two. It is probed in the WIDENING
+/// direction: it writes a NON-empty allowlist onto a victim planted with NULL. That
+/// is deliberate and worth stating, because it is not the obvious choice.
+///
+/// A leak here does not read as "the allowlist got bigger". A victim with NULL has NO
+/// allowlist, which is the WIDEST state there is, so a landed write actually
+/// RESTRICTS it: a cross-scope write is a denial of service against a foreign
+/// environment's machine clients, silently cutting them down to whatever scopes the
+/// attacker named. Both directions are real damage and either would do as a probe;
+/// this one is chosen because the observable is unambiguous. The registering suite
+/// asserts the victim still reads `None`, and `None` cannot be produced by a landed
+/// write, whereas an "attacker set `[]`" probe would be indistinguishable from a
+/// malformed-value read.
+struct ClientScopePolicySetProbe;
+
+impl IsolationProbe for ClientScopePolicySetProbe {
+    fn name(&self) -> &'static str {
+        "client_scope_policies.set"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            let env = Env::system();
+            let Ok(id) = store
+                .management()
+                .client_scope_policies(caller)
+                .parse_id(foreign_id)
+            else {
+                return ProbeOutcome::Denied;
+            };
+            let actor = ActorRef::service(ServiceId::generate(&env));
+            let correlation = CorrelationId::generate(&env);
+            let policies = store
+                .management()
+                .acting(actor, correlation)
+                .client_scope_policies(caller);
+            match policies
+                .set(&env, &id, Some(&["attacker:owned".to_owned()]))
+                .await
+            {
                 Ok(()) => ProbeOutcome::Leaked,
                 Err(_) => ProbeOutcome::Denied,
             }
