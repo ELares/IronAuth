@@ -215,7 +215,7 @@ where
 /// `token_format`, `audience`, and `access_token_ttl_secs` are NOT editable on this
 /// surface, and they appear in this struct for exactly one reason: naming one is a
 /// typed 400 that says which field and why, instead of a 200 that quietly ignored
-/// it. This follows [`crate::permissions`]'s `UpdatePermissionRequest` rather than a
+/// it. This follows `UpdatePermissionRequest` on the permission vocabulary rather than a
 /// bare `deny_unknown_fields`, so the refusal names the field and states the rule.
 ///
 /// The reason to spend that here rather than take the silent ignore is specific to

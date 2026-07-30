@@ -50,6 +50,16 @@
 //!   rather than to the policy.
 //! * Audit atomicity in BOTH directions, and the covenant: a role may carry
 //!   unlimited permissions and a permission may be carried by unlimited roles.
+//! * The role-scoped COUNT (issue #425), which is what the management attach response
+//!   reports its budget verdict over. Its organization fence is pinned on its own by
+//!   the CROSS ORGANIZATION ADDRESS assertion, which a mutant that neutered the
+//!   predicate answers with the addressed role's own non-zero count instead of zero,
+//!   plus liveness and the cross-scope zero with a positive control behind it. Two
+//!   further properties get their own fixtures because nothing smaller reaches them:
+//!   the count is driven PAST the list's page clamp, so substituting a page length is
+//!   red rather than silent, and a mapping whose PERMISSION has been soft-deleted is
+//!   asserted to keep counting, which is the mechanism that makes this figure larger
+//!   than the set a token would carry.
 //!
 //! Two ways of planting a row coexist here on purpose, exactly as in
 //! `permissions.rs`. `attach` goes through the audited write repository and is the
@@ -67,8 +77,9 @@
 use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
-    ActorRef, CorrelationId, CursorPosition, NewOrgRole, NewOrgRolePermission, NewPermission,
-    OrgRoleId, OrgRolePermissionId, OrganizationId, PermissionId, Scope, ServiceId, StoreError,
+    ActorRef, CorrelationId, CursorPosition, MANAGEMENT_LIST_HARD_CAP, NewOrgRole,
+    NewOrgRolePermission, NewPermission, OrgRoleId, OrgRolePermissionId, OrganizationId,
+    PermissionId, Scope, ServiceId, StoreError,
 };
 use sqlx::{PgPool, Row};
 
@@ -314,6 +325,75 @@ async fn plant_mapping(
             Err(error)
         }
     }
+}
+
+/// Plant `rows` live mappings on ONE role in ONE statement pair, with a fresh
+/// permission behind each, through the control pool under the same role, the same
+/// bound scope and the same grants the repository runs with.
+///
+/// The ONLY caller is `count_live_for_role_is_not_a_page_length`, which needs more
+/// mappings than a page can return and would otherwise pay for a couple of thousand
+/// audited write transactions to get there. Nothing about the count under test depends
+/// on how the rows arrived, and every property that DOES depend on the audited write
+/// path is proved row by row elsewhere in this file.
+///
+/// Ids are generated the same way the repository generates them, so the planted rows
+/// are indistinguishable from written ones; `created_at` is spread so the list's
+/// `(created_at, id)` order is total over them without relying on the id tiebreak.
+async fn plant_many(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    org: &OrganizationId,
+    role: &OrgRoleId,
+    rows: i64,
+) {
+    let count = usize::try_from(rows).expect("a row count fits usize");
+    let permission_ids: Vec<String> = (0..count)
+        .map(|_| PermissionId::generate(env, &scope).to_string())
+        .collect();
+    let mapping_ids: Vec<String> = (0..count)
+        .map(|_| OrgRolePermissionId::generate(env, &scope).to_string())
+        .collect();
+
+    let mut tx = db.control_pool().begin().await.expect("begin plant many");
+    bind_scope(
+        &mut tx,
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO permissions (id, tenant_id, environment_id, slug, display_name) \
+         SELECT p.id, $1, $2, 'bulk.capability_' || p.ord, 'Capability' \
+         FROM unnest($3::text[]) WITH ORDINALITY AS p(id, ord)",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(&permission_ids)
+    .execute(&mut *tx)
+    .await
+    .expect("plant the permissions");
+    sqlx::query(
+        "INSERT INTO org_role_permissions \
+         (id, tenant_id, environment_id, organization_id, role_id, permission_id, \
+          created_at, updated_at) \
+         SELECT t.mapping_id, $1, $2, $3, $4, t.permission_id, \
+                TIMESTAMPTZ 'epoch' + (t.ord::text || ' microseconds')::interval, \
+                TIMESTAMPTZ 'epoch' + (t.ord::text || ' microseconds')::interval \
+         FROM unnest($5::text[], $6::text[]) \
+              WITH ORDINALITY AS t(mapping_id, permission_id, ord)",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(org.to_string())
+    .bind(role.to_string())
+    .bind(&mapping_ids)
+    .bind(&permission_ids)
+    .execute(&mut *tx)
+    .await
+    .expect("plant the mappings");
+    tx.commit().await.expect("commit plant many");
 }
 
 /// The audit actions recorded against `target_id` in `scope`, in order. Read through
@@ -2178,6 +2258,273 @@ async fn a_role_may_carry_unlimited_permissions_and_a_permission_unlimited_roles
             listed.iter().map(ToString::to_string).collect();
         assert_eq!(unique.len(), WIDE, "no duplication across pages: {label}");
     }
+}
+
+/// The role-scoped live-mapping count, unwrapped. A count that FAILED is a distinct
+/// bug from a count that came back wrong, so the `expect` is here once rather than at
+/// each of the many call sites below.
+async fn count_for(
+    repo: &ironauth_store::OrgRolePermissionRepo<'_>,
+    org: &OrganizationId,
+    role: &OrgRoleId,
+) -> i64 {
+    repo.count_live_for_role(org, role)
+        .await
+        .expect("counting a role's live mappings must not fail")
+}
+
+#[tokio::test]
+async fn count_live_for_role_counts_only_this_organizations_live_mappings() {
+    // The read behind the attach response's role-scoped budget verdict (issue #425).
+    // It is a COUNT rather than a page length, and the three things that could make it
+    // report a number over the wrong set are pinned here, each on its own.
+    //
+    // The organization fence first, because it is the one row-level security CANNOT
+    // supply: the policy fences (tenant, environment) and cannot see `organization_id`,
+    // so this statement's own conjunct is the whole fence between two organizations of
+    // one environment. The fixture is built so a mutant that dropped it returns the
+    // OTHER organization's number rather than an empty answer, which is why both
+    // organizations here carry a DIFFERENT count.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let foreign = db.seed_scope(&env).await;
+
+    let alpha = create_org(&db, &env, scope, "Alpha").await;
+    let beta = create_org(&db, &env, scope, "Beta").await;
+    let alpha_role = create_role(&db, &env, scope, &alpha, "admin").await;
+    let beta_role = create_role(&db, &env, scope, &beta, "admin").await;
+
+    let repo = db.control_store().management().org_role_permissions(scope);
+    assert_eq!(
+        count_for(&repo, &alpha, &alpha_role).await,
+        0,
+        "a role carrying nothing counts ZERO, never an error and never an absence"
+    );
+
+    // Three in alpha, one in beta, so the two counts can never be confused for each
+    // other and neither can be confused for the scope-wide total of four.
+    let mut alpha_mappings = Vec::new();
+    for index in 0_i64..3 {
+        let permission =
+            create_permission(&db, &env, scope, &format!("alpha.capability_{index}")).await;
+        alpha_mappings.push(
+            attach_at(
+                &db,
+                &env,
+                scope,
+                &alpha,
+                &alpha_role,
+                &permission,
+                2_000 + index,
+            )
+            .await
+            .expect("attach in alpha"),
+        );
+    }
+    let beta_permission = create_permission(&db, &env, scope, "beta.capability").await;
+    attach(&db, &env, scope, &beta, &beta_role, &beta_permission)
+        .await
+        .expect("attach in beta");
+
+    assert_eq!(
+        count_for(&repo, &alpha, &alpha_role).await,
+        3,
+        "alpha's role counts its own three"
+    );
+    assert_eq!(
+        count_for(&repo, &beta, &beta_role).await,
+        1,
+        "beta's role counts its own one, not the scope-wide four"
+    );
+
+    // The ORGANIZATION conjunct, driven from the wrong organization in both directions.
+    // Without it each of these returns the OTHER organization's count, and an operator
+    // attaching in beta would be shown alpha's picture.
+    assert_eq!(
+        count_for(&repo, &beta, &alpha_role).await,
+        0,
+        "a role counted under a SIBLING organization counts nothing"
+    );
+    assert_eq!(
+        count_for(&repo, &alpha, &beta_role).await,
+        0,
+        "and the same the other way round"
+    );
+
+    // LIVENESS. A detach must stop counting at once, or the verdict an attach reports
+    // would keep including capabilities that were withdrawn.
+    detach(&db, &env, scope, &alpha, &alpha_mappings[0])
+        .await
+        .expect("detach one of alpha's");
+    assert_eq!(
+        count_for(&repo, &alpha, &alpha_role).await,
+        2,
+        "a detached mapping stops counting immediately"
+    );
+
+    // A role of ANOTHER scope counts zero rather than erroring: the same uniform
+    // "nothing is visible here" the role list answers with an empty page.
+    let foreign_org = create_org(&db, &env, foreign, "Foreign").await;
+    let foreign_role = create_role(&db, &env, foreign, &foreign_org, "admin").await;
+    let foreign_permission = create_permission(&db, &env, foreign, "foreign.capability").await;
+    attach(
+        &db,
+        &env,
+        foreign,
+        &foreign_org,
+        &foreign_role,
+        &foreign_permission,
+    )
+    .await
+    .expect("attach in the foreign scope");
+    assert_eq!(
+        count_for(&repo, &alpha, &foreign_role).await,
+        0,
+        "a role id of another scope is not visible here, so it counts zero"
+    );
+    assert_eq!(
+        count_for(&repo, &foreign_org, &foreign_role).await,
+        0,
+        "and neither is a wholly foreign pair"
+    );
+    // The positive control on that last pair: the foreign scope's OWN repository does
+    // count it, so the zeros above are the fence and not a broken fixture.
+    assert_eq!(
+        count_for(
+            &db.control_store()
+                .management()
+                .org_role_permissions(foreign),
+            &foreign_org,
+            &foreign_role,
+        )
+        .await,
+        1,
+        "the foreign row really exists; this scope simply cannot see it"
+    );
+}
+
+#[tokio::test]
+async fn count_live_for_role_is_not_a_page_length() {
+    // THE REASON `count_live_for_role` IS A COUNT AND NOT A LIST LENGTH, driven past
+    // the point where the difference shows.
+    //
+    // Its docs say a length read off `list_for_role` would silently stop growing at the
+    // page clamp. Every other test in this file works well below that clamp, so before
+    // this one the rationale was untestable and the regression it warns about was free:
+    // replacing the statement with `list_for_role(..).len()` at ANY limit passed the
+    // whole suite, because the clamp is `MANAGEMENT_LIST_HARD_CAP + 1` and no fixture
+    // came near it.
+    //
+    // So this fixture is deliberately the expensive one: MORE live mappings on ONE role
+    // than any single page can return. The covenant permits it (a role's mappings are
+    // uncapped) and the budget verdict the management attach reports is exactly the
+    // consumer that would be silently wrong.
+    //
+    // Seeded through the CONTROL POOL with direct SQL rather than through the audited
+    // write repository, for the reason `plant_mapping` gives one level up: what is under
+    // test here is the arithmetic of the read at scale, and paying for a thousand audit
+    // transactions to get there would buy nothing this file does not already prove
+    // row by row.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = create_org(&db, &env, scope, "Acme").await;
+    let role = create_role(&db, &env, scope, &org, "admin").await;
+
+    let clamp = MANAGEMENT_LIST_HARD_CAP + 1;
+    let seeded = clamp + 1;
+    plant_many(&db, &env, scope, &org, &role, seeded).await;
+
+    let repo = db.control_store().management().org_role_permissions(scope);
+    assert_eq!(
+        count_for(&repo, &org, &role).await,
+        seeded,
+        "the count reports EVERY live mapping of the role, however many there are"
+    );
+
+    // The clamp really is where the docs say it is, and it really does bite. Asking for
+    // more than the hard cap returns the clamped page, so the length of ANY single page
+    // is strictly less than the count above: that inequality is the whole claim, and it
+    // is asserted rather than assumed so a future clamp change cannot quietly make this
+    // test vacuous.
+    let page = repo
+        .list_for_role(&org, &role, i64::MAX, None)
+        .await
+        .expect("one page of a very large role");
+    let page_len = i64::try_from(page.len()).expect("a page length fits i64");
+    assert_eq!(
+        page_len, clamp,
+        "one page is clamped at MANAGEMENT_LIST_HARD_CAP + 1 however large the request"
+    );
+    assert!(
+        page_len < count_for(&repo, &org, &role).await,
+        "so a length read off one page UNDERSTATES the role: {page_len} against \
+         {seeded}. A budget verdict computed that way would stop growing here and \
+         report a role at the clamp forever"
+    );
+}
+
+#[tokio::test]
+async fn count_live_for_role_counts_a_mapping_whose_endpoints_are_dead() {
+    // The "NOT a grant count" caveat, asserted rather than only written down.
+    //
+    // Deleting a ROLE or a PERMISSION cascades to no mapping row
+    // (`an_attach_refuses_a_deleted_role_and_a_deleted_permission` pins that schema
+    // behaviour), so a mapping whose endpoint is soft-deleted stays LIVE in this table
+    // and stays counted here, while it resolves for nobody: the effective-permission
+    // projection filters the permission's own `deleted_at` as well.
+    //
+    // That is the mechanism that makes this count LARGER than a membership's resolved
+    // set, which is half of why the two figures bound each other in NEITHER direction.
+    // It is pinned here so a future liveness join added to this statement is a
+    // deliberate, visible change of meaning rather than a silent one.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = create_org(&db, &env, scope, "Acme").await;
+    let role = create_role(&db, &env, scope, &org, "admin").await;
+    let repo = db.control_store().management().org_role_permissions(scope);
+
+    let doomed = create_permission(&db, &env, scope, "billing.doomed").await;
+    let survivor = create_permission(&db, &env, scope, "billing.survivor").await;
+    attach(&db, &env, scope, &org, &role, &doomed)
+        .await
+        .expect("attach the doomed permission");
+    attach(&db, &env, scope, &org, &role, &survivor)
+        .await
+        .expect("attach the surviving permission");
+    assert_eq!(count_for(&repo, &org, &role).await, 2, "both are counted");
+
+    db.control_store()
+        .management()
+        .acting(actor(&env), CorrelationId::generate(&env))
+        .permissions(scope)
+        .delete(&env, &doomed)
+        .await
+        .expect("soft delete the permission out from under its live mapping");
+    assert_eq!(
+        count_for(&repo, &org, &role).await,
+        2,
+        "a mapping whose PERMISSION is dead is STILL counted: this is a mapping count \
+         and not a grant count, and it is exactly how this figure comes out LARGER \
+         than the set a token would carry"
+    );
+
+    // A DETACH is the one thing that does stop the count, which is what separates
+    // "withdrawn" from "endpoint deleted" here.
+    let mapping = repo
+        .get_assignment(&org, &role, &survivor)
+        .await
+        .expect("the surviving mapping is addressable");
+    detach(&db, &env, scope, &org, &mapping.id)
+        .await
+        .expect("detach the survivor");
+    assert_eq!(
+        count_for(&repo, &org, &role).await,
+        1,
+        "only a DETACH stops a mapping counting; the dead-endpoint row is still there"
+    );
 }
 
 /// Page the whole "permissions of this role" list through the `(created_at, id)`

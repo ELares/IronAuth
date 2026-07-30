@@ -474,9 +474,18 @@ impl PermissionOverflow {
 /// Exceeding the budget never refuses anything. On the management plane it produces
 /// no refusal AT ALL: no endpoint there answers 4xx or 5xx for a count or a size
 /// reason, and an attach that carries a role past a threshold still answers a plain
-/// 201. Where the verdict IS reported is the effective-roles READ, as the
-/// `permission_budget` object on its 200; the attach response carries no budget field
-/// today; issue #425 tracks adding it. On the token-issuance path an overflow WITHHOLDS the
+/// 201. The verdict is REPORTED in two places, over two different sets (issue #425):
+/// the effective-roles READ carries `permission_budget` on its 200, over one
+/// membership's whole RESOLVED set, which is what a token claim would carry and so is
+/// the authoritative answer; and the role-to-permission ATTACH carries
+/// `role_permission_budget` on its 201, over THAT ROLE'S OWN mappings including the one
+/// just attached. The two are a DIFFERENT SET each, and the role one is NEITHER an
+/// upper nor a lower bound on the membership one: a soft-deleted permission is still
+/// counted by it and resolves for nobody, a disabled organization stays writable while
+/// resolving nothing, and it is a snapshot taken at the write that a concurrent change
+/// can outdate in either direction and an idempotent replay reproduces unchanged. Both
+/// carriers say which set they measured, in a required `scope` member on the verdict
+/// itself. On the token-issuance path an overflow WITHHOLDS the
 /// complete permission claim and says so on the wire, and never truncates, never
 /// refuses issuance, and never returns an error.
 ///

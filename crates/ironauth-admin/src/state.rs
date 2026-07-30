@@ -581,13 +581,33 @@ impl AdminState {
     /// plane writes: no management endpoint refuses a create or an attach because of any
     /// count or size, so the budget produces no 4xx and no 5xx anywhere on this plane.
     ///
-    /// Where it IS reported is ONE place and not two, which is worth stating exactly
-    /// because the natural reading of the sentence above is wrong. The effective-roles
-    /// READ carries the verdict, as the `permission_budget` object on its 200. The
-    /// role-to-permission ATTACH does not: its 201 returns `OrgRolePermissionView`, which
-    /// has no budget field, so an operator who crosses a threshold learns it from the
-    /// read rather than from the write that caused it. Adding the verdict to the attach
-    /// response is tracked in issue #425.
+    /// It IS reported in TWO places, over TWO DIFFERENT SETS, and confusing them is the
+    /// one mistake this doc exists to prevent (issue #425):
+    ///
+    ///   * the effective-roles READ carries `permission_budget` on its 200, over one
+    ///     MEMBERSHIP'S RESOLVED set (direct roles, the group ancestor closure, and the
+    ///     organization's default role, unioned). That is what a token claim would carry,
+    ///     so it is the authoritative verdict, and the object states `scope:
+    ///     "membership"`;
+    ///   * the role-to-permission ATTACH carries `role_permission_budget` on its 201,
+    ///     over THAT ROLE'S OWN live mappings including the one just attached, and the
+    ///     object states `scope: "role"`. It is there because the write is where the
+    ///     operator's attention is.
+    ///
+    /// The role figure is NEITHER an upper nor a lower bound on the membership figure.
+    /// It counts a different set and can be wrong about the membership in either
+    /// direction: a soft-deleted PERMISSION is still counted by the role figure and
+    /// resolves for no membership, a DISABLED organization stays writable here while
+    /// resolving nothing at all, and the figure is a SNAPSHOT taken at the write, which
+    /// a concurrent change can outdate in either direction and which an Idempotency-Key
+    /// replay reproduces unchanged by design. Only the effective-roles read predicts
+    /// what a token will carry.
+    ///
+    /// Both evaluate through the one `PermissionBudgetView::evaluate` and take every
+    /// wire string from `ironauth_config::PermissionOverflow::permissions_status`, the
+    /// same source the mint stamps onto the token, so the console, the attach response
+    /// and the token cannot disagree about the vocabulary even where they legitimately
+    /// disagree about the count.
     #[must_use]
     pub fn with_token_claims(mut self, config: &TokenClaimsConfig) -> Self {
         if let Some(inner) = Arc::get_mut(&mut self.inner) {

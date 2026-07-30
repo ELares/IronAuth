@@ -36039,9 +36039,22 @@ impl OrgMembershipRoleRepo<'_> {
 /// The `organization_id` conjunct is a different matter entirely and is NOT
 /// redundant with anything: the policy cannot see that column, so it is the whole
 /// fence between two organizations of one environment. Dropping it from
-/// `get_assignment` or from `list_by` is killed on its own. `get` does not carry it
-/// AT ALL and is deliberately organization-blind; [`OrgRolePermissionRepo`] records
-/// what that means for a caller and what a nested route must use instead.
+/// `get_assignment`, from `list_by`, or from
+/// [`OrgRolePermissionRepo::count_live_for_role`] is killed on its own. The count
+/// read's copy was measured the same way as the other two, by neutering it to a
+/// tautology and running the suite, and
+/// `count_live_for_role_counts_only_this_organizations_live_mappings` is what turns
+/// red. WHICH assertion kills it was measured rather than assumed, because the first
+/// answer written here was wrong: it is the CROSS ORGANIZATION ADDRESS assertion,
+/// `count_for(&beta, &alpha_role) == 0`, which the mutant answers with alpha's own
+/// non-zero count. What that needs is a NON-ZERO count on the role being addressed
+/// from the wrong organization, and nothing more. It does NOT need the two
+/// organizations to hold DIFFERENT counts: setting both to one mapping each keeps the
+/// suite green and the mutant still dies at that same assertion, `left: 1, right: 0`.
+///
+/// `get` does not carry the conjunct AT ALL and is deliberately organization-blind;
+/// [`OrgRolePermissionRepo`] records what that means for a caller and what a nested
+/// route must use instead.
 ///
 /// Do not delete a scope conjunct on the grounds that a mutation survives: the
 /// survival is the expected consequence of typed addressing plus the policy, not
@@ -36063,9 +36076,10 @@ const ORG_ROLE_PERMISSION_SELECT_COLUMNS: &str = "id, organization_id, role_id, 
 /// row-level-security policy cannot see `organization_id` at all: the organization
 /// predicate is the whole fence between two organizations of one environment.
 ///
-/// * [`Self::get_in_org`], [`Self::get_assignment`], [`Self::list_for_role`] and
-///   [`Self::list_for_permission`] each take an organization and carry the
-///   predicate, so a mapping of a SIBLING organization is the uniform not-found.
+/// * [`Self::get_in_org`], [`Self::get_assignment`], [`Self::list_for_role`],
+///   [`Self::count_live_for_role`] and [`Self::list_for_permission`] each take an
+///   organization and carry the predicate, so a mapping of a SIBLING organization is
+///   the uniform not-found (an empty page, or a count of zero).
 /// * [`Self::get`] and [`Self::parse_id`] take none. `get` is addressed by the
 ///   mapping id ALONE and is DELIBERATELY organization-blind, because it is the
 ///   by-id read the audit target and the detach handle resolve through: given a
@@ -36254,6 +36268,79 @@ impl OrgRolePermissionRepo<'_> {
         }
         self.list_by("role_id", org_id, &role_id.to_string(), limit, after)
             .await
+    }
+
+    /// How many live mappings ONE role carries inside `org_id`: the count behind the
+    /// role-scoped budget verdict the attach response reports (issue #425).
+    ///
+    /// A COUNT rather than a length taken from [`Self::list_for_role`], because that
+    /// list is page-clamped and a length read off one page would silently stop growing
+    /// at the clamp. `count_live_for_role_is_not_a_page_length` seeds MORE rows than
+    /// the clamp and pins that difference, so the substitution is a red test rather
+    /// than a silent regression.
+    ///
+    /// One statement, bounded by THAT ROLE'S OWN live mappings, with no fan-out at all:
+    /// it never resolves the role's effective member set, which is the reason the
+    /// membership-scoped verdict is not computed on a write. It is NOT one page's work,
+    /// and saying so would be false in exactly the regime that motivates the count,
+    /// since the mappings of a role are uncapped by covenant. MEASURED with
+    /// `EXPLAIN (ANALYZE, BUFFERS)` on the real schema, one role carrying 20,000 live
+    /// mappings in a 200,000 row table: this count read 1,153 buffers in 6.8 ms while
+    /// the first page of [`Self::list_for_role`] (`LIMIT 101`) read 10 buffers in
+    /// 0.43 ms. Which access method the planner picks varies with the shape of the
+    /// table (a bitmap heap scan driven by the live-partial pair index on that fixture,
+    /// a plain sequential scan when the role is essentially the whole table), so no
+    /// single index name belongs in this doc; what is stable is that the work grows
+    /// with the role's own live mappings.
+    ///
+    /// What it counts is exactly THIS ROLE's own rows. It is NOT a membership's
+    /// resolved permission set, which unions every role a member holds directly, by
+    /// group inheritance through the ancestor closure, and by the organization's
+    /// default role; [`OrgGroupRepo::effective_permissions`] answers that question, and
+    /// this number is NEITHER an upper NOR a lower bound on it. It can be LARGER (a
+    /// mapping whose PERMISSION is soft-deleted is counted here and resolves nowhere,
+    /// because that projection filters `p.deleted_at` too) and SMALLER (a member may
+    /// hold several roles and inherit more). Anything reporting this figure to an
+    /// operator has to say which set it measured.
+    ///
+    /// `deleted_at IS NULL` so a detached mapping stops counting immediately, and the
+    /// count is NOT a grant count: deleting the ROLE or the PERMISSION cascades
+    /// nowhere, so a row counted here can already have a dead endpoint (the same
+    /// caveat [`Self::list_for_role`] carries). That caveat is what makes the paragraph
+    /// above true in the LARGER direction, and
+    /// `count_live_for_role_counts_a_mapping_whose_endpoints_are_dead` pins it, so a
+    /// future liveness join cannot change the meaning silently.
+    ///
+    /// A role or organization id of ANOTHER scope counts `0` rather than erroring, the
+    /// same uniform "nothing is visible here" [`Self::list_for_role`] answers with an
+    /// empty page.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn count_live_for_role(
+        &self,
+        org_id: &OrganizationId,
+        role_id: &OrgRoleId,
+    ) -> Result<i64, StoreError> {
+        if org_id.scope() != self.scope || role_id.scope() != self.scope {
+            return Ok(0);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let count: i64 = sqlx::query(
+            "SELECT COUNT(*) AS n FROM org_role_permissions \
+             WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
+             AND role_id = $4 AND deleted_at IS NULL",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(org_id.to_string())
+        .bind(role_id.to_string())
+        .fetch_one(&mut *tx)
+        .await?
+        .get("n");
+        tx.commit().await?;
+        Ok(count)
     }
 
     /// One page of live mappings for one permission: the "which roles grant this

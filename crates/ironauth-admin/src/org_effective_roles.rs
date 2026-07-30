@@ -182,12 +182,88 @@ impl EffectiveRoleView {
     }
 }
 
-/// What the permission budget would say about this membership's resolved permission
-/// set (issue #98). ADVISORY ONLY.
+/// WHICH SET a [`PermissionBudgetView`] was computed over (issue #425).
+///
+/// A REQUIRED discriminator INSIDE the verdict, not a property of the field carrying
+/// it, and that placement is the whole point. The two verdicts this plane reports are
+/// byte-shape identical apart from this member, so a bare `PermissionBudgetView`
+/// handed to an SDK, a console component or a log pipeline WITHOUT the name of the
+/// field it arrived in would otherwise have lost, irrecoverably, which set it
+/// describes. A discriminator travels with the object and makes the two carriers
+/// non-interchangeable by construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionBudgetScope {
+    /// ONE ROLE'S OWN live permission mappings, counted inside one organization.
+    ///
+    /// What the role-to-permission ATTACH reports, because that is the set the write
+    /// already addresses. It is a DIFFERENT question from [`Self::Membership`] and
+    /// bounds it in NEITHER direction; the type docs name the three mechanisms.
+    Role,
+    /// ONE MEMBERSHIP'S RESOLVED permission set: every role the member holds
+    /// directly, everything inherited through the group ancestor closure, and the
+    /// organization's default role, unioned and deduplicated.
+    ///
+    /// What the effective-roles READ reports, and the only verdict that predicts what
+    /// a token claim will carry.
+    Membership,
+}
+
+/// What the permission budget would say about ONE set of permissions (issue #98).
+/// ADVISORY ONLY.
 ///
 /// Nothing here refuses a write and no number here is a cap on what may be STORED. It
-/// reports what the NEXT token issuance would carry, in the same units the
-/// `[token_claims]` configuration is written in.
+/// reports what a token issuance would carry, in the same units the `[token_claims]`
+/// configuration is written in.
+///
+/// # WHICH set, said by the object itself
+///
+/// This type is the budget ARITHMETIC plus the NAME OF THE SET it ran over. It is
+/// carried by two fields on two different endpoints, over two DIFFERENT sets, and
+/// [`Self::scope`] states which one on every instance (issue #425):
+///
+///   * [`EffectiveRolesView::permission_budget`] carries
+///     [`PermissionBudgetScope::Membership`]: every role the member holds directly,
+///     through the group ancestor closure, and by the organization's default role,
+///     unioned and deduplicated. That is the set a token claim would carry, so it is
+///     the authoritative verdict.
+///   * `OrgRolePermissionView::role_permission_budget`, on the attach 201, carries
+///     [`PermissionBudgetScope::Role`]: one role's OWN live mappings. It is there
+///     because the write is where an operator's attention is at the moment they cross
+///     a threshold.
+///
+/// # The two verdicts bound each other in NEITHER direction
+///
+/// The role figure is not an upper bound on the membership figure and not a lower
+/// bound on it either. It is a different set, and an earlier draft of this document
+/// claimed a lower bound, which is why the refuting mechanisms are named rather than
+/// summarized:
+///
+///   * A DEAD PERMISSION ENDPOINT. The role count filters the MAPPING'S `deleted_at`
+///     and nothing else, while the membership resolution additionally requires the
+///     permission ROW to be live. Neither a role nor a permission cascades to the
+///     mapping table, so a soft-deleted permission leaves its mapping counted here and
+///     resolved nowhere. Measured: an attach reported 3 with `budget_exceeded` while
+///     the same membership read 1 with no overflow at all.
+///   * The ORGANIZATION LIFECYCLE. This plane deliberately keeps a DISABLED
+///     organization writable, while the resolution closure seeds only on an ACTIVE
+///     one. Measured: an attach reported 2 and overflowing while the same membership
+///     read 0, with no roles and no permissions.
+///   * STALENESS, in EITHER direction. The role figure is a SNAPSHOT taken at the
+///     write that reported it: a concurrent attach on the same role leaves it SHORT
+///     and a concurrent detach leaves it LONG, and an Idempotency-Key REPLAY
+///     faithfully reproduces the original snapshot by design, so a byte-identical 201
+///     can report a count the role no longer has. Measured: a replay reported 2 and
+///     `approaching` against a live count of 1.
+///
+/// So a membership can be over budget while the role verdict reads fine, AND the role
+/// verdict can name an overflow no membership will ever see.
+/// `an_attach_within_the_role_budget_can_still_be_a_membership_over_it` drives the
+/// first direction and pins both answers at once. What CANNOT disagree is the
+/// vocabulary: both carriers evaluate through [`PermissionBudgetView::evaluate`] and
+/// take every wire string from
+/// [`ironauth_config::PermissionOverflow::permissions_status`], which is also where
+/// the mint takes it from.
 ///
 /// # The one thing this does NOT answer, said plainly
 ///
@@ -205,8 +281,18 @@ impl EffectiveRoleView {
 /// `permissions_status` on the token when it withholds.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct PermissionBudgetView {
-    /// How many permissions the membership effectively holds. A count, never a cap:
-    /// nothing refuses a permission because of it.
+    /// WHICH SET the numbers below were computed over. ALWAYS present, on both
+    /// carriers, and the one member that makes them distinguishable once the object
+    /// has been separated from the field it arrived in (issue #425).
+    ///
+    /// `role` on the attach 201, `membership` on the effective-roles read. A reader
+    /// that treats the two alike is reading a different question from the one it
+    /// asked; see the type docs for the three mechanisms that make them disagree.
+    pub scope: PermissionBudgetScope,
+    /// How many permissions are in the set this verdict was computed over. A count,
+    /// never a cap: nothing refuses a permission because of it.
+    ///
+    /// WHICH set that is, `scope` above says.
     pub permission_count: usize,
     /// The configured largest element count ONE permission claim may carry.
     pub max_permission_count: u32,
@@ -236,15 +322,29 @@ pub struct PermissionBudgetView {
 }
 
 impl PermissionBudgetView {
-    /// Evaluate the ELEMENT half of `budget` against a resolved set of `count`
-    /// permissions.
+    /// Evaluate the ELEMENT half of `budget` against a set of `count` permissions.
     ///
     /// The comparisons mirror `ironauth_oidc`'s pure budget core exactly, including
     /// that both are STRICTLY greater-than, so a count sitting exactly on a threshold
     /// is neither approaching nor overflowing. An off-by-one here would make the
     /// console disagree with the token about a boundary set, which is the worst
     /// possible place to disagree.
-    fn evaluate(budget: &TokenClaimsConfig, count: usize) -> Self {
+    ///
+    /// The ONE evaluation on this plane, shared by both carriers of the type (issue
+    /// #425): the effective-roles read passes a membership's resolved count and the
+    /// attach passes one role's own mapping count, and neither re-implements the
+    /// comparisons or re-spells an overflow marker. Two copies would be two chances for
+    /// the console and the write response to disagree about the same numbers.
+    ///
+    /// `scope` is a parameter rather than a second constructor for the same reason
+    /// there is one `evaluate` at all: a caller cannot produce a verdict without
+    /// stating which set it counted, and the two carriers cannot drift apart by taking
+    /// different code paths to say so.
+    pub(crate) fn evaluate(
+        scope: PermissionBudgetScope,
+        budget: &TokenClaimsConfig,
+        count: usize,
+    ) -> Self {
         // Widened to `usize` rather than narrowing `count` to `u32`, for the reason
         // `ironauth_oidc`'s budget gives: the widening is lossless on every supported
         // target, while a narrowing cast is the one arithmetic step that could turn a
@@ -254,6 +354,7 @@ impl PermissionBudgetView {
         let over = count > max;
         let approaching = !over && count > warn;
         Self {
+            scope,
             permission_count: count,
             max_permission_count: budget.permission_claim_max_count,
             warn_permission_count: budget.permission_claim_warn_count,
@@ -302,6 +403,12 @@ pub struct EffectiveRolesView {
     /// What the budget would say about `permissions` at the next issuance. Advisory;
     /// see [`PermissionBudgetView`], in particular for which half of the budget it
     /// evaluates.
+    ///
+    /// This is the MEMBERSHIP-scoped verdict and the authoritative one, because this
+    /// set is what a token claim would carry. It always carries `scope: "membership"`.
+    /// The attach 201's `role_permission_budget` carries `scope: "role"` and counts a
+    /// DIFFERENT set, which bounds this one in NEITHER direction; the type docs name
+    /// the three mechanisms.
     pub permission_budget: PermissionBudgetView,
 }
 
@@ -373,7 +480,13 @@ pub async fn get_org_membership_effective_roles(
         .effective_permissions(&org_id, &membership.user_id, state.max_group_depth())
         .await?;
 
-    let permission_budget = PermissionBudgetView::evaluate(state.token_claims(), permissions.len());
+    // MEMBERSHIP scoped, and the verdict says so on the wire: `permissions` above is
+    // the whole resolved set, so this is the answer that predicts the next token.
+    let permission_budget = PermissionBudgetView::evaluate(
+        PermissionBudgetScope::Membership,
+        state.token_claims(),
+        permissions.len(),
+    );
     let view = EffectiveRolesView {
         roles: grants
             .into_iter()

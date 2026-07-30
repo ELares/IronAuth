@@ -6,6 +6,20 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- CORRECTION to `[token_claims]`'s section doc, which said the management plane's verdict
+  rides the effective-roles read alone and that the attach carried no budget field (issue
+  #425 has since added it). The section now names BOTH surfaces and, more importantly, the
+  two DIFFERENT sets they measure: the read's `permission_budget` is over one membership's
+  whole RESOLVED set and is what predicts the next token, while the attach's
+  `role_permission_budget` is over that role's own mappings. It states that the second is
+  NEITHER an upper NOR a lower bound on the first, and names why: a soft-deleted permission
+  is still counted by the role figure and resolves for nobody, a disabled organization stays
+  writable while resolving nothing, and the figure is a snapshot taken at the write that a
+  concurrent change can outdate in either direction and an idempotent replay reproduces
+  unchanged. An intermediate version of this section claimed a LOWER BOUND and was wrong.
+  Regenerates `docs/config-schema.json`. The covenant sentence around it is unchanged and
+  still true: no management endpoint answers 4xx or 5xx for a count or a size reason.
+
 - The `[token_claims]` budget keys are LIVE (issue #98, PR 13): the mint reads them on every
   `at+jwt` access token that carries a resolved permission set, and the management plane
   reports the same verdict against them. Issue #413 is DISCHARGED; the six
