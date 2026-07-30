@@ -979,6 +979,29 @@ impl Harness {
         self.state = state;
     }
 
+    /// Install a `[token_claims]` permission-claim budget and a `[diagnostics]` posture
+    /// (issue #98) on the harness state, and rebuild the protocol router.
+    ///
+    /// Both in ONE call because the acceptance test for the no-silent-drop covenant
+    /// varies them TOGETHER: it drives the cross product of the two overflow modes and
+    /// all three verbosity settings, and needs a state that carries one of each. The
+    /// budget is re-clamped to the shipped ceilings by `with_token_claims`, exactly as
+    /// the boot path clamps it, so a test cannot configure a bound production could
+    /// not.
+    pub fn install_token_claims_budget(
+        &mut self,
+        token_claims: &ironauth_config::TokenClaimsConfig,
+        diagnostics: &ironauth_config::DiagnosticsConfig,
+    ) {
+        let state = self
+            .state
+            .clone()
+            .with_token_claims(token_claims)
+            .with_diagnostics(diagnostics);
+        self.router = oidc_router(state.clone());
+        self.state = state;
+    }
+
     /// Arm the headless flow API (issue #84) for the harness and rebuild the protocol
     /// router, so the flow routes answer instead of the flag-off uniform 404. Sets
     /// `with_flows_enabled(true)` (the operator toggle the boot path resolves from the

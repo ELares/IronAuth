@@ -149,11 +149,7 @@ pub struct Config {
     pub organizations: OrganizationsConfig,
 
     /// Token claim budget settings (issue #98): the SIZE bounds an access token
-    /// carrying a permissions claim is held to. NOTHING CONSULTS THESE KEYS YET.
-    /// They are validated at load and installed on both planes, but the permissions
-    /// claim and its budget enforcement land with the claim itself, so setting any
-    /// of them changes no response and no token on this build; issue #413 tracks
-    /// deleting this sentence when the mint activates the claim. The budget is a
+    /// carrying a permissions claim is held to. The budget is a
     /// size bound on a TOKEN, never a cap on how many permissions or roles may be
     /// STORED; every key is named for the CLAIM it bounds rather than for the model,
     /// so `permission_claim_max_count` bounds what one claim carries, and there is
@@ -244,6 +240,34 @@ pub enum DiagnosticVerbosity {
     /// and the bounded kid-mismatch hint. Still never the assertion, a secret, or a
     /// token; these are computed values, not captured material.
     Verbose,
+}
+
+impl DiagnosticVerbosity {
+    /// Every verbosity setting an operator can choose, in declaration order.
+    ///
+    /// The SINGLE definition of "every setting", so a caller that must cover them all
+    /// iterates this rather than writing its own list in another crate, where a new
+    /// variant would silently not appear. Two callers do exactly that: the exemption
+    /// tests in `ironauth_oidc::policy_trace`, and the covenant cross product in
+    /// `ironauth-oidc`'s `tests/org_permissions_claim.rs`.
+    ///
+    /// Completeness here is a MEASUREMENT rather than a convention.
+    /// `the_verbosity_list_holds_every_variant_the_schema_declares` compares this array
+    /// against the variant list `schemars` derives from the enum ITSELF, so a variant
+    /// added above and not added here turns that test red.
+    ///
+    /// Be exact about which half is a compile error, because the two mechanisms catch
+    /// different mistakes. Adding a variant IS a compile error, in `ironauth-oidc`: the
+    /// two total `match`es that label each setting (the `policy_trace` exemption tests
+    /// and `tests/org_permissions_claim.rs`) stop being exhaustive. What no compiler
+    /// catches is this array staying at its old LENGTH once those arms are added, which
+    /// would leave both loops one setting short, and that is exactly what the test above
+    /// is for.
+    pub const ALL: [DiagnosticVerbosity; 3] = [
+        DiagnosticVerbosity::Off,
+        DiagnosticVerbosity::Standard,
+        DiagnosticVerbosity::Verbose,
+    ];
 }
 
 /// Organization settings (issue #97).
@@ -358,8 +382,15 @@ pub const TOKEN_CLAIMS_DEFAULT_PERMISSION_CLAIM_WARN_COUNT: u32 = 192;
 /// (issue #98). There is no `truncate` variant and there will not be one: a
 /// partial permission set is indistinguishable to a resource server from a
 /// complete one, so silent truncation would be an authorization DOWNGRADE that
-/// no consumer can detect. The enum having exactly two variants IS the
-/// no-silent-truncation guarantee.
+/// no consumer can detect.
+///
+/// The enum having exactly two variants is what makes truncation UNCONFIGURABLE:
+/// there is no value an operator can write that asks for it, and a config naming
+/// one fails to load rather than falling back to a default. That is the whole of
+/// what this type guarantees, and it is worth saying where the boundary is. It
+/// does not make a truncating EMITTER unwritable, because the emitter takes a
+/// permission set and would accept a shortened one; what holds that half is the
+/// mint's own behaviour, pinned by the tests `docs/THREAT-MODEL.md` names.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionOverflow {
@@ -372,12 +403,59 @@ pub enum PermissionOverflow {
     PdpRequired,
 }
 
-/// Token claim budget settings (issue #98). NOTHING CONSULTS THESE KEYS YET: they
-/// are validated at load and installed on both planes, but the permissions claim
-/// and its budget enforcement land with the claim itself, so setting any of them
-/// changes no response and no token on this build. Issue #413 tracks deleting this
-/// sentence, and its five copies on the fields below, when the mint activates the
-/// claim.
+impl PermissionOverflow {
+    /// Every overflow mode, in declaration order.
+    ///
+    /// The SINGLE definition of "every mode", so a caller that must cover them all
+    /// iterates this rather than writing its own list in another crate, where a new
+    /// variant would silently not appear. The covenant cross product in
+    /// `ironauth-oidc`'s `tests/org_permissions_claim.rs` is that caller, and the
+    /// acceptance criterion it makes mechanical is stated over EVERY mode, so a list
+    /// that could fall behind the enum would quietly weaken the criterion rather than
+    /// break it.
+    ///
+    /// Completeness here is a MEASUREMENT rather than a convention.
+    /// `the_overflow_mode_list_holds_every_variant_the_schema_declares` compares this
+    /// array against the variant list `schemars` derives from the enum ITSELF, so a
+    /// variant added above and not added here turns that test red.
+    ///
+    /// Be exact about which half is a compile error, because the two mechanisms catch
+    /// different mistakes. Adding a variant IS a compile error, in two places at once:
+    /// [`PermissionOverflow::permissions_status`] below is total over this enum, and so
+    /// is the `match` that gives each mode a slot in `ironauth-oidc`'s
+    /// `tests/org_permissions_claim.rs`. What no compiler catches is this array staying
+    /// at its old LENGTH once those arms are added, which would leave the covenant cross
+    /// product one mode short, and that is exactly what the test above is for.
+    pub const ALL: [PermissionOverflow; 2] = [
+        PermissionOverflow::RolesOnly,
+        PermissionOverflow::PdpRequired,
+    ];
+
+    /// The `permissions_status` claim value a withholding under this mode puts ON THE
+    /// WIRE (issue #98).
+    ///
+    /// The ONE place these two strings are spelled. Both planes need them and the
+    /// planes must not disagree: the data plane stamps the value into the access
+    /// token, and the management plane reports which value the NEXT token would carry.
+    /// Two independent `match` arms in two crates would be two chances to drift, and a
+    /// drifted management answer would tell an operator their resource servers will
+    /// see a marker they will never see.
+    ///
+    /// Closed vocabulary, chosen once and in issue #98 rather than in issue #100 where
+    /// the policy decision point lands: a marker whose value later had to change would
+    /// be a wire break for everyone who consumed it in the interim.
+    #[must_use]
+    pub const fn permissions_status(self) -> &'static str {
+        match self {
+            PermissionOverflow::RolesOnly => "budget_exceeded",
+            PermissionOverflow::PdpRequired => "pdp_required",
+        }
+    }
+}
+
+/// Token claim budget settings (issue #98). These keys are LIVE: the mint reads
+/// them on every `at+jwt` access token that carries a resolved permission set, and
+/// the management plane reports the same verdict against them.
 ///
 /// The budget is a SIZE BOUND ON A TOKEN. It is not a cap on how many permissions
 /// or roles may be STORED, and it never becomes one. Every key is named for the
@@ -393,20 +471,20 @@ pub enum PermissionOverflow {
 /// against it. Duplicating it under `[oidc]` would give one bound two
 /// operator-visible names that could disagree.
 ///
-/// Exceeding the budget never refuses anything. On the management plane the only
-/// statuses the budget can produce are 200 and 201 carrying a warning field; on the
-/// token-issuance path an overflow WITHHOLDS the complete permission claim and says
-/// so on the wire, and never truncates, never refuses issuance, and never returns
-/// an error.
+/// Exceeding the budget never refuses anything. On the management plane it produces
+/// no refusal AT ALL: no endpoint there answers 4xx or 5xx for a count or a size
+/// reason, and an attach that carries a role past a threshold still answers a plain
+/// 201. Where the verdict IS reported is the effective-roles READ, as the
+/// `permission_budget` object on its 200; the attach response carries no budget field
+/// today; issue #425 tracks adding it. On the token-issuance path an overflow WITHHOLDS the
+/// complete permission claim and says so on the wire, and never truncates, never
+/// refuses issuance, and never returns an error.
 ///
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct TokenClaimsConfig {
     /// The largest compact access token, in bytes, the mint will emit WITH a
-    /// permissions claim. NOTHING CONSULTS THIS KEY YET: setting it changes no
-    /// response and no token on this build, because the permissions claim and its
-    /// budget enforcement land with the claim itself (issue #413 tracks deleting
-    /// this sentence when the mint activates the claim). Default
+    /// permissions claim. Default
     /// [`TOKEN_CLAIMS_DEFAULT_ACCESS_TOKEN_MAX_BYTES`] (4096); config load REJECTS a
     /// value above the 32768 ceiling
     /// ([`TOKEN_CLAIMS_ACCESS_TOKEN_MAX_BYTES_CEILING`]). `0` does NOT mean
@@ -427,11 +505,8 @@ pub struct TokenClaimsConfig {
     /// the code. The absence of an unlimited value is what makes the bound a bound.
     pub access_token_max_bytes: u32,
 
-    /// The approach threshold, in bytes, over the same compact token size. NOTHING
-    /// CONSULTS THIS KEY YET: setting it changes no response and no token on this
-    /// build, because the permissions claim and its budget enforcement land with the
-    /// claim itself (issue #413 tracks deleting this sentence when the mint
-    /// activates the claim). A token within `access_token_max_bytes` but above this
+    /// The approach threshold, in bytes, over the same compact token size. A token
+    /// within `access_token_max_bytes` but above this
     /// is reported as approaching the budget; nothing is withheld and no request is
     /// refused at this threshold. Default
     /// [`TOKEN_CLAIMS_DEFAULT_ACCESS_TOKEN_WARN_BYTES`] (3072), deliberately the same
@@ -447,10 +522,7 @@ pub struct TokenClaimsConfig {
     pub access_token_warn_bytes: u32,
 
     /// The largest number of elements the mint will emit in ONE permissions claim.
-    /// NOTHING CONSULTS THIS KEY YET: setting it changes no response and no token on
-    /// this build, because the permissions claim and its budget enforcement land
-    /// with the claim itself (issue #413 tracks deleting this sentence when the mint
-    /// activates the claim). Default
+    /// Default
     /// [`TOKEN_CLAIMS_DEFAULT_PERMISSION_CLAIM_MAX_COUNT`] (256); config load
     /// REJECTS a value above the 4096 ceiling
     /// ([`TOKEN_CLAIMS_PERMISSION_CLAIM_MAX_COUNT_CEILING`]). `0` does NOT mean
@@ -461,9 +533,8 @@ pub struct TokenClaimsConfig {
     /// within that bound), and `permissions: []` is a meaningful statement: the
     /// subject is in an organization and holds nothing. `0` is a valid, safe posture
     /// for bounding the claim, but it is NOT the deployment-wide off switch; that is
-    /// the per-resource-server `permission_claims_enabled` opt-in, which lands with
-    /// the claim itself (issue #98) and is what stops the claim being emitted at
-    /// all. Set
+    /// the per-resource-server `permission_claims_enabled` opt-in (issue #98), which
+    /// is what stops the claim being emitted at all. Set
     /// `permission_claim_warn_count = 0` alongside a `0` maximum or the load is
     /// refused, because config load also rejects a threshold above the maximum it
     /// warns about and the shipped 192 threshold would then exceed this maximum.
@@ -475,11 +546,8 @@ pub struct TokenClaimsConfig {
     /// There is no `max_permissions_per_role` and there never will be.
     pub permission_claim_max_count: u32,
 
-    /// The approach threshold over the permission claim's element count. NOTHING
-    /// CONSULTS THIS KEY YET: setting it changes no response and no token on this
-    /// build, because the permissions claim and its budget enforcement land with the
-    /// claim itself (issue #413 tracks deleting this sentence when the mint
-    /// activates the claim). A claim within `permission_claim_max_count` but above
+    /// The approach threshold over the permission claim's element count. A claim
+    /// within `permission_claim_max_count` but above
     /// this is reported as approaching the budget; nothing is withheld and no
     /// request is refused at this threshold. Default
     /// [`TOKEN_CLAIMS_DEFAULT_PERMISSION_CLAIM_WARN_COUNT`] (192); config load
@@ -492,10 +560,7 @@ pub struct TokenClaimsConfig {
     pub permission_claim_warn_count: u32,
 
     /// What the mint does when a resolved permission set will not fit the budget.
-    /// NOTHING CONSULTS THIS KEY YET: setting it changes no response and no token on
-    /// this build, because the permissions claim and its budget enforcement land
-    /// with the claim itself (issue #413 tracks deleting this sentence when the mint
-    /// activates the claim). Both values WITHHOLD the COMPLETE set and say so on the
+    /// Both values WITHHOLD the COMPLETE set and say so on the
     /// wire; neither truncates, and neither refuses the request. `roles_only` (the
     /// default) tells the resource server to authorize from the `roles` claim it
     /// already receives; `pdp_required` tells it to consult the policy decision point
@@ -503,8 +568,9 @@ pub struct TokenClaimsConfig {
     /// is a startup failure rather than a silent fallback to the default.
     ///
     /// See [`PermissionOverflow`]: its having exactly two variants, with no
-    /// `truncate` among them, is what makes silent truncation unrepresentable
-    /// rather than merely unconfigured.
+    /// `truncate` among them, is what makes truncation UNCONFIGURABLE. That the
+    /// mint does not truncate anyway is a separate property, held by tests rather
+    /// than by this type.
     pub permission_claim_overflow: PermissionOverflow,
 }
 
@@ -6527,6 +6593,100 @@ mod tests {
             Config::from_toml_str("[token_claims]\nmax_permissions_per_role = 8\n", "<inline>")
                 .is_err(),
             "there is no per-role permission cap and a config naming one must not load"
+        );
+    }
+
+    /// The wire values `schemars` derives for a unit-variant enum, in declaration
+    /// order.
+    ///
+    /// Read out of the DERIVED schema rather than written down, which is the whole
+    /// point: the derive macro sees the enum's real variant list, so this is an
+    /// independent witness against which a hand-written `ALL` can be checked. A
+    /// hand-written expectation would witness nothing.
+    fn schema_variants<T: JsonSchema>() -> Vec<String> {
+        let schema = serde_json::to_value(schemars::schema_for!(T)).expect("schema serializes");
+        schema["oneOf"]
+            .as_array()
+            .expect("a unit-variant enum derives a oneOf")
+            .iter()
+            .map(|variant| {
+                variant["const"]
+                    .as_str()
+                    .expect("each arm is a const string")
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    /// The wire string `serde` gives a value, for comparison against the schema.
+    fn wire_string<T: Serialize>(value: &T) -> String {
+        serde_json::to_value(value)
+            .expect("serializes")
+            .as_str()
+            .expect("a unit variant serializes to a string")
+            .to_owned()
+    }
+
+    #[test]
+    fn the_overflow_mode_list_holds_every_variant_the_schema_declares() {
+        // What makes `PermissionOverflow::ALL` a definition of "every mode" rather
+        // than a list that happens to be right today. A variant added to the enum
+        // and not to the array leaves the two lists different lengths here, which is
+        // the ONLY place in the workspace that notices: the cross-product test in
+        // `ironauth-oidc` iterates this array, so it would otherwise keep passing
+        // while covering strictly less than the covenant is stated over.
+        assert_eq!(
+            PermissionOverflow::ALL
+                .iter()
+                .map(wire_string)
+                .collect::<Vec<_>>(),
+            schema_variants::<PermissionOverflow>(),
+            "ALL must hold every variant the derive sees, in the same order"
+        );
+    }
+
+    #[test]
+    fn the_verbosity_list_holds_every_variant_the_schema_declares() {
+        // The same guard for the other axis of the same cross product, and for the
+        // `EVERY_VERBOSITY` list the policy-trace exemption tests iterate.
+        assert_eq!(
+            DiagnosticVerbosity::ALL
+                .iter()
+                .map(wire_string)
+                .collect::<Vec<_>>(),
+            schema_variants::<DiagnosticVerbosity>(),
+            "ALL must hold every variant the derive sees, in the same order"
+        );
+    }
+
+    #[test]
+    fn the_overflow_mode_owns_the_two_wire_strings_both_planes_read() {
+        // The single-sourcing IS the justification for this method existing, so it is
+        // pinned in the crate that owns it rather than only through the two crates
+        // that delegate to it. `ironauth_oidc::PermissionStatus::as_str` returns these
+        // values into the access token and `PermissionBudgetView::overflow` returns
+        // them to the console, both by calling THIS function; swapping the two arms
+        // below would tell an operator their resource servers will see a marker they
+        // will never see.
+        assert_eq!(
+            PermissionOverflow::RolesOnly.permissions_status(),
+            "budget_exceeded"
+        );
+        assert_eq!(
+            PermissionOverflow::PdpRequired.permissions_status(),
+            "pdp_required"
+        );
+        // Every mode has its OWN marker: a mapping that collapsed two modes onto one
+        // string would leave a resource server unable to tell "authorize from roles"
+        // from "consult the policy decision point".
+        let markers: std::collections::BTreeSet<&str> = PermissionOverflow::ALL
+            .iter()
+            .map(|mode| mode.permissions_status())
+            .collect();
+        assert_eq!(
+            markers.len(),
+            PermissionOverflow::ALL.len(),
+            "the markers are distinct, one per mode"
         );
     }
 

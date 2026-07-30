@@ -34,10 +34,22 @@
 //!
 //! # An OBJECT, not a bare array
 //!
-//! The response is `{"roles": [...]}` rather than `[...]` so that issue #98 can add
-//! `permissions` (per role, and a top-level summary if it wants one) as a pure
-//! addition, with no consumer having to change how it parses today's shape. A bare
-//! array would have made every later field a breaking change.
+//! The response is `{"roles": [...], "permissions": [...], "permission_budget": {...}}`.
+//! Issue #97 shipped the object wrapper with only `roles` in it precisely so issue #98
+//! could add the other two as a pure addition, with no consumer having to change how
+//! it parses. A bare array would have made both a breaking change.
+//!
+//! # The permission set, and the budget verdict beside it
+//!
+//! `permissions` is the WHOLE resolved set, un-paginated and un-capped, and it is the
+//! same store read the mint runs. It is a flat set rather than a per-role breakdown
+//! because that is the shape the token claim takes and this endpoint's contract is
+//! "what would the next token carry".
+//!
+//! `permission_budget` reports what the budget would say about that set. It is
+//! ADVISORY and it refuses nothing: this endpoint is a read, and no endpoint anywhere
+//! in issue #98 answers 4xx or 5xx for a count or a size reason. Read
+//! [`PermissionBudgetView`] for the one thing it deliberately does NOT answer.
 //!
 //! # Un-paginated, and why that is safe
 //!
@@ -89,6 +101,7 @@
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::Response;
+use ironauth_config::TokenClaimsConfig;
 use ironauth_store::{EffectiveRoleGrant, EffectiveRoleSource};
 use serde::Serialize;
 use utoipa::ToSchema;
@@ -169,6 +182,94 @@ impl EffectiveRoleView {
     }
 }
 
+/// What the permission budget would say about this membership's resolved permission
+/// set (issue #98). ADVISORY ONLY.
+///
+/// Nothing here refuses a write and no number here is a cap on what may be STORED. It
+/// reports what the NEXT token issuance would carry, in the same units the
+/// `[token_claims]` configuration is written in.
+///
+/// # The one thing this does NOT answer, said plainly
+///
+/// The budget has TWO bounds, an element count and a compact-token BYTE size, and
+/// this view evaluates only the first. `approaching` and `overflow` are the ELEMENT
+/// verdict. The byte verdict is not withheld out of caution, it is genuinely not
+/// computable here: an exact compact-token size needs the environment's signing key
+/// (for the protected header and the signature width) and the whole rest of the
+/// exchange (the audience set, the granted scope, any `cnf` binding), none of which
+/// exists on a management read of a membership. The alternative would be an ESTIMATE,
+/// and an estimated byte verdict is a lie in exactly the direction that matters: it
+/// would tell an operator a set fits when the mint will withhold it. So the byte
+/// BOUNDS are reported as the configured numbers, for context, and the byte VERDICT
+/// belongs to the mint, which measures rather than estimates and puts
+/// `permissions_status` on the token when it withholds.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct PermissionBudgetView {
+    /// How many permissions the membership effectively holds. A count, never a cap:
+    /// nothing refuses a permission because of it.
+    pub permission_count: usize,
+    /// The configured largest element count ONE permission claim may carry.
+    pub max_permission_count: u32,
+    /// The configured element count above which an emitted claim is reported as
+    /// approaching the budget.
+    pub warn_permission_count: u32,
+    /// The configured largest compact access token, in bytes, that may carry a
+    /// permission claim. Reported for context; see the type docs for why no byte
+    /// verdict is computed here.
+    pub max_token_bytes: u32,
+    /// The configured compact-token size above which an emitted claim is reported as
+    /// approaching the budget. Context only, as above.
+    pub warn_token_bytes: u32,
+    /// `true` when the set is PAST `warn_permission_count` but still within
+    /// `max_permission_count`. The ELEMENT verdict only.
+    pub approaching: bool,
+    /// The `permissions_status` value the next token would carry, present ONLY when
+    /// the set is past `max_permission_count`. Absent (rather than null) otherwise.
+    ///
+    /// Its presence means the next token will carry NO `permissions` claim. It does
+    /// NOT mean anything was refused here: this membership still holds every one of
+    /// those permissions, the management plane still reports them all, and every
+    /// attach that produced them answered 201.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "budget_exceeded")]
+    pub overflow: Option<String>,
+}
+
+impl PermissionBudgetView {
+    /// Evaluate the ELEMENT half of `budget` against a resolved set of `count`
+    /// permissions.
+    ///
+    /// The comparisons mirror `ironauth_oidc`'s pure budget core exactly, including
+    /// that both are STRICTLY greater-than, so a count sitting exactly on a threshold
+    /// is neither approaching nor overflowing. An off-by-one here would make the
+    /// console disagree with the token about a boundary set, which is the worst
+    /// possible place to disagree.
+    fn evaluate(budget: &TokenClaimsConfig, count: usize) -> Self {
+        // Widened to `usize` rather than narrowing `count` to `u32`, for the reason
+        // `ironauth_oidc`'s budget gives: the widening is lossless on every supported
+        // target, while a narrowing cast is the one arithmetic step that could turn a
+        // large configured bound into a small effective one.
+        let max = usize::try_from(budget.permission_claim_max_count).unwrap_or(usize::MAX);
+        let warn = usize::try_from(budget.permission_claim_warn_count).unwrap_or(usize::MAX);
+        let over = count > max;
+        let approaching = !over && count > warn;
+        Self {
+            permission_count: count,
+            max_permission_count: budget.permission_claim_max_count,
+            warn_permission_count: budget.permission_claim_warn_count,
+            max_token_bytes: budget.access_token_max_bytes,
+            warn_token_bytes: budget.access_token_warn_bytes,
+            approaching,
+            overflow: over.then(|| {
+                budget
+                    .permission_claim_overflow
+                    .permissions_status()
+                    .to_owned()
+            }),
+        }
+    }
+}
+
 /// The resolved roles of one organization membership.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct EffectiveRolesView {
@@ -179,12 +280,29 @@ pub struct EffectiveRolesView {
     /// organization's default appears with a `default` entry that no withdrawal
     /// touches at all.
     ///
-    /// An OBJECT wraps this array rather than the array being the whole body, so a
-    /// later `permissions` field (issue #98) is a pure addition.
+    /// An OBJECT wraps this array rather than the array being the whole body, which
+    /// is what let issue #98 add `permissions` and `permission_budget` beside it as a
+    /// pure addition.
     ///
     /// The whole set, never a page: this is a bounded read (see the module docs),
     /// and there is no cap on how many roles a member may hold.
     pub roles: Vec<EffectiveRoleView>,
+    /// Every permission slug the membership effectively holds (issue #98), in the
+    /// store's total order, DEDUPLICATED: unlike `roles` above this is a SET and not a
+    /// list of grant paths, because that is what the token claim is and because a
+    /// permission's provenance is the role that carries it, which the list above
+    /// already names.
+    ///
+    /// The WHOLE set, never truncated and never paged, however large and whatever
+    /// `permission_budget` says about it. That is a structural property and not a
+    /// courtesy: an operator must always be able to see what a token will not carry,
+    /// so the one surface that could show them is the one surface that must never
+    /// shorten the answer.
+    pub permissions: Vec<String>,
+    /// What the budget would say about `permissions` at the next issuance. Advisory;
+    /// see [`PermissionBudgetView`], in particular for which half of the budget it
+    /// evaluates.
+    pub permission_budget: PermissionBudgetView,
 }
 
 /// Resolve every role one organization membership effectively holds, with the
@@ -202,7 +320,7 @@ pub struct EffectiveRolesView {
     ),
     security(("bearer" = [])),
     responses(
-        (status = 200, description = "The resolved roles, one entry per grant path. This is what the NEXT token issuance would carry; tokens already issued are NOT affected by a recent change. A DISABLED organization mints no roles, so this is empty for every one of its members until it is re-enabled (the assignment lists still show the configuration). Not paginated: a bounded read of one membership's whole set", body = EffectiveRolesView),
+        (status = 200, description = "The resolved roles, one entry per grant path, plus the resolved permission SET and the advisory budget verdict over it (issue #98). This is what the NEXT token issuance would carry; tokens already issued are NOT affected by a recent change. A DISABLED organization mints nothing, so both are empty for every one of its members until it is re-enabled (the assignment lists still show the configuration). Not paginated and never truncated, whatever the budget says: an operator must always be able to see what a token will not carry", body = EffectiveRolesView),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
         (status = 404, description = "Not found (the organization, or a membership that is not a live membership of it: uniform across absent, removed, another scope's, and another organization's)", body = ErrorBody)
@@ -242,11 +360,27 @@ pub async fn get_org_membership_effective_roles(
         .effective_role_grants(&org_id, &membership.user_id, state.max_group_depth())
         .await?;
 
+    // The permission set, through the SAME repository, the SAME (organization, user)
+    // key, and the SAME depth bound as the roles above and as the mint (issue #98), so
+    // this view and the token claim cannot answer differently for one membership. A
+    // store fault is a 500 here for the reason the module docs give for roles, and one
+    // step more sharply: an empty permission set is indistinguishable from a member who
+    // legitimately holds nothing.
+    let permissions = state
+        .store()
+        .management()
+        .org_groups(scope)
+        .effective_permissions(&org_id, &membership.user_id, state.max_group_depth())
+        .await?;
+
+    let permission_budget = PermissionBudgetView::evaluate(state.token_claims(), permissions.len());
     let view = EffectiveRolesView {
         roles: grants
             .into_iter()
             .map(EffectiveRoleView::from_grant)
             .collect(),
+        permissions: permissions.into_iter().collect(),
+        permission_budget,
     };
     let body = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body))

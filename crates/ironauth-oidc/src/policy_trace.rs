@@ -297,9 +297,8 @@ pub(crate) async fn record_token_size_event(
 /// passes [`None`] rather than picking one and mislabelling the verdict as belonging to
 /// it, and the warnings read renders the organization alone.
 ///
-/// INERT on this build: nothing constructs this. Issue #422 tracks removing the
-/// `allow` and this paragraph when the mint wires it.
-#[allow(dead_code)]
+/// LIVE: constructed by `crate::token::record_budget_outcome`, from both mint hooks
+/// (issue #98, PR 13).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PermissionBudgetEvent<'a> {
     /// WHY the verdict was recorded: approaching the budget, or which withholding.
@@ -351,7 +350,7 @@ pub(crate) struct PermissionBudgetEvent<'a> {
 /// The sink is retention pruned and its read is clamped to 200 rows
 /// (`TokenSizeEventsRepo::MAX_QUERY_LIMIT`), so an operator can lose these rows to time
 /// or to volume. That is acceptable ONLY because the token itself carries
-/// `permissions_status` once the mint is wired: the durable record of a withholding is
+/// `permissions_status`: the durable record of a withholding is
 /// the WIRE CONTRACT, and this row is the operator's convenience view of it. If this
 /// event were the sole record of a withholding, retention pruning would silently defeat
 /// the covenant above, and the verbosity exemption would not save it.
@@ -386,9 +385,8 @@ pub(crate) struct PermissionBudgetEvent<'a> {
 /// since migration 0073 (issue #91) with nothing ever writing the value, so a
 /// permission-budget event is the first access-token size event IronAuth has recorded.
 ///
-/// INERT on this build: nothing calls this. The mint hooks land in a later PR of issue
-/// #98; issue #422 tracks removing the `allow` and this paragraph with them.
-#[allow(dead_code)]
+/// LIVE on both mint hooks (issue #98, PR 13), through the one
+/// `crate::token::record_budget_outcome` that decides which verdicts are worth a row.
 pub(crate) async fn record_permission_budget_event(
     state: &OidcState,
     scope: Scope,
@@ -812,14 +810,18 @@ mod exemption_tests {
     use std::sync::Arc;
     use std::time::{Duration, UNIX_EPOCH};
 
-    /// Every verbosity setting the operator can choose. Written out rather than derived so
-    /// a fourth setting added to [`DiagnosticVerbosity`] does not silently stop being
-    /// covered here; the exhaustive `match` below is what makes that a compile error.
-    const EVERY_VERBOSITY: &[DiagnosticVerbosity] = &[
-        DiagnosticVerbosity::Off,
-        DiagnosticVerbosity::Standard,
-        DiagnosticVerbosity::Verbose,
-    ];
+    /// Every verbosity setting the operator can choose, taken from the enum's OWN list
+    /// rather than written out again here.
+    ///
+    /// Two mechanisms keep a fourth setting from silently escaping this loop, and they
+    /// catch different things. Being derived from [`DiagnosticVerbosity::ALL`] is what
+    /// puts a new setting IN the list (that list's own completeness is measured in
+    /// `ironauth-config`, against the variant list `schemars` derives from the enum).
+    /// The exhaustive `match` inside the loop below is what makes a new setting a
+    /// COMPILE error here until someone looks at it. A literal written out here had
+    /// neither property: the `match` alone would have been satisfied by adding an arm,
+    /// leaving the list one setting short and this test quietly narrower.
+    const EVERY_VERBOSITY: &[DiagnosticVerbosity] = &DiagnosticVerbosity::ALL;
 
     /// A store-backed [`OidcState`] at `verbosity`, and the scope its writes land in.
     ///

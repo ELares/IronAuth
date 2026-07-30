@@ -1864,3 +1864,409 @@ async fn a_disabled_organization_still_accepts_a_default_role_designation() {
         "and it can be cleared again"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The effective-roles view's permission extension (issue #98, PR 13)
+// ---------------------------------------------------------------------------
+
+/// Create a user and add them to `org`, returning the MEMBERSHIP id.
+async fn create_membership(
+    h: &Harness,
+    tenant: &str,
+    environment: &str,
+    org: &str,
+    ident: &str,
+    key: &str,
+) -> String {
+    let users = format!("/v1/tenants/{tenant}/environments/{environment}/users");
+    let body = serde_json::json!({ "identifier": ident }).to_string();
+    let (status, _, response) = h.post(&users, &format!("{key}-u"), &body).await;
+    assert_eq!(status, StatusCode::CREATED, "create user: {response}");
+    let user = id_of(&response);
+
+    let base =
+        format!("/v1/tenants/{tenant}/environments/{environment}/organizations/{org}/memberships");
+    let body = serde_json::json!({ "user_id": user }).to_string();
+    let (status, _, response) = h.post(&base, key, &body).await;
+    assert_eq!(status, StatusCode::CREATED, "add membership: {response}");
+    id_of(&response)
+}
+
+/// Grant `role` directly to `membership`.
+async fn grant_direct_role(
+    h: &Harness,
+    tenant: &str,
+    environment: &str,
+    org: &str,
+    membership: &str,
+    role: &str,
+    key: &str,
+) {
+    let base = format!(
+        "/v1/tenants/{tenant}/environments/{environment}/organizations/{org}\
+         /memberships/{membership}/roles"
+    );
+    let body = serde_json::json!({ "role_id": role }).to_string();
+    let (status, _, response) = h.post(&base, key, &body).await;
+    assert_eq!(status, StatusCode::CREATED, "grant role: {response}");
+}
+
+/// The effective-roles view body for one membership.
+async fn effective_view(
+    h: &Harness,
+    tenant: &str,
+    environment: &str,
+    org: &str,
+    membership: &str,
+) -> Value {
+    let path = format!(
+        "/v1/tenants/{tenant}/environments/{environment}/organizations/{org}\
+         /memberships/{membership}/effective-roles"
+    );
+    let (status, _, response) = h.get(&path).await;
+    assert_eq!(status, StatusCode::OK, "effective roles: {response}");
+    serde_json::from_str(&response).expect("json")
+}
+
+/// The `permissions` array of an effective-roles view, as owned strings.
+fn permissions_of(view: &Value) -> Vec<String> {
+    view["permissions"]
+        .as_array()
+        .expect("permissions is a named field, never a bare array body")
+        .iter()
+        .map(|slug| slug.as_str().expect("a slug is a string").to_owned())
+        .collect()
+}
+
+/// The `.../organizations/{org}` base path.
+fn org_base(tenant: &str, environment: &str, org: &str) -> String {
+    format!("/v1/tenants/{tenant}/environments/{environment}/organizations/{org}")
+}
+
+/// Define a group in an organization, optionally under `parent`, and return its id.
+async fn create_group(
+    h: &Harness,
+    base: &str,
+    slug: &str,
+    parent: Option<&str>,
+    key: &str,
+) -> String {
+    let mut body = serde_json::json!({ "slug": slug, "display_name": "Group" });
+    if let Some(parent) = parent {
+        body["parent_id"] = Value::String(parent.to_owned());
+    }
+    let (status, _, response) = h
+        .post(&format!("{base}/groups"), key, &body.to_string())
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "create group: {response}");
+    id_of(&response)
+}
+
+/// Bind a membership into a group.
+async fn bind_member(h: &Harness, base: &str, group: &str, membership: &str, key: &str) {
+    let body = serde_json::json!({ "membership_id": membership }).to_string();
+    let (status, _, response) = h
+        .post(&format!("{base}/groups/{group}/members"), key, &body)
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "bind member: {response}");
+}
+
+/// Grant a role to every member of a group and of its descendants.
+async fn grant_group_role(h: &Harness, base: &str, group: &str, role: &str, key: &str) {
+    let body = serde_json::json!({ "role_id": role }).to_string();
+    let (status, _, response) = h
+        .post(&format!("{base}/groups/{group}/roles"), key, &body)
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "grant group role: {response}");
+}
+
+#[tokio::test]
+async fn the_effective_roles_view_reports_the_resolved_permission_set_beside_the_roles() {
+    // The addition is PURE: `roles` is unchanged, and `permissions` plus
+    // `permission_budget` arrive beside it under the object wrapper issue #97 shipped
+    // for exactly this. The set is flat and deduplicated because it is what the token
+    // claim carries; the provenance of a permission is the role that holds it, which
+    // the roles array already names.
+    let h = Harness::start(50).await;
+    let (tenant, environment) = tenant_env(&h).await;
+    let org = create_org(&h, &tenant, &environment, "k-org").await;
+    let roles = roles_base(&tenant, &environment, &org);
+    let vocabulary = permissions_base(&tenant, &environment);
+    let role = create_role(&h, &roles, "operator", "k-role").await;
+    let membership = create_membership(&h, &tenant, &environment, &org, "m@x.test", "k-m").await;
+    grant_direct_role(&h, &tenant, &environment, &org, &membership, &role, "k-g").await;
+
+    let view = effective_view(&h, &tenant, &environment, &org, &membership).await;
+    assert!(
+        permissions_of(&view).is_empty(),
+        "a role with no mappings resolves an EMPTY set, never a missing field: {view}"
+    );
+    assert_eq!(
+        view["permission_budget"]["permission_count"], 0,
+        "and the budget reports the count it saw"
+    );
+    assert!(
+        view["permission_budget"].get("overflow").is_none(),
+        "nothing overflowed, so no overflow field: {view}"
+    );
+
+    // Attached in a NON-alphabetical order, so the assertion is about the store's
+    // total order rather than about insertion.
+    let base = mapping_base(&tenant, &environment, &org, &role);
+    for (slug, key) in [
+        ("orders.write", "k-p1"),
+        ("billing.read", "k-p2"),
+        ("audit.read", "k-p3"),
+    ] {
+        let permission = create_permission(&h, &vocabulary, slug, &format!("{key}-v")).await;
+        attach(&h, &base, &permission, key).await;
+    }
+
+    let view = effective_view(&h, &tenant, &environment, &org, &membership).await;
+    assert_eq!(
+        permissions_of(&view),
+        vec!["audit.read", "billing.read", "orders.write"],
+        "the whole set, sorted: {view}"
+    );
+    assert_eq!(view["permission_budget"]["permission_count"], 3);
+    assert_eq!(
+        view["permission_budget"]["approaching"], false,
+        "three permissions is nowhere near the shipped 192 warn threshold: {view}"
+    );
+    assert_eq!(
+        view["permission_budget"]["max_permission_count"], 256,
+        "the shipped default is reported, so an operator can size against it"
+    );
+    assert!(
+        view["roles"]
+            .as_array()
+            .is_some_and(|roles| roles.len() == 1),
+        "the roles half is untouched by the addition: {view}"
+    );
+}
+
+#[tokio::test]
+async fn the_management_plane_never_truncates_a_permission_set_past_the_budget() {
+    // THE COVENANT, on this plane: the budget produces no 4xx and no 5xx anywhere.
+    // Every attach past the bound still answers 201, and the view still returns the
+    // WHOLE set.
+    //
+    // Where the verdict is reported is ONE place and not two, and this test asserts
+    // exactly that shape rather than the shape the plan described. The effective-roles
+    // READ carries `permission_budget` on its 200. The ATTACH does not: its 201 body is
+    // an `OrgRolePermissionView` with no budget field, which is asserted below so the
+    // gap is pinned rather than merely unmentioned. Issue #425 tracks adding it.
+    //
+    // That last half is the property most at risk and the reason this test exists: an
+    // operator must always be able to see what a token will NOT carry, so the one
+    // surface that could show them is the one surface that must never shorten the
+    // answer. A view that truncated to the budget would leave a withheld capability
+    // invisible on both the wire and the console at once.
+    let h = Harness::start_with_token_claims(
+        50,
+        &ironauth_config::TokenClaimsConfig {
+            permission_claim_max_count: 2,
+            permission_claim_warn_count: 1,
+            permission_claim_overflow: ironauth_config::PermissionOverflow::PdpRequired,
+            ..ironauth_config::TokenClaimsConfig::default()
+        },
+    )
+    .await;
+    let (tenant, environment) = tenant_env(&h).await;
+    let org = create_org(&h, &tenant, &environment, "k-org").await;
+    let roles = roles_base(&tenant, &environment, &org);
+    let vocabulary = permissions_base(&tenant, &environment);
+    let role = create_role(&h, &roles, "operator", "k-role").await;
+    let membership = create_membership(&h, &tenant, &environment, &org, "m@x.test", "k-m").await;
+    grant_direct_role(&h, &tenant, &environment, &org, &membership, &role, "k-g").await;
+    let base = mapping_base(&tenant, &environment, &org, &role);
+
+    // Two: within the maximum but past the warn threshold. The warning is advisory and
+    // the write is a plain 201.
+    for (slug, key) in [("a.read", "k-p1"), ("b.read", "k-p2")] {
+        let permission = create_permission(&h, &vocabulary, slug, &format!("{key}-v")).await;
+        attach(&h, &base, &permission, key).await;
+    }
+    let view = effective_view(&h, &tenant, &environment, &org, &membership).await;
+    assert_eq!(view["permission_budget"]["approaching"], true, "{view}");
+    assert!(
+        view["permission_budget"].get("overflow").is_none(),
+        "approaching is not overflowing: {view}"
+    );
+
+    // Past the maximum. The attach is STILL a 201, the view still lists everything, and
+    // the budget reports which marker the next token will carry instead of the set.
+    //
+    // The FOURTH attach is driven by hand so the 201 BODY can be inspected. It is the
+    // attach that pushes the resolved set past `permission_claim_max_count`, so it is
+    // exactly the write the plan expected to carry a warning field, and asserting the
+    // absence pins the shipped shape: a later PR that adds the field (issue #425) turns
+    // this red and has to say so here.
+    for (slug, key) in [("c.read", "k-p3")] {
+        let permission = create_permission(&h, &vocabulary, slug, &format!("{key}-v")).await;
+        attach(&h, &base, &permission, key).await;
+    }
+    let permission = create_permission(&h, &vocabulary, "d.read", "k-p4-v").await;
+    let (status, _, response) = h.post(&base, "k-p4", &attach_body(&permission)).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "the attach that crosses the MAXIMUM is a plain 201: {response}"
+    );
+    let created: Value = serde_json::from_str(&response).expect("json");
+    assert!(
+        created.get("permission_budget").is_none()
+            && created.get("warning").is_none()
+            && created.get("warnings").is_none(),
+        "the attach 201 carries NO budget verdict today, whatever the read reports: \
+         {response}"
+    );
+    let view = effective_view(&h, &tenant, &environment, &org, &membership).await;
+    assert_eq!(
+        permissions_of(&view),
+        vec!["a.read", "b.read", "c.read", "d.read"],
+        "the WHOLE set is still reported, un-paginated and un-truncated: {view}"
+    );
+    assert_eq!(view["permission_budget"]["permission_count"], 4);
+    assert_eq!(
+        view["permission_budget"]["overflow"], "pdp_required",
+        "and it names the marker the next token will carry, per the configured mode: \
+         {view}"
+    );
+    assert_eq!(
+        view["permission_budget"]["approaching"], false,
+        "past the maximum is OVERFLOWING, not approaching: the two are distinct \
+         answers: {view}"
+    );
+
+    // The list of mappings is likewise complete: nothing anywhere on this plane
+    // shortened an answer because of the budget.
+    assert_eq!(
+        granted_permissions(&h, &base).await.len(),
+        4,
+        "the mapping list is not truncated either"
+    );
+}
+
+#[tokio::test]
+async fn a_count_exactly_at_the_warn_threshold_is_not_yet_approaching() {
+    // THE BOUNDARY, on the console. `PermissionBudgetView::evaluate` documents that its
+    // comparisons mirror the mint's pure budget core exactly, both STRICTLY
+    // greater-than, and names an off-by-one here as the worst possible place for the
+    // console and the token to disagree. Every other fixture in this file sits well
+    // clear of a threshold, so `count >= warn` survived all of them.
+    //
+    // Exactly AT the threshold is therefore the only fixture that can tell the two
+    // comparisons apart, and both sides of it are driven: at the threshold nothing is
+    // approaching, one past it something is.
+    let h = Harness::start_with_token_claims(
+        50,
+        &ironauth_config::TokenClaimsConfig {
+            permission_claim_max_count: 8,
+            permission_claim_warn_count: 2,
+            ..ironauth_config::TokenClaimsConfig::default()
+        },
+    )
+    .await;
+    let (tenant, environment) = tenant_env(&h).await;
+    let org = create_org(&h, &tenant, &environment, "k-org").await;
+    let roles = roles_base(&tenant, &environment, &org);
+    let vocabulary = permissions_base(&tenant, &environment);
+    let role = create_role(&h, &roles, "operator", "k-role").await;
+    let membership = create_membership(&h, &tenant, &environment, &org, "m@x.test", "k-m").await;
+    grant_direct_role(&h, &tenant, &environment, &org, &membership, &role, "k-g").await;
+    let base = mapping_base(&tenant, &environment, &org, &role);
+
+    for (slug, key) in [("a.read", "k-p1"), ("b.read", "k-p2")] {
+        let permission = create_permission(&h, &vocabulary, slug, &format!("{key}-v")).await;
+        attach(&h, &base, &permission, key).await;
+    }
+    let view = effective_view(&h, &tenant, &environment, &org, &membership).await;
+    assert_eq!(view["permission_budget"]["permission_count"], 2);
+    assert_eq!(
+        view["permission_budget"]["warn_permission_count"], 2,
+        "the fixture really is sitting ON the threshold: {view}"
+    );
+    assert_eq!(
+        view["permission_budget"]["approaching"], false,
+        "a count EXACTLY at the warn threshold is not approaching: the comparison is \
+         strictly greater-than, the same way the mint's is: {view}"
+    );
+
+    // One past it, and the same view flips. Without this half the assertion above
+    // would also pass for a view that never reports an approach at all.
+    let permission = create_permission(&h, &vocabulary, "c.read", "k-p3-v").await;
+    attach(&h, &base, &permission, "k-p3").await;
+    let view = effective_view(&h, &tenant, &environment, &org, &membership).await;
+    assert_eq!(view["permission_budget"]["permission_count"], 3);
+    assert_eq!(
+        view["permission_budget"]["approaching"], true,
+        "one PAST the threshold is approaching: {view}"
+    );
+    assert!(
+        view["permission_budget"].get("overflow").is_none(),
+        "and still nowhere near the maximum, so no overflow marker: {view}"
+    );
+}
+
+#[tokio::test]
+async fn the_effective_roles_view_resolves_permissions_through_the_full_ancestor_walk() {
+    // The console half of the shared nesting bound. `ironauth-oidc`'s
+    // `the_configured_group_depth_is_the_bound_the_permission_resolution_uses` is the
+    // mint half, and the pair is the whole of the crate CHANGELOG's claim that the
+    // console and the token cannot answer differently for one membership: they share
+    // the repository, the key, AND the depth bound, and a hard-coded bound on either
+    // side breaks the agreement silently and in a different direction on each.
+    //
+    // The fixture is a three-level chain with the member in the deepest group and the
+    // capability reachable only from the TOP of it, so a walk bounded to one level
+    // returns the near capability and drops the far one.
+    let h = Harness::start(50).await;
+    let (tenant, environment) = tenant_env(&h).await;
+    let org = create_org(&h, &tenant, &environment, "k-org").await;
+    let base = org_base(&tenant, &environment, &org);
+    let roles = roles_base(&tenant, &environment, &org);
+    let vocabulary = permissions_base(&tenant, &environment);
+
+    let grandparent = create_group(&h, &base, "gp", None, "k-gp").await;
+    let parent = create_group(&h, &base, "parent", Some(&grandparent), "k-p").await;
+    let child = create_group(&h, &base, "child", Some(&parent), "k-c").await;
+    let membership = create_membership(&h, &tenant, &environment, &org, "m@x.test", "k-m").await;
+    bind_member(&h, &base, &child, &membership, "k-bind").await;
+
+    for (group, role_slug, permission_slug, key) in [
+        (&parent, "near", "via.parent", "k-near"),
+        (&grandparent, "far", "via.grandparent", "k-far"),
+    ] {
+        let role = create_role(&h, &roles, role_slug, &format!("{key}-r")).await;
+        grant_group_role(&h, &base, group, &role, &format!("{key}-a")).await;
+        let permission =
+            create_permission(&h, &vocabulary, permission_slug, &format!("{key}-v")).await;
+        attach(
+            &h,
+            &mapping_base(&tenant, &environment, &org, &role),
+            &permission,
+            &format!("{key}-m"),
+        )
+        .await;
+    }
+
+    let view = effective_view(&h, &tenant, &environment, &org, &membership).await;
+    assert_eq!(
+        permissions_of(&view),
+        vec!["via.grandparent", "via.parent"],
+        "the view walks the WHOLE ancestor chain the configured bound admits, so a \
+         capability inherited two levels up is reported: {view}"
+    );
+    assert_eq!(
+        view["permission_budget"]["permission_count"], 2,
+        "and the budget counted the resolved set, not the mappings of one role: {view}"
+    );
+    // The roles half of the same response resolves through the same walk, which is what
+    // makes the two arrays comparable rather than two independent answers.
+    assert_eq!(
+        view["roles"].as_array().expect("roles").len(),
+        2,
+        "both ancestor roles are reported beside their permissions: {view}"
+    );
+}

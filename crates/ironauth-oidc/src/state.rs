@@ -2114,7 +2114,16 @@ impl OidcState {
     ///   surprising); the lifetime is the SHORTEST of the targeted servers'
     ///   `access_token_ttl_secs` (each falling back to the environment default when
     ///   unset), so bundling resources never LENGTHENS a token past what any one
-    ///   resource server asked for.
+    ///   resource server asked for. The issue #98 permission-claim opt-in folds a
+    ///   THIRD way, with AND: the claim is emitted only when EVERY targeted resource
+    ///   server opted in, and a mixed target suppresses it SILENTLY rather than
+    ///   refusing, for the reasons on [`AccessTokenTarget::permission_claims`].
+    ///
+    /// Three folds, three different rules, and the difference is not arbitrary.
+    /// Format cannot be reconciled at all, so disagreement is `invalid_target`. TTL
+    /// and the permission opt-in can both be reconciled by taking the most
+    /// restrictive answer, so they are, because refusing would break requests that
+    /// succeed today.
     ///
     /// The caller (the token/authorization endpoints) validates the resource URIs,
     /// the per-client allowlist, and the downscope-not-expand rule BEFORE calling
@@ -2141,12 +2150,23 @@ impl OidcState {
                 audiences: vec![client_id.to_owned()],
                 format: self.inner.default_access_token_format,
                 ttl: self.inner.access_token_ttl,
+                // Opted out BY CONSTRUCTION (issue #98): this branch reads no
+                // `resource_servers` row, so there is no row that could carry an
+                // opt-in. It is also the safe default, and it is what makes the
+                // device, client-credentials and jwt-bearer grants (which all pass no
+                // resource) permission-free without any of them knowing about it.
+                permission_claims: false,
             });
         }
 
         let mut audiences: Vec<String> = Vec::with_capacity(resources.len());
         let mut format: Option<TokenFormat> = None;
         let mut ttl: Option<Duration> = None;
+        // UNANIMITY OR SUPPRESS (issue #98): folded with AND across the targeted
+        // servers, beside the format-unanimity and shortest-TTL folds. Seeded `true`
+        // and only ever narrowed, which is sound because this branch is reached only
+        // for a NON-EMPTY resource list, so at least one row always folds into it.
+        let mut permission_claims = true;
         for resource in resources {
             let server = match self
                 .inner
@@ -2177,6 +2197,11 @@ impl OidcState {
                 .and_then(|secs| u64::try_from(secs).ok())
                 .map_or(self.inner.access_token_ttl, Duration::from_secs);
             ttl = Some(ttl.map_or(rs_ttl, |current| current.min(rs_ttl)));
+            // The permission-claim opt-in (issue #98) folds with AND, so ONE
+            // opted-out audience suppresses the claim for the whole token. Folded
+            // here, per targeted RESOURCE, rather than after the de-duplication
+            // below, so naming the same resource twice cannot change the verdict.
+            permission_claims = permission_claims && server.permission_claims_enabled;
             if !audiences.contains(&server.audience) {
                 audiences.push(server.audience);
             }
@@ -2185,6 +2210,7 @@ impl OidcState {
             audiences,
             format: format.unwrap_or(self.inner.default_access_token_format),
             ttl: ttl.unwrap_or(self.inner.access_token_ttl),
+            permission_claims,
         })
     }
 

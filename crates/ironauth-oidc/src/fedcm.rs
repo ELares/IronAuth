@@ -685,6 +685,9 @@ async fn mint_assertion(
         // FedCM mints an ID TOKEN only, and the `roles` claim (issue #97) rides the
         // ACCESS token only, so this is inert on this path twice over.
         roles: None,
+        // Permissions (issue #98) are inert here for the same two reasons: an ID token
+        // only, and no organization context.
+        permissions: None,
         at_hash: None,
         c_hash: None,
         extra_claims: &extra_claims,

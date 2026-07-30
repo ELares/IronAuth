@@ -60,7 +60,7 @@ use ironauth_store::{
     IssuedTokenRecord, NewOpaqueAccessToken, NewRefreshFamily, OrganizationId, RedeemOutcome,
     RefreshFamilyId, RefreshFamilyOpenOutcome, RefreshRedeem, RefreshRedeemOutcome, RefreshTokenId,
     RefreshTokenResolution, RotatedRefreshToken, Scope, ServiceId, SessionId, StoreError,
-    TokenKind, UserId,
+    TokenKind, TokenSizeReason, UserId,
 };
 use serde::Deserialize;
 
@@ -70,7 +70,11 @@ use crate::client_auth::{
     self, AuthenticatedClient, ClientAuthError, ClientAuthInputs, ClientAuthMethod,
 };
 use crate::error::TokenError;
+use crate::permission_budget::{
+    PermissionBudget, PermissionBudgetOutcome, PermissionWithheldReason,
+};
 use crate::pkce::verify_s256;
+use crate::policy_trace::PermissionBudgetEvent;
 use crate::registry::GrantType;
 use crate::resource;
 use crate::scope_claims::{assemble_claims, parse_scope_set};
@@ -818,6 +822,213 @@ async fn resolve_effective_roles(
         .map_err(|_| TokenError::ServerError)
 }
 
+/// The subject's effective PERMISSION set for THIS issuance (issue #98), resolved
+/// fresh from the store in the organization context frozen onto the grant.
+///
+/// The exact sibling of [`resolve_effective_roles`], deliberately: it is called from
+/// the same two hooks, on the same line as that one, with the same freshness rule,
+/// the same fail-closed rule, and the same absent-versus-empty distinction. Read that
+/// function's doc comment; everything it says applies here unchanged, including that
+/// the ORGANIZATION'S OWN LIFECYCLE is fenced in the store's shared closure because
+/// neither mint hook is in a position to check it.
+///
+/// The ONE thing this adds is `emits_claim`, which both hooks pass as
+/// [`AccessTokenTarget::emits_permission_claims`]: the audiences UNANIMOUSLY opted in
+/// AND the selected format is one that carries claims. It is checked FIRST, before the
+/// organization context and before any store read, which buys three things worth
+/// naming. It makes a target that cannot carry the claim cost exactly zero extra round
+/// trips, which matters because that is the overwhelmingly common case on the hottest
+/// path in the product. It makes the mixed-opt-in suppression reach the wire through
+/// the very same [`None`] that "no organization context" reaches it through, so the two
+/// are indistinguishable to a resource server BY CONSTRUCTION rather than by two code
+/// paths agreeing to emit the same thing. And, through the FORMAT half, it keeps the
+/// `opaque` plus opted-in combination genuinely inert: that combination is reachable
+/// through a config promotion, and without the format check this function would run a
+/// resolution whose result the opaque mint discards, so a fault in that read would turn
+/// a documented no-op into a 500 the same request without the opt-in survives.
+///
+/// Returns [`None`] when the target cannot carry the claim OR when there is no
+/// organization context: the claim is then ABSENT, and no `permissions_status` is
+/// emitted either, because neither is an overflow. An empty [`Some`] is distinct and
+/// DOES emit an empty array.
+///
+/// # Fails CLOSED
+///
+/// A store fault is a `server_error`, never a permission-less token, for a stronger
+/// version of the argument [`resolve_effective_roles`] makes: a permission names an
+/// API capability, so a silently dropped set is an authorization DOWNGRADE that looks
+/// exactly like a subject who legitimately holds nothing. Under the `roles_only`
+/// overflow mode it is worse still, because the resource server falls back to `roles`
+/// and grants SOMETHING, so the request succeeds with the wrong authority rather than
+/// failing loudly. This is also why permissions do not ride the ID token's
+/// deliberately fail-OPEN `extra_claims` bag.
+///
+/// # Errors
+///
+/// [`TokenError::ServerError`] on a store fault.
+///
+/// The two identifier-parse arms below also answer [`TokenError::ServerError`], and
+/// this doc does NOT claim they enforce anything, because on both mint hooks they are
+/// UNREACHABLE: [`resolve_effective_roles`] runs first, on the same line, with the same
+/// `scope`, `subject`, and `org_id`, and refuses the whole exchange on exactly those
+/// two parses. They are kept as a local fail-closed default rather than deleted (this
+/// function must not be sound only by virtue of its caller's ordering), and
+/// `a_recorded_identifier_that_is_out_of_scope_fails_closed_on_both_branches` in
+/// `crates/ironauth-oidc/tests/org_roles_claim.rs` is what actually measures the
+/// refusal, one function up.
+async fn resolve_effective_permissions(
+    state: &OidcState,
+    scope: Scope,
+    subject: &str,
+    org_id: Option<&str>,
+    emits_claim: bool,
+) -> Result<Option<BTreeSet<String>>, TokenError> {
+    if !emits_claim {
+        return Ok(None);
+    }
+    let Some(org_id) = org_id else {
+        return Ok(None);
+    };
+    let Ok(organization_id) = OrganizationId::parse_in_scope(org_id, &scope) else {
+        return Err(TokenError::ServerError);
+    };
+    let Ok(user_id) = UserId::parse_in_scope(subject, &scope) else {
+        return Err(TokenError::ServerError);
+    };
+    state
+        .store()
+        .scoped(scope)
+        .org_groups()
+        .effective_permissions(&organization_id, &user_id, state.max_group_depth())
+        .await
+        .map(Some)
+        .map_err(|_| TokenError::ServerError)
+}
+
+/// Record what the permission budget decided for one mint (issue #98), from EITHER
+/// mint hook.
+///
+/// One function for both hooks so the code exchange and the refresh grant cannot
+/// report the same verdict differently. Recording from the refresh hook is NEW
+/// observability rather than a duplicate: refresh is the highest-volume grant and
+/// this sink has never seen it.
+///
+/// # What is and is not recorded
+///
+/// A verdict that emitted the complete set and is nowhere near a threshold writes
+/// NOTHING. An event per successful mint would be a write on the hot path of the
+/// hottest endpoint in the product, for a row saying that nothing happened. Every
+/// verdict that an operator could act on IS recorded:
+///
+/// * [`PermissionBudgetOutcome::Emitted`] with `approaching` set: the early warning.
+/// * [`PermissionBudgetOutcome::Withheld`]: the overflow, with the reason that
+///   distinguishes an element overflow (nothing was serialized, so the size reported
+///   is the token that SHIPPED) from a byte overflow (the size reported is the token
+///   that was withheld).
+/// * A SECOND row, [`TokenSizeReason::RolesOnlyStillOversize`], when the token that
+///   actually ships is itself over the byte budget. Two rows and not one, because the
+///   reason a set was withheld and the fact that withholding it did not help are
+///   different facts and an operator needs both. Nothing acts on the second: the role
+///   set is uncapped by covenant (issue #97), so there is nothing further to withhold,
+///   and the design records that case rather than hiding it.
+///
+/// Best effort, exactly like every other recorder in `policy_trace`: a write failure
+/// is logged and the token is returned unchanged. The covenant does not depend on this
+/// write landing, because the token itself carries `permissions_status`.
+async fn record_budget_outcome(
+    state: &OidcState,
+    scope: Scope,
+    client_id: &str,
+    target: &AccessTokenTarget,
+    org_id: Option<&str>,
+    outcome: PermissionBudgetOutcome,
+) {
+    // A verdict exists only where a permission set was in play, and a permission set
+    // exists only in an organization context, so a verdict with no organization is not
+    // a thing this can observe. Nothing is recorded rather than a placeholder written.
+    let Some(organization_id) = org_id else {
+        return;
+    };
+    // ONE verdict is reached for the whole TOKEN, so it is attributable to a single
+    // audience only when the token targets exactly one. On a multi-audience token the
+    // event carries no audience rather than mislabelling the verdict as belonging to
+    // one of them.
+    let audience = match target.audiences.as_slice() {
+        [single] => Some(single.as_str()),
+        _ => None,
+    };
+    let (reason, token_bytes, permission_count, permission_status, roles_only_bytes) = match outcome
+    {
+        PermissionBudgetOutcome::NotApplicable
+        | PermissionBudgetOutcome::Emitted {
+            approaching: false, ..
+        } => return,
+        PermissionBudgetOutcome::Emitted {
+            token_bytes, count, ..
+        } => (
+            TokenSizeReason::BudgetApproaching,
+            token_bytes,
+            count,
+            None,
+            None,
+        ),
+        PermissionBudgetOutcome::Withheld {
+            reason,
+            roles_only_token_bytes,
+            count,
+            status,
+        } => {
+            let (reason, token_bytes) = match reason {
+                PermissionWithheldReason::CountExceeded => {
+                    (TokenSizeReason::BudgetOverflowCount, roles_only_token_bytes)
+                }
+                PermissionWithheldReason::ByteExceeded { token_bytes } => {
+                    (TokenSizeReason::BudgetOverflowBytes, token_bytes)
+                }
+            };
+            (
+                reason,
+                token_bytes,
+                count,
+                Some(status),
+                Some(roles_only_token_bytes),
+            )
+        }
+    };
+    crate::policy_trace::record_permission_budget_event(
+        state,
+        scope,
+        client_id,
+        PermissionBudgetEvent {
+            reason,
+            token_bytes,
+            permission_count,
+            audience,
+            organization_id,
+            permission_status,
+        },
+    )
+    .await;
+    // The fallback is itself oversize: a distinct, second fact about the SAME mint.
+    let budget = PermissionBudget::from_config(state.token_claims());
+    if let Some(bytes) = roles_only_bytes.filter(|bytes| *bytes > budget.max_token_bytes) {
+        crate::policy_trace::record_permission_budget_event(
+            state,
+            scope,
+            client_id,
+            PermissionBudgetEvent {
+                reason: TokenSizeReason::RolesOnlyStillOversize,
+                token_bytes: bytes,
+                permission_count,
+                audience,
+                organization_id,
+                permission_status,
+            },
+        )
+        .await;
+    }
+}
+
 /// Resolves the environment's issuer entry (its signer and algorithm policy)
 /// through the shared registry, then hands the borrowed signer and policy into the
 /// pure, synchronous [`tokens::mint`]: the async key resolution is confined here,
@@ -844,6 +1055,18 @@ async fn mint_tokens(
     let roles =
         resolve_effective_roles(state, scope, &bindings.subject, bindings.org_id.as_deref())
             .await?;
+    // The effective PERMISSIONS (issue #98), on the same terms and the same line: fresh
+    // at every issuance, fail closed, and additionally gated on the target being able
+    // to CARRY the claim at all (unanimous opt-in and an at+jwt format), which is what
+    // makes this cost nothing for the overwhelming majority of exchanges.
+    let permissions = resolve_effective_permissions(
+        state,
+        scope,
+        &bindings.subject,
+        bindings.org_id.as_deref(),
+        target.emits_permission_claims(),
+    )
+    .await?;
     let entry = state
         .issuer_entry(&scope)
         .await
@@ -872,7 +1095,7 @@ async fn mint_tokens(
     // the RFC 8707 resource indicators by the caller (issue #28/#29). No resource
     // resolves to the environment default (the client id as audience), keeping the
     // existing at+jwt/UserInfo behavior intact.
-    tokens::mint(
+    let minted = tokens::mint(
         state,
         signer,
         entry.policy(),
@@ -898,6 +1121,10 @@ async fn mint_tokens(
             // The effective organization roles (issue #97), resolved FRESH above and
             // emitted on the ACCESS token only. None when there is no org context.
             roles: roles.as_ref(),
+            // The effective organization permissions (issue #98), resolved FRESH above
+            // and emitted on the ACCESS token only. None when there is no org context
+            // OR when the target's audiences did not unanimously opt in.
+            permissions: permissions.as_ref(),
             // A token-endpoint ID token never carries at_hash, and the code flow
             // never carries c_hash; the front-channel/hybrid path (#17) supplies
             // them. Both are absent here by construction.
@@ -912,7 +1139,20 @@ async fn mint_tokens(
         },
         target,
     )
-    .map_err(|()| TokenError::ServerError)
+    .map_err(|()| TokenError::ServerError)?;
+    // The budget verdict, recorded AFTER the mint and off its critical path (issue
+    // #98). Best effort: a failed write never affects the token, which already carries
+    // `permissions_status` if anything was withheld.
+    record_budget_outcome(
+        state,
+        scope,
+        &bindings.client_id,
+        target,
+        bindings.org_id.as_deref(),
+        minted.permission_budget,
+    )
+    .await;
+    Ok(minted)
 }
 
 /// Resolve the RFC 8707 access-token target for a code exchange (issue #28) from the
@@ -1640,7 +1880,7 @@ async fn mint_refresh_access(
     target: &AccessTokenTarget,
     confirmation: Option<&Confirmation>,
 ) -> Result<(MintedAccessToken, i64), TokenError> {
-    // FRESH at every refresh (issue #97), in the org context frozen onto the family's
+    // FRESH at every refresh (issue #97, #98), in the org context frozen onto the family's
     // grant. Fails closed: a store fault refuses the refresh rather than rotating out
     // an access token whose missing roles read as a successful authorization downgrade.
     let roles = resolve_effective_roles(
@@ -1648,6 +1888,18 @@ async fn mint_refresh_access(
         scope,
         &resolution.subject,
         resolution.org_id.as_deref(),
+    )
+    .await?;
+    // The effective PERMISSIONS (issue #98), re-resolved here for the same reason and
+    // never replayed from the family. This hook is also where the budget event first
+    // observes the refresh grant at all: the sink it writes to has only ever seen code
+    // exchanges, so the highest-volume grant has been invisible to it until now.
+    let permissions = resolve_effective_permissions(
+        state,
+        scope,
+        &resolution.subject,
+        resolution.org_id.as_deref(),
+        target.emits_permission_claims(),
     )
     .await?;
     let entry = state
@@ -1658,7 +1910,7 @@ async fn mint_refresh_access(
     let issuer = state.issuer_for(&scope);
     let subject = state.resolve_public_subject(&resolution.subject);
     let extra_claims = serde_json::Map::new();
-    tokens::mint_access_token(
+    let minted = tokens::mint_access_token(
         state,
         signer,
         entry.policy(),
@@ -1682,6 +1934,10 @@ async fn mint_refresh_access(
             // than replayed: THIS is what makes a role change visible one access-token
             // lifetime after it happens instead of one refresh-family lifetime.
             roles: roles.as_ref(),
+            // The effective organization permissions (issue #98), re-resolved above
+            // rather than replayed, for the same reason and one step more sharply: a
+            // permission names an API capability.
+            permissions: permissions.as_ref(),
             at_hash: None,
             c_hash: None,
             extra_claims: &extra_claims,
@@ -1697,7 +1953,20 @@ async fn mint_refresh_access(
         },
         target,
     )
-    .map_err(|()| TokenError::ServerError)
+    .map_err(|()| TokenError::ServerError)?;
+    // The budget verdict from the REFRESH hook (issue #98), recorded through the same
+    // one function the code exchange records through, so the two grants can never
+    // report the same verdict differently.
+    record_budget_outcome(
+        state,
+        scope,
+        &resolution.client_id,
+        target,
+        resolution.org_id.as_deref(),
+        minted.permission_budget,
+    )
+    .await;
+    Ok((minted.access, minted.expires_in_secs))
 }
 
 /// Resolve the RFC 8707 access-token target for a refresh (issue #28) from the

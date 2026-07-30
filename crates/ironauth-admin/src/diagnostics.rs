@@ -426,8 +426,8 @@ pub struct WarningItemView {
 /// through a SEPARATE clamped window per event family, so one noisy family cannot evict
 /// the other. They inherit that bound and that pruning: they are an operator's CONVENIENCE
 /// view of a withholding and never its record of record, because the token itself carries
-/// `permissions_status` once the mint is wired, so a warning aged out of this list does
-/// not mean the withholding went unrecorded.
+/// `permissions_status`, so a warning aged out of this list does not mean the withholding
+/// went unrecorded.
 #[derive(Serialize, ToSchema)]
 pub struct DiagnosticsWarningsList {
     /// The computed warnings, connector warnings first, then token size warnings, then
@@ -684,8 +684,8 @@ fn permission_budget_subject(event: &TokenSizeEventRecord) -> String {
 /// it hides. `events` is one clamped window (`TokenSizeEventsRepo::MAX_QUERY_LIMIT`), so a
 /// FULL window means the per-pair counts are lower bounds and every detail below says "at
 /// least" instead of naming a figure. Retention pruning bounds it from the other side. The
-/// thing that is never lost is the wire contract: the token carries `permissions_status`
-/// once the mint is wired, and that is the record this list is only a view of.
+/// thing that is never lost is the wire contract: the token carries `permissions_status`,
+/// and that is the record this list is only a view of.
 ///
 /// A row whose `reason` this build cannot parse is skipped, which is the correct answer for
 /// both cases that produce one: an access-token row that carries no reason at all, and a

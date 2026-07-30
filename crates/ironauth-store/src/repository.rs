@@ -412,9 +412,9 @@ impl<'a> ScopedStore<'a> {
 
     /// The read-only role-to-permission mapping repository for this scope on the
     /// DATA plane (issue #98). Migration 0092 grants the data-plane SELECT on
-    /// `org_role_permissions` (and nothing else): it is the join a later PR's
+    /// `org_role_permissions` (and nothing else): it is the join the
     /// effective-permission resolution performs once the effective ROLE set is
-    /// known, on the token-issuance path. There is deliberately no MUTATING
+    /// known, on the token-issuance path (LIVE since issue #98 PR 13). There is deliberately no MUTATING
     /// data-plane counterpart and no INSERT, UPDATE, or DELETE grant of any shape: a
     /// data plane able to decide which capabilities a role grants is a data plane
     /// able to write its own token claim.
@@ -33760,7 +33760,7 @@ impl PermissionRepo<'_> {
     ///
     /// This list is PAGE-size clamped like every management list. There is NO cap on
     /// how many permissions an environment may define: the covenant forbids one, and
-    /// the byte budget a later PR of issue #98 adds bounds one TOKEN, never this
+    /// the byte budget issue #98 ships bounds one TOKEN, never this
     /// table.
     ///
     /// # Errors
@@ -34442,7 +34442,7 @@ impl OrgGroupRepo<'_> {
 ///      `a_soft_deleted_organization_resolves_to_no_permissions_too` in
 ///      `crates/ironauth-store/tests/effective_permissions.rs` hold the same
 ///      property for the fourth projection at the store layer, which is the only
-///      layer it has until a later PR of issue #98 wires it into a mint hook.
+///      layer it had until issue #98 PR 13 wired it into both mint hooks.
 ///   5. The `effective_roles` arm. It is the AUTHORITATIVE definition of which roles
 ///      a membership effectively holds, and it is deliberately here rather than in a
 ///      projection: [`EFFECTIVE_ROLE_SLUGS_TAIL`] is now nothing but a projection of
@@ -38666,7 +38666,7 @@ impl ActingOrgRoleRepo<'_> {
 /// repository or in migration 0091. An environment may define as many permissions as
 /// it likes: the advisory-lock-plus-COUNT registration gate used elsewhere in this
 /// module is deliberately NOT replicated here (a project covenant). The byte and
-/// count budget a later PR of issue #98 adds bounds ONE TOKEN and never this table.
+/// count budget issue #98 ships bounds ONE TOKEN and never this table.
 ///
 /// # Write-side survivor census (read before deleting a predicate here)
 ///
@@ -40021,7 +40021,7 @@ impl ActingOrgMembershipRoleRepo<'_> {
 /// There is no count cap, quota, or paywall gate anywhere in this repository or in
 /// migration 0092. A role may carry unlimited permissions and a permission may be
 /// carried by unlimited roles, in both directions (a project covenant). The byte and
-/// count budget a later PR of issue #98 adds bounds ONE TOKEN and never this table.
+/// count budget issue #98 ships bounds ONE TOKEN and never this table.
 ///
 /// # Write-side survivor census (read before deleting a predicate here)
 ///

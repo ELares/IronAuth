@@ -6,6 +6,103 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The `permissions` and `permissions_status` access-token claims** (issue #98, PR 13, the
+  ACTIVATION change). Everything issue #98 shipped before this was inert or admin only; this
+  is where a token changes shape. `permissions` carries the subject's effective API
+  capability set on the RFC 9068 `at+jwt` ACCESS token only, resolved FRESH at BOTH mint
+  hooks (the code exchange and the refresh grant) and frozen nowhere, so a capability
+  granted or withdrawn since the code was minted is reflected on the next token and the
+  exposure of a revocation is ONE ACCESS TOKEN LIFETIME rather than one refresh-family
+  lifetime. Only `org_id` freezes onto the grant; roles and permissions deliberately do not.
+  A resource server can distinguish exactly three states: NEITHER claim (no organization
+  context, or a target whose audiences did not unanimously opt in), `permissions: []` (in an
+  organization, holding nothing), and `permissions_status` (the set was WITHHELD for a
+  budget reason, and the value says whether to fall back to `roles` or to consult a policy
+  decision point). The two claims are mutually exclusive by construction: the emitter takes
+  a three-variant `PermissionClaim`, which has no variant carrying a partial set, so a
+  truncated claim is unrepresentable rather than merely unconfigured.
+- **The audience opt-in is UNANIMITY OR SUPPRESS.** `AccessTokenTarget` gains
+  `permission_claims`, folded with AND across the targeted resource servers beside the
+  existing format-unanimity and shortest-TTL folds. A token targeting a mix of opted-in and
+  opted-out audiences carries no permission claim, and carries no `permissions_status`
+  either: the suppression is a CONFIGURATION fact rather than an overflow, and the opted-in
+  resource server can determine it from its own opt-in state plus `aud`. Emitting anyway
+  would be a cross-audience privilege leak; refusing with `invalid_target` would be a
+  behaviour change to a shipped path. The no-resource branch is `false` BY CONSTRUCTION (it
+  reads no resource-server row), which is what keeps the device, client-credentials and
+  jwt-bearer grants permission-free without any of them knowing about the feature.
+- **The budget is now enforced, and it measures rather than estimates.** `mint_access`
+  serializes the claims twice on the (rare) path where a set is in play, computing the EXACT
+  compact-token length from the same protected-header builder and signature width the
+  signing core uses, and retains the bytes it measured so nothing is serialized a third
+  time. Past the bound the complete claim is WITHHELD and `permissions_status` ships in its
+  place: issuance is never refused, nothing is truncated, and no error is returned. When the
+  roles-only token that actually ships is ITSELF over the byte budget a distinct
+  `roles_only_still_oversize` event is recorded beside the withholding and deliberately not
+  acted on, because the role set is uncapped by covenant (issue #97).
+- **Both hooks record the verdict**, through one shared function so the two grants cannot
+  report the same verdict differently. This closes a pre-existing blindness: the sink had
+  only ever seen code exchanges, so the refresh grant, the highest-volume grant in the
+  product, has been unobserved until now. A comfortable mint records NOTHING, so this is not
+  a write per issuance; only an approach, a withholding, and the oversize-fallback case
+  write a row.
+- **Both claim names join `PROTECTED_ACCESS_TOKEN_CLAIMS`**, for two DIFFERENT reasons.
+  `permissions` is an authorization claim, so a self-asserted one is a privilege escalation.
+  `permissions_status` grants nothing, but forging its ABSENCE or a weaker value downgrades
+  the resource server's behaviour by convincing it a withheld set was simply empty. Both are
+  proved through the real forgery paths (the OIDC Core 5.5 `claims` bag and a client's
+  stored `custom_token_claims`) rather than asserted from the denylist.
+- Fails CLOSED on both hooks: a store fault is a `server_error`, never a 200 with the claim
+  missing, because under `roles_only` a quiet drop would make the request succeed with the
+  WRONG authority rather than fail loudly. Both resolutions run before the atomic redeem, so
+  a fault burns neither a code nor a refresh family. `resolve_effective_permissions` also
+  refuses an unparsable recorded identifier, and its doc says plainly that those two arms are
+  UNREACHABLE from either hook rather than claiming an enforcement they do not perform:
+  `resolve_effective_roles` runs first, on the same line, with the same inputs, and refuses
+  on exactly those parses. They are kept as a local fail-closed default so the function is
+  not sound only by virtue of its caller's ordering.
+- **The permission resolution is gated on the token FORMAT as well as the opt-in.** The gate
+  is `AccessTokenTarget::emits_permission_claims`, `at+jwt` AND the unanimous opt-in, so an
+  OPAQUE resource server that is opted in performs no permission resolution at all. That
+  combination is reachable through a config promotion (the management API refuses it, the
+  promotion engine writes both columns in one statement with no handler in the path), and
+  the threat model calls it INERT. Gating on the opt-in alone made that word not quite true:
+  the resolution ran and its answer was discarded, so a fault in that read turned a
+  documented no-op into a 500 that the same request without the opt-in survived, and every
+  opaque exchange paid a wasted round trip.
+  `an_opaque_target_runs_no_permission_resolution_at_all` measures it under fault injection.
+- `PermissionStatus::as_str` now DELEGATES to `ironauth_config::PermissionOverflow::permissions_status`
+  so the two wire strings are spelled in exactly one place, which the management plane
+  (which cannot see the OIDC type) reads from as well.
+- Issues #416 and #422 are DISCHARGED: the inert markers and the `#![allow(dead_code)]` on
+  the budget core and the recorder are gone, because both are now called from the mint. The
+  sweep covers every marker in the tree and not only the two `#![allow]`s, including one
+  that reached the SHIPPED public API document: the `DiagnosticsWarningsList` description
+  said the token carries `permissions_status` "once the mint is wired", and that sentence
+  is regenerated into `docs/openapi/management.json` and
+  `packages/admin-spa/src/api/management.gen.ts`. Migration headers 0091, 0092, 0094 and
+  0095 still carry theirs and are deliberately LEFT: `migrate.rs` checksums each migration's
+  SQL text with SHA-256 and refuses to proceed on drift from the recorded ledger value, and
+  the checksum is over the whole text including comments, so editing a comment in an
+  already-applied migration is a startup failure for every existing deployment.
+- Three documented behaviours the suite did not pin are now pinned, each by one assertion.
+  The REFRESH hook records its own budget row, counted rather than merely present, since the
+  exchange that issued the refresh token already wrote one
+  (`the_refresh_grant_records_its_own_budget_verdict`). A COUNT overflow reports the size of
+  the token that SHIPPED, asserted against the byte length of the real compact token the
+  exchange returned, so neither a payload-length measurement nor a placeholder passes. And
+  the `roles_only_still_oversize` row is actually observed, reached with an unreachably
+  small `access_token_max_bytes` behind an element overflow that settles the withholding
+  first (both in
+  `a_count_overflow_reports_the_shipped_token_size_and_flags_an_oversize_fallback`).
+- The UNANIMITY fold is now driven over every ordering, plus duplicate listings
+  (`[IN, OUT]`, `[OUT, IN]`, `[IN, OUT, IN]`, `[OUT, IN, IN]`), each asserting the opted-out
+  audience really is in `aud`. One ordering was not enough: replacing the fold with a
+  last-wins assignment passes an opted-out-LAST ordering and mints the claim on an
+  opted-in-last one, which is the cross-audience leak the fork exists to prevent. The
+  duplicate listings pin the fold's placement BEFORE the audience de-duplication, which the
+  code comment asserted and nothing measured.
+
 - `record_permission_budget_event`, the permission-budget recorder (issue #98, PR 12), in
   `policy_trace` beside `record_token_size_event`. It writes an `access_token` row into the
   token size event sink carrying the migration 0095 dimensions, and it is the FIRST
@@ -24,7 +121,7 @@ range per docs/RELEASING.md.
   `the_recorder_threads_the_configured_retention` measures that threading through a real
   `DiagnosticsConfig` on a manual clock rather than leaving it to the store-side test that
   passes a literal window. That pruning is acceptable ONLY because the token itself carries
-  `permissions_status` once the mint is wired, making the durable record the wire contract
+  `permissions_status`, making the durable record the wire contract
   and this row the operator's convenience view; the sharpest case is stated outright rather
   than derived, namely that `retention_secs = 0` is a valid posture under which this sink
   holds at most ONE budget row per scope. Recording stays
@@ -45,8 +142,9 @@ range per docs/RELEASING.md.
   negative half of the corpus being vacuous. The corpus no longer claims a destructuring
   "enforces" the caller guarantee (it does not: the struct literal beside it already fails to
   compile on a new field, so the destructuring was a no-op) and no longer claims anything
-  "proves no sentinel can reach" a `&str`. INERT on this build: nothing calls the recorder;
-  the mint hooks land in a later PR of issue #98 and issue #422 tracks removing the markers.
+  "proves no sentinel can reach" a `&str`. The recorder was INERT when that PR landed; the
+  mint hooks wired it on both grants in PR 13 (the entry at the top of this file), which is
+  where issue #422's markers were removed.
 
 - Char-boundary panic in query percent-decoding (issue #419): `percent_decode` sliced
   a `str` at the constant `value[i + 1..i + 3]` behind a byte-LENGTH check, so a `%`
