@@ -30633,7 +30633,13 @@ impl ActingInvitationRepo<'_> {
                             // `revoke_membership_attachments`.
                             if live.revived {
                                 revoke_membership_attachments_audited(
-                                    tx, store, scope, &acting, env, &live.id, now_micros,
+                                    tx,
+                                    store,
+                                    scope,
+                                    &acting,
+                                    env,
+                                    &live.record.id,
+                                    now_micros,
                                 )
                                 .await?;
                             }
@@ -30645,7 +30651,7 @@ impl ActingInvitationRepo<'_> {
                                     acting: &acting,
                                     env,
                                     action: Action::OrganizationMembershipAdd,
-                                    target: &live.id,
+                                    target: &live.record.id,
                                 },
                                 None,
                             )
@@ -32153,6 +32159,43 @@ pub struct IdempotencyWrite<'a> {
     pub response_status: u16,
     /// The body the caller is about to return, stored for verbatim replay.
     pub response_body: &'a str,
+}
+
+/// A pending Idempotency-Key record whose stored body is only KNOWABLE once the write
+/// has run, because the write RESOLVES which row it lands on (issue #395).
+///
+/// [`IdempotencyWrite`] carries a body the caller already serialized, which is correct
+/// whenever the caller knows the resulting resource before the write executes. A
+/// revive-or-insert does not have that property: it can land on an EXISTING
+/// soft-deleted row, keeping that row's ORIGINAL id and creation time and, when the
+/// re-add supplied none, its existing metadata. A body serialized up front from
+/// REQUEST state therefore describes a resource that was never persisted: a phantom
+/// id no endpoint resolves, and two fields that disagree with every read of the row.
+/// It is a phantom twice over, because it is both what the create returns and what
+/// every replay of that Idempotency-Key returns forever after.
+///
+/// The body is therefore a BUILDER the store calls with the ROW the write actually
+/// resolved, inside the same transaction as the write, so the stored response and the
+/// row it describes commit together and agree. The caller renders its own response
+/// from the same returned row, so the 201 and its replays are the same bytes.
+pub struct ResolvedIdempotencyWrite<'a> {
+    /// The acting credential's audit-actor id (the isolation key here).
+    pub credential_ref: &'a str,
+    /// The client-supplied Idempotency-Key header value.
+    pub key: &'a str,
+    /// Hash of the request (method, path, body).
+    pub request_fingerprint: &'a str,
+    /// The status the caller is about to return.
+    pub response_status: u16,
+    /// Renders the body to store from the membership the write RESOLVED, as persisted
+    /// (the revived row, or the freshly inserted one). A serialization failure
+    /// surfaces as a decode error and rolls the whole transaction back, so a body
+    /// that cannot be rendered never commits a half-written membership.
+    /// `Sync` because the write it feeds is held across an await inside an axum
+    /// handler whose future must be `Send`, and a shared reference is `Send` only
+    /// when its referent is `Sync`.
+    pub response_body:
+        &'a (dyn Fn(&OrgMembershipRecord) -> Result<String, serde_json::Error> + Sync),
 }
 
 /// A tenant row (management plane).
@@ -38083,20 +38126,32 @@ impl ActingOrgMembershipRepo<'_> {
     /// EXACTLY ONE live membership, or returns [`StoreError::Conflict`] when a live one
     /// already exists. The partial unique index over live rows makes that structural.
     ///
+    /// Because a revive keeps the EXISTING row, `spec` describes the row this
+    /// INSERTS, not necessarily the one it RESOLVES: this returns the resolved row AS
+    /// PERSISTED and the caller must report THAT and never its own request state
+    /// (issues #395 and #435). The id is the visible case, since a minted id resolves
+    /// nowhere, but `created_at` and `metadata` diverge on a revive just as
+    /// concretely: the revive keeps the original creation time, and it keeps the
+    /// existing metadata whenever the re-add supplied none. The idempotency record
+    /// takes the same discipline, which is why it is a [`ResolvedIdempotencyWrite`]:
+    /// its body is rendered from that resolved row inside this transaction, so a
+    /// replay can never serve a resource that no read agrees with.
+    ///
     /// # Errors
     ///
     /// [`StoreError::NotFound`] if any id is not in this scope;
     /// [`StoreError::Conflict`] if the user is already a live member of the organization;
     /// [`StoreError::IdempotencyConflict`] on a concurrent Idempotency-Key race;
     /// [`StoreError::Database`] on a persistence failure (including a nonexistent
-    /// organization or user, which surfaces as the foreign-key violation).
+    /// organization or user, which surfaces as the foreign-key violation, and a
+    /// response body that fails to render).
     pub async fn create(
         &self,
         env: &Env,
         spec: NewMembership<'_>,
         created_at_micros: i64,
-        idempotency: Option<IdempotencyWrite<'_>>,
-    ) -> Result<OrgMembershipId, StoreError> {
+        idempotency: Option<ResolvedIdempotencyWrite<'_>>,
+    ) -> Result<OrgMembershipRecord, StoreError> {
         if spec.id.scope() != self.scope
             || spec.organization_id.scope() != self.scope
             || spec.user_id.scope() != self.scope
@@ -38137,7 +38192,7 @@ impl ActingOrgMembershipRepo<'_> {
                 scope,
                 &self.acting,
                 env,
-                &live.id,
+                &live.record.id,
                 created_at_micros,
             )
             .await?;
@@ -38150,14 +38205,19 @@ impl ActingOrgMembershipRepo<'_> {
                 acting: &self.acting,
                 env,
                 action: Action::OrganizationMembershipAdd,
-                target: &live.id,
+                target: &live.record.id,
             },
             None,
         )
         .await?;
-        insert_idempotency(&mut tx, idempotency).await?;
+        // The stored response is rendered from the ROW this RESOLVED, not from the
+        // request, so a replay of a re-add serves the revived row's real id, real
+        // creation time and real metadata (issues #395 and #435). Same transaction as
+        // the write: the response and the row it describes commit together or not at
+        // all.
+        insert_resolved_idempotency(&mut tx, idempotency, &live.record).await?;
         tx.commit().await?;
-        Ok(live.id)
+        Ok(live.record)
     }
 
     /// Remove a membership (soft delete) in this scope and audit
@@ -41961,8 +42021,8 @@ fn metadata_json_opt(metadata: Option<&serde_json::Value>) -> Result<Option<Stri
 
 /// Insert a fresh membership OR revive a soft-deleted one for `(organization, user)`
 /// in `scope`, inside the caller's open transaction, returning the resulting LIVE
-/// membership id (issue #94). Shared by the admin add and the invitation-accept side
-/// effect so both behave identically.
+/// membership ROW as it was persisted (issue #94). Shared by the admin add and the
+/// invitation-accept side effect so both behave identically.
 ///
 /// A soft-deleted row is REVIVED first (`deleted_at` back to NULL, state to active),
 /// so remove is reversible and no second row accumulates. If none is dead, a fresh
@@ -41984,14 +42044,22 @@ async fn insert_or_revive_membership(
     // NOT NULL`, so a concurrent create that already revived it re-reads a live row
     // here (zero rows) and falls through to the insert, which then conflicts: exactly
     // one create ever revives or inserts the single live row.
-    let revived = sqlx::query(
+    //
+    // Both arms RETURN the read projection rather than the bare id, so the caller
+    // holds the row AS PERSISTED (issue #435). On a revive that row is not derivable
+    // from the request: `created_at` is the ORIGINAL creation time (this UPDATE never
+    // touches it) and `metadata` is the existing value whenever the re-add omitted
+    // its own (the COALESCE keeps it). Decoding both arms through
+    // `org_membership_from_row`, the same function every read uses, is what makes a
+    // create response and a subsequent GET the same object by construction.
+    let revived = sqlx::query(&format!(
         "UPDATE org_memberships SET deleted_at = NULL, state = 'active', \
              metadata = COALESCE($1::jsonb, metadata), \
              updated_at = TIMESTAMPTZ 'epoch' + ($2::text || ' microseconds')::interval \
          WHERE tenant_id = $3 AND environment_id = $4 \
          AND organization_id = $5 AND user_id = $6 AND deleted_at IS NOT NULL \
-         RETURNING id",
-    )
+         RETURNING {ORG_MEMBERSHIP_SELECT_COLUMNS}"
+    ))
     .bind(metadata)
     .bind(now_micros)
     .bind(scope.tenant().to_string())
@@ -42002,7 +42070,7 @@ async fn insert_or_revive_membership(
     .await?;
     if let Some(row) = revived {
         return Ok(LiveMembership {
-            id: OrgMembershipId::parse_in_scope(&row.get::<String, _>("id"), &scope)?,
+            record: org_membership_from_row(&row, &scope)?,
             revived: true,
         });
     }
@@ -42012,18 +42080,18 @@ async fn insert_or_revive_membership(
     // already-member conflict). Using ON CONFLICT rather than catching a raw unique
     // violation keeps the surrounding transaction USABLE (a raw constraint error would
     // abort it), which the accept path relies on to continue after a no-op.
-    let inserted = sqlx::query(
+    let inserted = sqlx::query(&format!(
         "INSERT INTO org_memberships \
          (id, tenant_id, environment_id, organization_id, user_id, \
           state, metadata, created_at, updated_at) \
-         VALUES ($1, $2, $3, $4, $5, 'active', COALESCE($6::jsonb, '{}'::jsonb), \
+         VALUES ($1, $2, $3, $4, $5, 'active', COALESCE($6::jsonb, '{{}}'::jsonb), \
                  TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval, \
                  TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval) \
          ON CONFLICT (tenant_id, environment_id, organization_id, user_id) \
              WHERE deleted_at IS NULL \
          DO NOTHING \
-         RETURNING id",
-    )
+         RETURNING {ORG_MEMBERSHIP_SELECT_COLUMNS}"
+    ))
     .bind(new_id.to_string())
     .bind(scope.tenant().to_string())
     .bind(scope.environment().to_string())
@@ -42034,8 +42102,8 @@ async fn insert_or_revive_membership(
     .fetch_optional(&mut **tx)
     .await?;
     match inserted {
-        Some(_) => Ok(LiveMembership {
-            id: *new_id,
+        Some(row) => Ok(LiveMembership {
+            record: org_membership_from_row(&row, &scope)?,
             revived: false,
         }),
         // A live membership already exists (the insert conflicted and did nothing).
@@ -42055,14 +42123,57 @@ async fn insert_or_revive_membership(
 /// rather than something a caller can silently not make. See
 /// [`revoke_membership_attachments`] for what the callers do with it and why all of
 /// them must.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct LiveMembership {
-    /// The id of the LIVE membership that now exists: the revived row's original id,
-    /// or the freshly inserted one.
-    id: OrgMembershipId,
+    /// The LIVE membership that now exists, AS PERSISTED: the revived row (its
+    /// original id, original `created_at` and, when the re-add supplied none, its
+    /// existing metadata), or the freshly inserted one. Read back from the write's
+    /// own `RETURNING`, so nothing here is a restatement of the request (issue #435).
+    record: OrgMembershipRecord,
     /// Whether an existing soft-deleted row was brought back (as opposed to a fresh
     /// row being inserted).
     revived: bool,
+}
+
+/// Insert the pending Idempotency-Key row for a write whose stored body is only
+/// knowable once the write has RESOLVED which row it landed on (issue #395), if the
+/// caller supplied one. A no-op when they did not.
+///
+/// Rendering and inserting are ONE function on purpose. Split across two, a record
+/// and its rendered body are separate values that a later edit could desynchronize:
+/// a present record paired with an absent body would insert NO idempotency row, the
+/// mutation would still commit, and a replay would re-execute it instead of serving
+/// the original response. Here the body is rendered from the record that is about to
+/// be inserted, so the two cannot come apart.
+///
+/// A body that fails to render surfaces as a decode error, which propagates out of
+/// the caller's transaction and rolls it back: the membership row, any attachment
+/// revocations and the audit row written before this point all go with it, so
+/// nothing half-written and no unbacked idempotency record ever commits.
+async fn insert_resolved_idempotency(
+    tx: &mut Transaction<'_, Postgres>,
+    idempotency: Option<ResolvedIdempotencyWrite<'_>>,
+    resolved: &OrgMembershipRecord,
+) -> Result<(), StoreError> {
+    let Some(idem) = idempotency else {
+        return Ok(());
+    };
+    let body = (idem.response_body)(resolved).map_err(|error| {
+        StoreError::Database(sqlx::Error::Decode(
+            format!("idempotent response is not serializable: {error}").into(),
+        ))
+    })?;
+    insert_idempotency(
+        tx,
+        Some(IdempotencyWrite {
+            credential_ref: idem.credential_ref,
+            key: idem.key,
+            request_fingerprint: idem.request_fingerprint,
+            response_status: idem.response_status,
+            response_body: &body,
+        }),
+    )
+    .await
 }
 
 /// Insert a pending idempotency row, if the caller supplied one. A primary-key

@@ -12,14 +12,16 @@
 //! none. Cross-tenant and cross-environment isolation is exercised in the IDOR
 //! harness (tests/idor.rs).
 
+use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
     ActorRef, CorrelationId, InvitationCredentialType, MintedInvitationToken, NewAdminUser,
-    NewInvitation, NewMembership, OrgMembershipId, OrganizationId, OrganizationState, Scope,
-    ServiceId, StoreError, UserId, UserState, mint_invitation_token,
+    NewInvitation, NewMembership, OrgMembershipId, OrgMembershipRecord, OrganizationId,
+    OrganizationState, ResolvedIdempotencyWrite, Scope, ServiceId, StoreError, UserId, UserState,
+    mint_invitation_token,
 };
 use sqlx::Row;
 
@@ -118,6 +120,9 @@ async fn add_member(
             None,
         )
         .await
+        // The create returns the RESOLVED row (issues #395, #435); these helpers only
+        // want its id.
+        .map(|record| record.id)
 }
 
 /// The audit actions recorded against `target_id` in `scope`, in order.
@@ -844,5 +849,151 @@ async fn accept_when_already_a_live_member_writes_no_second_add_audit() {
         membership_add_count(&db, scope).await,
         adds_before,
         "an accept for an already-live member writes no second membership-add audit"
+    );
+}
+
+/// A body renderer that cannot succeed: a map with a non-string key is not
+/// representable as JSON, so `serde_json` refuses it. (A float NaN would NOT do: it
+/// serializes to `null`.) Stands in for any future response type whose serialization
+/// can fail.
+fn unrenderable_body(_resolved: &OrgMembershipRecord) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&BTreeMap::from([((1_u8, 2_u8), 3_u8)]))
+}
+
+/// Every membership row in `scope`, INCLUDING soft-deleted ones (which the repository
+/// reads deliberately cannot see), so a rollback check cannot be fooled by a row that
+/// merely reads as absent.
+async fn membership_row_count(db: &TestDatabase, scope: Scope) -> i64 {
+    sqlx::query(
+        "SELECT COUNT(*) AS n FROM org_memberships \
+         WHERE tenant_id = $1 AND environment_id = $2",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("count membership rows")
+    .get::<i64, _>("n")
+}
+
+/// The response body stored under an Idempotency-Key, or `None` when no record was
+/// committed for it.
+async fn stored_idempotent_body(
+    db: &TestDatabase,
+    credential_ref: &str,
+    key: &str,
+) -> Option<String> {
+    sqlx::query(
+        "SELECT response_body FROM idempotency_keys \
+         WHERE credential_ref = $1 AND idempotency_key = $2",
+    )
+    .bind(credential_ref)
+    .bind(key)
+    .fetch_optional(db.owner_pool())
+    .await
+    .expect("read stored response")
+    .map(|row| row.get::<String, _>("response_body"))
+}
+
+/// Add `user` to `org` under the fixed test Idempotency-Key, storing whatever
+/// `render` makes of the row the write resolves.
+async fn add_member_storing(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    membership: (&OrgMembershipId, &OrganizationId, &UserId),
+    render: &(dyn Fn(&OrgMembershipRecord) -> Result<String, serde_json::Error> + Sync),
+) -> Result<OrgMembershipRecord, StoreError> {
+    let (id, org, user) = membership;
+    db.control_store()
+        .management()
+        .acting(actor(env), CorrelationId::generate(env))
+        .org_memberships(scope)
+        .create(
+            env,
+            NewMembership {
+                id,
+                organization_id: org,
+                user_id: user,
+                metadata: None,
+            },
+            now_micros(env),
+            Some(ResolvedIdempotencyWrite {
+                credential_ref: "cred-rollback",
+                key: "k-rollback",
+                request_fingerprint: "fp-rollback",
+                response_status: 201,
+                response_body: render,
+            }),
+        )
+        .await
+}
+
+/// The membership add and its Idempotency-Key record commit TOGETHER or not at all
+/// (issues #395, #435). The stored response is rendered from the resolved row inside
+/// the write's own transaction, so a body that cannot be rendered must abort the
+/// whole thing: no membership row, no audit row (both written BEFORE the render), and
+/// above all no idempotency record, because a record that outlived its write would let
+/// a replay serve a response describing a row that does not exist.
+///
+/// The complement matters just as much: an aborted attempt must not POISON the key.
+/// A retry with the SAME Idempotency-Key has to be free to execute, which it can only
+/// be if the failed attempt left nothing behind.
+#[tokio::test]
+async fn a_body_that_cannot_be_rendered_rolls_the_whole_add_back() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let org = create_org(&db, &env, scope, "Rollback").await;
+    let user = create_active_user(&db, &env, scope, "rollback@example.test").await;
+    let adds_before = membership_add_count(&db, scope).await;
+
+    let id = OrgMembershipId::generate(&env, &scope);
+    let failed = add_member_storing(&db, &env, scope, (&id, &org, &user), &unrenderable_body).await;
+    assert!(
+        matches!(failed, Err(StoreError::Database(_))),
+        "an unrenderable body is a persistence failure, not a silent success"
+    );
+
+    // Nothing landed: no membership row (not even a soft-deleted one), and no audit
+    // row, even though both were written BEFORE the render in the same transaction.
+    assert!(
+        !db.control_store()
+            .management()
+            .org_memberships(scope)
+            .exists(&org, &user)
+            .await
+            .expect("exists"),
+        "the membership row rolled back with the transaction"
+    );
+    assert_eq!(membership_row_count(&db, scope).await, 0);
+    assert_eq!(
+        membership_add_count(&db, scope).await,
+        adds_before,
+        "the audit row written before the render rolled back too"
+    );
+
+    // And no idempotency record: a committed one would make every replay of this key
+    // serve a response for a membership that was never created.
+    assert_eq!(
+        stored_idempotent_body(&db, "cred-rollback", "k-rollback").await,
+        None,
+        "no idempotency record outlived its aborted write"
+    );
+
+    // The key is not poisoned: the same one is free to carry a successful retry, which
+    // now stores the body it really rendered.
+    let retry_id = OrgMembershipId::generate(&env, &scope);
+    let created = add_member_storing(&db, &env, scope, (&retry_id, &org, &user), &|resolved| {
+        Ok(resolved.id.to_string())
+    })
+    .await
+    .expect("the retry executes: the aborted attempt reserved nothing");
+    assert_eq!(created.id, retry_id);
+    assert_eq!(
+        stored_idempotent_body(&db, "cred-rollback", "k-rollback").await,
+        Some(retry_id.to_string()),
+        "the stored response describes the row the retry resolved"
     );
 }
