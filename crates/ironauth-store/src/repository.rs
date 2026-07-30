@@ -37275,9 +37275,25 @@ impl ActingTenantRepo<'_> {
     /// Restore a tenant from the GRACE stage of offboarding (issue #46): reverse the
     /// grace delete while it is still INSIDE the configured `retention` window. Clears
     /// the tenant's, its environments', and its management credentials' soft-delete
-    /// tombstones and un-fences every environment's data plane, in one audited
-    /// transaction, so the tenant serves again with NO data loss (the grace delete
-    /// never shredded a key).
+    /// tombstones and returns every environment's data plane to the serving state the
+    /// tenant's OWN lifecycle status entails, in one audited transaction, so the tenant
+    /// serves again with NO data loss (the grace delete never shredded a key).
+    ///
+    /// A restore undoes the DELETE without touching the tenant's LIFECYCLE STATUS
+    /// (issue #432): a tenant that was [`TenantStatus::Suspended`] before the grace
+    /// delete comes back suspended AND still FENCED, because [`serving_state_for`]
+    /// derives the serving state from the surviving status rather than asserting
+    /// `active`. Lifting a suspension is [`ActingTenantRepo::resume`]'s job, and it
+    /// still works on a restored tenant.
+    ///
+    /// That narrowness is claimed for the tenant's own status and for NOTHING else.
+    /// It is NOT claimed for an environment's own deletion: step 3 below clears
+    /// `deleted_at` on EVERY environment of this tenant unconditionally, and step 2
+    /// writes the serving state the TENANT status entails over every one of them, so
+    /// an environment that had been deleted individually before the tenant was ever
+    /// offboarded comes back with the rest. Issue #439 records that case with the
+    /// measurement; it is not introduced here, and
+    /// [`ActingTenantRepo::transition`]'s cascade selects environments the same way.
     ///
     /// State machine: valid only for a tenant in GRACE (soft-deleted, not yet purged)
     /// whose retention window has NOT elapsed. A tenant that was never deleted, was
@@ -37347,20 +37363,50 @@ impl ActingTenantRepo<'_> {
             async move |tx| {
                 let now_micros = epoch_micros(env.clock().now_utc());
                 // 1. Clear the tenant tombstone, guarded on the grace predicate so a
-                //    concurrent purge cannot be undone.
-                let result = sqlx::query(
+                //    concurrent purge cannot be undone. RETURNING the surviving
+                //    lifecycle status in the same statement, so the serving state
+                //    written below is derived from the status this very restore
+                //    committed. A separate in-transaction SELECT would read the same
+                //    value (this UPDATE has already row-locked the tuple, so no
+                //    concurrent writer can change it under us); RETURNING is simply
+                //    one round trip and one place to get the predicate right instead
+                //    of two.
+                let restored = sqlx::query(
                     "UPDATE tenants SET deleted_at = NULL \
                      WHERE id = $1 AND operator_id = $2 \
-                     AND deleted_at IS NOT NULL AND purged_at IS NULL",
+                     AND deleted_at IS NOT NULL AND purged_at IS NULL \
+                     RETURNING status",
                 )
                 .bind(id.to_string())
                 .bind(operator.to_string())
-                .execute(&mut **tx)
+                .fetch_optional(&mut **tx)
                 .await?;
-                if result.rows_affected() == 0 {
+                let Some(restored) = restored else {
                     return Err(StoreError::NotFound);
-                }
-                // 2. Per environment: un-fence the data plane and clear the grace
+                };
+                // The tenant's OWN lifecycle status decides whether its data plane
+                // serves (issue #432). A restore undoes the DELETE without touching the
+                // status: a tenant that was SUSPENDED before the grace delete is still
+                // suspended after it, so it must come back FENCED, as its status says.
+                // Writing a literal `active` here instead left `tenants.status =
+                // suspended` (what a subsequent tenant READ reports, `GET
+                // /v1/tenants/{id}` included) disagreeing with a serving data plane,
+                // silently un-enforcing the suspension; only an explicit resume lifts
+                // it.
+                //
+                // The unparseable-status arm below is DEFENSE IN DEPTH, not a
+                // reachable path: `tenants.status` carries the `tenants_status_valid`
+                // CHECK constraint (migration 0030_tenant_lifecycle.sql), which admits
+                // only the two values `TenantStatus::from_wire` parses, so the state it
+                // refuses cannot exist while that constraint stands. It is deliberately
+                // NOT covered by a test, because manufacturing it means dropping the
+                // constraint. If a migration ever widened the column, this refuses the
+                // whole restore fail closed (the transaction rolls back) rather than
+                // guessing a serving state for a status it does not know.
+                let status = TenantStatus::from_wire(&restored.get::<String, _>("status"))
+                    .ok_or(StoreError::NotFound)?;
+                let serving_status = serving_status_str(serving_state_for(status));
+                // 2. Per environment: restore the data-plane serving state and clear the grace
                 //    delete's credential tombstones, re-scoping to each environment
                 //    for the forced row-level security on management_credentials and
                 //    environment_states.
@@ -37382,16 +37428,27 @@ impl ActingTenantRepo<'_> {
                     .bind(&env_id)
                     .execute(&mut **tx)
                     .await?;
+                    // Only the ON CONFLICT arm ever runs on THIS path: a grace delete
+                    // is a precondition of a restore (the guarded UPDATE above
+                    // requires `deleted_at IS NOT NULL`), and `ActingTenantRepo::delete`
+                    // upserts a fence row for every environment this same query
+                    // returns, so the row is always already there. The upsert form is
+                    // kept because it is the honest shape and because
+                    // `EXCLUDED.serving_status` reads the bound parameter out of the
+                    // VALUES clause. For the same reason a mutant on that clause is NO
+                    // evidence the INSERT arm runs: the conflict arm reads it too.
                     sqlx::query(
                         "INSERT INTO environment_states \
                          (tenant_id, environment_id, serving_status, updated_at) \
-                         VALUES ($1, $2, 'active', \
-                                 TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval) \
+                         VALUES ($1, $2, $3, \
+                                 TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval) \
                          ON CONFLICT (tenant_id, environment_id) DO UPDATE \
-                         SET serving_status = 'active', updated_at = EXCLUDED.updated_at",
+                         SET serving_status = EXCLUDED.serving_status, \
+                             updated_at = EXCLUDED.updated_at",
                     )
                     .bind(id.to_string())
                     .bind(&env_id)
+                    .bind(serving_status)
                     .bind(now_micros)
                     .execute(&mut **tx)
                     .await?;
@@ -42220,6 +42277,28 @@ fn is_idempotency_conflict(error: &sqlx::Error) -> bool {
 /// offboarding retention window.
 fn retention_micros(retention: Duration) -> i64 {
     i64::try_from(retention.as_micros()).unwrap_or(i64::MAX)
+}
+
+/// The data-plane serving state a live tenant's lifecycle status ENTAILS (issue
+/// #432): active serves, suspended is fenced. The mapping is total and written as an
+/// exhaustive match rather than a condition, so a third [`TenantStatus`] variant
+/// breaks the build here (and must state its serving posture) instead of silently
+/// defaulting a new status into a serving data plane.
+///
+/// Deletion is a separate dimension and is NOT expressible here. For the TENANT's own
+/// deletion the two compose cleanly: an offboarded tenant is fenced by
+/// [`ActingTenantRepo::delete`] writing the fence directly, and stays fenced until a
+/// restore, which asks this function what the surviving status entails.
+///
+/// An ENVIRONMENT's own deletion does not compose that way, and this function does not
+/// claim it does: the only input is the TENANT status, so whatever it returns is
+/// written over every environment of that tenant, including one that was deleted
+/// individually beforehand. Issue #439 records that case with the measurement.
+fn serving_state_for(status: TenantStatus) -> EnvironmentServingState {
+    match status {
+        TenantStatus::Active => EnvironmentServingState::Active,
+        TenantStatus::Suspended => EnvironmentServingState::Suspended,
+    }
 }
 
 /// The stored `serving_status` wire string for a data-plane serving state (issue

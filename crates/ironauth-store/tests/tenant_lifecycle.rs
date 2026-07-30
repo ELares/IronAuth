@@ -13,11 +13,20 @@
 //!   recorded on create, read back, and immutable (the control role's grant
 //!   excludes them, so a rewrite is refused);
 //! - the data-plane FENCE: a suspended tenant's scope reads as fenced and a resumed
-//!   one reads as served again, with no data loss;
+//!   one reads as served again, with no data loss, and a SECOND suspension fences it
+//!   again (the cascade's upsert conflict arm, which one suspend and one resume
+//!   cannot tell apart from a fixed value);
 //! - the OFFBOARDING PIPELINE: a grace delete fences the tenant but keeps its keys
 //!   INTACT (restorable, no data loss); the retention window gates restore and hard
 //!   delete under a manual clock; only the terminal HARD DELETE crypto-shreds the
 //!   envelope KEK, permanently, while a sibling tenant is unaffected;
+//! - a RESTORE undoes the delete WITHOUT touching the tenant's lifecycle status
+//!   (issue #432): a tenant that was suspended before the grace delete comes back
+//!   still suspended AND still fenced, so a tenant READ and the data plane agree,
+//!   while an active one serves again. Narrower claims than they look: the restore
+//!   ENDPOINT's 200 body is a literal (#438 records it) and an environment deleted
+//!   on its own is still revived by a tenant restore (#439 records it), neither of
+//!   which this suite covers;
 //! - cross-tenant isolation and audited transitions.
 
 use std::sync::Arc;
@@ -460,6 +469,52 @@ async fn the_fence_spans_every_environment_of_a_tenant() {
 }
 
 #[tokio::test]
+async fn a_resumed_tenant_is_fenced_again_when_suspended_a_second_time() {
+    // Pins the UPSERT'S CONFLICT ARM in the lifecycle cascade, which nothing else
+    // asserted on. A fresh tenant has no `environment_states` row, so its FIRST
+    // transition takes the INSERT arm and every later one takes `ON CONFLICT ... DO
+    // UPDATE`. The other fence tests stop after one resume, and the value a correct
+    // resume writes ('active') is also the value a conflict arm frozen at a literal
+    // 'active' would write, so they cannot tell the two apart: forcing that arm to
+    // 'active' survives them. A SECOND suspension is the shape that separates them,
+    // because there the two disagree. Across two environments, so the whole cascade
+    // is covered and not just its first row.
+    let fx = Fixture::start().await;
+    let scope = fx.create_tenant(None).await;
+    let tenant = scope.tenant();
+    let scope2 = fx.create_environment(tenant, None).await;
+
+    // First suspension: the INSERT arm, already covered elsewhere.
+    fx.suspend(&tenant).await.expect("first suspend");
+    assert!(fx.serving_state(scope).await.is_fenced());
+    assert!(fx.serving_state(scope2).await.is_fenced());
+
+    // Resume: the CONFLICT arm, writing the state a resume implies.
+    fx.resume(&tenant).await.expect("resume");
+    assert!(!fx.serving_state(scope).await.is_fenced());
+    assert!(!fx.serving_state(scope2).await.is_fenced());
+
+    // Second suspension: the CONFLICT arm again, and this time the state it must
+    // write is NOT the one the previous write left behind.
+    fx.suspend(&tenant).await.expect("second suspend");
+    assert_eq!(
+        fx.status(&tenant).await.expect("status"),
+        TenantStatus::Suspended
+    );
+    assert_eq!(
+        fx.serving_state(scope).await,
+        EnvironmentServingState::Suspended,
+        "a re-suspended tenant is fenced again: the cascade's conflict arm writes the \
+         state the transition implies, not a fixed value"
+    );
+    assert_eq!(
+        fx.serving_state(scope2).await,
+        EnvironmentServingState::Suspended,
+        "and so is every other environment of it"
+    );
+}
+
+#[tokio::test]
 async fn a_grace_deleted_tenant_is_fenced_but_keeps_its_keys_and_is_restorable() {
     let fx = Fixture::start().await;
     let scope = fx.create_tenant(None).await;
@@ -521,6 +576,99 @@ async fn a_grace_deleted_tenant_is_fenced_but_keeps_its_keys_and_is_restorable()
         b"ada@lovelace.test",
         "a restored tenant loses no data"
     );
+}
+
+#[tokio::test]
+async fn a_restore_returns_a_suspended_tenant_to_its_fence() {
+    // A restore undoes the grace DELETE without touching the tenant's lifecycle status
+    // (issue #432). It must not also lift an unrelated SUSPENSION:
+    // `TenantStatus::Suspended` documents that a suspended tenant "is fenced (a
+    // structured refusal) ... and a resume restores service", so a tenant whose
+    // `status` still reads suspended must come back off the data plane. The defect
+    // this pins wrote a literal `active` serving state for every environment, leaving
+    // `tenants.status = suspended` (what a subsequent tenant READ reports) disagreeing
+    // with an unfenced data plane, with no operator action ever having lifted the
+    // suspension.
+    let fx = Fixture::start().await;
+
+    // The CONTROL, taken in the same test so the fence asserted below is attributable
+    // to the suspension rather than to a restore that fences everything: an ACTIVE
+    // tenant, deleted and restored, comes back SERVING. That DIRECTION is not new
+    // here; `a_grace_deleted_tenant_is_fenced_but_keeps_its_keys_and_is_restorable`
+    // already asserts a restored active tenant serves again on its single
+    // environment. What this control adds is the SECOND environment, so the
+    // derivation is controlled across the whole per-environment cascade rather than
+    // on its first row only.
+    let control = fx.create_tenant(None).await;
+    let control_tenant = control.tenant();
+    let control2 = fx.create_environment(control_tenant, None).await;
+
+    // The subject: a suspended tenant, with a SECOND environment so the derivation is
+    // proven across the whole per-environment cascade rather than on one row.
+    let scope = fx.create_tenant(None).await;
+    let tenant = scope.tenant();
+    let scope2 = fx.create_environment(tenant, None).await;
+
+    fx.suspend(&tenant).await.expect("suspend");
+    assert_eq!(
+        fx.status(&tenant).await.expect("status"),
+        TenantStatus::Suspended
+    );
+    assert!(fx.serving_state(scope).await.is_fenced());
+    assert!(fx.serving_state(scope2).await.is_fenced());
+
+    // Grace-delete BOTH, then restore both inside the retention window.
+    fx.delete(&control_tenant).await.expect("delete control");
+    fx.delete(&tenant).await.expect("grace delete");
+    fx.restore(&control_tenant).await.expect("restore control");
+    fx.restore(&tenant).await.expect("restore in window");
+
+    // The control serves again: the restore is not over-fencing.
+    assert_eq!(
+        fx.status(&control_tenant).await.expect("control status"),
+        TenantStatus::Active,
+        "a restored active tenant is active again"
+    );
+    assert!(
+        !fx.serving_state(control).await.is_fenced(),
+        "a restored ACTIVE tenant serves its data plane again"
+    );
+    assert!(
+        !fx.serving_state(control2).await.is_fenced(),
+        "and so does every one of its environments"
+    );
+
+    // The subject stays suspended in the control-plane READ (the one `GET
+    // /v1/tenants/{id}` serves) AND stays fenced on the data plane: the two agree,
+    // which is the property the defect broke. The restore ENDPOINT's own 200 body is
+    // a different surface and still a literal `active`; #438 records that.
+    assert_eq!(
+        fx.status(&tenant).await.expect("status"),
+        TenantStatus::Suspended,
+        "a restore does not silently lift a suspension"
+    );
+    assert!(
+        fx.serving_state(scope).await.is_fenced(),
+        "a restored SUSPENDED tenant stays fenced off the data plane"
+    );
+    assert!(
+        fx.serving_state(scope2).await.is_fenced(),
+        "every environment of the restored suspended tenant stays fenced"
+    );
+
+    // The suspension is lifted only by the explicit RESUME, which still works on the
+    // restored tenant and un-fences every one of its environments, so the fence a
+    // restore preserves is not a permanent one. (Whether a restore loses DATA is a
+    // different property, asserted over sealed PII in
+    // `a_grace_deleted_tenant_is_fenced_but_keeps_its_keys_and_is_restorable`; this
+    // test opens no PII and claims none.)
+    fx.resume(&tenant).await.expect("resume after restore");
+    assert_eq!(
+        fx.status(&tenant).await.expect("status"),
+        TenantStatus::Active
+    );
+    assert!(!fx.serving_state(scope).await.is_fenced());
+    assert!(!fx.serving_state(scope2).await.is_fenced());
 }
 
 #[tokio::test]
