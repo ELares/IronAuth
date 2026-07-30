@@ -168,6 +168,29 @@ function makeGroup(
 const groupA = makeGroup("grp_a", "engineering", "Engineering", null);
 const groupB = makeGroup("grp_b", "platform", "Platform", "grp_a");
 
+// A well formed effective-roles body (issue #98). `permissions` and
+// `permission_budget` are BOTH required by the contract, and the client wrapper
+// refuses a body missing either rather than rendering it as a member who holds
+// nothing, so every effective-roles stub here carries them. The budget defaults to
+// a within-budget verdict over the permissions given; the org-permissions suite is
+// where the overflow and malformed cases live.
+const BUDGET = {
+  permission_count: 0,
+  max_permission_count: 64,
+  warn_permission_count: 48,
+  max_token_bytes: 4096,
+  warn_token_bytes: 3072,
+  approaching: false,
+};
+
+function effective(roles: unknown[], permissions: string[] = []): unknown {
+  return {
+    roles,
+    permissions,
+    permission_budget: { ...BUDGET, permission_count: permissions.length },
+  };
+}
+
 beforeEach(() => {
   setManagementBase(BASE);
   setScope();
@@ -904,7 +927,7 @@ describe("the roles of one member", () => {
   }
 
   it("lists, grants, and withdraws the DIRECT grants by the pair", async () => {
-    const { root, calls } = open({ items: [direct] }, { roles: [] });
+    const { root, calls } = open({ items: [direct] }, effective([]));
     await flush();
 
     const rows = rowsOf(root, "Roles granted directly to the member");
@@ -933,7 +956,7 @@ describe("the roles of one member", () => {
   it("surfaces a more-exist note on the direct grants", async () => {
     const { root } = open(
       { items: [direct], next_cursor: "opaque_mr_2" },
-      { roles: [] },
+      effective([]),
     );
     await flush();
     expect(root.textContent).toContain("More direct role grants exist");
@@ -941,7 +964,7 @@ describe("the roles of one member", () => {
   });
 
   it("re-reads the resolved picture after a grant changes", async () => {
-    const { root, calls } = open({ items: [direct] }, { roles: [] });
+    const { root, calls } = open({ items: [direct] }, effective([]));
     await flush();
     const before = calls.filter((call) =>
       call.url.endsWith("/effective-roles"),
@@ -960,7 +983,7 @@ describe("the roles of one member", () => {
   });
 
   it("reads the effective roles from the documented path", async () => {
-    const { calls } = open({ items: [] }, { roles: [] });
+    const { calls } = open({ items: [] }, effective([]));
     await flush();
     const read = calls.find((call) => call.url.endsWith("/effective-roles"));
     expect(read?.url).toBe(`${ORG}/memberships/omb_a/effective-roles`);
@@ -970,16 +993,10 @@ describe("the roles of one member", () => {
   it("shows the provenance of every grant path, not just the slugs", async () => {
     const { root } = open(
       { items: [] },
-      {
-        roles: [
-          { slug: "billing.admin", source: "direct" },
-          {
-            slug: "support.agent",
-            source: "group",
-            via_group_id: "grp_a",
-          },
-        ],
-      },
+      effective([
+        { slug: "billing.admin", source: "direct" },
+        { slug: "support.agent", source: "group", via_group_id: "grp_a" },
+      ]),
     );
     await flush();
 
@@ -1000,16 +1017,10 @@ describe("the roles of one member", () => {
     // survive by the path that was hidden.
     const { root } = open(
       { items: [] },
-      {
-        roles: [
-          { slug: "billing.admin", source: "direct" },
-          {
-            slug: "billing.admin",
-            source: "group",
-            via_group_id: "grp_a",
-          },
-        ],
-      },
+      effective([
+        { slug: "billing.admin", source: "direct" },
+        { slug: "billing.admin", source: "group", via_group_id: "grp_a" },
+      ]),
     );
     await flush();
 
@@ -1029,7 +1040,7 @@ describe("the roles of one member", () => {
   });
 
   it("says so plainly when a member resolves no roles at all", async () => {
-    const { root } = open({ items: [] }, { roles: [] });
+    const { root } = open({ items: [] }, effective([]));
     await flush();
     expect(root.textContent).toContain("resolves no roles in this organization");
     expect(rowsOf(root, "Effective role grant paths")).toEqual([]);
@@ -1043,7 +1054,7 @@ describe("the roles of one member", () => {
     // to an empty resolved set and reasonably concludes the grants were lost.
     const calls = stubFetch((call) =>
       call.url.endsWith("/effective-roles")
-        ? json({ roles: [] })
+        ? json(effective([]))
         : json({ items: [direct] }),
     );
     const root = mount(
@@ -1060,7 +1071,7 @@ describe("the roles of one member", () => {
   it("explains an empty resolved set when the membership is not active", async () => {
     stubFetch((call) =>
       call.url.endsWith("/effective-roles")
-        ? json({ roles: [] })
+        ? json(effective([]))
         : json({ items: [direct] }),
     );
     const root = mount(
@@ -1123,7 +1134,7 @@ describe("the roles of one member", () => {
   it("does not claim a gate when the member actually resolves roles", async () => {
     const { root } = open(
       { items: [] },
-      { roles: [{ slug: "billing.admin", source: "direct" }] },
+      effective([{ slug: "billing.admin", source: "direct" }]),
     );
     await flush();
     expect(root.textContent).not.toContain("still on file");
@@ -1162,7 +1173,7 @@ describe("the roles and groups panels inside the organization detail", () => {
     };
     stubFetch((call) => {
       if (call.url.endsWith("/memberships/omb_a/effective-roles")) {
-        return json({ roles: [] });
+        return json(effective([]));
       }
       if (call.url.endsWith("/memberships/omb_a/roles")) {
         return json({ items: [grant] });
@@ -1260,16 +1271,12 @@ describe("the roles and groups panels inside the organization detail", () => {
     };
     const calls = stubFetch((call) => {
       if (call.url.endsWith("/memberships/omb_a/effective-roles")) {
-        return json({
-          roles: [
+        return json(
+          effective([
             { slug: "billing.admin", source: "direct" },
-            {
-              slug: "billing.admin",
-              source: "group",
-              via_group_id: "grp_a",
-            },
-          ],
-        });
+            { slug: "billing.admin", source: "group", via_group_id: "grp_a" },
+          ]),
+        );
       }
       if (call.url.endsWith("/organizations/org_a/memberships")) {
         return json({ items: [member] });

@@ -30,6 +30,7 @@ import { ConnectorDetail, ConnectorsList } from "./ui/ConnectorsView";
 import { ClientsList } from "./ui/ClientsView";
 import { OrganizationDetail, OrganizationsList } from "./ui/OrganizationsView";
 import { InvitationsList } from "./ui/InvitationsView";
+import { PermissionsList } from "./ui/PermissionsView";
 import { DiagnosticsView } from "./ui/DiagnosticsView";
 
 // UI state lives in signals (the locked state primitive). `signedIn` flips true
@@ -99,7 +100,11 @@ function SectionView({ label }: { label: string }) {
   );
 }
 
-function Routes() {
+// The route table. EXPORTED so a test can mount it under a chosen URL and assert
+// that a nav section actually resolves to its view: a section listed in SECTIONS
+// with no Route here renders the Overview fallback, which looks like a working
+// console and is not one, and nothing else in the app can observe that.
+export function Routes() {
   return (
     <Router>
       <Route path="/" component={() => <SectionView label="Overview" />} />
@@ -120,6 +125,7 @@ function Routes() {
         path="/organizations/:organizationId"
         component={OrganizationDetail}
       />
+      <Route path="/permissions" component={PermissionsList} />
       <Route path="/invitations" component={InvitationsList} />
       <Route path="/diagnostics" component={DiagnosticsView} />
       <Route default component={() => <SectionView label="Overview" />} />
