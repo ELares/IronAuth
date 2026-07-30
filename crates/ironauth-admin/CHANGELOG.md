@@ -6,6 +6,95 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The role-to-permission attach response now carries a budget verdict** (issue #425, the
+  #98 follow-up): `POST .../organizations/{org}/roles/{role}/permissions` answers 201 with
+  `role_permission_budget` beside the mapping. Issue #98's acceptance criterion asked for an
+  admin-time warning "before overflow occurs" and only the effective-roles READ satisfied it,
+  which meant an operator learned they had crossed a threshold by separately reading the
+  view of some membership that happened to hold the role. The write is where their attention
+  is, and it is the only moment at which the actor, the correlation id and the intent are all
+  present.
+- **`PermissionBudgetView` now carries a REQUIRED `scope` discriminator**, `"role"` on the
+  attach and `"membership"` on the effective-roles read, and that is a breaking addition to
+  the published contract on purpose. The two verdicts were byte-shape identical, so the only
+  thing separating an authoritative answer from a different question was the JSON KEY the
+  object arrived under; an SDK, a console component or a log pipeline handed a bare
+  `PermissionBudgetView` had lost the distinction irrecoverably. A discriminator inside the
+  object travels with it and makes the two carriers non-interchangeable by construction.
+  There is still exactly ONE `PermissionBudgetView::evaluate`, now taking the scope as a
+  parameter, so a caller cannot produce a verdict without stating which set it counted.
+- **The field is named for the set it measures, and the name plus the discriminator are the
+  mitigation, not decoration.** The verdict is computed over THAT ROLE'S OWN live mappings,
+  which is what the write transaction already addresses. The alternative, the resolved set of
+  every affected membership, is the honest question but its blast radius is the whole
+  effective member set of the role, direct and group-inherited through the recursive closure,
+  so it is an unbounded fan-out read on a WRITE and issue #98 refused exactly that shape
+  everywhere else.
+- **CORRECTION, and the reason the paragraph above is worded the way it is.** An earlier
+  draft of this entry, of the field docs, of `docs/openapi/management.json` and of
+  `docs/config-schema.json` said one role's mappings were a LOWER BOUND on any membership's
+  resolved set. That is FALSE. It is a DIFFERENT SET and bounds the membership figure in
+  NEITHER direction, by three measured mechanisms:
+  a soft-deleted PERMISSION is still counted by the role figure while the membership
+  resolution filters it out (measured: attach 3 with `budget_exceeded`, membership 1 with no
+  overflow); a DISABLED organization stays writable on this plane while the resolution
+  closure seeds only on an active one (measured: attach 2 and overflowing, membership 0 with
+  empty roles and permissions); and the figure is a SNAPSHOT taken at the write, so a
+  concurrent DETACH leaves it LONG just as a concurrent attach leaves it short, and an
+  Idempotency-Key REPLAY faithfully reproduces that snapshot by design (measured: a replay
+  reporting 2 and `approaching` against a live count of 1). Every "at least that bad and
+  possibly worse" and every "never the other way" is gone.
+- The verdict is present on the attach 201 ONLY, absent (not null) on every item of the
+  mapping list, because a verdict per listed row would be one count query per item and every
+  row of one page would carry the same number. It is computed BEFORE the insert and reported
+  as that count plus this attach, which is forced BY THE CURRENT `assign()` SIGNATURE rather
+  than by anything intrinsic: that signature takes a PRE-SERIALIZED body as the
+  Idempotency-Key REPLAY body, so the body has to be complete before the write and a 201
+  would otherwise disagree with its own replay. `write_audited`'s closure already holds the
+  transaction, so a store variant counting INSIDE the write would be snapshot exact and still
+  land in the stored body; issue #430 tracks it, and records that it would close the
+  concurrent window in both directions but NOT the replay staleness, which is inherent.
+- **THE COVENANT IS UNCHANGED and is re-asserted past the maximum.** No count and no size
+  turns the attach into a 4xx or a 5xx and nothing truncates anywhere.
+  `the_management_plane_never_truncates_a_permission_set_past_the_budget` now drives four
+  attaches through a maximum of 2 and a warn threshold of 1, inspecting every 201 body: the
+  crossing of the WARN threshold is reported on the write that caused it (the criterion that
+  had no surface before), the crossing of the MAXIMUM is a 201 naming the configured marker,
+  the attach one FURTHER past the maximum is still a 201, and the mapping list plus the
+  effective-roles view are still complete and un-truncated.
+- Four coverage gaps of the first draft are closed on this plane.
+  `the_attach_verdict_names_the_set_it_counted` pins the discriminator on BOTH surfaces at
+  once, so an attach stamped `"membership"` and a verdict with no `scope` at all are each a
+  red test. `a_detached_mapping_stops_being_counted_by_the_attach_verdict` drives a detach
+  through HTTP and asserts the next attach counts the live set, so dropping the liveness
+  filter is visible on this plane and not only in the store suite.
+  `a_maximum_of_zero_is_over_on_the_very_first_attach` exercises the documented
+  `permission_claim_max_count = 0` posture, where the first attach is already past the
+  maximum and still a 201. And the round trip's field-for-field comparison now asserts the
+  verdict through the same helper every other budget assertion uses.
+- `PermissionBudgetView`'s SINGLE SOURCING is preserved and is measured over every overflow
+  mode: `the_attach_the_read_and_the_configured_overflow_marker_are_one_string` asserts, for
+  each of `PermissionOverflow::ALL`, that the attach 201's marker and the effective-roles
+  read's marker are BOTH the configured
+  `ironauth_config::PermissionOverflow::permissions_status` (which is what the MINT stamps on
+  the token) and are each other. That is TWO surfaces compared against one source, not three
+  independent readings: a closing assertion that the observed strings were as many as the
+  modes has been DELETED, because it read those strings from `permissions_status` itself and
+  therefore asserted the injectivity of the source and nothing about either surface, which is
+  already `ironauth-config`'s own
+  `the_overflow_mode_owns_the_two_wire_strings_both_planes_read`. A surface that hard-coded a
+  single marker still dies, at the in-loop equality, which was measured. A coordinated swap
+  of BOTH arms of `permissions_status` is invisible to this test by construction and is
+  `ironauth-config`'s test to catch. Both management surfaces share the one
+  `PermissionBudgetView::evaluate`, so the comparisons cannot drift either.
+- The three doc sentences PR 13 corrected are corrected again, now that the 201 half is
+  true: `AdminState::with_token_claims`, `[token_claims]`'s section doc in `ironauth-config`
+  (regenerating `docs/config-schema.json`), and the test comment that pinned the absence.
+  `docs/openapi/management.json` and `packages/admin-spa/src/api/management.gen.ts` are
+  regenerated; `openapi-typescript` drops the description of a nullable `$ref` member, so
+  `packages/admin-spa/src/api/client.ts` carries the scope statement where a console reader
+  meets the type.
+
 - **The per-client scope-allowlist management surface** (issue #98, PR 15): `GET` and `PUT`
   on `.../clients/{client_id}/allowed-scopes` (`getClientAllowedScopes`,
   `setClientAllowedScopes`), a static suffix under the client and a sibling of
@@ -79,9 +168,11 @@ range per docs/RELEASING.md.
   budget field. The covenant is intact either way (the budget produces no 4xx and no 5xx
   anywhere on this plane), so this is a missing surface and not a defect: the sentence is
   corrected on `AdminState::with_token_claims` and in `[token_claims]`'s own section doc
-  (regenerating `docs/CONFIG.md` and `docs/config-schema.json`), the attach 201's lack of a
-  budget field is now ASSERTED so a later change has to say so, and issue #425 tracks adding
-  it.
+  (regenerating `docs/CONFIG.md` and `docs/config-schema.json`), and the attach 201's lack of
+  a budget field was ASSERTED so a later change had to say so. Issue #425, in this same
+  unreleased section, is that later change: the attach now carries
+  `role_permission_budget` and those sentences are corrected a second time. Read the two
+  entries together; neither describes a released state on its own.
 
 - Two new operational warning kinds, `permission_budget_overflow` and
   `permission_budget_approaching`, on `GET .../diagnostics/warnings` (issue #98, PR 12),

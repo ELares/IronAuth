@@ -127,6 +127,87 @@ async fn attach(h: &Harness, base: &str, permission: &str, key: &str) -> String 
     id_of(&response)
 }
 
+/// Attach a permission to a role, asserting a 201, and return the whole parsed BODY,
+/// which is what the budget assertions of issue #425 read.
+///
+/// The 201 assertion lives here rather than in each caller so no budget test can
+/// accidentally stop asserting the covenant while inspecting the verdict.
+async fn attach_created(h: &Harness, base: &str, permission: &str, key: &str) -> Value {
+    let (status, _, response) = h.post(base, key, &attach_body(permission)).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "an attach answers 201 at every count, whatever the budget says: {response}"
+    );
+    serde_json::from_str(&response).expect("json")
+}
+
+/// The ROLE-scoped budget verdict on an attach 201: refusing the membership-scoped
+/// FIELD NAME, and requiring the verdict to name its own SCOPE.
+///
+/// Two checks rather than an index expression, and both are the point of the helper.
+/// `permission_budget` is the name the effective-roles READ uses for a verdict over a
+/// MEMBERSHIP'S resolved set, and an attach carrying that name would be claiming an
+/// answer it did not compute. The `scope` member is the same claim made where it
+/// survives being lifted out of the response, so it is checked in the same place: an
+/// attach stamped `"membership"` is exactly as wrong as one renamed to the colliding
+/// field, and both die here.
+///
+/// Every assertion about the CONTENT of an attach verdict routes through this
+/// function. Exactly two sites in this file name the field literally instead, and
+/// neither is a claim about the verdict: the round trip's field-for-field comparison
+/// has to REMOVE it by name from the body it compares, and the list assertion checks
+/// that no listed row carries it at all.
+fn role_budget(created: &Value) -> &Value {
+    assert!(
+        created.get("permission_budget").is_none(),
+        "the attach must NOT use the membership-scoped name for a role-scoped \
+         verdict: {created}"
+    );
+    let budget = created
+        .get("role_permission_budget")
+        .expect("the attach 201 carries the role-scoped budget verdict");
+    assert_eq!(
+        budget["scope"], "role",
+        "and the verdict NAMES the set it counted, so a reader holding the object \
+         without the field it came in still knows which question it answers: {created}"
+    );
+    budget
+}
+
+/// The whole role-scoped verdict on an attach 201: the count, the approach flag, and
+/// the overflow marker (`None` meaning the field is ABSENT rather than null).
+///
+/// All three together in one helper because they are one answer and the interesting
+/// mistakes are the combinations: an implementation reporting `approaching` alongside an
+/// overflow marker, or an overflow marker with a count still inside the maximum, would
+/// pass any of the three checked alone.
+fn assert_role_budget(created: &Value, count: u64, approaching: bool, overflow: Option<&str>) {
+    let budget = role_budget(created);
+    assert_eq!(
+        budget["permission_count"], count,
+        "the verdict counts THIS ROLE's own live mappings INCLUDING the one just \
+         attached: {created}"
+    );
+    assert_eq!(
+        budget["approaching"], approaching,
+        "the approach flag is the ELEMENT verdict, strictly past the warn threshold and \
+         strictly within the maximum: {created}"
+    );
+    match overflow {
+        Some(marker) => assert_eq!(
+            budget["overflow"], marker,
+            "past the maximum the 201 NAMES the marker the next token will carry: \
+             {created}"
+        ),
+        None => assert!(
+            budget.get("overflow").is_none(),
+            "within the maximum there is no overflow field at all, not a null one: \
+             {created}"
+        ),
+    }
+}
+
 /// The sorted set of `id` values on a list page, so an assertion pins the WHOLE set
 /// rather than a membership.
 async fn list_ids(h: &Harness, base: &str) -> Vec<String> {
@@ -354,12 +435,32 @@ async fn mapping_attach_list_and_detach_round_trip() {
     // The attach response is composed BEFORE the write from values the handler holds,
     // so a divergence between what it promised and what it stored would be invisible
     // without reading the row back through the list.
+    //
+    // The comparison is over the PERSISTED fields, with the advisory budget verdict
+    // (issue #425) taken off the attach response first. Its PRESENCE and its shape are
+    // asserted through the same helper every other budget assertion uses, so this site
+    // cannot drift from them; only the REMOVAL names the field literally, which it has
+    // to, because removing a member from an object is what it is doing. The verdict is
+    // the one field on the attach 201 that is not a column, so it is the one field the
+    // list has no way to reproduce, and that must be the ONLY difference between the two
+    // bodies.
     let (status, _, listed) = h.get(&base).await;
     assert_eq!(status, StatusCode::OK, "list: {listed}");
+    assert_role_budget(&value, 1, false, None);
+    let mut persisted = value.clone();
+    assert!(
+        persisted
+            .as_object_mut()
+            .expect("the attach 201 is an object")
+            .remove("role_permission_budget")
+            .is_some(),
+        "the attach 201 carries the role-scoped verdict: {value}"
+    );
     assert_eq!(
         serde_json::from_str::<Value>(&listed).expect("json")["items"][0],
-        value,
-        "the attach response must describe the row the list returns"
+        persisted,
+        "the attach response must describe the row the list returns, field for field, \
+         once the advisory verdict it alone carries is set aside"
     );
     assert_eq!(
         mapping_audit(&h, &tenant, &environment).await,
@@ -1033,9 +1134,28 @@ async fn an_idempotency_key_replay_is_byte_identical_and_never_crosses_a_scope_o
     let mapping = id_of(&first);
 
     // 1. A genuine replay: byte-identical, and no second row or audit row.
+    //
+    //    Byte-identity now covers the budget verdict too (issue #425), and that is why
+    //    the verdict is computed BEFORE the write rather than after it: the body handed
+    //    back here is the one the store persisted inside the insert's transaction, so a
+    //    count taken afterwards could not have been in it and the 201 would have
+    //    disagreed with its own replay.
+    //
+    //    The consequence, stated where it is easiest to miss: the figure is a SNAPSHOT
+    //    of the original write, not of now. A detach between the two calls does not
+    //    change what this replay reports, and that is correct behaviour for an
+    //    idempotent replay rather than a defect to fix.
     let (status, _, replay) = h.post(&base_one, "shared-key", &attach_body(&read)).await;
     assert_eq!(status, StatusCode::CREATED, "a replay repeats the original");
     assert_eq!(first, replay, "byte-identical replay");
+    // Routed through the same helper as every other verdict assertion, so the identity
+    // above is a claim about a verdict that is really there and really role-scoped.
+    assert_role_budget(
+        &serde_json::from_str::<Value>(&replay).expect("json"),
+        1,
+        false,
+        None,
+    );
     assert_eq!(list_ids(&h, &base_one).await, vec![mapping.clone()]);
     assert_eq!(
         mapping_audit(&h, &tenant, &environment).await,
@@ -2051,15 +2171,18 @@ async fn the_management_plane_never_truncates_a_permission_set_past_the_budget()
     // Every attach past the bound still answers 201, and the view still returns the
     // WHOLE set.
     //
-    // Where the verdict is reported is ONE place and not two, and this test asserts
-    // exactly that shape rather than the shape the plan described. The effective-roles
-    // READ carries `permission_budget` on its 200. The ATTACH does not: its 201 body is
-    // an `OrgRolePermissionView` with no budget field, which is asserted below so the
-    // gap is pinned rather than merely unmentioned. Issue #425 tracks adding it.
+    // The verdict is reported in TWO places over TWO sets (issue #425), and both are
+    // driven here. The effective-roles READ carries `permission_budget` on its 200, over
+    // this membership's whole RESOLVED set. The ATTACH carries `role_permission_budget`
+    // on its 201, over the role's OWN mappings. This fixture is the case where the two
+    // sets COINCIDE (one role, one member holding only it, nothing inherited), which is
+    // what lets it assert both against the same numbers;
+    // `an_attach_within_the_role_budget_can_still_be_a_membership_over_it` is the
+    // opposite case and is the one that makes the naming load-bearing.
     //
-    // That last half is the property most at risk and the reason this test exists: an
-    // operator must always be able to see what a token will NOT carry, so the one
-    // surface that could show them is the one surface that must never shorten the
+    // The un-truncated half is the property most at risk and the reason this test
+    // exists: an operator must always be able to see what a token will NOT carry, so the
+    // one surface that could show them is the one surface that must never shorten the
     // answer. A view that truncated to the budget would leave a withheld capability
     // invisible on both the wire and the console at once.
     let h = Harness::start_with_token_claims(
@@ -2081,12 +2204,30 @@ async fn the_management_plane_never_truncates_a_permission_set_past_the_budget()
     grant_direct_role(&h, &tenant, &environment, &org, &membership, &role, "k-g").await;
     let base = mapping_base(&tenant, &environment, &org, &role);
 
-    // Two: within the maximum but past the warn threshold. The warning is advisory and
-    // the write is a plain 201.
-    for (slug, key) in [("a.read", "k-p1"), ("b.read", "k-p2")] {
-        let permission = create_permission(&h, &vocabulary, slug, &format!("{key}-v")).await;
-        attach(&h, &base, &permission, key).await;
-    }
+    // The FIRST attach: one mapping, within both thresholds (the warn count is 1 and the
+    // comparison is strictly greater-than), so the write reports a clean verdict.
+    let permission = create_permission(&h, &vocabulary, "a.read", "k-p1-v").await;
+    let created = attach_created(&h, &base, &permission, "k-p1").await;
+    assert_role_budget(&created, 1, false, None);
+
+    // The SECOND attach: within the maximum but PAST the warn threshold, which is the
+    // acceptance criterion of issue #98 that only the read could satisfy before. The
+    // warning arrives on the write that caused it and the write is still a plain 201.
+    let permission = create_permission(&h, &vocabulary, "b.read", "k-p2-v").await;
+    let created = attach_created(&h, &base, &permission, "k-p2").await;
+    // The whole point of the field: the write that CROSSES the approach threshold is what
+    // reports it, and it is still a plain 201.
+    assert_role_budget(&created, 2, true, None);
+    assert_eq!(
+        role_budget(&created)["warn_permission_count"],
+        1,
+        "and it reports the configured threshold it was measured against: {created}"
+    );
+    assert_eq!(
+        role_budget(&created)["max_permission_count"],
+        2,
+        "and the maximum, so an operator can size against both: {created}"
+    );
     let view = effective_view(&h, &tenant, &environment, &org, &membership).await;
     assert_eq!(view["permission_budget"]["approaching"], true, "{view}");
     assert!(
@@ -2095,32 +2236,16 @@ async fn the_management_plane_never_truncates_a_permission_set_past_the_budget()
     );
 
     // Past the maximum. The attach is STILL a 201, the view still lists everything, and
-    // the budget reports which marker the next token will carry instead of the set.
-    //
-    // The FOURTH attach is driven by hand so the 201 BODY can be inspected. It is the
-    // attach that pushes the resolved set past `permission_claim_max_count`, so it is
-    // exactly the write the plan expected to carry a warning field, and asserting the
-    // absence pins the shipped shape: a later PR that adds the field (issue #425) turns
-    // this red and has to say so here.
-    for (slug, key) in [("c.read", "k-p3")] {
-        let permission = create_permission(&h, &vocabulary, slug, &format!("{key}-v")).await;
-        attach(&h, &base, &permission, key).await;
-    }
+    // both budgets report which marker the next token will carry instead of the set.
+    let permission = create_permission(&h, &vocabulary, "c.read", "k-p3-v").await;
+    let created = attach_created(&h, &base, &permission, "k-p3").await;
+    assert_role_budget(&created, 3, false, Some("pdp_required"));
+
+    // One more PAST the maximum, so the covenant is asserted where a count-gated
+    // implementation would have started refusing rather than only at the crossing.
     let permission = create_permission(&h, &vocabulary, "d.read", "k-p4-v").await;
-    let (status, _, response) = h.post(&base, "k-p4", &attach_body(&permission)).await;
-    assert_eq!(
-        status,
-        StatusCode::CREATED,
-        "the attach that crosses the MAXIMUM is a plain 201: {response}"
-    );
-    let created: Value = serde_json::from_str(&response).expect("json");
-    assert!(
-        created.get("permission_budget").is_none()
-            && created.get("warning").is_none()
-            && created.get("warnings").is_none(),
-        "the attach 201 carries NO budget verdict today, whatever the read reports: \
-         {response}"
-    );
+    let created = attach_created(&h, &base, &permission, "k-p4").await;
+    assert_role_budget(&created, 4, false, Some("pdp_required"));
     let view = effective_view(&h, &tenant, &environment, &org, &membership).await;
     assert_eq!(
         permissions_of(&view),
@@ -2145,6 +2270,21 @@ async fn the_management_plane_never_truncates_a_permission_set_past_the_budget()
         granted_permissions(&h, &base).await.len(),
         4,
         "the mapping list is not truncated either"
+    );
+    // And no listed row carries a budget verdict. That is the N+1 the field's docs
+    // promise not to be: a verdict per row would be one count query per item, and every
+    // row of one page would carry the same number anyway.
+    let (status, _, response) = h.get(&base).await;
+    assert_eq!(status, StatusCode::OK, "list: {response}");
+    let listed: Value = serde_json::from_str(&response).expect("json");
+    assert!(
+        listed["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .all(|item| item.get("role_permission_budget").is_none()
+                && item.get("permission_budget").is_none()),
+        "the verdict rides the attach 201 ONLY, never a listed row: {listed}"
     );
 }
 
@@ -2268,5 +2408,432 @@ async fn the_effective_roles_view_resolves_permissions_through_the_full_ancestor
         view["roles"].as_array().expect("roles").len(),
         2,
         "both ancestor roles are reported beside their permissions: {view}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The attach response's ROLE-SCOPED budget verdict (issue #425)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn an_attach_within_the_role_budget_can_still_be_a_membership_over_it() {
+    // THE DIVERGENCE, constructed on purpose, and the reason the attach's field is
+    // called `role_permission_budget` and not `permission_budget`.
+    //
+    // The attach computes its verdict over the ROLE's own live mappings, because that is
+    // what the write already addresses; the honest question is about a MEMBERSHIP's
+    // resolved set, and answering that on a write would mean resolving the whole
+    // effective member set of the role (direct plus the recursive group closure) and then
+    // a permission set per member. Issue #98 refused that fan-out everywhere else. So the
+    // two verdicts count DIFFERENT SETS, neither bounds the other in either direction,
+    // and the field NAME plus the verdict's own `scope` member are the mitigation.
+    //
+    // This test drives ONE of the two directions, the one the issue calls out as worse
+    // than silence: the attach reads fine while the member holding the role is already
+    // over. It is here to make the naming load-bearing rather than decorative, and if the
+    // fixture below could not be built, or if the two answers came out the same, this
+    // would be the place that says so. The OPPOSITE direction, the role verdict
+    // overstating what any membership resolves, has its own mechanisms (a soft-deleted
+    // permission, a disabled organization, replay staleness) and is pinned in the store
+    // suite and in the field docs rather than here.
+    //
+    // Both routes into a membership's set are used, so the divergence is driven for two
+    // reasons at once: one role reaches the member DIRECTLY and the other through a
+    // GROUP.
+    //
+    // Its precision was MEASURED across the complete ironauth-store and ironauth-admin
+    // package suites: neutering the count statement's `role_id` conjunct kills exactly
+    // two tests, this one and the store's
+    // `count_live_for_role_counts_only_this_organizations_live_mappings`, whose
+    // cross-organization assertion does double duty. This is the only one of the two
+    // that observes the ATTACH SURFACE reporting the wrong set.
+    let h = Harness::start_with_token_claims(
+        50,
+        &ironauth_config::TokenClaimsConfig {
+            permission_claim_max_count: 2,
+            permission_claim_warn_count: 1,
+            ..ironauth_config::TokenClaimsConfig::default()
+        },
+    )
+    .await;
+    let (tenant, environment) = tenant_env(&h).await;
+    let org = create_org(&h, &tenant, &environment, "k-org").await;
+    let base = org_base(&tenant, &environment, &org);
+    let roles = roles_base(&tenant, &environment, &org);
+    let vocabulary = permissions_base(&tenant, &environment);
+    let membership = create_membership(&h, &tenant, &environment, &org, "m@x.test", "k-m").await;
+
+    // The INHERITED role, reached through a group, carrying two permissions. Two, so the
+    // membership is already AT the maximum before the attach under test runs.
+    let inherited = create_role(&h, &roles, "inherited", "k-r-inherited").await;
+    let group = create_group(&h, &base, "engineering", None, "k-grp").await;
+    bind_member(&h, &base, &group, &membership, "k-bind").await;
+    grant_group_role(&h, &base, &group, &inherited, "k-grant-group").await;
+    let inherited_base = mapping_base(&tenant, &environment, &org, &inherited);
+    for (slug, key) in [("far.read", "k-f1"), ("far.write", "k-f2")] {
+        let permission = create_permission(&h, &vocabulary, slug, &format!("{key}-v")).await;
+        attach(&h, &inherited_base, &permission, key).await;
+    }
+
+    // The DIRECT role, granted straight to the same membership, carrying nothing yet.
+    let direct = create_role(&h, &roles, "direct", "k-r-direct").await;
+    grant_direct_role(&h, &tenant, &environment, &org, &membership, &direct, "k-g").await;
+    let direct_base = mapping_base(&tenant, &environment, &org, &direct);
+
+    // Sanity, before the attach under test: the membership is at the maximum and NOT yet
+    // over it, so the crossing below is attributable to this one attach.
+    let before = effective_view(&h, &tenant, &environment, &org, &membership).await;
+    assert_eq!(
+        permissions_of(&before),
+        vec!["far.read", "far.write"],
+        "the member holds the inherited role's two and nothing else yet: {before}"
+    );
+    assert!(
+        before["permission_budget"].get("overflow").is_none(),
+        "and is not over budget yet: {before}"
+    );
+
+    // THE ATTACH UNDER TEST. It is the FIRST mapping on the direct role, so the role's
+    // own count is one, which is not past a warn threshold of one. The write therefore
+    // reports a clean verdict.
+    let permission = create_permission(&h, &vocabulary, "near.read", "k-n1-v").await;
+    let created = attach_created(&h, &direct_base, &permission, "k-n1").await;
+    // One is within a warn threshold of one, so the role-scoped verdict reads perfectly
+    // fine: no approach flag and no overflow marker at all.
+    assert_role_budget(&created, 1, false, None);
+    let budget = role_budget(&created);
+
+    // And the SAME instant, for the SAME organization, the membership-scoped read says
+    // the member is OVER. Both answers are correct about the set they name.
+    let after = effective_view(&h, &tenant, &environment, &org, &membership).await;
+    assert_eq!(
+        permissions_of(&after),
+        vec!["far.read", "far.write", "near.read"],
+        "the member's RESOLVED set unions both roles, one direct and one inherited \
+         through a group: {after}"
+    );
+    assert_eq!(
+        after["permission_budget"]["permission_count"], 3,
+        "three resolved against the role-scoped one: {after}"
+    );
+    assert_eq!(
+        after["permission_budget"]["overflow"], "budget_exceeded",
+        "the membership is OVER the maximum, so the next token withholds the whole \
+         claim, while the attach that caused it reported no overflow: {after}"
+    );
+
+    // The divergence asserted as a RELATION rather than as two constants, so it is the
+    // claim that is pinned and not the fixture. Strictly less HERE, in this direction, on
+    // this fixture: it is not a general bound and the field docs no longer claim one.
+    let role_count = budget["permission_count"].as_u64().expect("a count");
+    let resolved_count = after["permission_budget"]["permission_count"]
+        .as_u64()
+        .expect("a count");
+    assert!(
+        role_count < resolved_count,
+        "the role verdict UNDERSTATES this membership, which is the direction the issue \
+         calls worse than silence: {role_count} against {resolved_count}"
+    );
+
+    // The two verdicts are otherwise the same SHAPE, which is exactly why the difference
+    // has to be carried explicitly: apart from `scope` and the count derived from it,
+    // nothing about the object distinguishes them. Every configured bound in both comes
+    // from the one `[token_claims]` section.
+    assert_eq!(
+        after["permission_budget"]["scope"], "membership",
+        "the READ's verdict names the MEMBERSHIP set: {after}"
+    );
+    assert_ne!(
+        budget["scope"], after["permission_budget"]["scope"],
+        "and the two carriers are distinguishable from the objects ALONE, with no field \
+         name in hand: {created} against {after}"
+    );
+    for key in [
+        "max_permission_count",
+        "warn_permission_count",
+        "max_token_bytes",
+        "warn_token_bytes",
+    ] {
+        assert_eq!(
+            budget[key], after["permission_budget"][key],
+            "both verdicts report the SAME configured {key}, because there is one \
+             budget: {created} against {after}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_attach_the_read_and_the_configured_overflow_marker_are_one_string() {
+    // SINGLE SOURCING, over EVERY overflow mode. The console, the attach response and the
+    // token must not be able to disagree about the marker a withholding carries: a
+    // drifted management answer would tell an operator their resource servers will see a
+    // string they will never see.
+    //
+    // TWO SURFACES are read here and both are compared against ONE source: the attach
+    // 201's `role_permission_budget.overflow` and the effective-roles read's
+    // `permission_budget.overflow`, each against
+    // `ironauth_config::PermissionOverflow::permissions_status`, which is the ONE place
+    // the two strings are spelled and is what the MINT stamps onto the token
+    // (`ironauth-oidc`'s `tests/org_permissions_claim.rs` is the token half of the same
+    // property). Both management surfaces evaluate through the one
+    // `PermissionBudgetView::evaluate`, so a second copy of either comparison or either
+    // string would show up here.
+    //
+    // Two surfaces and NOT three readings, which this comment used to claim. Reading
+    // `permissions_status` a third time and comparing those readings to each other
+    // measures the SOURCE and nothing about either surface; that assertion lived at the
+    // end of this test, was a verbatim duplicate of `ironauth-config`'s own
+    // `the_overflow_mode_owns_the_two_wire_strings_both_planes_read`, and has been
+    // deleted rather than reworded.
+    //
+    // Driven over `PermissionOverflow::ALL` rather than over one mode, because a surface
+    // that hard-coded a single marker would satisfy any one-mode fixture. What kills that
+    // hard-coding is the in-loop equality below, under the mode whose marker differs from
+    // the hard-coded one, which was measured. What no test HERE can catch is a
+    // coordinated swap of BOTH arms of `permissions_status`, since both surfaces would
+    // move with it; that is inherent to single sourcing and is `ironauth-config`'s
+    // property to hold.
+    for mode in ironauth_config::PermissionOverflow::ALL {
+        let expected = mode.permissions_status();
+        assert!(
+            !expected.is_empty(),
+            "the configured marker for {mode:?} is a real string"
+        );
+        let h = Harness::start_with_token_claims(
+            50,
+            &ironauth_config::TokenClaimsConfig {
+                permission_claim_max_count: 1,
+                permission_claim_warn_count: 0,
+                permission_claim_overflow: mode,
+                ..ironauth_config::TokenClaimsConfig::default()
+            },
+        )
+        .await;
+        let (tenant, environment) = tenant_env(&h).await;
+        let org = create_org(&h, &tenant, &environment, "k-org").await;
+        let roles = roles_base(&tenant, &environment, &org);
+        let vocabulary = permissions_base(&tenant, &environment);
+        let role = create_role(&h, &roles, "operator", "k-role").await;
+        let membership =
+            create_membership(&h, &tenant, &environment, &org, "m@x.test", "k-m").await;
+        grant_direct_role(&h, &tenant, &environment, &org, &membership, &role, "k-g").await;
+        let base = mapping_base(&tenant, &environment, &org, &role);
+
+        // One is AT the maximum, so nothing is withheld and neither surface may invent a
+        // marker. Without this half the assertions below would also pass for a surface
+        // that reported an overflow unconditionally.
+        let permission = create_permission(&h, &vocabulary, "a.read", "k-p1-v").await;
+        let created = attach_created(&h, &base, &permission, "k-p1").await;
+        assert!(
+            role_budget(&created).get("overflow").is_none(),
+            "at the maximum nothing overflows, under {mode:?}: {created}"
+        );
+
+        // Two is past it. Both surfaces must name the CONFIGURED marker.
+        let permission = create_permission(&h, &vocabulary, "b.read", "k-p2-v").await;
+        let created = attach_created(&h, &base, &permission, "k-p2").await;
+        assert_eq!(
+            role_budget(&created)["overflow"],
+            expected,
+            "the attach 201 names the configured marker for {mode:?}: {created}"
+        );
+        let view = effective_view(&h, &tenant, &environment, &org, &membership).await;
+        assert_eq!(
+            view["permission_budget"]["overflow"], expected,
+            "and so does the effective-roles read, from the same source: {view}"
+        );
+        assert_eq!(
+            role_budget(&created)["overflow"],
+            view["permission_budget"]["overflow"],
+            "so the write response and the console cannot disagree: {created} against \
+             {view}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_attach_verdict_names_the_set_it_counted() {
+    // THE DISCRIMINATOR, on both carriers, in one place.
+    //
+    // `PermissionBudgetView` is byte-shape identical on the two endpoints apart from
+    // this one member. Before it existed, the ONLY thing separating an authoritative
+    // membership verdict from a role verdict that answers a different question was the
+    // JSON KEY the object arrived under, so any SDK, console component or log pipeline
+    // handed a bare verdict had lost the distinction with no way to recover it. The
+    // member is REQUIRED on both, so an omission is as loud as a wrong value.
+    //
+    // Both surfaces are read in the SAME fixture rather than in two, because what has to
+    // be true is that they DIFFER: two separate tests could each pass against an
+    // implementation that stamped one constant everywhere.
+    let h = Harness::start(50).await;
+    let (tenant, environment) = tenant_env(&h).await;
+    let org = create_org(&h, &tenant, &environment, "k-org").await;
+    let roles = roles_base(&tenant, &environment, &org);
+    let vocabulary = permissions_base(&tenant, &environment);
+    let role = create_role(&h, &roles, "operator", "k-role").await;
+    let membership = create_membership(&h, &tenant, &environment, &org, "m@x.test", "k-m").await;
+    grant_direct_role(&h, &tenant, &environment, &org, &membership, &role, "k-g").await;
+    let base = mapping_base(&tenant, &environment, &org, &role);
+
+    let permission = create_permission(&h, &vocabulary, "a.read", "k-p1-v").await;
+    let created = attach_created(&h, &base, &permission, "k-p1").await;
+    let attach_verdict = created
+        .get("role_permission_budget")
+        .expect("the attach 201 carries a verdict");
+    assert_eq!(
+        attach_verdict["scope"], "role",
+        "the ATTACH counted one role's own mappings and says so: {created}"
+    );
+
+    let view = effective_view(&h, &tenant, &environment, &org, &membership).await;
+    let read_verdict = &view["permission_budget"];
+    assert_eq!(
+        read_verdict["scope"], "membership",
+        "the READ counted the membership's resolved set and says so: {view}"
+    );
+
+    // The property that neither assertion above states on its own: the two verdicts are
+    // TELLABLE APART from the objects alone. This fixture is the one where the two
+    // COUNTS coincide (one role, one member holding only it), so the count cannot be
+    // doing the work here and `scope` is the only thing left that can.
+    assert_eq!(
+        attach_verdict["permission_count"], read_verdict["permission_count"],
+        "the two counts agree on this fixture, which is what makes the next assertion \
+         about the discriminator and nothing else: {created} against {view}"
+    );
+    assert_ne!(
+        attach_verdict["scope"], read_verdict["scope"],
+        "so an object handed on WITHOUT the field name it arrived under is still \
+         attributable to its set: {created} against {view}"
+    );
+
+    // And it is REQUIRED, not optional. Nothing on either surface may omit it, or a
+    // consumer switching on it would silently fall through to a default.
+    for (label, verdict) in [("attach", attach_verdict), ("read", read_verdict)] {
+        assert!(
+            verdict.get("scope").is_some(),
+            "the {label} verdict must carry `scope`; a missing discriminator is a \
+             verdict that has stopped saying what it counted: {verdict}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_detached_mapping_stops_being_counted_by_the_attach_verdict() {
+    // LIVENESS, on the MANAGEMENT PLANE. The store suite pins that the count filters
+    // detached rows; nothing here did, so dropping `deleted_at IS NULL` was invisible on
+    // the surface an operator actually reads.
+    //
+    // It matters here and not only there because this is the number an operator sizes
+    // against: a verdict that kept counting withdrawn capabilities would tell them they
+    // are approaching a budget they have already moved away from, and the whole
+    // justification for putting the verdict on the write is that the write is where they
+    // are looking.
+    let h = Harness::start_with_token_claims(
+        50,
+        &ironauth_config::TokenClaimsConfig {
+            permission_claim_max_count: 3,
+            permission_claim_warn_count: 2,
+            ..ironauth_config::TokenClaimsConfig::default()
+        },
+    )
+    .await;
+    let (tenant, environment) = tenant_env(&h).await;
+    let org = create_org(&h, &tenant, &environment, "k-org").await;
+    let roles = roles_base(&tenant, &environment, &org);
+    let vocabulary = permissions_base(&tenant, &environment);
+    let role = create_role(&h, &roles, "operator", "k-role").await;
+    let base = mapping_base(&tenant, &environment, &org, &role);
+
+    let first = create_permission(&h, &vocabulary, "a.read", "k-p1-v").await;
+    let second = create_permission(&h, &vocabulary, "b.read", "k-p2-v").await;
+    let third = create_permission(&h, &vocabulary, "c.read", "k-p3-v").await;
+    assert_role_budget(
+        &attach_created(&h, &base, &first, "k-p1").await,
+        1,
+        false,
+        None,
+    );
+    // Two is NOT past a warn threshold of two: both comparisons are strictly
+    // greater-than, so a count sitting exactly on a threshold is neither approaching
+    // nor overflowing.
+    assert_role_budget(
+        &attach_created(&h, &base, &second, "k-p2").await,
+        2,
+        false,
+        None,
+    );
+
+    // Withdraw the first. The pair address is the wire address, so this is the detach an
+    // operator performs.
+    let (status, _, body) = h.delete(&format!("{base}/{first}")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "detach: {body}");
+
+    // The NEXT attach counts TWO, not three: one surviving live mapping plus itself. A
+    // count that kept the detached row would say three and would cross the warn
+    // threshold here, which is exactly the wrong advice.
+    let created = attach_created(&h, &base, &third, "k-p3").await;
+    assert_role_budget(&created, 2, false, None);
+    assert_eq!(
+        list_ids(&h, &base).await.len(),
+        2,
+        "and the live set really is two, so the verdict matches the rows: {created}"
+    );
+}
+
+#[tokio::test]
+async fn a_maximum_of_zero_is_over_on_the_very_first_attach() {
+    // `permission_claim_max_count = 0` is a DOCUMENTED posture (issue #98 ships it as a
+    // valid configuration: withhold the permission claim from every token) and no attach
+    // test exercised the verdict there. It is the one boundary where the FIRST attach is
+    // already past the maximum, so an implementation that special-cased an empty role, or
+    // that compared with `>=` somewhere, would pass every other fixture in this file.
+    //
+    // The covenant is the point: a maximum of zero must still be a plain 201 with the
+    // mapping stored and listed. A budget of zero bounds the TOKEN, never the table.
+    let h = Harness::start_with_token_claims(
+        50,
+        &ironauth_config::TokenClaimsConfig {
+            permission_claim_max_count: 0,
+            permission_claim_warn_count: 0,
+            ..ironauth_config::TokenClaimsConfig::default()
+        },
+    )
+    .await;
+    let (tenant, environment) = tenant_env(&h).await;
+    let org = create_org(&h, &tenant, &environment, "k-org").await;
+    let roles = roles_base(&tenant, &environment, &org);
+    let vocabulary = permissions_base(&tenant, &environment);
+    let role = create_role(&h, &roles, "operator", "k-role").await;
+    let membership = create_membership(&h, &tenant, &environment, &org, "m@x.test", "k-m").await;
+    grant_direct_role(&h, &tenant, &environment, &org, &membership, &role, "k-g").await;
+    let base = mapping_base(&tenant, &environment, &org, &role);
+
+    let permission = create_permission(&h, &vocabulary, "a.read", "k-p1-v").await;
+    let created = attach_created(&h, &base, &permission, "k-p1").await;
+    // One is past a maximum of zero, so the verdict OVERFLOWS immediately and is NOT
+    // "approaching": the two are mutually exclusive by construction.
+    assert_role_budget(&created, 1, false, Some("budget_exceeded"));
+    assert_eq!(
+        role_budget(&created)["max_permission_count"],
+        0,
+        "and it reports the zero it was measured against: {created}"
+    );
+
+    // The covenant, at the one setting where a count gate would be most tempting.
+    assert_eq!(
+        list_ids(&h, &base).await.len(),
+        1,
+        "a maximum of zero stores and lists the mapping like any other"
+    );
+    let view = effective_view(&h, &tenant, &environment, &org, &membership).await;
+    assert_eq!(
+        permissions_of(&view),
+        vec!["a.read"],
+        "and the membership view still reports the WHOLE set it will not carry: {view}"
+    );
+    assert_eq!(
+        view["permission_budget"]["overflow"], "budget_exceeded",
+        "with both verdicts agreeing that the next token withholds the claim: {view}"
     );
 }

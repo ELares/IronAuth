@@ -510,6 +510,57 @@ fn documented_paths_are_the_expected_set() {
     );
 }
 
+/// No PRIVATE RUST MODULE PATH leaks into the published contract (issue #425).
+///
+/// Every `description` in this document is a rustdoc comment lifted verbatim by
+/// utoipa, so a rustdoc intra-doc link written as ``[`crate::some::private::Path`]``
+/// ships to every consumer of the spec and to the generated TypeScript with it. That
+/// is not merely untidy: `crate::` names a module tree no API consumer can see or
+/// resolve, so it reads as a broken reference in the one artifact that is supposed to
+/// be self-contained. One such link shipped before this test existed and nothing
+/// caught it, because there is no rustdoc lane in the local gate or in CI.
+///
+/// Scoped to the `crate::`-prefixed form deliberately. A bare type name in a link is
+/// a legible cross-reference to a schema this same document defines; a private module
+/// path is not.
+#[test]
+fn no_private_rust_module_path_reaches_the_published_contract() {
+    let mut offenders = Vec::new();
+    collect_descriptions(&spec(), "", &mut offenders);
+    let leaked: Vec<&(String, String)> = offenders
+        .iter()
+        .filter(|(_, text)| text.contains("crate::"))
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "a private Rust module path reached the published spec; write the reference \
+         without the `crate::` prefix: {leaked:?}"
+    );
+}
+
+/// Every `description` string in the document, with the JSON pointer that reaches it,
+/// so a failure names WHERE the offending text lives rather than only that it exists.
+fn collect_descriptions(node: &Value, path: &str, out: &mut Vec<(String, String)>) {
+    match node {
+        Value::Object(map) => {
+            for (key, value) in map {
+                if key == "description" {
+                    if let Some(text) = value.as_str() {
+                        out.push((format!("{path}/description"), text.to_owned()));
+                    }
+                }
+                collect_descriptions(value, &format!("{path}/{key}"), out);
+            }
+        }
+        Value::Array(items) => {
+            for (index, value) in items.iter().enumerate() {
+                collect_descriptions(value, &format!("{path}/{index}"), out);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[test]
 fn committed_artifact_matches_generated_spec() {
     // The same byte content scripts/openapi-check.sh regenerates and diffs.

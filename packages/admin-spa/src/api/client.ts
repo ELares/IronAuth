@@ -169,6 +169,26 @@ export type EffectiveRoleSourceView =
 //   scoped mapping from one role to one vocabulary entry. The row carries the
 //   permission ID, never its slug: the slug belongs to the vocabulary.
 //
+//   OrgRolePermissionView.role_permission_budget is present on the ATTACH response
+//   only and is over THAT ROLE'S OWN mappings, never over a member's resolved set
+//   (issue #425). openapi-typescript drops the description of a nullable $ref
+//   member, so the generated type says nothing about the scope and this comment is
+//   where a console reader meets it. A role's mappings are a DIFFERENT SET from any
+//   membership's resolved set and bound it in NEITHER direction: a soft-deleted
+//   permission is still counted here and resolves for nobody, a disabled
+//   organization stays writable here while resolving nothing, and a member may hold
+//   several roles and inherit more through groups. The figure is also a snapshot
+//   taken at the write, which a concurrent change can outdate either way and which an
+//   Idempotency-Key replay reproduces unchanged by design. So a membership can be
+//   OVER budget while this reads fine, AND this can name an overflow no membership
+//   will ever see. The verdict says which set it counted in its own required `scope`
+//   member ("role" here, "membership" on the read), so code that passes the object
+//   around without the field name has not lost the distinction. Anything rendering it
+//   must say whose role it measured; the membership scoped answer is the
+//   effective-roles read's `permission_budget` below, which is what predicts the next
+//   token. The published contract carries the full text:
+//   docs/openapi/management.json, schema OrgRolePermissionView.
+//
 //   SetOrgDefaultRoleRequest designates the default role of ONE organization, a
 //   single valued property answered with the OrgRoleView that now holds it.
 //
@@ -176,9 +196,13 @@ export type EffectiveRoleSourceView =
 //   claim opt-in. Only `permission_claims_enabled` is writable there, and it is
 //   REQUIRED, so an empty body cannot be a request that silently did nothing.
 //
-//   PermissionBudgetView is the ADVISORY verdict the effective-roles read carries.
-//   It refuses no write and caps nothing that may be STORED; it reports what the
-//   NEXT token issuance would carry, and only the ELEMENT half of the budget.
+//   PermissionBudgetView is the ADVISORY verdict, carried by the effective-roles
+//   read over a MEMBERSHIP'S resolved set and by the attach response over ONE
+//   ROLE'S mappings. It refuses no write and caps nothing that may be STORED, and it
+//   evaluates only the ELEMENT half of the budget. Its required `scope` member says
+//   which set it covers ("membership" or "role"), so the two are never
+//   interchangeable even once the object has been separated from the field it
+//   arrived in. Read it before rendering a count; the two answer different questions.
 export type PermissionView = components["schemas"]["PermissionView"];
 export type CreatePermissionRequest =
   components["schemas"]["CreatePermissionRequest"];

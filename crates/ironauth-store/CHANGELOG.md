@@ -6,6 +6,40 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **`OrgRolePermissionRepo::count_live_for_role`** (issue #425): how many live mappings ONE
+  role carries inside one organization, the count behind the budget verdict the management
+  attach response now reports. A COUNT rather than a length taken off `list_for_role`,
+  because that list is page-clamped and a length read from one page would silently stop
+  growing at the clamp. It is ONE statement bounded by that role's own live mappings, with no
+  fan-out, and it is explicitly NOT one page's work: an earlier version of this entry said it
+  was "the same order of work as the list's first page", which is false in exactly the regime
+  the count exists for, since a role's mappings are uncapped by covenant. MEASURED with
+  `EXPLAIN (ANALYZE, BUFFERS)` on the real schema at 20,000 live mappings for one role, the
+  count read 1,153 buffers in 6.8 ms while the first page (`LIMIT 101`) read 10 buffers in
+  0.43 ms. `count_live_for_role_is_not_a_page_length` seeds past the clamp and pins the
+  difference, so substituting a page length is a red test rather than a silent regression.
+- It counts THIS ROLE'S own rows and is NOT a membership's resolved set, which unions every
+  role a member holds plus the group ancestor closure plus the organization's default role.
+  `effective_permissions` answers that, and this number is NEITHER an upper NOR a lower bound
+  on it: it can be LARGER, because a mapping whose PERMISSION is soft-deleted is counted here
+  and resolves nowhere, and SMALLER, because a member may hold several roles.
+  `count_live_for_role_counts_a_mapping_whose_endpoints_are_dead` pins the larger direction,
+  so a future liveness join cannot change the meaning silently.
+- Its ORGANIZATION conjunct is the whole fence between two organizations of one environment,
+  because the row-level-security policy cannot see that column, and it is killed on its own
+  by `count_live_for_role_counts_only_this_organizations_live_mappings`. WHICH assertion
+  kills it was measured rather than assumed, and the first answer written here was wrong: it
+  is the CROSS ORGANIZATION ADDRESS assertion, `count_for(&beta, &alpha_role) == 0`, which a
+  mutant that neutered the predicate answers with alpha's own non-zero count. That needs a
+  NON-ZERO count on the addressed role and nothing more, NOT two organizations holding
+  different counts; setting both to one mapping each keeps the suite green and the mutant
+  still dies at that same assertion. The same test pins liveness (a detach stops counting at
+  once) and the cross-scope zero, with a positive control in the foreign scope's own
+  repository so the zeros are attributable to the fence. A role or organization id of another
+  scope counts `0` rather than erroring, the uniform "nothing is visible here" that
+  `list_for_role` answers with an empty page. NO migration and no grant change: the read uses
+  the `SELECT` the control role already holds.
+
 - **The per-client OAuth SCOPE allowlist** (issue #98, PR 15): migration 0096 adds one
   nullable `clients.allowed_scopes jsonb`, the deliberate twin of `clients.allowed_resources`
   (0019) with the same three states. NULL means NO allowlist is configured and every scope

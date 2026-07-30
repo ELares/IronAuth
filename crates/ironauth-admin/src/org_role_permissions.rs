@@ -102,6 +102,25 @@
 //! table: an attach past it still answers 201, and
 //! `the_management_plane_never_truncates_a_permission_set_past_the_budget` measures
 //! exactly that.
+//!
+//! # The attach REPORTS the budget, and reports which set it measured
+//!
+//! Since issue #425 the attach 201 carries `role_permission_budget`, so the operator
+//! who crosses a threshold learns it from the write that caused it rather than from a
+//! separate read of some membership that happens to hold the role. Reporting is all it
+//! does: no count and no size turns this into a 4xx or a 5xx and nothing is truncated.
+//!
+//! It is computed over THIS ROLE'S OWN live mappings, which is what the write already
+//! addresses, and NOT over the resolved set of every affected membership. The blast
+//! radius of one attach is the whole effective member set of the role, direct and
+//! group-inherited through the recursive closure, and resolving that on a write is the
+//! unbounded fan-out issue #98 refused everywhere else. The cost of the cheap answer is
+//! that it answers a DIFFERENT question from the effective-roles read, one that bounds
+//! it in NEITHER direction, so the mitigation is stated twice over: the field is named
+//! `role_permission_budget` rather than `permission_budget`, AND the verdict object
+//! itself carries `scope: "role"`, so the distinction survives being lifted out of the
+//! response and passed around. `an_attach_within_the_role_budget_can_still_be_a_membership_over_it`
+//! constructs the divergence and pins both answers.
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
@@ -121,6 +140,7 @@ use crate::input::parse_json;
 use crate::org_context::{
     parse_permission_id, parse_role_id, require_role_in_org, resolve_live_org, resolve_scope,
 };
+use crate::org_effective_roles::{PermissionBudgetScope, PermissionBudgetView};
 use crate::pagination::{ListQuery, Pagination};
 use crate::response::{json, no_content};
 use crate::state::AdminState;
@@ -144,11 +164,76 @@ pub struct OrgRolePermissionView {
     pub created_at_unix_ms: i64,
     /// Last-modification time, milliseconds since the Unix epoch.
     pub updated_at_unix_ms: i64,
+    /// The budget verdict over THIS ROLE'S OWN live permission mappings, counting the
+    /// one this response reports (issue #425). ADVISORY: it refuses nothing, and the
+    /// attach that produced it answered 201 however far past any threshold it went.
+    ///
+    /// # It is named for the set it measures, and the verdict repeats the name
+    ///
+    /// This is NOT `permission_budget`, and the difference is not cosmetic. The
+    /// `permission_budget` on `GET .../memberships/{id}/effective-roles` is over one
+    /// MEMBERSHIP'S RESOLVED set: every role that member holds directly, everything
+    /// inherited through the group ancestor closure, and the organization's default
+    /// role, unioned. THIS verdict is over one role's own live mappings. The object
+    /// here always carries `scope: "role"` and the one there always carries
+    /// `scope: "membership"`, so a reader that keeps only the verdict still knows which
+    /// question it answers.
+    ///
+    /// # It is a DIFFERENT set, and NEITHER an upper nor a lower bound on that one
+    ///
+    /// A membership can be OVER budget while this field reads perfectly fine, AND this
+    /// field can name an `overflow` that no membership will ever see. Both are
+    /// legitimate answers rather than bugs, and three separate mechanisms produce them:
+    ///
+    ///   * A DEAD PERMISSION ENDPOINT. This count filters the MAPPING'S liveness and
+    ///     nothing else, while the membership resolution also requires the PERMISSION
+    ///     row to be live; deleting a permission cascades to no mapping. Measured: an
+    ///     attach reported 3 with `budget_exceeded` while the membership read 1 with no
+    ///     overflow at all.
+    ///   * The ORGANIZATION LIFECYCLE. A DISABLED organization stays writable here on
+    ///     purpose, while the resolution closure seeds only on an ACTIVE one. Measured:
+    ///     an attach reported 2 and overflowing while the membership read 0.
+    ///   * STALENESS, in EITHER direction, described below.
+    ///
+    /// So when this field says `approaching` or carries an `overflow` it says nothing
+    /// about any membership, and when it says neither it says nothing about any
+    /// membership either. The effective-roles view is the membership-scoped answer and
+    /// the only one that predicts what a token will carry.
+    ///
+    /// # A SNAPSHOT taken at the write, reproduced exactly on a replay
+    ///
+    /// The count is a read taken immediately BEFORE the insert, in its own transaction,
+    /// plus the one row being attached, and nothing is held between the two. So a
+    /// permission attached to the SAME role concurrently leaves the figure SHORT and a
+    /// concurrent DETACH leaves it LONG: the looseness runs BOTH ways, not one. An
+    /// Idempotency-Key REPLAY then reproduces the original snapshot byte for byte by
+    /// design, so a 201 can report a count the role no longer has (measured: a replay
+    /// reported 2 and `approaching` against a live count of 1). No surface on this plane
+    /// claims an instant; the effective-roles read has the same looseness, its two store
+    /// reads being two transactions too. Why the count runs before rather than after is
+    /// recorded on the handler, together with what would be needed to tighten it.
+    ///
+    /// # Present on the attach 201 ONLY
+    ///
+    /// Serialized only when the verdict exists, so it is ABSENT rather than null on
+    /// every item of `GET .../roles/{role_id}/permissions`. The published schema still
+    /// renders the member as nullable, exactly as `overflow` on `PermissionBudgetView`
+    /// does, so a generated client sees `null | PermissionBudgetView` and must treat
+    /// absent and null alike. A verdict per listed row would be one count query per
+    /// item, an N+1 on a read whose whole job is to page cheaply, and every row of one
+    /// page would carry the same number anyway. The count that list wants is the attach
+    /// response's, or the effective-roles view's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role_permission_budget: Option<PermissionBudgetView>,
 }
 
 impl OrgRolePermissionView {
     /// Build a view from a stored record. The repository only returns LIVE (not
     /// detached) mappings.
+    ///
+    /// No budget verdict: this is the LIST projection, and the field is documented as
+    /// present on the attach 201 alone. Computing one here would be a count query per
+    /// listed row.
     fn from_record(record: &OrgRolePermissionRecord) -> Self {
         Self {
             id: record.id.to_string(),
@@ -157,6 +242,7 @@ impl OrgRolePermissionView {
             permission_id: record.permission_id.to_string(),
             created_at_unix_ms: record.created_at_unix_micros / 1000,
             updated_at_unix_ms: record.updated_at_unix_micros / 1000,
+            role_permission_budget: None,
         }
     }
 }
@@ -204,7 +290,7 @@ pub struct OrgRolePermissionList {
     ),
     security(("bearer" = [])),
     responses(
-        (status = 201, description = "Attached. Every member who effectively holds the role, directly or through the group forest, resolves the permission at the NEXT token issuance", body = OrgRolePermissionView),
+        (status = 201, description = "Attached. Every member who effectively holds the role, directly or through the group forest, resolves the permission at the NEXT token issuance. The body carries `role_permission_budget`, the advisory budget verdict over THIS ROLE'S OWN live mappings including this one, stamped `scope: \"role\"` (issue #425). It refuses nothing: an attach past every threshold is still this 201, and nothing is truncated anywhere. Read the field for what it does NOT cover: a role's mappings are a DIFFERENT set from any membership's resolved set and bound it in NEITHER direction, because a soft-deleted permission is still counted here, a disabled organization stays writable here while resolving nothing, and the figure is a snapshot taken at the write that a replay reproduces unchanged. The effective-roles view, whose verdict is stamped `scope: \"membership\"`, is the only answer that predicts what a token will carry", body = OrgRolePermissionView),
         (status = 400, description = "Malformed request", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
@@ -275,6 +361,48 @@ pub async fn assign_org_role_permission(
     // reachable only by a caller who has already proven they can see it.
     let permission = parse_permission_id(&state, scope, &request.permission_id)?;
 
+    // The ROLE-SCOPED budget verdict this response carries (issue #425). Counted BEFORE
+    // the insert and reported as that count plus this one attach, which is forced BY THE
+    // CURRENT `assign()` SIGNATURE rather than by anything intrinsic, and the difference
+    // matters to whoever reads this next. The signature takes a PRE-SERIALIZED body as
+    // the Idempotency-Key REPLAY body, so with today's seam the body has to be complete
+    // before the write runs and a count taken afterwards could not be in it; a 201 that
+    // disagreed with its own replay would be worse than a slightly loose count.
+    // `write_audited`'s closure does already hold the transaction, so a store variant
+    // that counted INSIDE the write would be snapshot exact and still land in the stored
+    // body. Issue #430 tracks that tightening. It would close the concurrent window in
+    // both directions but NOT the replay staleness, which is inherent to a byte
+    // identical replay.
+    //
+    // One indexed count over ONE role, never a fan-out. The honest verdict for an
+    // operator is the MEMBERSHIP-scoped one, but computing that here would mean
+    // resolving the whole effective member set of this role (direct plus the recursive
+    // group closure) and then a resolved permission set per member, on a WRITE. Issue
+    // #98 avoided exactly that shape everywhere else. So this reports what the write
+    // cheaply knows and the field NAMES the set it measured; see
+    // `OrgRolePermissionView::role_permission_budget` for what that costs a reader and
+    // where the membership-scoped answer lives.
+    let live_mappings = state
+        .store()
+        .management()
+        .org_role_permissions(scope)
+        .count_live_for_role(&org_id, &role.id)
+        .await?;
+    // Widening rather than narrowing, for the reason `PermissionBudgetView::evaluate`
+    // gives: saturating at `usize::MAX` on a target too narrow to hold the count reports
+    // an overflow, which is the safe direction, while a truncating cast could report a
+    // huge set as a small one. `saturating_add` for the same reason at the other end.
+    let attached_count = usize::try_from(live_mappings)
+        .unwrap_or(usize::MAX)
+        .saturating_add(1);
+    // ROLE scoped, and the verdict carries that on the wire so the answer stays
+    // attributable to its set after it leaves this response.
+    let role_permission_budget = PermissionBudgetView::evaluate(
+        PermissionBudgetScope::Role,
+        state.token_claims(),
+        attached_count,
+    );
+
     let created_at_micros = state.now_unix_micros();
     let mapping_id = OrgRolePermissionId::generate(state.env(), &scope);
     let view = OrgRolePermissionView {
@@ -284,6 +412,7 @@ pub async fn assign_org_role_permission(
         permission_id: permission.to_string(),
         created_at_unix_ms: created_at_micros / 1000,
         updated_at_unix_ms: created_at_micros / 1000,
+        role_permission_budget: Some(role_permission_budget),
     };
     let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
 

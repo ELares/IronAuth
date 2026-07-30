@@ -2651,6 +2651,12 @@ export interface components {
              * @description What the budget would say about `permissions` at the next issuance. Advisory;
              *     see [`PermissionBudgetView`], in particular for which half of the budget it
              *     evaluates.
+             *
+             *     This is the MEMBERSHIP-scoped verdict and the authoritative one, because this
+             *     set is what a token claim would carry. It always carries `scope: "membership"`.
+             *     The attach 201's `role_permission_budget` carries `scope: "role"` and counts a
+             *     DIFFERENT set, which bounds this one in NEITHER direction; the type docs name
+             *     the three mechanisms.
              */
             permission_budget: components["schemas"]["PermissionBudgetView"];
             /**
@@ -3619,6 +3625,7 @@ export interface components {
             permission_id: string;
             /** @description The role that grants the permission (`rol_...`). */
             role_id: string;
+            role_permission_budget?: null | components["schemas"]["PermissionBudgetView"];
             /**
              * Format: int64
              * @description Last-modification time, milliseconds since the Unix epoch.
@@ -3778,12 +3785,74 @@ export interface components {
             target_latency_ms: number | null;
         };
         /**
-         * @description What the permission budget would say about this membership's resolved permission
-         *     set (issue #98). ADVISORY ONLY.
+         * @description WHICH SET a [`PermissionBudgetView`] was computed over (issue #425).
+         *
+         *     A REQUIRED discriminator INSIDE the verdict, not a property of the field carrying
+         *     it, and that placement is the whole point. The two verdicts this plane reports are
+         *     byte-shape identical apart from this member, so a bare `PermissionBudgetView`
+         *     handed to an SDK, a console component or a log pipeline WITHOUT the name of the
+         *     field it arrived in would otherwise have lost, irrecoverably, which set it
+         *     describes. A discriminator travels with the object and makes the two carriers
+         *     non-interchangeable by construction.
+         * @enum {string}
+         */
+        PermissionBudgetScope: "role" | "membership";
+        /**
+         * @description What the permission budget would say about ONE set of permissions (issue #98).
+         *     ADVISORY ONLY.
          *
          *     Nothing here refuses a write and no number here is a cap on what may be STORED. It
-         *     reports what the NEXT token issuance would carry, in the same units the
-         *     `[token_claims]` configuration is written in.
+         *     reports what a token issuance would carry, in the same units the `[token_claims]`
+         *     configuration is written in.
+         *
+         *     # WHICH set, said by the object itself
+         *
+         *     This type is the budget ARITHMETIC plus the NAME OF THE SET it ran over. It is
+         *     carried by two fields on two different endpoints, over two DIFFERENT sets, and
+         *     [`Self::scope`] states which one on every instance (issue #425):
+         *
+         *       * [`EffectiveRolesView::permission_budget`] carries
+         *         [`PermissionBudgetScope::Membership`]: every role the member holds directly,
+         *         through the group ancestor closure, and by the organization's default role,
+         *         unioned and deduplicated. That is the set a token claim would carry, so it is
+         *         the authoritative verdict.
+         *       * `OrgRolePermissionView::role_permission_budget`, on the attach 201, carries
+         *         [`PermissionBudgetScope::Role`]: one role's OWN live mappings. It is there
+         *         because the write is where an operator's attention is at the moment they cross
+         *         a threshold.
+         *
+         *     # The two verdicts bound each other in NEITHER direction
+         *
+         *     The role figure is not an upper bound on the membership figure and not a lower
+         *     bound on it either. It is a different set, and an earlier draft of this document
+         *     claimed a lower bound, which is why the refuting mechanisms are named rather than
+         *     summarized:
+         *
+         *       * A DEAD PERMISSION ENDPOINT. The role count filters the MAPPING'S `deleted_at`
+         *         and nothing else, while the membership resolution additionally requires the
+         *         permission ROW to be live. Neither a role nor a permission cascades to the
+         *         mapping table, so a soft-deleted permission leaves its mapping counted here and
+         *         resolved nowhere. Measured: an attach reported 3 with `budget_exceeded` while
+         *         the same membership read 1 with no overflow at all.
+         *       * The ORGANIZATION LIFECYCLE. This plane deliberately keeps a DISABLED
+         *         organization writable, while the resolution closure seeds only on an ACTIVE
+         *         one. Measured: an attach reported 2 and overflowing while the same membership
+         *         read 0, with no roles and no permissions.
+         *       * STALENESS, in EITHER direction. The role figure is a SNAPSHOT taken at the
+         *         write that reported it: a concurrent attach on the same role leaves it SHORT
+         *         and a concurrent detach leaves it LONG, and an Idempotency-Key REPLAY
+         *         faithfully reproduces the original snapshot by design, so a byte-identical 201
+         *         can report a count the role no longer has. Measured: a replay reported 2 and
+         *         `approaching` against a live count of 1.
+         *
+         *     So a membership can be over budget while the role verdict reads fine, AND the role
+         *     verdict can name an overflow no membership will ever see.
+         *     `an_attach_within_the_role_budget_can_still_be_a_membership_over_it` drives the
+         *     first direction and pins both answers at once. What CANNOT disagree is the
+         *     vocabulary: both carriers evaluate through [`PermissionBudgetView::evaluate`] and
+         *     take every wire string from
+         *     [`ironauth_config::PermissionOverflow::permissions_status`], which is also where
+         *     the mint takes it from.
          *
          *     # The one thing this does NOT answer, said plainly
          *
@@ -3830,10 +3899,22 @@ export interface components {
              */
             overflow?: string | null;
             /**
-             * @description How many permissions the membership effectively holds. A count, never a cap:
-             *     nothing refuses a permission because of it.
+             * @description How many permissions are in the set this verdict was computed over. A count,
+             *     never a cap: nothing refuses a permission because of it.
+             *
+             *     WHICH set that is, `scope` above says.
              */
             permission_count: number;
+            /**
+             * @description WHICH SET the numbers below were computed over. ALWAYS present, on both
+             *     carriers, and the one member that makes them distinguishable once the object
+             *     has been separated from the field it arrived in (issue #425).
+             *
+             *     `role` on the attach 201, `membership` on the effective-roles read. A reader
+             *     that treats the two alike is reading a different question from the one it
+             *     asked; see the type docs for the three mechanisms that make them disagree.
+             */
+            scope: components["schemas"]["PermissionBudgetScope"];
             /**
              * Format: int32
              * @description The configured element count above which an emitted claim is reported as
@@ -4683,7 +4764,7 @@ export interface components {
          *     `token_format`, `audience`, and `access_token_ttl_secs` are NOT editable on this
          *     surface, and they appear in this struct for exactly one reason: naming one is a
          *     typed 400 that says which field and why, instead of a 200 that quietly ignored
-         *     it. This follows [`crate::permissions`]'s `UpdatePermissionRequest` rather than a
+         *     it. This follows `UpdatePermissionRequest` on the permission vocabulary rather than a
          *     bare `deny_unknown_fields`, so the refusal names the field and states the rule.
          *
          *     The reason to spend that here rather than take the silent ignore is specific to
@@ -11633,7 +11714,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Attached. Every member who effectively holds the role, directly or through the group forest, resolves the permission at the NEXT token issuance */
+            /** @description Attached. Every member who effectively holds the role, directly or through the group forest, resolves the permission at the NEXT token issuance. The body carries `role_permission_budget`, the advisory budget verdict over THIS ROLE'S OWN live mappings including this one, stamped `scope: "role"` (issue #425). It refuses nothing: an attach past every threshold is still this 201, and nothing is truncated anywhere. Read the field for what it does NOT cover: a role's mappings are a DIFFERENT set from any membership's resolved set and bound it in NEITHER direction, because a soft-deleted permission is still counted here, a disabled organization stays writable here while resolving nothing, and the figure is a snapshot taken at the write that a replay reproduces unchanged. The effective-roles view, whose verdict is stamped `scope: "membership"`, is the only answer that predicts what a token will carry */
             201: {
                 headers: {
                     [name: string]: unknown;
