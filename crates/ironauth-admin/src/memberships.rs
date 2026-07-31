@@ -10,6 +10,13 @@
 //! live, the typed [`ironauth_store::OrgMembershipId`] embeds the scope, and the
 //! membership's foreign keys reject a nonexistent organization or user.
 //!
+//! The scope and organization resolution comes from [`crate::org_context`] rather than
+//! from private copies here. This file carried its own byte-identical pair until issue
+//! #411, which is exactly what the note on those copies predicted would eventually
+//! matter: the write fence for a soft-deleted environment went into the ONE
+//! [`crate::org_context::resolve_live_org`], and a second copy would have been three
+//! endpoints silently keeping the old answer.
+//!
 //! Add is idempotent through the required Idempotency-Key (a replayed POST returns
 //! the original response); a distinct SECOND add of a user already a member is a 409.
 //! Remove is a soft deactivation: the first remove of a live membership is a 204, and
@@ -29,56 +36,19 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::Response;
 use ironauth_store::{
-    CorrelationId, NewMembership, OrgMembershipId, OrgMembershipRecord, OrganizationId,
-    ResolvedIdempotencyWrite, Scope, StoreError, UserId,
+    CorrelationId, NewMembership, OrgMembershipId, OrgMembershipRecord, ResolvedIdempotencyWrite,
+    StoreError, UserId,
 };
 
 use crate::auth::Principal;
 use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
 use crate::input::parse_json;
+use crate::org_context::{OrgAccess, resolve_live_org, resolve_scope};
 use crate::pagination::{ListQuery, Pagination};
 use crate::response::{json, no_content};
 use crate::state::AdminState;
 use crate::views::{CreateMembershipRequest, MembershipList, MembershipView};
-
-/// Resolve and authorize the `(tenant, environment)` scope from the path. The
-/// operator passes; a management key must be scoped to exactly this environment
-/// (otherwise the LOUD wrong-scope error). A malformed tenant or environment id is
-/// the uniform not-found.
-fn resolve_scope(
-    state: &AdminState,
-    principal: &Principal,
-    tenant_id: &str,
-    environment_id: &str,
-) -> Result<(Scope, ironauth_store::ActorRef), ApiError> {
-    let tenant = state
-        .store()
-        .management()
-        .tenants(state.bootstrap_operator_id())
-        .parse_id(tenant_id)?;
-    let environment = state
-        .store()
-        .management()
-        .environments(tenant)
-        .parse_id(environment_id)?;
-    let actor = principal.require_environment(tenant, environment)?;
-    Ok((Scope::new(tenant, environment), actor))
-}
-
-/// Resolve the parent organization id in scope, verifying it exists and is LIVE. A
-/// foreign or soft-deleted organization reads as a uniform not-found.
-async fn resolve_live_org(
-    state: &AdminState,
-    scope: Scope,
-    organization_id: &str,
-) -> Result<OrganizationId, ApiError> {
-    let organizations = state.store().management().organizations(scope);
-    let id = organizations.parse_id(organization_id)?;
-    // A soft-deleted or absent organization is the uniform not-found.
-    organizations.get(&id).await?;
-    Ok(id)
-}
 
 /// Add a user to an organization.
 #[utoipa::path(
@@ -100,7 +70,7 @@ async fn resolve_live_org(
         (status = 400, description = "Malformed request", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Organization or user not found", body = ErrorBody),
+        (status = 404, description = "Organization or user not found. The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody),
         (status = 409, description = "The user is already a member", body = ErrorBody),
         (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
     )
@@ -128,7 +98,7 @@ pub async fn create_membership(
         return Ok(replay);
     }
 
-    let org_id = resolve_live_org(&state, scope, &organization_id).await?;
+    let org_id = resolve_live_org(&state, scope, &organization_id, OrgAccess::Write).await?;
 
     let request: CreateMembershipRequest = parse_json(&body)?;
     // The member must be a user in THIS scope; a malformed or cross-scope id is the
@@ -228,7 +198,7 @@ pub async fn list_memberships(
     Query(query): Query<ListQuery>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
-    let org_id = resolve_live_org(&state, scope, &organization_id).await?;
+    let org_id = resolve_live_org(&state, scope, &organization_id, OrgAccess::Read).await?;
     let page = Pagination::resolve(&query, state.default_page_size(), state.max_page_size())?;
     let rows = state
         .store()
@@ -264,7 +234,7 @@ pub async fn list_memberships(
         (status = 204, description = "Removed"),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Not found (absent, or already removed: a repeat delete)", body = ErrorBody)
+        (status = 404, description = "Not found (absent, or already removed: a repeat delete). The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody)
     )
 )]
 pub async fn delete_membership(
@@ -281,7 +251,7 @@ pub async fn delete_membership(
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     // The parent organization must resolve in scope (a cross-scope org path segment is
     // the uniform not-found), keeping the nested resource consistent.
-    let org_id = resolve_live_org(&state, scope, &organization_id).await?;
+    let org_id = resolve_live_org(&state, scope, &organization_id, OrgAccess::Write).await?;
     let memberships = state.store().management().org_memberships(scope);
     let id = memberships.parse_id(&membership_id)?;
     // Enforce the NESTED resource: the membership must belong to THIS organization. A

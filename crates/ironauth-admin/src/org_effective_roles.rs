@@ -108,7 +108,7 @@ use utoipa::ToSchema;
 
 use crate::auth::Principal;
 use crate::error::{ApiError, ErrorBody};
-use crate::org_context::{require_membership_in_org, resolve_live_org, resolve_scope};
+use crate::org_context::{OrgAccess, require_membership_in_org, resolve_live_org, resolve_scope};
 use crate::response::json;
 use crate::state::AdminState;
 
@@ -444,7 +444,7 @@ pub async fn get_org_membership_effective_roles(
     )>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
-    let org_id = resolve_live_org(&state, scope, &organization_id).await?;
+    let org_id = resolve_live_org(&state, scope, &organization_id, OrgAccess::Read).await?;
     // The membership is resolved in THIS organization first: a membership of a
     // sibling organization is the uniform not-found, so this view can never report a
     // member of another organization's authorization picture.

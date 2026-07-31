@@ -138,7 +138,8 @@ use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
 use crate::input::parse_json;
 use crate::org_context::{
-    parse_permission_id, parse_role_id, require_role_in_org, resolve_live_org, resolve_scope,
+    OrgAccess, parse_permission_id, parse_role_id, require_role_in_org, resolve_live_org,
+    resolve_scope,
 };
 use crate::org_effective_roles::{PermissionBudgetScope, PermissionBudgetView};
 use crate::pagination::{ListQuery, Pagination};
@@ -294,7 +295,7 @@ pub struct OrgRolePermissionList {
         (status = 400, description = "Malformed request", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Not found: the organization, a role that is not a live role of it, or a permission that is not a live permission of this environment (uniform across absent, deleted, another scope's, and another organization's, so a cross pairing never says which half was wrong)", body = ErrorBody),
+        (status = 404, description = "Not found: the organization, a role that is not a live role of it, or a permission that is not a live permission of this environment (uniform across absent, deleted, another scope's, and another organization's, so a cross pairing never says which half was wrong). The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody),
         (status = 409, description = "The role already carries that permission", body = ErrorBody),
         (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
     )
@@ -338,7 +339,7 @@ pub async fn assign_org_role_permission(
     // `an_attach_into_an_unreachable_environment_is_never_a_server_error`
     // records, including the one case that is NOT a refusal and is shared with every
     // organization-nested write in the tree.
-    let org_id = resolve_live_org(&state, scope, &organization_id).await?;
+    let org_id = resolve_live_org(&state, scope, &organization_id, OrgAccess::Write).await?;
     // The ROLE is resolved as a live role of THIS organization BEFORE the body is
     // parsed, and that ordering is the point rather than the read. Parsing the id
     // alone would leave the role's EXISTENCE to the store, which runs after the body,
@@ -492,7 +493,7 @@ pub async fn list_org_role_permissions(
     Query(query): Query<ListQuery>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
-    let org_id = resolve_live_org(&state, scope, &organization_id).await?;
+    let org_id = resolve_live_org(&state, scope, &organization_id, OrgAccess::Read).await?;
     // The role is resolved as a live role of THIS organization first, so a role of a
     // sibling organization is the same 404 that reading the role itself gives, rather
     // than an empty page asserting it exists here and grants nothing. The read below
@@ -538,7 +539,7 @@ pub async fn list_org_role_permissions(
         (status = 204, description = "Detached. Members holding the role stop resolving the permission at the NEXT token issuance; access tokens already issued are NOT revoked (revoke the session or refresh family for that). The pair is immediately available again, and re-attaching mints a FRESH mapping rather than reviving this one"),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Not found (no such live mapping: absent, already detached, either half in another scope, a role of another organization, or a pair whose two halves are individually visible but do not belong together)", body = ErrorBody)
+        (status = 404, description = "Not found (no such live mapping: absent, already detached, either half in another scope, a role of another organization, or a pair whose two halves are individually visible but do not belong together). The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody)
     )
 )]
 pub async fn unassign_org_role_permission(
@@ -554,7 +555,7 @@ pub async fn unassign_org_role_permission(
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
-    let org_id = resolve_live_org(&state, scope, &organization_id).await?;
+    let org_id = resolve_live_org(&state, scope, &organization_id, OrgAccess::Write).await?;
     let role = parse_role_id(&state, scope, &role_id)?;
     let permission = parse_permission_id(&state, scope, &permission_id)?;
 

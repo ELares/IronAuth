@@ -1271,15 +1271,19 @@ async fn an_attach_into_an_unreachable_environment_is_never_a_server_error() {
     // reach the constraint. The absent and the malformed environment are therefore one
     // answer, and neither is a 500.
     //
-    // The SOFT-DELETED environment is the case that is NOT a refusal, and it is
-    // asserted rather than quietly left out. Deleting an environment does not cascade
-    // to its organizations, so `resolve_live_org` still resolves and the write lands.
-    // That is a property of every ORGANIZATION-NESTED write in the tree and not
-    // something this surface introduces, which is why the shipped
-    // `POST .../organizations/{org}/roles` is driven side by side in the same fixture:
-    // the two agreeing is the mechanical form of that claim, and if a later change
-    // makes one of them refuse, this test says so instead of the prose quietly going
-    // stale.
+    // The SOFT-DELETED environment used to be the case that was NOT a refusal, because
+    // deleting an environment does not cascade to its organizations and
+    // `resolve_live_org` therefore still resolved. Issue #411 settled it the other way:
+    // a write into an environment an operator believes is decommissioned refuses, and
+    // the fence sits in `resolve_live_org` itself, so every organization-nested write
+    // inherits it. This test kept working through that change without being rewritten,
+    // which is the whole point of the pairing below: the shipped
+    // `POST .../organizations/{org}/roles` is driven side by side in the SAME fixture,
+    // so the two agreeing is a mechanical claim rather than a paragraph, and the second
+    // assertion is the one that had to be edited to record the new answer.
+    //
+    // `tests/deleted_environment.rs` is where the whole surface is swept; this pair
+    // stays here because this file is where the divergence was first measured.
     let h = Harness::start(50).await;
     let (tenant, environment) = tenant_env(&h).await;
     let org = create_org(&h, &tenant, &environment, "k-org").await;
@@ -1360,10 +1364,18 @@ async fn an_attach_into_an_unreachable_environment_is_never_a_server_error() {
          environment: {body} vs {role_body}"
     );
     assert_eq!(
+        body, role_body,
+        "and they agree byte for byte, not merely on the status"
+    );
+    assert_eq!(
         status,
-        StatusCode::CREATED,
-        "and what they agree on today is that the write LANDS, because deleting an \
-         environment does not cascade to its organizations: {body}"
+        StatusCode::NOT_FOUND,
+        "and what they agree on is the uniform refusal (issue #411): {body}"
+    );
+    assert_eq!(
+        body, malformed_body,
+        "which is the SAME answer a malformed environment segment gets, so a \
+         soft-deleted environment is indistinguishable from one that never existed"
     );
 
     // The positive control: the live environment still accepts an attach, so the two

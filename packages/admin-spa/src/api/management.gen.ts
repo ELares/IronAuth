@@ -9553,7 +9553,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Environment not found */
+            /** @description Environment not found: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -9668,7 +9668,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Not found (absent, or already deactivated: a repeat delete) */
+            /** @description Not found (absent, or already deactivated: a repeat delete). The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -9735,7 +9735,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Not found: the organization, or a role that is not a live role of it (uniform across absent, deleted, another scope's, and another organization's) */
+            /** @description Not found: the organization, or a role that is not a live role of it (uniform across absent, deleted, another scope's, and another organization's). The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -9796,7 +9796,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Not found (the organization, or an organization with no live default role: a repeat clear and an organization whose default role has since been deleted are the same answer) */
+            /** @description Not found (the organization, or an organization with no live default role: a repeat clear and an organization whose default role has since been deleted are the same answer). The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -9850,7 +9850,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Not found */
+            /** @description Not found. The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -9904,7 +9904,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Not found */
+            /** @description Not found. The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -10048,7 +10048,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Organization not found, or the parent is not a live group of it */
+            /** @description Organization not found, or the parent is not a live group of it. The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -10176,7 +10176,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Not found (absent, already deleted, another scope's, or another organization's) */
+            /** @description Not found (absent, already deleted, another scope's, or another organization's). The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -10245,7 +10245,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Not found (absent, deleted, another scope's, or another organization's) */
+            /** @description Not found (absent, deleted, another scope's, or another organization's). The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -10393,7 +10393,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Not found: the organization, the group, or the membership is not a live row of this organization (uniform across absent, deleted, another scope's, and another organization's) */
+            /** @description Not found: the organization, the group, or the membership is not a live row of this organization (uniform across absent, deleted, another scope's, and another organization's). The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -10467,7 +10467,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Not found (no such live binding: absent, already removed, another scope's, another organization's, or a pair whose two halves belong to different organizations) */
+            /** @description Not found (no such live binding: absent, already removed, another scope's, another organization's, or a pair whose two halves belong to different organizations). The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -10536,7 +10536,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Not found: the group or the proposed parent is not a live group of this organization (uniform across absent, deleted, another scope's, and another organization's) */
+            /** @description Not found: the group or the proposed parent is not a live group of this organization (uniform across absent, deleted, another scope's, and another organization's). The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -10693,7 +10693,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Not found: the organization, the group, or the role is not a live row of this organization (uniform across absent, deleted, another scope's, and another organization's) */
+            /** @description Not found: the organization, the group, or the role is not a live row of this organization (uniform across absent, deleted, another scope's, and another organization's). The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -10767,7 +10767,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Not found (no such live assignment: absent, already withdrawn, another scope's, another organization's, or a pair whose two halves belong to different organizations) */
+            /** @description Not found (no such live assignment: absent, already withdrawn, another scope's, another organization's, or a pair whose two halves belong to different organizations). The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -10911,7 +10911,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Organization or user not found */
+            /** @description Organization or user not found. The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -10983,7 +10983,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Not found (absent, or already removed: a repeat delete) */
+            /** @description Not found (absent, or already removed: a repeat delete). The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -11187,7 +11187,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Not found: the organization, the membership, or the role is not a live row of this organization (uniform across absent, deleted, another scope's, and another organization's) */
+            /** @description Not found: the organization, the membership, or the role is not a live row of this organization (uniform across absent, deleted, another scope's, and another organization's). The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -11261,7 +11261,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Not found (no such live assignment: absent, already withdrawn, another scope's, another organization's, or a pair whose two halves belong to different organizations) */
+            /** @description Not found (no such live assignment: absent, already withdrawn, another scope's, another organization's, or a pair whose two halves belong to different organizations). The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -11405,7 +11405,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Organization not found */
+            /** @description Organization not found. The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -11533,7 +11533,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Not found (absent, already deleted, another scope's, or another organization's) */
+            /** @description Not found (absent, already deleted, another scope's, or another organization's). The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -11602,7 +11602,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Not found (absent, deleted, another scope's, or another organization's) */
+            /** @description Not found (absent, deleted, another scope's, or another organization's). The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -11750,7 +11750,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Not found: the organization, a role that is not a live role of it, or a permission that is not a live permission of this environment (uniform across absent, deleted, another scope's, and another organization's, so a cross pairing never says which half was wrong) */
+            /** @description Not found: the organization, a role that is not a live role of it, or a permission that is not a live permission of this environment (uniform across absent, deleted, another scope's, and another organization's, so a cross pairing never says which half was wrong). The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -11824,7 +11824,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Not found (no such live mapping: absent, already detached, either half in another scope, a role of another organization, or a pair whose two halves are individually visible but do not belong together) */
+            /** @description Not found (no such live mapping: absent, already detached, either half in another scope, a role of another organization, or a pair whose two halves are individually visible but do not belong together). The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;

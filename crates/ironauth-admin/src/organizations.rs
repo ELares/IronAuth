@@ -19,47 +19,34 @@
 //! already-deactivated organization, like a delete of an absent one, is the uniform
 //! 404. That anti-oracle 404 is the same not-found the get returns, so delete never
 //! discloses whether a not-found id was once live.
+//!
+//! Scope and organization resolution come from [`crate::org_context`] rather than from
+//! private copies here. The three WRITES (`delete`, `disable`, `enable`) address their
+//! organization through [`crate::org_context::resolve_live_org`] with
+//! [`crate::org_context::OrgAccess::Write`], which is what puts them behind the same
+//! soft-deleted-environment fence as every write nested under an organization (issue
+//! #411), and `get` addresses its organization through the same function with
+//! [`crate::org_context::OrgAccess::Read`], which deliberately does NOT carry the fence:
+//! a decommissioned environment stays auditable. `list` addresses no organization at
+//! all, so it resolves only the scope.
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::Response;
 use ironauth_store::{
-    CorrelationId, IdempotencyWrite, OrganizationId, OrganizationState, Scope, StoreError,
+    CorrelationId, IdempotencyWrite, OrganizationId, OrganizationState, StoreError,
 };
 
 use crate::auth::Principal;
 use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
 use crate::input::{parse_json, require_non_empty};
+use crate::org_context::{OrgAccess, resolve_live_org, resolve_scope};
 use crate::pagination::{ListQuery, Pagination};
 use crate::response::{json, no_content};
 use crate::state::AdminState;
 use crate::views::{CreateOrganizationRequest, OrganizationList, OrganizationView};
-
-/// Resolve and authorize the `(tenant, environment)` scope from the path. The
-/// operator passes; a management key must be scoped to exactly this environment
-/// (otherwise the LOUD wrong-scope error). A malformed tenant or environment id
-/// is the uniform not-found.
-fn resolve_scope(
-    state: &AdminState,
-    principal: &Principal,
-    tenant_id: &str,
-    environment_id: &str,
-) -> Result<(Scope, ironauth_store::ActorRef), ApiError> {
-    let tenant = state
-        .store()
-        .management()
-        .tenants(state.bootstrap_operator_id())
-        .parse_id(tenant_id)?;
-    let environment = state
-        .store()
-        .management()
-        .environments(tenant)
-        .parse_id(environment_id)?;
-    let actor = principal.require_environment(tenant, environment)?;
-    Ok((Scope::new(tenant, environment), actor))
-}
 
 /// Create an organization under an environment.
 #[utoipa::path(
@@ -80,7 +67,7 @@ fn resolve_scope(
         (status = 400, description = "Malformed request", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Environment not found", body = ErrorBody),
+        (status = 404, description = "Environment not found: an absent or soft-deleted one answers this same not-found", body = ErrorBody),
         (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
     )
 )]
@@ -110,12 +97,14 @@ pub async fn create_organization(
     // Containment: the parent environment must exist and be live. A foreign or
     // soft-deleted environment reads as a uniform not-found (the tenant filter is
     // the anti-oracle), never a foreign-key error.
-    state
-        .store()
-        .management()
-        .environments(scope.tenant())
-        .get(&scope.environment())
-        .await?;
+    //
+    // This used to be an inline copy of the two-line read. It is the shared
+    // [`crate::org_context::require_live_environment`] now, which is the same function
+    // the writes nested UNDER an organization reach through `resolve_live_org` (issue
+    // #411): a create that refused a deleted environment while every nested write
+    // accepted one was half of the split this issue closed, and one copy of the check
+    // is what keeps the halves from drifting apart again.
+    crate::org_context::require_live_environment(&state, &scope).await?;
 
     let request: CreateOrganizationRequest = parse_json(&body)?;
     let display_name = require_non_empty(&request.display_name, "display_name")?;
@@ -234,10 +223,23 @@ pub async fn get_organization(
     Path((tenant_id, environment_id, organization_id)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
-    let organizations = state.store().management().organizations(scope);
-    // A cross-scope id fails to parse in scope: the uniform not-found.
-    let id = organizations.parse_id(&organization_id)?;
-    let record = organizations.get(&id).await?;
+    // Addressed through the shared resolution like every other route under this prefix
+    // (issue #411), with [`OrgAccess::Read`]: a decommissioned environment stays
+    // auditable, so this read is deliberately NOT behind the environment fence. It
+    // replaces an inline `parse_id` then `get` that was byte-identical to the helper's
+    // body, which is the copy the module note above says does not exist here.
+    //
+    // The cost is one extra read of the same row: the helper proves the organization is
+    // live and hands back only its id, and the projection below needs the record. That
+    // is paid deliberately, because the alternative is the private copy this change
+    // exists to remove.
+    let id = resolve_live_org(&state, scope, &organization_id, OrgAccess::Read).await?;
+    let record = state
+        .store()
+        .management()
+        .organizations(scope)
+        .get(&id)
+        .await?;
     let body = serde_json::to_string(&OrganizationView::from_record(record))
         .map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body))
@@ -259,7 +261,7 @@ pub async fn get_organization(
         (status = 204, description = "Deactivated"),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Not found (absent, or already deactivated: a repeat delete)", body = ErrorBody)
+        (status = 404, description = "Not found (absent, or already deactivated: a repeat delete). The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody)
     )
 )]
 pub async fn delete_organization(
@@ -269,11 +271,13 @@ pub async fn delete_organization(
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
-    let id = state
-        .store()
-        .management()
-        .organizations(scope)
-        .parse_id(&organization_id)?;
+    // Addressed through the SAME resolution every other organization-nested write uses
+    // (issue #411), which is what puts this route behind the one environment fence
+    // instead of beside it. It replaces a bare `parse_id`, so it adds a read of the
+    // organization that the delete below would have performed as its own predicate
+    // anyway: a soft-deleted organization was already the uniform not-found from the
+    // delete's zero-row result and is now the same not-found from this read.
+    let id = resolve_live_org(&state, scope, &organization_id, OrgAccess::Write).await?;
     state
         .store()
         .management()
@@ -297,11 +301,11 @@ async fn set_organization_state(
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(state, principal, tenant_id, environment_id)?;
     crate::sudo::require_fresh_privilege(state, scope, actor).await?;
-    let id = state
-        .store()
-        .management()
-        .organizations(scope)
-        .parse_id(organization_id)?;
+    // The same shared resolution the delete above uses (issue #411). It replaces a bare
+    // `parse_id`, and the read it adds is one this handler already performed at the end
+    // to render the response, so a soft-deleted organization answered the uniform
+    // not-found before this line existed and answers it here now.
+    let id = resolve_live_org(state, scope, organization_id, OrgAccess::Write).await?;
     state
         .store()
         .management()
@@ -338,7 +342,7 @@ async fn set_organization_state(
         (status = 200, description = "The disabled organization", body = OrganizationView),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Not found", body = ErrorBody)
+        (status = 404, description = "Not found. The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody)
     )
 )]
 pub async fn disable_organization(
@@ -373,7 +377,7 @@ pub async fn disable_organization(
         (status = 200, description = "The enabled organization", body = OrganizationView),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Not found", body = ErrorBody)
+        (status = 404, description = "Not found. The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody)
     )
 )]
 pub async fn enable_organization(
