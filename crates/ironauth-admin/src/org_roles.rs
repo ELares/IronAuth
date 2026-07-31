@@ -111,7 +111,9 @@ use crate::auth::Principal;
 use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
 use crate::input::{parse_json, require_non_empty, require_slug};
-use crate::org_context::{parse_role_id, require_role_in_org, resolve_live_org, resolve_scope};
+use crate::org_context::{
+    OrgAccess, parse_role_id, require_role_in_org, resolve_live_org, resolve_scope,
+};
 use crate::pagination::{ListQuery, Pagination};
 use crate::response::{json, no_content};
 use crate::state::AdminState;
@@ -237,7 +239,7 @@ pub struct SetOrgDefaultRoleRequest {
         (status = 400, description = "Malformed request (including a slug the stable-name rule refuses)", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Organization not found", body = ErrorBody),
+        (status = 404, description = "Organization not found. The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody),
         (status = 409, description = "A live role of this organization already holds that slug", body = ErrorBody),
         (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
     )
@@ -265,7 +267,7 @@ pub async fn create_org_role(
         return Ok(replay);
     }
 
-    let org_id = resolve_live_org(&state, scope, &organization_id).await?;
+    let org_id = resolve_live_org(&state, scope, &organization_id, OrgAccess::Write).await?;
 
     let request: CreateOrgRoleRequest = parse_json(&body)?;
     let slug = require_slug(&request.slug, "slug")?;
@@ -358,7 +360,7 @@ pub async fn list_org_roles(
     Query(query): Query<ListQuery>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
-    let org_id = resolve_live_org(&state, scope, &organization_id).await?;
+    let org_id = resolve_live_org(&state, scope, &organization_id, OrgAccess::Read).await?;
     let page = Pagination::resolve(&query, state.default_page_size(), state.max_page_size())?;
     // `list_for_org` filters on organization_id, so a sibling organization's roles
     // can never appear on this page.
@@ -410,7 +412,7 @@ pub async fn get_org_role(
     )>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
-    let org_id = resolve_live_org(&state, scope, &organization_id).await?;
+    let org_id = resolve_live_org(&state, scope, &organization_id, OrgAccess::Read).await?;
     let record = require_role_in_org(&state, scope, &org_id, &role_id).await?;
     let body =
         serde_json::to_string(&OrgRoleView::from_record(record)).map_err(|_| ApiError::Internal)?;
@@ -436,7 +438,7 @@ pub async fn get_org_role(
         (status = 400, description = "Malformed request", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Not found (absent, deleted, another scope's, or another organization's)", body = ErrorBody)
+        (status = 404, description = "Not found (absent, deleted, another scope's, or another organization's). The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody)
     )
 )]
 pub async fn update_org_role(
@@ -452,7 +454,7 @@ pub async fn update_org_role(
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
-    let org_id = resolve_live_org(&state, scope, &organization_id).await?;
+    let org_id = resolve_live_org(&state, scope, &organization_id, OrgAccess::Write).await?;
     // The cross-parent guard, BEFORE the write: a role of a sibling organization
     // presented under this organization's path is the uniform not-found, so the
     // nested path can never rename another organization's role. `organization_id`
@@ -504,7 +506,7 @@ pub async fn update_org_role(
         (status = 204, description = "Deleted (the slug is immediately free for a new role)"),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Not found (absent, already deleted, another scope's, or another organization's)", body = ErrorBody)
+        (status = 404, description = "Not found (absent, already deleted, another scope's, or another organization's). The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody)
     )
 )]
 pub async fn delete_org_role(
@@ -519,7 +521,7 @@ pub async fn delete_org_role(
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
-    let org_id = resolve_live_org(&state, scope, &organization_id).await?;
+    let org_id = resolve_live_org(&state, scope, &organization_id, OrgAccess::Write).await?;
     // The cross-parent guard: deleting a sibling organization's role through this
     // path is the uniform not-found and removes nothing.
     let record = require_role_in_org(&state, scope, &org_id, &role_id).await?;
@@ -556,7 +558,7 @@ pub async fn delete_org_role(
         (status = 400, description = "Malformed request", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Not found: the organization, or a role that is not a live role of it (uniform across absent, deleted, another scope's, and another organization's)", body = ErrorBody),
+        (status = 404, description = "Not found: the organization, or a role that is not a live role of it (uniform across absent, deleted, another scope's, and another organization's). The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody),
         (status = 409, description = "A CONCURRENT designation in this organization won the race; retry. A caller sending one request cannot reach this, because a second designation moves the existing one rather than colliding with it", body = ErrorBody)
     )
 )]
@@ -571,7 +573,7 @@ pub async fn set_org_default_role(
     // The ADDRESS of this resource is the ORGANIZATION, and it resolves BEFORE the
     // body is parsed: a caller who cannot reach the organization must not be able to
     // tell a body this endpoint would refuse from one it would accept.
-    let org_id = resolve_live_org(&state, scope, &organization_id).await?;
+    let org_id = resolve_live_org(&state, scope, &organization_id, OrgAccess::Write).await?;
 
     let request: SetOrgDefaultRoleRequest = parse_json(&body)?;
     // Parse ONLY. Whether the id names a live role OF THIS ORGANIZATION is the
@@ -628,7 +630,7 @@ pub async fn set_org_default_role(
         (status = 204, description = "Cleared. Members stop resolving the role through the designation at the NEXT token issuance, and keep it if some row grants it; access tokens already issued are NOT revoked (revoke the session or refresh family for that). The role itself is untouched"),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Not found (the organization, or an organization with no live default role: a repeat clear and an organization whose default role has since been deleted are the same answer)", body = ErrorBody)
+        (status = 404, description = "Not found (the organization, or an organization with no live default role: a repeat clear and an organization whose default role has since been deleted are the same answer). The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody)
     )
 )]
 pub async fn clear_org_default_role(
@@ -638,7 +640,7 @@ pub async fn clear_org_default_role(
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
-    let org_id = resolve_live_org(&state, scope, &organization_id).await?;
+    let org_id = resolve_live_org(&state, scope, &organization_id, OrgAccess::Write).await?;
     // The store resolves the outgoing role IN THE SAME STATEMENT that clears it, so
     // there is nothing to name here and no second read to race against. An
     // organization with no live default matches no row and is the uniform not-found.

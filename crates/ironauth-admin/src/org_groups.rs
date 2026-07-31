@@ -65,7 +65,7 @@ use crate::auth::Principal;
 use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
 use crate::input::{parse_json, require_non_empty, require_slug};
-use crate::org_context::{parse_group_id, resolve_live_org, resolve_scope};
+use crate::org_context::{OrgAccess, parse_group_id, resolve_live_org, resolve_scope};
 use crate::pagination::{ListQuery, Pagination};
 use crate::response::{json, no_content};
 use crate::state::AdminState;
@@ -236,7 +236,7 @@ fn parse_optional_parent(
         (status = 400, description = "Malformed request (including a slug the stable-name rule refuses)", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Organization not found, or the parent is not a live group of it", body = ErrorBody),
+        (status = 404, description = "Organization not found, or the parent is not a live group of it. The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody),
         (status = 409, description = "A live group of this organization already holds that slug", body = ErrorBody),
         (status = 422, description = "The parent would nest the group past the configured maximum depth, or the Idempotency-Key was reused with a different request", body = ErrorBody)
     )
@@ -264,7 +264,7 @@ pub async fn create_org_group(
         return Ok(replay);
     }
 
-    let org_id = resolve_live_org(&state, scope, &organization_id).await?;
+    let org_id = resolve_live_org(&state, scope, &organization_id, OrgAccess::Write).await?;
 
     let request: CreateOrgGroupRequest = parse_json(&body)?;
     let slug = require_slug(&request.slug, "slug")?;
@@ -361,7 +361,7 @@ pub async fn list_org_groups(
     Query(query): Query<ListQuery>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
-    let org_id = resolve_live_org(&state, scope, &organization_id).await?;
+    let org_id = resolve_live_org(&state, scope, &organization_id, OrgAccess::Read).await?;
     let page = Pagination::resolve(&query, state.default_page_size(), state.max_page_size())?;
     // `list_for_org` filters on organization_id, so a sibling organization's groups
     // can never appear on this page.
@@ -413,7 +413,7 @@ pub async fn get_org_group(
     )>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
-    let org_id = resolve_live_org(&state, scope, &organization_id).await?;
+    let org_id = resolve_live_org(&state, scope, &organization_id, OrgAccess::Read).await?;
     let id = parse_group_id(&state, scope, &group_id)?;
     let record = read_group_in_org(&state, scope, &org_id, &id).await?;
     let body = serde_json::to_string(&OrgGroupView::from_record(record))
@@ -441,7 +441,7 @@ pub async fn get_org_group(
         (status = 400, description = "Malformed request", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Not found (absent, deleted, another scope's, or another organization's)", body = ErrorBody)
+        (status = 404, description = "Not found (absent, deleted, another scope's, or another organization's). The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody)
     )
 )]
 pub async fn update_org_group(
@@ -457,7 +457,7 @@ pub async fn update_org_group(
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
-    let org_id = resolve_live_org(&state, scope, &organization_id).await?;
+    let org_id = resolve_live_org(&state, scope, &organization_id, OrgAccess::Write).await?;
     let id = parse_group_id(&state, scope, &group_id)?;
 
     let request: UpdateOrgGroupRequest = parse_json(&body)?;
@@ -518,7 +518,7 @@ pub async fn update_org_group(
         (status = 400, description = "Malformed request", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Not found: the group or the proposed parent is not a live group of this organization (uniform across absent, deleted, another scope's, and another organization's)", body = ErrorBody),
+        (status = 404, description = "Not found: the group or the proposed parent is not a live group of this organization (uniform across absent, deleted, another scope's, and another organization's). The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody),
         (status = 422, description = "The move would close a cycle, or would nest the moved subtree past the configured maximum depth", body = ErrorBody)
     )
 )]
@@ -535,7 +535,7 @@ pub async fn set_org_group_parent(
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
-    let org_id = resolve_live_org(&state, scope, &organization_id).await?;
+    let org_id = resolve_live_org(&state, scope, &organization_id, OrgAccess::Write).await?;
     let id = parse_group_id(&state, scope, &group_id)?;
 
     let request: SetOrgGroupParentRequest = parse_json(&body)?;
@@ -584,7 +584,7 @@ pub async fn set_org_group_parent(
         (status = 204, description = "Deleted (children detached to roots; the slug is immediately free for a new group)"),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Not found (absent, already deleted, another scope's, or another organization's)", body = ErrorBody)
+        (status = 404, description = "Not found (absent, already deleted, another scope's, or another organization's). The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody)
     )
 )]
 pub async fn delete_org_group(
@@ -599,7 +599,7 @@ pub async fn delete_org_group(
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
-    let org_id = resolve_live_org(&state, scope, &organization_id).await?;
+    let org_id = resolve_live_org(&state, scope, &organization_id, OrgAccess::Write).await?;
     let id = parse_group_id(&state, scope, &group_id)?;
     // The organization rides into the DELETE statement as a predicate: a group of a
     // sibling organization matches no row, is the uniform not-found, and is not

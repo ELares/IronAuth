@@ -452,5 +452,15 @@ name = "absent_environment"
 path = "tests/absent_environment.rs"
 required-features = ["testing"]
 
+# The soft-deleted-environment contract (issue #411): every operation the committed
+# contract publishes under `/organizations/{organization_id}` driven at an environment
+# that was created, populated, and then soft-deleted, asserting that a WRITE is the
+# uniform not-found and a READ still answers. Spec driven in both directions, so a new
+# organization-nested route fails it the moment it is documented. Needs a real database.
+[[test]]
+name = "deleted_environment"
+path = "tests/deleted_environment.rs"
+required-features = ["testing"]
+
 [lints]
 workspace = true

@@ -54,7 +54,8 @@ use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
 use crate::input::parse_json;
 use crate::org_context::{
-    parse_group_id, parse_membership_id, require_group_in_org, resolve_live_org, resolve_scope,
+    OrgAccess, parse_group_id, parse_membership_id, require_group_in_org, resolve_live_org,
+    resolve_scope,
 };
 use crate::pagination::{ListQuery, Pagination};
 use crate::response::{json, no_content};
@@ -137,7 +138,7 @@ pub struct OrgGroupMemberList {
         (status = 400, description = "Malformed request", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Not found: the organization, the group, or the membership is not a live row of this organization (uniform across absent, deleted, another scope's, and another organization's)", body = ErrorBody),
+        (status = 404, description = "Not found: the organization, the group, or the membership is not a live row of this organization (uniform across absent, deleted, another scope's, and another organization's). The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody),
         (status = 409, description = "The membership is already a live member of this group", body = ErrorBody),
         (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
     )
@@ -170,7 +171,7 @@ pub async fn add_org_group_member(
         return Ok(replay);
     }
 
-    let org_id = resolve_live_org(&state, scope, &organization_id).await?;
+    let org_id = resolve_live_org(&state, scope, &organization_id, OrgAccess::Write).await?;
     let group = parse_group_id(&state, scope, &group_id)?;
 
     let request: AddOrgGroupMemberRequest = parse_json(&body)?;
@@ -265,7 +266,7 @@ pub async fn list_org_group_members(
     Query(query): Query<ListQuery>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
-    let org_id = resolve_live_org(&state, scope, &organization_id).await?;
+    let org_id = resolve_live_org(&state, scope, &organization_id, OrgAccess::Read).await?;
     // The group is resolved as a LIVE group of THIS organization before the page is
     // read, so listing the members of a group of a SIBLING organization is the same
     // 404 that reading the group itself gives, rather than a 200 with an empty page
@@ -308,7 +309,7 @@ pub async fn list_org_group_members(
         (status = 204, description = "Removed (the pair is immediately available again)"),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Not found (no such live binding: absent, already removed, another scope's, another organization's, or a pair whose two halves belong to different organizations)", body = ErrorBody)
+        (status = 404, description = "Not found (no such live binding: absent, already removed, another scope's, another organization's, or a pair whose two halves belong to different organizations). The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody)
     )
 )]
 pub async fn remove_org_group_member(
@@ -324,7 +325,7 @@ pub async fn remove_org_group_member(
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
-    let org_id = resolve_live_org(&state, scope, &organization_id).await?;
+    let org_id = resolve_live_org(&state, scope, &organization_id, OrgAccess::Write).await?;
     let group = parse_group_id(&state, scope, &group_id)?;
     let membership = parse_membership_id(&state, scope, &membership_id)?;
 

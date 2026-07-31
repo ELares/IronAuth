@@ -20,10 +20,88 @@
 //! liveness check in [`resolve_live_org`], whose omission would let a nested route
 //! keep serving an organization that had been deleted.
 //!
-//! `memberships.rs` (issue #94) still carries its own copies. That is deliberate
-//! rather than an oversight: folding it in would put an issue #94 file in an issue
-//! #97 diff for no behavior change. The two copies there are byte-identical to
-//! these and should be folded in whenever that file is next touched.
+//! `memberships.rs` (issue #94) and `organizations.rs` (issue #41) used to carry their
+//! own byte-identical copies, left there because folding them in would have put those
+//! files in an issue #97 diff for no behavior change, with a note to fold them in
+//! whenever either file was next touched. Issue #411 is that touch, and it is the
+//! reason the note existed: the fence below had to be added to the ONE copy of
+//! [`resolve_live_org`], and a second copy in `memberships.rs` would have been three
+//! endpoints that kept the old answer. Both files now import from here.
+//!
+//! # A WRITE into a SOFT-DELETED environment is refused; a READ is not
+//!
+//! Deleting an environment does not cascade to its organizations, so an
+//! `organizations` row under a deleted environment is still live and
+//! [`resolve_live_org`] still resolves it. Every write nested under an organization
+//! therefore LANDED in an environment an operator believed they had decommissioned,
+//! while `POST .../permissions` refused the identical request because issue #98 PR 7
+//! had given the environment-scoped vocabulary create a [`require_live_environment`]
+//! precondition for an unrelated reason. The tree had two answers to one question,
+//! decided by which route the caller picked (issue #411).
+//!
+//! The answer is now one answer, and it is placed HERE rather than per endpoint,
+//! because per endpoint is exactly how it drifted. [`resolve_live_org`] takes an
+//! [`OrgAccess`] and performs the environment fence for a write, so all nineteen
+//! organization-nested writes inherit it from the single call each of them already
+//! made, and the three organization-lifecycle writes in `organizations.rs` inherit it
+//! by resolving through the same function. There is ONE call to
+//! [`require_live_environment`] behind the whole organization surface, and the
+//! vocabulary create calls the same function, so the two cannot be given different
+//! answers without editing one place.
+//!
+//! A READ keeps working, which is the same line issue #409 drew when it made an ABSENT
+//! environment the uniform not-found for every NON-GET operation under the environment
+//! prefix and left every GET alone. An operator who decommissions an environment still
+//! has to be able to see what is inside it, and the resurrection question issue #411
+//! raises (a restored environment returns carrying whatever was written while it was
+//! deleted) is only auditable if the listings still answer.
+//!
+//! # What holds that in place, and what does NOT
+//!
+//! The required [`OrgAccess`] argument constrains CALLERS of [`resolve_live_org`]: an
+//! endpoint that resolves its organization through this function has to name an intent,
+//! and a case that names the wrong one is caught by `tests/deleted_environment.rs`,
+//! which requires the intent to match the method. That is a real constraint, and it is
+//! the only one the type system gives.
+//!
+//! It is NOT true that divergence cannot compile, and that claim used to stand here.
+//! The refutation is measured rather than argued: a new organization-nested write wired
+//! into `management_router`, resolving its organization with a bare `parse_id` and
+//! carrying no `#[utoipa::path]`, answers 204 and destroys a role row inside a
+//! soft-deleted environment with `tests/deleted_environment.rs` and
+//! `tests/openapi_contract.rs` both green. The argument constrains callers of this
+//! function; the sweep constrains DOCUMENTED routes; a route that is neither is
+//! constrained by nothing.
+//!
+//! What IS unbroken is the chain conditioned on documentation, and it is worth stating
+//! because it is what the sweep actually buys. IF the new route carries a
+//! `#[utoipa::path]`, then `openapi_contract`'s
+//! `committed_artifact_matches_generated_spec` fails until `docs/openapi/management.json`
+//! is regenerated, the regenerated artifact publishes the operation,
+//! `every_documented_organization_operation_is_driven_by_a_case` then fails until a case
+//! drives it, and the sweep drives that case into a soft-deleted environment and sees
+//! the bypass. An UNDOCUMENTED served route escapes all of it. That is the same hole
+//! `tests/openapi_contract.rs` already records against
+//! `served_routes_match_documented_routes` ("NOT caught here: a brand-new served path
+//! outside the documented set"), for the reason stated there: axum does not expose its
+//! route table, so there is no served set to compare the documented one against.
+//!
+//! # The uniform answer is the DEFAULT configuration's answer
+//!
+//! Every claim on this surface that a write into a soft-deleted environment answers the
+//! uniform not-found is a claim about the default configuration, in which sudo mode is
+//! off. With sudo mode armed, [`crate::sudo::require_fresh_privilege`] runs BEFORE this
+//! function in all twenty two organization-addressed writes, so a caller whose elevation
+//! has lapsed is answered 401 `insufficient_user_authentication` and the environment
+//! liveness read never happens.
+//!
+//! That is not an existence oracle, which is the property this fence is for: an ABSENT
+//! environment answers a lapsed elevation identically, so the two stay
+//! indistinguishable and only WHICH uniform answer the caller sees changes. It is still
+//! a gap, because the challenge path writes an `audit_log` row into the environment an
+//! operator believes is decommissioned. The ordering and that row are tracked as issue
+//! #452, they are shared with the absent-environment fence issue #409 built, and neither
+//! is addressed here.
 //!
 //! # Two callers here are NOT nested under an organization
 //!
@@ -101,18 +179,75 @@ pub fn resolve_scope(
     Ok((Scope::new(tenant, environment), actor))
 }
 
-/// Resolve the parent organization id in scope, verifying it exists and is LIVE. A
-/// foreign, malformed, or soft-deleted organization reads as a uniform not-found.
+/// What the caller resolving an organization is about to do with it: the ONE thing the
+/// endpoints nested under an organization do not all agree about, and therefore the one
+/// thing each of them has to say (issue #411).
+///
+/// It is a named intent rather than a `bool` so that a call site reads as the decision
+/// it is, and it is a required argument rather than a defaulted one so that a new
+/// organization-nested endpoint RESOLVING THROUGH THIS FUNCTION cannot inherit the wrong
+/// answer by saying nothing. One that addresses its organization some other way is
+/// outside the argument altogether; the module note on what holds this in place says so
+/// and says what does catch it. The backstop for a case that names the wrong variant is
+/// `tests/deleted_environment.rs`, which drives every operation the committed contract
+/// publishes under the organization prefix and requires the intent to match the method.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OrgAccess {
+    /// The request only READS. A soft-deleted environment is not fenced: its
+    /// organizations, roles, groups and memberships stay listable, which is what an
+    /// operator auditing a decommissioned environment needs and what makes the
+    /// resurrection question answerable.
+    Read,
+    /// The request WRITES. The environment must exist and be live, or the write would
+    /// land rows inside something an operator believes is gone.
+    Write,
+}
+
+/// Resolve the parent organization id in scope, verifying it exists and is LIVE, and,
+/// for a WRITE, that the environment it hangs off is live too. A foreign, malformed, or
+/// soft-deleted organization reads as a uniform not-found, and so does a soft-deleted
+/// or absent environment on a write.
 ///
 /// # Errors
 ///
 /// [`ApiError::NotFound`] if the segment is malformed, out of scope, absent, or
+/// soft-deleted, or, on an [`OrgAccess::Write`], if the environment is absent or
 /// soft-deleted.
 pub async fn resolve_live_org(
     state: &AdminState,
     scope: Scope,
     organization_id: &str,
+    access: OrgAccess,
 ) -> Result<OrganizationId, ApiError> {
+    // The GRANDPARENT-existence precondition (issue #411), and the ONE copy of it
+    // behind the organization surface. It runs BEFORE the organization segment is even
+    // parsed, so a caller cannot tell a malformed organization id in a deleted
+    // environment from a well-formed one; both answers are the uniform not-found
+    // anyway, which is what makes the ordering free to be the one that reads as
+    // "prove the parent, then address the child".
+    //
+    // The precondition also inherits its ORDERING from the one call site each handler
+    // already had. SEVEN of the twenty two organization-addressed writes carry an
+    // Idempotency-Key (the three creates and the four assigns), and every one of them
+    // performs the replay BEFORE it calls this function, which is the ordering the
+    // sibling environment-scoped creates observe: a genuine replay still returns the
+    // original response even if the environment went away in between, so a retry of a
+    // request that ALREADY SUCCEEDED never becomes a 404 the client cannot tell from
+    // "my write never landed". The other fifteen carry no key, so there is nothing to
+    // order against and the precondition is simply the first thing after the scope is
+    // authorized.
+    //
+    // That ordering is a client-visible property, so it is PINNED rather than merely
+    // observed: `a_keyed_writes_replay_survives_the_environments_deletion` in
+    // `tests/deleted_environment.rs` drives all seven, storing each response while the
+    // environment is live, deleting the environment, and then requiring the same key to
+    // return the original 201 while a FRESH key at the same route is the uniform
+    // not-found. Hoisting this precondition above the replay in `create_org_role` was
+    // measured to fail that test and nothing else in the file; the other six are driven
+    // by the same loop, which reports the route by name.
+    if access == OrgAccess::Write {
+        require_live_environment(state, &scope).await?;
+    }
     let organizations = state.store().management().organizations(scope);
     let id = organizations.parse_id(organization_id)?;
     organizations.get(&id).await?;
