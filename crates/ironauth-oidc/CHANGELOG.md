@@ -6,6 +6,56 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **WIRE CHANGE. `POST /t/{tenant}/e/{environment}/device` answers an environment that
+  never existed byte for byte as it answers a real one, where it used to answer `500`
+  against that real environment's `200`** (issue #449). No credential of any kind was
+  required, so this was an unauthenticated tenant and environment enumeration oracle, over
+  exactly the fact issue #433 went to lengths to withhold at the token endpoint. The fix is
+  not two branches written to agree: the rate-limit write now reports the uniform not-found
+  for a scope with no environment row, the handler FALLS THROUGH it (there is no user code
+  to rate limit in a scope that holds no flows), and the lookup below runs the same query it
+  runs for a live environment, matches nothing, and renders the same page. One code path
+  produces both answers.
+- **The same shape was measured on the whole passwordless family and fixed with it.**
+  `otp/send` and `magic/send` answered a real environment `200` and a ghost `429`, with a
+  whole `ratelimit` header block the real one did not send; the proof-of-work and
+  flow-creation routes answered `200` and `500`. The `429` family is one seam:
+  `regulate_before` recorded the attempt with a WRITE and failed CLOSED when it could not
+  land. It now allows when the store reports the scope absent, which is not a weakening,
+  because a scope that does not exist holds no account, no credential, and no data to brute
+  force, and every other error still fails closed. The two write-first routes that MINT
+  rather than read now answer their own uniform `404`: the proof-of-work gate answers the
+  same `404` it already answers when the defense is switched off, and the flow engine
+  answers `FlowError::NotFound`.
+- **What this does NOT claim, measured rather than argued.** Environment existence is still
+  observable: `.well-known/openid-configuration` and `jwks.json` answer `200` for a live
+  environment and `404` for one that never existed, deliberately and unavoidably, since a
+  discovery document that answered uniformly could not serve its purpose.
+  `tests/unauthenticated_scope_oracle.rs` ISSUES that measurement rather than leaving the
+  reader to assume the stronger claim.
+- **`tests/unauthenticated_scope_oracle.rs` derives its subject list from the crate's own
+  SOURCE TREE.** Every scope-routed path literal anywhere in `src/` must be either driven
+  there or on an explicit exclusion list carrying its reason, in both directions. An earlier
+  draft read `lib.rs` plus the flow transport and MISSED `authorize-challenge` entirely,
+  which is the failure mode a hand-picked source list has and a tree walk does not.
+- **WIRE CHANGE. A session mint refused by the account-lifecycle fence renders the path's
+  own uniform auth-failure shape, not a `500`** (issue #279). `EstablishSessionError` has
+  two variants that mean opposite things, and four call sites collapsed them with
+  `Err(_) => server_error_page()`: the MFA step-up (the one the issue names), the password
+  login, the lazy-migration login, and the device sign-in step, plus the federated callback,
+  where the fence is the ONLY thing standing between a blocked account and a session because
+  that path runs no pre-check of its own. Each now renders the same answer a wrong credential
+  renders on that path, byte for byte, so a fenced account is not an account-state oracle for
+  a caller who can already pass the first factor. `tests/step_up.rs` reads the SOURCE TREE
+  and fails on a fifth call site that collapses them.
+- **Issue #279's account of reachability is narrower than stated, and the test says so.**
+  The audited transition to `blocked` cascades the user's sessions in the SAME transaction,
+  so a moment after it commits there is no session for the step-up to resolve and the handler
+  returns its login redirect long before the fence: driving the transition through the
+  management API was measured returning `303`, not the fenced refusal. The window the fence
+  exists for is the one INSIDE a single request, and the test holds it open deterministically
+  rather than racing for it.
+
 - **WIRE CHANGE. A SUSPENDED or OFFBOARDED environment answers the token endpoint with
   `503 temporarily_unavailable` and a `Retry-After: 60` header, where it used to answer
   `500 server_error`** (issue #433). This applies to ALL FIVE grants that mint at

@@ -674,7 +674,18 @@ pub async fn create_flow(
             },
         )
         .await
-        .map_err(|_| FlowError::Store)?;
+        // A scope that does not exist cannot hold a flow row (the table carries the
+        // composite foreign key to `environments`), so the create answers the uniform
+        // not-found and this route answers its own `404` rather than the `500` it used
+        // to (issue #449's shape on the flow engine). Creating the flow IS the request,
+        // so there is no live-and-empty answer to be byte identical to; the `404` it
+        // answers instead is the same one this deployment's discovery document already
+        // gives for a scope that was never created. A genuine persistence fault still
+        // answers the neutral `500`.
+        .map_err(|error| match error {
+            ironauth_store::StoreError::NotFound => FlowError::NotFound,
+            _ => FlowError::Store,
+        })?;
 
     // Build the initial flow object from an in memory record (no extra round trip).
     let record = FlowRecord {

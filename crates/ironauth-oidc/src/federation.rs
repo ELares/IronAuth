@@ -1469,11 +1469,34 @@ pub(crate) async fn finalize_federated_login(finalize: FinalizeLogin<'_>) -> Res
         identity.upstream_acr.as_deref(),
     );
     let actor = interaction::user_actor(&user_id);
-    let Ok(cookies) =
-        interaction::establish_session(state, scope, &user_id.to_string(), &event, actor, headers)
-            .await
-    else {
-        return interaction::server_error_page();
+    // The central lifecycle fence (issue #80 / #52) is the ONLY thing standing between a
+    // blocked, disabled, or waitlisted account and a federated session: this path runs no
+    // `can_authenticate` pre-check of its own, because the upstream, not this server,
+    // decided who the human is. The two refusals therefore have to be told apart (issue
+    // #279's shape on the federated path). Collapsing both into a 500 reported a server
+    // fault for a deliberate administrative state, on the ORDINARY route rather than in a
+    // race.
+    let cookies = match interaction::establish_session(
+        state,
+        scope,
+        &user_id.to_string(),
+        &event,
+        actor,
+        headers,
+    )
+    .await
+    {
+        Ok(cookies) => cookies,
+        // The uniform callback failure this path already answers for an unresolvable,
+        // replayed, or expired correlation state. Reusing it is what keeps the fence
+        // from being an account-state oracle: a fenced account and a stale link are one
+        // answer, and neither names a lifecycle state.
+        Err(interaction::EstablishSessionError::NotAuthenticatable) => {
+            return interaction::invalid_link_page();
+        }
+        Err(interaction::EstablishSessionError::Store) => {
+            return interaction::server_error_page();
+        }
     };
 
     // The full upstream exchange + validation succeeded: mark this connector healthy (issue

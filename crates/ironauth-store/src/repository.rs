@@ -15619,9 +15619,12 @@ impl ActingUserRepo<'_> {
     ///
     /// # Errors
     ///
-    /// [`StoreError::NotFound`] if no live user matched in this scope;
+    /// [`StoreError::NotFound`] if no live user matched in this scope, INCLUDING when
+    /// the scope has no envelope key yet (the addressing check is ordered ahead of the
+    /// key resolution for exactly that reason, issue #442);
     /// [`StoreError::Conflict`] if the external id is already claimed by another user
-    /// in the scope; [`StoreError::Encryption`] if no master key is configured;
+    /// in the scope; [`StoreError::Encryption`] if no master key is configured, or if
+    /// the scope's envelope key is unusable for a user that IS present;
     /// [`StoreError::Database`] on a persistence failure.
     pub async fn link_external_id(
         &self,
@@ -15646,6 +15649,37 @@ impl ActingUserRepo<'_> {
                 target: id,
             },
             async move |tx| {
+                // ADDRESS THE ROW BEFORE RESOLVING THE KEY (issue #442).
+                //
+                // The seal below needs the scope's active envelope key, and an
+                // environment that has never sealed anything HAS no such key: the
+                // key pair is minted lazily by the first sealing write, never at
+                // environment create. Resolving it first therefore answered
+                // `StoreError::Encryption` for a user that simply is not there, and
+                // the management surface rendered that as an opaque 500. The
+                // MEASURED shape was two different answers for the same absent user
+                // on the same resource: the link PUT returned 500 while the unlink
+                // DELETE, which seals nothing, returned the correct 404.
+                //
+                // Ordering the addressing check first makes the absent user the
+                // uniform not-found whatever the scope's key state is, and leaves
+                // `Encryption` meaning only what it should: the key really is
+                // unusable for a user that really is there. The row is locked, so
+                // it cannot be deleted between this check and the update below.
+                let present = sqlx::query(
+                    "SELECT 1 AS present FROM users \
+                     WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
+                     AND deleted_at IS NULL \
+                     FOR UPDATE",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .fetch_optional(&mut **tx)
+                .await?;
+                if present.is_none() {
+                    return Err(StoreError::NotFound);
+                }
                 let (dek_version, dek) = fetch_active_dek(tx, scope, master).await?;
                 let sealed = dek.seal(
                     env.entropy(),
@@ -37834,8 +37868,10 @@ impl ActingEnvironmentRepo<'_> {
     /// fresh, unfenced environment (issue #46), the same lifecycle-precondition
     /// convention the tenant transitions use;
     /// [`StoreError::IdempotencyConflict`] on a concurrent Idempotency-Key race;
-    /// [`StoreError::Database`] on a persistence failure (including a missing
-    /// tenant, which surfaces as the tenant foreign-key violation).
+    /// [`StoreError::NotFound`] if the parent tenant does not exist: that trips the
+    /// tenant foreign key, which the conversion reports as the uniform not-found
+    /// rather than as a fault (issues #409, #449);
+    /// [`StoreError::Database`] on a persistence failure.
     pub async fn create(
         &self,
         env: &Env,
@@ -38184,10 +38220,12 @@ impl ActingOrganizationRepo<'_> {
     ///
     /// # Errors
     ///
-    /// [`StoreError::NotFound`] if the id is not in this scope;
+    /// [`StoreError::NotFound`] if the id is not in this scope, and ALSO if the parent
+    /// environment does not exist: that trips the scope foreign key, which the
+    /// conversion reports as the uniform not-found rather than as a fault (issues
+    /// #409, #449), so the two are indistinguishable to the caller on purpose;
     /// [`StoreError::IdempotencyConflict`] on a concurrent Idempotency-Key race;
-    /// [`StoreError::Database`] on a persistence failure (including a nonexistent
-    /// environment, which surfaces as the foreign-key violation).
+    /// [`StoreError::Database`] on a persistence failure.
     pub async fn create(
         &self,
         env: &Env,

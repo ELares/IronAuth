@@ -221,10 +221,37 @@ async fn create_under_a_nonexistent_environment_is_refused() {
         .organizations(phantom)
         .create(&env, &id, 1_000, "orphan", None)
         .await;
+    // The containment property this test exists for is unchanged: the insert is REFUSED
+    // by the foreign key. What changed is the shape the store reports it with (issues
+    // #409, #449): a write into a scope that was never created is now the uniform
+    // not-found rather than a database FAULT, because the difference between the two was
+    // an environment existence oracle on the unauthenticated data plane.
+    //
+    // The variant alone no longer identifies WHICH refusal this is. `Database` could
+    // only have come from Postgres; `NotFound` is also what an early guard returns, so
+    // this assertion on its own would be satisfied by a create that declined before it
+    // reached the constraint. The control below is what keeps the foreign key as the
+    // thing being measured.
     assert!(
-        matches!(result, Err(StoreError::Database(_))),
-        "an organization under a nonexistent environment must be refused, got {result:?}"
+        matches!(result, Err(StoreError::NotFound)),
+        "an organization under a nonexistent environment must be refused as the uniform \
+         not-found, got {result:?}"
     );
+
+    // THE CONTROL: the SAME create, differing only in that its scope was seeded,
+    // succeeds. Without it a store that refused every create would pass this test.
+    let seeded = db.seed_scope(&env).await;
+    let live_id = OrganizationId::generate(&env, &seeded);
+    db.control_store()
+        .management()
+        .acting(actor(&env), CorrelationId::generate(&env))
+        .organizations(seeded)
+        .create(&env, &live_id, 1_000, "control", None)
+        .await
+        .expect(
+            "the same create into a SEEDED scope must succeed, or the refusal above is \
+             the store declining to write rather than containment holding",
+        );
 }
 
 #[tokio::test]

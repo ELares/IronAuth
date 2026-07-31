@@ -1103,3 +1103,13 @@ required-features = ["testing"]
 
 [lints]
 workspace = true
+
+# The unauthenticated existence-oracle contract (issue #449): no scope-routed data-plane
+# route answers a scope that never existed with a server fault, the device verification
+# page answers a real and a never-existed environment byte for byte alike, and the
+# subject list is derived from the ROUTER SOURCE so a new scope-routed route fails this
+# file the moment it is registered rather than sitting unmeasured.
+[[test]]
+name = "unauthenticated_scope_oracle"
+path = "tests/unauthenticated_scope_oracle.rs"
+required-features = ["testing"]

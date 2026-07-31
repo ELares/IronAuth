@@ -6,6 +6,72 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **A WRITE into a `(tenant, environment)` scope that was never created answers the uniform
+  not-found instead of a database fault** (issues #409, #449). Row-level security already
+  made a READ in an absent scope indistinguishable from a read in an empty one, but a write
+  reached the scope foreign key every scoped table declares and failed, and
+  `From<sqlx::Error> for StoreError` reported that as `StoreError::Database`. On the
+  management plane that was an opaque 500 for a mistyped identifier; on the UNAUTHENTICATED
+  data plane it was an existence oracle, because the same request answered `200` for a real
+  environment and `500` for one that never existed with no credential of any kind. The
+  conversion now recognizes SQLSTATE 23503 on a constraint whose name ends
+  `_tenant_id_fkey`, which covers BOTH the single-column key onto `tenants` and the
+  composite key onto `environments`. Which of the two a request trips is a property of the
+  request rather than of the code, and recognizing only the composite one left the shape a
+  probe actually sends still answering a fault; that was caught by MEASUREMENT, not by
+  reading. Nothing else changes: every other SQLSTATE still reports as a fault, and a
+  uniqueness violation is still the caller-facing conflict.
+- **`tests/absent_scope.rs` derives its subject list from the LIVE SCHEMA and measures the
+  rule in BOTH directions.** The rule recognizes a constraint by NAME, which is exactly the
+  kind of thing that silently stops covering the whole set, and equally the kind that
+  silently starts covering more than it should. COMPLETENESS: every foreign key referencing
+  `tenants` or `environments` must be recognized, so a future table that names its
+  constraint explicitly fails the test rather than quietly reopening the gap. SOUNDNESS:
+  every constraint the rule MATCHES must really reference a scope table, so a referential
+  failure against a row that is present cannot answer not-found. The schema carries eleven
+  constraints one column-order away from tripping the second half, which is why it is
+  measured rather than argued. Both halves read the suffix from the source constant, and the
+  file additionally drives a real SQLSTATE 23503 on a NON-scope foreign key and requires it
+  to stay a fault; without that case, widening the suffix to `_fkey` left the file green.
+- **`tests/atomicity.rs` and `tests/organizations.rs` each gained the control the new
+  refusal shape requires.** Both had asserted `StoreError::Database`, which only Postgres
+  could produce and which therefore pinned the FAILURE INJECTOR as well as the failure.
+  `StoreError::NotFound` is also what an early guard returns, so swapping to it lost that:
+  short-circuiting `ClientRepo::create` before it touched Postgres left the atomicity test
+  green, both of its no-orphan counts passing against a write that never ran. Each test now
+  drives the same call into a SEEDED scope and requires it to succeed, which restores what
+  the old variant carried for free.
+- **`StoreError::into_wire` and `StoreErrorWire`: the compile-time gate on how a store
+  error reaches a wire** (issues #442, #449, #279). `StoreError` is `#[non_exhaustive]`, so
+  no other crate can match it exhaustively, and every consumer was forced into a wildcard.
+  That wildcard is how seventeen of the twenty-two variants became an opaque 500 on every
+  route that could produce them, with nothing failing to say so; three separate issues were
+  filed for three symptoms of it before the shape itself was addressed. FOURTEEN of those
+  seventeen now answer a typed status. The other three (`Database`, `Migration`,
+  `Encryption`) are faults and classify to `StoreErrorWire::Internal` on purpose, so the
+  number of variants whose wire answer CHANGED is fourteen. The classification
+  now lives in the crate that defines the type, where the match CAN be exhaustive and
+  carries no wildcard, so a new variant fails the build until its wire shape is decided.
+  `StoreErrorWire` is deliberately NOT `#[non_exhaustive]`, which is the other half: the
+  boundary that renders it matches exhaustively too, so a new CLASS fails the build there.
+- **`StoreError::Encryption` stays a fault, deliberately.** The variant COLLAPSES three
+  causes (no platform master key is wired, the scope has no live envelope key, a ciphertext
+  did not authenticate) so a caller can never learn which. Two of the three are genuine
+  faults and any typed answer would assert something false about them: a not-found would
+  tell an operator whose key management is misconfigured that their user does not exist.
+  The one caller-facing case is closed by ORDERING instead, at the write that reaches it.
+- **`ActingUserRepo::link_external_id` addresses the user BEFORE it resolves the envelope
+  key** (issue #442). A freshly created environment holds no envelope key, because the key
+  pair is minted lazily by the first sealing write, so linking an external id for an ABSENT
+  user in such an environment answered `StoreError::Encryption` rather than the uniform
+  not-found. The measured shape was two answers for the same absent user on the same
+  resource: the sealing PUT returned 500 and the non-sealing DELETE returned 404. The
+  addressing check is now ordered ahead of the key resolution, inside the same transaction
+  and under the row lock, so an absent user is the uniform not-found whatever the scope's
+  key state is. `StoreError::InvalidOrgContext`'s `Display` text is now the one the
+  management surface has always sent, because that boundary renders the refusal FROM this
+  text rather than restating it.
+
 - **Migration 0098 grants the control plane the two relations the management surface
   reached with no privilege at all** (issue #441). `abuse_bans` (`SELECT, INSERT, DELETE`)
   and `mds3_blob_cache` (`SELECT`) were granted to the data-plane role alone, while the

@@ -1049,3 +1049,249 @@ async fn a_store_fault_on_the_policy_read_at_token_issuance_fails_closed() {
         "the policy-read fault fails closed with a server error, got {status}: {body}"
     );
 }
+
+/// The uniform wrong-code answer the step-up challenge renders, captured from a run
+/// that really did submit a wrong code, so the comparison below is against the shape
+/// the path produces rather than against a literal transcribed from reading it.
+async fn wrong_code_answer(
+    harness: &Harness,
+    cookie: &str,
+    return_to: &str,
+) -> (StatusCode, String) {
+    let wrong = form(&[("code", "000000"), ("return_to", return_to)]);
+    let (status, _headers, body) = harness.post_form("/login/mfa", &wrong, Some(cookie)).await;
+    (status, body)
+}
+
+#[tokio::test]
+async fn an_account_that_goes_non_authenticatable_mid_step_up_gets_the_challenge_shape() {
+    // ISSUE #279. The central lifecycle fence (issue #80 / #52) correctly refuses to
+    // elevate a session when the account transitions to a non-authenticatable state
+    // BETWEEN the first and the second factor. It fails closed and mints nothing, which
+    // was never in doubt. What it ALSO did was surface that refusal as a `500`, so the
+    // same outcome, no elevated session, was reported two different ways depending only
+    // on when the transition landed.
+    //
+    // The password path pre-checks the account state and so meets this only in a race;
+    // the step-up path has no pre-check of its own, because the account was
+    // authenticatable when the first factor succeeded. That is what made this the
+    // reachable one.
+    let harness = Harness::start().await;
+    let client_id = *harness.client_id();
+    let client = client_id.to_string();
+    harness
+        .configure_client_policy(&client_id, "explicit", true, false, None)
+        .await;
+    harness
+        .set_scope_step_up_policy("payments:write", Some(ACR_MFA), None)
+        .await;
+
+    let subject = harness.seed_unique_user().await;
+    let seed = enroll_active_totp(&harness, &subject).await;
+    let cookie = harness
+        .session_cookie_at(&subject, "pwd", now_secs_i64(&harness) * 1_000_000)
+        .await;
+
+    let query = authorize_query(&client, "openid payments:write", &["max_age=3600"]);
+    let (status, headers, body) = harness.authorize_with_cookie(&query, &cookie).await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "authorize should redirect to the challenge: {body}"
+    );
+    let return_to = location_param(&headers, "return_to").expect("return_to in the challenge URL");
+
+    // THE REFERENCE ANSWER, measured on this very run: what a WRONG code renders. The
+    // fenced refusal has to be this, and asserting against a captured answer rather than
+    // a literal is what stops the two from drifting apart later.
+    let (wrong_status, wrong_body) = wrong_code_answer(&harness, &cookie, &return_to).await;
+    assert_eq!(
+        wrong_status,
+        StatusCode::OK,
+        "the wrong-code reference must be the challenge page: {wrong_body}"
+    );
+    assert!(
+        wrong_body.contains("Incorrect or expired code."),
+        "the wrong-code reference must carry the generic failure: {wrong_body}"
+    );
+
+    // THE CONTROL, before the transition: a CORRECT code against a still-authenticatable
+    // account really does elevate. Without it the assertion below could pass because the
+    // code was wrong rather than because the fence fired, which would make this test
+    // measure the TOTP verifier instead of the fence.
+    //
+    // Elevating ROTATES the session (issue #32), so the control's own upgraded cookie is
+    // what the fenced attempt below presents; the original one is invalidated by this
+    // very call and would resolve to nothing.
+    harness.clock().advance(Duration::from_secs(60));
+    let good = code_at(
+        &seed,
+        TotpParams::authenticator_default(),
+        now_secs(&harness),
+    );
+    let elevate = form(&[("code", &good), ("return_to", &return_to)]);
+    let (status, headers, body) = harness
+        .post_form("/login/mfa", &elevate, Some(&cookie))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "a correct code against a live account must elevate the session: {body}"
+    );
+    let cookie = set_cookie_pair(&headers).expect("the control elevation rotates the session");
+
+    // Now the account goes non-authenticatable while its session is STILL LIVE, which is
+    // the mid-flow state the issue describes.
+    //
+    // # Why the row is written directly rather than through the lifecycle transition
+    //
+    // This is worth reading, because it also narrows the issue's own account of how
+    // reachable the defect is. The audited transition to `blocked` CASCADES the user's
+    // sessions in the SAME transaction (`UserState::ends_sessions`), so a moment after
+    // it commits there is no session left for the step-up to resolve, and the handler
+    // returns its login redirect long before it reaches the fence. Driving the
+    // transition through the management API therefore does NOT reach the branch under
+    // test: it was measured returning `303` to the login page, not the fenced refusal.
+    //
+    // The window the fence exists for is the one INSIDE a single request: the session
+    // resolved at the top of the handler, and the account went non-authenticatable
+    // before the mint at the bottom. Writing the state column without the cascade holds
+    // that window open deterministically instead of racing for it. Every other
+    // non-authenticatable state is creation-time only and so cannot be transitioned into
+    // at all, which is why this is the construction rather than a tidier one.
+    sqlx::query("UPDATE users SET state = 'blocked' WHERE id = $1")
+        .bind(&subject)
+        .execute(harness.db().owner_pool())
+        .await
+        .expect("hold the mid-flow window open");
+
+    harness.clock().advance(Duration::from_secs(60));
+    let good = code_at(
+        &seed,
+        TotpParams::authenticator_default(),
+        now_secs(&harness),
+    );
+    let stepped = form(&[("code", &good), ("return_to", &return_to)]);
+    let (status, headers, body) = harness
+        .post_form("/login/mfa", &stepped, Some(&cookie))
+        .await;
+
+    assert_eq!(
+        status, wrong_status,
+        "a fenced account must get the path's own challenge-failure status, not a \
+         server fault: {body}"
+    );
+    assert_eq!(
+        body, wrong_body,
+        "and the SAME body a wrong code renders, byte for byte: a distinct wording \
+         would turn the uniformity into an account-state oracle for a caller who can \
+         already pass the first factor"
+    );
+
+    // And it really did fail CLOSED: no session cookie is set, so nothing was elevated.
+    assert!(
+        set_cookie_pair(&headers).is_none(),
+        "the fenced refusal must mint no session"
+    );
+}
+
+/// Every `establish_session` call site in this crate's sources, as `(file, line)`.
+///
+/// Read from the SOURCE TREE rather than listed here, so a new session-minting path is
+/// covered the moment it is written.
+fn establish_session_call_sites() -> Vec<(String, usize, String)> {
+    let mut sites = Vec::new();
+    let mut pending = vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).expect("the crate's sources are readable") {
+            let path = entry.expect("a readable directory entry").path();
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if path.extension().is_none_or(|ext| ext != "rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("a readable source file");
+            let lines: Vec<&str> = source.lines().collect();
+            for (index, line) in lines.iter().enumerate() {
+                // The CALL, not a mention: a doc comment or a prose reference is not a
+                // call site and must not be demanded to handle anything.
+                if !line.contains("interaction::establish_session(")
+                    || line.trim_start().starts_with("//")
+                {
+                    continue;
+                }
+                // The handling window. The step-up call site is the longest: its success
+                // arm runs the remember-device decision before the refusal arms are
+                // reached, which is 50 lines below the call, so 80 covers every site
+                // with room and still cannot reach into the NEXT one (the closest pair
+                // in this crate is further apart than that).
+                let window = lines[index..lines.len().min(index + 80)].join("\n");
+                let relative = path
+                    .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string();
+                sites.push((relative, index + 1, window));
+            }
+        }
+    }
+    sites
+}
+
+#[tokio::test]
+async fn every_session_mint_tells_the_lifecycle_fence_apart_from_a_store_fault() {
+    // ISSUE #279, generalized from the one path it was filed against.
+    //
+    // `EstablishSessionError` has exactly two variants and they mean OPPOSITE things:
+    // `NotAuthenticatable` is the account-lifecycle fence, which every caller must render
+    // as its own uniform auth-failure shape, and `Store` is a neutral server fault. The
+    // type's own documentation says so. A call site that writes `Err(_) =>
+    // server_error_page()` collapses them and reports a deliberate administrative state
+    // as a `500`, which is what issue #279 measured on the step-up path.
+    //
+    // Four call sites had that shape and were fixed together, because fixing only the
+    // one the issue named would leave the identical defect on the other three and invite
+    // three more issues. This assertion is what stops a fifth from appearing: it reads
+    // the SOURCE TREE, so a new session-minting path is covered the moment it is
+    // written, and a `_` catch-all over the refusal fails it.
+    let sites = establish_session_call_sites();
+    assert!(
+        sites.len() >= 10,
+        "the source scan must find the session-minting call sites; found {} which means \
+         the scan is broken rather than that the paths are gone",
+        sites.len()
+    );
+
+    // The two ceremony call sites in `webauthn.rs` are the deliberate exception, and the
+    // reason is a real difference rather than an oversight: BOTH refusals render the
+    // ceremony's uniform failure there, so the fence is already answered with the path's
+    // own shape and there is no `500` to collapse into. They are named by FILE so that a
+    // new call site in the same file still has to be considered, and the count is pinned
+    // so that one of them quietly becoming three does not slip through.
+    let mut exempt = 0;
+    let mut offenders = Vec::new();
+    for (file, line, window) in &sites {
+        let handles_fence = window.contains("EstablishSessionError::NotAuthenticatable");
+        let handles_fault = window.contains("EstablishSessionError::Store");
+        if handles_fence && handles_fault {
+            continue;
+        }
+        if file.ends_with("webauthn.rs") && window.contains("ceremony_error()") {
+            exempt += 1;
+            continue;
+        }
+        offenders.push(format!("{file}:{line}"));
+    }
+    assert!(
+        offenders.is_empty(),
+        "every session mint must tell the lifecycle fence apart from a store fault, or a \
+         deliberate administrative state is reported as a server fault: {offenders:#?}"
+    );
+    assert_eq!(
+        exempt, 2,
+        "exactly the two webauthn ceremony call sites may collapse the two refusals, \
+         because both already render the ceremony's own uniform failure rather than a 500"
+    );
+}

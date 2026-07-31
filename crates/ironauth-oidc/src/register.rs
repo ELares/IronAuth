@@ -391,7 +391,17 @@ pub async fn register_post(
             .await
             {
                 Ok(cookie) => interaction::redirect_setting_cookie(&resume.return_to, &cookie),
-                Err(_) => interaction::server_error_page(),
+                // The central lifecycle fence refused the mint for an account that was
+                // JUST created (issue #279's shape on the registration path): the
+                // waitlist was switched on between the branch above and the mint, or a
+                // concurrent admin action parked the account. The registration itself
+                // SUCCEEDED, so the honest answer is the same uniform pending
+                // acknowledgment a waitlisted signup already gets, not a 500 that would
+                // invite the caller to register again.
+                Err(interaction::EstablishSessionError::NotAuthenticatable) => {
+                    registration_pending_page(banner)
+                }
+                Err(interaction::EstablishSessionError::Store) => interaction::server_error_page(),
             }
         }
         Err(StoreError::Conflict) => register_error(

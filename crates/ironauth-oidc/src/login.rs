@@ -309,7 +309,23 @@ pub async fn mfa_challenge_post(
             )
             .await
         }
-        Err(_) => interaction::server_error_page(),
+        // The central lifecycle fence refused the elevation (issue #80 / #52, issue
+        // #279): the account went blocked, disabled, or waitlisted BETWEEN the first
+        // and the second factor. It fails closed either way, and no session is
+        // elevated, but the SHAPE has to be this path's own uniform challenge failure
+        // rather than a 500. The other passwordless paths already answer their fence
+        // refusal that way; this one did not, so a rare mid-flow transition read as a
+        // server fault, and the wire told a caller two different things about the same
+        // outcome depending on when the transition landed.
+        //
+        // The message is the SAME string a wrong code renders, byte for byte, because
+        // it is the same call. A distinct wording here would turn the uniformity into
+        // an account-state oracle for a caller who can already authenticate the first
+        // factor.
+        Err(interaction::EstablishSessionError::NotAuthenticatable) => {
+            rerender("Incorrect or expired code.")
+        }
+        Err(interaction::EstablishSessionError::Store) => interaction::server_error_page(),
     }
 }
 
@@ -691,7 +707,18 @@ pub async fn login_post(
                         .await;
                         interaction::redirect_setting_cookie(&resume.return_to, &cookie)
                     }
-                    Err(_) => interaction::server_error_page(),
+                    // The lifecycle fence refused between the pre-check above and the
+                    // mint (issue #279's shape on the password path). The pre-check
+                    // makes this a narrow race rather than the ordinary route, but the
+                    // answer must still be this path's uniform failure and not a 500:
+                    // the same page a wrong password renders, so a correct password
+                    // against an account that just went blocked reveals nothing.
+                    Err(interaction::EstablishSessionError::NotAuthenticatable) => {
+                        failed_login_page(identifier, &resume.return_to, &resume.hints, banner)
+                    }
+                    Err(interaction::EstablishSessionError::Store) => {
+                        interaction::server_error_page()
+                    }
                 }
             } else {
                 // Present but wrong password: generic failure (no wrong-password
@@ -1031,7 +1058,13 @@ async fn complete_lazy_migration(
     .await
     {
         Ok(cookie) => Some(interaction::redirect_setting_cookie(return_to, &cookie)),
-        Err(_) => Some(interaction::server_error_page()),
+        // The migrated account cannot authenticate (issue #279's shape on the lazy
+        // migration path): fall through to the caller's uniform failure, exactly as a
+        // failed create above already does. The row is written and a later retry finds
+        // it locally, so answering a 500 here would report a fault for a migration that
+        // in fact succeeded.
+        Err(interaction::EstablishSessionError::NotAuthenticatable) => None,
+        Err(interaction::EstablishSessionError::Store) => Some(interaction::server_error_page()),
     }
 }
 
