@@ -6,6 +6,41 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **WIRE CHANGE. `impl From<StoreError> for ApiError` is now EXHAUSTIVE and no longer
+  collapses every unmapped store refusal into an opaque 500** (issues #442, #449, #279).
+  It mapped five variants explicitly and wildcarded the other seventeen, so a typed refusal
+  the store already knew how to describe reached the caller as a server fault. FOURTEEN of
+  those seventeen now answer a typed status; the other three (`Database`, `Migration`,
+  `Encryption`) are genuine FAULTS and deliberately stay `500`, so the count of behaviour
+  changes on the wire is fourteen and not seventeen. Exhaustiveness
+  runs in two links and neither can be skipped: `StoreError::into_wire` classifies in the
+  crate that defines the type, where the match can be exhaustive, so a new VARIANT fails the
+  build there; and `StoreErrorWire` is not `#[non_exhaustive]`, so the match here is
+  exhaustive too and a new CLASS fails the build here.
+- **What changed on the wire, and what each newly mapped class reveals.** A uniqueness or
+  state collision is now `409` rather than `500`; an Idempotency-Key RACE is `409` with a
+  retry message rather than `500`, and is logged at WARN so the create path that skipped its
+  replay stays visible; a malformed submitted value is `400`; a well-formed value a policy or
+  structure refuses is `422`; and a typed environment-guardrail refusal is the `422` carrying
+  the failed guardrail's stable code, the same shape this crate's own pre-check already emits
+  for the same condition. Every one of these is reachable only by a caller already authorized
+  for the scope, and every message is read from the store's `Display`, whose caller-facing
+  arms are value free by construction: each names a DIMENSION or a structural fact, never an
+  offending value or a resource id. Reading the message from there rather than restating it
+  is what stops the log line and the caller's message from drifting apart.
+- **The old wildcard's stated defense is kept and generalized rather than discarded.** It
+  argued that "a handler that forgets its explicit arm degrades to the correct 422 instead of
+  a server error"; every caller-facing class still has a central answer, so that remains
+  true. What is gone is the SILENCE, which is the half that was doing the damage.
+- **`tests/unsealed_environment.rs`: an ABSENT user in a live environment that has never
+  sealed any PII is the uniform not-found on every user-scoped route** (issue #442). The
+  subject list is derived from `docs/openapi/management.json`, so a new user-scoped route
+  fails this file the moment it is documented rather than joining `external-id` as the one
+  nobody drove against a fresh environment. The sealing-against-non-sealing differential
+  inside it asserts the shared answer IS the `404`, not merely that the two verbs agree:
+  agreement alone survives a total collapse of the not-found, which was measured by mapping
+  the store's uniform not-found to an opaque 500 and watching the differential stay green.
+
 - **The whole management surface is now driven against a LIVE environment by one sweep**
   (issue #441), `tests/live_surface.rs`. It enumerates every operation
   `docs/openapi/management.json` publishes, addresses each at a real seeded row with a real

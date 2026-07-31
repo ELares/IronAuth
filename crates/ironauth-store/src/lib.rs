@@ -112,7 +112,7 @@ pub use environment::{
     EnvironmentType, Guardrail, GuardrailClass, GuardrailReport, GuardrailSet, GuardrailViolation,
     UnknownEnvironmentType,
 };
-pub use error::StoreError;
+pub use error::{StoreError, StoreErrorWire};
 pub use esv::{
     MAX_NAME_LEN, Reference, ReferenceError, ReferenceKind, ResolveError, Resolved, name_is_valid,
     reference_resolves, resolve_value,

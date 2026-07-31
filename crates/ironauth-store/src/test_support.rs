@@ -39,6 +39,22 @@ use crate::id::{EnvironmentId, HumanId, OperatorId, TenantId};
 use crate::scope::Scope;
 use crate::store::Store;
 
+/// The SUFFIX the absent-scope conversion recognizes a scope foreign key by, re-exported
+/// so the schema test that measures it against the live catalog reads THE SOURCE rather
+/// than a hand-typed copy of it.
+///
+/// The copy is the version that was tried first and it does not work. A copy makes the
+/// test insensitive to exactly the change most worth catching: widening the source
+/// predicate leaves the copy narrow, the test keeps measuring the old rule, and it stays
+/// green while every foreign-key violation in the schema starts answering not-found.
+/// That was MEASURED (widening the source to `_fkey` left the whole file at 3 passed),
+/// which is why this re-export exists.
+///
+/// Reading the source here does not make the test vacuous, because what it asserts is
+/// not the suffix's spelling: it is a relation between the suffix and the live schema,
+/// in both directions, and a widened suffix breaks that relation loudly.
+pub const SCOPE_FK_SUFFIX: &str = crate::error::SCOPE_FK_SUFFIX;
+
 /// The low-privilege data-plane role the migration grants to.
 const APP_ROLE: &str = "ironauth_app";
 

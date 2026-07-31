@@ -736,3 +736,15 @@ required-features = ["testing"]
 
 [lints]
 workspace = true
+
+# The absent-scope contract (issues #409, #449): a WRITE into a scope that was never
+# created answers the uniform not-found rather than a database fault, and the
+# recognition rule that delivers it is checked against the LIVE SCHEMA rather than a
+# hand-written table list, in BOTH directions: every scope foreign key is recognized,
+# and every constraint the rule recognizes really is a scope foreign key. So neither a
+# future scoped table falling outside the rule nor a future constraint falling wrongly
+# inside it can happen without this test saying so.
+[[test]]
+name = "absent_scope"
+path = "tests/absent_scope.rs"
+required-features = ["testing"]

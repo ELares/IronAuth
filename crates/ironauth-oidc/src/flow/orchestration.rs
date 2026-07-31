@@ -440,7 +440,14 @@ pub(super) async fn create_custom_flow(
             },
         )
         .await
-        .map_err(|_| FlowError::Store)?;
+        // The same absent-scope rule the built-in journey create carries (issue #449):
+        // a scope with no environment row answers the uniform not-found, and this
+        // route answers its own `404` rather than a server fault. A genuine
+        // persistence fault still answers the neutral `500`.
+        .map_err(|error| match error {
+            ironauth_store::StoreError::NotFound => FlowError::NotFound,
+            _ => FlowError::Store,
+        })?;
 
     let record = FlowRecord {
         id: flow_id.to_string(),

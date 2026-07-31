@@ -81,17 +81,34 @@ pub(crate) struct IssuedChallenge {
     pub difficulty_bits: u8,
 }
 
+/// The outcome of minting a built-in proof-of-work challenge (issue #80).
+///
+/// The two failures are kept APART (issue #449) because their wire answers differ: an
+/// absent scope is an addressing miss the caller controls, and a persistence fault is a
+/// server fault. Collapsing them, which an `Option` did, is what made the challenge
+/// endpoint answer `500` for an environment that never existed and `200` for one that
+/// does, with no credential required.
+pub(crate) enum ChallengeIssue {
+    /// The challenge was minted.
+    Issued(IssuedChallenge),
+    /// The `(tenant, environment)` scope named has no environment row, so no challenge
+    /// can be stored against it.
+    AbsentScope,
+    /// A persistence fault.
+    Failed,
+}
+
 /// Mint a built-in proof-of-work challenge (issue #80), bound to `endpoint` plus `context`,
 /// via the store. The challenge randomness comes from `env.entropy()` and the expiry from
 /// `env.clock()`, so the whole path is deterministic under a test's manual clock and fixed
-/// entropy, and it makes ZERO third-party calls. Returns `None` only on a persistence
-/// failure (the caller then omits the challenge rather than failing the page).
+/// entropy, and it makes ZERO third-party calls. Never returns
+/// [`ChallengeIssue::Issued`] without a stored row.
 pub(crate) async fn issue_builtin_challenge(
     state: &OidcState,
     scope: Scope,
     endpoint: &str,
     context: &str,
-) -> Option<IssuedChallenge> {
+) -> ChallengeIssue {
     // Eager expiry reclamation (issue #80 LOW-3): before minting, reclaim a BOUNDED batch of
     // this scope's already-expired challenge rows, so a stream of issue calls keeps the
     // table from accumulating dead rows on the request path (no external janitor needed).
@@ -112,7 +129,7 @@ pub(crate) async fn issue_builtin_challenge(
     let ttl_micros =
         i64::try_from(pow.challenge_ttl_secs.saturating_mul(1_000_000)).unwrap_or(i64::MAX);
     let expires_at_micros = epoch_micros(state.now()).saturating_add(ttl_micros);
-    state
+    match state
         .store()
         .scoped(scope)
         .pow_challenges()
@@ -126,12 +143,15 @@ pub(crate) async fn issue_builtin_challenge(
             },
         )
         .await
-        .ok()?;
-    Some(IssuedChallenge {
-        id,
-        challenge: challenge.to_vec(),
-        difficulty_bits: difficulty,
-    })
+    {
+        Ok(()) => ChallengeIssue::Issued(IssuedChallenge {
+            id,
+            challenge: challenge.to_vec(),
+            difficulty_bits: difficulty,
+        }),
+        Err(ironauth_store::StoreError::NotFound) => ChallengeIssue::AbsentScope,
+        Err(_) => ChallengeIssue::Failed,
+    }
 }
 
 /// The solution material a client presents (issue #80). For the built-in `PoW` the client
@@ -297,8 +317,21 @@ pub async fn pow_challenge_issue(
         Some(ENDPOINT_MAGIC_SEND) => ENDPOINT_MAGIC_SEND,
         _ => return bad_request_json("unknown endpoint"),
     };
-    let Some(issued) = issue_builtin_challenge(&state, scope, endpoint, &body.context).await else {
-        return crate::interaction::server_error_page();
+    // A scope that does not exist cannot hold a challenge row (the table carries the
+    // composite foreign key to `environments`), so the mint answers the uniform
+    // not-found and this route answers `404` rather than the `500` it used to (issue
+    // #449's shape on the proof-of-work gate). It is a WRITE-first route with nothing
+    // read beforehand, so unlike the device page it has no live-and-empty answer to be
+    // identical to: minting is the whole request. The `404` it answers instead is the
+    // SAME answer this deployment's discovery document and JWKS already give for a
+    // scope that was never created, so it publishes nothing those do not.
+    let issued = match issue_builtin_challenge(&state, scope, endpoint, &body.context).await {
+        ChallengeIssue::Issued(issued) => issued,
+        // The SAME uniform 404 this route already answers when the proof-of-work
+        // defense is switched off, so a scope that never existed is indistinguishable
+        // from a live environment that does not use the gate.
+        ChallengeIssue::AbsentScope => return not_found_json(),
+        ChallengeIssue::Failed => return crate::interaction::server_error_page(),
     };
     let payload = serde_json::json!({
         "challenge_id": issued.id.to_string(),

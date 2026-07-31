@@ -476,3 +476,13 @@ required-features = ["testing"]
 
 [lints]
 workspace = true
+
+# The unsealed-environment contract (issue #442): addressing an ABSENT user in a live
+# environment that has never sealed any PII, and therefore holds no envelope key, is the
+# uniform not-found on every user-scoped route rather than an opaque 500 on the ones
+# whose verb happens to seal. The subject list is derived from the committed management
+# contract, so a new user-scoped route cannot join the sweep's blind spot.
+[[test]]
+name = "unsealed_environment"
+path = "tests/unsealed_environment.rs"
+required-features = ["testing"]

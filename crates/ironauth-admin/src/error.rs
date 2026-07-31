@@ -14,7 +14,7 @@
 
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use ironauth_store::{GuardrailViolation, StoreError};
+use ironauth_store::{GuardrailViolation, StoreError, StoreErrorWire};
 use serde::Serialize;
 use utoipa::ToSchema;
 
@@ -279,73 +279,88 @@ impl From<crate::provision::ProvisionError> for ApiError {
 
 impl From<StoreError> for ApiError {
     fn from(error: StoreError) -> Self {
-        match error {
+        // # There is no wildcard here, and that is the point
+        //
+        // This conversion used to map five variants explicitly and collapse the other
+        // seventeen into `ApiError::Internal` with a `_ =>` arm. That arm was not a
+        // safety net, it was a silencer: a typed refusal the store already knew how to
+        // describe became an opaque 500 on every route that could produce it, and
+        // nothing failed to say so. Three separate issues were filed for three
+        // symptoms of it (#442, #449, #279) before the shape itself was addressed.
+        //
+        // FOURTEEN of those seventeen changed answer. The other three are `Database`,
+        // `Migration`, and `Encryption`, which are genuine faults and still render 500
+        // through the one arm that may.
+        //
+        // Exhaustiveness now runs in TWO links and neither can be skipped. `StoreError`
+        // is `#[non_exhaustive]`, so this crate cannot match it exhaustively at all;
+        // `StoreError::into_wire` can, because it lives in the crate that defines the
+        // type, and IT carries no wildcard, so a new variant fails the build there
+        // until its wire shape is decided. `StoreErrorWire` is not `#[non_exhaustive]`,
+        // so the match below is exhaustive too, and a new CLASS fails the build HERE
+        // until its status and body are decided.
+        //
+        // The old arm's stated defense was that "a handler that forgets its explicit
+        // arm degrades to the correct 422 instead of a server error". That reasoning
+        // is preserved and generalized rather than discarded: every caller-facing
+        // class still has a central answer, so a handler that adds no arm of its own
+        // still gets the right shape. What is gone is the SILENCE, which is the half
+        // that was doing the damage.
+        //
+        // The message comes from the store's `Display`, which is exhaustive in that
+        // crate and value free by construction on every caller-facing variant (each
+        // arm names a DIMENSION or a structural fact, never an offending value or a
+        // resource id), so nothing here can report anything the caller did not already
+        // send. Reading it from there rather than restating it means the log line and
+        // the caller's message cannot drift apart.
+        let message = error.to_string();
+        match error.into_wire() {
             // The uniform not-found is preserved across the boundary.
-            StoreError::NotFound => ApiError::NotFound,
-            // An invalid invitation org-context (issue #94) is a caller-facing bad
-            // request (the admin layer validates it richly up front; this is the
-            // store's defense-in-depth guard surfacing).
-            StoreError::InvalidOrgContext => {
-                ApiError::BadRequest("org_context is not a valid organization id".to_owned())
-            }
-            // A group create or reparent the organization's hierarchy cannot honor
-            // (issue #97). 422 rather than 400 (the value is well formed and names
-            // a group the caller can see) and rather than 409 (this is a
-            // structural refusal, not a uniqueness collision), matching the
-            // config-promotion unresolved-reference precedent.
+            StoreErrorWire::NotFound => ApiError::NotFound,
+            // A collision inside a scope the caller has already proven it can address.
+            // Every live route that can produce one carries its OWN arm with a
+            // resource-specific message; this is the backstop for the ones that do
+            // not, and answering it 409 rather than 500 is what stops a legitimate
+            // name collision from reading as a server fault.
+            StoreErrorWire::Conflict => ApiError::Conflict(message),
+            // A concurrent request under the SAME Idempotency-Key won the insert race.
+            // Reaching here means a create path skipped its replay, so it is logged at
+            // WARN: the condition is genuinely retryable and the caller is told so,
+            // but the missing replay stays visible rather than being absorbed.
             //
-            // These arms are here, in the ONE central conversion, and not only at
-            // the handler call sites: the wildcard below turns any unmapped
-            // variant into an opaque 500, so a handler that forgets its explicit
-            // arm degrades to the correct 422 instead of a server error on every
-            // route. Neither message names a group id, so neither can report
-            // anything the caller did not already send.
-            StoreError::OrgGroupCycle => ApiError::Unprocessable(
-                "the requested parent would create a cycle in the group hierarchy".to_owned(),
-            ),
-            // "AT LEAST" is exact, not hedging. Both recursive walks stop one level
-            // past the bound, so the depth they report SATURATES: against an
-            // already-over-deep hierarchy the number here is a FLOOR on the depth the
-            // write would have produced, never necessarily the depth itself. Wording
-            // it as an exact value would have an operator resolve a request that is
-            // "3 levels" over by raising the bound by 3 and watch it be refused
-            // again.
-            StoreError::OrgGroupDepthExceeded { max, attempted } => {
-                ApiError::Unprocessable(format!(
-                    "the requested parent would nest groups at least {attempted} levels deep, \
-                     exceeding the configured maximum of {max}"
-                ))
+            // Deliberately NOT `IdempotencyKeyConflict`, which is a 422 meaning
+            // something else entirely (the key was replayed with a DIFFERENT request).
+            // Answering that here would tell the caller their request was malformed
+            // when it was not.
+            StoreErrorWire::IdempotencyRace => {
+                tracing::warn!(
+                    error = %message,
+                    "a management create reached the central conversion with an \
+                     Idempotency-Key race; its replay path did not run"
+                );
+                ApiError::Conflict(
+                    "a concurrent request is already storing a result under this \
+                     Idempotency-Key; retry"
+                        .to_owned(),
+                )
             }
-            // A per-organization authentication policy document the store refused
-            // (issue #95). 422 for the same reason as the group refusals above: the
-            // values are well formed and in set, and this is a structural refusal of
-            // a document rather than a uniqueness collision.
-            //
-            // This arm lands AHEAD of issue #95's admin routes, exactly as the two
-            // group arms above landed ahead of theirs. It adds no type, no route, and
-            // no schema, so the served management spec cannot drift; and omitting it
-            // would NOT be neutral, because the wildcard below would turn this
-            // variant into an opaque 500 on every route that can produce it, with
-            // nothing failing to say so.
-            //
-            // Every carried refusal is value free by construction (each names a
-            // DIMENSION, never the offending value), so rendering them all is safe
-            // and is what makes the response actionable in one round trip. The list
-            // is already sorted and deduplicated by the store's validator, so the
-            // message is a deterministic function of the submitted document.
-            StoreError::OrgAuthPolicyInvalid(ref errors) => {
-                let dimensions: Vec<&str> = errors.iter().map(|failure| failure.as_str()).collect();
-                ApiError::Unprocessable(format!(
-                    "the organization authentication policy is invalid: {}",
-                    dimensions.join("; ")
-                ))
-            }
-            // Anything else (a database fault, or an idempotency conflict that
-            // did not funnel through the re-read path) is an opaque internal
-            // error; the detail is logged, never returned. `StoreError` is
-            // non-exhaustive, so a wildcard keeps this total.
-            other => {
-                tracing::error!(error = %other, "management store error");
+            // A malformed submitted value. Decided from the submitted bytes alone,
+            // without reading a row, so it can never be an existence probe.
+            StoreErrorWire::BadRequest => ApiError::BadRequest(message),
+            // A well-formed value a policy, schema, or structure refuses. 422 rather
+            // than 400 (the value parses and is in set) and rather than 409 (nothing
+            // collided; this is a structural refusal), matching the config-promotion
+            // unresolved-reference precedent.
+            StoreErrorWire::Unprocessable => ApiError::Unprocessable(message),
+            // A typed environment-guardrail refusal, rendered with the stable code of
+            // the failed guardrail so the caller learns which one. The management
+            // plane already emits this shape from its own pre-check; routing the
+            // store's refusal to the SAME shape means the two cannot answer the same
+            // failure two different ways.
+            StoreErrorWire::Guardrail(violation) => ApiError::GuardrailViolation(vec![violation]),
+            // A genuine server fault; the detail is logged, never returned.
+            StoreErrorWire::Internal => {
+                tracing::error!(error = %message, "management store error");
                 ApiError::Internal
             }
         }
@@ -354,17 +369,183 @@ impl From<StoreError> for ApiError {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApiError, StatusCode};
+    use super::{ApiError, GuardrailViolation, StatusCode};
     use crate::state::AdminState;
-    use ironauth_store::{AuthPolicyError, StoreError};
+    use ironauth_store::{AuthPolicyError, Guardrail, GuardrailClass, StoreError, StoreErrorWire};
+
+    /// Every wire class, with the status it must render and a representative
+    /// [`StoreError`] that carries it.
+    ///
+    /// The list is a hand-written one and could in principle shrink, but a class that
+    /// went unlisted would not be a silent hole: adding a class to `StoreErrorWire`
+    /// fails the BUILD of the conversion above, because that match is exhaustive and
+    /// carries no wildcard. This is the belt to that brace, pinning the STATUS each
+    /// class renders rather than merely that it renders something.
+    /// A representative guardrail violation: the production `https` rule, which is the
+    /// one an operator meets first.
+    fn https_only_violation() -> GuardrailViolation {
+        GuardrailViolation::new(
+            Guardrail::HttpsOnlyRedirectUris,
+            GuardrailClass::Production,
+            "a production redirect uri must be https".to_owned(),
+        )
+    }
+
+    fn class_expectations() -> Vec<(StoreErrorWire, StatusCode, StoreError)> {
+        vec![
+            (
+                StoreErrorWire::NotFound,
+                StatusCode::NOT_FOUND,
+                StoreError::NotFound,
+            ),
+            (
+                StoreErrorWire::Conflict,
+                StatusCode::CONFLICT,
+                StoreError::Conflict,
+            ),
+            (
+                StoreErrorWire::IdempotencyRace,
+                StatusCode::CONFLICT,
+                StoreError::IdempotencyConflict,
+            ),
+            (
+                StoreErrorWire::BadRequest,
+                StatusCode::BAD_REQUEST,
+                StoreError::InvalidOrgContext,
+            ),
+            (
+                StoreErrorWire::Unprocessable,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                StoreError::OrgGroupCycle,
+            ),
+            (
+                StoreErrorWire::Guardrail(https_only_violation()),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                StoreError::GuardrailViolation(https_only_violation()),
+            ),
+            (
+                StoreErrorWire::Internal,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                StoreError::Encryption,
+            ),
+        ]
+    }
+
+    #[test]
+    fn every_wire_class_renders_its_own_status_and_only_the_fault_class_renders_a_500() {
+        // THE PROPERTY THE WILDCARD DESTROYED. The conversion used to map five variants
+        // and collapse the other seventeen into an opaque 500, so a typed refusal the
+        // store already knew how to describe reached the caller as a server fault.
+        // Fourteen of the seventeen now answer typed; the three that stay 500 are the
+        // faults, and the last clause below is what holds that line.
+        //
+        // What makes this assertion worth having, rather than a restatement of the
+        // match, is the LAST clause: exactly one class may render a 500. A future edit
+        // that quietly routes a caller-facing class back to `Internal` to make some
+        // handler simpler fails here.
+        for (class, expected_status, error) in class_expectations() {
+            let rendered = ApiError::from(error);
+            assert_eq!(
+                rendered.status(),
+                expected_status,
+                "the {class:?} class must render {expected_status}: {rendered:?}"
+            );
+            assert_eq!(
+                matches!(rendered, ApiError::Internal),
+                class == StoreErrorWire::Internal,
+                "only the fault class may render as an opaque internal error, and it \
+                 must: {class:?} rendered {rendered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_classification_agrees_with_what_the_conversion_is_handed() {
+        // The two halves of the chain are in DIFFERENT crates, so nothing but this
+        // checks that the representative error each expectation above carries really
+        // does classify as the class it is filed under. Without it a mislabelled row
+        // would silently assert the wrong thing while still passing.
+        for (class, _status, error) in class_expectations() {
+            let actual = error.into_wire();
+            assert_eq!(
+                actual, class,
+                "the representative error for {class:?} must actually classify as it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_caller_facing_refusal_carries_the_store_s_own_message_and_no_submitted_value() {
+        // The conversion reads its message from the store's `Display` rather than
+        // restating it, so the log line and the caller's message cannot drift. That is
+        // only safe because every caller-facing arm of that `Display` is value free by
+        // construction, and this is where "value free" stops being a claim in a doc
+        // comment.
+        let rendered = ApiError::from(StoreError::OrgGroupDepthExceeded {
+            max: 8,
+            attempted: 11,
+        });
+        let ApiError::Unprocessable(ref message) = rendered else {
+            panic!("the depth refusal must render as unprocessable: {rendered:?}");
+        };
+        assert!(
+            message.contains("11") && message.contains('8'),
+            "the refusal must report both the attempted depth and the bound: {message}"
+        );
+
+        let rendered = ApiError::from(StoreError::InvalidOrgContext);
+        let ApiError::BadRequest(ref message) = rendered else {
+            panic!("an invalid org context must render as a bad request: {rendered:?}");
+        };
+        assert_eq!(
+            message, "org_context is not a valid organization id",
+            "the wire message must be the one the management surface has always sent, \
+             which is why the store's Display arm carries exactly this text"
+        );
+    }
+
+    #[test]
+    fn the_idempotency_race_is_a_retryable_conflict_and_not_the_unprocessable_replay_error() {
+        // These two are easy to confuse and mean opposite things. `IdempotencyRace` is a
+        // CONCURRENT request under the same key, which is retryable and is not the
+        // caller's fault; `ApiError::IdempotencyKeyConflict` is a 422 meaning the key was
+        // replayed with a DIFFERENT request, which IS. Answering the 422 for the race
+        // would tell a caller their request was malformed when it was not.
+        let rendered = ApiError::from(StoreError::IdempotencyConflict);
+        assert_eq!(rendered.status(), StatusCode::CONFLICT);
+        assert!(
+            !matches!(rendered, ApiError::IdempotencyKeyConflict),
+            "the race must not borrow the replay error's shape: {rendered:?}"
+        );
+        assert!(
+            matches!(&rendered, ApiError::Conflict(message) if message.contains("retry")),
+            "and it must tell the caller the condition is retryable: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn a_guardrail_refusal_from_the_store_renders_the_failed_guardrail_code() {
+        // The management plane already emits `ApiError::GuardrailViolation` from its OWN
+        // pre-check. Before this arm existed the store's refusal of the same condition
+        // reached the wildcard instead, so one failure had two answers depending on
+        // which layer caught it. The stable CODE is the part an integrator keys on, so
+        // it is what is asserted.
+        let rendered = ApiError::from(StoreError::GuardrailViolation(https_only_violation()));
+        assert_eq!(rendered.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = rendered.body();
+        assert_eq!(body.error, "guardrail_violation");
+        assert_eq!(
+            body.failed_guardrails,
+            Some(vec!["https_only_redirect_uris".to_owned()]),
+            "the refusal must name the failed guardrail by its stable code"
+        );
+    }
 
     #[test]
     fn the_group_hierarchy_refusals_render_as_unprocessable_and_never_as_internal() {
-        // `impl From<StoreError> for ApiError` wildcards every unmapped variant to an
-        // opaque 500 with a tracing error. A new typed refusal that is added to the
-        // store but not mapped here is therefore a SILENT 500 on every route that can
-        // produce it, with nothing failing to say so. These two assertions are what
-        // make the issue #97 refusals a caller-facing 422 rather than that.
+        // These two assertions predate the exhaustive conversion and are kept as they
+        // were: they pin the WIRE SHAPE of the issue #97 refusals, which is a narrower
+        // and more durable claim than how the conversion happens to reach it.
         let cycle: ApiError = StoreError::OrgGroupCycle.into();
         assert_eq!(cycle.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert!(

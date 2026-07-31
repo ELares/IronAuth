@@ -176,7 +176,26 @@ async fn device_enter(
             .check_and_increment(&key, limit, window, now)
             .await
         {
-            Ok(true) => {}
+            // PROCEED. Two different reasons, deliberately ONE outcome.
+            //
+            // `Ok(true)` is the ordinary case: this source is under its limit.
+            //
+            // `Err(NotFound)` is THE SCOPE DOES NOT EXIST (issue #449). The counter row
+            // carries the composite foreign key to `environments`, so incrementing it in
+            // a scope that was never created cannot land, and the store answers the
+            // uniform not-found. This used to be a `500` while a real environment
+            // answered `200`, with NO credential of any kind required: an
+            // unauthenticated tenant and environment enumeration oracle, and precisely
+            // the fact issue #433 went to lengths to withhold at the token endpoint.
+            //
+            // Falling THROUGH rather than answering here is the point, and sharing the
+            // arm is the honest way to write it. There is no user code to rate limit in
+            // a scope that holds no flows, and the lookup below then runs the same query
+            // it runs for a live environment, matches nothing, and renders the same
+            // non-oracular "code not recognized" page. The two answers are identical
+            // because ONE code path produces both, which is a stronger guarantee than
+            // two paths written to agree.
+            Ok(true) | Err(ironauth_store::StoreError::NotFound) => {}
             Ok(false) => {
                 return safe_notice(
                     StatusCode::TOO_MANY_REQUESTS,
@@ -292,7 +311,17 @@ async fn device_login(
                             let response = render_after_login(state, scope, action, raw_code).await;
                             with_set_cookie(response, &cookie)
                         }
-                        Err(_) => server_error(),
+                        // The central lifecycle fence refused between the
+                        // `can_authenticate` check above and the mint (issue #279's
+                        // shape on the device sign-in step). The refusal must be this
+                        // path's own uniform failure, which is the SAME call the
+                        // fenced branch above already makes, so a correct password
+                        // against an account that just went blocked is not an
+                        // account-state oracle.
+                        Err(interaction::EstablishSessionError::NotAuthenticatable) => {
+                            failed_login(action, raw_code)
+                        }
+                        Err(interaction::EstablishSessionError::Store) => server_error(),
                     }
                 }
                 Ok(false) => failed_login(action, raw_code),

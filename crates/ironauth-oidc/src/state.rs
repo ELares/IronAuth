@@ -1844,6 +1844,22 @@ impl OidcState {
                         worst = Some(max_escalation(worst, count, delay));
                     }
                 }
+                // THE SCOPE DOES NOT EXIST (issue #449). Recording an attempt is a
+                // WRITE, and a write into a scope with no `environments` row cannot
+                // land: the counter table carries the composite foreign key, so the
+                // store answers the uniform not-found. Failing CLOSED on that made
+                // every identifier-bearing unauthenticated route a `429` for an
+                // environment that never existed and its ordinary `200` for one that
+                // does, which is an unauthenticated tenant and environment
+                // enumeration oracle across the whole passwordless surface.
+                //
+                // Allowing is not a weakening of the defense. There is nothing in a
+                // scope that does not exist to brute force: it holds no account, no
+                // credential, and no data, and every subsequent step of the request
+                // reaches the same absent scope and answers the same uniform miss. The
+                // regulation still fails CLOSED for every OTHER error, which is the
+                // case the fail-closed rule was written for.
+                Err(ironauth_store::StoreError::NotFound) => {}
                 Err(_) => {
                     return RegulationOutcome::Throttled(banned_snapshot(&settings));
                 }
