@@ -462,5 +462,17 @@ name = "deleted_environment"
 path = "tests/deleted_environment.rs"
 required-features = ["testing"]
 
+# The LIVE-environment contract (issue #441): every operation the committed contract
+# publishes, driven with a real operator credential against a healthy environment whose
+# ids all name real rows, asserting that none of them answers a server error. This is the
+# sweep that catches a management route reaching a relation the least-privileged
+# `ironauth_control` role was never granted, which is refused by Postgres before any
+# application logic runs and is invisible in dev_mode (where the control DSN falls back to
+# the data-plane one). Spec driven in both directions. Needs a real database.
+[[test]]
+name = "live_surface"
+path = "tests/live_surface.rs"
+required-features = ["testing"]
+
 [lints]
 workspace = true

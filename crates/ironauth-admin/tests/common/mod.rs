@@ -269,6 +269,91 @@ impl Harness {
         }
     }
 
+    /// Start a fresh database and router with EVERY optional management surface armed,
+    /// bound to one freshly seeded `(tenant, environment)` returned as
+    /// [`Harness::outbound_scope`].
+    ///
+    /// The whole-surface live sweep needs this. A surface that is off answers the uniform
+    /// not-found BEFORE it resolves anything, so a sweep run against the default harness
+    /// would report a clean 404 for every gated route and would be blind to whatever those
+    /// routes do once they reach the database. Arming them all in one router is what makes
+    /// the sweep's silence meaningful.
+    ///
+    /// Sudo mode is deliberately NOT armed: it gates every environment-scoped mutation on a
+    /// fresh elevation, so arming it would turn the sweep into a 403 sweep. The elevation
+    /// route is driven under [`Harness::start_with_sudo`] instead.
+    ///
+    /// The outbound verification endpoint is bound to an explicit `(tenant, environment)`
+    /// at CONFIGURATION time, which it cannot be if the tenant does not exist yet, and the
+    /// tenant cannot be seeded through the owner pool either: `TestDatabase::seed_scope`
+    /// mints its own operator, and every management read is scoped to the BOOTSTRAP
+    /// operator, so such a tenant is a uniform not-found to this plane (measured: the
+    /// environment create answered 404). So the router is built TWICE over the one
+    /// database, the tenant and environment are created through the first one exactly as an
+    /// operator would, and the second is bound to what that produced.
+    pub async fn start_fully_armed(default_page_size: u32, outbound_token: &str) -> Self {
+        let db = TestDatabase::start().await;
+        let bootstrap = AdminConfig {
+            bootstrap_operator_token: Some(Secret::Literal(SecretString::new(OPERATOR_TOKEN))),
+            max_page_size: 200,
+            default_page_size,
+            ..AdminConfig::default()
+        };
+        let opening_state = AdminState::new(db.control_store().clone(), Env::system(), &bootstrap)
+            .expect("admin state builds");
+        let opening = Self {
+            db,
+            router: management_router(opening_state),
+            outbound_scope: None,
+        };
+        let (tenant, environment) = opening.create_tenant("armed", "armed-tenant").await;
+        let scope = Scope::new(
+            ironauth_store::TenantId::parse(&tenant).expect("tenant parses"),
+            ironauth_store::EnvironmentId::parse(&environment).expect("environment parses"),
+        );
+        let db = opening.db;
+        let config = AdminConfig {
+            bootstrap_operator_token: Some(Secret::Literal(SecretString::new(OPERATOR_TOKEN))),
+            max_page_size: 200,
+            default_page_size,
+            outbound_verification_enabled: true,
+            outbound_verification_token: Some(Secret::Literal(SecretString::new(outbound_token))),
+            outbound_verification_tenant: Some(scope.tenant().to_string()),
+            outbound_verification_environment: Some(scope.environment().to_string()),
+            ..AdminConfig::default()
+        };
+        let registry = std::sync::Arc::new(ironauth_oidc::IssuerRegistry::store_backed(
+            "https://issuer.test",
+            ironauth_oidc::JwksCacheWindow::clamped(300),
+            db.store().clone(),
+        ));
+        let fetcher = std::sync::Arc::new(
+            ironauth_fetch::Fetcher::new(ironauth_fetch::FetchLimits::default()).expect("fetcher"),
+        );
+        let keys = std::sync::Arc::new(ironauth_oidc::FederationKeyResolver::new(
+            std::sync::Arc::clone(&fetcher),
+            std::time::Duration::from_secs(300),
+        ));
+        let federation = std::sync::Arc::new(ironauth_oidc::FederationRuntime::new(
+            fetcher,
+            keys,
+            std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(30),
+        ));
+        let state = AdminState::new(db.control_store().clone(), Env::system(), &config)
+            .expect("admin state builds")
+            .with_signing_registry(registry)
+            .with_federation(federation)
+            .with_signup_quarantine_enabled(true)
+            .with_advanced_recovery_enabled(true);
+        let router = management_router(state);
+        Self {
+            db,
+            router,
+            outbound_scope: Some(scope),
+        }
+    }
+
     /// Provision the three day-one signing algorithms (`EdDSA`, `ES256`, `RS256`) into an
     /// existing `scope` through the data-plane store, so its issuer resolves as fully
     /// provisioned (every wizard recommendation is signable). Mirrors env-create's

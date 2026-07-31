@@ -1374,8 +1374,12 @@ fn select_control_dsn(config: &Config) -> Option<String> {
         tracing::warn!(
             "admin.control_database_url is unset; in dev_mode the management API falls back to \
              database.url. The ironauth_control role separation and the management_credentials \
-             FORCE row-level-security backstop are NOT enforced. Set admin.control_database_url \
-             to a least-privilege ironauth_control DSN before production."
+             FORCE row-level-security backstop are NOT enforced. A development database is \
+             usually a full-privilege one, so this fallback can also make the management \
+             surface look healthier than it is: a route the control role holds no privilege \
+             for answers normally here and fails on every deployment that sets this knob \
+             (issue #441). Set admin.control_database_url to a least-privilege \
+             ironauth_control DSN before production."
         );
         return Some(config.database.url.expose().to_owned());
     }
