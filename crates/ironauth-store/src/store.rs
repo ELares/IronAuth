@@ -88,6 +88,22 @@ impl Store {
         self.master.as_deref()
     }
 
+    /// The platform master key HANDLE, for the boot-wiring harness only (issue #414).
+    ///
+    /// The management plane and the OIDC data plane each open their own store, and the
+    /// sealed PII one plane writes is only the sealed PII the other opens when both
+    /// stores carry the SAME key. The key material itself is never exposed (a
+    /// [`MasterKey`] redacts itself and offers no byte accessor), so a test proves that
+    /// property by comparing the handles, which is why this returns the `Arc` rather
+    /// than the key. Gated on `testing`, so the production build's surface is unchanged
+    /// and the repository layer keeps reading the key through the crate-private
+    /// [`Store::master`].
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn master_key(&self) -> Option<&Arc<MasterKey>> {
+        self.master.as_ref()
+    }
+
     /// Apply the full IronAuth migration chain to bring the schema current.
     ///
     /// Runs the runtime [`MigrationRunner`] over the two production migrations:

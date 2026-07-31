@@ -293,6 +293,17 @@ impl TestDatabase {
         &self.app_url
     }
 
+    /// The low-privilege CONTROL-plane connection URL (`ironauth_control` role) for THIS
+    /// throwaway database, the peer of [`TestDatabase::app_url`]. A test that drives the
+    /// real boot path (the boot-wiring harness, issue #414) writes this into
+    /// `admin.control_database_url` so the management plane connects as the SEPARATE
+    /// credential class production uses, rather than borrowing the data-plane role and
+    /// quietly testing a role separation that would not hold.
+    #[must_use]
+    pub fn control_url(&self) -> &str {
+        &self.control_url
+    }
+
     /// A throwaway human actor for tests that need to perform a write. Writes
     /// require an acting context; tests that only need *an* actor (not a
     /// specific one) can use this rather than minting their own.

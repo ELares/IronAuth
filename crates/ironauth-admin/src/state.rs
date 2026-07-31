@@ -354,6 +354,23 @@ impl AdminState {
         self.inner.signing_registry.as_deref()
     }
 
+    /// The shared data-plane issuer registry HANDLE, for the boot-wiring harness only
+    /// (issue #414).
+    ///
+    /// This registry carries the issuer base the console credential bridge enforces
+    /// `iss` against and the JWKS cache window this plane caches keys for. Both are
+    /// operator-visible values the OIDC data plane also carries, and a second
+    /// derivation that disagreed would fail every console login while the data plane
+    /// looked healthy, so the harness reads them off BOTH assembled planes through this
+    /// and [`ironauth_oidc::OidcState::issuers`]. Gated on `testing`: no production
+    /// caller needs the handle, and the in-crate readers keep going through
+    /// [`AdminState::signing_registry`].
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn shared_issuer_registry(&self) -> Option<&Arc<IssuerRegistry>> {
+        self.inner.signing_registry.as_ref()
+    }
+
     /// Resolve a console `at+jwt` (issue #90, PR 2) to a management [`Principal`].
     ///
     /// This is the THIRD resolution arm, after the bootstrap operator token and the
@@ -642,6 +659,23 @@ impl AdminState {
         self
     }
 
+    /// The installed lazy-migration hook, if any (issue #56).
+    ///
+    /// Exists so the boot-wiring harness (issue #414) can prove what
+    /// [`AdminState::with_migration_hook`] claims: that this plane holds the SAME `Arc`
+    /// as the OIDC data plane, not merely an equal configuration. Equality would not
+    /// do, because the login path drives the circuit breaker inside this object and
+    /// this plane reports THAT breaker's state. Nothing on the management plane reads
+    /// the hook through this accessor; the progress endpoint goes through
+    /// [`AdminState::migration_breaker_state`]. Gated on `testing` for exactly that
+    /// reason: it has no production caller, so the production build's surface is
+    /// unchanged.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn migration_hook(&self) -> Option<&Arc<ironauth_oidc::LazyMigrationHook>> {
+        self.inner.migration_hook.as_ref()
+    }
+
     /// This node's lazy-migration circuit-breaker state (issue #56), or `None` when no
     /// hook is installed on this node. Reported by the migration-progress endpoint.
     #[must_use]
@@ -663,6 +697,20 @@ impl AdminState {
             inner.federation = Some(runtime);
         }
         self
+    }
+
+    /// The installed federation runtime, if any (issue #76).
+    ///
+    /// Exists for the same reason as [`AdminState::migration_hook`]: the boot-wiring
+    /// harness (issue #414) proves this plane holds the SAME `Arc` the login legs
+    /// record connector health into, which is what makes the health-diagnostics read
+    /// live rather than empty. The health read itself goes through
+    /// [`AdminState::connector_health`], not this accessor, so this is gated on
+    /// `testing` and the production build's surface is unchanged.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn federation(&self) -> Option<&Arc<ironauth_oidc::FederationRuntime>> {
+        self.inner.federation.as_ref()
     }
 
     /// This node's live health snapshot for one connector (issue #76), read against the admin

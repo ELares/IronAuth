@@ -942,8 +942,15 @@ impl OidcState {
 
     /// The installed federation runtime, if any (issue #75, PR B). The `/federation`
     /// handlers consult it; when absent they return a uniform not-found.
+    ///
+    /// Public rather than crate-private only so the boot-wiring harness (issue #414)
+    /// can prove the claim this builder's doc makes: that the management plane holds
+    /// the SAME `Arc`, not merely an equal configuration. Equality of configuration
+    /// would not do, because the login legs record connector health INTO this object
+    /// and the admin health-diagnostics read reports out of it. A read-only handle to
+    /// an already public type, so it widens nothing an operator can reach.
     #[must_use]
-    pub(crate) fn federation(&self) -> Option<&Arc<crate::federation::FederationRuntime>> {
+    pub fn federation(&self) -> Option<&Arc<crate::federation::FederationRuntime>> {
         self.federation.as_ref()
     }
 
@@ -1348,8 +1355,15 @@ impl OidcState {
 
     /// The installed lazy-migration hook, if any (issue #56). The login path consults it
     /// ONLY when the submitted identifier is unknown locally.
+    ///
+    /// Public rather than crate-private only so the boot-wiring harness (issue #414)
+    /// can prove the claim this builder's doc makes: that the management plane holds
+    /// the SAME `Arc`, not merely an equal configuration. Equality would not do,
+    /// because the login path drives the circuit breaker inside this object and the
+    /// migration-progress endpoint reports THIS node's breaker state out of it. A
+    /// read-only handle to an already public type.
     #[must_use]
-    pub(crate) fn migration_hook(&self) -> Option<&Arc<crate::migration::LazyMigrationHook>> {
+    pub fn migration_hook(&self) -> Option<&Arc<crate::migration::LazyMigrationHook>> {
         self.migration_hook.as_ref()
     }
 
