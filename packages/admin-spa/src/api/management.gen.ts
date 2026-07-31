@@ -5783,7 +5783,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Environment not found */
+            /** @description The environment is absent or deleted */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -5857,7 +5857,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Environment not found */
+            /** @description The environment is absent or deleted */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -5912,7 +5912,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Sudo mode is disabled, or the scope is not found */
+            /** @description The environment is absent or deleted, or sudo mode is disabled */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -6743,7 +6743,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Not found (absent client or another scope) */
+            /** @description The environment is absent or deleted, or the client is absent or in another scope */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -7853,7 +7853,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Environment not found */
+            /** @description The tenant or environment identifier is malformed. An environment that merely does not EXIST is evaluated like any other, because the dry run reads no row of it */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -12886,6 +12886,15 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
+            /** @description The environment is absent or deleted */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
             /** @description Idempotency-Key reused with a different request */
             422: {
                 headers: {
@@ -13010,7 +13019,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Not found (absent or in another scope) */
+            /** @description The environment is absent or deleted, or the session is in another scope */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -13743,7 +13752,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Not found (absent or in another scope) */
+            /** @description The environment is absent or deleted, or the user or client is in another scope */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -13810,7 +13819,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Not found (absent or in another scope) */
+            /** @description The environment is absent or deleted, or the user is absent or in another scope */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -13943,7 +13952,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Not found (absent or in another scope) */
+            /** @description The environment is absent or deleted, or the user is in another scope */
             404: {
                 headers: {
                     [name: string]: unknown;

@@ -51,6 +51,7 @@ use crate::auth::Principal;
 use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
 use crate::input::parse_json;
+use crate::org_context::require_live_environment;
 use crate::response::json;
 use crate::signing_interop;
 use crate::state::AdminState;
@@ -164,7 +165,7 @@ pub async fn get_signing_recommendations(principal: Principal) -> Result<Respons
         (status = 400, description = "Malformed request, or an algorithm outside the wizard set", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Not found (absent client or another scope)", body = ErrorBody),
+        (status = 404, description = "The environment is absent or deleted, or the client is absent or in another scope", body = ErrorBody),
         (status = 422, description = "The environment cannot sign the requested algorithm, or the Idempotency-Key was reused with a different request", body = ErrorBody)
     )
 )]
@@ -191,6 +192,25 @@ pub async fn set_client_signing_algorithm(
     {
         return Ok(replay);
     }
+
+    // The PARENT-EXISTENCE precondition (issue #409), and the one route on this surface
+    // where an absent environment was DISTINGUISHABLE from a malformed one before it.
+    //
+    // `scope_from_path` proves only that the two path segments PARSE. Layer 2 below
+    // resolves the environment's signable set through the issuer registry, and a
+    // registry that cannot resolve an environment fails closed at 422, so an ARMED
+    // deployment answered a malformed environment 404 and an ABSENT one 422 (measured
+    // under a harness with the registry installed and the scope fully provisioned; the
+    // default test harness holds no registry, so THERE every environment answers 422 and
+    // the difference is invisible). A 422 that only an absent environment can produce is
+    // an existence oracle over a sibling environment, and it contradicts the rule the
+    // rest of this surface holds.
+    //
+    // The check goes here, AFTER the replay and ahead of both the body parse and the
+    // registry lookup, matching every sibling that carries an Idempotency-Key: a genuine
+    // replay must return the original response even if the environment went away
+    // meanwhile, and addressing is answered before content.
+    require_live_environment(&state, &scope).await?;
 
     let request: SetClientSigningAlgorithmRequest = parse_json(&body)?;
 

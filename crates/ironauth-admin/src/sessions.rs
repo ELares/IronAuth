@@ -39,6 +39,7 @@ use crate::auth::Principal;
 use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
 use crate::input::parse_json;
+use crate::org_context::require_live_environment;
 use crate::pagination::{ListQuery, Pagination};
 use crate::response::json;
 use crate::state::AdminState;
@@ -205,7 +206,7 @@ pub async fn get_session(
         (status = 400, description = "Malformed request", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Not found (absent or in another scope)", body = ErrorBody),
+        (status = 404, description = "The environment is absent or deleted, or the session is in another scope", body = ErrorBody),
         (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
     )
 )]
@@ -229,6 +230,28 @@ pub async fn revoke_session(
     {
         return Ok(replay);
     }
+
+    // The PARENT-EXISTENCE precondition (issue #409). `scope_from_path` proves only
+    // that the two path segments PARSE. A revoke is idempotent over the session itself,
+    // so an absent session is deliberately a 200 rather than a refusal; what is NOT
+    // idempotent is the AUDIT row the revocation writes, and `audit_log` carries a
+    // composite foreign key to `environments`. A well-formed identifier naming an
+    // environment that does not exist was MEASURED reaching that constraint
+    // (`audit_log_environment_id_tenant_id_fkey`) and coming back as an opaque 500. The
+    // environment is the one thing on this route whose absence the caller can observe,
+    // so it answers the uniform not-found.
+    //
+    // The constraint NAME above is a value recorded from that run, not an invariant the
+    // suite enforces: `StoreError` is mapped to `ApiError::Internal` before it reaches
+    // the wire, so no test can see a constraint name and none asserts one. What the
+    // tests do enforce is the observable answer, which is the 404 and the empty write
+    // set.
+    //
+    // AFTER the replay, matching every sibling create: a genuine replay must return the
+    // original response even if the environment went away meanwhile, or a retry of a
+    // request that ALREADY SUCCEEDED becomes a 404 the client cannot tell from "my
+    // revocation never landed".
+    require_live_environment(&state, &scope).await?;
 
     let request = revoke_request(&body)?;
     // Parse under the caller's OWN scope: a foreign session is the uniform not-found
@@ -299,6 +322,7 @@ pub async fn revoke_session(
         (status = 400, description = "Malformed request or too many sessions", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "The environment is absent or deleted", body = ErrorBody),
         (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
     )
 )]
@@ -322,6 +346,11 @@ pub async fn bulk_revoke_sessions(
     {
         return Ok(replay);
     }
+
+    // The parent-existence precondition, for the reason `revoke_session` records: the
+    // batch's audit row is what carries the foreign key to `environments`, so an absent
+    // environment was MEASURED as an opaque 500 rather than the uniform not-found.
+    require_live_environment(&state, &scope).await?;
 
     let request: BulkRevokeSessionsRequest = parse_json(&body)?;
     if request.session_ids.len() > MAX_BULK_REVOKE {
@@ -396,7 +425,7 @@ pub async fn bulk_revoke_sessions(
         (status = 400, description = "Malformed request", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Not found (absent or in another scope)", body = ErrorBody),
+        (status = 404, description = "The environment is absent or deleted, or the user is in another scope", body = ErrorBody),
         (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
     )
 )]
@@ -420,6 +449,12 @@ pub async fn revoke_user_sessions(
     {
         return Ok(replay);
     }
+
+    // The parent-existence precondition, for the reason `revoke_session` records. This
+    // route never reads the user (revoking every session of a subject that owns none is
+    // a legitimate no-op), so the audit row is the first thing to reach the foreign key
+    // and an absent environment was MEASURED as an opaque 500.
+    require_live_environment(&state, &scope).await?;
 
     let request = revoke_request(&body)?;
     // A user id from another scope (or a malformed one) is the uniform not-found.

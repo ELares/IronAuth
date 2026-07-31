@@ -25,6 +25,7 @@ use utoipa::ToSchema;
 
 use crate::auth::Principal;
 use crate::error::{ApiError, ErrorBody};
+use crate::org_context::require_live_environment;
 use crate::response::json;
 use crate::state::AdminState;
 
@@ -157,7 +158,7 @@ fn build_subject(kind: AbuseSubjectKind, raw: &str) -> AbuseSubject {
         (status = 400, description = "Malformed request", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Environment not found", body = ErrorBody),
+        (status = 404, description = "The environment is absent or deleted", body = ErrorBody),
         (status = 409, description = "The subject is already banned on this path", body = ErrorBody)
     )
 )]
@@ -169,6 +170,23 @@ pub async fn create_ban(
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
+    // The PARENT-EXISTENCE precondition (issue #409). `resolve_scope` proves only that
+    // the two path segments PARSE; it never proves the environment row is there. A ban
+    // subject is PII, so placing one SEALS it, and sealing mints the scope's envelope
+    // key: `tenant_keks` carries a composite foreign key to `environments`, and a
+    // well-formed identifier naming an environment that does not exist was MEASURED
+    // reaching that constraint (`23503 tenant_keks_environment_id_tenant_id_fkey`, a
+    // name RECORDED from that run rather than an invariant any test asserts, since the
+    // store error is mapped to `ApiError::Internal` before it reaches the wire) and
+    // coming back as an opaque 500 for an input the caller fully controls. This turns
+    // it into the uniform not-found, the same answer a MALFORMED environment segment
+    // already gets, so the two are indistinguishable.
+    //
+    // There is no Idempotency-Key on this route, so the ordering the sibling creates
+    // observe (replay first, precondition second) has nothing to order against here;
+    // the precondition is simply the first thing after the scope is authorized, ahead
+    // of body validation exactly as `permissions.rs` places it.
+    require_live_environment(&state, &scope).await?;
     let request: CreateBanRequest = crate::input::parse_json(&body)?;
     let kind = parse_subject_kind(&request.subject_kind)?;
     let path = parse_auth_path(&request.auth_path)?;
@@ -241,7 +259,7 @@ pub async fn create_ban(
         (status = 400, description = "Malformed request", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Environment not found", body = ErrorBody)
+        (status = 404, description = "The environment is absent or deleted", body = ErrorBody)
     )
 )]
 pub async fn lift_ban(
@@ -252,6 +270,24 @@ pub async fn lift_ban(
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
+    // The same precondition as `create_ban`, placed here as FUTURE PROOFING rather than
+    // on the strength of a measurement, which is the honest account and the one this
+    // comment gives.
+    //
+    // The lift's own effect is currently MASKED. `abuse_bans` is granted to
+    // `ironauth_app` alone (migration 0046) while this plane connects as
+    // `ironauth_control`, and a lift OPENS with a scoped read over that same relation,
+    // so the measured answer is a `42501` insufficient-privilege refusal naming
+    // `abuse_bans`, for a LIVE environment and for an absent one ALIKE. The
+    // environment's absence is not the cause of that 500 and neutering this
+    // precondition does not change it. Issue #441 records the grant gap.
+    //
+    // The precondition is still correct: once #441 is settled the opening SELECT
+    // succeeds, and the lift's audit row becomes the first write to reach `audit_log`'s
+    // composite foreign key to `environments`, which is exactly the constraint
+    // `revoke_session` records. Placing the check now means the answer never has to
+    // change when that day comes.
+    require_live_environment(&state, &scope).await?;
     let request: LiftBanRequest = crate::input::parse_json(&body)?;
     let kind = parse_subject_kind(&request.subject_kind)?;
     let path = parse_auth_path(&request.auth_path)?;

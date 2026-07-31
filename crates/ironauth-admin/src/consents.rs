@@ -33,6 +33,7 @@ use ironauth_store::{ClientId, CorrelationId, StoreError, UserId};
 
 use crate::auth::Principal;
 use crate::error::{ApiError, ErrorBody};
+use crate::org_context::require_live_environment;
 use crate::response::json;
 use crate::sessions::scope_from_path;
 use crate::state::AdminState;
@@ -150,7 +151,7 @@ pub async fn list_user_consents(
         (status = 200, description = "The consent was revoked", body = ConsentRevocationView),
         (status = 401, description = "Missing or invalid credential, or fresh privilege required", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Not found (absent or in another scope)", body = ErrorBody)
+        (status = 404, description = "The environment is absent or deleted, or the user or client is in another scope", body = ErrorBody)
     )
 )]
 pub async fn revoke_user_consent(
@@ -161,6 +162,22 @@ pub async fn revoke_user_consent(
     let actor = principal.require_operator()?;
     let (_tenant, scope) = scope_from_path(&state, &tenant_id, &environment_id)?;
     crate::sudo::require_fresh_privilege(&state, scope, principal.actor()).await?;
+
+    // The PARENT-EXISTENCE precondition (issue #409). This route did NOT need it to stop
+    // a 500: the revoke is idempotent over a consent that need not exist, so an absent
+    // environment simply matched nothing and answered 200 `{"revoked":false}` having
+    // written no row (the sweep's zero-write snapshot covers that). It is here for the
+    // OPERATOR rather than for the store: a mistyped environment id in a console or a
+    // script was told "there was nothing to revoke", which reads as a completed action
+    // over a real environment, when the truthful answer is that the environment named
+    // does not exist. A revoke is a security mutation an operator performs believing it
+    // took effect somewhere, so silently addressing nothing is the wrong answer even
+    // though it is a safe one.
+    //
+    // It also makes the rule uniform. With this in place, the ONE environment-scoped
+    // write that is not the not-found at an absent environment is the flow dry run,
+    // which reads and writes nothing at all and so has no parent to require.
+    require_live_environment(&state, &scope).await?;
 
     // Both ids are parsed under the caller's OWN scope: a malformed or cross-scope user
     // id or client id is the uniform not-found BEFORE any mutating repository is reached.

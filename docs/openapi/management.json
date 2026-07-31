@@ -1025,7 +1025,7 @@
             }
           },
           "404": {
-            "description": "Environment not found",
+            "description": "The environment is absent or deleted",
             "content": {
               "application/json": {
                 "schema": {
@@ -1131,7 +1131,7 @@
             }
           },
           "404": {
-            "description": "Environment not found",
+            "description": "The environment is absent or deleted",
             "content": {
               "application/json": {
                 "schema": {
@@ -1220,7 +1220,7 @@
             }
           },
           "404": {
-            "description": "Sudo mode is disabled, or the scope is not found",
+            "description": "The environment is absent or deleted, or sudo mode is disabled",
             "content": {
               "application/json": {
                 "schema": {
@@ -2509,7 +2509,7 @@
             }
           },
           "404": {
-            "description": "Not found (absent client or another scope)",
+            "description": "The environment is absent or deleted, or the client is absent or in another scope",
             "content": {
               "application/json": {
                 "schema": {
@@ -4150,7 +4150,7 @@
             }
           },
           "404": {
-            "description": "Environment not found",
+            "description": "The tenant or environment identifier is malformed. An environment that merely does not EXIST is evaluated like any other, because the dry run reads no row of it",
             "content": {
               "application/json": {
                 "schema": {
@@ -12033,6 +12033,16 @@
               }
             }
           },
+          "404": {
+            "description": "The environment is absent or deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "422": {
             "description": "Idempotency-Key reused with a different request",
             "content": {
@@ -12233,7 +12243,7 @@
             }
           },
           "404": {
-            "description": "Not found (absent or in another scope)",
+            "description": "The environment is absent or deleted, or the session is in another scope",
             "content": {
               "application/json": {
                 "schema": {
@@ -13379,7 +13389,7 @@
             }
           },
           "404": {
-            "description": "Not found (absent or in another scope)",
+            "description": "The environment is absent or deleted, or the user or client is in another scope",
             "content": {
               "application/json": {
                 "schema": {
@@ -13484,7 +13494,7 @@
             }
           },
           "404": {
-            "description": "Not found (absent or in another scope)",
+            "description": "The environment is absent or deleted, or the user is absent or in another scope",
             "content": {
               "application/json": {
                 "schema": {
@@ -13691,7 +13701,7 @@
             }
           },
           "404": {
-            "description": "Not found (absent or in another scope)",
+            "description": "The environment is absent or deleted, or the user is in another scope",
             "content": {
               "application/json": {
                 "schema": {
