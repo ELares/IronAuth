@@ -270,23 +270,15 @@ pub async fn lift_ban(
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
-    // The same precondition as `create_ban`, placed here as FUTURE PROOFING rather than
-    // on the strength of a measurement, which is the honest account and the one this
-    // comment gives.
-    //
-    // The lift's own effect is currently MASKED. `abuse_bans` is granted to
-    // `ironauth_app` alone (migration 0046) while this plane connects as
-    // `ironauth_control`, and a lift OPENS with a scoped read over that same relation,
-    // so the measured answer is a `42501` insufficient-privilege refusal naming
-    // `abuse_bans`, for a LIVE environment and for an absent one ALIKE. The
-    // environment's absence is not the cause of that 500 and neutering this
-    // precondition does not change it. Issue #441 records the grant gap.
-    //
-    // The precondition is still correct: once #441 is settled the opening SELECT
-    // succeeds, and the lift's audit row becomes the first write to reach `audit_log`'s
-    // composite foreign key to `environments`, which is exactly the constraint
-    // `revoke_session` records. Placing the check now means the answer never has to
-    // change when that day comes.
+    // The same precondition as `create_ban`. When it was written this route's own effect
+    // was MASKED by a missing control-plane privilege, so the check was placed as future
+    // proofing rather than on the strength of a measurement, and the comment said so.
+    // Migration 0098 settled that, and the check is now load bearing on its own terms: the
+    // opening scoped read succeeds, and the lift's audit row is the first write to reach
+    // the composite foreign key from `audit_log` to `environments`, which is the same
+    // constraint `revoke_session` records. Without the precondition an absent environment
+    // would reach that constraint and come back as an opaque 500 for an input the caller
+    // fully controls.
     require_live_environment(&state, &scope).await?;
     let request: LiftBanRequest = crate::input::parse_json(&body)?;
     let kind = parse_subject_kind(&request.subject_kind)?;

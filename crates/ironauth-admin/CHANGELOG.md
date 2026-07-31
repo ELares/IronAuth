@@ -6,6 +6,28 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The whole management surface is now driven against a LIVE environment by one sweep**
+  (issue #441), `tests/live_surface.rs`. It enumerates every operation
+  `docs/openapi/management.json` publishes, addresses each at a real seeded row with a real
+  operator credential, and fails when any of them answers a server error. Its coverage is
+  checked against the committed contract in both directions, so a new route fails it the
+  moment it is documented and a case whose path drifts matches no template and fails too.
+  The abuse-ban surface shipped completely dead because nothing drove it; this is the guard
+  that makes that class of omission structurally hard to repeat.
+- **`createBan`, `liftBan`, `listBans`, and `getMds3Health` answer** (issue #441). All four
+  were refused by Postgres before any application logic ran, because the relations behind
+  them carried no privilege for the role this plane connects as. Migration 0098 settles the
+  privilege; this crate gains the tests that would have caught it: the ban round trip
+  including the canonicalized subject and the sealed value read back, the cross-plane proof
+  that a ban the operator places is the ban the login path refuses on, the audit sequence,
+  the metadata health read across its three verdicts, and the two least-privilege refusals
+  that pin what the control role must NOT be able to do.
+- **The sibling absent-environment sweep no longer pins two routes at 500.** It carried
+  `createBan` and `liftBan` as documented deadness so that the deadness could not quietly
+  become something else, and that is how this change was noticed: the pins went red. They
+  now carry the answers a live environment gives, and the sweep additionally refuses a
+  server error at a live environment for every route it drives.
+
 - **The role-to-permission attach response now carries a budget verdict** (issue #425, the
   #98 follow-up): `POST .../organizations/{org}/roles/{role}/permissions` answers 201 with
   `role_permission_budget` beside the mapping. Issue #98's acceptance criterion asked for an

@@ -854,6 +854,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0097_email_factor_config.sql"),
         },
+        Migration {
+            version: 98,
+            name: "control_plane_dead_surface_grants",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0098_control_plane_dead_surface_grants.sql"),
+        },
     ]
 }
 

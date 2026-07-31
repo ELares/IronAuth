@@ -6,6 +6,16 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The `dev_mode` control-DSN fallback warning now names the consequence that actually
+  bites** (issue #441). When `admin.control_database_url` is unset and `dev_mode` is on, the
+  management plane connects on `database.url`. A development database is usually a
+  full-privilege one, so a management route the least-privileged control role holds no
+  privilege for answers perfectly there and fails on every deployment that sets the knob.
+  That was measured rather than supposed: with the router on the owning role and the
+  relevant grants reverted, all 143 published management operations pass. The warning listed
+  the row-level-security backstop and the role separation and stopped there, which said
+  nothing about a surface being invisibly dead.
+
 - Inbound OIDC federation is now WIRED into the server boot path (issue #75, PR B,
   adversarial review MEDIUM-1). `build_oidc_router` reads the new `oidc.federation` config and,
   when `oidc.federation.enabled` is set, builds the `FederationRuntime` (its OWN SSRF-hardened

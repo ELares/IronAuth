@@ -616,7 +616,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
     );
     assert_eq!(
         report.already_applied(),
-        97,
+        98,
         "a migration was added to or removed from the production chain; this count is a \
          deliberate checkpoint, not a bug, so read the new migration, satisfy yourself that it \
          belongs in the shipped chain, then update this number and the subject list below and \
@@ -647,7 +647,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
          organization role assignments, organization authentication policies, permission \
          vocabulary, role-to-permission mapping, organization default role, resource-server \
          permission claims, token size event budget columns, client allowed scopes, \
-         email-factor downgrade configuration."
+         email-factor downgrade configuration, control-plane dead-surface grants."
     );
 
     // The ledger holds exactly the shipped versions, contiguous and in order.
@@ -658,7 +658,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
             46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67,
             68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89,
-            90, 91, 92, 93, 94, 95, 96, 97
+            90, 91, 92, 93, 94, 95, 96, 97, 98
         ]
     );
     let phase_of = |version: i64| async move {
@@ -6850,5 +6850,66 @@ async fn clients_carries_the_scope_allowlist_and_its_control_column_grant() {
     assert!(
         !role_has_table_privilege(pool, "ironauth_app", "clients", "UPDATE").await,
         "0096 must not widen the data role to a table-wide UPDATE on clients"
+    );
+}
+
+/// 0098 names the two relations the management plane reached with no privilege at
+/// all, and the two withholdings are the least-privilege statement it makes.
+///
+/// `live_surface.rs` pins all of this behaviourally, which is the stronger proof
+/// because it drives the real role over the real routes. This test exists anyway,
+/// for a reason worth stating: a behavioural test goes red for many causes, and a
+/// reader who sees it fail cannot tell a lost grant from a broken handler. These
+/// assertions name the invariant directly, so the catalog and the wire have to be
+/// wrong together before the invariant is silently lost.
+#[tokio::test]
+async fn the_control_plane_holds_exactly_the_dead_surface_grants_0098_adds() {
+    let db = TestDatabase::start().await;
+    let pool = db.owner_pool();
+
+    // The three abuse_bans verbs the management surface actually issues. A lift
+    // resolves the row before removing it, so SELECT is not optional.
+    for privilege in ["SELECT", "INSERT", "DELETE"] {
+        assert!(
+            role_has_table_privilege(pool, "ironauth_control", "abuse_bans", privilege).await,
+            "the control plane needs {privilege} on abuse_bans; without it listBans, \
+             createBan and liftBan answer an opaque server error on every deployment \
+             that sets admin.control_database_url"
+        );
+    }
+
+    // A ban is immutable once placed. Withholding UPDATE means a compromised control
+    // path can create one (audited) or remove one (audited) and cannot retarget an
+    // existing ban's subject, widen its authentication path, or extend its expiry,
+    // which are precisely the edits an audit trail recording only create and lift
+    // would never show.
+    assert!(
+        !role_has_table_privilege(pool, "ironauth_control", "abuse_bans", "UPDATE").await,
+        "0098 must not grant the control plane UPDATE on abuse_bans; a ban is immutable"
+    );
+
+    // The MDS3 cache backs one management operation, a health read. The blob is the
+    // FIDO metadata the passkey attestation gate evaluates against, so a plane able
+    // to write it could weaken attestation for an environment by seeding a forged or
+    // stale blob. The only writer is the data-plane synchronization task, which
+    // verifies the signature and refuses a replayed blob number first.
+    assert!(
+        role_has_table_privilege(pool, "ironauth_control", "mds3_blob_cache", "SELECT").await,
+        "the control plane needs SELECT on mds3_blob_cache for getMds3Health"
+    );
+    for privilege in ["INSERT", "UPDATE", "DELETE"] {
+        assert!(
+            !role_has_table_privilege(pool, "ironauth_control", "mds3_blob_cache", privilege).await,
+            "0098 must not grant the control plane {privilege} on mds3_blob_cache; a plane \
+             that can write the metadata blob can weaken passkey attestation"
+        );
+    }
+
+    // A positive control, so a catalog lookup that answered "no" to everything could
+    // not satisfy the withholdings above: the DATA plane does hold the abuse_bans
+    // grants 0046 gave it.
+    assert!(
+        role_has_table_privilege(pool, "ironauth_app", "abuse_bans", "SELECT").await,
+        "the data plane holds the abuse_bans SELECT that enforcement reads"
     );
 }

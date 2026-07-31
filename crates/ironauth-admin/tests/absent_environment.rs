@@ -912,22 +912,22 @@ fn documented_exceptions() -> BTreeMap<&'static str, StatusCode> {
 /// The routes whose LIVE answer is pinned exactly, rather than merely checked for being
 /// routed at the method this sweep drives.
 ///
-/// `createBan` and `liftBan` are DEAD on this plane, not merely unsatisfied by the
-/// fixture: `abuse_bans` is granted to `ironauth_app` alone (migration 0046) while the
-/// management surface connects as `ironauth_control`, so both answer 500 for a LIVE
-/// environment with a `42501` insufficient-privilege refusal naming `abuse_bans`. Issue #441 records
-/// that grant gap, which is a control-role privilege decision against a deliberate
-/// least-privilege boundary and NOT this issue's to settle.
+/// These two entries were both pinned at 500 when this file was written, because
+/// `createBan` and `liftBan` were DEAD on this plane rather than merely unsatisfied by the
+/// fixture: the relation behind them was granted to the data-plane role alone while the
+/// management surface connects as the control role, so both were refused by Postgres for a
+/// LIVE environment and an absent one alike. Issue #441 settled that (migration 0098), and
+/// the pins now carry the answers a live environment actually gives.
 ///
-/// The 500 is pinned so the deadness cannot quietly become something else. Without this,
-/// "these two are dead today" is a sentence nothing measures, and the day the grant
-/// changes the sweep would keep passing while the absent-environment behaviour of two
-/// live routes went un-re-derived. With it, that day turns this test red and forces the
-/// re-derivation.
+/// The mechanism did exactly what it was put here to do. The comment it replaces said that
+/// the day the grant changed this test would go red and force the answers to be
+/// re-derived, and that is how the change was noticed. Keeping the pins, rather than
+/// deleting them along with the deadness they described, is what keeps that true for the
+/// next change.
 fn documented_live_answers() -> BTreeMap<&'static str, StatusCode> {
     BTreeMap::from([
-        ("bans.createBan", StatusCode::INTERNAL_SERVER_ERROR),
-        ("bans.liftBan", StatusCode::INTERNAL_SERVER_ERROR),
+        ("bans.createBan", StatusCode::CREATED),
+        ("bans.liftBan", StatusCode::OK),
     ])
 }
 
@@ -1035,6 +1035,17 @@ async fn every_environment_scoped_write_at_an_absent_environment_is_the_uniform_
                 case.label
             );
         }
+        // No route may answer a server error at a LIVE environment, whatever else it
+        // answers. This is the property the two ban entries above used to violate, and
+        // leaving it unasserted is how they got to a release: a dead surface looks
+        // identical to a healthy one in a pass that only checks the route is wired.
+        // `tests/live_surface.rs` owns the whole-surface version of this, GETs included;
+        // the one line here keeps the sibling sweep from re-introducing what it found.
+        assert!(
+            !status.is_server_error(),
+            "{} answered a server error at a LIVE environment: {status} {body}",
+            case.label
+        );
     }
 
     let before = snapshot(h.db().owner_pool()).await;

@@ -6,6 +6,29 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **Migration 0098 grants the control plane the two relations the management surface
+  reached with no privilege at all** (issue #441). `abuse_bans` (`SELECT, INSERT, DELETE`)
+  and `mds3_blob_cache` (`SELECT`) were granted to the data-plane role alone, while the
+  management router connects as `ironauth_control`, so Postgres refused every statement
+  against them before any application logic ran and four published operations answered 500
+  on every deployment that sets `admin.control_database_url`: `listBans`, `createBan`,
+  `liftBan`, and `getMds3Health`. The set was derived twice and both derivations agree.
+  Statically: sixty relations are reachable from the management handlers and exactly these
+  two carried no `ironauth_control` privilege of any kind. Empirically: all 143 operations
+  the committed management contract publishes, driven against a live healthy environment
+  with a real operator credential, and exactly these four answered a server error.
+- **What is deliberately WITHHELD is the part worth reading.** No `UPDATE` on `abuse_bans`:
+  a ban is immutable once placed, the surface only creates and removes one, and both of
+  those audit, while a silent retarget of a subject or extension of an expiry would not. No
+  write of any shape on `mds3_blob_cache`: the cached blob is the metadata the passkey
+  attestation gate evaluates against, and its only legitimate writer is the data-plane
+  synchronization task that verifies the blob signature first. Both withholdings are
+  asserted by tests rather than only described here.
+- The migration adds no table, no column, and no policy. Row-level security was already
+  enabled and FORCED on both relations and their isolation policies key on the scope
+  session settings rather than on the role, so the control plane is confined to the
+  addressed `(tenant, environment)` exactly as the data plane is.
+
 - **`ScopedStore::environment_state` fails CLOSED on a serving status it cannot name**
   (issue #433). It mapped `'suspended'` to a fence and EVERYTHING ELSE to serving, so a
   stored value outside the pair this crate knows was served. Nothing can reach that

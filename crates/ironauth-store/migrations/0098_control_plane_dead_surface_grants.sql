@@ -1,0 +1,106 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+--
+-- Control-plane grants for the two relations the management surface reaches with
+-- no privilege at all (issue #441).
+--
+-- The management router connects as ironauth_control. Two relations it reads or
+-- writes were granted to ironauth_app ALONE, so every statement against them was
+-- refused by Postgres before any application logic ran, and the refusal reached
+-- the wire as an opaque 500. Four published operations were dead on every
+-- production deployment: listBans, createBan, liftBan, and getMds3Health. The
+-- defect is invisible in development because admin.control_database_url falls back
+-- to database.url when dev_mode is set, which puts the management plane on the
+-- data-plane role and hides exactly the privilege boundary this migration is about.
+--
+-- The set was derived twice and both derivations agree. Statically: every relation
+-- the management handlers reach, resolved through the repository module, checked
+-- against the catalog for an ironauth_control privilege. Empirically: every
+-- operation the committed management contract publishes, driven against a live
+-- healthy environment with a real operator credential (see the live-surface sweep
+-- in crates/ironauth-admin/tests). Exactly the two relations below had none. No count
+-- of reachable relations is stated here on purpose: the two obvious populations differ
+-- (the relations this plane actually addresses, and the relations carrying a control
+-- grant, several of which serve the CLI and apply tooling rather than a published
+-- operation), so a single figure would be wrong for one of them.
+--
+-- WHY GRANT RATHER THAN ROUTE THROUGH THE DATA PLANE
+--
+-- The alternative is real and has precedent: the compatibility wizard reaches the
+-- data plane through an injected store rather than through the control pool. It was
+-- rejected here because it is STRICTLY more privilege, not less. Handing the
+-- management process a data-plane pool would give it the whole ironauth_app grant
+-- set, which includes INSERT on the credential, token, and authorization-code
+-- relations, in order to buy four statements against two relations. Least privilege
+-- is served by naming the two relations, not by opening a second credential class.
+-- The audited writes also settle it: a ban create and a ban lift each commit their
+-- audit row in the SAME transaction as the ban, and a management-plane audit row
+-- written over a data-plane connection would break the plane separation the audit
+-- trail depends on.
+--
+-- Row-level security is already ENABLED and FORCED on both relations, and their
+-- isolation policies key on the scope GUCs rather than on the role, so the control
+-- plane is confined to the addressed (tenant, environment) exactly as the data plane
+-- is. This migration adds no table, no column, and no policy: it is grants only, and
+-- every statement is additive, so it is an EXPAND.
+
+-- ---------------------------------------------------------------------------
+-- 1. Credential-abuse bans (issue #64 shipped the table; migration 0046 granted it
+--    to the data plane alone).
+--
+-- The management surface places a ban, lists the active ones, and lifts one. A lift
+-- is a hard DELETE and it resolves the row it is about to remove first, so the read
+-- is not optional: without SELECT the lift cannot target anything and the list
+-- endpoint has nothing to answer with.
+--
+-- SELECT and INSERT are TABLE scoped rather than column scoped, deliberately. Column
+-- scoping expresses a restriction only when some column is left out, and the granted
+-- statements touch every column of the row between them: the list read opens the
+-- sealed subject, its DEK version, and the rest of the ban record, the lift resolves
+-- the row it is about to remove through the blind index, and the insert writes all
+-- eleven columns. A column list naming all eleven would restrict nothing while
+-- silently breaking on the next column added. The recent control-plane grants that
+-- ARE column scoped (0078 on consents, 0089 on the assignment tables) scope UPDATE,
+-- which is where a column list carries meaning, and they grant SELECT table wide for
+-- this same reason.
+GRANT SELECT, INSERT, DELETE ON abuse_bans TO ironauth_control;
+
+-- UPDATE is deliberately WITHHELD, and the withholding is the least-privilege
+-- statement this grant makes. A ban is immutable once placed: the management surface
+-- and the CLI both create one and remove one, and neither ever rewrites one. So a
+-- compromised or buggy control-plane path can place a ban (audited, abuse.ban.create)
+-- or remove a ban (audited, abuse.ban.lift), and cannot silently retarget an existing
+-- ban's subject, widen its authentication path, or extend its expiry, which are the
+-- edits that would be invisible in an audit trail that only records create and lift.
+
+-- ---------------------------------------------------------------------------
+-- 2. The WebAuthn metadata (MDS3) blob cache (issue #79 shipped the table).
+--
+-- The management surface exposes ONE operation over it, a health read reporting
+-- whether the environment has a cached blob, which blob number, when it was last
+-- verified, and when it next expires. So the control plane gets SELECT and nothing
+-- else.
+--
+-- No INSERT, UPDATE, or DELETE, and that is a security property rather than an
+-- omission to be filled in later. The cached blob is the FIDO metadata the passkey
+-- attestation gate evaluates against, so a plane that could write it could weaken
+-- attestation for an environment by seeding a forged or stale blob. The only writer
+-- is the data-plane synchronization task, which verifies the blob's signature and
+-- refuses a replayed blob number before it stores anything. A future management
+-- operation that wants to force a refresh must go through that task rather than
+-- reach for a write grant here.
+GRANT SELECT ON mds3_blob_cache TO ironauth_control;
+
+-- ---------------------------------------------------------------------------
+-- 3. One asymmetry of this same shape is deliberately LEFT ALONE, recorded so the
+--    next reader does not mistake it for an oversight.
+--
+-- ironauth_control holds INSERT on signing_keys and NO SELECT. A management route does
+-- insert there during environment creation, so the write half is used and correct. The
+-- read half is absent because the admin signing registry is built from the DATA-PLANE
+-- store, so no management read of a signing key ever travels the control pool.
+--
+-- Granting SELECT here would add privilege that nothing currently needs, which is the
+-- opposite of what this migration is for. The trap to be aware of is the future one:
+-- the FIRST management read of a signing key routed through the control pool will fail
+-- exactly the way the four operations above did, and it will be invisible in
+-- development for exactly the same reason.
