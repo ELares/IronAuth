@@ -13,25 +13,35 @@ use std::sync::Arc;
 use axum::Router;
 use ironauth_admin::{AdminOidcBridge, AdminState};
 use ironauth_config::{
-    ADVANCED_RECOVERY_FEATURE, Config, DiagnosticsConfig, FEDCM_FEATURE,
-    FIRST_PARTY_CHALLENGE_FEATURE, FeatureRegistry, GLOBAL_TOKEN_REVOCATION_FEATURE, Loaded,
-    OidcConfig, PasswordHashingConfig, PasswordPolicyConfig, QuotaConfig, RISK_SIGNALS_FEATURE,
-    SIGNUP_QUARANTINE_FEATURE, ScreeningFailurePolicy, ScreeningProvider, TokenClaimsConfig,
+    ADVANCED_RECOVERY_FEATURE, Config, FEDCM_FEATURE, FIRST_PARTY_CHALLENGE_FEATURE,
+    FeatureRegistry, GLOBAL_TOKEN_REVOCATION_FEATURE, Loaded, OidcConfig, PasswordPolicyConfig,
+    RISK_SIGNALS_FEATURE, ScreeningFailurePolicy, ScreeningProvider,
 };
 use ironauth_env::Env;
 use ironauth_jose::MasterKey;
 use ironauth_oidc::{
     BackChannelLogoutWorker, CredentialClass, DiscoveryCapabilities, DiscoveryState,
     FederationKeyResolver, FederationRuntime, FetchLogoutSender, IssuerRegistry, IssuerState,
-    JwksCacheWindow, LazyMigrationHook, OidcState, WorkerSettings, canonical_login_identifier,
-    canonical_step_up_acr, discovery_router, issuer_router, oidc_router,
+    JwksCacheWindow, OidcState, WorkerSettings, canonical_login_identifier, canonical_step_up_acr,
+    discovery_router, issuer_router, oidc_router,
 };
 use ironauth_quota::QuotaEnforcer;
-use ironauth_server::{Server, SiteContext};
+use ironauth_server::{Server, ServerError};
 use ironauth_store::{
     AbuseBanId, AbuseSubject, AbuseSubjectKind, ActorRef, AuthPath, ClientId, CorrelationId,
     EnvironmentId, NewBan, Scope, ServiceId, Store, TenantId,
 };
+
+use crate::shared_config::SharedPlaneInputs;
+
+/// The config sections both planes must receive identically (issue #414).
+mod shared_config;
+
+/// The boot-wiring harness (issue #414): assembles both plane states from one config
+/// and observes what they actually hold. DB-backed, so it rides the `testing` feature
+/// exactly as the CLI integration suite does.
+#[cfg(all(test, feature = "testing"))]
+mod boot_wiring_tests;
 
 /// Semantic version of this build, injected by Cargo.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -145,61 +155,6 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             tracing::error!(%error, "refusing to boot on a feature-gate violation");
             return ExitCode::FAILURE;
         }
-        // The experimental Global Token Revocation receiver (issue #36) mounts only when
-        // its feature is enabled AND acknowledged; the gate is the ladder, never a plain
-        // [oidc] toggle, so the ack can never be bypassed.
-        let global_revocation_enabled =
-            features.is_enabled(&config, GLOBAL_TOKEN_REVOCATION_FEATURE);
-        // The experimental IdP-side FedCM surface (issue #83) is armed only when its
-        // feature is enabled AND acknowledged; the gate is the ladder, never a plain
-        // [oidc] toggle, so the ack can never be bypassed. Resolved to a bool here and
-        // injected through the OIDC state builder (never OidcConfig), so every FedCM
-        // route stays a 404 and discovery advertises nothing until an operator opts in.
-        let fedcm_enabled = features.is_enabled(&config, FEDCM_FEATURE);
-        // The experimental third-party risk-signal ingestion surface (issue #82, PR 1) is
-        // armed only when its feature is enabled AND acknowledged; the gate is the ladder,
-        // never a plain [oidc] toggle, so the ack can never be bypassed. Resolved to a bool
-        // here and injected through the OIDC state builder (never OidcConfig), so the
-        // ingestion endpoint stays a 404 and the engine reads no external signal until an
-        // operator opts in.
-        let risk_signals_enabled = features.is_enabled(&config, RISK_SIGNALS_FEATURE);
-        // The experimental signup fraud-review-queue surface (issue #82, PR 2) is armed only
-        // when its feature is enabled AND acknowledged; the gate is the ladder, never a plain
-        // config toggle, so the ack can never be bypassed. Resolved to a bool here and
-        // injected through BOTH the OIDC state builder (the register hook and the quarantined
-        // authorize restrictions) and the admin state builder (the review-queue endpoints),
-        // so the register path keeps BLOCKING a risky signup and the review-queue endpoints
-        // stay 404s until an operator opts in.
-        let signup_quarantine_enabled = features.is_enabled(&config, SIGNUP_QUARANTINE_FEATURE);
-        // The experimental advanced-recovery-modes surface (issue #82, PR 3) is armed only
-        // when its feature is enabled AND acknowledged; the gate is the ladder, never a plain
-        // config toggle, so the ack can never be bypassed. Resolved to a bool here and
-        // injected through BOTH the OIDC state builder (the recovery-method seam and the
-        // trusted-contact / IDV data-plane routes) and the admin state builder (the
-        // recovery-approval review queue), so every advanced-recovery path stays a 404 and
-        // standard recovery is unchanged until an operator opts in.
-        let advanced_recovery_enabled = features.is_enabled(&config, ADVANCED_RECOVERY_FEATURE);
-        // The experimental OAuth 2.0 Authorization Challenge Endpoint (issue #93, Bet 3) is served
-        // only when its feature is enabled AND acknowledged at the exact draft revision; the gate is
-        // the ladder, never a plain [oidc] toggle, so the ack can never be bypassed. Resolved to a
-        // bool here and injected through the OIDC state builder (never OidcConfig), so the
-        // challenge endpoint stays a 404 and no browserless code can be minted until an operator
-        // opts in AND acknowledges the draft.
-        let first_party_challenge_enabled =
-            features.is_enabled(&config, FIRST_PARTY_CHALLENGE_FEATURE);
-
-        // The headless flow API (issue #84): a plain top-level operator toggle (like
-        // `oidc.enabled`), off by default, resolved here before `config` is moved so the flow
-        // routes answer a uniform 404 until an operator turns it on.
-        let flows_enabled = config.flows.enabled;
-
-        // The hosted-page render app cutover (issue #85): a plain top-level operator toggle,
-        // off by default, resolved here before `config` is moved. It retargets the `/authorize`
-        // login and registration interaction redirects onto the flow browser page, but ONLY in
-        // composition with `flows_enabled` (the pages render through the flow engine), which the
-        // state builder enforces via `hosted_pages_cutover`. A config that arms the pages without
-        // the flow engine is surfaced as a load-time warning (see the config `collect_warnings`).
-        let hosted_pages_enabled = config.hosted_pages.enabled;
 
         // The admin console SPA (issue #90): a plain top-level operator toggle, off by
         // default, resolved here before `config` is moved. When on, the embedded console is
@@ -262,7 +217,10 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // CLEANLY instead of booting and then failing closed at every IDV recovery callback.
         // Only checked when the feature is armed (a malformed JWKS with the feature off is
         // inert), and only for enabled providers (mirroring the config non-empty check).
-        if advanced_recovery_enabled {
+        // The verdict is the SAME pure ladder question the carrier resolves it from,
+        // asked of the same unmutated config, so the two cannot disagree; it is asked
+        // here because this refusal must happen before any store is opened.
+        if features.is_enabled(&config, ADVANCED_RECOVERY_FEATURE) {
             if let Err(error) = validate_idv_provider_jwks(&config.oidc.advanced_recovery) {
                 tracing::error!(%error, "advanced-recovery IDV provider JWKS is invalid");
                 return ExitCode::FAILURE;
@@ -271,67 +229,27 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
 
         let env = Env::system();
 
-        // The inbound lazy-migration hook (issue #56), built once and shared: it arms the
-        // login path (OIDC data plane) to verify an unknown identifier's first login
-        // against a legacy store, and the SAME Arc is handed to the management plane so the
-        // migration-progress endpoint reports this node's circuit-breaker state. Built only
-        // when the OIDC provider is mounted (the login path it guards) AND the hook is
-        // enabled; disabled or misconfigured yields `None` (the login path is unchanged).
-        let migration_hook = if config.oidc.enabled {
-            ironauth_oidc::build_lazy_migration_hook(&config.oidc.lazy_migration, &env)
-        } else {
-            None
-        };
+        // Install the process-wide Prometheus recorder BEFORE anything describes a
+        // metric. The data-plane assembly below registers the help and type text for
+        // the hashing-pool, screening, and connector-health metrics, and a `describe`
+        // that runs while the global recorder is still the no-op one is silently
+        // dropped, leaving those metrics on `/metrics` with no HELP or TYPE. `Server::new`
+        // used to be the first caller by accident of ordering; this makes it explicit,
+        // and the call is idempotent (it hands back the same handle the server takes).
+        let _recorder = ironauth_server::metrics::recorder_handle();
 
-        // The generic OIDC UPSTREAM federation runtime (issue #75), built once and shared: it
-        // powers the /federation login legs (OIDC data plane) AND its per-connector health
-        // registry (issue #76) is the SAME Arc handed to the management plane, so the admin
-        // health-diagnostics read reports the live health the login path records into. Built only
-        // when OIDC is mounted and federation is enabled; otherwise `None`.
-        let federation_runtime = if config.oidc.enabled {
-            build_federation_runtime(&config.oidc)
-        } else {
-            None
-        };
-
-        // Build the management API router (issue #11) before moving config into
-        // the server. It mounts on the management plane only when a bootstrap
-        // operator token is configured; otherwise the server boots exactly as the
-        // DB-free skeleton it was, serving only health, readiness, and metrics.
-        let management = build_management_router(
-            &config,
-            &env,
-            migration_hook.clone(),
-            federation_runtime.clone(),
-            signup_quarantine_enabled,
-            advanced_recovery_enabled,
-        )
-        .await;
-
-        // Capture what the OIDC mount (issue #12) needs before config and env
-        // move into the server: the OIDC settings, the data-plane DSN, and an env
-        // handle. The public issuer root is taken from the built server below.
-        let oidc_inputs = if config.oidc.enabled {
-            Some((
-                config.oidc.clone(),
-                config.database.url.expose().to_owned(),
-                env.clone(),
-                resolve_master_key(&config),
-                config.quota.clone(),
-                config.password_hashing.clone(),
-                config.password_policy.clone(),
-                config.diagnostics.clone(),
-                // The organization group nesting bound (issue #97): the data plane
-                // needs the SAME value the management plane installs, because the
-                // effective-role resolution the mint path runs is bounded by it.
-                config.organizations.max_group_depth,
-                // The token claim budget (issue #98): the data plane needs the SAME
-                // section the management plane installs, because the mint enforces the
-                // budget the management API reports the approach warning against.
-                config.token_claims.clone(),
-            ))
-        } else {
-            None
+        // BOTH planes, assembled from the ONE loaded config through the ONE capture
+        // (issue #414), before `config` moves into the server. Every value the two
+        // planes must agree on is resolved inside that capture and read off the one
+        // carrier, so this call site has nothing to hand a plane and no second
+        // derivation to get wrong. A malformed `server.public_url` refuses to boot here,
+        // exactly as `Server::new` would, only earlier and before any store is opened.
+        let planes = match assemble_planes(&config, &env, &features).await {
+            Ok(planes) => planes,
+            Err(error) => {
+                tracing::error!(%error, "failed to derive the public site context");
+                return ExitCode::FAILURE;
+            }
         };
 
         // Capture what the Back-Channel Logout delivery worker (issue #34) needs before
@@ -348,6 +266,13 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+        // Mount the management API (issue #11) on the management plane. The state was
+        // assembled above; mounting is all this adds, which is why the assembly is a
+        // separate step the boot-wiring harness can observe.
+        let management = planes.management.map(|state| {
+            tracing::info!("management API mounted on the management plane");
+            ironauth_admin::management_router(state)
+        });
         // Keep a clone of the management router (if any) for the admin console's
         // same-origin proxy (issue #90, PR 2): the browser reaches the management
         // API through /admin/api on the PUBLIC plane, which the proxy forwards to
@@ -356,51 +281,20 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         if let Some(router) = management {
             server = server.mount_management(router);
         }
-        // Mount the OIDC provider on the PUBLIC plane when enabled. The issuer root
-        // is the server's config-derived base URL, so issuers are per environment.
-        if let Some((
-            oidc_config,
-            dsn,
-            oidc_env,
-            master_key,
-            quota_config,
-            hashing_config,
-            policy_config,
-            diagnostics_config,
-            max_group_depth,
-            token_claims_config,
-        )) = oidc_inputs
-        {
-            let issuer_base = server.base_url();
-            if let Some(router) = build_oidc_router(
-                &oidc_config,
-                &dsn,
-                oidc_env,
-                issuer_base,
-                global_revocation_enabled,
-                fedcm_enabled,
-                risk_signals_enabled,
-                signup_quarantine_enabled,
-                advanced_recovery_enabled,
-                first_party_challenge_enabled,
-                flows_enabled,
-                hosted_pages_enabled,
-                master_key,
-                &quota_config,
-                &hashing_config,
-                &policy_config,
-                &diagnostics_config,
-                max_group_depth,
-                &token_claims_config,
-                migration_hook,
-                federation_runtime,
-            )
-            .await
-            {
-                server = server.mount_public(router);
-            }
-        } else {
-            tracing::info!("OIDC provider not mounted: oidc.enabled is false");
+        // Mount the OIDC provider on the PUBLIC plane when enabled. Its three surfaces
+        // read the SAME issuer registry, under the ONE config-derived base URL the
+        // management plane also took, so issuers are per environment and the two planes
+        // cannot disagree about what `iss` is.
+        if let Some(plane) = planes.oidc {
+            tracing::info!(
+                "OIDC provider, discovery, and per-environment JWKS mounted on the public plane; \
+                 per-environment signing keys load lazily from the store on first use"
+            );
+            server = server.mount_public(
+                oidc_router(plane.state)
+                    .merge(plane.discovery)
+                    .merge(plane.jwks),
+            );
         }
         // Mount the admin console SPA on the PUBLIC plane under /admin when enabled
         // (issue #90). mount_public MERGES with the OIDC router above, so both mount
@@ -459,22 +353,133 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
     })
 }
 
-/// Build the management API router, or `None` if it should not be mounted.
+/// The data-plane-only surface verdicts, resolved ONCE.
 ///
-/// The management API mounts only when a bootstrap operator token is configured,
-/// so the default (token unset) config still boots without a database, exactly
-/// like the server skeleton. When configured, it connects a control-plane store
-/// with the DSN chosen by [`select_control_dsn`] (per the D2 policy). A failure
-/// to connect or an invalid admin config is logged and the server continues to
-/// serve health, readiness, and metrics rather than refusing to boot.
-async fn build_management_router(
+/// Named fields rather than a positional list of booleans: each is set beside the
+/// exact ladder entry or config toggle it comes from, in one place, so no call site
+/// can fill one of them in from another's source. None of these reaches the management
+/// plane; the two verdicts that DO are declared in the `shared_plane_inputs!`
+/// invocation and travel on the shared carrier instead.
+// Six independent verdicts, and NAMED fields are the point: the alternative here was six
+// positional booleans threaded through two call sites, where any two could be swapped
+// silently. A state machine would model a composition these do not have.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy)]
+struct DataPlaneSurfaces {
+    /// The experimental Global Token Revocation receiver (issue #36).
+    global_revocation: bool,
+    /// The experimental IdP-side FedCM surface (issue #83).
+    fedcm: bool,
+    /// The experimental third-party risk-signal ingestion surface (issue #82, PR 1).
+    risk_signals: bool,
+    /// The experimental OAuth 2.0 Authorization Challenge Endpoint (issue #93, Bet 3).
+    first_party_challenge: bool,
+    /// The headless flow API (issue #84), a plain operator toggle.
+    flows: bool,
+    /// The hosted-page render app cutover (issue #85), a plain operator toggle.
+    hosted_pages: bool,
+}
+
+impl DataPlaneSurfaces {
+    /// Resolve every data-plane surface verdict from the validated ladder and config.
+    ///
+    /// Each experimental surface is armed only when its feature is enabled AND
+    /// acknowledged at its exact current version; the gate is the ladder, never a plain
+    /// `[oidc]` toggle, so the ack can never be bypassed. Each verdict is injected
+    /// through the OIDC state builder (never `OidcConfig`), so the routes stay uniform
+    /// 404s until an operator opts in. The last two are ordinary top-level operator
+    /// toggles, off by default, and are resolved here so they travel with the rest.
+    fn resolve(features: &FeatureRegistry, config: &Config) -> Self {
+        Self {
+            global_revocation: features.is_enabled(config, GLOBAL_TOKEN_REVOCATION_FEATURE),
+            fedcm: features.is_enabled(config, FEDCM_FEATURE),
+            risk_signals: features.is_enabled(config, RISK_SIGNALS_FEATURE),
+            first_party_challenge: features.is_enabled(config, FIRST_PARTY_CHALLENGE_FEATURE),
+            flows: config.flows.enabled,
+            // The hosted pages retarget the `/authorize` login and registration
+            // interaction redirects onto the flow browser page, but ONLY in composition
+            // with `flows` (the pages render through the flow engine), which the state
+            // builder enforces via `hosted_pages_cutover`. A config that arms the pages
+            // without the flow engine is surfaced as a load-time warning.
+            hosted_pages: config.hosted_pages.enabled,
+        }
+    }
+}
+
+/// Both plane states, assembled from ONE config through ONE capture.
+///
+/// Returned rather than mounted so the boot-wiring harness (issue #414) can OBSERVE
+/// what each plane actually holds. Mounting turns both into opaque `Router`s, which is
+/// why deleting an install, or handing one plane a different value than the other, used
+/// to build with zero warnings.
+struct AssembledPlanes {
+    /// The management plane's state, or `None` when the management API does not mount.
+    management: Option<AdminState>,
+    /// The OIDC data plane, or `None` when it is disabled or cannot mount.
+    oidc: Option<OidcPlane>,
+}
+
+/// Assemble BOTH planes from the one loaded config (issue #414).
+///
+/// This is the whole cross-plane seam, and it exists as ONE function for one reason:
+/// everything both planes must agree on is captured here, ONCE, and each plane is
+/// built from that one carrier. A harness that drove the two builders itself would be
+/// asserting a discipline it had just supplied; driving THIS function is what makes the
+/// single-carrier discipline an observed property of the production path.
+///
+/// Neither plane failing to mount is fatal: the management API stays off when no
+/// bootstrap operator token is configured or its store is unreachable, and the data
+/// plane stays off when `oidc.enabled` is false or its store is unreachable. The server
+/// then serves what remains rather than refusing to boot.
+///
+/// # Errors
+///
+/// [`ServerError::InvalidPublicUrl`] if `server.public_url` is set but is not a valid
+/// `http`/`https` base URL, which is the one input both planes need and neither can
+/// substitute for.
+async fn assemble_planes(
     config: &Config,
     env: &Env,
-    migration_hook: Option<Arc<LazyMigrationHook>>,
-    federation_runtime: Option<Arc<FederationRuntime>>,
-    signup_quarantine_enabled: bool,
-    advanced_recovery_enabled: bool,
-) -> Option<Router> {
+    features: &FeatureRegistry,
+) -> Result<AssembledPlanes, ServerError> {
+    // The ONE capture. Every cross-plane value is resolved inside it, from this config,
+    // this ladder, and this env seam; both planes below are handed `&shared` and take
+    // every shared value off it. There is no second carrier to hand a plane and no
+    // argument here that could be filled from the wrong source.
+    let shared = SharedPlaneInputs::capture(config, features, env)?;
+    let management = build_admin_state(config, env, &shared).await;
+    let oidc = if config.oidc.enabled {
+        build_oidc_plane(
+            config,
+            env,
+            DataPlaneSurfaces::resolve(features, config),
+            &shared,
+        )
+        .await
+    } else {
+        tracing::info!("OIDC provider not mounted: oidc.enabled is false");
+        None
+    };
+    Ok(AssembledPlanes { management, oidc })
+}
+
+/// Assemble the management plane's [`AdminState`], or `None` if it should not mount.
+///
+/// The management API mounts only when a bootstrap operator token is configured, so the
+/// default (token unset) config still boots without a database, exactly like the server
+/// skeleton. When configured, it connects a control-plane store with the DSN chosen by
+/// [`select_control_dsn`] (per the D2 policy). A failure to connect or an invalid admin
+/// config is logged and the server continues to serve health, readiness, and metrics
+/// rather than refusing to boot.
+///
+/// Every cross-plane value comes off `shared` rather than being derived here, so the
+/// console credential bridge enforces the `iss` the mint stamps, this plane opens the
+/// PII the data plane sealed, and one cache key has one value.
+async fn build_admin_state(
+    config: &Config,
+    env: &Env,
+    shared: &SharedPlaneInputs,
+) -> Option<AdminState> {
     if config.admin.bootstrap_operator_token.is_none() {
         tracing::info!(
             "management API not mounted: admin.bootstrap_operator_token is unset (operator plane \
@@ -499,55 +504,47 @@ async fn build_management_router(
     // surface: it seals, blind-indexes, and opens user PII through the envelope
     // substrate (issue #48) exactly as the data plane does, so attach the platform
     // master key. Without it the admin user create/read paths fail closed (never
-    // plaintext); resolve_master_key logs when it is unset.
-    let store = match resolve_master_key(config) {
-        Some(master) => store.with_master_key(master),
+    // plaintext); resolve_master_key logged once at boot when it is unset.
+    let store = match shared.master_key() {
+        Some(master) => store.with_master_key(Arc::clone(master)),
         None => store,
     };
     match AdminState::new(store, env.clone(), &config.admin) {
         Ok(state) => {
-            // Share the lazy-migration hook (issue #56) so the migration-progress endpoint
-            // can report this node's circuit-breaker state alongside the DB progress counts.
-            let state = match migration_hook {
-                Some(hook) => state.with_migration_hook(hook),
-                None => state,
-            };
-            // Share the federation runtime (issue #76) so the per-connector health-diagnostics
-            // read reports the live health the OIDC data plane records into (the SAME Arc).
-            let state = match federation_runtime {
-                Some(runtime) => state.with_federation(runtime),
-                None => state,
-            };
-            // Arm the experimental signup fraud-review-queue endpoints (issue #82, PR 2) only
-            // when the ladder resolved the feature enabled AND acked; otherwise every
-            // review-queue endpoint stays a uniform 404.
-            let state = state.with_signup_quarantine_enabled(signup_quarantine_enabled);
-            // Arm the experimental admin-approved recovery review-queue endpoints (issue #82,
-            // PR 3) only when the ladder resolved the feature enabled AND acked; otherwise
-            // every recovery-approval endpoint stays a uniform 404.
-            let state = state.with_advanced_recovery_enabled(advanced_recovery_enabled);
-            // The organization group nesting bound (issue #97) lives in `[organizations]`,
-            // not `[admin]`, so it is installed by the builder rather than riding
-            // AdminConfig: one bound, one operator-visible name. It bounds tree DEPTH
-            // only and caps nothing that is counted.
-            let state = state.with_max_group_depth(config.organizations.max_group_depth);
-            // The token claim budget (issue #98) lives in `[token_claims]`, not `[admin]`,
-            // for the same reason: one budget, one operator-visible name, the SAME section
-            // the data plane installs. The management plane reads it only to report an
-            // approach warning; it never refuses a write because of it.
-            let state = state.with_token_claims(&config.token_claims);
-            // Share a data-plane issuer registry (issue #93) so the compatibility wizard can
-            // resolve an environment's actually signable ID-token algorithms and write the
-            // per-client column through the data plane (the only role that can). Absent a
-            // reachable data-plane store the wizard's write endpoint fails closed.
-            let state = install_signing_registry(state, config).await;
+            // The ONE data-plane issuer registry this plane reads signing keys through
+            // (issue #414). Two installs need it, the compatibility wizard's
+            // signable-algorithm resolution (issue #93) and the console credential
+            // bridge (issue #90), and each used to open its OWN data-plane pool and
+            // build its OWN registry from its OWN derivation of the issuer base and the
+            // cache window. That was two connection pools where one does, two caches of
+            // the same keys, and two chances for one operator-visible value to be
+            // derived differently. `None` when the data-plane store is unreachable,
+            // which leaves both installs off (each fails closed).
+            let data_plane_registry = connect_data_plane_registry(config, shared).await;
+            // Everything that reaches BOTH planes (issue #414): the two config sections
+            // that live outside `[admin]` because both planes consume them (the
+            // `[organizations]` group nesting bound, issue #97, and the `[token_claims]`
+            // budget, issue #98), the two feature-ladder verdicts that arm this plane's
+            // review-queue endpoints and the data plane's enforcement (issue #82), and
+            // the two runtime objects this plane must hold the SAME Arc of (the
+            // lazy-migration hook, issue #56, and the federation runtime, issue #76).
+            // All six come from the SAME captured carrier the data plane installs,
+            // through the SAME generic install body, so the two planes cannot be handed
+            // different values. The budget is read here only to report an approach
+            // warning; it never refuses a write, and the depth bound caps nothing that
+            // is counted.
+            let state = shared.install(state);
+            // Share the data-plane issuer registry (issue #93) so the compatibility wizard
+            // can resolve an environment's actually signable ID-token algorithms and write
+            // the per-client column through the data plane (the only role that can).
+            // Absent a reachable data-plane store the wizard's write endpoint fails closed.
+            let state = install_signing_registry(state, data_plane_registry.clone());
             // Arm the OIDC-session credential bridge (issue #90, PR 2) when the operator has
             // configured an admin issuer and a management audience AND the OIDC data plane is
             // mounted (so signing keys exist to verify against). Absent config leaves the
             // bridge disarmed: the management API then accepts no at+jwt at all (fail closed).
-            let state = install_admin_oidc_bridge(state, config).await;
-            tracing::info!("management API mounted on the management plane");
-            Some(ironauth_admin::management_router(state))
+            let state = install_admin_oidc_bridge(state, config, data_plane_registry);
+            Some(state)
         }
         Err(error) => {
             tracing::error!(%error, "management API not mounted: invalid admin config");
@@ -556,39 +553,65 @@ async fn build_management_router(
     }
 }
 
-/// Share a data-plane issuer registry with the management state (issue #93).
+/// Open the ONE data-plane issuer registry the management plane reads signing keys
+/// through, or `None` when the data-plane store is unreachable.
+///
+/// Two management-plane installs need it and both get THIS one (issue #414): the
+/// compatibility wizard's signable-algorithm resolution (issue #93) and the console
+/// credential bridge (issue #90). One store-backed [`IssuerRegistry`] over one
+/// data-plane pool, under the ONE issuer base and the ONE clamped cache window the
+/// boot path derived, master-keyed so sealed material opens. Sharing it is not merely
+/// thrift: a registry built from a second derivation of the issuer base could enforce
+/// an `iss` the mint never stamps, which would fail every console login while the data
+/// plane looked healthy.
+///
+/// `None` leaves both installs off, and each fails closed on its own terms: the
+/// wizard's write endpoint cannot confirm signability, and the management API accepts
+/// no `at+jwt` at all.
+async fn connect_data_plane_registry(
+    config: &Config,
+    shared: &SharedPlaneInputs,
+) -> Option<Arc<IssuerRegistry>> {
+    let store = match Store::connect(config.database.url.expose()).await {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "management-plane data-plane registry NOT opened: cannot connect the \
+                 data-plane store. The compatibility wizard's signing-algorithm endpoint and \
+                 the admin console OIDC bridge both stay off (each fails closed)."
+            );
+            return None;
+        }
+    };
+    let store = match shared.master_key() {
+        Some(master) => store.with_master_key(Arc::clone(master)),
+        None => store,
+    };
+    Some(Arc::new(IssuerRegistry::store_backed(
+        shared.issuer_base().clone(),
+        *shared.jwks_cache(),
+        store,
+    )))
+}
+
+/// Share the data-plane issuer registry with the management state (issue #93).
 ///
 /// The compatibility wizard resolves an environment's ACTUALLY signable ID-token
 /// algorithms (the layer-2 security check) and writes the per-client
 /// `id_token_signed_response_alg` column, both of which need the DATA plane: the
 /// signable set comes from the per-environment signing keys, and that column is
-/// data-plane writable only (the control role holds no grant on it). This builds a
-/// store-backed [`IssuerRegistry`] over the SAME data-plane store and issuer base the
-/// OIDC plane serves its JWKS from, master-keyed so sealed PII opens (signing key
-/// material itself is not sealed), and installs it. Any failure to derive the issuer
-/// base or connect the data-plane store leaves the registry uninstalled, and the
-/// wizard's write endpoint then fails closed (it cannot confirm signability).
-async fn install_signing_registry(state: AdminState, config: &Config) -> AdminState {
-    let issuer_base = match SiteContext::derive(&config.server) {
-        Ok(site) => site.base_url(),
-        Err(error) => {
-            tracing::error!(%error, "compatibility wizard signing registry NOT installed: cannot derive the issuer base");
-            return state;
-        }
+/// data-plane writable only (the control role holds no grant on it). The registry is
+/// the one [`connect_data_plane_registry`] opened. Absent it the registry stays
+/// uninstalled and the wizard's write endpoint fails closed (it cannot confirm
+/// signability).
+fn install_signing_registry(
+    state: AdminState,
+    registry: Option<Arc<IssuerRegistry>>,
+) -> AdminState {
+    let Some(registry) = registry else {
+        return state;
     };
-    let store = match Store::connect(config.database.url.expose()).await {
-        Ok(store) => store,
-        Err(error) => {
-            tracing::error!(%error, "compatibility wizard signing registry NOT installed: cannot connect the data-plane store");
-            return state;
-        }
-    };
-    let store = match resolve_master_key(config) {
-        Some(master) => store.with_master_key(master),
-        None => store,
-    };
-    let cache = JwksCacheWindow::clamped(config.oidc.jwks_cache_max_age_secs);
-    let registry = Arc::new(IssuerRegistry::store_backed(issuer_base, cache, store));
     tracing::info!(
         "compatibility wizard signing registry installed (issue #93): the per-client \
          signing-algorithm endpoint validates against the environment's actually signable set"
@@ -604,13 +627,18 @@ async fn install_signing_registry(state: AdminState, config: &Config) -> AdminSt
 /// fail-closed operator-subject allowlist. This installs the bridge when the
 /// operator has named an admin issuer `(tenant, environment)` and a management
 /// audience in `[admin_spa]` AND the OIDC data plane is enabled (so signing keys
-/// exist to verify against). It reads those keys through a store-backed
-/// [`IssuerRegistry`] over the SAME data-plane store and issuer base the OIDC plane
-/// serves its JWKS from, so the verification keys are the identical RLS-scoped rows
-/// (the registry seam reused, not a new key store). Any missing or unparseable
-/// config leaves the bridge disarmed, and the management API then accepts no
-/// `at+jwt` at all (fail closed).
-async fn install_admin_oidc_bridge(state: AdminState, config: &Config) -> AdminState {
+/// exist to verify against). It reads those keys through the ONE store-backed
+/// [`IssuerRegistry`] [`connect_data_plane_registry`] opened, over the SAME data-plane
+/// store and the SAME issuer base the OIDC plane serves its JWKS from, so the
+/// verification keys are the identical RLS-scoped rows and the enforced `iss` is the
+/// one the mint stamps (the registry seam reused, not a new key store). Any missing or
+/// unparseable config, or an unreachable data-plane store, leaves the bridge disarmed,
+/// and the management API then accepts no `at+jwt` at all (fail closed).
+fn install_admin_oidc_bridge(
+    state: AdminState,
+    config: &Config,
+    registry: Option<Arc<IssuerRegistry>>,
+) -> AdminState {
     // The bridge needs the OIDC data plane (its signing keys) and the admin-issuer
     // config. Absent either, leave it disarmed.
     if !config.oidc.enabled {
@@ -637,30 +665,14 @@ async fn install_admin_oidc_bridge(state: AdminState, config: &Config) -> AdminS
         );
         return state;
     };
-    // The issuer base the OIDC plane mints issuers under (server.public_url derived),
-    // so the enforced `iss` matches exactly what the shared registry publishes.
-    let issuer_base = match SiteContext::derive(&config.server) {
-        Ok(site) => site.base_url(),
-        Err(error) => {
-            tracing::error!(%error, "admin console OIDC bridge NOT armed: cannot derive the issuer base");
-            return state;
-        }
+    // The ONE data-plane registry, carrying the ONE derived issuer base, so the enforced
+    // `iss` matches exactly what the mint stamps and the JWKS publishes.
+    let Some(registry) = registry else {
+        tracing::error!(
+            "admin console OIDC bridge NOT armed: the data-plane issuer registry is not open"
+        );
+        return state;
     };
-    // A store-backed registry over the DATA-plane store (the app role reads signing
-    // keys under forced RLS), master-keyed so sealed key material opens.
-    let store = match Store::connect(config.database.url.expose()).await {
-        Ok(store) => store,
-        Err(error) => {
-            tracing::error!(%error, "admin console OIDC bridge NOT armed: cannot connect the data-plane store");
-            return state;
-        }
-    };
-    let store = match resolve_master_key(config) {
-        Some(master) => store.with_master_key(master),
-        None => store,
-    };
-    let cache = JwksCacheWindow::clamped(config.oidc.jwks_cache_max_age_secs);
-    let registry = Arc::new(IssuerRegistry::store_backed(issuer_base, cache, store));
     // Trim each allowlist entry ONCE at load (operator convenience against a stray
     // space in config) and drop empties; the token subject is then matched byte
     // exact against these canonical entries.
@@ -704,8 +716,24 @@ fn resolve_admin_scope(state: &AdminState, tenant_id: &str, environment_id: &str
     Some(Scope::new(tenant, environment))
 }
 
-/// Build the OIDC provider router (issue #12), or `None` if it should not be
-/// mounted.
+/// The assembled OIDC data plane: the mint state and the two surfaces that read the
+/// SAME issuer registry it does.
+///
+/// Returned rather than mounted so the boot-wiring harness (issue #414) can OBSERVE
+/// what the assembled [`OidcState`] holds. Merging the three into one `Router` hides
+/// every install behind an opaque type, which is why deleting an install, or handing
+/// this plane a different section than the management plane, used to build with zero
+/// warnings.
+struct OidcPlane {
+    /// The mint state: everything the protocol router runs on.
+    state: OidcState,
+    /// The discovery surface (both well-known forms).
+    discovery: Router,
+    /// The per-environment JWKS surface.
+    jwks: Router,
+}
+
+/// Assemble the OIDC data plane (issue #12), or `None` if it cannot mount.
 ///
 /// Mounts only when `oidc.enabled` is set (checked by the caller), connecting the
 /// DATA-plane store with `database.url` (the least-privilege `ironauth_app` DSN in
@@ -732,41 +760,25 @@ fn resolve_admin_scope(state: &AdminState, tenant_id: &str, environment_id: &str
 /// 404 for an unprovisioned OR cross-tenant scope, exactly like the JWKS surface.
 /// The JWKS/discovery cache window is derived from `oidc.jwks_cache_max_age_secs`
 /// and carried by the registry, so the served `Cache-Control: max-age` reflects the
-/// configured value (AC #4).
-// The mount takes the data-plane inputs, the two experimental/quota installs, and now
-// the optional lazy-migration hook; each is an independent input to the one OidcState
-// build, so bundling them into a struct would not make the wiring clearer.
-#[allow(clippy::too_many_arguments)]
+/// configured value (AC #4). It is clamped ONCE, on the shared carrier, so the
+/// management plane's registry caches under the same window.
+///
+/// The caller merges the three surfaces into one `Router`; see [`OidcPlane`] for why
+/// this returns them instead of mounting them.
 // One flat sequence of independent state-builder installs and startup notices; splitting
 // it would scatter the single OIDC mount the boot path performs.
-// The mount flags are each resolved from the strict feature ladder (never a plain config
-// toggle) and injected here, so the several experimental-surface booleans are inherent to the
-// boot wiring rather than a design smell.
-#[allow(clippy::too_many_lines, clippy::fn_params_excessive_bools)]
-async fn build_oidc_router(
-    oidc_config: &OidcConfig,
-    data_plane_dsn: &str,
-    env: Env,
-    issuer_base: String,
-    global_revocation_enabled: bool,
-    fedcm_enabled: bool,
-    risk_signals_enabled: bool,
-    signup_quarantine_enabled: bool,
-    advanced_recovery_enabled: bool,
-    first_party_challenge_enabled: bool,
-    flows_enabled: bool,
-    hosted_pages_enabled: bool,
-    master_key: Option<Arc<MasterKey>>,
-    quota_config: &QuotaConfig,
-    hashing_config: &PasswordHashingConfig,
-    policy_config: &PasswordPolicyConfig,
-    diagnostics_config: &DiagnosticsConfig,
-    max_group_depth: u32,
-    token_claims_config: &TokenClaimsConfig,
-    migration_hook: Option<Arc<LazyMigrationHook>>,
-    federation_runtime: Option<Arc<FederationRuntime>>,
-) -> Option<Router> {
-    let store = match Store::connect(data_plane_dsn).await {
+#[allow(clippy::too_many_lines)]
+async fn build_oidc_plane(
+    config: &Config,
+    env: &Env,
+    surfaces: DataPlaneSurfaces,
+    shared: &SharedPlaneInputs,
+) -> Option<OidcPlane> {
+    let oidc_config = &config.oidc;
+    let policy_config = &config.password_policy;
+    let hashing_config = &config.password_hashing;
+    let env = env.clone();
+    let store = match Store::connect(config.database.url.expose()).await {
         Ok(store) => store,
         Err(error) => {
             tracing::error!(
@@ -780,14 +792,19 @@ async fn build_oidc_router(
     // UserInfo surfaces can seal and open the classified PII columns (issue #48).
     // Without it those paths fail closed (never plaintext); resolve_master_key has
     // already logged when it is unset or unreadable.
-    let store = match master_key {
-        Some(master) => store.with_master_key(master),
+    let store = match shared.master_key() {
+        Some(master) => store.with_master_key(Arc::clone(master)),
         None => store,
     };
 
-    // The JWKS cache window from config (validated into the 300..=900s range, so
-    // `clamped` is a no-op here); it governs the JWKS AND discovery Cache-Control.
-    let cache = JwksCacheWindow::clamped(oidc_config.jwks_cache_max_age_secs);
+    // The issuer root and the JWKS cache window, each derived ONCE on the shared carrier
+    // (issue #414) and read off it here. The window governs the JWKS AND discovery
+    // Cache-Control on this plane and sizes the management plane's registry cache on
+    // that one, so one operator-visible key has one value; the issuer root is what this
+    // plane stamps as `iss` and what the console credential bridge over there enforces
+    // `iss` against.
+    let issuer_base = shared.issuer_base().clone();
+    let cache = *shared.jwks_cache();
 
     // The ONE shared registry: store-backed and lazy. The Store is cheap to clone
     // (it wraps a reference-counted pool), so the mint (via OidcState) and the
@@ -804,7 +821,7 @@ async fn build_oidc_router(
     // divergent algorithms; an unprovisioned or cross-tenant scope resolves to no
     // entry and returns 404, exactly like the JWKS surface.
     let capabilities = DiscoveryCapabilities::from_config(oidc_config)
-        .with_first_party_challenge_endpoint(first_party_challenge_enabled);
+        .with_first_party_challenge_endpoint(surfaces.first_party_challenge);
     let discovery = discovery_router(DiscoveryState::new(
         issuer_base.clone(),
         cache,
@@ -822,7 +839,7 @@ async fn build_oidc_router(
     // the tenant-fairness spend on the authorization path refills deterministically.
     // A dimension with a burst of 0 is unlimited, which is how a self-hoster who
     // wants no quota expresses it; enforcement then admits every request.
-    let quota_enforcer = Arc::new(QuotaEnforcer::from_config(quota_config, env.clock_arc()));
+    let quota_enforcer = Arc::new(QuotaEnforcer::from_config(&config.quota, env.clock_arc()));
 
     // The dedicated, admission-controlled Argon2id hashing pool (issue #62): Argon2
     // runs ONLY on these threads, never a tokio protocol-I/O worker, and each hash
@@ -867,27 +884,14 @@ async fn build_oidc_router(
     // connector-labeled health gauge and success/error counters carry help/type text.
     ironauth_oidc::describe_connector_health_metrics();
 
-    let mut state = OidcState::new(store, env, registry, oidc_config, issuer_base)
-        .with_global_token_revocation_enabled(global_revocation_enabled)
-        .with_fedcm_enabled(fedcm_enabled)
-        .with_risk_signals_enabled(risk_signals_enabled)
-        .with_signup_quarantine_enabled(signup_quarantine_enabled)
-        .with_advanced_recovery_enabled(advanced_recovery_enabled)
-        .with_first_party_challenge_enabled(first_party_challenge_enabled)
-        .with_flows_enabled(flows_enabled)
-        .with_hosted_pages_enabled(hosted_pages_enabled)
-        .with_diagnostics(diagnostics_config)
-        // The organization group nesting bound (issue #97) lives in `[organizations]`,
-        // not `[oidc]`, so it is installed by the builder rather than riding OidcConfig:
-        // one bound, one operator-visible name, the SAME value the management plane
-        // installs. It bounds the ancestor walk the mint-path effective-role resolution
-        // performs, and caps nothing that is counted.
-        .with_max_group_depth(max_group_depth)
-        // The token claim budget (issue #98) lives in `[token_claims]`, not `[oidc]`, so
-        // it is installed by the builder rather than riding OidcConfig: one budget, one
-        // operator-visible name, the SAME section the management plane installs. It
-        // bounds a TOKEN's size and what ONE claim carries, and caps nothing stored.
-        .with_token_claims(token_claims_config)
+    let state = OidcState::new(store, env, registry, oidc_config, issuer_base)
+        .with_global_token_revocation_enabled(surfaces.global_revocation)
+        .with_fedcm_enabled(surfaces.fedcm)
+        .with_risk_signals_enabled(surfaces.risk_signals)
+        .with_first_party_challenge_enabled(surfaces.first_party_challenge)
+        .with_flows_enabled(surfaces.flows)
+        .with_hosted_pages_enabled(surfaces.hosted_pages)
+        .with_diagnostics(&config.diagnostics)
         .with_quota_enforcer(quota_enforcer)
         .with_hashing_pool(hashing_pool)
         .with_password_policy(password_policy, screening_failure, screen_on_login)
@@ -907,6 +911,19 @@ async fn build_oidc_router(
         // SMS gateway. A production deployment installs its own `SmsSender` here. SMS OTP
         // is off by default, so this stub is inert until a tenant explicitly enables SMS.
         .with_sms_sender(std::sync::Arc::new(ironauth_oidc::LoggingSmsSender));
+    // Everything that reaches BOTH planes (issue #414): the two config sections that
+    // live outside `[oidc]` because both planes consume them (the `[organizations]`
+    // group nesting bound, issue #97, which bounds the ancestor walk the mint-path
+    // effective-role resolution performs, and the `[token_claims]` budget, issue #98,
+    // which bounds a TOKEN's size and what ONE claim carries), the two feature-ladder
+    // verdicts that arm this plane's enforcement and the management plane's review
+    // queues (issue #82), and the two runtime objects both planes must hold the SAME
+    // Arc of (the lazy-migration hook on the login path, issue #56, and the federation
+    // runtime whose per-connector health registry the admin read reports, issue #76).
+    // All six come from the SAME captured carrier the management plane installs,
+    // through the SAME generic install body, so the two planes cannot be handed
+    // different values. Neither bound caps anything that is stored or counted.
+    let mut state = shared.install(state);
     // Wire the production custom-journey source (issue #92, PR 5): a store-backed
     // CompiledJourneySource over the RLS-scoped flow_versions registry, with a compile cache
     // keyed by version id. It replaces PR 4's test-only embedded source, so a custom flow created
@@ -920,35 +937,20 @@ async fn build_oidc_router(
     if let Some(provider) = build_breach_provider(policy_config) {
         state = state.with_breach_provider(provider);
     }
-    // Arm the inbound lazy-migration hook on the login path (issue #56) when one is
-    // configured; without it an unknown-identifier login is the uniform failure.
-    if let Some(hook) = migration_hook {
-        state = state.with_migration_hook(hook);
-    }
-    // Wire the generic OIDC UPSTREAM federation runtime (issue #75), built once by the boot
-    // path and shared with the management plane (issue #76). OFF by default, so a deployment
-    // that has not enabled federation leaves the `/federation` routes a uniform not-found.
-    if let Some(federation) = federation_runtime {
-        state = state.with_federation(federation);
-        tracing::info!(
-            "inbound OIDC federation wired (issue #75); the /federation routes are live for \
-             stored connectors, over a dedicated SSRF-hardened fetcher"
-        );
-    }
-    if global_revocation_enabled {
+    if surfaces.global_revocation {
         tracing::info!(
             "experimental Global Token Revocation receiver mounted (issue #36); the draft \
              is not WG-adopted and the wire shape may change between releases"
         );
     }
-    if fedcm_enabled {
+    if surfaces.fedcm {
         tracing::info!(
             "experimental FedCM IdP surface mounted (issue #83); Chrome only (Firefox \
              paused, Safari absent), the W3C draft may change between releases, and \
              redirect flows are unaffected"
         );
     }
-    if risk_signals_enabled {
+    if surfaces.risk_signals {
         tracing::info!(
             "experimental third-party risk-signal ingestion mounted (issue #82); a signed \
              Security Event Token is verified per-source through the JOSE core and folded \
@@ -956,7 +958,9 @@ async fn build_oidc_router(
              contract may change between releases"
         );
     }
-    if advanced_recovery_enabled {
+    // Read off the built state rather than a parameter, so the notice reports what this
+    // plane actually holds rather than a value that could disagree with it.
+    if state.advanced_recovery_enabled() {
         tracing::info!(
             "experimental advanced recovery modes mounted (issue #82); admin-approved, \
              trusted-contact, and IDV-gated recovery each complete THROUGH the recovery delay \
@@ -965,7 +969,7 @@ async fn build_oidc_router(
              releases"
         );
     }
-    if first_party_challenge_enabled {
+    if surfaces.first_party_challenge {
         tracing::info!(
             "experimental OAuth 2.0 Authorization Challenge Endpoint mounted (issue #93, \
              draft-ietf-oauth-first-party-apps): the browserless first-party native login surface; \
@@ -974,11 +978,11 @@ async fn build_oidc_router(
              may change between releases"
         );
     }
-    tracing::info!(
-        "OIDC provider, discovery, and per-environment JWKS mounted on the public plane; \
-         per-environment signing keys load lazily from the store on first use"
-    );
-    Some(oidc_router(state).merge(discovery).merge(jwks))
+    Some(OidcPlane {
+        state,
+        discovery,
+        jwks,
+    })
 }
 
 /// Build the generic OIDC upstream federation runtime (issue #75, PR B) from

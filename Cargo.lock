@@ -1178,6 +1178,7 @@ dependencies = [
  "ironauth-screening",
  "ironauth-server",
  "ironauth-store",
+ "serde_json",
  "tokio",
  "tracing",
 ]

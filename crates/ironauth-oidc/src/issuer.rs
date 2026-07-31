@@ -381,6 +381,19 @@ impl IssuerRegistry {
         self.cache
     }
 
+    /// The deployment's externally visible base URL every issuer in this registry is
+    /// built from, the root of what [`IssuerRegistry::issuer_for`] returns.
+    ///
+    /// Two registries exist per node: the data plane's, whose base the mint stamps as
+    /// `iss`, and the management plane's, whose base the console credential bridge
+    /// ENFORCES `iss` against. They must agree, and the boot-wiring harness (issue
+    /// #414) reads this to prove they do. It exposes nothing new: the same string is
+    /// the prefix of every issuer this registry already publishes.
+    #[must_use]
+    pub fn issuer_base(&self) -> &str {
+        &self.issuer_base
+    }
+
     /// The data-plane store this registry loads through, or [`None`] for a pre-populated
     /// (loader-less) registry. The store-backed discovery path reads a scope's installed locale
     /// bundles through it (issue #86, PR 2) so discovery advertises exactly the UI locales the
