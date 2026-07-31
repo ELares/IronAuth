@@ -575,13 +575,31 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
     );
 }
 
-/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the ninety-five
-/// real migrations and leaves no throwaway demo object in a real database.
+/// The PRODUCTION chain (`MigrationRunner::new`) is exactly the shipped migrations
+/// and leaves no throwaway demo object in a real database.
+///
+/// The chain's length appears as a number exactly once, in the assertion below,
+/// and never in this name or in this sentence. The subject list and the version
+/// vector that follow it encode the same length structurally rather than as a
+/// number, so the same edit turns all three red together. A count in prose rots
+/// silently on the next migration and has done so here before; a count in an
+/// assertion goes red and makes a human look at what was added, which is the
+/// control this test exists to be.
+///
+/// The body is long, and its stack demand is measured rather than assumed. On the
+/// pinned toolchain the whole test runs in roughly 452 KiB of the 2 MiB a default
+/// test thread gets, and every await point added to it costs around half a
+/// kilobyte, so it holds thousands more before the budget is a concern. Re-measure
+/// by bisecting `RUST_MIN_STACK` over a direct run of the test binary
+/// (`RUST_MIN_STACK=<bytes> target/debug/deps/migration-<hash> --exact <name>`)
+/// until the run reports `has overflowed its stack` instead of a test result.
+/// A direct run needs `DATABASE_URL` set the way `scripts/with-test-db.sh` sets
+/// it, otherwise the run panics in the harness before it reaches the body.
 // A long but linear ledger-and-table assertion sweep (one line per migration and
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
@@ -599,9 +617,13 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
     assert_eq!(
         report.already_applied(),
         96,
-        "the production chain is exactly ninety-six migrations (isolation, audit log, management \
-         API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
-         registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
+        "a migration was added to or removed from the production chain; this count is a \
+         deliberate checkpoint, not a bug, so read the new migration, satisfy yourself that it \
+         belongs in the shipped chain, then update this number and the subject list below and \
+         the version vector that follows. The chain this test pins is: isolation, audit log, \
+         management API, OIDC authorization, signing keys, login/consent, authentication \
+         context, redirect registration, UserInfo claims, consent scope upsert, resource \
+         servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
          refresh tokens, client-credentials service accounts, DCR abuse controls, resource \
          indicators, JWT bearer assertion grant, device authorization, session model, RP-initiated \
@@ -624,10 +646,10 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
          context, organization roles, organization groups, organization group members, \
          organization role assignments, organization authentication policies, permission \
          vocabulary, role-to-permission mapping, organization default role, resource-server \
-         permission claims, token size event budget columns, client allowed scopes)"
+         permission claims, token size event budget columns, client allowed scopes."
     );
 
-    // The ledger holds exactly versions 1 through 96.
+    // The ledger holds exactly the shipped versions, contiguous and in order.
     assert_eq!(
         applied_versions(pool).await,
         vec![
@@ -4895,9 +4917,10 @@ async fn production_chain_is_only_the_seventy_real_migrations_and_ships_no_demo_
 /// every column closes that gap, so the invariant is a physical property of the
 /// schema rather than a claim about which code paths happen to exist.
 ///
-/// This is its own test rather than more lines in the production-chain test: that
-/// function's future is already at the stack budget of a default test thread, and
-/// anything added to its body aborts the process on a stack overflow.
+/// This is its own test rather than more lines in the production-chain test so that
+/// a failure names the grant shape it found rather than a line inside that test's
+/// long sweep. An earlier note gave that test's stack budget as the reason; the
+/// measurement in its doc comment shows the budget is not the constraint.
 #[tokio::test]
 async fn the_data_plane_holds_no_column_scoped_write_grant_on_org_roles() {
     let db = TestDatabase::start().await;
@@ -4928,9 +4951,10 @@ async fn the_data_plane_holds_no_column_scoped_write_grant_on_org_roles() {
 
 /// The `org_groups` schema, policy, indexes, and grants (issue #97, migration 0087).
 ///
-/// Its own test rather than more lines in the production-chain assertions: that
-/// function's future is already at the stack budget of a default test thread, and
-/// anything added to its body aborts the process on a stack overflow.
+/// Its own test rather than more lines in the production-chain assertions so that a
+/// failure names this table rather than a line inside that test's long sweep. An
+/// earlier note gave that test's stack budget as the reason; the measurement in
+/// its doc comment shows the budget is not the constraint.
 #[tokio::test]
 #[allow(
     clippy::too_many_lines,
@@ -5280,8 +5304,8 @@ async fn applied_versions(pool: &sqlx::PgPool) -> Vec<i64> {
 /// soft delete, the same partial uniqueness over live rows, the same read-only data
 /// plane. A per-table copy would let one of the three drift while the other two kept
 /// the suite green, which is exactly the defect this shape rules out. Its own test
-/// rather than more lines in the production-chain assertions, whose future is already
-/// at the stack budget of a default test thread.
+/// rather than more lines in the production-chain assertions so that a failure names
+/// these tables rather than a line inside that test's long sweep.
 #[tokio::test]
 #[allow(
     clippy::too_many_lines,
@@ -5549,9 +5573,10 @@ async fn the_org_join_tables_carry_their_isolation_indexes_and_least_privilege_g
 /// The `org_auth_policies` schema, policy, indexes, and grants (issue #95,
 /// migration 0090).
 ///
-/// Its own test rather than more lines in the production-chain assertions: that
-/// function's future is already at the stack budget of a default test thread, and
-/// anything added to its body aborts the process on a stack overflow.
+/// Its own test rather than more lines in the production-chain assertions so that a
+/// failure names this table rather than a line inside that test's long sweep. An
+/// earlier note gave that test's stack budget as the reason; the measurement in
+/// its doc comment shows the budget is not the constraint.
 #[tokio::test]
 #[allow(
     clippy::too_many_lines,
@@ -5795,10 +5820,11 @@ async fn the_data_plane_holds_no_column_scoped_write_grant_on_org_auth_policies(
 
 /// The `permissions` schema, policy, indexes, and grants (issue #98, migration 0091).
 ///
-/// Its own test rather than more lines in the production-chain assertions: that
-/// function's future is already at the stack budget of a default test thread, and
-/// anything added to its body aborts the process on a stack overflow (the 0090
-/// precedent).
+/// Its own test rather than more lines in the production-chain assertions, following
+/// the 0090 precedent, so that a failure names this table rather than a line
+/// inside that test's long sweep. An earlier note gave that test's stack budget as
+/// the reason; the measurement in its doc comment shows the budget is not the
+/// constraint.
 #[tokio::test]
 #[allow(
     clippy::too_many_lines,
@@ -6025,10 +6051,11 @@ async fn the_data_plane_holds_no_column_scoped_write_grant_on_permissions() {
 /// The `org_role_permissions` schema, policy, indexes, and grants (issue #98,
 /// migration 0092).
 ///
-/// Its own test rather than more lines in the production-chain assertions: that
-/// function's future is already at the stack budget of a default test thread, and
-/// anything added to its body aborts the process on a stack overflow (the 0090
-/// precedent).
+/// Its own test rather than more lines in the production-chain assertions, following
+/// the 0090 precedent, so that a failure names this table rather than a line
+/// inside that test's long sweep. An earlier note gave that test's stack budget as
+/// the reason; the measurement in its doc comment shows the budget is not the
+/// constraint.
 #[tokio::test]
 #[allow(
     clippy::too_many_lines,
@@ -6303,10 +6330,11 @@ async fn the_data_plane_holds_no_column_scoped_write_grant_on_org_role_permissio
 /// that makes "at most one per organization" structural, and the one new grant
 /// (issue #98, migration 0093).
 ///
-/// Its own test rather than more lines in the production-chain assertions: that
-/// function's future is already at the stack budget of a default test thread, and
-/// anything added to its body aborts the process on a stack overflow (the 0090
-/// precedent).
+/// Its own test rather than more lines in the production-chain assertions, following
+/// the 0090 precedent, so that a failure names this table rather than a line
+/// inside that test's long sweep. An earlier note gave that test's stack budget as
+/// the reason; the measurement in its doc comment shows the budget is not the
+/// constraint.
 #[tokio::test]
 async fn org_roles_carries_the_default_designation_its_live_uniqueness_and_its_grant() {
     let db = TestDatabase::start().await;
@@ -6421,7 +6449,7 @@ async fn org_roles_carries_the_default_designation_its_live_uniqueness_and_its_g
 /// #98, migration 0094).
 ///
 /// Its own test rather than more lines in the production-chain assertions, for the
-/// stack-budget reason the 0090 and 0093 tests record.
+/// reason the 0090 and 0093 tests record.
 #[tokio::test]
 async fn resource_servers_carries_the_permission_claim_opt_in_and_its_column_grant() {
     let db = TestDatabase::start().await;
@@ -6534,7 +6562,7 @@ async fn resource_servers_carries_the_permission_claim_opt_in_and_its_column_gra
 /// and the GRANT that did NOT have to be written (issue #98, migration 0095).
 ///
 /// Its own test rather than more lines in the production-chain assertions, for the
-/// stack-budget reason the 0090, 0093, and 0094 tests record.
+/// reason the 0090, 0093, and 0094 tests record.
 #[tokio::test]
 async fn token_size_events_carries_the_budget_columns_under_the_existing_grants() {
     let db = TestDatabase::start().await;
@@ -6672,7 +6700,7 @@ async fn token_size_events_carries_the_budget_columns_under_the_existing_grants(
 /// without which the management setter fails 42501 (issue #98, migration 0096).
 ///
 /// Its own test rather than more lines in the production-chain assertions, for the
-/// stack-budget reason the 0090, 0093, and 0094 tests record.
+/// reason the 0090, 0093, and 0094 tests record.
 #[tokio::test]
 async fn clients_carries_the_scope_allowlist_and_its_control_column_grant() {
     let db = TestDatabase::start().await;
