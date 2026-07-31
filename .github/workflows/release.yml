@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: tag equals crates/ironauth version
         run: |
           tag_version="${GITHUB_REF_NAME#ironauth-v}"
@@ -42,7 +42,7 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Install musl target for the pinned toolchain
         run: rustup target add x86_64-unknown-linux-musl
@@ -65,7 +65,7 @@ jobs:
           cp docs/config-schema.json dist/config-schema.json
           cd dist && sha256sum * > SHA256SUMS
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/ironauth-x86_64-linux-musl
       - name: Extract changelog section
@@ -93,7 +93,7 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Install musl target for the pinned toolchain
         run: rustup target add x86_64-unknown-linux-musl
@@ -102,7 +102,7 @@ jobs:
       - name: Build static binary
         run: cargo build --release --target x86_64-unknown-linux-musl -p ironauth
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -131,7 +131,7 @@ jobs:
       - name: Sign image (keyless)
         run: cosign sign --yes "${{ steps.push.outputs.image }}@${{ steps.push.outputs.digest }}"
       - name: Attest image provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-name: ${{ steps.push.outputs.image }}
           subject-digest: ${{ steps.push.outputs.digest }}
