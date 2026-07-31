@@ -231,6 +231,14 @@ impl<'a> ScopedStore<'a> {
     /// scope can only ever observe its own serving state. The OIDC data-plane
     /// issuer-load path consults this and refuses a suspended scope fail closed.
     ///
+    /// Exactly ONE stored value serves. `'active'` reads as
+    /// [`EnvironmentServingState::Active`] and everything else, including a value no
+    /// build of this crate can name, reads as
+    /// [`EnvironmentServingState::Suspended`] (issue #433): the read fails closed on
+    /// what it cannot interpret, so a lifecycle state added to the
+    /// `environment_states_serving_status_valid` CHECK and not added here fences its
+    /// environments rather than serving them.
+    ///
     /// # Errors
     ///
     /// [`StoreError::Database`] on a persistence failure.
@@ -248,9 +256,26 @@ impl<'a> ScopedStore<'a> {
         match row {
             None => Ok(EnvironmentServingState::Active),
             Some(row) => Ok(match row.get::<String, _>("serving_status").as_str() {
-                "suspended" => EnvironmentServingState::Suspended,
-                // Any other value (only 'active' passes the CHECK) is served.
-                _ => EnvironmentServingState::Active,
+                "active" => EnvironmentServingState::Active,
+                // 'suspended', and every value this build cannot name, FENCE (issue
+                // #433). Only 'active' serves, and it has to be spelled out rather
+                // than left to a catch-all: this arm read `_ => Active`, and a value
+                // outside the pair the CHECK constraint admits was SERVED. Nothing
+                // could reach it (the CHECK is the only writer's gate and the data
+                // plane has no write grant at all), so it was never a live hole, but
+                // it pointed the wrong way for a read whose whole documented posture
+                // is fail closed. The way it comes true is a later lifecycle state
+                // added to the CHECK and not added here, and the failure would be
+                // silent: the environment it names keeps minting tokens.
+                //
+                // Fenced rather than an error, because of who can write here: only
+                // the control plane, and only a value its own CHECK admits. A string
+                // this build does not know is therefore a deliberate administrative
+                // state it is too old to name, not a broken row, and it renders as
+                // the ordinary fenced refusal rather than as a new, distinguishable
+                // answer. The `ironauth-oidc` lifecycle-fence suite drives it, in
+                // `an_unrecognized_serving_status_fences_rather_than_serving`.
+                _ => EnvironmentServingState::Suspended,
             }),
         }
     }
@@ -32268,7 +32293,9 @@ impl TenantStatus {
 pub enum EnvironmentServingState {
     /// The data plane serves this scope.
     Active,
-    /// The data plane fences this scope (a suspended or offboarded tenant).
+    /// The data plane fences this scope: a suspended or offboarded tenant, or a
+    /// stored serving status this build cannot name, which the read fails closed on
+    /// rather than serving (issue #433).
     Suspended,
 }
 
@@ -35018,7 +35045,7 @@ impl OrgGroupRepo<'_> {
 /// deactivated environment must stop issuing tokens at all rather than issue role-less
 /// ones. It does, for the ENVIRONMENT: the control plane writes
 /// `environment_states.serving_status = 'suspended'`, and `ironauth_oidc`'s
-/// `scope_is_fenced` consults it on EVERY issuer resolution, which the token mint
+/// `fence_state` consults it on EVERY issuer resolution, which the token mint
 /// reaches through its issuer-entry lookup, FAIL CLOSED on a store read error.
 /// `crates/ironauth-oidc/tests/lifecycle_fence.rs` drives all of that:
 /// `a_suspended_scope_mints_no_token_from_an_outstanding_code` over the token mint,

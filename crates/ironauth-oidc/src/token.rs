@@ -50,6 +50,7 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::sync::Arc;
 
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
@@ -70,6 +71,7 @@ use crate::client_auth::{
     self, AuthenticatedClient, ClientAuthError, ClientAuthInputs, ClientAuthMethod,
 };
 use crate::error::TokenError;
+use crate::issuer::{IssuerEntry, IssuerResolution};
 use crate::permission_budget::{
     PermissionBudget, PermissionBudgetOutcome, PermissionWithheldReason,
 };
@@ -1067,10 +1069,7 @@ async fn mint_tokens(
         target.emits_permission_claims(),
     )
     .await?;
-    let entry = state
-        .issuer_entry(&scope)
-        .await
-        .ok_or(TokenError::ServerError)?;
+    let entry = grant_issuer_entry(state, scope).await?;
     let signer = entry.signer(state.now()).ok_or(TokenError::ServerError)?;
     // Honor the client's negotiated `id_token_signed_response_alg` (issue #30): sign
     // THIS client's ID token with the environment key of the algorithm DCR recorded
@@ -1371,6 +1370,38 @@ pub(crate) fn token_ok(body: &str) -> Response {
         body.to_owned(),
     )
         .into_response()
+}
+
+/// Resolve the environment's issuer entry for a TOKEN-ENDPOINT grant (issue #433).
+///
+/// EVERY grant that signs something goes through here, so the shape of a refusal is
+/// decided once rather than five times. The two conditions the registry used to
+/// collapse into one `None` are separated:
+///
+/// - [`IssuerResolution::Fenced`]: an operator SUSPENDED or offboarded this
+///   environment. A deliberate administrative state, so it renders 503
+///   `temporarily_unavailable` with a `Retry-After` rather than claiming a fault the
+///   server did not suffer, and rather than a 4xx that would tell a conforming client
+///   to throw away a credential that is still perfectly valid.
+/// - [`IssuerResolution::Absent`]: no provisioned signing key, an environment named
+///   under the wrong tenant, a scope that never existed, or a fence the store could
+///   not be read for. A server that cannot sign IS a fault, so this keeps the 500
+///   `server_error` it has always answered. Widening the 503 to cover this arm would
+///   hide real outages behind "try again later", which is strictly worse than the
+///   defect issue #433 set out to correct.
+///
+/// Called AFTER the presented credential has been validated on every grant, which is
+/// what keeps the 503 from becoming an environment-existence oracle (see the
+/// `crate::error` module documentation).
+pub(crate) async fn grant_issuer_entry(
+    state: &OidcState,
+    scope: Scope,
+) -> Result<Arc<IssuerEntry>, TokenError> {
+    match state.issuer_resolution(&scope).await {
+        IssuerResolution::Ready(entry) => Ok(entry),
+        IssuerResolution::Fenced => Err(TokenError::TemporarilyUnavailable),
+        IssuerResolution::Absent => Err(TokenError::ServerError),
+    }
 }
 
 /// Map a store error at redemption: a not-found (out-of-scope code) is a uniform
@@ -1981,10 +2012,7 @@ async fn mint_refresh_access(
         target.emits_permission_claims(),
     )
     .await?;
-    let entry = state
-        .issuer_entry(&scope)
-        .await
-        .ok_or(TokenError::ServerError)?;
+    let entry = grant_issuer_entry(state, scope).await?;
     let signer = entry.signer(state.now()).ok_or(TokenError::ServerError)?;
     let issuer = state.issuer_for(&scope);
     let subject = state.resolve_public_subject(&resolution.subject);

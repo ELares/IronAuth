@@ -6,6 +6,25 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **`ScopedStore::environment_state` fails CLOSED on a serving status it cannot name**
+  (issue #433). It mapped `'suspended'` to a fence and EVERYTHING ELSE to serving, so a
+  stored value outside the pair this crate knows was served. Nothing can reach that
+  today: `environment_states_serving_status_valid` admits only `'active'` and
+  `'suspended'`, and the data-plane role holds no write grant on the table, so no
+  deployment behaves differently and this is recorded rather than announced as a fix.
+  What changes is the POSTURE, which the rest of this read documents as fail closed and
+  which the arm contradicted. Only `'active'` serves now. The way the old arm would have
+  come true is ordinary and silent: a later release adds a lifecycle state to that CHECK
+  constraint, an older node does not learn it, and the environments it names keep minting
+  tokens. They now fence instead, rendering as the ordinary fenced refusal rather than as
+  a new distinguishable answer, since only the control plane can write the column and only
+  a value its own constraint admits, which makes an unknown string a deliberate
+  administrative state this build is too old to name rather than a corrupt row.
+  `crates/ironauth-oidc/tests/lifecycle_fence.rs`'s
+  `an_unrecognized_serving_status_fences_rather_than_serving` drives it end to end: it
+  drops the constraint, writes `'offboarding'`, and asserts the token endpoint, JWKS, and
+  discovery all refuse. Before the change that exchange answered `200` with a full access
+  token, ID token, and refresh token.
 - **`ActingTenantRepo::restore` no longer lifts a suspension** (issue #432). A restore
   undoes the grace DELETE without touching the tenant's lifecycle status. It used to upsert
   a literal `active` serving state for every environment of the tenant, so a tenant that was

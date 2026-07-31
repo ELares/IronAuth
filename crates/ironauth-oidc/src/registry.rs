@@ -8,10 +8,15 @@
 //! illegal states are unrepresentable, because the enums have no variant for
 //! them and the parsers map every forbidden spelling to `None`.
 //!
-//! - [`GrantType`] has exactly one variant, [`GrantType::AuthorizationCode`].
-//!   There is no `Password` variant, so the resource-owner-password-credentials
-//!   (ROPC) grant has no value to match and no handler to route to: it is absent,
-//!   not disabled.
+//! - [`GrantType`] is closed around the five grants the token endpoint services,
+//!   which [`GrantType::ALL`] names: `authorization_code`, `refresh_token`,
+//!   `client_credentials`, the JWT bearer assertion grant, and the RFC 8628 device
+//!   grant. There is no `Password` variant, so the
+//!   resource-owner-password-credentials (ROPC) grant has no value to match and no
+//!   handler to route to: it is absent, not disabled. (This list read "exactly one
+//!   variant" until the four grants after the first had shipped past it; it is
+//!   [`GrantType::ALL`] that other code cites as the authority, so the two must
+//!   agree.)
 //! - [`ResponseType`] is closed around a SET of exactly four members: `code`,
 //!   `code id_token`, `id_token`, and `none`. There is NO component for an
 //!   access token anywhere in the type, so NONE of the token-bearing response
@@ -47,8 +52,10 @@
 /// Closed on purpose: the members are the authorization-code grant (RFC 6749
 /// 4.1.3), the refresh-token grant (RFC 6749 6, with the RFC 9700 2.2.2 / OAuth
 /// 2.1 rotation and reuse-detection rules, issue #21), the client-credentials
-/// grant (RFC 6749 4.4, machine-to-machine, issue #23), and the JWT bearer
-/// assertion grant (RFC 7521 4.1 / RFC 7523 2.1, issue #26). ROPC (`password`) and
+/// grant (RFC 6749 4.4, machine-to-machine, issue #23), the JWT bearer assertion
+/// grant (RFC 7521 4.1 / RFC 7523 2.1, issue #26), and the device grant (RFC 8628,
+/// issue #24). [`GrantType::ALL`] is that list in code, and callers that need to be
+/// exhaustive over the token endpoint's grants drive off it. ROPC (`password`) and
 /// every other grant are simply absent, so there is no way to name one at this
 /// layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

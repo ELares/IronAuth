@@ -6,6 +6,53 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **WIRE CHANGE. A SUSPENDED or OFFBOARDED environment answers the token endpoint with
+  `503 temporarily_unavailable` and a `Retry-After: 60` header, where it used to answer
+  `500 server_error`** (issue #433). This applies to ALL FIVE grants that mint at
+  `POST /token`: `authorization_code`, `refresh_token`, `client_credentials`, the
+  jwt-bearer assertion grant, and the RFC 8628 device grant. An administrative
+  suspension is an operator decision, not a server fault, and `500` both told relying
+  parties to retry a fault forever and charged a deliberate operator action to the
+  error rate a fault is measured by. A 4xx was rejected because it would be FALSE:
+  `invalid_grant` would assert that the presented code or refresh token is bad when it
+  is perfectly good, and a conforming client would discard a credential the fence
+  deliberately did not burn (lift the suspension and the very same code still
+  exchanges). `temporarily_unavailable` is registered by RFC 6749 4.1.2.1 for the
+  authorization endpoint, so its use here is a deliberate extension. What did NOT
+  change: the fence itself (nothing is minted, nothing is signed, no credential is
+  spent), and a genuinely missing signing key, which is a real fault and still answers
+  `500 server_error`.
+  - **If you integrate against IronAuth, this is the behavior to plan for.** Treat
+    `503 temporarily_unavailable` as "this environment is not serving right now", back
+    off for at least the advertised `Retry-After`, and do NOT discard the credential
+    you presented: it is still valid and will work when the environment resumes. Do
+    not alert on it as a server error.
+  - **The consequence worth knowing about before you file a support ticket.** The
+    refusal deliberately says nothing about WHY an environment is not serving, because
+    an answer that separated "suspended" from "offboarded" from "never existed" would
+    let anyone enumerate a deployment's tenants one request at a time. The cost is that
+    an OFFBOARDED environment answers `temporarily_unavailable` PERMANENTLY: if your
+    client still holds a credential for an environment that has been deleted, it will
+    be told to retry forever and retrying will never succeed. A `503` that never clears
+    over hours is that case, not an outage, and the way to confirm it is with your
+    operator rather than from the response. A plain MISTYPED environment id behaves
+    differently and more usefully: it never reaches this refusal at all (every grant
+    validates your credential first), so it answers the ordinary `invalid_client` /
+    `invalid_grant`, and its discovery document answers `404`.
+  - **`temporarily_unavailable` now names two different conditions at two different
+    statuses, so switch on the status too.** Dynamic client registration has emitted
+    `temporarily_unavailable` with `429 Too Many Requests` for a rate-limited
+    `POST /register` since issue #31, and that is unchanged. The token endpoint's new
+    use is `503`. They are different endpoints, so no single request can be ambiguous,
+    but an integrator matching on the error STRING alone will see one code mean "you
+    are sending too many registrations" on one endpoint and "this environment is not
+    serving" on another. Match on `(endpoint, status, error)`, not on `error`.
+  - `Retry-After` is a fixed 60 seconds. It is deliberately modest and bounded, and it
+    is identical for every environment: a per-environment delay would itself be the
+    oracle this refusal exists to close. Sixty seconds damps a client stuck against a
+    permanently fenced environment to roughly one request a minute, while keeping a
+    resumed environment (which starts serving on the very next request, with no restart)
+    promptly reachable.
 - **The jwt-bearer grant answers an allowlist refusal with `invalid_grant`, not
   `invalid_scope`** (issue #98, PR 15). That grant deliberately permits a PUBLIC (`none`)
   presenting client, because the ASSERTION is the authorization grant rather than a client

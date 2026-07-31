@@ -205,10 +205,7 @@ async fn mint_and_persist(
         .map_err(|_| TokenError::ServerError)?;
 
     // Mint ONLY the access token: no ID token, and NO refresh token (RFC 6749 4.4.3).
-    let entry = state
-        .issuer_entry(&scope)
-        .await
-        .ok_or(TokenError::ServerError)?;
+    let entry = crate::token::grant_issuer_entry(state, scope).await?;
     let signer = entry.signer(state.now()).ok_or(TokenError::ServerError)?;
     let issuer = state.issuer_for(&scope);
     let (minted, expires_in) = tokens::mint_client_credentials_access_token(
