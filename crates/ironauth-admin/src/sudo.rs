@@ -38,6 +38,7 @@ use utoipa::ToSchema;
 
 use crate::auth::Principal;
 use crate::error::{ApiError, ErrorBody};
+use crate::org_context::require_live_environment;
 use crate::response::json;
 use crate::sessions::scope_from_path;
 use crate::state::AdminState;
@@ -145,7 +146,7 @@ pub struct SudoElevationView {
         (status = 200, description = "The acting credential is elevated", body = SudoElevationView),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Sudo mode is disabled, or the scope is not found", body = ErrorBody)
+        (status = 404, description = "The environment is absent or deleted, or sudo mode is disabled", body = ErrorBody)
     )
 )]
 pub async fn elevate_sudo(
@@ -162,6 +163,18 @@ pub async fn elevate_sudo(
     // Authorize the scope (the operator plane, or the environment's own key). The
     // returned actor is exactly the identity the mutation guard later keys freshness on.
     let actor = principal.require_environment(tenant, scope.environment())?;
+    // The PARENT-EXISTENCE precondition (issue #409). `scope_from_path` proves only that
+    // the two path segments PARSE, and an elevation is a WRITE: `admin_sudo_elevations`
+    // carries a composite foreign key to `environments`, and a well-formed identifier
+    // naming an environment that does not exist was MEASURED reaching that constraint
+    // (`admin_sudo_elevations_environment_id_tenant_id_fkey`, a value recorded from that
+    // run rather than an invariant any test enforces, since `StoreError` is mapped to
+    // `ApiError::Internal` before it reaches the wire) and coming back as an opaque 500.
+    // The route already answers the uniform not-found when sudo mode is off, so an
+    // unreachable environment gives the same answer and adds no new shape. There is no
+    // Idempotency-Key here (an elevation is naturally safe to repeat), so nothing orders
+    // ahead of it.
+    require_live_environment(&state, &scope).await?;
 
     let now = state.now_unix_micros();
     let window = state.sudo_mode_window_secs();

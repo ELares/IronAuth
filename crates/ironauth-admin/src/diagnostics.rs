@@ -1208,7 +1208,7 @@ impl From<DryRunProjection> for FlowDryRunResponse {
         (status = 400, description = "A malformed request body or journey", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Environment not found", body = ErrorBody)
+        (status = 404, description = "The tenant or environment identifier is malformed. An environment that merely does not EXIST is evaluated like any other, because the dry run reads no row of it", body = ErrorBody)
     )
 )]
 pub async fn post_flow_dry_run(

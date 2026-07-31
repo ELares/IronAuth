@@ -443,5 +443,14 @@ name = "client_scopes"
 path = "tests/client_scopes.rs"
 required-features = ["testing"]
 
+# The absent-environment contract (issue #409): every environment-scoped WRITE in the
+# management surface driven at a well-formed but ABSENT environment id, asserting the
+# uniform not-found rather than an opaque 500, plus the focused per-handler proofs that
+# nothing was written and no audit row appeared. Needs a real database.
+[[test]]
+name = "absent_environment"
+path = "tests/absent_environment.rs"
+required-features = ["testing"]
+
 [lints]
 workspace = true

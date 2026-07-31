@@ -38,6 +38,7 @@ use crate::auth::Principal;
 use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
 use crate::input::{parse_json, require_non_empty};
+use crate::org_context::require_live_environment;
 use crate::pagination::{ListQuery, Pagination};
 use crate::response::{json, no_content};
 use crate::state::AdminState;
@@ -538,7 +539,7 @@ pub async fn set_user_state(
         (status = 400, description = "Malformed request", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Not found (absent or in another scope)", body = ErrorBody),
+        (status = 404, description = "The environment is absent or deleted, or the user is absent or in another scope", body = ErrorBody),
         (status = 409, description = "The external id is already claimed by another user", body = ErrorBody)
     )
 )]
@@ -550,6 +551,16 @@ pub async fn link_user_external_id(
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
+    // The PARENT-EXISTENCE precondition (issue #409). `resolve_scope` proves only that
+    // the two path segments PARSE. An external id is PII, so linking one SEALS it, and
+    // the seal resolves the scope's envelope key BEFORE it looks the user up, which is
+    // why this route alone among the user routes could not fall through to the user's
+    // own not-found. An environment that does not exist has no envelope key and can be
+    // given none (the key tables carry the same composite foreign key to
+    // `environments`), and the MEASURED answer was the store's envelope failure
+    // rendered as an opaque 500. There is no Idempotency-Key on this PUT, so nothing
+    // orders ahead of it.
+    require_live_environment(&state, &scope).await?;
     let id = parse_user_id(scope, &user_id)?;
     let request: LinkExternalIdRequest = parse_json(&body)?;
     let external_id = require_non_empty(&request.external_id, "external_id")?;
