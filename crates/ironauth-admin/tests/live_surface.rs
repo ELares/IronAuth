@@ -52,14 +52,55 @@
 //! wizard's issuer registry, the federation runtime, and the outbound verification
 //! endpoint in one router, so the sweep's silence about those routes is a measurement
 //! rather than an artifact of their being off.
+//!
+//! # Why the SOFT-DELETED contract lives here too
+//!
+//! [`every_environment_scoped_write_refuses_a_soft_deleted_environment`] needs exactly the
+//! three things above: one of every row the surface addresses, one case per documented
+//! operation, and a check that the case list has not drifted from the contract. Building a
+//! second copy of all three in a file of its own would be a second inventory to keep in
+//! step with the same document, which is the shape of the defect issue #443 is about. It
+//! reuses [`Fixture`] and [`all_cases`] instead, filters them to the environment prefix,
+//! and drives them at two identically configured routers, one of whose environments has
+//! been deleted.
+//!
+//! What it found is the reason it exists. Issue #451 reported three user writes still
+//! landing in a soft-deleted environment. Driven across the whole prefix with everything
+//! seeded, the answer was TWENTY SIX of the seventy five documented environment-scoped
+//! writes, of which the three it named were three.
+//!
+//! Two spreads are worth naming, because "twenty six" alone says nothing about how far
+//! the defect reached, and the number this note used to carry was neither of them. The
+//! twenty six are handled by FOURTEEN modules of this crate (`brand_assets`,
+//! `client_admin_grants`, `client_scopes`, `connectors`, `dcr`, `flow_versions`,
+//! `invitations`, `locales`, `permissions`, `recovery_approvals`, `resource_servers`,
+//! `signup_forms`, `signup_quarantine`, `users`), and they hang off TWELVE URL groups
+//! under the environment prefix (`applications`, `brands`, `clients`, `connectors`,
+//! `invitations`, `journeys`, `locales`, `permissions`, `recovery-approvals`,
+//! `resource-servers`, `signup-quarantine`, `users`). Both counts are MEASURED from the
+//! failing table this sweep prints when the fixed handlers are reverted, resolved against
+//! the committed contract. The fix and the reasoning live in
+//! `crates/ironauth-admin/src/org_context.rs`.
+//!
+//! # What the soft-deleted sweep compares, which is three things and not one
+//!
+//! The STATUS of every environment-scoped operation, read and write alike, against the
+//! answer the live control gave. The BODY of the subset [`documented_body_contents`]
+//! names, because a read that lost its rows and kept its 200 is not an audit and satisfies
+//! a status comparison perfectly. And the answer to a MALFORMED body on every JSON-bodied
+//! write, because a handler that validates its body before it resolves its parent answers
+//! a 400 out of an environment an operator believes is gone, and the well-formed sweep
+//! cannot see it. All three found something the other two did not.
 
 mod common;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use axum::body::Body;
-use axum::http::{Request, StatusCode, header};
+use axum::http::{HeaderMap, Request, StatusCode, header};
+use axum::response::IntoResponse;
 use common::{Harness, OPERATOR_TOKEN, bearer};
+use ironauth_admin::ApiError;
 use ironauth_env::Env;
 use ironauth_store::{
     AbuseSubject, AbuseSubjectKind, AuthPath, CorrelationId, MigrationKind, NewMigrationRun,
@@ -80,6 +121,28 @@ const RASTER_UPLOAD: &str = "RIFF\0\0\0\0WEBP";
 
 /// A fixed, plausible instant for every seeded row, in Unix microseconds.
 const SEED_MICROS: i64 = 1_700_000_000_000_000;
+
+/// The password the outbound migration verification case presents, and the plaintext the
+/// seeded user's native Argon2id verifier is built over, so that case drives the POSITIVE
+/// branch rather than only the negative one.
+const MIGRATION_PASSWORD: &str = "hunter2hunter2";
+
+/// A claim value the seeded user's claim document carries and nothing else in this file
+/// does, so finding it in a response proves the PROFILE came back rather than an empty
+/// object that happened to serialize.
+const MIGRATION_CLAIM: &str = "sweep-nickname";
+
+/// A native Argon2id PHC verifier for `password`, exactly what the login path stores for
+/// a normally registered user. The same helper, with the same defaults, that
+/// `tests/export.rs` seeds its native-credential users with.
+fn argon2_hash(password: &str) -> String {
+    use argon2::password_hash::{PasswordHasher, SaltString};
+    let salt = SaltString::encode_b64(b"live-surface-seed-salt").expect("salt");
+    argon2::Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .expect("argon2 hash")
+        .to_string()
+}
 
 /// A valid serialized design-token blob (the typed scalars the branding module validates),
 /// for the seeded default brand the four asset routes hang off.
@@ -279,11 +342,24 @@ impl Fixture {
         assert_eq!(status, StatusCode::OK, "list operators: {body}");
         let operator = field(&body, "/items/0/id", "seed operator");
 
+        // The user carries a REAL native Argon2id verifier and a REAL claim document, and
+        // both are load bearing rather than decoration. `verifyMigrationCredential` is one
+        // of the two documented write exceptions below, and the branch that exemption is
+        // ABOUT is the positive one: a successor draining a decommissioned environment
+        // reads back the subject and the profile. Seeded with no password the case drove
+        // only the negative branch (MEASURED at a soft-deleted environment:
+        // `{"verified":false}`), so the exemption was pinned by a status code over a code
+        // path that returns nothing and reads no PII.
         let (status, _, body) = h
             .post(
                 &format!("{base}/users"),
                 "seed-user",
-                &serde_json::json!({ "identifier": "sweep@example.test" }).to_string(),
+                &serde_json::json!({
+                    "identifier": "sweep@example.test",
+                    "password_hash": argon2_hash(MIGRATION_PASSWORD),
+                    "claims": { "nickname": MIGRATION_CLAIM },
+                })
+                .to_string(),
             )
             .await;
         assert_eq!(status, StatusCode::CREATED, "create user: {body}");
@@ -437,6 +513,22 @@ impl Fixture {
 
         let actor = h.test_actor(&env);
 
+        // A remembered CONSENT from the seeded user to the seeded client, so
+        // `listUserConsents` answers with a ROW. The read half of the soft-deleted
+        // contract below compares the BODY for this case, and an empty 200 is not an
+        // audit: with no consent seeded the list was structurally empty, and
+        // `consents::list_user_consents` returning `Vec::new()` outright left the whole
+        // soft-deleted sweep GREEN along with `tests/consents.rs`, `tests/users.rs` and
+        // `tests/deleted_environment.rs` (MEASURED). The client's consent mode is the
+        // default `explicit`, so the grant is not filtered out as an auto-grant.
+        h.store()
+            .scoped(scope)
+            .acting(actor, CorrelationId::generate(&env))
+            .consents()
+            .grant(&env, &user, &client, Some("openid"))
+            .await
+            .expect("seed a remembered consent");
+
         // A quarantined signup for the fraud-review queue.
         let quarantined_user = h
             .store()
@@ -589,6 +681,27 @@ impl Fixture {
             .await
             .expect("seed the mds3 blob cache");
 
+        // The per-client admin consent grant and the signup form. Both are addressed by a
+        // DELETE case, and both used to be created by the PUT case that runs before it, so
+        // in a pass where the PUT is refused the DELETE addressed a row that was never
+        // there and answered 404 for a reason that had nothing to do with the environment.
+        // A sweep cannot tell that apart from a fence, so the rows are SEEDED here and the
+        // deletes are discriminating in both passes.
+        let (status, _, body) = h
+            .put(
+                &format!("{base}/applications/{client}/admin-consent"),
+                &serde_json::json!({ "scope": "openid" }).to_string(),
+            )
+            .await;
+        assert!(status.is_success(), "seed admin consent: {status} {body}");
+        let (status, _, body) = h
+            .put(
+                &format!("{base}/applications/{client}/signup-form"),
+                &serde_json::json!({ "fields": [] }).to_string(),
+            )
+            .await;
+        assert!(status.is_success(), "seed signup form: {status} {body}");
+
         // A DEFAULT brand. The four brand-asset routes address a brand by slug and answer
         // 404 when none exists, and no management route creates one, so without this the
         // whole asset surface is driven at a 404 and measured by nothing.
@@ -615,6 +728,27 @@ impl Fixture {
             )
             .await
             .expect("seed the default brand");
+
+        // And its LOGO and FAVICON. Same reason as the admin consent and the signup form
+        // above, and this one was found by mutation rather than by reading: with the two
+        // assets created only by the upload CASE, a pass in which the upload is refused
+        // leaves the two DELETE cases addressing an asset that was never there, and
+        // removing the fence from `brand_assets::delete_asset` outright left the whole
+        // soft-deleted sweep GREEN (measured). Seeding the assets is what makes the two
+        // deletes discriminating, and it is why the live answer alone is not a sufficient
+        // anti-vacuity control: at a live environment the upload runs first, so the delete
+        // answers 204 there either way.
+        for kind in ["logo", "favicon"] {
+            let request = Request::builder()
+                .method("PUT")
+                .uri(format!("{base}/brands/default/{kind}"))
+                .header(header::AUTHORIZATION, bearer(OPERATOR_TOKEN))
+                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .body(Body::from(RASTER_UPLOAD))
+                .expect("request builds");
+            let (status, _, body) = h.send(request).await;
+            assert!(status.is_success(), "seed brand {kind}: {status} {body}");
+        }
 
         // An open headless flow, so the flow inspector's observation read resolves a row
         // instead of stopping at its own not-found.
@@ -1526,8 +1660,13 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
 }
 
 /// Drive one case with the bootstrap operator token, carrying an Idempotency-Key on every
-/// request (the routes that require one get it; the rest ignore it).
-async fn drive(h: &Harness, case: &Case, key: &str) -> (StatusCode, String) {
+/// request (the routes that require one get it; the rest ignore it), returning the
+/// HEADERS as well as the status and the body.
+///
+/// The headers are not decoration for the soft-deleted sweep below: its claim is that
+/// every refusal is the SAME refusal, and two responses that agree on the status and the
+/// body can still differ in what a client actually receives.
+async fn drive_observed(h: &Harness, case: &Case, key: &str) -> (StatusCode, HeaderMap, String) {
     let request = Request::builder()
         .method(case.method)
         .uri(&case.path)
@@ -1536,7 +1675,12 @@ async fn drive(h: &Harness, case: &Case, key: &str) -> (StatusCode, String) {
         .header(header::CONTENT_TYPE, case.content_type)
         .body(case.body.clone().map_or_else(Body::empty, Body::from))
         .expect("request builds");
-    let (status, _, body) = h.send(request).await;
+    h.send(request).await
+}
+
+/// Drive one case, keeping only the status and the body.
+async fn drive(h: &Harness, case: &Case, key: &str) -> (StatusCode, String) {
+    let (status, _, body) = drive_observed(h, case, key).await;
     (status, body)
 }
 
@@ -2237,5 +2381,834 @@ async fn the_sudo_elevation_answers_against_a_live_environment_when_armed() {
         status,
         StatusCode::OK,
         "an armed elevation answers against a live environment: {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// The SOFT-DELETED-ENVIRONMENT contract for the whole environment prefix (issues #443,
+// #451).
+//
+// This lives here rather than in a file of its own, and the reason is the defect issue
+// #443 names. The sweep below needs three things: one of every row the surface addresses,
+// one case per documented operation, and a check that the case list has not drifted from
+// the contract. All three already exist in this file, seeded and checked. A second copy
+// would be a second inventory to keep in step with the contract, which is the same shape
+// as the nine copies of one precondition issue #443 folded together.
+// ---------------------------------------------------------------------------------------
+
+/// The uniform not-found EXACTLY as the wire carries it, rendered from the one type that
+/// produces it rather than transcribed into a literal here.
+///
+/// This is what stops a case from passing on the WRONG 404. Axum answers a path that
+/// matches no route with a bare 404 and an empty body, so a sweep that asserts only the
+/// status cannot tell a real refusal from a request that never reached a handler.
+async fn uniform_not_found() -> (StatusCode, BTreeMap<String, Vec<String>>, String) {
+    let response = ApiError::NotFound.into_response();
+    let status = response.status();
+    let headers = header_fields(response.headers());
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("the not-found body is finite");
+    (
+        status,
+        headers,
+        String::from_utf8(bytes.to_vec()).expect("the not-found body is utf-8"),
+    )
+}
+
+/// A response's headers as a sorted, printable map, so a divergence names the header
+/// rather than dumping an opaque `HeaderMap`. The value is a `Vec` because a `HeaderMap`
+/// may carry a name more than once, and collapsing to one value would hide exactly the
+/// divergence this instrument exists to see.
+fn header_fields(headers: &HeaderMap) -> BTreeMap<String, Vec<String>> {
+    let mut fields: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (name, value) in headers {
+        fields
+            .entry(name.as_str().to_owned())
+            .or_default()
+            .push(String::from_utf8_lossy(value.as_bytes()).into_owned());
+    }
+    fields
+}
+
+/// Every table's row count, read as the database OWNER so row-level security can never
+/// hide a write. The same instrument the two sibling sweeps use.
+///
+/// The LIMIT is worth stating, because it is the difference between what this measures
+/// and what its assertion sounds like. It counts ROWS, not their contents, so a write
+/// that mutated a column IN PLACE and wrote nothing else would be invisible to it. What
+/// makes it a usable net anyway is that every management write on this surface INSERTs
+/// an `audit_log` row in the same transaction as its change, so an in-place update still
+/// moves a count. That is a property of the crate's audit contract rather than of this
+/// function, and a future write that skipped its audit row would slip through here: the
+/// backstop for that one is the audit contract's own tests, not this snapshot. MEASURED:
+/// weakening `setClientAllowedScopes`'s pre-write fence to a Read (leaving the post-write
+/// re-read a Write, so the response is still the uniform not-found) lands the update in
+/// the soft-deleted environment, and the only count that moves is `audit_log`.
+async fn snapshot(pool: &sqlx::PgPool) -> BTreeMap<String, i64> {
+    let tables: Vec<(String,)> =
+        sqlx::query_as("SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
+            .fetch_all(pool)
+            .await
+            .expect("list public tables");
+    let mut counts = BTreeMap::new();
+    for (table,) in tables {
+        let (count,): (i64,) = sqlx::query_as(&format!("SELECT count(*) FROM \"{table}\""))
+            .fetch_one(pool)
+            .await
+            .expect("count table rows");
+        counts.insert(table, count);
+    }
+    counts
+}
+
+/// Every operation the committed contract publishes under the ENVIRONMENT prefix, split
+/// by whether it is a GET: the inventory the soft-deleted sweep must cover in full.
+///
+/// It is derived from the document rather than from the case list, so the two can be
+/// required to agree. Deleting a case from [`all_cases`] therefore fails this file twice:
+/// once in [`every_documented_operation_is_driven_by_a_case`], which is about the whole
+/// contract, and once here, which is about this sweep's own reach.
+fn documented_environment_operations() -> (BTreeSet<String>, BTreeSet<String>) {
+    let doc: serde_json::Value =
+        serde_json::from_str(COMMITTED_SPEC).expect("the committed spec parses");
+    let mut writes = BTreeSet::new();
+    let mut reads = BTreeSet::new();
+    for (template, methods) in doc["paths"].as_object().expect("paths") {
+        if !template.starts_with(ENVIRONMENT_PREFIX) {
+            continue;
+        }
+        for (method, operation) in methods.as_object().expect("operations") {
+            let id = operation["operationId"]
+                .as_str()
+                .expect("every operation carries an id")
+                .to_owned();
+            if method.eq_ignore_ascii_case("get") {
+                reads.insert(id);
+            } else {
+                writes.insert(id);
+            }
+        }
+    }
+    (writes, reads)
+}
+
+/// The templated prefix every environment-scoped route hangs off. The trailing slash is
+/// load bearing: it excludes the environment's OWN address, so `getEnvironment` and
+/// `deleteEnvironment` are outside the sweep rather than inside it.
+const ENVIRONMENT_PREFIX: &str = "/v1/tenants/{tenant_id}/environments/{environment_id}/";
+
+/// The operations whose answer at a SOFT-DELETED environment is deliberately NOT the
+/// uniform not-found, and the reason each one is exempt.
+///
+/// Both are POSTs that write NOTHING, which the row snapshot in the sweep proves rather
+/// than assumes, and both are the kind of question an operator asks ABOUT a
+/// decommissioned environment rather than a mutation of one. Fencing them would close
+/// nothing the write fence does not already close and would take away the two things a
+/// decommissioned environment is still for.
+///
+/// The list is a decision record, not a tolerance: a route that stops matching its entry,
+/// or a NEW route that answers anything but the refusal, fails the sweep and gets a
+/// decision of its own.
+fn documented_write_exceptions() -> BTreeMap<&'static str, StatusCode> {
+    BTreeMap::from([
+        // A pure evaluation of the shipped policies against a submitted hypothetical. It
+        // reads no row and writes none, so there is nothing for the environment to be the
+        // parent OF. This is the same exemption `tests/absent_environment.rs` grants it,
+        // for the same reason and with the same wording.
+        ("diagnostics.postFlowDryRun", StatusCode::OK),
+        // The EXIT surface. A successor system verifies a credential and reads back the
+        // profile so it can migrate the identity out; it writes nothing. Decommissioning
+        // an environment is exactly WHEN a successor is draining it, so refusing here
+        // would break the migration path at the moment it is needed, and it would do so
+        // for a request that changes nothing. It is scope-bound at configuration time and
+        // authorized by its own shared token, so it is not reachable as a general
+        // management route at all.
+        //
+        // Its 200 is not the whole exemption, and pinning only the 200 left the branch
+        // the exemption is FOR undriven: with the fixture user seeded without a password
+        // the case answered `{"verified":false}`, which is the negative verdict every
+        // wrong password gets and reads no profile at all. The seed carries a real
+        // Argon2id verifier and a real claim document now, and
+        // [`documented_body_contents`] requires the answer to carry the positive verdict,
+        // the subject, and the claim.
+        ("migration.verifyMigrationCredential", StatusCode::OK),
+    ])
+}
+
+/// The operations whose LIVE answer IS the uniform not-found, so that driving them at a
+/// soft-deleted environment measures nothing about the fence, and the reason each one
+/// cannot be made to discriminate here.
+///
+/// Every other case is required to answer something ELSE at a live environment, which is
+/// what stops the sweep from passing because its fixture was never satisfiable. That
+/// check is the whole difference between this sweep and one that would have stayed green
+/// with every fence removed.
+fn documented_non_discriminating() -> BTreeSet<&'static str> {
+    BTreeSet::from([
+        // Sudo mode cannot be armed in this router without gating every other mutation
+        // behind an elevation, so the feature is OFF here and the route answers the
+        // uniform not-found before it resolves anything, at a live environment and a
+        // deleted one alike. `the_sudo_elevation_answers_against_a_live_environment_when_armed`
+        // drives it at an armed router; the interaction between an armed elevation and
+        // this fence was decided under issue #452 (the privilege check keeps running first,
+        // and the challenge's audit row keeps landing) and is described on
+        // `ironauth_admin::sudo::require_fresh_privilege`.
+        "sudo.elevateAdminSudo",
+    ])
+}
+
+/// The writes that answer a body-level 400 to a MALFORMED body at a soft-deleted
+/// environment rather than the uniform not-found, and the reason each one is exempt.
+///
+/// All three are CREATES: they address no child row, so the only thing to resolve is the
+/// environment itself, and the parent-existence read that fences them sits after the body
+/// parse. That ordering is what issue #409 established for the absent-environment fence
+/// and neither issue #443 nor #451 touched it, so this list records a shape that was
+/// already there rather than a tolerance issued here.
+///
+/// The reason it is acceptable where `extendSignupQuarantine`'s was not is that these
+/// three answer IDENTICALLY at a live environment: 400 there, 400 here, so no caller
+/// learns anything about the environment from the answer. What the reordered routes buy
+/// on top of that is stronger and separate, namely that nothing at all gets a body-level
+/// answer out of a decommissioned environment.
+///
+/// The list is a decision record, not a tolerance: a NEW route that answers a 400 here
+/// fails the sweep and gets a decision of its own.
+fn documented_malformed_body_exceptions() -> BTreeSet<&'static str> {
+    BTreeSet::from([
+        "connectors.createConnector",
+        "dcr.createDcrInitialAccessToken",
+        "dcr.createDcrPolicy",
+    ])
+}
+
+/// The READS whose answer changes when the environment is soft-deleted, and why that is
+/// correct rather than a fence that leaked onto a GET.
+fn documented_read_exceptions() -> BTreeSet<&'static str> {
+    BTreeSet::from([
+        // Deleting an environment CASCADES `deleted_at` onto its management credentials,
+        // which is a deliberate security property and predates all of this: revoking an
+        // environment revokes the keys that could act on it. The key row is gone from the
+        // repository's point of view, so the read is a not-found for the same reason a
+        // revoked key is, and `deleteManagementKey` refuses for that reason too rather
+        // than because of the fence. `users`, `organizations`, `connectors`, `permissions`
+        // and the rest carry no such cascade, which is the whole mechanism behind issues
+        // #411 and #451.
+        "keys.getManagementKey",
+    ])
+}
+
+/// What a case's answer must CARRY, beyond the status it answers with.
+///
+/// A status alone is not the contract on either half of this sweep, and this is the
+/// instrument that says so.
+///
+/// On the READ half the claim is that a decommissioned environment stays AUDITABLE, and
+/// that is a claim about the ROWS. A read that lost its rows and kept its 200 satisfies
+/// every status assertion in this file: MEASURED, making `consents::list_user_consents`
+/// return `Vec::new()` when the environment read fails left this sweep GREEN, along with
+/// `tests/consents.rs`, `tests/users.rs` and `tests/deleted_environment.rs`. The whole
+/// justification for leaving reads unfenced rests on the listings still answering with
+/// their contents, so at least the listings that carry a row have to be checked for it.
+///
+/// On the WRITE half the same problem has one instance, and it is the exemption rather
+/// than a refusal: `verifyMigrationCredential` is exempt BECAUSE a successor draining the
+/// environment reads back the subject and the profile, so pinning only its 200 leaves the
+/// branch the exemption exists for undriven.
+///
+/// It is a SUBSET rather than every case, because each entry has to name a value the
+/// fixture genuinely seeds, and most cases here address a resource whose id the case list
+/// already spells into the path. The organization subtree gets the exhaustive version of
+/// this in `tests/deleted_environment.rs`, with the same substring idiom over identifiers
+/// that are freshly generated per run and appear nowhere else in a response.
+fn documented_body_contents(f: &Fixture) -> BTreeMap<&'static str, Vec<String>> {
+    BTreeMap::from([
+        // The user page and the single user, by the id of the seeded row.
+        ("users.listUsers", vec![f.user.clone()]),
+        ("users.getUser", vec![f.user.clone()]),
+        // The connected app, by client id: the one field the list exists to name.
+        ("consents.listUserConsents", vec![f.client.clone()]),
+        // The POSITIVE verdict, the subject it carries, and the PII inside the profile.
+        (
+            "migration.verifyMigrationCredential",
+            vec![
+                "\"verified\":true".to_owned(),
+                f.user.clone(),
+                MIGRATION_CLAIM.to_owned(),
+            ],
+        ),
+    ])
+}
+
+/// The expected strings a body failed to carry, if any.
+fn missing_contents<'a>(body: &str, expected: &'a [String]) -> Vec<&'a str> {
+    expected
+        .iter()
+        .filter(|value| !body.contains(value.as_str()))
+        .map(String::as_str)
+        .collect()
+}
+
+/// Delete an environment through the management API, exactly as an operator would.
+async fn soft_delete_environment(h: &Harness, tenant: &str, environment: &str) {
+    let (status, _, body) = h
+        .delete(&format!("/v1/tenants/{tenant}/environments/{environment}"))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "the environment soft-deletes: {body}"
+    );
+    // And it really is gone as far as every reader is concerned, so the pass below is
+    // measuring a deleted environment rather than a delete that quietly did nothing.
+    let (status, _, body) = h
+        .get(&format!("/v1/tenants/{tenant}/environments/{environment}"))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a soft-deleted environment reads as absent: {body}"
+    );
+}
+
+/// Drive every environment-prefixed case at the LIVE control environment and record the
+/// status each one answered.
+///
+/// This is the anti-vacuity instrument the sweep turns on: a case whose live answer is
+/// already the uniform not-found could never have measured the fence at a deleted
+/// environment, and the sweep requires such a case to be one of the documented
+/// non-discriminating entries rather than silently passing.
+///
+/// It is the anti-vacuity instrument for the BODY expectations too. A case whose contents
+/// are pinned has to carry them HERE, at a live environment, which is what makes the same
+/// assertion at the deleted environment attributable to the deletion: an expectation the
+/// fixture never satisfied fails on this pass rather than being reported as a content
+/// regression that had nothing to do with the environment.
+async fn control_answers(
+    control: &Harness,
+    fixture: &Fixture,
+    base: &str,
+) -> BTreeMap<String, StatusCode> {
+    let contents = documented_body_contents(fixture);
+    let mut live = BTreeMap::new();
+    for (index, case) in all_cases(fixture).iter().enumerate() {
+        if !case.path.starts_with(base) {
+            continue;
+        }
+        let (status, body) = drive(control, case, &format!("k-control-{index}")).await;
+        assert_ne!(
+            status,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{} is not routed at the method this sweep drives: {body}",
+            case.label
+        );
+        if let Some(expected) = contents.get(case.label) {
+            let missing = missing_contents(&body, expected);
+            assert!(
+                missing.is_empty(),
+                "{} answered {status} at a LIVE environment without carrying {missing:?}, so \
+                 the same expectation at a soft-deleted one would measure the fixture rather \
+                 than the fence: {body}",
+                case.label
+            );
+        }
+        live.insert(case.label.to_owned(), status);
+    }
+    live
+}
+
+/// Drive every environment-prefixed GET at the soft-deleted environment and require each
+/// answer to match the one the LIVE control gave.
+///
+/// This is the half of the contract that says a decommissioned environment stays
+/// AUDITABLE, and it is asserted rather than assumed because a fence that leaked onto a
+/// read would otherwise look exactly like a fence that worked. Returns the observed
+/// table, the divergences, and the set of operations actually driven.
+///
+/// The status is compared for every read and the BODY for the subset
+/// [`documented_body_contents`] names, and the second half is not optional polish: a 200
+/// carrying nothing is not an audit, and an emptied listing keeps its status.
+async fn read_pass(
+    doomed: &Harness,
+    cases: &[Case],
+    base: &str,
+    live: &BTreeMap<String, StatusCode>,
+    contents: &BTreeMap<&'static str, Vec<String>>,
+) -> (Vec<String>, Vec<String>, BTreeSet<String>) {
+    let exceptions = documented_read_exceptions();
+    let mut observed = Vec::new();
+    let mut wrong = Vec::new();
+    let mut driven = BTreeSet::new();
+    for (index, case) in cases.iter().enumerate() {
+        if !case.path.starts_with(base) || case.method != "GET" {
+            continue;
+        }
+        driven.insert(operation_of(case).to_owned());
+        let (status, body) = drive(doomed, case, &format!("k-read-{index}")).await;
+        let expected = live.get(case.label).copied().expect("a control answer");
+        observed.push(format!("{:7} {:55} {status}", case.method, case.label));
+        if exceptions.contains(case.label) {
+            continue;
+        }
+        if status != expected {
+            wrong.push(format!(
+                "{} answered {status} for a READ of a soft-deleted environment, expected the \
+                 live answer {expected}: {body}",
+                case.label
+            ));
+            continue;
+        }
+        if let Some(expected_contents) = contents.get(case.label) {
+            let missing = missing_contents(&body, expected_contents);
+            if !missing.is_empty() {
+                wrong.push(format!(
+                    "{} answered {status} for a READ of a soft-deleted environment but did not \
+                     carry {missing:?}, so the environment is not AUDITABLE through it and the \
+                     status is the only thing that survived: {body}",
+                    case.label
+                ));
+            }
+        }
+    }
+    (observed, wrong, driven)
+}
+
+/// Require the sweep to have driven EVERY operation the committed contract publishes
+/// under the environment prefix, in both directions.
+///
+/// This is what stops the sweep from shrinking. A case removed from [`all_cases`] stops
+/// being driven here, and a new environment-scoped route is undriven the moment it is
+/// documented.
+fn assert_sweep_reaches_the_whole_prefix(
+    driven: &BTreeSet<String>,
+    driven_reads: &BTreeSet<String>,
+) {
+    let (documented_writes, documented_reads) = documented_environment_operations();
+    assert_eq!(
+        driven,
+        &documented_writes,
+        "the committed contract publishes {} environment-scoped writes and this sweep drives \
+         {}; the difference is what nothing measures at a soft-deleted environment",
+        documented_writes.len(),
+        driven.len()
+    );
+    assert_eq!(
+        driven_reads,
+        &documented_reads,
+        "the committed contract publishes {} environment-scoped reads and this sweep drives {}",
+        documented_reads.len(),
+        driven_reads.len()
+    );
+}
+
+/// Require every refusal to be the SAME refusal, headers included.
+///
+/// Two things, because neither alone is the claim: every refusal carries every header the
+/// ONE renderer emits (which rules out axum's bare 404 for a path that reached no
+/// handler), and all of the refusals carry the same headers as each other down to the
+/// middleware's stamp (which rules out one route adding or dropping a header the other
+/// sixty do not, something no comparison against the bare rendered error could see).
+fn assert_every_refusal_is_the_same_refusal(
+    refusals: &[(&str, BTreeMap<String, Vec<String>>)],
+    not_found_headers: &BTreeMap<String, Vec<String>>,
+) {
+    let (canonical, canonical_headers) = refusals
+        .first()
+        .map(|(label, fields)| (*label, fields.clone()))
+        .expect("the sweep drives at least one refusal");
+    for (name, values) in not_found_headers {
+        assert_eq!(
+            canonical_headers.get(name),
+            Some(values),
+            "{canonical} answered a refusal whose `{name}` is not the one the uniform \
+             not-found renders: {canonical_headers:?}"
+        );
+    }
+    for (label, fields) in refusals {
+        assert_eq!(
+            fields, &canonical_headers,
+            "{label} refused with different headers from {canonical}"
+        );
+    }
+}
+
+/// The tables whose row count MOVED between two snapshots, one line each.
+///
+/// `assert_eq!(before, after)` over the whole map already FAILS when a write lands, so
+/// this changes nothing about the verdict; it changes what the failure says. The map
+/// carries a count for every table in the schema, so the equality failure prints two
+/// hundred-odd unchanged pairs and names nothing, and the reader is left to find the
+/// surface by rereading the driven table. Naming the moved tables points at it directly:
+/// `audit_log` alone says a write landed and its action names the route, and a resource
+/// table beside it names the resource outright.
+///
+/// MEASURED against exactly the mutant [`snapshot`] describes: the failure reads
+/// `audit_log: 42 -> 43` and nothing else, where the equality failure it replaced named
+/// no table at all.
+fn moved_tables(before: &BTreeMap<String, i64>, after: &BTreeMap<String, i64>) -> Vec<String> {
+    let mut moved = Vec::new();
+    for (table, before_count) in before {
+        let after_count = after.get(table).copied().unwrap_or_default();
+        if after_count != *before_count {
+            moved.push(format!("{table}: {before_count} -> {after_count}"));
+        }
+    }
+    for table in after.keys() {
+        if !before.contains_key(table) {
+            moved.push(format!("{table}: absent -> present"));
+        }
+    }
+    moved
+}
+
+/// The `operationId` half of a case's `module.operationId` label.
+fn operation_of(case: &Case) -> &'static str {
+    case.label
+        .rsplit('.')
+        .next()
+        .expect("a case label names an operation")
+}
+
+/// One ordering probe: a route, the id it addresses, a body the handler must REFUSE at
+/// the body level, and the status each of the two environments must answer.
+struct OrderingProbe {
+    what: &'static str,
+    path: fn(&Fixture) -> String,
+    body: &'static str,
+    live: StatusCode,
+    deleted: StatusCode,
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn the_address_is_resolved_before_the_body_on_the_two_reordered_writes() {
+    // The ORDERING contract for `setUserState` and `extendSignupQuarantine`, written down
+    // as statuses because the comments on both handlers now make a claim about exactly
+    // these cells and a comment is not a measurement.
+    //
+    // The sweep's malformed-body pass above already pins the deleted column for every
+    // JSON-bodied write. What it cannot pin is the LIVE column, and the live column is
+    // where the interesting half of this ordering lives: the body is STILL validated at a
+    // live environment (so the fence did not swallow the 400 wholesale), and an
+    // unaddressable user id now beats a malformed body (so the wire changed, in a way
+    // worth writing down rather than discovering later).
+    let control = Harness::start_fully_armed(50, OUTBOUND_TOKEN).await;
+    let control_fixture = Fixture::seed(&control).await;
+    let doomed = Harness::start_fully_armed(50, OUTBOUND_TOKEN).await;
+    let fixture = Fixture::seed(&doomed).await;
+    soft_delete_environment(&doomed, &fixture.tenant, &fixture.environment).await;
+
+    let probes = [
+        // A user that EXISTS, and a body that does not parse. The 400 at a live
+        // environment is what says the body is still checked; the 404 at a deleted one is
+        // the whole point of the reorder.
+        OrderingProbe {
+            what: "setUserState, addressable user, malformed body",
+            path: |f| {
+                format!(
+                    "/v1/tenants/{}/environments/{}/users/{}/state",
+                    f.tenant, f.environment, f.user
+                )
+            },
+            body: "{",
+            live: StatusCode::BAD_REQUEST,
+            deleted: StatusCode::NOT_FOUND,
+        },
+        // The DOCUMENTED wire change: an unaddressable user id plus a malformed body
+        // answered 400 before this change and answers the not-found now, at a LIVE
+        // environment. The address wins.
+        OrderingProbe {
+            what: "setUserState, unaddressable user, malformed body",
+            path: |f| {
+                format!(
+                    "/v1/tenants/{}/environments/{}/users/not-a-user-id/state",
+                    f.tenant, f.environment
+                )
+            },
+            body: "{",
+            live: StatusCode::NOT_FOUND,
+            deleted: StatusCode::NOT_FOUND,
+        },
+        OrderingProbe {
+            what: "extendSignupQuarantine, malformed body",
+            path: |f| {
+                format!(
+                    "/v1/tenants/{}/environments/{}/signup-quarantine/{}/extend",
+                    f.tenant, f.environment, f.quarantined_user
+                )
+            },
+            body: "{",
+            live: StatusCode::BAD_REQUEST,
+            deleted: StatusCode::NOT_FOUND,
+        },
+        // The route's own field-level refusal, which is the second 400 a decommissioned
+        // environment used to answer.
+        OrderingProbe {
+            what: "extendSignupQuarantine, zero window",
+            body: "{\"extend_secs\":0}",
+            path: |f| {
+                format!(
+                    "/v1/tenants/{}/environments/{}/signup-quarantine/{}/extend",
+                    f.tenant, f.environment, f.quarantined_user
+                )
+            },
+            live: StatusCode::BAD_REQUEST,
+            deleted: StatusCode::NOT_FOUND,
+        },
+    ];
+
+    let mut wrong: Vec<String> = Vec::new();
+    for (index, probe) in probes.iter().enumerate() {
+        for (name, h, f, expected) in [
+            ("LIVE", &control, &control_fixture, probe.live),
+            ("DELETED", &doomed, &fixture, probe.deleted),
+        ] {
+            let case = Case {
+                label: "ordering.probe",
+                method: "POST",
+                path: (probe.path)(f),
+                body: Some(probe.body.to_owned()),
+                content_type: "application/json",
+                token: OPERATOR_TOKEN,
+            };
+            let (status, body) = drive(h, &case, &format!("k-order-{index}-{name}")).await;
+            if status != expected {
+                wrong.push(format!(
+                    "{} at a {name} environment answered {status}, expected {expected}: {body}",
+                    probe.what
+                ));
+            }
+        }
+    }
+
+    // And the ONE 400 that deliberately survives at a decommissioned environment: the
+    // Idempotency-Key precondition. It runs ahead of the fence because a genuine replay
+    // has to keep working across the deletion (issue #411), so a POST with no key is told
+    // so rather than told not-found, and it is told so identically at both environments.
+    // Both handlers' comments say this; this is where it is measured.
+    for (name, h, f) in [
+        ("LIVE", &control, &control_fixture),
+        ("DELETED", &doomed, &fixture),
+    ] {
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/v1/tenants/{}/environments/{}/users/{}/state",
+                f.tenant, f.environment, f.user
+            ))
+            .header(header::AUTHORIZATION, bearer(OPERATOR_TOKEN))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("{"))
+            .expect("request builds");
+        let (status, _, body) = h.send(request).await;
+        if status != StatusCode::BAD_REQUEST
+            || !body.contains("the Idempotency-Key header is required on POST")
+        {
+            wrong.push(format!(
+                "setUserState with no Idempotency-Key at a {name} environment answered {status} \
+                 {body}, expected the 400 that says the header is required"
+            ));
+        }
+    }
+
+    assert!(
+        wrong.is_empty(),
+        "the address-before-body ordering does not hold:\n{}",
+        wrong.join("\n")
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn every_environment_scoped_write_refuses_a_soft_deleted_environment() {
+    // The whole-surface soft-deleted contract (issues #443, #451), driven at TWO
+    // identically configured routers over two identically seeded environments. The only
+    // difference between them is the DELETE, which is what makes every divergence below
+    // attributable to it and nothing else.
+    //
+    // A single environment cannot do this. The writes CONSUME what they address (a delete
+    // removes its row, a queue decision consumes its case), so a second pass over one
+    // fixture would answer 404 for reasons that have nothing to do with the environment,
+    // and a sweep cannot tell that apart from a fence. That is the exact shape of vacuity
+    // this file has already been caught by once: `deleteSignupForm` and
+    // `deleteClientAdminConsent` refused a deleted environment while UNFENCED, because the
+    // PUT that would have created the row they address had itself been refused. Both rows
+    // are seeded in `Fixture::seed` now, and both cases are discriminating.
+    let control = Harness::start_fully_armed(50, OUTBOUND_TOKEN).await;
+    let control_fixture = Fixture::seed(&control).await;
+    let doomed = Harness::start_fully_armed(50, OUTBOUND_TOKEN).await;
+    let fixture = Fixture::seed(&doomed).await;
+
+    let control_base = format!(
+        "/v1/tenants/{}/environments/{}/",
+        control_fixture.tenant, control_fixture.environment
+    );
+    let base = format!(
+        "/v1/tenants/{}/environments/{}/",
+        fixture.tenant, fixture.environment
+    );
+
+    let live = control_answers(&control, &control_fixture, &control_base).await;
+
+    soft_delete_environment(&doomed, &fixture.tenant, &fixture.environment).await;
+
+    let (not_found_status, not_found_headers, not_found_body) = uniform_not_found().await;
+    let write_exceptions = documented_write_exceptions();
+    let non_discriminating = documented_non_discriminating();
+
+    // The READS first, and the row snapshot AFTER them. A read is not free of side
+    // effects on this surface: `exportIdentities` writes a `user.export` audit row by
+    // design, and it must keep doing so, so the zero-write claim below is about the
+    // WRITES and is measured over exactly them.
+    let cases = all_cases(&fixture);
+    let contents = documented_body_contents(&fixture);
+    let mut driven: BTreeSet<String> = BTreeSet::new();
+    let (mut observed, mut wrong, driven_reads) =
+        read_pass(&doomed, &cases, &base, &live, &contents).await;
+
+    let before = snapshot(doomed.db().owner_pool()).await;
+
+    // The WRITES.
+    let mut refusals: Vec<(&str, BTreeMap<String, Vec<String>>)> = Vec::new();
+    for (index, case) in cases.iter().enumerate() {
+        if !case.path.starts_with(&base) || case.method == "GET" {
+            continue;
+        }
+        driven.insert(operation_of(case).to_owned());
+        let (status, headers, body) =
+            drive_observed(&doomed, case, &format!("k-write-{index}")).await;
+        observed.push(format!("{:7} {:55} {status}", case.method, case.label));
+        let live_answer = live.get(case.label).copied().expect("a control answer");
+        if non_discriminating.contains(case.label) {
+            if live_answer != not_found_status {
+                wrong.push(format!(
+                    "{} answers {live_answer} at a LIVE environment, so it DOES discriminate \
+                     and must not be listed in documented_non_discriminating",
+                    case.label
+                ));
+            }
+        } else if live_answer == not_found_status {
+            wrong.push(format!(
+                "{} answers the uniform not-found at a LIVE environment too, so driving it at \
+                 a soft-deleted one measures nothing about the fence; make the fixture satisfy \
+                 it or document why it cannot",
+                case.label
+            ));
+        }
+        if let Some(&expected) = write_exceptions.get(case.label) {
+            if status != expected {
+                wrong.push(format!(
+                    "{} answered {status}, expected the documented exception {expected}: {body}",
+                    case.label
+                ));
+            } else if let Some(expected_contents) = contents.get(case.label) {
+                // And the exemption's own BRANCH was driven. An exception pinned by its
+                // status alone says only that the route was not fenced; it says nothing
+                // about the code path the exemption was granted FOR.
+                let missing = missing_contents(&body, expected_contents);
+                if !missing.is_empty() {
+                    wrong.push(format!(
+                        "{} answered its documented exception {status} at a soft-deleted \
+                         environment but did not carry {missing:?}, so the branch the exemption \
+                         exists for was never driven: {body}",
+                        case.label
+                    ));
+                }
+            }
+            continue;
+        }
+        if status != not_found_status || body != not_found_body {
+            wrong.push(format!(
+                "{} answered {status} for a WRITE into a soft-deleted environment, expected the \
+                 uniform not-found: {body}",
+                case.label
+            ));
+            continue;
+        }
+        refusals.push((case.label, header_fields(&headers)));
+    }
+
+    // And the same writes again with a MALFORMED body, which is a different question and
+    // was a different answer.
+    //
+    // Everything above drives a WELL FORMED request, so all it can say is that a
+    // well-formed write is refused. A handler that validates its body BEFORE it resolves
+    // its parent answers the body-level 400 instead, and "every environment-scoped write
+    // answers the uniform not-found" is then true only of the requests the sweep happens
+    // to send. MEASURED before this pass existed: `extendSignupQuarantine` answered 400
+    // `bad_request` to a malformed body and 400 "extend_secs must be at least 1" to
+    // `{"extend_secs":0}` at a soft-deleted environment, while `approveSignupQuarantine`
+    // and `rejectSignupQuarantine` next door answered the refusal. Nothing in this file
+    // could see it.
+    let malformed_exceptions = documented_malformed_body_exceptions();
+    for (index, case) in cases.iter().enumerate() {
+        if !case.path.starts_with(&base) || case.method == "GET" {
+            continue;
+        }
+        // Only the JSON-bodied writes: a route that takes no body cannot be sent a
+        // malformed one, and the two octet-stream uploads have no parse step to order
+        // against (their sniff is over the BYTES).
+        if case.body.is_none() || case.content_type != "application/json" {
+            continue;
+        }
+        // The two documented write exceptions answer their exception rather than the
+        // refusal by design, and the non-discriminating route answers the refusal for a
+        // reason that has nothing to do with the environment. Neither measures anything
+        // here.
+        if write_exceptions.contains_key(case.label) || non_discriminating.contains(case.label) {
+            continue;
+        }
+        let probe = Case {
+            label: case.label,
+            method: case.method,
+            path: case.path.clone(),
+            // An empty object that never closes: rejected by every body parser on the
+            // surface, at the parse rather than at a field, so no route can be refusing
+            // it for a reason of its own.
+            body: Some("{".to_owned()),
+            content_type: case.content_type,
+            token: case.token,
+        };
+        let (status, body) = drive(&doomed, &probe, &format!("k-malformed-{index}")).await;
+        observed.push(format!(
+            "{:7} {:55} {status} (malformed body)",
+            case.method, case.label
+        ));
+        if malformed_exceptions.contains(case.label) {
+            continue;
+        }
+        if status != not_found_status || body != not_found_body {
+            wrong.push(format!(
+                "{} answered {status} to a MALFORMED body at a soft-deleted environment, so it \
+                 validates the body before it resolves the environment and the refusal above is \
+                 true only of well formed requests: {body}",
+                case.label
+            ));
+        }
+    }
+
+    assert!(
+        wrong.is_empty(),
+        "the environment surface disagrees about a soft-deleted environment:\n{}\n\nthe whole \
+         table:\n{}",
+        wrong.join("\n"),
+        observed.join("\n")
+    );
+
+    assert_sweep_reaches_the_whole_prefix(&driven, &driven_reads);
+    assert_every_refusal_is_the_same_refusal(&refusals, &not_found_headers);
+
+    // And no WRITE landed a row anywhere, audit log included. Read as the database owner,
+    // so row-level security cannot hide one, and it covers the two documented exceptions
+    // as well as the refusals: the claim that the flow dry run and the credential
+    // verification write nothing is measured here rather than asserted in their comments.
+    let after = snapshot(doomed.db().owner_pool()).await;
+    let moved = moved_tables(&before, &after);
+    assert!(
+        moved.is_empty(),
+        "a write into a soft-deleted environment landed a row:\n{}\n\nthe whole table:\n{}",
+        moved.join("\n"),
+        observed.join("\n")
     );
 }

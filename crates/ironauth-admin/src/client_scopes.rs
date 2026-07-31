@@ -124,7 +124,7 @@ use utoipa::ToSchema;
 use crate::auth::Principal;
 use crate::error::{ApiError, ErrorBody};
 use crate::input::parse_json;
-use crate::org_context::{require_client_scope_policy, resolve_scope};
+use crate::org_context::{EnvironmentAccess, require_client_scope_policy, resolve_scope};
 use crate::response::json;
 use crate::state::AdminState;
 
@@ -278,7 +278,8 @@ pub async fn get_client_allowed_scopes(
     Path((tenant_id, environment_id, client_id)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
-    let (id, policy) = require_client_scope_policy(&state, scope, &client_id).await?;
+    let (id, policy) =
+        require_client_scope_policy(&state, scope, &client_id, EnvironmentAccess::Read).await?;
     let body = serde_json::to_string(&ClientAllowedScopesView::new(id.to_string(), policy))
         .map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body))
@@ -302,7 +303,7 @@ pub async fn get_client_allowed_scopes(
         (status = 400, description = "Malformed request, a body omitting allowed_scopes, or an entry that is empty or carries whitespace", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential, or a lapsed sudo elevation (the RFC 9470 insufficient_user_authentication challenge)", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Not found (absent, malformed, or another scope's)", body = ErrorBody)
+        (status = 404, description = "Not found (absent, malformed, or another scope's). The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody)
     )
 )]
 pub async fn set_client_allowed_scopes(
@@ -317,7 +318,8 @@ pub async fn set_client_allowed_scopes(
     // reason: a caller who cannot address the client must not be able to tell "that
     // client is not yours" from "that client does not exist" by the STATUS of a
     // body-level refusal.
-    let (id, _current) = require_client_scope_policy(&state, scope, &client_id).await?;
+    let (id, _current) =
+        require_client_scope_policy(&state, scope, &client_id, EnvironmentAccess::Write).await?;
 
     let request: SetClientAllowedScopesRequest = parse_json(&body)?;
     let Some(allowed_scopes) = request.allowed_scopes else {
@@ -341,7 +343,8 @@ pub async fn set_client_allowed_scopes(
 
     // Re-read through the SAME address, so the response can only ever describe a
     // client of this environment and reports what was actually stored.
-    let (_id, updated) = require_client_scope_policy(&state, scope, &client_id).await?;
+    let (_id, updated) =
+        require_client_scope_policy(&state, scope, &client_id, EnvironmentAccess::Write).await?;
     let body = serde_json::to_string(&ClientAllowedScopesView::new(id.to_string(), updated))
         .map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body))

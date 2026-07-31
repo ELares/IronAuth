@@ -115,7 +115,7 @@ use utoipa::ToSchema;
 use crate::auth::Principal;
 use crate::error::{ApiError, ErrorBody};
 use crate::input::parse_json;
-use crate::org_context::{require_live_resource_server, resolve_scope};
+use crate::org_context::{EnvironmentAccess, require_live_resource_server, resolve_scope};
 use crate::pagination::{ListQuery, Pagination};
 use crate::response::json;
 use crate::state::AdminState;
@@ -417,7 +417,9 @@ pub async fn get_resource_server(
     Path((tenant_id, environment_id, resource_server_id)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
-    let record = require_live_resource_server(&state, scope, &resource_server_id).await?;
+    let record =
+        require_live_resource_server(&state, scope, &resource_server_id, EnvironmentAccess::Read)
+            .await?;
     let body = serde_json::to_string(&ResourceServerView::from_record(record))
         .map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body))
@@ -442,7 +444,7 @@ pub async fn get_resource_server(
         (status = 400, description = "Malformed request, a body omitting permission_claims_enabled, or a body naming a read-only field (token_format, audience, access_token_ttl_secs)", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Not found (absent, malformed, or another scope's)", body = ErrorBody),
+        (status = 404, description = "Not found (absent, malformed, or another scope's). The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody),
         (status = 422, description = "Cannot enable permission claims on an opaque resource server", body = ErrorBody)
     )
 )]
@@ -459,7 +461,9 @@ pub async fn update_resource_server_permission_claims(
     // be able to tell "that resource server is not yours" from "that resource server
     // does not exist" by the STATUS of a body-level refusal. Both the parse failure
     // and the malformed body would otherwise be distinguishing signals.
-    let record = require_live_resource_server(&state, scope, &resource_server_id).await?;
+    let record =
+        require_live_resource_server(&state, scope, &resource_server_id, EnvironmentAccess::Write)
+            .await?;
 
     let request: UpdateResourceServerRequest = parse_json(&body)?;
     // The read-only fields BEFORE the format rule: a body that names `token_format`
@@ -478,7 +482,9 @@ pub async fn update_resource_server_permission_claims(
 
     // Re-read through the SAME address, so the response can only ever describe a
     // resource server of this environment.
-    let updated = require_live_resource_server(&state, scope, &resource_server_id).await?;
+    let updated =
+        require_live_resource_server(&state, scope, &resource_server_id, EnvironmentAccess::Write)
+            .await?;
     let body = serde_json::to_string(&ResourceServerView::from_record(updated))
         .map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body))

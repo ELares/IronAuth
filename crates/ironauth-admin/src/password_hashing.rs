@@ -167,12 +167,10 @@ pub async fn probe_password_hashing(
     // key, may run the probe.
     principal.require_environment(tenant, scope.environment())?;
     // The environment must exist (a clean 404 rather than a probe on nothing).
-    state
-        .store()
-        .management()
-        .environments(tenant)
-        .get(&scope.environment())
-        .await?;
+    // This used to be an inline copy of the two-line read. It is the shared
+    // [`crate::org_context::require_live_environment`] now (issue #443): one expression
+    // of one precondition, so a change to what LIVENESS means has one place to change.
+    crate::org_context::require_live_environment(&state, &scope).await?;
 
     let request: PasswordHashingProbeRequest = if body.is_empty() {
         PasswordHashingProbeRequest::default()

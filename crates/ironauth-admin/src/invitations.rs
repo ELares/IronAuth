@@ -168,12 +168,10 @@ pub async fn create_invitation(
 
     // Containment: the parent environment must exist and be live. A foreign or
     // soft-deleted environment reads as a uniform not-found.
-    state
-        .store()
-        .management()
-        .environments(scope.tenant())
-        .get(&scope.environment())
-        .await?;
+    // This used to be an inline copy of the two-line read. It is the shared
+    // [`crate::org_context::require_live_environment`] now (issue #443): one expression
+    // of one precondition, so a change to what LIVENESS means has one place to change.
+    crate::org_context::require_live_environment(&state, &scope).await?;
 
     let request: CreateInvitationRequest = parse_json(&body)?;
     let identifier = require_non_empty(&request.identifier, "identifier")?;
@@ -442,7 +440,7 @@ pub async fn get_invitation(
         (status = 200, description = "The invitation is revoked", body = InvitationStateChangeView),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Not found (absent, not pending, or in another scope)", body = ErrorBody),
+        (status = 404, description = "Not found (absent, not pending, or in another scope). The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody),
         (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
     )
 )]
@@ -468,6 +466,14 @@ pub async fn revoke_invitation(
     {
         return Ok(replay);
     }
+
+    // The parent-existence precondition, through the ONE expression of it (issues #443,
+    // #451). An `invitations` row survives its environment's soft delete, so the revoke
+    // landed inside a decommissioned environment (MEASURED: 200) while the CREATE next
+    // door refused. It sits AFTER the idempotency replay for the reason `resolve_live_org`
+    // records: a genuine replay must still return the original response even if the
+    // environment went away in between.
+    crate::org_context::require_live_environment(&state, &scope).await?;
 
     let id = parse_invitation_id(scope, &invitation_id)?;
     let body_string = state_change_body(&id, InvitationStateView::Revoked)?;
@@ -516,7 +522,7 @@ pub async fn revoke_invitation(
         (status = 200, description = "A fresh token was issued; it is returned once", body = InvitationCreatedView),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Not found (absent, not pending, or in another scope)", body = ErrorBody),
+        (status = 404, description = "Not found (absent, not pending, or in another scope). The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody),
         (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
     )
 )]
@@ -543,6 +549,12 @@ pub async fn resend_invitation(
     {
         return Ok(replay);
     }
+
+    // The parent-existence precondition, for the reason the revoke records (MEASURED:
+    // 200, with a fresh token minted into a decommissioned environment). It sits AFTER the idempotency replay for the reason `resolve_live_org`
+    // records: a genuine replay must still return the original response even if the
+    // environment went away in between.
+    crate::org_context::require_live_environment(&state, &scope).await?;
 
     let id = parse_invitation_id(scope, &invitation_id)?;
 

@@ -23,10 +23,10 @@
 //! Scope and organization resolution come from [`crate::org_context`] rather than from
 //! private copies here. The three WRITES (`delete`, `disable`, `enable`) address their
 //! organization through [`crate::org_context::resolve_live_org`] with
-//! [`crate::org_context::OrgAccess::Write`], which is what puts them behind the same
+//! [`crate::org_context::EnvironmentAccess::Write`], which is what puts them behind the same
 //! soft-deleted-environment fence as every write nested under an organization (issue
 //! #411), and `get` addresses its organization through the same function with
-//! [`crate::org_context::OrgAccess::Read`], which deliberately does NOT carry the fence:
+//! [`crate::org_context::EnvironmentAccess::Read`], which deliberately does NOT carry the fence:
 //! a decommissioned environment stays auditable. `list` addresses no organization at
 //! all, so it resolves only the scope.
 
@@ -42,7 +42,7 @@ use crate::auth::Principal;
 use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
 use crate::input::{parse_json, require_non_empty};
-use crate::org_context::{OrgAccess, resolve_live_org, resolve_scope};
+use crate::org_context::{EnvironmentAccess, resolve_live_org, resolve_scope};
 use crate::pagination::{ListQuery, Pagination};
 use crate::response::{json, no_content};
 use crate::state::AdminState;
@@ -224,7 +224,7 @@ pub async fn get_organization(
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
     // Addressed through the shared resolution like every other route under this prefix
-    // (issue #411), with [`OrgAccess::Read`]: a decommissioned environment stays
+    // (issue #411), with [`EnvironmentAccess::Read`]: a decommissioned environment stays
     // auditable, so this read is deliberately NOT behind the environment fence. It
     // replaces an inline `parse_id` then `get` that was byte-identical to the helper's
     // body, which is the copy the module note above says does not exist here.
@@ -233,7 +233,7 @@ pub async fn get_organization(
     // live and hands back only its id, and the projection below needs the record. That
     // is paid deliberately, because the alternative is the private copy this change
     // exists to remove.
-    let id = resolve_live_org(&state, scope, &organization_id, OrgAccess::Read).await?;
+    let id = resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Read).await?;
     let record = state
         .store()
         .management()
@@ -277,7 +277,7 @@ pub async fn delete_organization(
     // organization that the delete below would have performed as its own predicate
     // anyway: a soft-deleted organization was already the uniform not-found from the
     // delete's zero-row result and is now the same not-found from this read.
-    let id = resolve_live_org(&state, scope, &organization_id, OrgAccess::Write).await?;
+    let id = resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Write).await?;
     state
         .store()
         .management()
@@ -305,7 +305,7 @@ async fn set_organization_state(
     // `parse_id`, and the read it adds is one this handler already performed at the end
     // to render the response, so a soft-deleted organization answered the uniform
     // not-found before this line existed and answers it here now.
-    let id = resolve_live_org(state, scope, organization_id, OrgAccess::Write).await?;
+    let id = resolve_live_org(state, scope, organization_id, EnvironmentAccess::Write).await?;
     state
         .store()
         .management()

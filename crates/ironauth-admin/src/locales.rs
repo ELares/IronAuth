@@ -178,12 +178,10 @@ pub async fn set_locale(
     let locale = parse_locale(&locale)?;
 
     // The environment must exist (a clean 404 rather than a foreign-key error).
-    state
-        .store()
-        .management()
-        .environments(scope.tenant())
-        .get(&scope.environment())
-        .await?;
+    // This used to be an inline copy of the two-line read. It is the shared
+    // [`crate::org_context::require_live_environment`] now (issue #443): one expression
+    // of one precondition, so a change to what LIVENESS means has one place to change.
+    crate::org_context::require_live_environment(&state, &scope).await?;
 
     let request: SetLocaleRequest = parse_json(&body)?;
     // Store ONLY the validated result: an unregistered id or an undeclared placeholder is a loud
@@ -268,7 +266,7 @@ pub async fn get_locale(
         (status = 204, description = "Deleted"),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Not found (absent or in another scope)", body = ErrorBody)
+        (status = 404, description = "Not found (absent or in another scope). The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody)
     )
 )]
 pub async fn delete_locale(
@@ -278,6 +276,12 @@ pub async fn delete_locale(
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
+    // The parent-existence precondition, through the ONE expression of it (issues #443,
+    // #451). A `locale_bundles` row survives its
+    // environment's soft delete, so the read below still resolved and the delete landed
+    // inside a decommissioned environment (MEASURED: 204, and the bundle gone) while the
+    // SET next door refused.
+    crate::org_context::require_live_environment(&state, &scope).await?;
     let locale = parse_locale(&locale)?;
     // Resolve the stored id by tag (a uniform not-found when absent), then delete by id so the
     // audit row names the immutable bundle id.

@@ -29,11 +29,11 @@
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::Response;
-use ironauth_store::{ClientId, CorrelationId, StoreError, UserId};
+use ironauth_store::{ClientId, CorrelationId, StoreError};
 
 use crate::auth::Principal;
 use crate::error::{ApiError, ErrorBody};
-use crate::org_context::require_live_environment;
+use crate::org_context::{EnvironmentAccess, resolve_user};
 use crate::response::json;
 use crate::sessions::scope_from_path;
 use crate::state::AdminState;
@@ -81,8 +81,11 @@ pub async fn list_user_consents(
 ) -> Result<Response, ApiError> {
     principal.require_operator()?;
     let (_tenant, scope) = scope_from_path(&state, &tenant_id, &environment_id)?;
-    // A user id from another scope (or a malformed one) is the uniform not-found.
-    let subject = UserId::parse_in_scope(&user_id, &scope).map_err(|_| StoreError::NotFound)?;
+    // A user id from another scope (or a malformed one) is the uniform not-found. The
+    // READ is deliberately not fenced on the environment's liveness: an operator
+    // auditing a decommissioned environment has to be able to see what its users had
+    // consented to (issues #409, #411, #451).
+    let subject = resolve_user(&state, scope, &user_id, EnvironmentAccess::Read).await?;
 
     let grants = state
         .store()
@@ -177,11 +180,15 @@ pub async fn revoke_user_consent(
     // It also makes the rule uniform. With this in place, the ONE environment-scoped
     // write that is not the not-found at an absent environment is the flow dry run,
     // which reads and writes nothing at all and so has no parent to require.
-    require_live_environment(&state, &scope).await?;
-
+    //
+    // It was a bare `require_live_environment` call; issue #451 folded it into
+    // [`resolve_user`], which is where every user-addressed route on this surface now
+    // gets it, so the precondition and the address are one step rather than two a future
+    // handler can perform separately or not at all.
+    //
     // Both ids are parsed under the caller's OWN scope: a malformed or cross-scope user
     // id or client id is the uniform not-found BEFORE any mutating repository is reached.
-    let subject = UserId::parse_in_scope(&user_id, &scope).map_err(|_| StoreError::NotFound)?;
+    let subject = resolve_user(&state, scope, &user_id, EnvironmentAccess::Write).await?;
     let client = ClientId::parse_in_scope(&client_id, &scope).map_err(|_| StoreError::NotFound)?;
 
     let revocation = state

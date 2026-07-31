@@ -6085,7 +6085,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Not found (absent or in another scope) */
+            /** @description Not found (absent or in another scope). The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -6258,7 +6258,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Not found (absent or in another scope) */
+            /** @description Not found (absent or in another scope). The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -6326,7 +6326,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Brand not found */
+            /** @description Brand not found. The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -6378,7 +6378,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Brand or asset not found */
+            /** @description Brand or asset not found. The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -6446,7 +6446,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Brand not found */
+            /** @description Brand not found. The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -6498,7 +6498,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Brand or asset not found */
+            /** @description Brand or asset not found. The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -6673,7 +6673,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Not found (absent, malformed, or another scope's) */
+            /** @description Not found (absent, malformed, or another scope's). The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -6818,7 +6818,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Not found (absent, not a DCR client, or in another scope) */
+            /** @description Not found (absent, not a DCR client, or in another scope). The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -7313,7 +7313,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Not found (absent or in another scope) */
+            /** @description Not found (absent or in another scope). The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -7365,7 +7365,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Not found (absent or in another scope) */
+            /** @description Not found (absent or in another scope). The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -8345,7 +8345,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Not found (absent, not pending, or in another scope) */
+            /** @description Not found (absent, not pending, or in another scope). The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -8411,7 +8411,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Not found (absent, not pending, or in another scope) */
+            /** @description Not found (absent, not pending, or in another scope). The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -8677,7 +8677,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description The version does not exist in this scope */
+            /** @description The version does not exist in this scope. The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -9114,7 +9114,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Not found (absent or in another scope) */
+            /** @description Not found (absent or in another scope). The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -12157,7 +12157,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Not found (absent, already deleted, malformed, or another scope's) */
+            /** @description Not found (absent, already deleted, malformed, or another scope's). The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -12224,7 +12224,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Not found (absent, deleted, malformed, or another scope's) */
+            /** @description Not found (absent, deleted, malformed, or another scope's). The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -12353,7 +12353,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Not found (no open approval, absent, or feature disabled) */
+            /** @description Not found (no open approval, absent, or feature disabled). The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -12419,7 +12419,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Not found (no open approval, absent, or feature disabled) */
+            /** @description Not found (no open approval, absent, or feature disabled). The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -12742,7 +12742,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Not found (absent, malformed, or another scope's) */
+            /** @description Not found (absent, malformed, or another scope's). The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -13157,7 +13157,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Not found (no open case, absent, or feature disabled) */
+            /** @description Not found (no open case, absent, or feature disabled). The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -13236,7 +13236,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Not found (no open case, absent, or feature disabled) */
+            /** @description Not found (no open case, absent, or feature disabled). The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -13302,7 +13302,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Not found (no open case, absent, or feature disabled) */
+            /** @description Not found (no open case, absent, or feature disabled). The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -13575,7 +13575,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Not found (absent, already deleted, or in another scope) */
+            /** @description Not found (absent, already deleted, or in another scope). The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -13642,7 +13642,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Not found (absent or in another scope) */
+            /** @description Not found (absent or in another scope). The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -13882,7 +13882,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Not found (absent or in another scope) */
+            /** @description Not found (absent or in another scope). The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -14031,7 +14031,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Not found (absent or in another scope) */
+            /** @description Not found (absent or in another scope). The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
                 headers: {
                     [name: string]: unknown;

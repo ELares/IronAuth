@@ -105,7 +105,7 @@ use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
 use crate::input::{parse_json, require_non_empty, require_permission_slug};
 use crate::org_context::{
-    parse_permission_id, require_live_environment, require_live_permission, resolve_scope,
+    EnvironmentAccess, require_live_environment, require_live_permission, resolve_scope,
 };
 use crate::pagination::{ListQuery, Pagination};
 use crate::response::{json, no_content};
@@ -487,7 +487,8 @@ pub async fn get_permission(
     Path((tenant_id, environment_id, permission_id)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
-    let record = require_live_permission(&state, scope, &permission_id).await?;
+    let record =
+        require_live_permission(&state, scope, &permission_id, EnvironmentAccess::Read).await?;
     let body = serde_json::to_string(&PermissionView::from_record(record))
         .map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body))
@@ -512,7 +513,7 @@ pub async fn get_permission(
         (status = 400, description = "Malformed request, or a body naming the immutable slug or kind", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Not found (absent, deleted, malformed, or another scope's)", body = ErrorBody)
+        (status = 404, description = "Not found (absent, deleted, malformed, or another scope's). The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody)
     )
 )]
 pub async fn update_permission(
@@ -527,7 +528,8 @@ pub async fn update_permission(
     // store write is skipped entirely and this read is the only guard left; and a
     // body naming an immutable column must not be told apart from a body that does
     // not when the caller cannot address the row at all.
-    let record = require_live_permission(&state, scope, &permission_id).await?;
+    let record =
+        require_live_permission(&state, scope, &permission_id, EnvironmentAccess::Write).await?;
 
     let request: UpdatePermissionRequest = parse_json(&body)?;
     refuse_immutable_fields(&request)?;
@@ -552,7 +554,8 @@ pub async fn update_permission(
     }
     // Re-read through the SAME address, so the response can only ever describe a
     // live permission of this environment.
-    let updated = require_live_permission(&state, scope, &permission_id).await?;
+    let updated =
+        require_live_permission(&state, scope, &permission_id, EnvironmentAccess::Write).await?;
     let body = serde_json::to_string(&PermissionView::from_record(updated))
         .map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body))
@@ -574,7 +577,7 @@ pub async fn update_permission(
         (status = 204, description = "Deleted (the slug is immediately free for a NEW permission, which gets a fresh id)"),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Not found (absent, already deleted, malformed, or another scope's)", body = ErrorBody)
+        (status = 404, description = "Not found (absent, already deleted, malformed, or another scope's). The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody)
     )
 )]
 pub async fn delete_permission(
@@ -584,16 +587,22 @@ pub async fn delete_permission(
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
-    // Parse only. The store's own delete resolves the row as LIVE and IN SCOPE
-    // inside the write transaction and answers the same uniform not-found, so a
-    // pre-read here would be a second copy of a guard the write already carries.
-    let id = parse_permission_id(&state, scope, &permission_id)?;
+    // Addressed through the SAME resolution as the read and the update, rather than the
+    // bare parse this used to do. The store's own delete already resolves the row as LIVE
+    // and IN SCOPE inside the write transaction, so the row half of this read is indeed a
+    // second copy of a guard the write carries; what the write does NOT carry is the
+    // ENVIRONMENT half. `permissions` rows survive their environment's soft delete, so
+    // the bare parse let this delete land inside a decommissioned environment (MEASURED:
+    // 204, and the row gone). Going through the resolution is what makes the delete
+    // inherit the fence rather than carry a third copy of it (issues #443, #451).
+    let record =
+        require_live_permission(&state, scope, &permission_id, EnvironmentAccess::Write).await?;
     state
         .store()
         .management()
         .acting(actor, CorrelationId::generate(state.env()))
         .permissions(scope)
-        .delete(state.env(), &id)
+        .delete(state.env(), &record.id)
         .await?;
     Ok(no_content())
 }

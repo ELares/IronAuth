@@ -62,6 +62,20 @@
 //! has to stay auditable, and a 200 carrying an empty page is not an audit.
 //! `list_memberships` returning `Vec::new()` used to leave this whole file green.
 //!
+//! # This file is the ORGANIZATION subtree of a larger contract
+//!
+//! Issue #451 found that the same defect ran through twenty six more writes, spread over
+//! fourteen handler modules and twelve URL groups, none of them the organization subtree
+//! this file drives. The whole-prefix version of this sweep is
+//! `live_surface::every_environment_scoped_write_refuses_a_soft_deleted_environment`,
+//! which drives all seventy five documented environment-scoped writes rather than the
+//! twenty two here. This file stays, and is not redundant with it, because it pins two
+//! things that one does not pin as far. It requires EVERY read in its subtree to NAME its
+//! rows rather than merely to answer 200, where the whole-prefix sweep requires that of a
+//! named subset (`getUser`, `listUsers` and `listUserConsents`) and compares only the
+//! status of the rest; and it requires the keyed writes' idempotent replay to survive the
+//! deletion, which nothing else measures.
+//!
 //! # What this file assumes about the configuration
 //!
 //! Everything here is driven at the DEFAULT configuration, in which sudo mode is off.
@@ -70,9 +84,15 @@
 //! answered 401 `insufficient_user_authentication` and the environment is never read at
 //! all. The property that matters survives that, because an ABSENT environment answers a
 //! lapsed elevation identically and the two therefore stay indistinguishable; what does
-//! not survive is the claim that the answer is THIS not-found. The ordering, and the
-//! `audit_log` row the challenge writes into the decommissioned environment, are tracked
-//! as issue #452 and are outside this file.
+//! not survive is the claim that the answer is THIS not-found.
+//!
+//! The challenge path also writes an `admin.privilege.challenged` row into the
+//! decommissioned environment's `audit_log` (MEASURED: three rows to four). Issue #452
+//! asked whether the ordering should move ahead of the fence to stop that; the owner
+//! decided it should not and the row should stay, because an audit record of a REJECTED
+//! attempt against an environment an operator believes is gone is worth having. The
+//! reasoning lives on `ironauth_admin::sudo::require_fresh_privilege`, and it is the one
+//! documented exception to "no write lands in a soft-deleted environment".
 
 mod common;
 

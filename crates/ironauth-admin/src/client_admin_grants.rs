@@ -108,12 +108,10 @@ pub async fn set_client_admin_consent(
     let client_id = parse_client_id(&client_id, scope)?;
 
     // The environment must exist (a clean 404 rather than a foreign-key error).
-    state
-        .store()
-        .management()
-        .environments(scope.tenant())
-        .get(&scope.environment())
-        .await?;
+    // This used to be an inline copy of the two-line read. It is the shared
+    // [`crate::org_context::require_live_environment`] now (issue #443): one expression
+    // of one precondition, so a change to what LIVENESS means has one place to change.
+    crate::org_context::require_live_environment(&state, &scope).await?;
 
     let request: SetClientAdminConsentRequest = parse_json(&body)?;
     let scope_value = parse_scope(&request)?;
@@ -203,7 +201,7 @@ pub async fn get_client_admin_consent(
         (status = 204, description = "Deleted"),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Not found (absent or in another scope)", body = ErrorBody)
+        (status = 404, description = "Not found (absent or in another scope). The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody)
     )
 )]
 pub async fn delete_client_admin_consent(
@@ -213,6 +211,12 @@ pub async fn delete_client_admin_consent(
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
+    // The parent-existence precondition, through the ONE expression of it (issues #443,
+    // #451). A `client_admin_grants` row survives its
+    // environment's soft delete, so the read below still resolved and the revoke landed
+    // inside a decommissioned environment. The SET next door already refused, which made
+    // this the two-answers-to-one-question shape issue #451 is about.
+    crate::org_context::require_live_environment(&state, &scope).await?;
     let client_id = parse_client_id(&client_id, scope)?;
     // Resolve the stored id by client (a uniform not-found when absent), then delete by id so the
     // audit row names the immutable pre-authorization id.

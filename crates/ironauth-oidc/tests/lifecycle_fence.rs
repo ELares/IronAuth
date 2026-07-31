@@ -1,11 +1,45 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The tenant-lifecycle DATA-PLANE fence (issue #46), against a real Postgres.
+//! The tenant-lifecycle MINT fence (issue #46), against a real Postgres.
 //!
-//! A suspended (or offboarded) tenant must stop serving its data plane. The
-//! control plane records the serving decision in the scoped, data-plane-readable
-//! `environment_states` table; the store-backed issuer registry consults it on
-//! EVERY resolution and fails closed for a fenced scope.
+//! A suspended (or offboarded) tenant must stop ISSUING. The control plane records the
+//! serving decision in the scoped, data-plane-readable `environment_states` table; the
+//! store-backed issuer registry consults it on EVERY resolution and fails closed for a
+//! fenced scope.
+//!
+//! # What is enforced, and what is NOT (issue #448)
+//!
+//! This file used to open by saying a suspended tenant "must stop serving its data
+//! plane". That is not what is enforced, and the difference is the whole of issue #448.
+//!
+//! ENFORCED, precisely: nothing is MINTED and nothing is SIGNED. The token endpoint
+//! refuses every one of the five grants with `503 temporarily_unavailable`, JWKS and
+//! discovery are fenced on the next request with no restart, and the authorization code
+//! is NOT burned, so the same code mints once the scope resumes. Every one of those is
+//! driven below.
+//!
+//! NOT enforced, equally precisely, and MEASURED on a store-backed harness with the
+//! scope's serving state set to `suspended`:
+//!
+//! - `GET /authorize` for a consenting subject answers `303 See Other` and the redirect
+//!   carries a fresh authorization code (`ac_...`).
+//! - `POST /device_authorization` for a client permitted the device grant answers
+//!   `200 OK` with a live `device_code`, a `user_code`, and both verification URIs. For a
+//!   client NOT permitted that grant it answers `400 unauthorized_client`, which is the
+//!   client-permission answer and not the fence, so the 200 above is the measurement that
+//!   matters.
+//! - Exchanging that code at the token endpoint answers `503 temporarily_unavailable`.
+//!
+//! The owner's decision is that refusing at the MINT is sufficient and the behavior
+//! stays. The artifacts a suspended scope still issues are INERT: an authorization code
+//! that cannot be exchanged and a device code that cannot be polled to a token are
+//! bearer-shaped strings that unlock nothing, and they expire on their own.
+//!
+//! The cost is stated rather than hidden. A suspended tenant's user spends a FULL login
+//! and consent journey, including entering credentials and approving scopes, and is
+//! refused only at the last step, by a redirect target that fails rather than by anything
+//! the authorization server said to them. An operator suspending a tenant should expect
+//! that shape rather than a clean early refusal.
 //!
 //! The load-bearing property this proves is IMMEDIACY WITHOUT A RESTART: the scope
 //! is served at least once first (so its issuer entry is CACHED in the live

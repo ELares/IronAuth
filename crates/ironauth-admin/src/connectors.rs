@@ -144,7 +144,7 @@ pub async fn create_connector(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let actor = principal.require_operator()?;
-    let (tenant, scope) = scope_from_path(&state, &tenant_id, &environment_id)?;
+    let (_tenant, scope) = scope_from_path(&state, &tenant_id, &environment_id)?;
     // Sudo mutation gate (issue #73): writing a connector is an environment-scoped
     // mutation. Gate before the idempotency replay so a challenge writes nothing.
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
@@ -167,12 +167,10 @@ pub async fn create_connector(
     let capabilities = definition.capabilities();
 
     // The environment must exist (a clean 404 rather than a foreign-key error).
-    state
-        .store()
-        .management()
-        .environments(tenant)
-        .get(&scope.environment())
-        .await?;
+    // This used to be an inline copy of the two-line read. It is the shared
+    // [`crate::org_context::require_live_environment`] now (issue #443): one expression
+    // of one precondition, so a change to what LIVENESS means has one place to change.
+    crate::org_context::require_live_environment(&state, &scope).await?;
 
     let created_at_micros = state.now_unix_micros();
     let id = ConnectorId::generate(state.env(), &scope);
@@ -447,7 +445,7 @@ fn unix_ms(at: std::time::SystemTime) -> i64 {
         (status = 400, description = "Malformed or invalid definition (JSON-pointer error)", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Not found (absent or in another scope)", body = ErrorBody)
+        (status = 404, description = "Not found (absent or in another scope). The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody)
     )
 )]
 pub async fn update_connector(
@@ -459,6 +457,11 @@ pub async fn update_connector(
     let actor = principal.require_operator()?;
     let (_tenant, scope) = scope_from_path(&state, &tenant_id, &environment_id)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
+    // The parent-existence precondition, through the ONE expression of it (issues #443,
+    // #451). A `connectors` row survives its
+    // environment's soft delete, so the update landed inside a decommissioned environment
+    // (MEASURED: 200) while the CREATE next door refused.
+    crate::org_context::require_live_environment(&state, &scope).await?;
     let id = state
         .store()
         .scoped(scope)
@@ -531,7 +534,7 @@ pub async fn update_connector(
         (status = 204, description = "Deleted"),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Not found (absent or in another scope)", body = ErrorBody)
+        (status = 404, description = "Not found (absent or in another scope). The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody)
     )
 )]
 pub async fn delete_connector(
@@ -542,6 +545,10 @@ pub async fn delete_connector(
     let actor = principal.require_operator()?;
     let (_tenant, scope) = scope_from_path(&state, &tenant_id, &environment_id)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
+    // The parent-existence precondition, through the ONE expression of it (issues #443,
+    // #451). For the reason the update records
+    // (MEASURED: 204, and the connector row gone).
+    crate::org_context::require_live_environment(&state, &scope).await?;
     let id = state
         .store()
         .scoped(scope)

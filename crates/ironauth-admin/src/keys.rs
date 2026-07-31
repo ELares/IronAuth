@@ -94,7 +94,7 @@ pub async fn create_key(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let actor = principal.require_operator()?;
-    let (tenant, scope) = scope_from_path(&state, &tenant_id, &environment_id)?;
+    let (_tenant, scope) = scope_from_path(&state, &tenant_id, &environment_id)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
 
     let key = idempotency::required_key(&headers)?;
@@ -112,12 +112,10 @@ pub async fn create_key(
 
     // The environment must exist and be live; a clean 404 rather than a
     // foreign-key error (a soft-deleted environment reads as absent).
-    state
-        .store()
-        .management()
-        .environments(tenant)
-        .get(&scope.environment())
-        .await?;
+    // This used to be an inline copy of the two-line read. It is the shared
+    // [`crate::org_context::require_live_environment`] now (issue #443): one expression
+    // of one precondition, so a change to what LIVENESS means has one place to change.
+    crate::org_context::require_live_environment(&state, &scope).await?;
 
     let request: CreateManagementKeyRequest = parse_json(&body)?;
     let display_name = require_non_empty(&request.display_name, "display_name")?;
