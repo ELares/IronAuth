@@ -4835,12 +4835,27 @@ fn validate_totp(oidc: &OidcConfig) -> Result<(), ConfigError> {
             });
         }
     }
-    // The step-up acr order (issue #72) must be a PERMUTATION of the canonical rung set
-    // ([`OIDC_DEFAULT_ACR_ORDER`]): no unknown value (a silently-unranked floor), no
-    // duplicate (an ambiguous rank comparison), and every known rung present (so nothing
-    // the ladder can ACHIEVE is left unranked, which would fail closed and spuriously
-    // block a legitimate login). An EMPTY list is allowed: it falls back to the canonical
-    // order at read time.
+    validate_acr_order(oidc)
+}
+
+/// Validate the step-up `acr` order (issues #71/#72/#267), kept out of [`validate_totp`]
+/// so each stays within the readable-length lint.
+///
+/// The order must be a PERMUTATION of the canonical rung set ([`OIDC_DEFAULT_ACR_ORDER`]):
+/// no unknown value (a silently-unranked floor), no duplicate (an ambiguous rank
+/// comparison), and every known rung present (so nothing the ladder can ACHIEVE is left
+/// unranked, which would fail closed and spuriously block a legitimate login). An EMPTY
+/// list is allowed: it falls back to the canonical order at read time.
+///
+/// Two rungs are additionally PINNED relative to others, because a permutation alone can
+/// be internally consistent and still assert something untrue about credential strength:
+/// `mfa_remembered` strictly below `mfa` (issue #71), and `pwd` strictly below every
+/// stronger rung (issue #267).
+///
+/// # Errors
+///
+/// [`ConfigError::Invalid`] with the offending value and the rule it broke.
+fn validate_acr_order(oidc: &OidcConfig) -> Result<(), ConfigError> {
     if !oidc.acr_order.is_empty() {
         let known: std::collections::BTreeSet<&str> =
             OIDC_DEFAULT_ACR_ORDER.iter().copied().collect();
@@ -4887,6 +4902,33 @@ fn validate_totp(oidc: &OidcConfig) -> Result<(), ConfigError> {
                          factor and must never satisfy a genuine mfa step-up floor"
                     ),
                 });
+            }
+        }
+        // The single-primary-factor floor (issue #267): `pwd` MUST rank strictly BELOW
+        // every genuinely stronger rung. `pwd` is the rung a WEAK possession proof sits
+        // at (an email OTP, a magic link, an SMS code all prove control of a delivery
+        // channel and nothing more), so an order that ranks it at or above `mfa`, `phr`,
+        // `phrh`, or `attested_passkey` asserts that a mailbox is worth a passkey. That
+        // is an operator error in its own right on the step-up path it governs: it would
+        // let a mailbox proof satisfy an application's passkey floor.
+        //
+        // The issue #267 factor-downgrade gate does NOT depend on this rule (it compares
+        // against the canonical ladder precisely so no configuration can steer it), so
+        // this is defence in depth, not the gate's enforcement. It is here because a
+        // misordered rung set is worth refusing at boot regardless of who reads it.
+        let pwd_rank = rank(OIDC_ACR_PWD);
+        for stronger in [OIDC_ACR_MFA, OIDC_ACR_PHR, OIDC_ACR_PHRH, OIDC_ACR_ATTESTED] {
+            if let (Some(weak_rank), Some(strong_rank)) = (pwd_rank, rank(stronger)) {
+                if weak_rank >= strong_rank {
+                    return Err(ConfigError::Invalid {
+                        message: format!(
+                            "oidc.acr_order must rank '{OIDC_ACR_PWD}' strictly below \
+                             '{stronger}': a single primary factor (including a weak \
+                             possession proof such as an email or SMS one-time code) must \
+                             never satisfy a stronger floor"
+                        ),
+                    });
+                }
             }
         }
     }
@@ -8455,6 +8497,111 @@ enabled = true
             OIDC_ACR_ATTESTED.to_owned(),
         ];
         validate_totp(&reordered).expect("a valid permutation with mfa_remembered below mfa");
+    }
+
+    /// The single-primary-factor floor (issue #267): `pwd` must rank strictly BELOW every
+    /// genuinely stronger rung, so a weak possession proof (an email OTP, a magic link, an
+    /// SMS code, all of which sit at `pwd`) can never satisfy a passkey or `mfa` floor.
+    ///
+    /// This ordering was ACCEPTED at boot before issue #267: it is a permutation with no
+    /// duplicate and no unknown, and it keeps `mfa_remembered` below `mfa`, so every rule
+    /// that existed passed it. The exact vector below is the one the issue #267 review
+    /// measured, which turned the factor-downgrade gate off for every tenant in a
+    /// deployment with a single configuration line, because that gate read `acr_order`.
+    /// The gate now compares against the canonical ladder instead, so this rule is
+    /// defence in depth rather than the gate's enforcement; it stands on its own for the
+    /// step-up path, which legitimately does read `acr_order`.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)] // one-field mutations off a large default read clearest
+    fn validate_acr_order_refuses_pwd_ranked_above_a_stronger_rung() {
+        let mut inverted = OidcConfig::default();
+        inverted.acr_order = vec![
+            OIDC_ACR_PHR.to_owned(),
+            OIDC_ACR_PHRH.to_owned(),
+            OIDC_ACR_ATTESTED.to_owned(),
+            OIDC_ACR_PWD.to_owned(),
+            OIDC_ACR_MFA_REMEMBERED.to_owned(),
+            OIDC_ACR_MFA.to_owned(),
+        ];
+        assert!(
+            matches!(validate_totp(&inverted), Err(ConfigError::Invalid { .. })),
+            "pwd ranked above the passkey rungs must be refused at boot"
+        );
+
+        // Each stronger rung is pinned INDIVIDUALLY, so a rule that only compared against
+        // one of them (and left the other three steerable) fails here. Every vector below
+        // ranks `pwd` above exactly ONE of the four and below the other three, and each is
+        // otherwise a valid permutation with `mfa_remembered` below `mfa`, so the only
+        // rule that can reject it is the one for the named rung.
+        for (stronger, order) in [
+            (
+                OIDC_ACR_MFA,
+                [
+                    OIDC_ACR_MFA_REMEMBERED,
+                    OIDC_ACR_MFA,
+                    OIDC_ACR_PWD,
+                    OIDC_ACR_PHR,
+                    OIDC_ACR_PHRH,
+                    OIDC_ACR_ATTESTED,
+                ],
+            ),
+            (
+                OIDC_ACR_PHR,
+                [
+                    OIDC_ACR_PHR,
+                    OIDC_ACR_PWD,
+                    OIDC_ACR_MFA_REMEMBERED,
+                    OIDC_ACR_MFA,
+                    OIDC_ACR_PHRH,
+                    OIDC_ACR_ATTESTED,
+                ],
+            ),
+            (
+                OIDC_ACR_PHRH,
+                [
+                    OIDC_ACR_PHRH,
+                    OIDC_ACR_PWD,
+                    OIDC_ACR_MFA_REMEMBERED,
+                    OIDC_ACR_MFA,
+                    OIDC_ACR_PHR,
+                    OIDC_ACR_ATTESTED,
+                ],
+            ),
+            (
+                OIDC_ACR_ATTESTED,
+                [
+                    OIDC_ACR_ATTESTED,
+                    OIDC_ACR_PWD,
+                    OIDC_ACR_MFA_REMEMBERED,
+                    OIDC_ACR_MFA,
+                    OIDC_ACR_PHR,
+                    OIDC_ACR_PHRH,
+                ],
+            ),
+        ] {
+            let mut one_inverted = OidcConfig::default();
+            one_inverted.acr_order = order.iter().map(|acr| (*acr).to_owned()).collect();
+            assert!(
+                matches!(
+                    validate_totp(&one_inverted),
+                    Err(ConfigError::Invalid { .. })
+                ),
+                "pwd ranked above '{stronger}' alone must be refused at boot"
+            );
+        }
+
+        // The control: `pwd` at the bottom, with the rest reordered, stays valid. Without
+        // this the rule above could be satisfied by refusing every override.
+        let mut valid = OidcConfig::default();
+        valid.acr_order = vec![
+            OIDC_ACR_PWD.to_owned(),
+            OIDC_ACR_MFA_REMEMBERED.to_owned(),
+            OIDC_ACR_MFA.to_owned(),
+            OIDC_ACR_ATTESTED.to_owned(),
+            OIDC_ACR_PHR.to_owned(),
+            OIDC_ACR_PHRH.to_owned(),
+        ];
+        validate_totp(&valid).expect("pwd at the bottom is valid however the rest is ordered");
     }
 
     /// The remembered-device duration policy (issue #71): the defaults are valid and off,

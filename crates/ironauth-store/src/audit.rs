@@ -1055,6 +1055,12 @@ pub enum Action {
     /// SMS OTP was enabled/disabled, the factor-downgrade path was set, or the
     /// country allowlist was edited. The row records what changed in `detail`.
     SmsConfigUpdate,
+    /// The per (tenant, environment) EMAIL-FACTOR configuration was CHANGED (issue
+    /// #267): the factor-downgrade opt-in for the email possession family (email OTP,
+    /// magic link, headless recovery) was set. Turning it ON permits an email
+    /// possession proof to mint a primary session over a passkey or an active TOTP, so
+    /// the change is attributable either way; the `detail` records the new value.
+    EmailFactorConfigUpdate,
     /// An account-recovery flow was INITIATED (issue #81): the first-class recovery
     /// state machine started for a subject. The row targets the `rcv_` flow; the
     /// `detail` records the entry point, the recover-factor strength (acr), whether a
@@ -1387,6 +1393,7 @@ impl Action {
             Action::SmsRouteThrottled => "sms_route.throttled",
             Action::SmsConversionAlarm => "sms_route.conversion_alarm",
             Action::SmsConfigUpdate => "sms_config.update",
+            Action::EmailFactorConfigUpdate => "email_factor_config.update",
             Action::MagicLinkSend => "magic_link.send",
             Action::MagicLinkConsume => "magic_link.consume",
             Action::RecoveryInitiate => "recovery.initiate",

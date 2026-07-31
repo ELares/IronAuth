@@ -34,6 +34,19 @@
 //! recovery tests, which drive `gate_factor_removal` after a flow initiation). A session level
 //! delay gated recovery completion would be a SEPARATE #81 enhancement, not part of this
 //! engine.
+//!
+//! # The #267 no-silent-downgrade gate IS wired into the mint
+//!
+//! Because the #81 `hold_until` gates factor REMOVAL and not the mint (above), this journey
+//! reached the same hole the hosted `/otp/verify` did: a code delivered to the mailbox
+//! completed the journey and the engine minted a primary session for an account protected by
+//! a passkey, an active TOTP, or unconsumed recovery codes. The verify transition now names
+//! its [`GatedSessionPath`](crate::factor_downgrade::GatedSessionPath) when it calls the
+//! shared [`crate::email_otp::verify_email_code`] core, which decides the gate before the
+//! code is judged and applies it after the single-use consume, so a refused downgrade
+//! re-renders the SAME uniform incorrect code failure with the flow OPEN and the proven code
+//! already burned. That is a DIFFERENT invariant from `hold_until` (an enrolled strength
+//! comparison, not a notified delay window) and neither replaces the other.
 
 use ironauth_store::{
     AuthPath, EmailFactorPurpose, FlowRecord, RecoveryEntryPoint, RecoveryMethod, Scope,
@@ -392,6 +405,16 @@ pub(super) async fn advance_verify(
         });
     }
 
+    // The no-silent-downgrade gate (issue #267) rides on the SHARED verify core: this
+    // journey drives the same core the hosted `/otp/verify` does, so naming the gated path
+    // here is all it takes to be gated, and it is gated with the same ordering (decided on
+    // the resolved subject before the code is judged, applied after the single-use
+    // consume). Before #267 this journey reached the hole through a different door: a code
+    // delivered to the mailbox completed the journey and the flow engine minted a primary
+    // session for an account protected by a passkey or an active TOTP. Issue #81 computes
+    // the account's strongest factor at recovery INITIATION and holds a security-reducing
+    // recovery, but that `hold_until` gates FACTOR REMOVAL, not the session mint, so it
+    // never blocked this path.
     match email_otp::verify_email_code(
         state,
         scope,
@@ -399,6 +422,7 @@ pub(super) async fn advance_verify(
         identifier,
         code,
         headers,
+        crate::factor_downgrade::GatedSessionPath::FlowRecoveryVerify,
     )
     .await
     {
@@ -408,9 +432,10 @@ pub(super) async fn advance_verify(
                 ctx,
             })))
         }
-        // A wrong/expired/absent code, or a throttle, both render the SAME uniform incorrect
-        // code failure with the flow OPEN (existence independent, never an oracle).
-        EmailCodeOutcome::Invalid | EmailCodeOutcome::Throttled(_) => {
+        // A wrong/expired/absent code, a throttle, and a REFUSED downgrade all render the
+        // SAME uniform incorrect code failure with the flow OPEN (existence independent,
+        // factor independent, never an oracle). The refused code is already burned.
+        EmailCodeOutcome::Invalid | EmailCodeOutcome::Blocked | EmailCodeOutcome::Throttled(_) => {
             Ok(RecoveryVerifyStep::Render {
                 nodes: ack_nodes(transport, flow_id, true),
                 messages: Vec::new(),

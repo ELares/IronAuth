@@ -16,6 +16,25 @@
 //! - **Abuse-throttled, anti-enumeration send.** The send is throttled per recipient and
 //!   per tenant through the #64 abuse layer; a send to an unknown recipient is SUPPRESSED
 //!   with an IDENTICAL acknowledgment, so the endpoint is never an existence oracle.
+//! - **No silent downgrade, on ANY purpose (issue #267).** A verify may not mint a
+//!   PRIMARY login session for an account already protected by a stronger factor (a
+//!   passkey, an active TOTP, or unconsumed recovery codes) unless the scope explicitly
+//!   opted in through `email_factor_config.allow_factor_downgrade`. Only `login`,
+//!   `recovery`, and self-service `register` are session-establishing, and each passes
+//!   through [`crate::factor_downgrade::blocked`]; `mfa` and `verify_address` are
+//!   possession PROOFS that never set the session cookie.
+//!
+//!   Both halves shipped for SMS in issue #70 and were MISSING here until issue #267:
+//!   every purpose fell through to `establish_and_respond`, so an actor who controlled a
+//!   mailbox minted a primary session over a passkey, and an `mfa` code alone signed the
+//!   presenter in. The gate now lives in [`crate::factor_downgrade`], shared with SMS,
+//!   so the two cannot diverge again.
+//!
+//!   The refusal is uniform in STATUS and BODY with a wrong code, and also in the
+//!   statements it runs: [`verify_email_code`] DECIDES the gate on the resolved subject
+//!   before the presented code is judged and APPLIES it after the single-use consume, so
+//!   a correct-but-refused guess does not cost more than a wrong one. See that function
+//!   for the measurement that motivated the ordering.
 
 use axum::Json;
 use axum::extract::{Path, State};
@@ -28,6 +47,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::authn::AuthenticationEvent;
+use crate::factor_downgrade;
 use crate::interaction;
 use crate::state::OidcState;
 use crate::util::epoch_micros;
@@ -331,15 +351,41 @@ pub async fn verify(
         return invalid_code();
     }
 
-    // The resolve / constant-time-compare / attempt-count / consume sequence runs through the
-    // shared core, then the session mint. The core is the ONE place the email-factor verify
-    // security lives, so the headless recovery flow (issue #84) reuses it identically; only
-    // the mint differs (this handler responds directly, the flow trips its completion latch).
-    match verify_email_code(&state, scope, purpose, identifier, code, &headers).await {
+    // The resolve / gate-decision / constant-time-compare / attempt-count / consume sequence
+    // runs through the shared core, then the session mint. The core is the ONE place the
+    // email-factor verify security lives, so the headless recovery flow (issue #84) reuses it
+    // identically; only the mint differs (this handler responds directly, the flow trips its
+    // completion latch). The no-silent-downgrade gate (issue #267) is DECIDED and APPLIED
+    // inside the core, so this handler only renders what the core decided.
+    match verify_email_code(
+        &state,
+        scope,
+        purpose,
+        identifier,
+        code,
+        &headers,
+        factor_downgrade::GatedSessionPath::EmailOtpVerify,
+    )
+    .await
+    {
         EmailCodeOutcome::Verified { subject, ctx } => {
+            // The purpose split (issue #267, mirroring issue #70). Before this, EVERY
+            // purpose fell through to a full primary session: an `mfa` code alone signed
+            // the presenter in (claiming a first factor that was never proven) and a
+            // `verify_address` code did the same. Only the purposes for which the code IS
+            // the primary authenticator may mint; the core has already cleared those
+            // through the no-silent-downgrade gate.
+            if !purpose.establishes_session() {
+                // A possession proof: no cookie, no `authenticated`, no `amr`. The abuse
+                // throttle relaxes on a proven possession just as a sign-in does.
+                state.reset_after_success(&ctx).await;
+                return proof_response(purpose);
+            }
             establish_and_respond(&state, scope, &subject, &ctx, &headers).await
         }
-        EmailCodeOutcome::Invalid => invalid_code(),
+        // A refused downgrade renders the SAME uniform invalid-code result a wrong code
+        // does, so the refusal is never a factor-possession oracle.
+        EmailCodeOutcome::Invalid | EmailCodeOutcome::Blocked => invalid_code(),
         EmailCodeOutcome::Throttled(snapshot) => {
             let mut response = json_response(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -370,6 +416,15 @@ pub(crate) enum EmailCodeOutcome {
     /// A wrong, expired, absent, or already-consumed code: the UNIFORM invalid result, never
     /// an existence or state oracle.
     Invalid,
+    /// The code was CORRECT and was consumed single-use, but the no-silent-downgrade gate
+    /// refused the session mint (issue #267): the account holds a stronger factor and this
+    /// scope has no downgrade opt-in.
+    ///
+    /// A separate variant from [`Self::Invalid`] so the caller cannot accidentally treat a
+    /// refusal as a mint, but every caller renders it IDENTICALLY to [`Self::Invalid`]:
+    /// the response must not distinguish a refused downgrade from a wrong guess. The
+    /// proven code is already BURNED when this is returned, so it is never replayable.
+    Blocked,
     /// The verify path is throttled (the #64 per-recipient / per-IP brute-force bound).
     Throttled(ironauth_quota::RateLimitSnapshot),
     /// The admission-controlled hashing pool refused the verify (saturated or disabled).
@@ -385,6 +440,29 @@ pub(crate) enum EmailCodeOutcome {
 /// neither re-derives the email-factor security. It performs the SAME anti-timing dummy spend
 /// on an absent recipient or an absent code, and does NOT establish a session (the caller owns
 /// the mint).
+///
+/// # The no-silent-downgrade gate lives here, and WHERE in here matters
+///
+/// `gate` names the caller's [`GatedSessionPath`](crate::factor_downgrade::GatedSessionPath).
+/// It is REQUIRED, not optional: there is no value a caller can pass to opt out, so a new
+/// surface that drives this core is gated by construction and the only decision left to it
+/// is which surface to attribute a refusal to. On a session-establishing purpose the gate
+/// is DECIDED on the resolved subject BEFORE the presented code is judged, and APPLIED
+/// only after the single-use consume, exactly as `sms_otp::verify` has done since issue
+/// #70.
+///
+/// That ordering is the whole point, and the issue #267 review measured what the other one
+/// costs. When the gate ran only on a code that had already verified, a WRONG code spent 125
+/// transactions and a CORRECT-but-refused code spent 129 on the same passkey-protected
+/// account: one gate configuration read and one passkey probe that a wrong guess did not
+/// perform. Both answered a byte-identical 401, so the body was uniform, but the latency was
+/// not, and a code-guessing attacker who does NOT control the mailbox could in principle read
+/// a correct guess off it. Deciding first and applying last removes the difference: the same
+/// statements run whatever the code turns out to be.
+///
+/// Applying LAST is equally load-bearing in the other direction. The gate must not short
+/// circuit past the resolve, the Argon2 compare, and the durable write a wrong guess performs,
+/// and the proven-but-refused code must be BURNED rather than left replayable.
 pub(crate) async fn verify_email_code(
     state: &OidcState,
     scope: ironauth_store::Scope,
@@ -392,6 +470,7 @@ pub(crate) async fn verify_email_code(
     identifier: &str,
     code: &str,
     headers: &HeaderMap,
+    gate: crate::factor_downgrade::GatedSessionPath,
 ) -> EmailCodeOutcome {
     // Throttle the VERIFY on the flow's path, keyed on the recipient and the peer IP, so a
     // brute force escalates to a uniform failure (issue #64).
@@ -415,6 +494,31 @@ pub(crate) async fn verify_email_code(
         let _ = state.verify_absent(&scope, code).await;
         return EmailCodeOutcome::Invalid;
     };
+
+    // DECIDE the no-silent-downgrade gate here (issue #267), before the presented code is
+    // judged, so the gate's reads are spent on a wrong guess exactly as they are on a
+    // correct one. The decision is APPLIED after the consume below. Carrying the path
+    // rather than a bare bool means the refusal can be attributed to the surface that
+    // refused without a second lookup, and makes it impossible to record a refusal for a
+    // path that was never gated.
+    let refused = if purpose.establishes_session() {
+        match gate_blocks(state, scope, &user.id, gate).await {
+            Ok(true) => Some(gate),
+            Ok(false) => None,
+            // A store fault reading the opt-in or probing the account's factors. Fails
+            // CLOSED: no mint. This returns before the compare, which is the same shape
+            // `sms_otp::verify` has: a store fault is not attacker-selectable per
+            // request, so it is not a code-correctness oracle.
+            Err(crate::factor_downgrade::FactorProbeError) => {
+                return EmailCodeOutcome::ServerError;
+            }
+        }
+    } else {
+        // A possession PROOF (`mfa` / `verify_address`) mints no primary session, so there
+        // is nothing to downgrade and no probe to spend.
+        None
+    };
+
     let active = match state
         .store()
         .scoped(scope)
@@ -449,7 +553,9 @@ pub(crate) async fn verify_email_code(
         return EmailCodeOutcome::Invalid;
     }
 
-    // Correct code: consume it single-use. The caller mints the session.
+    // Correct code: consume it single-use. The caller mints the session. A refused
+    // downgrade consumes it too, so the refusal spends the SAME durable write a wrong
+    // guess does and the proven-but-refused code is burned rather than left replayable.
     let consumed = state
         .store()
         .scoped(scope)
@@ -461,14 +567,72 @@ pub(crate) async fn verify_email_code(
         .consume(state.env(), &active.id, epoch_micros(state.now()))
         .await;
     match consumed {
-        Ok(true) => EmailCodeOutcome::Verified {
-            subject: user.id,
-            ctx,
+        // APPLY the gate decision taken before the compare. The refusal is recorded on the
+        // observability plane HERE rather than at the decision, so a wrong guess on a
+        // protected account never logs a refusal it did not earn.
+        Ok(true) => match refused {
+            Some(path) => {
+                crate::factor_downgrade::record_refusal(scope, path, purpose.as_str());
+                EmailCodeOutcome::Blocked
+            }
+            None => EmailCodeOutcome::Verified {
+                subject: user.id,
+                ctx,
+            },
         },
         // A race already consumed it: the uniform invalid result.
         Ok(false) => EmailCodeOutcome::Invalid,
         Err(_) => EmailCodeOutcome::ServerError,
     }
+}
+
+/// THE email-family no-silent-downgrade DECISION (issue #267): whether this scope refuses
+/// `path`'s weak possession factor a primary session for `subject`.
+///
+/// This is the ONE place the email OTP, the magic link, and the headless recovery journey
+/// funnel through, so none of the three can be gated while another is not. It only
+/// DECIDES; recording the refusal and rendering it belong to the caller, at the point the
+/// refusal is actually applied, so a decision taken speculatively (before the presented
+/// proof has been judged) never emits a refusal the presenter did not earn.
+///
+/// The scope's opt-in is read here rather than passed in. A scope with no row, and a scope
+/// whose read FAILS, both resolve to "not opted in": the permissive value is only ever
+/// returned by a row that exists and says so, so neither a store fault nor the day-one
+/// state of an existing tenant (issue #267's migration back-fills nothing) can open the
+/// downgrade path.
+///
+/// # Errors
+///
+/// [`FactorProbeError`](crate::factor_downgrade::FactorProbeError) on a store fault
+/// reading the opt-in or probing the account's factors. Every caller fails CLOSED on it:
+/// no session is minted.
+pub(crate) async fn gate_blocks(
+    state: &OidcState,
+    scope: ironauth_store::Scope,
+    subject: &UserId,
+    path: crate::factor_downgrade::GatedSessionPath,
+) -> Result<bool, crate::factor_downgrade::FactorProbeError> {
+    let allow_downgrade = state
+        .store()
+        .scoped(scope)
+        .email_factor_config()
+        .config()
+        .await
+        .map(|config| config.allow_factor_downgrade)
+        .map_err(|_| crate::factor_downgrade::FactorProbeError)?;
+    crate::factor_downgrade::blocked(state, scope, subject, path.factor(), allow_downgrade).await
+}
+
+/// The NON-session-establishing success result for an `mfa` or `verify_address` verify
+/// (issue #267, mirroring the issue #70 SMS shape): a possession proof that the
+/// presenter controls the address, with NO session cookie and NO authenticated-login
+/// claim. It never carries `authenticated: true` or an `amr`, so it cannot be mistaken
+/// for (or promoted into) a primary session.
+fn proof_response(purpose: EmailFactorPurpose) -> Response {
+    json_response(
+        StatusCode::OK,
+        json!({ "verified": true, "purpose": purpose.as_str() }),
+    )
 }
 
 /// Establish a session for a verified email-factor login and return a JSON result that

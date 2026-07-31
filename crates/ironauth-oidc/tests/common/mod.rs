@@ -1257,6 +1257,92 @@ impl Harness {
         }
     }
 
+    /// Set the scope's EMAIL-FACTOR downgrade opt-in (issue #267): the deliberate
+    /// per-tenant act that permits an email possession proof (an email OTP, a magic link,
+    /// or the headless recovery journey) to mint a primary session over a stronger
+    /// factor. The email-side twin of [`Self::enable_sms`]'s `allow_downgrade`.
+    pub async fn enable_email_factor_downgrade(&self, allow: bool) {
+        let (actor, corr) = self.seeding_actor();
+        self.store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .email_factor_config()
+            .set_allow_factor_downgrade(&self.env, allow, 0)
+            .await
+            .expect("set email factor downgrade opt-in");
+    }
+
+    /// Break the app role's read of the email-factor configuration in THIS harness's
+    /// database (issue #267), so the no-silent-downgrade gate's configuration read fails
+    /// with a genuine [`ironauth_store::StoreError::Database`].
+    ///
+    /// This is the fault injection the fail-CLOSED contract needs: the gate must refuse
+    /// the mint on a store fault, never fall back to the permissive default, and no
+    /// shipped test could reach that arm without a real fault. The REVOKE runs through the
+    /// owner pool (the migration/provisioning connection) on the harness's own throwaway
+    /// database, and roles are cluster-wide while grants are per-database, so it cannot
+    /// affect a concurrently running test.
+    pub async fn break_email_factor_config_reads(&self) {
+        sqlx::query("REVOKE SELECT ON email_factor_config FROM ironauth_app")
+            .execute(self.db.owner_pool())
+            .await
+            .expect("revoke the app role's email_factor_config read");
+    }
+
+    /// Mark every one of `subject`'s recovery codes CONSUMED (issue #267), for the tests
+    /// that prove a spent recovery-code set does not keep blocking.
+    ///
+    /// A recovery code has exactly two states: unconsumed, and consumed. There is no
+    /// expiry (the `recovery_codes` table carries `consumed_at` and no expiry column), so
+    /// "spent" is the only way the rung stops counting. Runs through the owner pool, like
+    /// [`Self::set_user_quarantined`]; the column the gate counts on is the same one.
+    pub async fn consume_all_recovery_codes(&self, subject: &str) {
+        sqlx::query(
+            "UPDATE recovery_codes \
+             SET consumed_at = TIMESTAMPTZ 'epoch' \
+             WHERE subject = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(subject)
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .execute(self.db.owner_pool())
+        .await
+        .expect("consume the subject's recovery codes");
+    }
+
+    /// Seed one UNCONSUMED recovery code for `subject` (issue #267), so a test can drive
+    /// the no-silent-downgrade gate against an account whose only surviving stronger
+    /// factor is its recovery-code set. The issue #70 SMS probe ignored this rung, which
+    /// is one of the holes the shared gate closes; the code material is a throwaway (the
+    /// gate counts unconsumed rows, it never redeems one).
+    pub async fn seed_recovery_code(&self, subject: &str) {
+        use ironauth_store::NewRecoveryCode;
+        let subject_id = self
+            .store()
+            .scoped(self.scope)
+            .users()
+            .parse_id(subject)
+            .expect("parse subject");
+        let (actor, corr) = self.seeding_actor();
+        self.store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .recovery_codes()
+            .replace_all(
+                &self.env,
+                &subject_id,
+                &[NewRecoveryCode {
+                    normalized_code: "abcd1234efgh5678",
+                    // A syntactically valid Argon2id PHC verifier: the gate only counts
+                    // rows, so the hash is never verified by these tests.
+                    code_hash: "$argon2id$v=19$m=19456,t=2,p=1$\
+                                c29tZXNhbHRzb21lc2FsdA$YXhY3l7cIYbCU4TCEZ8lIkKfPPnPl2zRLPjXO0nQ0lM",
+                }],
+            )
+            .await
+            .expect("seed recovery code");
+    }
+
     /// Enroll an ACTIVE TOTP credential for `subject` (issue #70), so a test can drive the
     /// no-silent-downgrade invariant against an account already protected by a stronger
     /// factor.

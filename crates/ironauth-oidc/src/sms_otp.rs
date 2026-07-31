@@ -36,6 +36,15 @@
 //!    second factor is the step-up flow, issue #72, not this factor), so they can never be
 //!    a factor-downgrade / account-takeover vector.
 //!
+//!    Both halves of that invariant now live OUTSIDE this file (issue #267): the
+//!    purpose split is [`EmailFactorPurpose::establishes_session`] on the shared purpose
+//!    type, and the strength comparison is [`crate::factor_downgrade::blocked`]. They
+//!    were private helpers here, which is why the email family shipped without them for
+//!    two milestones. The shared gate also CLOSES two holes this file's original helper
+//!    had: it counts unconsumed recovery codes (an `mfa`-rung factor it ignored) and it
+//!    runs every probe unconditionally (its short circuit made the response time reveal
+//!    which strong factor an account held).
+//!
 //! # Route bucket granularity (known limitation)
 //!
 //! The pumping-defense route bucket is per-COUNTRY (the E.164 calling code; see
@@ -56,6 +65,7 @@ use serde_json::{Value, json};
 
 use crate::authn::AuthenticationEvent;
 use crate::email_otp::{attempt_context, generate_numeric_code, purpose_or_login};
+use crate::factor_downgrade;
 use crate::interaction;
 use crate::phone::{E164, score};
 use crate::sms_conversion::{conversion_percent, route_health};
@@ -362,10 +372,12 @@ pub async fn verify(
     // The no-silent-downgrade invariant (issue #70), enforced for EVERY session-
     // establishing purpose. SMS is a RESTRICTED authenticator (NIST SP 800-63B-4): it may
     // never mint a PRIMARY login session for an account already protected by a stronger
-    // factor (a passkey or an active TOTP) unless the tenant EXPLICITLY opted into the
-    // documented downgrade path. Only `login`, `recovery`, and self-service `register`
-    // are session-establishing; `mfa` and `verify_address` prove control of the phone
-    // number WITHOUT signing anyone in (see `establishes_session` / `proof_response`), so
+    // factor (a passkey, an active TOTP, or unconsumed recovery codes: issue #267 added
+    // that third rung, which this file's original probe ignored) unless the tenant
+    // EXPLICITLY opted into the documented downgrade path. Only `login`, `recovery`, and
+    // self-service `register` are session-establishing; `mfa` and `verify_address` prove
+    // control of the phone number WITHOUT signing anyone in (see
+    // `EmailFactorPurpose::establishes_session` / `proof_response`), so
     // they carry no downgrade risk. A genuinely new `register` account holds no stronger
     // factor, so the gate is a no-op for it, while an EXISTING protected account is
     // blocked on `register` exactly like a login.
@@ -377,11 +389,19 @@ pub async fn verify(
     // a weak-factor account and never a factor-possession timing oracle (adversarial
     // review LOW: the old block returned early after only `verify_absent`, faster than a
     // real attempt).
-    let establishes_session = establishes_session(purpose);
-    let blocked_downgrade = if establishes_session && !config.allow_factor_downgrade {
-        match has_stronger_factor(&state, scope, &user.id).await {
+    let establishes_session = purpose.establishes_session();
+    let blocked_downgrade = if establishes_session {
+        match factor_downgrade::blocked(
+            &state,
+            scope,
+            &user.id,
+            factor_downgrade::WeakFactor::SmsOtp,
+            config.allow_factor_downgrade,
+        )
+        .await
+        {
             Ok(blocked) => blocked,
-            Err(()) => return server_error(),
+            Err(factor_downgrade::FactorProbeError) => return server_error(),
         }
     } else {
         false
@@ -444,13 +464,10 @@ pub async fn verify(
     // uniformly (the work above already equalized the timing). Not counted as a route
     // conversion (it did not complete an authentication).
     if blocked_downgrade {
-        tracing::info!(
-            target: "ironauth.abuse",
-            tenant = %scope.tenant(),
-            environment = %scope.environment(),
-            purpose = purpose.as_str(),
-            "SMS factor-downgrade refused: account holds a stronger factor and no \
-             downgrade path is configured"
+        factor_downgrade::record_refusal(
+            scope,
+            factor_downgrade::GatedSessionPath::SmsOtpVerify,
+            purpose.as_str(),
         );
         return invalid_code();
     }
@@ -480,22 +497,6 @@ pub async fn verify(
     }
 }
 
-/// Whether a successful verify for `purpose` establishes a PRIMARY login session
-/// (issue #70). `login`, `recovery`, and self-service `register` mint a session with the
-/// honest `sms` amr (the SMS code IS the primary authenticator for these flows) and so
-/// pass through the no-silent-downgrade gate. `mfa` and `verify_address` are possession
-/// PROOFS that never mint a primary session: SMS-as-a-second-factor session elevation is
-/// the step-up flow (issue #72), and address verification proves control of the number
-/// without signing anyone in. Minting a primary `sms` session from an `mfa` OTP alone
-/// would silently claim a first factor that was never proven, so those purposes are never
-/// session-establishing here.
-fn establishes_session(purpose: EmailFactorPurpose) -> bool {
-    matches!(
-        purpose,
-        EmailFactorPurpose::Login | EmailFactorPurpose::Recovery | EmailFactorPurpose::Register
-    )
-}
-
 /// The NON-session-establishing success result for an `mfa` or `verify_address` verify
 /// (issue #70): a possession proof that the presenter controls the phone number, with NO
 /// session cookie and NO authenticated-login claim. It never carries `authenticated: true`
@@ -505,31 +506,6 @@ fn proof_response(purpose: EmailFactorPurpose) -> Response {
         StatusCode::OK,
         json!({ "verified": true, "purpose": purpose.as_str() }),
     )
-}
-
-/// Whether `subject` holds a stronger factor than SMS (a passkey or an active TOTP),
-/// for the no-silent-downgrade invariant (issue #70). An error collapses to a
-/// fail-closed [`Err`] so the caller refuses rather than silently permits a downgrade.
-async fn has_stronger_factor(
-    state: &OidcState,
-    scope: Scope,
-    subject: &UserId,
-) -> Result<bool, ()> {
-    let scoped = state.store().scoped(scope);
-    let has_passkey = scoped
-        .webauthn_credentials()
-        .has_any(subject)
-        .await
-        .map_err(|_| ())?;
-    if has_passkey {
-        return Ok(true);
-    }
-    let has_totp = scoped
-        .totp_credentials()
-        .has_active(subject)
-        .await
-        .map_err(|_| ())?;
-    Ok(has_totp)
 }
 
 /// Account a DELIVERED send to `route_key`, evaluate the send-to-verify conversion, and
