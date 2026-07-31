@@ -39,7 +39,7 @@ ironauth-jose.workspace = true
 argon2.workspace = true
 # bcrypt (all four $2a$/$2b$/$2x$/$2y$ variants), the single most common foreign
 # scheme.
-bcrypt = "0.16"
+bcrypt = "0.19"
 # scrypt (RFC 7914) PHC-string verify, and the key-derivation half of Firebase's
 # modified scrypt.
 scrypt = "0.11"
