@@ -123,6 +123,13 @@ async fn upload_asset(
     // A brand asset is the visible chrome of the auth pages (a social-engineering surface), so it
     // demands fresh privilege exactly like the locale writes and organizations / connectors.
     crate::sudo::require_fresh_privilege(state, scope, actor).await?;
+    // The parent-existence precondition, through the ONE expression of it (issues #443,
+    // #451). A `brands` row survives its environment's soft delete, so the brand read
+    // below still resolved and both uploads landed inside a decommissioned environment
+    // (MEASURED: 200 for the logo and 200 for the favicon). It is placed in the shared
+    // helper rather than in the four routes, so the logo and the favicon cannot be given
+    // different answers.
+    crate::org_context::require_live_environment(state, &scope).await?;
 
     if body.is_empty() {
         return Err(ApiError::BadRequest("the asset body is empty".to_owned()));
@@ -208,6 +215,10 @@ async fn delete_asset(
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(state, principal, tenant_id, environment_id)?;
     crate::sudo::require_fresh_privilege(state, scope, actor).await?;
+    // The parent-existence precondition, in the shared helper for the same reason as the
+    // upload above (MEASURED: 204 for the logo and 204 for the favicon, both destroying
+    // the asset inside a decommissioned environment).
+    crate::org_context::require_live_environment(state, &scope).await?;
     let brand = state
         .store()
         .scoped(scope)
@@ -244,7 +255,7 @@ async fn delete_asset(
         (status = 400, description = "Not an accepted raster, or over the size cap", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope, or sudo required", body = ErrorBody),
-        (status = 404, description = "Brand not found", body = ErrorBody)
+        (status = 404, description = "Brand not found. The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody)
     )
 )]
 pub async fn set_brand_logo(
@@ -281,7 +292,7 @@ pub async fn set_brand_logo(
         (status = 204, description = "Deleted"),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope, or sudo required", body = ErrorBody),
-        (status = 404, description = "Brand or asset not found", body = ErrorBody)
+        (status = 404, description = "Brand or asset not found. The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody)
     )
 )]
 pub async fn delete_brand_logo(
@@ -318,7 +329,7 @@ pub async fn delete_brand_logo(
         (status = 400, description = "Not an accepted raster, or over the size cap", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope, or sudo required", body = ErrorBody),
-        (status = 404, description = "Brand not found", body = ErrorBody)
+        (status = 404, description = "Brand not found. The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody)
     )
 )]
 pub async fn set_brand_favicon(
@@ -355,7 +366,7 @@ pub async fn set_brand_favicon(
         (status = 204, description = "Deleted"),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope, or sudo required", body = ErrorBody),
-        (status = 404, description = "Brand or asset not found", body = ErrorBody)
+        (status = 404, description = "Brand or asset not found. The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody)
     )
 )]
 pub async fn delete_brand_favicon(

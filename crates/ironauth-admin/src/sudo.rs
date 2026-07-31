@@ -56,6 +56,35 @@ const ADMIN_REAUTH_ACR: &str = "urn:ironauth:acr:admin_reauth";
 /// audits the refusal (the expiry event) and returns the RFC 9470 challenge. The
 /// freshness derives entirely from server-side state, so no request field can forge it.
 ///
+/// # This runs BEFORE the environment liveness fence, deliberately (issue #452)
+///
+/// Every environment-scoped write calls this FIRST and resolves its parent environment
+/// SECOND. That ordering is the one that leaks nothing: a caller whose elevation has
+/// lapsed is answered 401 `insufficient_user_authentication` without the server having
+/// read a single row of the environment it named, so the challenge cannot be used to
+/// distinguish a live environment from a decommissioned one from one that never existed.
+/// Fencing first would answer the unprivileged caller a 404 for a live environment and a
+/// 404 for an absent one, which is uniform, but it would also spend an environment read
+/// on an unauthorized request and would make the two checks' order the thing a future
+/// reader has to reason about.
+///
+/// The consequence is a WRITE that lands in a soft-deleted environment, and it is
+/// intended rather than accidental: `record_challenge` below writes an
+/// `admin.privilege.challenged` row into the `audit_log` of an environment an operator
+/// believes is decommissioned. MEASURED, at a router with sudo mode armed, a lapsed
+/// elevation, and the environment soft-deleted first: the write answered 401
+/// `insufficient_user_authentication`, and the scope's audit trail went from three rows
+/// to four, the new row being exactly `admin.privilege.challenged`.
+///
+/// The owner decided that row STAYS. An audit row recording a REJECTED access attempt
+/// has value against a decommissioned environment, arguably more than usual, because
+/// someone is poking at something an operator believes is gone, and the record of that is
+/// precisely what an investigation would want. It is the one documented exception to
+/// "no write lands in a soft-deleted environment" (issues #411, #443, #451), and the
+/// whole-surface sweep in `crates/ironauth-admin/tests/live_surface.rs` measures the
+/// unarmed configuration, in which this guard is inert and the claim holds without
+/// exception.
+///
 /// # Errors
 ///
 /// [`ApiError::ReauthRequired`] when sudo mode is on and the acting credential has no

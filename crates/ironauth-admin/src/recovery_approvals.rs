@@ -148,7 +148,7 @@ pub async fn list_recovery_approvals(
         (status = 200, description = "The recovery is approved", body = RecoveryApprovalDecisionView),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Not found (no open approval, absent, or feature disabled)", body = ErrorBody),
+        (status = 404, description = "Not found (no open approval, absent, or feature disabled). The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody),
         (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
     )
 )]
@@ -190,7 +190,7 @@ pub async fn approve_recovery_approval(
         (status = 200, description = "The recovery is rejected", body = RecoveryApprovalDecisionView),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Not found (no open approval, absent, or feature disabled)", body = ErrorBody),
+        (status = 404, description = "Not found (no open approval, absent, or feature disabled). The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody),
         (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
     )
 )]
@@ -242,6 +242,16 @@ async fn decide(
     {
         return Ok(replay);
     }
+
+    // The parent-existence precondition, through the ONE expression of it (issues #443,
+    // #451). A `recovery_flows` row and its approval survive their environment's soft
+    // delete, so an approve COMPLETED a recovery inside a decommissioned environment and
+    // a reject fenced one there (MEASURED: 200 and 200). It is placed in the shared
+    // helper rather than in the two routes, so approve and reject cannot be given
+    // different answers. It sits AFTER the idempotency replay for the reason `resolve_live_org`
+    // records: a genuine replay must still return the original response even if the
+    // environment went away in between.
+    crate::org_context::require_live_environment(state, &scope).await?;
 
     let flow = parse_flow(scope, flow_id)?;
     let body_string = decision_body(&flow, decision)?;

@@ -182,12 +182,10 @@ pub async fn create_flow_version(
     }
 
     // The environment must exist (a clean 404 rather than a foreign-key error).
-    state
-        .store()
-        .management()
-        .environments(scope.tenant())
-        .get(&scope.environment())
-        .await?;
+    // This used to be an inline copy of the two-line read. It is the shared
+    // [`crate::org_context::require_live_environment`] now (issue #443): one expression
+    // of one precondition, so a change to what LIVENESS means has one place to change.
+    crate::org_context::require_live_environment(&state, &scope).await?;
 
     let request: CreateFlowVersionRequest = parse_json(&body)?;
     // Store ONLY the validated result: a load-invalid artifact is a loud 400 and nothing is
@@ -356,7 +354,7 @@ pub async fn get_flow_version(
         (status = 200, description = "The now-pinned version", body = FlowVersionView),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "The version does not exist in this scope", body = ErrorBody),
+        (status = 404, description = "The version does not exist in this scope. The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody),
         (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
     )
 )]
@@ -382,6 +380,15 @@ pub async fn pin_flow_version(
     {
         return Ok(replay);
     }
+
+    // The parent-existence precondition, through the ONE expression of it (issues #443,
+    // #451). A `flow_versions` row survives its environment's soft delete, so the pin
+    // landed inside a decommissioned environment (MEASURED: 200, and a
+    // `flow_version_pins` row) while the version CREATE next door refused.
+    // It sits AFTER the idempotency replay for the reason `resolve_live_org`
+    // records: a genuine replay must still return the original response even if the
+    // environment went away in between.
+    crate::org_context::require_live_environment(&state, &scope).await?;
 
     // Resolve the target version BEFORE the pin so the response (the now-pinned version) is fully
     // known and can be stored under the idempotency key in the SAME transaction as the pin. A

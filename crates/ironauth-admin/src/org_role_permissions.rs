@@ -138,7 +138,7 @@ use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
 use crate::input::parse_json;
 use crate::org_context::{
-    OrgAccess, parse_permission_id, parse_role_id, require_role_in_org, resolve_live_org,
+    EnvironmentAccess, parse_permission_id, parse_role_id, require_role_in_org, resolve_live_org,
     resolve_scope,
 };
 use crate::org_effective_roles::{PermissionBudgetScope, PermissionBudgetView};
@@ -339,7 +339,8 @@ pub async fn assign_org_role_permission(
     // `an_attach_into_an_unreachable_environment_is_never_a_server_error`
     // records, including the one case that is NOT a refusal and is shared with every
     // organization-nested write in the tree.
-    let org_id = resolve_live_org(&state, scope, &organization_id, OrgAccess::Write).await?;
+    let org_id =
+        resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Write).await?;
     // The ROLE is resolved as a live role of THIS organization BEFORE the body is
     // parsed, and that ordering is the point rather than the read. Parsing the id
     // alone would leave the role's EXISTENCE to the store, which runs after the body,
@@ -493,7 +494,7 @@ pub async fn list_org_role_permissions(
     Query(query): Query<ListQuery>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
-    let org_id = resolve_live_org(&state, scope, &organization_id, OrgAccess::Read).await?;
+    let org_id = resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Read).await?;
     // The role is resolved as a live role of THIS organization first, so a role of a
     // sibling organization is the same 404 that reading the role itself gives, rather
     // than an empty page asserting it exists here and grants nothing. The read below
@@ -555,7 +556,8 @@ pub async fn unassign_org_role_permission(
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
-    let org_id = resolve_live_org(&state, scope, &organization_id, OrgAccess::Write).await?;
+    let org_id =
+        resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Write).await?;
     let role = parse_role_id(&state, scope, &role_id)?;
     let permission = parse_permission_id(&state, scope, &permission_id)?;
 

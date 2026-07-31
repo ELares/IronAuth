@@ -122,14 +122,12 @@ pub async fn plan_config_promotion(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     principal.require_operator()?;
-    let (tenant, scope) = scope_from_path(&state, &tenant_id, &environment_id)?;
+    let (_tenant, scope) = scope_from_path(&state, &tenant_id, &environment_id)?;
     // The target environment must exist (a clean 404 rather than an empty plan).
-    state
-        .store()
-        .management()
-        .environments(tenant)
-        .get(&scope.environment())
-        .await?;
+    // This used to be an inline copy of the two-line read. It is the shared
+    // [`crate::org_context::require_live_environment`] now (issue #443): one expression
+    // of one precondition, so a change to what LIVENESS means has one place to change.
+    crate::org_context::require_live_environment(&state, &scope).await?;
 
     let source = validate_document(&body)
         .map_err(|violations| ApiError::BadRequest(violation_message(&violations)))?;
@@ -189,17 +187,15 @@ pub async fn apply_config_promotion(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let actor = principal.require_operator()?;
-    let (tenant, scope) = scope_from_path(&state, &tenant_id, &environment_id)?;
+    let (_tenant, scope) = scope_from_path(&state, &tenant_id, &environment_id)?;
     // Sudo mutation gate: applying a config snapshot is the most powerful
     // environment-scoped write, so it requires a fresh elevation (issue #73). Placed
     // before the existence read and the apply, so a challenge leaves nothing written.
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
-    state
-        .store()
-        .management()
-        .environments(tenant)
-        .get(&scope.environment())
-        .await?;
+    // This used to be an inline copy of the two-line read. It is the shared
+    // [`crate::org_context::require_live_environment`] now (issue #443): one expression
+    // of one precondition, so a change to what LIVENESS means has one place to change.
+    crate::org_context::require_live_environment(&state, &scope).await?;
 
     let request: ApplyConfigPromotionRequest = parse_json(&body)?;
     let source_bytes = serde_json::to_vec(&request.source).map_err(|_| ApiError::Internal)?;

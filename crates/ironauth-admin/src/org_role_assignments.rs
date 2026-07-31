@@ -68,7 +68,7 @@ use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
 use crate::input::parse_json;
 use crate::org_context::{
-    OrgAccess, parse_group_id, parse_membership_id, parse_role_id, require_group_in_org,
+    EnvironmentAccess, parse_group_id, parse_membership_id, parse_role_id, require_group_in_org,
     require_membership_in_org, resolve_live_org, resolve_scope,
 };
 use crate::pagination::{ListQuery, Pagination};
@@ -243,7 +243,8 @@ pub async fn assign_org_group_role(
         return Ok(replay);
     }
 
-    let org_id = resolve_live_org(&state, scope, &organization_id, OrgAccess::Write).await?;
+    let org_id =
+        resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Write).await?;
     let group = parse_group_id(&state, scope, &group_id)?;
 
     let request: AssignOrgGroupRoleRequest = parse_json(&body)?;
@@ -336,7 +337,7 @@ pub async fn list_org_group_roles(
     Query(query): Query<ListQuery>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
-    let org_id = resolve_live_org(&state, scope, &organization_id, OrgAccess::Read).await?;
+    let org_id = resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Read).await?;
     // The group is resolved as a live group of THIS organization first, so a group
     // of a sibling organization is the same 404 that reading the group itself gives,
     // rather than an empty page asserting it exists here and grants nothing.
@@ -393,7 +394,8 @@ pub async fn unassign_org_group_role(
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
-    let org_id = resolve_live_org(&state, scope, &organization_id, OrgAccess::Write).await?;
+    let org_id =
+        resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Write).await?;
     let group = parse_group_id(&state, scope, &group_id)?;
     let role = parse_role_id(&state, scope, &role_id)?;
 
@@ -471,7 +473,8 @@ pub async fn assign_org_membership_role(
         return Ok(replay);
     }
 
-    let org_id = resolve_live_org(&state, scope, &organization_id, OrgAccess::Write).await?;
+    let org_id =
+        resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Write).await?;
     let membership = parse_membership_id(&state, scope, &membership_id)?;
 
     let request: AssignOrgMembershipRoleRequest = parse_json(&body)?;
@@ -560,7 +563,7 @@ pub async fn list_org_membership_roles(
     Query(query): Query<ListQuery>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
-    let org_id = resolve_live_org(&state, scope, &organization_id, OrgAccess::Read).await?;
+    let org_id = resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Read).await?;
     // The membership is resolved as a live membership of THIS organization first,
     // for the same reason the group lists resolve their group: a membership of a
     // sibling organization is the same 404 that removing it through this path gives.
@@ -620,7 +623,8 @@ pub async fn unassign_org_membership_role(
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
-    let org_id = resolve_live_org(&state, scope, &organization_id, OrgAccess::Write).await?;
+    let org_id =
+        resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Write).await?;
     let membership = parse_membership_id(&state, scope, &membership_id)?;
     let role = parse_role_id(&state, scope, &role_id)?;
 

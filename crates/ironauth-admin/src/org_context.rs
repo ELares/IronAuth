@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The shared ADDRESS resolution every endpoint nested under an organization
-//! performs first (issue #97).
+//! The shared ADDRESS resolution the environment-scoped endpoints perform first
+//! (issues #97, #411, #443, #451).
 //!
 //! Six modules' worth of endpoints hang off
 //! `/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}`,
@@ -41,7 +41,7 @@
 //!
 //! The answer is now one answer, and it is placed HERE rather than per endpoint,
 //! because per endpoint is exactly how it drifted. [`resolve_live_org`] takes an
-//! [`OrgAccess`] and performs the environment fence for a write, so all nineteen
+//! [`EnvironmentAccess`] and performs the environment fence for a write, so all nineteen
 //! organization-nested writes inherit it from the single call each of them already
 //! made, and the three organization-lifecycle writes in `organizations.rs` inherit it
 //! by resolving through the same function. There is ONE call to
@@ -49,29 +49,64 @@
 //! vocabulary create calls the same function, so the two cannot be given different
 //! answers without editing one place.
 //!
+//! # The organization surface was a THIRD of the defect (issue #451)
+//!
+//! Issue #411 fixed the surface it looked at and left the rest of the environment
+//! prefix untouched, and nothing measured the rest. Driven at a soft-deleted
+//! environment with one of every row seeded, TWENTY SIX of the seventy five documented
+//! environment-scoped writes still succeeded, of which issue #451 named three. The full
+//! measured list, and the before-and-after, is in
+//! `crates/ironauth-admin/tests/live_surface.rs`; the mechanism was the same one in
+//! every case, which is that soft-deleting an environment cascades to almost nothing, so
+//! each handler's own addressing read still found the row it was given and never asked
+//! about the parent.
+//!
+//! FIVE resolutions here now carry the fence behind a required [`EnvironmentAccess`]:
+//! [`resolve_live_org`] for the organization surface, [`resolve_user`] for the user
+//! surface (which is `users.rs`, `consents.rs`, the user session revoke, and the signup
+//! review queue), [`require_live_permission`] for the vocabulary, and
+//! [`require_live_resource_server`] and [`require_client_scope_policy`] for the two
+//! registries. The rest of the fixed writes had no shared resolution to put it behind
+//! and call [`require_live_environment`] directly, which is a weaker guarantee, stated
+//! plainly here rather than glossed: those call sites are constrained by the sweep and
+//! not by the type system.
+//!
 //! A READ keeps working, which is the same line issue #409 drew when it made an ABSENT
 //! environment the uniform not-found for every NON-GET operation under the environment
 //! prefix and left every GET alone. An operator who decommissions an environment still
 //! has to be able to see what is inside it, and the resurrection question issue #411
 //! raises (a restored environment returns carrying whatever was written while it was
-//! deleted) is only auditable if the listings still answer.
+//! deleted) is only auditable if the listings still answer. That line is now pinned over
+//! the WHOLE environment prefix rather than the organization subtree: the sweep drives
+//! every documented environment-scoped GET at a soft-deleted environment and requires
+//! the answer to match the live one. It has exactly one exception, `getManagementKey`,
+//! because deleting an environment CASCADES `deleted_at` onto its management
+//! credentials, which is a deliberate security property older than any of this.
 //!
 //! # What holds that in place, and what does NOT
 //!
-//! The required [`OrgAccess`] argument constrains CALLERS of [`resolve_live_org`]: an
-//! endpoint that resolves its organization through this function has to name an intent,
-//! and a case that names the wrong one is caught by `tests/deleted_environment.rs`,
-//! which requires the intent to match the method. That is a real constraint, and it is
-//! the only one the type system gives.
+//! The required [`EnvironmentAccess`] argument constrains CALLERS of the five resolutions
+//! that take it: an endpoint that resolves its row through one of them has to name an
+//! intent, and a call site that names the wrong one is caught by
+//! `tests/deleted_environment.rs` for the organization subtree and by the whole-prefix
+//! sweep in `tests/live_surface.rs` for the rest, both of which require the answer to
+//! match the method. That is a real constraint, and it is the only one the type system
+//! gives.
 //!
 //! It is NOT true that divergence cannot compile, and that claim used to stand here.
 //! The refutation is measured rather than argued: a new organization-nested write wired
 //! into `management_router`, resolving its organization with a bare `parse_id` and
 //! carrying no `#[utoipa::path]`, answers 204 and destroys a role row inside a
 //! soft-deleted environment with `tests/deleted_environment.rs` and
-//! `tests/openapi_contract.rs` both green. The argument constrains callers of this
-//! function; the sweep constrains DOCUMENTED routes; a route that is neither is
+//! `tests/openapi_contract.rs` both green. The argument constrains callers of these
+//! functions; the sweep constrains DOCUMENTED routes; a route that is neither is
 //! constrained by nothing.
+//!
+//! Issue #451 widened what escapes, and it is worth being exact. A handler that
+//! addresses a USER with a bare `UserId::parse_in_scope` instead of [`resolve_user`], or
+//! one that reads any other child row directly, is outside the argument in the same way.
+//! Nothing about the five resolutions prevents that; what catches it is the sweep, and
+//! only when the route is documented. It is the honest conditional and not a guarantee.
 //!
 //! What IS unbroken is the chain conditioned on documentation, and it is worth stating
 //! because it is what the sweep actually buys. IF the new route carries a
@@ -91,17 +126,24 @@
 //! Every claim on this surface that a write into a soft-deleted environment answers the
 //! uniform not-found is a claim about the default configuration, in which sudo mode is
 //! off. With sudo mode armed, [`crate::sudo::require_fresh_privilege`] runs BEFORE this
-//! function in all twenty two organization-addressed writes, so a caller whose elevation
-//! has lapsed is answered 401 `insufficient_user_authentication` and the environment
-//! liveness read never happens.
+//! function in every environment-scoped write, so a caller whose elevation has lapsed is
+//! answered 401 `insufficient_user_authentication` and the environment liveness read
+//! never happens.
 //!
 //! That is not an existence oracle, which is the property this fence is for: an ABSENT
-//! environment answers a lapsed elevation identically, so the two stay
-//! indistinguishable and only WHICH uniform answer the caller sees changes. It is still
-//! a gap, because the challenge path writes an `audit_log` row into the environment an
-//! operator believes is decommissioned. The ordering and that row are tracked as issue
-//! #452, they are shared with the absent-environment fence issue #409 built, and neither
-//! is addressed here.
+//! environment answers a lapsed elevation identically, so the two stay indistinguishable
+//! and only WHICH uniform answer the caller sees changes. It IS one write that lands in a
+//! soft-deleted environment: the challenge path records an
+//! `admin.privilege.challenged` row in the `audit_log` of the environment an operator
+//! believes is decommissioned (MEASURED: three audit rows to four).
+//!
+//! Issue #452 asked whether the ordering should change. The owner decided it should not
+//! and the row should stay, because an audit record of a REJECTED attempt against a
+//! decommissioned environment is worth having. So the sentence to carry away is the
+//! qualified one: the organization-nested write path, and every other environment-scoped
+//! write, refuses a soft-deleted environment in the DEFAULT configuration, and an armed
+//! sudo challenge is a deliberate exception. The reasoning and the measurement live on
+//! [`crate::sudo::require_fresh_privilege`].
 //!
 //! # Two callers here are NOT nested under an organization
 //!
@@ -142,7 +184,7 @@
 use ironauth_store::{
     ActorRef, ClientId, ClientScopePolicy, OrgGroupId, OrgMembershipId, OrgMembershipRecord,
     OrgRoleId, OrgRoleRecord, OrganizationId, PermissionId, PermissionRecord, ResourceServerId,
-    ResourceServerRecord, Scope,
+    ResourceServerRecord, Scope, UserId,
 };
 
 use crate::auth::Principal;
@@ -179,23 +221,29 @@ pub fn resolve_scope(
     Ok((Scope::new(tenant, environment), actor))
 }
 
-/// What the caller resolving an organization is about to do with it: the ONE thing the
-/// endpoints nested under an organization do not all agree about, and therefore the one
-/// thing each of them has to say (issue #411).
+/// What the caller resolving a row is about to do with the environment that row hangs
+/// off: the ONE thing the environment-scoped endpoints do not all agree about, and
+/// therefore the one thing each of them has to say (issues #411, #451).
 ///
 /// It is a named intent rather than a `bool` so that a call site reads as the decision
 /// it is, and it is a required argument rather than a defaulted one so that a new
-/// organization-nested endpoint RESOLVING THROUGH THIS FUNCTION cannot inherit the wrong
-/// answer by saying nothing. One that addresses its organization some other way is
-/// outside the argument altogether; the module note on what holds this in place says so
-/// and says what does catch it. The backstop for a case that names the wrong variant is
-/// `tests/deleted_environment.rs`, which drives every operation the committed contract
-/// publishes under the organization prefix and requires the intent to match the method.
+/// endpoint RESOLVING THROUGH ONE OF THESE FUNCTIONS cannot inherit the wrong answer by
+/// saying nothing. One that addresses its row some other way is outside the argument
+/// altogether; the module note on what holds this in place says so and says what does
+/// catch it. The backstop for a call site that names the wrong variant is the
+/// whole-surface sweep in `tests/live_surface.rs`, which drives every operation the
+/// committed contract publishes under the environment prefix at a soft-deleted
+/// environment and requires the answer to match the method.
+///
+/// It is ONE enum across every resolution rather than one per surface. Issue #411
+/// introduced it for organizations alone, under the name `OrgAccess`; issue #451 found
+/// the same question being answered differently on the user surface, and a second enum
+/// spelling the same two intents would have been the very thing issue #443 is about.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum OrgAccess {
+pub enum EnvironmentAccess {
     /// The request only READS. A soft-deleted environment is not fenced: its
-    /// organizations, roles, groups and memberships stay listable, which is what an
-    /// operator auditing a decommissioned environment needs and what makes the
+    /// organizations, roles, groups, memberships and users stay listable, which is what
+    /// an operator auditing a decommissioned environment needs and what makes the
     /// resurrection question answerable.
     Read,
     /// The request WRITES. The environment must exist and be live, or the write would
@@ -211,13 +259,13 @@ pub enum OrgAccess {
 /// # Errors
 ///
 /// [`ApiError::NotFound`] if the segment is malformed, out of scope, absent, or
-/// soft-deleted, or, on an [`OrgAccess::Write`], if the environment is absent or
+/// soft-deleted, or, on an [`EnvironmentAccess::Write`], if the environment is absent or
 /// soft-deleted.
 pub async fn resolve_live_org(
     state: &AdminState,
     scope: Scope,
     organization_id: &str,
-    access: OrgAccess,
+    access: EnvironmentAccess,
 ) -> Result<OrganizationId, ApiError> {
     // The GRANDPARENT-existence precondition (issue #411), and the ONE copy of it
     // behind the organization surface. It runs BEFORE the organization segment is even
@@ -245,7 +293,7 @@ pub async fn resolve_live_org(
     // not-found. Hoisting this precondition above the replay in `create_org_role` was
     // measured to fail that test and nothing else in the file; the other six are driven
     // by the same loop, which reports the route by name.
-    if access == OrgAccess::Write {
+    if access == EnvironmentAccess::Write {
         require_live_environment(state, &scope).await?;
     }
     let organizations = state.store().management().organizations(scope);
@@ -338,6 +386,46 @@ pub async fn require_live_environment(state: &AdminState, scope: &Scope) -> Resu
     Ok(())
 }
 
+/// Resolve an untrusted user id in scope and, for a WRITE, verify that the environment
+/// the user hangs off is live: the user surface's equivalent of [`resolve_live_org`]
+/// (issue #451).
+///
+/// Soft-deleting an environment does not cascade to its users, so the `users` row
+/// survives and a handler's own addressing read still finds it. Every write on this
+/// surface therefore LANDED in an environment an operator believed they had
+/// decommissioned, while `POST .../users` refused the identical request because it
+/// carried the parent-existence precondition for an unrelated reason. That is the same
+/// split issue #411 closed on the organization surface, on a surface that issue did not
+/// name, and it is closed the same way: the fence lives in the resolution behind a
+/// required [`EnvironmentAccess`], so a handler that addresses a user through this
+/// function cannot inherit an answer by saying nothing.
+///
+/// The ordering is "prove the parent, then address the child", which is free here: a
+/// malformed user id and a live one in a deleted environment are both the uniform
+/// not-found, so no caller can tell which check refused.
+///
+/// A READ is not fenced, deliberately, and that is the same line issue #409 drew for an
+/// ABSENT environment and issue #411 for a soft-deleted one. An operator who
+/// decommissions an environment still has to be able to see the users inside it, and the
+/// resurrection question (a restored environment comes back carrying whatever was
+/// written while it was deleted) is only auditable if the reads still answer.
+///
+/// # Errors
+///
+/// [`ApiError::NotFound`] if the id is malformed or out of scope, or, on an
+/// [`EnvironmentAccess::Write`], if the environment is absent or soft-deleted.
+pub async fn resolve_user(
+    state: &AdminState,
+    scope: Scope,
+    user_id: &str,
+    access: EnvironmentAccess,
+) -> Result<UserId, ApiError> {
+    if access == EnvironmentAccess::Write {
+        require_live_environment(state, &scope).await?;
+    }
+    UserId::parse_in_scope(user_id, &scope).map_err(|_| ApiError::NotFound)
+}
+
 /// Parse an untrusted permission id in scope, under the same uniform not-found as
 /// [`parse_group_id`].
 ///
@@ -372,14 +460,24 @@ pub fn parse_permission_id(
 /// "nonsense", which is what stops the vocabulary from being an existence oracle
 /// over a sibling environment's capability names.
 ///
+/// For a WRITE it also verifies the ENVIRONMENT is live, for the reason
+/// [`resolve_user`] records: `permissions` rows survive their environment's soft delete,
+/// so `updatePermission` and `deletePermission` both LANDED inside a decommissioned
+/// environment (MEASURED: 200 and 204) while `createPermission` next door refused.
+///
 /// # Errors
 ///
-/// [`ApiError::NotFound`] if the id is malformed, out of scope, absent, or deleted.
+/// [`ApiError::NotFound`] if the id is malformed, out of scope, absent, or deleted, or,
+/// on an [`EnvironmentAccess::Write`], if the environment is absent or soft-deleted.
 pub async fn require_live_permission(
     state: &AdminState,
     scope: Scope,
     permission_id: &str,
+    access: EnvironmentAccess,
 ) -> Result<PermissionRecord, ApiError> {
+    if access == EnvironmentAccess::Write {
+        require_live_environment(state, &scope).await?;
+    }
     let id = parse_permission_id(state, scope, permission_id)?;
     Ok(state
         .store()
@@ -425,14 +523,24 @@ pub fn parse_resource_server_id(
 /// a promotion hard-deleted is simply absent, and reads exactly like one that never
 /// existed.
 ///
+/// For a WRITE it also verifies the ENVIRONMENT is live, for the reason
+/// [`resolve_user`] records: a `resource_servers` row survives its environment's soft
+/// delete, so `updateResourceServerPermissionClaims` LANDED inside a decommissioned
+/// environment (MEASURED: 200).
+///
 /// # Errors
 ///
-/// [`ApiError::NotFound`] if the id is malformed, out of scope, or absent.
+/// [`ApiError::NotFound`] if the id is malformed, out of scope, or absent, or, on an
+/// [`EnvironmentAccess::Write`], if the environment is absent or soft-deleted.
 pub async fn require_live_resource_server(
     state: &AdminState,
     scope: Scope,
     resource_server_id: &str,
+    access: EnvironmentAccess,
 ) -> Result<ResourceServerRecord, ApiError> {
+    if access == EnvironmentAccess::Write {
+        require_live_environment(state, &scope).await?;
+    }
     let id = parse_resource_server_id(state, scope, resource_server_id)?;
     Ok(state
         .store()
@@ -460,14 +568,23 @@ pub async fn require_live_resource_server(
 /// [`ironauth_store::ClientRepo`], so this surface can read one column of a client
 /// and nothing else.
 ///
+/// For a WRITE it also verifies the ENVIRONMENT is live, for the reason
+/// [`resolve_user`] records: a `clients` row survives its environment's soft delete, so
+/// `setClientAllowedScopes` LANDED inside a decommissioned environment (MEASURED: 200).
+///
 /// # Errors
 ///
-/// [`ApiError::NotFound`] if the id is malformed, out of scope, or absent.
+/// [`ApiError::NotFound`] if the id is malformed, out of scope, or absent, or, on an
+/// [`EnvironmentAccess::Write`], if the environment is absent or soft-deleted.
 pub async fn require_client_scope_policy(
     state: &AdminState,
     scope: Scope,
     client_id: &str,
+    access: EnvironmentAccess,
 ) -> Result<(ClientId, ClientScopePolicy), ApiError> {
+    if access == EnvironmentAccess::Write {
+        require_live_environment(state, &scope).await?;
+    }
     let policies = state.store().management().client_scope_policies(scope);
     let id = policies.parse_id(client_id)?;
     let policy = policies.get(&id).await?;

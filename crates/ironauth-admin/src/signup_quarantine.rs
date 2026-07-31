@@ -26,6 +26,7 @@ use crate::auth::Principal;
 use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
 use crate::input::parse_json;
+use crate::org_context::{EnvironmentAccess, resolve_user};
 use crate::pagination::{ListQuery, Pagination};
 use crate::response::json;
 use crate::state::AdminState;
@@ -59,8 +60,14 @@ fn resolve_scope(
 
 /// Parse a subject (`usr_...`) under this scope, mapping a malformed or cross-scope id to the
 /// uniform not-found.
-fn parse_subject(scope: Scope, raw: &str) -> Result<UserId, ApiError> {
-    UserId::parse_in_scope(raw, &scope).map_err(|_| ApiError::NotFound)
+async fn parse_subject(state: &AdminState, scope: Scope, raw: &str) -> Result<UserId, ApiError> {
+    // The review queue decides a QUARANTINED SIGNUP, which is a `users` row, so it
+    // addresses one through the one user resolution (issue #451) rather than parsing the
+    // segment itself. All three decisions WRITE: an approve lifts the hold, a reject
+    // fences the account, an extend moves the deadline. Soft-deleting an environment does
+    // not cascade to its users, so all three used to land inside a decommissioned
+    // environment (MEASURED: 200, 200 and 200 respectively, against a live queue).
+    resolve_user(state, scope, raw, EnvironmentAccess::Write).await
 }
 
 /// The deterministic decision body, built without a re-read so an Idempotency-Key replay is
@@ -147,7 +154,7 @@ pub async fn list_signup_quarantines(
         (status = 200, description = "The account is released", body = SignupQuarantineDecisionView),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Not found (no open case, absent, or feature disabled)", body = ErrorBody),
+        (status = 404, description = "Not found (no open case, absent, or feature disabled). The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody),
         (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
     )
 )]
@@ -173,7 +180,7 @@ pub async fn approve_signup_quarantine(
         return Ok(replay);
     }
 
-    let subject = parse_subject(scope, &user_id)?;
+    let subject = parse_subject(&state, scope, &user_id).await?;
     let body_string = decision_body(&subject, SignupQuarantineStateView::Approved, None)?;
     let write = IdempotencyWrite {
         credential_ref: &credential_ref,
@@ -216,7 +223,7 @@ pub async fn approve_signup_quarantine(
         (status = 200, description = "The signup is rejected", body = SignupQuarantineDecisionView),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Not found (no open case, absent, or feature disabled)", body = ErrorBody),
+        (status = 404, description = "Not found (no open case, absent, or feature disabled). The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody),
         (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
     )
 )]
@@ -242,7 +249,7 @@ pub async fn reject_signup_quarantine(
         return Ok(replay);
     }
 
-    let subject = parse_subject(scope, &user_id)?;
+    let subject = parse_subject(&state, scope, &user_id).await?;
     let body_string = decision_body(&subject, SignupQuarantineStateView::Rejected, None)?;
     let write = IdempotencyWrite {
         credential_ref: &credential_ref,
@@ -288,7 +295,7 @@ pub async fn reject_signup_quarantine(
         (status = 400, description = "Malformed request (extend_secs missing or zero)", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Not found (no open case, absent, or feature disabled)", body = ErrorBody),
+        (status = 404, description = "Not found (no open case, absent, or feature disabled). The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody),
         (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
     )
 )]
@@ -306,6 +313,35 @@ pub async fn extend_signup_quarantine(
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
 
+    let key = idempotency::required_key(&headers)?;
+    // The fingerprint is over the concrete body, so a replay with the SAME key but a
+    // different window is a 422 rather than a silent no-op. It is taken over the RAW
+    // bytes, so it does not need the body parsed first and nothing is lost by ordering
+    // the parse after it.
+    let fingerprint = idempotency::fingerprint("POST", uri.path(), &body);
+    let credential_ref = principal.credential_ref();
+    if let Some(replay) =
+        idempotency::replay_if_stored(&state, &credential_ref, &key, &fingerprint).await?
+    {
+        return Ok(replay);
+    }
+
+    // The ADDRESS before the BODY, exactly as `users::set_user_state` orders it, and this
+    // route is the sibling that did not get the treatment when that one did. It read the
+    // body FIRST, so a decommissioned environment answered 400 `bad_request` for a
+    // malformed body and 400 "extend_secs must be at least 1" for a zero window
+    // (MEASURED, both), while `approve` and `reject` next door answered the uniform
+    // not-found. The claim that all twenty six of the fixed writes answer the uniform
+    // not-found was therefore true only of well formed requests here.
+    //
+    // As on `set_user_state`, what this buys is that a decommissioned environment answers
+    // not-found to everything reaching the fence, and its cost at a LIVE environment is
+    // that an unaddressable user id plus a malformed body is now 404 rather than 400.
+    // It stays AFTER the idempotency replay for the reason `resolve_live_org` records: a
+    // genuine replay must keep returning the original response even if the environment
+    // went away in between.
+    let subject = parse_subject(&state, scope, &user_id).await?;
+
     let request: ExtendSignupQuarantineRequest = parse_json(&body)?;
     if request.extend_secs == 0 {
         return Err(ApiError::BadRequest(
@@ -321,18 +357,6 @@ pub async fn extend_signup_quarantine(
         .unwrap_or(i64::MAX);
     let quarantined_until_micros = now_micros.saturating_add(added_micros);
 
-    let key = idempotency::required_key(&headers)?;
-    // The fingerprint is over the concrete body, so a replay with the SAME key but a
-    // different window is a 422 rather than a silent no-op.
-    let fingerprint = idempotency::fingerprint("POST", uri.path(), &body);
-    let credential_ref = principal.credential_ref();
-    if let Some(replay) =
-        idempotency::replay_if_stored(&state, &credential_ref, &key, &fingerprint).await?
-    {
-        return Ok(replay);
-    }
-
-    let subject = parse_subject(scope, &user_id)?;
     let body_string = decision_body(
         &subject,
         SignupQuarantineStateView::Extended,

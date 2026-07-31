@@ -38,7 +38,7 @@ use crate::auth::Principal;
 use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
 use crate::input::{parse_json, require_non_empty};
-use crate::org_context::require_live_environment;
+use crate::org_context::{EnvironmentAccess, require_live_environment, resolve_user};
 use crate::pagination::{ListQuery, Pagination};
 use crate::response::{json, no_content};
 use crate::state::AdminState;
@@ -94,8 +94,15 @@ fn resolve_scope(
     Ok((Scope::new(tenant, environment), actor))
 }
 
-/// Parse a user id under this scope, mapping a malformed or cross-scope id to the
-/// uniform not-found.
+/// Parse a CALLER-SUPPLIED id for a user this request is about to MINT, mapping a
+/// malformed or cross-scope id to the uniform not-found.
+///
+/// This is the one place on the surface where a user id is parsed without addressing an
+/// existing row, and it is why it survives issue #451's fold. Every route that ADDRESSES
+/// a user goes through [`crate::org_context::resolve_user`], which performs the
+/// environment fence for a write; `create_user` proves the environment live itself, one
+/// line above, and then reads this optional id out of the body as the identity to give
+/// the row it is creating.
 fn parse_user_id(scope: Scope, raw: &str) -> Result<UserId, ApiError> {
     UserId::parse_in_scope(raw, &scope).map_err(|_| ApiError::NotFound)
 }
@@ -146,12 +153,16 @@ pub async fn create_user(
 
     // Containment: the parent environment must exist and be live. A foreign or
     // soft-deleted environment reads as a uniform not-found.
-    state
-        .store()
-        .management()
-        .environments(scope.tenant())
-        .get(&scope.environment())
-        .await?;
+    //
+    // This used to be an inline copy of the two-line read (issue #443). It is the
+    // shared [`require_live_environment`] now, which is the same function every OTHER
+    // user route reaches through [`resolve_user`]: a create that refused a deleted
+    // environment while `updateUser`, `setUserState`, `deleteUser` and
+    // `unlinkUserExternalId` all accepted one was the split issue #451 closed, and one
+    // copy of the check is what keeps the halves from drifting apart again. The create
+    // cannot go through `resolve_user` itself, because it MINTS the user rather than
+    // addressing one.
+    require_live_environment(&state, &scope).await?;
 
     let request: CreateUserRequest = parse_json(&body)?;
     let identifier = require_non_empty(&request.identifier, "identifier")?;
@@ -319,7 +330,7 @@ pub async fn get_user(
     Path((tenant_id, environment_id, user_id)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
-    let id = parse_user_id(scope, &user_id)?;
+    let id = resolve_user(&state, scope, &user_id, EnvironmentAccess::Read).await?;
     let record = state.store().scoped(scope).users().get(&id).await?;
     let body =
         serde_json::to_string(&UserView::from_record(record)).map_err(|_| ApiError::Internal)?;
@@ -344,7 +355,7 @@ pub async fn get_user(
         (status = 400, description = "Malformed request", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Not found (absent or in another scope)", body = ErrorBody)
+        (status = 404, description = "Not found (absent or in another scope). The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody)
     )
 )]
 pub async fn update_user(
@@ -355,7 +366,7 @@ pub async fn update_user(
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
-    let id = parse_user_id(scope, &user_id)?;
+    let id = resolve_user(&state, scope, &user_id, EnvironmentAccess::Write).await?;
     let request: UpdateUserRequest = parse_json(&body)?;
     if let Some(claims) = request.claims.as_ref() {
         let claims_json = claims.to_string();
@@ -394,7 +405,7 @@ pub async fn update_user(
         (status = 204, description = "Deleted (sessions cascaded, session-ended events published)"),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Not found (absent, already deleted, or in another scope)", body = ErrorBody)
+        (status = 404, description = "Not found (absent, already deleted, or in another scope). The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody)
     )
 )]
 pub async fn delete_user(
@@ -405,7 +416,7 @@ pub async fn delete_user(
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
-    let id = parse_user_id(scope, &user_id)?;
+    let id = resolve_user(&state, scope, &user_id, EnvironmentAccess::Write).await?;
     state
         .store()
         .scoped(scope)
@@ -436,7 +447,7 @@ pub async fn delete_user(
         (status = 400, description = "Malformed request", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Not found (absent or in another scope)", body = ErrorBody),
+        (status = 404, description = "Not found (absent or in another scope). The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody),
         (status = 409, description = "The transition is not valid from the user's current state", body = ErrorBody),
         (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
     )
@@ -461,6 +472,37 @@ pub async fn set_user_state(
         return Ok(replay);
     }
 
+    // Addressed BEFORE the body is validated, which is where every sibling
+    // environment-scoped write puts its parent-existence precondition. What that ordering
+    // buys is stated exactly here, because the obvious claim about it is the wrong way
+    // round. It does NOT make a live environment and a decommissioned one answer alike:
+    // MEASURED with a malformed body, a live environment answers 400 and a soft-deleted
+    // one answers 404, and under the OLD ordering both answered 400, so this ordering
+    // CREATES that difference rather than removing it.
+    //
+    // What it buys is the other property, and it is the one worth having: a
+    // decommissioned environment answers the uniform not-found to EVERYTHING that reaches
+    // this fence, well formed or not. No request shape gets a body-level answer out of an
+    // environment an operator believes is gone, and in particular no 400 confirms that
+    // the body was readable there.
+    //
+    // The cost is a wire change at a LIVE environment too, small but real and recorded
+    // rather than discovered later: a request carrying BOTH an unaddressable user id and
+    // a malformed body used to be answered 400 and is now answered 404. The address wins,
+    // which is the precedence `set_client_allowed_scopes` and `update_permission` already
+    // use for the same anti-oracle reason.
+    //
+    // It sits AFTER the idempotency replay for the reason `resolve_live_org` records: a
+    // genuine replay still returns the original response even if the environment went
+    // away in between, so a retry of a request that ALREADY SUCCEEDED never becomes a 404
+    // the client cannot tell from "my write never landed". The replay's own precondition
+    // stays ahead of the fence with it, so a request with NO Idempotency-Key is still
+    // answered 400 "the Idempotency-Key header is required on POST" at a decommissioned
+    // environment (MEASURED). That 400 is deliberate and predates this fence (issue
+    // #411); it is a statement about the request, not about the environment, and every
+    // environment answers it identically.
+    let id = resolve_user(&state, scope, &user_id, EnvironmentAccess::Write).await?;
+
     let request: SetUserStateRequest = parse_json(&body)?;
     let target: UserState = request.state.into();
     // A scheduled-offboarding target needs an instant; every other target must not
@@ -480,7 +522,6 @@ pub async fn set_user_state(
         }
         (_, None) => None,
     };
-    let id = parse_user_id(scope, &user_id)?;
 
     let view = UserStateChangeView {
         id: id.to_string(),
@@ -560,8 +601,12 @@ pub async fn link_user_external_id(
     // `environments`), and the MEASURED answer was the store's envelope failure
     // rendered as an opaque 500. There is no Idempotency-Key on this PUT, so nothing
     // orders ahead of it.
-    require_live_environment(&state, &scope).await?;
-    let id = parse_user_id(scope, &user_id)?;
+    //
+    // It was a bare `require_live_environment` call here, and it is
+    // [`crate::org_context::resolve_user`] that carries it now (issue #451): the same
+    // fence, reached through the same function every other user-addressed write reaches,
+    // so this route can no longer be the only one on the surface that has it.
+    let id = resolve_user(&state, scope, &user_id, EnvironmentAccess::Write).await?;
     let request: LinkExternalIdRequest = parse_json(&body)?;
     let external_id = require_non_empty(&request.external_id, "external_id")?;
     let result = state
@@ -603,7 +648,7 @@ pub async fn link_user_external_id(
         (status = 200, description = "The external id was unlinked", body = UserExternalIdView),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Not found (absent or in another scope)", body = ErrorBody)
+        (status = 404, description = "Not found (absent or in another scope). The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody)
     )
 )]
 pub async fn unlink_user_external_id(
@@ -613,7 +658,7 @@ pub async fn unlink_user_external_id(
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
-    let id = parse_user_id(scope, &user_id)?;
+    let id = resolve_user(&state, scope, &user_id, EnvironmentAccess::Write).await?;
     state
         .store()
         .scoped(scope)

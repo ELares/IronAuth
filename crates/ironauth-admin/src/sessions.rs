@@ -30,7 +30,7 @@ use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::Response;
 use ironauth_store::{
     CorrelationId, IdempotencyWrite, RefreshFamilyFleetFilter, Scope, SessionEndCause, SessionId,
-    StoreError, TenantId, UserId,
+    StoreError, TenantId,
 };
 use serde::Deserialize;
 use utoipa::IntoParams;
@@ -39,7 +39,7 @@ use crate::auth::Principal;
 use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
 use crate::input::parse_json;
-use crate::org_context::require_live_environment;
+use crate::org_context::{EnvironmentAccess, require_live_environment, resolve_user};
 use crate::pagination::{ListQuery, Pagination};
 use crate::response::json;
 use crate::state::AdminState;
@@ -454,11 +454,15 @@ pub async fn revoke_user_sessions(
     // route never reads the user (revoking every session of a subject that owns none is
     // a legitimate no-op), so the audit row is the first thing to reach the foreign key
     // and an absent environment was MEASURED as an opaque 500.
-    require_live_environment(&state, &scope).await?;
+    //
+    // It was a bare `require_live_environment` call; issue #451 folded it into
+    // [`resolve_user`], so this route reaches the fence through the same function as
+    // every other user-addressed write and cannot drift from them.
+    //
+    // A user id from another scope (or a malformed one) is the uniform not-found.
+    let subject = resolve_user(&state, scope, &user_id, EnvironmentAccess::Write).await?;
 
     let request = revoke_request(&body)?;
-    // A user id from another scope (or a malformed one) is the uniform not-found.
-    let subject = UserId::parse_in_scope(&user_id, &scope).map_err(|_| StoreError::NotFound)?;
 
     let view = UserRevocationView {
         subject: subject.to_string(),

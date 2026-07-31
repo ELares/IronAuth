@@ -140,7 +140,7 @@ pub async fn create_dcr_policy(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let actor = principal.require_operator()?;
-    let (tenant, scope) = scope_from_path(&state, &tenant_id, &environment_id)?;
+    let (_tenant, scope) = scope_from_path(&state, &tenant_id, &environment_id)?;
     // Sudo mutation gate (issue #73): writing a DCR policy is an environment-scoped
     // mutation. Gate before the idempotency replay so a challenge writes nothing.
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
@@ -173,12 +173,10 @@ pub async fn create_dcr_policy(
     let primitives_text = serialize_chain(&primitives).map_err(|_| ApiError::Internal)?;
 
     // The environment must exist (a clean 404 rather than a foreign-key error).
-    state
-        .store()
-        .management()
-        .environments(tenant)
-        .get(&scope.environment())
-        .await?;
+    // This used to be an inline copy of the two-line read. It is the shared
+    // [`crate::org_context::require_live_environment`] now (issue #443): one expression
+    // of one precondition, so a change to what LIVENESS means has one place to change.
+    crate::org_context::require_live_environment(&state, &scope).await?;
 
     let created_at_micros = state.now_unix_micros();
     let id = DcrPolicyId::generate(state.env(), &scope);
@@ -310,7 +308,7 @@ pub async fn create_initial_access_token(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let actor = principal.require_operator()?;
-    let (tenant, scope) = scope_from_path(&state, &tenant_id, &environment_id)?;
+    let (_tenant, scope) = scope_from_path(&state, &tenant_id, &environment_id)?;
     // Sudo mutation gate (issue #73): minting a bearer IAT is an environment-scoped
     // mutation. Gate before the idempotency replay so a challenge writes nothing.
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
@@ -332,12 +330,10 @@ pub async fn create_initial_access_token(
     }
 
     // The environment must exist (a clean 404).
-    state
-        .store()
-        .management()
-        .environments(tenant)
-        .get(&scope.environment())
-        .await?;
+    // This used to be an inline copy of the two-line read. It is the shared
+    // [`crate::org_context::require_live_environment`] now (issue #443): one expression
+    // of one precondition, so a change to what LIVENESS means has one place to change.
+    crate::org_context::require_live_environment(&state, &scope).await?;
 
     // Resolve the attached policy chain (by name, in order) to its primitive
     // snapshot, so a later edit or deletion of a named policy never changes an
@@ -475,7 +471,7 @@ pub async fn get_dcr_client(
         (status = 400, description = "Malformed request", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Not found (absent, not a DCR client, or in another scope)", body = ErrorBody),
+        (status = 404, description = "Not found (absent, not a DCR client, or in another scope). The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody),
         (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
     )
 )]
@@ -500,6 +496,15 @@ pub async fn verify_dcr_client(
     {
         return Ok(replay);
     }
+
+    // The parent-existence precondition, through the ONE expression of it (issues #443,
+    // #451). Verifying LIFTS a client's quarantine, and a `clients` row survives its
+    // environment's soft delete, so this un-quarantined a client inside a decommissioned
+    // environment (MEASURED: 200) while both DCR creates next door refused.
+    // It sits AFTER the idempotency replay for the reason `resolve_live_org`
+    // records: a genuine replay must still return the original response even if the
+    // environment went away in between.
+    crate::org_context::require_live_environment(&state, &scope).await?;
 
     let id: ClientId = state.store().scoped(scope).clients().parse_id(&client_id)?;
     let verified_at_micros = state.now_unix_micros();

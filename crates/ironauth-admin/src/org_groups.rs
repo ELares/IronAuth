@@ -65,7 +65,7 @@ use crate::auth::Principal;
 use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
 use crate::input::{parse_json, require_non_empty, require_slug};
-use crate::org_context::{OrgAccess, parse_group_id, resolve_live_org, resolve_scope};
+use crate::org_context::{EnvironmentAccess, parse_group_id, resolve_live_org, resolve_scope};
 use crate::pagination::{ListQuery, Pagination};
 use crate::response::{json, no_content};
 use crate::state::AdminState;
@@ -264,7 +264,8 @@ pub async fn create_org_group(
         return Ok(replay);
     }
 
-    let org_id = resolve_live_org(&state, scope, &organization_id, OrgAccess::Write).await?;
+    let org_id =
+        resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Write).await?;
 
     let request: CreateOrgGroupRequest = parse_json(&body)?;
     let slug = require_slug(&request.slug, "slug")?;
@@ -361,7 +362,7 @@ pub async fn list_org_groups(
     Query(query): Query<ListQuery>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
-    let org_id = resolve_live_org(&state, scope, &organization_id, OrgAccess::Read).await?;
+    let org_id = resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Read).await?;
     let page = Pagination::resolve(&query, state.default_page_size(), state.max_page_size())?;
     // `list_for_org` filters on organization_id, so a sibling organization's groups
     // can never appear on this page.
@@ -413,7 +414,7 @@ pub async fn get_org_group(
     )>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
-    let org_id = resolve_live_org(&state, scope, &organization_id, OrgAccess::Read).await?;
+    let org_id = resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Read).await?;
     let id = parse_group_id(&state, scope, &group_id)?;
     let record = read_group_in_org(&state, scope, &org_id, &id).await?;
     let body = serde_json::to_string(&OrgGroupView::from_record(record))
@@ -457,7 +458,8 @@ pub async fn update_org_group(
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
-    let org_id = resolve_live_org(&state, scope, &organization_id, OrgAccess::Write).await?;
+    let org_id =
+        resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Write).await?;
     let id = parse_group_id(&state, scope, &group_id)?;
 
     let request: UpdateOrgGroupRequest = parse_json(&body)?;
@@ -535,7 +537,8 @@ pub async fn set_org_group_parent(
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
-    let org_id = resolve_live_org(&state, scope, &organization_id, OrgAccess::Write).await?;
+    let org_id =
+        resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Write).await?;
     let id = parse_group_id(&state, scope, &group_id)?;
 
     let request: SetOrgGroupParentRequest = parse_json(&body)?;
@@ -599,7 +602,8 @@ pub async fn delete_org_group(
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
-    let org_id = resolve_live_org(&state, scope, &organization_id, OrgAccess::Write).await?;
+    let org_id =
+        resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Write).await?;
     let id = parse_group_id(&state, scope, &group_id)?;
     // The organization rides into the DELETE statement as a predicate: a group of a
     // sibling organization matches no row, is the uniform not-found, and is not
