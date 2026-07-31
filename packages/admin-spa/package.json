@@ -13,17 +13,17 @@
   },
   "dependencies": {
     "@preact/signals": "^2.0.1",
-    "openapi-fetch": "^0.13.5",
+    "openapi-fetch": "^0.17.0",
     "preact": "^10.25.4",
     "preact-iso": "^2.9.1"
   },
   "devDependencies": {
     "@preact/preset-vite": "^2.9.4",
-    "jsdom": "^25.0.1",
+    "jsdom": "^29.1.1",
     "openapi-typescript": "^7.5.0",
     "typescript": "5.6.3",
-    "vite": "^6.0.7",
-    "vitest": "^2.1.9"
+    "vite": "^8.0.0",
+    "vitest": "^4.0.0"
   },
   "engines": {
     "node": ">=20"
