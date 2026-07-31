@@ -95,6 +95,7 @@ mod disposable;
 mod dpop;
 mod email_otp;
 mod error;
+pub mod factor_downgrade;
 mod fedcm;
 mod federation;
 mod federation_client_secret;

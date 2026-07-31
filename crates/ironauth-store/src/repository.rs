@@ -69,8 +69,8 @@ use crate::custom_domain::{
     VerificationStatus,
 };
 use crate::email_otp::{
-    ActiveEmailOtpCode, EmailFactorPurpose, MagicLinkChallenge, MagicLinkConsumeOutcome,
-    NewEmailOtpCode, NewMagicLink, OtpAttemptOutcome,
+    ActiveEmailOtpCode, EmailFactorConfig, EmailFactorPurpose, MagicLinkChallenge,
+    MagicLinkConsumeOutcome, NewEmailOtpCode, NewMagicLink, OtpAttemptOutcome,
 };
 use crate::environment::{EnvironmentType, GuardrailSet};
 use crate::error::StoreError;
@@ -1165,6 +1165,18 @@ impl<'a> ScopedStore<'a> {
         }
     }
 
+    /// The read-only email-FACTOR configuration repository for this scope (issue
+    /// #267): read the per-tenant factor-downgrade opt-in the email possession family
+    /// (email OTP, magic link, headless recovery) is gated on. Writing it is an
+    /// audited mutation on [`ActingStore::email_factor_config`].
+    #[must_use]
+    pub fn email_factor_config(&self) -> EmailFactorConfigRepo<'a> {
+        EmailFactorConfigRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
     /// The read-only scanner-safe magic-link repository for this scope (issue #68):
     /// resolve an ACTIVE link by its same-device binding digest (the cross-device
     /// short-code path) so the caller can verify the short code through the hashing
@@ -1468,6 +1480,17 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn email_otp_codes(&self) -> ActingEmailOtpCodeRepo<'a> {
         ActingEmailOtpCodeRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating email-FACTOR configuration repository for this scope and actor
+    /// (issue #267): set the per-tenant factor-downgrade opt-in, audited.
+    #[must_use]
+    pub fn email_factor_config(&self) -> ActingEmailFactorConfigRepo<'a> {
+        ActingEmailFactorConfigRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -7305,6 +7328,135 @@ impl AuditTarget for SmsConfigTarget {
 
     fn audit_target_id(&self) -> String {
         "sms_config".to_owned()
+    }
+}
+
+/// The read-only per (tenant, environment) EMAIL-FACTOR configuration repository
+/// (issue #267): the factor-downgrade opt-in the email possession family is gated on.
+pub struct EmailFactorConfigRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl EmailFactorConfigRepo<'_> {
+    /// The per (tenant, environment) email-factor configuration (issue #267). A scope
+    /// with NO row resolves to [`EmailFactorConfig::default`], whose
+    /// `allow_factor_downgrade` is FALSE: the no-silent-downgrade posture is the
+    /// default everywhere, exactly as it is for SMS.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure. The gate treats an error as
+    /// a REFUSAL (it never falls back to the permissive default), so a read fault can
+    /// never open the downgrade path.
+    pub async fn config(&self) -> Result<EmailFactorConfig, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "SELECT allow_factor_downgrade FROM email_factor_config \
+             WHERE tenant_id = $1 AND environment_id = $2",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(match row {
+            Some(row) => EmailFactorConfig {
+                allow_factor_downgrade: row.get("allow_factor_downgrade"),
+            },
+            None => EmailFactorConfig::default(),
+        })
+    }
+}
+
+/// The mutating per (tenant, environment) EMAIL-FACTOR configuration repository
+/// (issue #267).
+pub struct ActingEmailFactorConfigRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingEmailFactorConfigRepo<'_> {
+    /// SET the scope's email-factor downgrade opt-in (issue #267): an upsert with one
+    /// `email_factor_config.update` audit row. Turning it ON is the deliberate,
+    /// attributable act that permits an email possession proof to mint a primary
+    /// session over a passkey or an active TOTP, so it is audited either way.
+    ///
+    /// # No production caller yet, and what that means
+    ///
+    /// As shipped, this has NO caller outside the test harness, and neither does its SMS
+    /// twin [`ActingSmsOtpRepo::set_config`]. There is no management endpoint,
+    /// no CLI verb, and no configuration key that reaches either. So the "explicit
+    /// per-tenant opt-in" is real in the store and unreachable from any production
+    /// surface: today no actor of any kind can weaken the posture, and every scope refuses
+    /// the downgrade. That fails closed and is the intended posture, but it should be read
+    /// as "not yet exposed" rather than as an operator-facing control.
+    ///
+    /// When a management surface does land it needs BOTH the control-plane grant (see the
+    /// grants in migration 0097, which today give the write to `ironauth_app` only) and a
+    /// management-plane privilege check, or turning the gate off becomes reachable by
+    /// whatever already holds an application-role connection.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn set_allow_factor_downgrade(
+        &self,
+        env: &Env,
+        allow_factor_downgrade: bool,
+        now_micros: i64,
+    ) -> Result<(), StoreError> {
+        let scope = self.scope;
+        let detail = format!("allow_downgrade={allow_factor_downgrade}");
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::EmailFactorConfigUpdate,
+                target: &EmailFactorConfigTarget,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "INSERT INTO email_factor_config \
+                     (tenant_id, environment_id, allow_factor_downgrade, updated_at) \
+                     VALUES ($1, $2, $3, \
+                             TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval) \
+                     ON CONFLICT (tenant_id, environment_id) DO UPDATE \
+                       SET allow_factor_downgrade = EXCLUDED.allow_factor_downgrade, \
+                           updated_at = EXCLUDED.updated_at",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(allow_factor_downgrade)
+                .bind(now_micros)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+            Some(&detail),
+        )
+        .await
+    }
+}
+
+/// The audit target for a per (tenant, environment) email-factor configuration change
+/// (issue #267). The configuration is a per-scope singleton (no `id_`), so its audit
+/// rows target the scope-level `email_factor_config` handle, mirroring
+/// [`SmsConfigTarget`].
+struct EmailFactorConfigTarget;
+
+impl AuditTarget for EmailFactorConfigTarget {
+    fn audit_target_kind(&self) -> &'static str {
+        "email_factor_config"
+    }
+
+    fn audit_target_id(&self) -> String {
+        "email_factor_config".to_owned()
     }
 }
 

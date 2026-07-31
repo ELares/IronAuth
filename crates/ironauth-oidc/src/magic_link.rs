@@ -29,13 +29,14 @@ use axum::extract::{Form, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use ironauth_store::{
-    CorrelationId, MagicLinkConsumeOutcome, MagicLinkTokenId, NewMagicLink, Scope, UserId,
-    magic_link_binding_digest, magic_link_token_digest,
+    CorrelationId, EmailFactorPurpose, MagicLinkConsumeOutcome, MagicLinkTokenId, NewMagicLink,
+    Scope, UserId, magic_link_binding_digest, magic_link_token_digest,
 };
 use serde::Deserialize;
 
 use crate::authn::AuthenticationEvent;
 use crate::email_otp::{attempt_context, generate_numeric_code, purpose_or_login};
+use crate::factor_downgrade;
 use crate::interaction::{self, cookie_header};
 use crate::pages;
 use crate::session;
@@ -414,6 +415,15 @@ async fn consume_cross_device(
         }
         Err(_) => return interaction::server_error_page(),
     };
+    // DECIDE the no-silent-downgrade gate (issue #267) BEFORE the short code is judged.
+    // The cross-device short code is the low-entropy half of this factor (6 to 8 digits,
+    // guessable), so it is the half where a correct guess must not be readable off the
+    // response time: deciding here spends the gate's reads on a wrong guess exactly as on
+    // a correct one. The decision is APPLIED after the single-use consume.
+    let refused = match decide_gate(state, scope, &challenge).await {
+        Ok(refused) => refused,
+        Err(GateFault) => return interaction::server_error_page(),
+    };
     let matched = match state
         .verify_password(&scope, short_code, &challenge.short_code_hash)
         .await
@@ -439,7 +449,7 @@ async fn consume_cross_device(
             .await;
         return invalid_page();
     }
-    finish_consume(state, scope, &challenge, ctx, headers, now).await
+    finish_consume(state, scope, &challenge, refused, ctx, headers, now).await
 }
 
 /// The SAME-DEVICE token consume path (issue #68). Without the binding cookie the link was
@@ -469,15 +479,70 @@ async fn consume_same_device(
         Ok(None) => return invalid_page(),
         Err(_) => return interaction::server_error_page(),
     };
-    finish_consume(state, scope, &challenge, ctx, headers, now).await
+    // The gate decision, for symmetry with the cross-device path. There is nothing to
+    // order it against here: the token IS the lookup key, so a wrong token returns
+    // not-found above without ever reaching a compare, and the ordering that matters on
+    // the short-code path has no analogue. What remains is that a VALID token costs the
+    // gate's reads and an invalid one does not, which is a distinction available only to
+    // someone already holding a valid 256-bit token. That is the honest bound: this path
+    // is uniform in status and body, and uniform in work only once the token resolves.
+    let refused = match decide_gate(state, scope, &challenge).await {
+        Ok(refused) => refused,
+        Err(GateFault) => return interaction::server_error_page(),
+    };
+    finish_consume(state, scope, &challenge, refused, ctx, headers, now).await
+}
+
+/// A store fault while deciding the no-silent-downgrade gate, or a stored subject that is
+/// not a parseable `usr_` id (issue #267). Both render the SAME neutral server-error page
+/// and mint NOTHING, so they are one type: fail CLOSED.
+struct GateFault;
+
+/// DECIDE the no-silent-downgrade gate for a resolved magic-link challenge (issue #267),
+/// returning the gated path to attribute the refusal to when it is applied.
+///
+/// Split out so both consume paths take the decision at the same point in their sequence,
+/// on the challenge and BEFORE any compare, rather than one of them taking it late.
+///
+/// # Errors
+///
+/// [`GateFault`] on a store fault or an unparseable stored subject. The caller renders the
+/// neutral server-error page and mints nothing.
+async fn decide_gate(
+    state: &OidcState,
+    scope: Scope,
+    challenge: &ironauth_store::MagicLinkChallenge,
+) -> Result<Option<factor_downgrade::GatedSessionPath>, GateFault> {
+    // A link minted for `mfa` or `verify_address` mints no primary session at all (see
+    // `establish_session_page`), so there is no downgrade to refuse and no probe to spend.
+    if !challenge.purpose.establishes_session() {
+        return Ok(None);
+    }
+    // Defensive: the stored subject is a `usr_` id this bootstrap minted.
+    let Ok(subject) = UserId::parse_in_scope(&challenge.subject, &scope) else {
+        return Err(GateFault);
+    };
+    let path = factor_downgrade::GatedSessionPath::MagicLinkConsume;
+    match crate::email_otp::gate_blocks(state, scope, &subject, path).await {
+        Ok(true) => Ok(Some(path)),
+        Ok(false) => Ok(None),
+        Err(crate::factor_downgrade::FactorProbeError) => Err(GateFault),
+    }
 }
 
 /// Consume a resolved magic-link challenge single-use and, on success, establish the
 /// session (issue #68). Shared by both consume paths.
+///
+/// `refused` is the no-silent-downgrade decision [`decide_gate`] already took (issue
+/// #267). It is APPLIED here, after the consume, so a proven-but-refused link is BURNED
+/// rather than left replayable and the refusal spends the same durable write a successful
+/// consume does.
+#[allow(clippy::too_many_arguments)]
 async fn finish_consume(
     state: &OidcState,
     scope: Scope,
     challenge: &ironauth_store::MagicLinkChallenge,
+    refused: Option<factor_downgrade::GatedSessionPath>,
     ctx: &crate::abuse::AttemptContext,
     headers: &HeaderMap,
     now: i64,
@@ -493,8 +558,16 @@ async fn finish_consume(
         .consume_by_id(state.env(), challenge, now)
         .await
     {
-        Ok(MagicLinkConsumeOutcome::Consumed { subject, .. }) => {
-            establish_session_page(state, scope, &subject, ctx, headers).await
+        Ok(MagicLinkConsumeOutcome::Consumed { subject, purpose }) => {
+            // A refused downgrade renders the SAME uniform invalid-link page a spent or
+            // forged link returns, so the refusal is not a factor-possession oracle. The
+            // refusal is recorded HERE rather than at the decision, so a wrong short-code
+            // guess on a protected account never logs a refusal it did not earn.
+            if let Some(path) = refused {
+                factor_downgrade::record_refusal(scope, path, purpose.as_str());
+                return invalid_page();
+            }
+            establish_session_page(state, scope, &subject, purpose, ctx, headers).await
         }
         Ok(MagicLinkConsumeOutcome::NotFound) => invalid_page(),
         Err(_) => interaction::server_error_page(),
@@ -502,15 +575,36 @@ async fn finish_consume(
 }
 
 /// Establish a session for a consumed magic link and render a success page that SETS the
-/// session cookie, with the honest `amr` (issue #68).
+/// session cookie, with the honest `amr` (issue #68), subject to the session-establishing
+/// purpose split (issue #267). The no-silent-downgrade gate was decided and applied by
+/// [`decide_gate`] and [`finish_consume`] before this is reached.
 async fn establish_session_page(
     state: &OidcState,
     scope: Scope,
     subject: &str,
+    purpose: EmailFactorPurpose,
     ctx: &crate::abuse::AttemptContext,
     headers: &HeaderMap,
 ) -> Response {
-    // Defensive: the stored subject is a `usr_` id this bootstrap minted.
+    // The purpose split (issue #267): a link minted for `mfa` or `verify_address` proves
+    // control of the address WITHOUT signing anyone in. The link was consumed above
+    // (single-use is preserved) and the throttle relaxes on the proven possession, but no
+    // session cookie is set, so an address-verification link can never be a primary
+    // login. The page is the neutral confirmation, never the signed-in one.
+    if !purpose.establishes_session() {
+        state.reset_after_success(ctx).await;
+        return pages::secure_html(
+            StatusCode::OK,
+            pages::notice_page(
+                "Address confirmed",
+                "Your address has been confirmed. You can close this page.",
+            ),
+        );
+    }
+    // Defensive: the stored subject is a `usr_` id this bootstrap minted. `decide_gate`
+    // parses it too and fails closed if it does not, but this check stays: the mint below
+    // uses the subject and must validate it on its own rather than depend on a caller
+    // having done so. This is the check that shipped for issue #68, unchanged.
     if UserId::parse_in_scope(subject, &scope).is_err() {
         return interaction::server_error_page();
     }

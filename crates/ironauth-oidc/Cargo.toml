@@ -923,6 +923,19 @@ name = "sms_otp"
 path = "tests/sms_otp.rs"
 required-features = ["testing"]
 
+# The no-silent-downgrade SWEEP (issue #267): every session-establishing weak-possession
+# surface (email OTP verify, magic-link consume, SMS OTP verify, the headless recovery
+# journey) driven end to end from the SAME `GatedSessionPath::ALL` registry the production
+# call sites name, so a surface cannot be fenced-but-undriven or silently dropped from the
+# list; the per-purpose split (no purpose mints a primary session for a protected account,
+# and `mfa` / `verify_address` never mint at all); the passkey, active-TOTP, and surviving
+# recovery-code rungs; and the explicit per-tenant opt-in that restores each path.
+# Needs a real database (DATABASE_URL).
+[[test]]
+name = "factor_downgrade"
+path = "tests/factor_downgrade.rs"
+required-features = ["testing"]
+
 # The headless flow API (issue #84): a native JSON client completes login (identifier +
 # password) end to end with NO HTML against the SAME flow object the browser transport
 # renders; the anti-enumeration crux (known vs unknown identifier indistinguishable in body,

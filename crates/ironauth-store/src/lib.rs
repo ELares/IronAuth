@@ -105,8 +105,8 @@ pub use custom_domain::{
     CustomDomainRecord, VerificationStatus, domain_is_registrable, normalize_domain,
 };
 pub use email_otp::{
-    ActiveEmailOtpCode, EmailFactorPurpose, MagicLinkChallenge, MagicLinkConsumeOutcome,
-    NewEmailOtpCode, NewMagicLink, OtpAttemptOutcome,
+    ActiveEmailOtpCode, EmailFactorConfig, EmailFactorPurpose, MagicLinkChallenge,
+    MagicLinkConsumeOutcome, NewEmailOtpCode, NewMagicLink, OtpAttemptOutcome,
 };
 pub use environment::{
     EnvironmentType, Guardrail, GuardrailClass, GuardrailReport, GuardrailSet, GuardrailViolation,

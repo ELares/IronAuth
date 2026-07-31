@@ -848,6 +848,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0096_client_allowed_scopes.sql"),
         },
+        Migration {
+            version: 97,
+            name: "email_factor_config",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0097_email_factor_config.sql"),
+        },
     ]
 }
 

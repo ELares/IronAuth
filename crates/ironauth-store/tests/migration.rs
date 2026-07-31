@@ -616,7 +616,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
     );
     assert_eq!(
         report.already_applied(),
-        96,
+        97,
         "a migration was added to or removed from the production chain; this count is a \
          deliberate checkpoint, not a bug, so read the new migration, satisfy yourself that it \
          belongs in the shipped chain, then update this number and the subject list below and \
@@ -646,7 +646,8 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
          context, organization roles, organization groups, organization group members, \
          organization role assignments, organization authentication policies, permission \
          vocabulary, role-to-permission mapping, organization default role, resource-server \
-         permission claims, token size event budget columns, client allowed scopes."
+         permission claims, token size event budget columns, client allowed scopes, \
+         email-factor downgrade configuration."
     );
 
     // The ledger holds exactly the shipped versions, contiguous and in order.
@@ -657,7 +658,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
             46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67,
             68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89,
-            90, 91, 92, 93, 94, 95, 96
+            90, 91, 92, 93, 94, 95, 96, 97
         ]
     );
     let phase_of = |version: i64| async move {
@@ -3864,6 +3865,50 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
             "{table} must carry the scope-nonempty CHECK constraint"
         );
     }
+
+    // ---- 0097 email-factor config (issue #267) ----
+    // The email-side twin of sms_config's downgrade opt-in: one per-scope row governing
+    // whether an email possession proof (an email OTP, a magic link, or the headless
+    // recovery journey) may mint a primary session over a passkey or an active TOTP.
+    // Safe by default in TWO independent ways: the column DEFAULTs false, and a scope
+    // with no row at all resolves to the refusing default in the reader.
+    assert!(
+        table_exists(pool, "email_factor_config").await,
+        "email_factor_config exists after 0097"
+    );
+    for column in [
+        "tenant_id",
+        "environment_id",
+        "allow_factor_downgrade",
+        "updated_at",
+    ] {
+        assert!(
+            column_exists(pool, "email_factor_config", column).await,
+            "email_factor_config.{column} exists after 0097"
+        );
+    }
+    assert!(
+        rls_enabled_and_forced(pool, "email_factor_config").await,
+        "email_factor_config must ENABLE and FORCE row-level security"
+    );
+    assert!(
+        policy_exists(
+            pool,
+            "email_factor_config",
+            "email_factor_config_tenant_isolation"
+        )
+        .await,
+        "the (tenant, environment) isolation policy must exist on email_factor_config"
+    );
+    assert!(
+        check_constraint_exists(
+            pool,
+            "email_factor_config",
+            "email_factor_config_scope_nonempty"
+        )
+        .await,
+        "email_factor_config must carry the scope-nonempty CHECK constraint"
+    );
 
     // ---- 0051 passkey attestation (issue #66, PR B) ----
     // The per-scope verified MDS3 BLOB cache: the extracted, trusted authenticator
