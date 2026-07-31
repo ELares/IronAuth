@@ -573,10 +573,7 @@ async fn mint_and_persist(
         .resolve_access_token_target(&scope, &[], client_id_str)
         .await
         .map_err(|_| TokenError::ServerError)?;
-    let entry = state
-        .issuer_entry(&scope)
-        .await
-        .ok_or(TokenError::ServerError)?;
+    let entry = crate::token::grant_issuer_entry(state, scope).await?;
     let signer = entry.signer(state.now()).ok_or(TokenError::ServerError)?;
     let issuer = state.issuer_for(&scope);
     // The mapped-identity access token carries the RFC 9068 protocol claims with the

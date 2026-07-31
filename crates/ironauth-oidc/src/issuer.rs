@@ -225,6 +225,39 @@ struct CachedEntry {
     loaded_at: SystemTime,
 }
 
+/// Why a scope resolved to the issuer entry it did (issue #433).
+///
+/// [`IssuerRegistry::entry_for`] answers `Option<Arc<IssuerEntry>>`, which collapses
+/// an administrative FENCE and a missing signing key into the same `None`. The token
+/// endpoint must separate them: one is an operator decision a relying party should
+/// wait out, the other is a fault. [`IssuerRegistry::resolve`] answers this instead.
+///
+/// There is no `NeverExisted` arm, and there cannot be one: the data plane sees an
+/// environment only through its scope-forced rows, and an environment that was never
+/// created is indistinguishable there from one that exists with no provisioned
+/// signing key. Both are [`IssuerResolution::Absent`].
+///
+/// No [`std::fmt::Debug`], deliberately: the `Ready` arm holds an [`IssuerEntry`],
+/// which carries private key material and implements no `Debug` of its own, so a
+/// derived one here would be the seam through which a `tracing` field or a panic
+/// message could reach for it.
+#[derive(Clone)]
+pub enum IssuerResolution {
+    /// The environment's live issuer entry: its key set, algorithm policy, salt, and
+    /// guardrails.
+    Ready(Arc<IssuerEntry>),
+    /// The scope is FENCED off the data plane (issue #46): an operator suspended the
+    /// tenant, or offboarded it. Deliberate, administrative, and reversible by
+    /// another operator action. Nothing about the scope's provisioning is implied.
+    Fenced,
+    /// There is no entry to serve and no fence to explain it: no provisioned signing
+    /// key, an environment named under the wrong tenant (row-level security yields
+    /// nothing), a scope that never existed, or a store that could not be read. The
+    /// data plane cannot tell those apart, and every one of them is a condition the
+    /// server, not the caller, has to resolve.
+    Absent,
+}
+
 /// The registry of per-environment issuers.
 ///
 /// Keyed by the FULL `(tenant, environment)` [`Scope`], so an entry can never be
@@ -403,44 +436,78 @@ impl IssuerRegistry {
     /// Panics only if the internal lock is poisoned, which happens after a panic
     /// while another thread held it (never in normal operation).
     pub async fn entry_for(&self, scope: &Scope, now: SystemTime) -> Option<Arc<IssuerEntry>> {
+        match self.resolve(scope, now).await {
+            IssuerResolution::Ready(entry) => Some(entry),
+            IssuerResolution::Fenced | IssuerResolution::Absent => None,
+        }
+    }
+
+    /// [`IssuerRegistry::entry_for`], but reporting WHY there is no entry (issue
+    /// #433).
+    ///
+    /// `entry_for` collapses two unrelated conditions into one `None`: an
+    /// administratively FENCED scope (an operator suspended or offboarded it) and an
+    /// ABSENT entry (no provisioned signing key, a cross-tenant environment, or a
+    /// transient store error). The token endpoint has to tell them apart, because a
+    /// suspension is an operator state that a relying party should wait out, while a
+    /// missing signing key is a genuine server fault. Surfaces that answer a uniform
+    /// 404 either way (JWKS, discovery) keep using `entry_for`.
+    ///
+    /// Every caching, fencing, and negative-caching rule documented on
+    /// [`IssuerRegistry::entry_for`] applies here unchanged; this is the same code
+    /// path with a wider return type.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the internal lock is poisoned, which happens after a panic
+    /// while another thread held it (never in normal operation).
+    pub async fn resolve(&self, scope: &Scope, now: SystemTime) -> IssuerResolution {
         // The fence is consulted FIRST, ahead of every cache, so it governs the fast
         // path too. A pre-populated (loader-less) registry has no serving state to
         // read and is never fenced here (the store-free test path).
         if let Some(store) = self.loader.as_ref() {
-            if scope_is_fenced(store, scope).await {
-                return None;
+            match fence_state(store, scope).await {
+                FenceState::Serving => {}
+                FenceState::Fenced => return IssuerResolution::Fenced,
+                // Fail closed, and report it as an ABSENCE rather than a fence: the
+                // serving state is UNKNOWN here, so calling it an operator suspension
+                // would be a claim the server cannot make. A store that cannot answer
+                // is a fault, and the token endpoint renders it as one.
+                FenceState::Unreadable => return IssuerResolution::Absent,
             }
         }
         // Fast path: a cached entry served only when this registry is loader-less
         // (no store to reload from, so it never expires) OR the entry is still fresh
         // within the TTL. A stale store-backed entry falls through to a reload.
         if let Some(entry) = self.fresh_cached(scope, now) {
-            return Some(entry);
+            return IssuerResolution::Ready(entry);
         }
         // A still-fresh negative short-circuits the store load (never the fence,
         // which already ran above).
         if self.negative_is_fresh(scope, now) {
-            return None;
+            return IssuerResolution::Absent;
         }
         // Slow path: load from the store, scoped to this exact (tenant, environment).
-        let store = self.loader.as_ref()?;
+        let Some(store) = self.loader.as_ref() else {
+            return IssuerResolution::Absent;
+        };
         match load_issuer_entry(store, scope).await {
             LoadOutcome::Loaded(loaded) => {
                 let entry = Arc::new(loaded);
                 self.store_positive(*scope, Arc::clone(&entry), now);
-                Some(entry)
+                IssuerResolution::Ready(entry)
             }
             // A CONFIRMED absence: safe to negative-cache so a scope flood is bounded.
             LoadOutcome::Empty => {
                 self.record_negative(*scope, now);
-                None
+                IssuerResolution::Absent
             }
             // A TRANSIENT store error: do NOT negative-cache (that would amplify a blip
             // into a TTL-long fail-closed outage for a real scope) and do NOT serve a
             // stale entry (that would extend a compromise-rotation staleness window
-            // during errors). Return None so the very next request retries, exactly as
-            // pre-#204 did.
-            LoadOutcome::Error => None,
+            // during errors). Return an absence so the very next request retries,
+            // exactly as pre-#204 did.
+            LoadOutcome::Error => IssuerResolution::Absent,
         }
     }
 
@@ -554,19 +621,38 @@ impl IssuerRegistry {
     }
 }
 
-/// Whether `scope` is fenced off the data plane right now (issue #46): the
-/// serving-state fence read, FAIL CLOSED. A suspended or offboarded scope reads a
-/// suspended serving state and is fenced; a store error reading the
-/// state is ALSO treated as fenced (deny serving), so a transient failure can never
-/// let a suspended scope keep serving. Read under the scope's forced row-level
+/// The serving-state fence read for `scope` (issue #46), FAIL CLOSED: only
+/// [`FenceState::Serving`] permits serving, and both other arms deny it.
+///
+/// The three arms are distinguished (issue #433) because the token endpoint answers
+/// a deliberate operator suspension and a broken database differently, while every
+/// other surface treats them alike. Read under the scope's forced row-level
 /// security. Consulted on EVERY resolution so a control-plane suspend/delete takes
 /// effect on the next request without a restart or a cache eviction.
-async fn scope_is_fenced(store: &Store, scope: &Scope) -> bool {
+async fn fence_state(store: &Store, scope: &Scope) -> FenceState {
     match store.scoped(*scope).environment_state().await {
-        Ok(state) => state.is_fenced(),
-        // Fail closed: a state-read error denies serving rather than permitting it.
-        Err(_) => true,
+        Ok(state) if state.is_fenced() => FenceState::Fenced,
+        Ok(_) => FenceState::Serving,
+        // Fail closed: a state-read error denies serving rather than permitting it,
+        // so a transient failure can never let a suspended scope keep serving. It is
+        // NOT reported as a fence, because the serving state was never read.
+        Err(_) => FenceState::Unreadable,
     }
+}
+
+/// The outcome of the per-resolution fence read (issue #46). Only
+/// [`FenceState::Serving`] permits serving; the fence FAILS CLOSED on everything
+/// else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FenceState {
+    /// The scope's serving state was read and permits serving.
+    Serving,
+    /// The scope's serving state was read and FENCES it: an operator suspended the
+    /// tenant, or offboarded it. A deliberate administrative state, not a fault.
+    Fenced,
+    /// The serving state could NOT be read (a store error). Serving is denied, but
+    /// the scope's actual state is unknown, so this is a fault rather than a fence.
+    Unreadable,
 }
 
 /// The outcome of a store-backed issuer load (issue #204). A CONFIRMED absence is
@@ -602,7 +688,7 @@ enum LoadOutcome {
 /// retry it on the next request instead of caching it as a 404.
 async fn load_issuer_entry(store: &Store, scope: &Scope) -> LoadOutcome {
     // The data-plane suspension fence (issue #46) is enforced by the caller,
-    // `IssuerRegistry::entry_for`, on EVERY resolution (see `scope_is_fenced`), so it
+    // `IssuerRegistry::resolve`, on EVERY resolution (see `fence_state`), so it
     // governs both this cold load and the cached fast path. It is not re-checked here.
     // A transient read error is NOT a confirmed absence: retry, never cache.
     let Ok(records) = store.scoped(*scope).signing_keys().list().await else {

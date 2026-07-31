@@ -43,7 +43,7 @@ use crate::util::epoch_micros;
 
 use crate::client_keys::ClientKeyResolver;
 use crate::introspection::{IntrospectionSerializer, default_serializer};
-use crate::issuer::{IssuerEntry, IssuerRegistry};
+use crate::issuer::{IssuerEntry, IssuerRegistry, IssuerResolution};
 use crate::registry::{ResponseMode, ResponseType};
 use crate::revocation::{RevocationEventSink, default_sink};
 use crate::subject::{PairwiseSalt, SubjectCache, SubjectConfig};
@@ -3201,6 +3201,20 @@ impl OidcState {
     /// and policy into the pure, synchronous mint functions.
     pub(crate) async fn issuer_entry(&self, scope: &Scope) -> Option<Arc<IssuerEntry>> {
         self.inner.issuers.entry_for(scope, self.now()).await
+    }
+
+    /// [`OidcState::issuer_entry`], but reporting WHY there is no entry (issue
+    /// #433): an administrative FENCE (a suspended or offboarded scope) is separated
+    /// from an ABSENT entry (no provisioned signing key, a cross-tenant environment,
+    /// a scope that never existed, or a store that could not be read).
+    ///
+    /// The TOKEN-ENDPOINT grants resolve through this, because they are the only
+    /// surface that answers those two conditions differently: a fence renders the
+    /// 503 `temporarily_unavailable` an operator suspension deserves, an absence
+    /// keeps the 500 `server_error` a real fault deserves. Every other caller wants
+    /// the uniform fail-closed `None` and keeps using `issuer_entry`.
+    pub(crate) async fn issuer_resolution(&self, scope: &Scope) -> IssuerResolution {
+        self.inner.issuers.resolve(scope, self.now()).await
     }
 
     /// Resolve the environment's TYPED guardrail set for `scope` (issue #42),

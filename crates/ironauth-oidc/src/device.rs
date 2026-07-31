@@ -563,10 +563,7 @@ async fn mint_device_tokens(
     scope: Scope,
     grant: &ApprovedDeviceGrant,
 ) -> Result<IssuedTokens, TokenError> {
-    let entry = state
-        .issuer_entry(&scope)
-        .await
-        .ok_or(TokenError::ServerError)?;
+    let entry = crate::token::grant_issuer_entry(state, scope).await?;
     let signer = entry.signer(state.now()).ok_or(TokenError::ServerError)?;
     let issuer = state.issuer_for(&scope);
     let subject = state.resolve_public_subject(&grant.subject);

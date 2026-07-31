@@ -19,6 +19,42 @@
 //! expired code, a replayed code, and any single binding mismatch (including a
 //! wrong `client_id`) all render identically, so the endpoint never says which
 //! check failed.
+//!
+//! # The fenced-environment refusal is not an existence oracle (issue #433)
+//!
+//! [`TokenError::TemporarilyUnavailable`] answers a token request whose environment
+//! an operator has SUSPENDED or OFFBOARDED. Three properties of that answer are
+//! deliberate and load bearing, and a later change that quietly drops one of them
+//! reopens the hole:
+//!
+//! 1. The body and headers say nothing about WHICH LIFECYCLE STATE applies. A
+//!    SUSPENDED environment and an OFFBOARDED one render byte for byte alike,
+//!    `Retry-After` and every other header included, so the refusal is not an
+//!    oracle over lifecycle either. That is a differential rather than a claim:
+//!    `lifecycle_fence::every_token_endpoint_grant_answers_a_fenced_scope_the_same_way`
+//!    drives a real control-plane offboard through all five grants and compares
+//!    its answers against the suspended ones, and asserts the refusal names no
+//!    lifecycle state at all. An environment that never existed does NOT render
+//!    alike here, and must not be made to: property (2) is why it never reaches
+//!    this refusal in the first place.
+//! 2. The refusal is raised where the issuer entry is resolved, which every grant
+//!    reaches only AFTER the presented credential has been validated. It is
+//!    therefore visible only to a caller who already holds a credential that this
+//!    environment itself minted, and never to an unauthenticated caller probing
+//!    which environments exist. Hoisting the fence check earlier, so it answers
+//!    before the credential check, would hand exactly that probe a two-valued
+//!    answer and would be a regression, not a simplification.
+//! 3. The accepted cost: an OFFBOARDED environment answers this same 503, forever,
+//!    to a client that still holds one of its credentials. "Temporarily" is false
+//!    for that caller and the retry will never succeed, which is the price of (1)
+//!    and is paid knowingly. The `Retry-After` delay is bounded and modest partly
+//!    for that caller's sake, and the consequence is written down for integrators
+//!    in the `ironauth-oidc` changelog rather than only here. Note that a plain
+//!    MISTYPED environment id does not land here: property (2) means it never
+//!    reaches this refusal at all and gets the uniform credential rejection
+//!    instead, which
+//!    `lifecycle_fence::a_fenced_scope_is_not_an_environment_existence_oracle`
+//!    measures rather than assumes.
 
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -203,6 +239,41 @@ pub fn redirect_response(location: &str) -> Response {
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
+/// The `Retry-After` delay, in seconds, on a token-endpoint
+/// [`TokenError::TemporarilyUnavailable`] (issue #433).
+///
+/// Chosen MODEST and BOUNDED, and the reasoning is worth keeping, because both ends
+/// of the range are wrong in a different way. The refusal is deliberately ambiguous
+/// between a suspension that will be lifted and an offboarding that never will, so
+/// the delay has to serve a caller who will succeed on the next poll and a caller who
+/// will never succeed at all.
+///
+/// - Much shorter (the RFC 8628 device poll interval is 5 seconds) and a fleet still
+///   holding credentials for a PERMANENTLY fenced environment keeps a retry storm
+///   running indefinitely.
+/// - Much longer and a real suspension, which is lifted on the very NEXT request with
+///   no restart and no cache eviction, still takes minutes to resume serving from the
+///   client's side, for no gain.
+///
+/// One minute damps a stuck client to roughly one request a minute while keeping the
+/// resume prompt. It is a fixed server constant rather than configuration: it is a
+/// protocol hint that must be identical for every scope, since a per-environment
+/// value would itself be the existence oracle this refusal exists to close.
+///
+/// What this constant IS, stated exactly, because it is easy to read it as more:
+/// the PUBLISHED, machine-readable spelling of the delay, for integrators and for
+/// tests. No production path reads it. The header itself is built from
+/// [`RETRY_AFTER_HEADER_VALUE`], and the only thing holding the two together is
+/// `the_retry_after_header_value_matches_the_declared_delay`.
+pub const RETRY_AFTER_SECS: u64 = 60;
+
+/// The `Retry-After` header value as a literal, which is what the refusal path
+/// actually puts on the wire: a static string costs no allocation and no fallible
+/// conversion there. [`RETRY_AFTER_SECS`] is the same number published as a `u64`,
+/// and `the_retry_after_header_value_matches_the_declared_delay` keeps the two from
+/// drifting.
+const RETRY_AFTER_HEADER_VALUE: &str = "60";
+
 /// A token-endpoint error (RFC 6749 5.2).
 #[derive(Debug, Clone)]
 pub enum TokenError {
@@ -261,6 +332,29 @@ pub enum TokenError {
     /// An unexpected server-side condition (for example no signing key for the
     /// target environment). Renders 500.
     ServerError,
+    /// The environment this grant names is FENCED off the data plane (issue #46): an
+    /// operator suspended its tenant, or offboarded it. Renders 503
+    /// `temporarily_unavailable` with a [`RETRY_AFTER_SECS`] `Retry-After` header
+    /// (issue #433).
+    ///
+    /// Not a fault, and deliberately not `server_error`: a suspension is an operator
+    /// decision, so telling a relying party to retry forever (and charging its own
+    /// error-rate budget for a deliberate act) is the wrong answer. It is not a 4xx
+    /// either: `invalid_grant` would assert something FALSE about a still-valid
+    /// authorization code and make a conforming client discard a credential that is
+    /// perfectly good, and the refusal here does not burn the code. 503 is still 5xx,
+    /// so this makes the operator action DISTINGUISHABLE from a fault rather than
+    /// removing it from the 5xx class, which was accepted knowingly.
+    ///
+    /// `temporarily_unavailable` is registered by RFC 6749 4.1.2.1 for the
+    /// AUTHORIZATION endpoint; using it at the token endpoint is a deliberate
+    /// extension, for want of a registered code that says the same thing there.
+    ///
+    /// It is also the answer for an OFFBOARDED environment, where "temporarily" is
+    /// literally false, and for a scope whose issuer entry the caller cannot
+    /// distinguish from a suspended one. Both are deliberate: see the module
+    /// documentation on why this answer must not become an existence oracle.
+    TemporarilyUnavailable,
     /// The refresh or authorization-code grant would mint an access token whose
     /// scope carries a step-up authentication requirement (an `acr` floor and/or a
     /// max auth age) that the frozen authentication does NOT satisfy (RFC 9470,
@@ -296,6 +390,7 @@ impl TokenError {
             TokenError::AccessDenied => "access_denied",
             TokenError::ExpiredToken => "expired_token",
             TokenError::ServerError => "server_error",
+            TokenError::TemporarilyUnavailable => "temporarily_unavailable",
             TokenError::InsufficientUserAuthentication { .. } => "insufficient_user_authentication",
         }
     }
@@ -306,6 +401,7 @@ impl TokenError {
     fn status(&self) -> StatusCode {
         match self {
             TokenError::ServerError => StatusCode::INTERNAL_SERVER_ERROR,
+            TokenError::TemporarilyUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             TokenError::InvalidClient { .. } => StatusCode::UNAUTHORIZED,
             _ => StatusCode::BAD_REQUEST,
         }
@@ -333,6 +429,12 @@ impl TokenError {
             TokenError::AccessDenied => "the authorization request was denied",
             TokenError::ExpiredToken => "the device code has expired; start a new device flow",
             TokenError::ServerError => "the request could not be processed",
+            // Says only that the request cannot be served right now, and never
+            // whether the environment is suspended, offboarded, or unknown to this
+            // deployment. Every one of those reads identically here on purpose.
+            TokenError::TemporarilyUnavailable => {
+                "this environment is not currently serving token requests; retry later"
+            }
             TokenError::InsufficientUserAuthentication { .. } => {
                 "the authentication does not meet the required authentication context; \
                  re-authorize with the indicated acr_values and max_age"
@@ -374,6 +476,15 @@ impl IntoResponse for TokenError {
             body,
         )
             .into_response();
+        // A fenced environment asks the caller to come back later, with a fixed,
+        // scope-independent delay (issue #433). The value is a server constant, so
+        // the header is built from a static string and reflects no input.
+        if let TokenError::TemporarilyUnavailable = self {
+            response.headers_mut().insert(
+                header::RETRY_AFTER,
+                header::HeaderValue::from_static(RETRY_AFTER_HEADER_VALUE),
+            );
+        }
         // A Basic authentication attempt that failed MUST carry WWW-Authenticate
         // (RFC 6749 5.2). The value is a fixed server constant (no reflected
         // input), so it is safe to set verbatim.
@@ -417,5 +528,21 @@ mod tests {
         );
         assert_eq!(AuthzErrorCode::InvalidTarget.as_str(), "invalid_target");
         assert_eq!(AuthzErrorCode::ServerError.as_str(), "server_error");
+    }
+
+    #[test]
+    fn the_retry_after_header_value_matches_the_declared_delay() {
+        // Two spellings of one number: the `u64` this crate PUBLISHES and that the
+        // documentation and the tests reason about (no production path reads it),
+        // and the static string the header is actually built from (issue #433).
+        // They are separate only because `HeaderValue::from_static` wants a literal,
+        // and a silent drift between them would put a delay on the wire that no test
+        // and no doc comment describes. Parsed rather than compared as text, so this
+        // is a claim about the VALUE, not about how it happens to be spelled.
+        assert_eq!(
+            RETRY_AFTER_HEADER_VALUE.parse::<u64>(),
+            Ok(RETRY_AFTER_SECS),
+            "the Retry-After header value must be the declared delay"
+        );
     }
 }

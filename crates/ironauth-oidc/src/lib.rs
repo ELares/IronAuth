@@ -196,7 +196,7 @@ pub use discovery::{
     DiscoveryState, ID_TOKEN_CLAIMS_SUPPORTED, SCOPES_SUPPORTED, UI_LOCALES_SUPPORTED,
     claims_supported, discovery_document, discovery_router, id_token_signing_alg_values,
 };
-pub use error::{AuthorizeError, AuthzErrorCode, TokenError};
+pub use error::{AuthorizeError, AuthzErrorCode, RETRY_AFTER_SECS, TokenError};
 pub use federation::{
     FederationRuntime, TokenExchange, UpstreamTokenPolicy, VerifiedUpstreamIdentity, exchange_code,
     federated_external_id, fetch_discovery, resolve_alg_allowlist, validate_upstream_id_token,
@@ -221,7 +221,8 @@ pub use introspection::{
     SerializedIntrospection,
 };
 pub use issuer::{
-    IssuerEntry, IssuerError, IssuerRegistry, JwksCacheError, JwksCacheWindow, load_signing_key,
+    IssuerEntry, IssuerError, IssuerRegistry, IssuerResolution, JwksCacheError, JwksCacheWindow,
+    load_signing_key,
 };
 pub use jwks::{IssuerState, issuer_router};
 pub use logout::LogoutParams;
