@@ -541,3 +541,85 @@ pub struct Flow {
     /// The UI: ordered nodes plus flow level messages.
     pub ui: Ui,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::NodeGroup;
+    use ironauth_journey::NODE_GROUPS;
+    use std::collections::BTreeSet;
+
+    /// Every wire form the [`NodeGroup`] DECLARATION renders, read out of the `JsonSchema` derive
+    /// rather than out of any list maintained here.
+    ///
+    /// This matters, and an earlier draft of this lock got it wrong. The obvious shape is an array
+    /// of variants beside a compiler forced exhaustive match, but that array is a SECOND list, and
+    /// a second list is the very thing that goes stale: a thirteenth variant handed a duplicate
+    /// index in the match, with the array not grown, is invisible to a loop that iterates the
+    /// array. The derive has no such soft spot because it enumerates the variants from the enum
+    /// itself, so a new variant appears here the moment it is declared, with nothing to update.
+    ///
+    /// Each name is then round tripped through SERDE, because it is serde and not schemars that
+    /// decides what actually travels: the two read the same `rename_all`, and this is what would
+    /// catch them disagreeing.
+    fn declared_wire_forms() -> BTreeSet<String> {
+        let schema = serde_json::to_value(schemars::schema_for!(NodeGroup))
+            .expect("the generated schema serializes");
+        let variants = schema
+            .get("oneOf")
+            .and_then(serde_json::Value::as_array)
+            .expect("a fieldless enum renders as a oneOf of const strings")
+            .clone();
+        let forms: BTreeSet<String> = variants
+            .iter()
+            .map(|variant| {
+                let name = variant
+                    .get("const")
+                    .and_then(serde_json::Value::as_str)
+                    .expect("each fieldless variant renders as a const string");
+                serde_json::from_value::<NodeGroup>(serde_json::Value::String(name.to_owned()))
+                    .unwrap_or_else(|_| {
+                        panic!("schemars renders `{name}`, which serde refuses to accept")
+                    });
+                name.to_owned()
+            })
+            .collect();
+        assert_eq!(
+            forms.len(),
+            variants.len(),
+            "two NodeGroup variants render the same wire form"
+        );
+        forms
+    }
+
+    /// The cross crate drift lock (issues #92 and #347). `ironauth-journey` is a pure crate and
+    /// cannot depend on the flow engine, so its [`NODE_GROUPS`] vocabulary is a mirror of this
+    /// enum maintained by hand. Nothing compared the two until now, and the mirror is load
+    /// bearing in both directions: the journey validator refuses any `node_group` outside it,
+    /// and the signed interchange archive derives one `node_group.<group>` capability per entry,
+    /// so a variant missing from the mirror is a step no custom journey may render AND a
+    /// capability an importing environment can never be asked to grant.
+    #[test]
+    fn the_journey_node_group_vocabulary_matches_this_enum() {
+        let declared = declared_wire_forms();
+        let mirrored: BTreeSet<String> =
+            NODE_GROUPS.iter().map(|name| (*name).to_owned()).collect();
+        assert_eq!(
+            mirrored.len(),
+            NODE_GROUPS.len(),
+            "ironauth-journey's NODE_GROUPS holds a duplicate name"
+        );
+        let unmirrored: Vec<&String> = declared.difference(&mirrored).collect();
+        assert!(
+            unmirrored.is_empty(),
+            "NodeGroup renders {unmirrored:?}, which ironauth-journey's NODE_GROUPS does not \
+             accept: a custom journey could never render these groups, and the signed \
+             interchange archive could never name them as capabilities"
+        );
+        let undeclared: Vec<&String> = mirrored.difference(&declared).collect();
+        assert!(
+            undeclared.is_empty(),
+            "NODE_GROUPS accepts {undeclared:?}, which no NodeGroup variant renders: the journey \
+             validator admits groups the flow model cannot express"
+        );
+    }
+}

@@ -157,126 +157,135 @@ pub struct Step {
     pub comment: Option<String>,
 }
 
-/// The built-in step kinds a journey step may declare (issue #92): the CLOSED orchestration
-/// vocabulary, mirroring the engine's flow-state and step vocabulary. Each known kind names a
-/// fixed Rust executor; the artifact never expresses step-internal logic. The wire form is
-/// the `snake_case` tag.
+/// Declare the CLOSED step kind vocabulary ONCE: the variant, its documentation, and its wire
+/// string.
 ///
-/// The [`StepKind::Unknown`] variant is NOT a built-in kind: it is the parse-tolerant carrier
-/// for an unrecognized wire value, so the load-time validator rejects it with
-/// [`crate::JourneyError::UnknownStepKind`] (carrying the offending name) rather than failing
-/// the parse opaquely. The published JSON Schema lists ONLY the closed built-in set, so a
-/// schema-level check still rejects an unknown kind.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum StepKind {
-    /// The login identifier plus password first factor.
-    IdentifierPassword,
-    /// A second factor challenge.
-    MfaChallenge,
-    /// A second factor enrollment.
-    MfaEnroll,
-    /// A progressive-profiling step that collects held later-login fields.
-    ProgressiveProfiling,
-    /// An organization-picker step (issue #94, PR-B2): a multi-organization subject with no
-    /// `organization` request parameter chooses which of their live-and-active memberships this
-    /// login binds as its DURABLE org context. It READS the already-established subject to list
-    /// their memberships (so it is a [`StepKind::requires_subject`] kind), RENDERS the choice only
-    /// for a multi-org, no-parameter subject, and SKIPS (rendering nothing, so the flow auto-
-    /// advances) when the org context is already determined (a parameter was supplied, or the
-    /// subject has at most one active membership). It is NOT built-in-only (a custom journey may
-    /// use it, exactly like [`StepKind::ProgressiveProfiling`]).
-    OrgPicker,
-    /// A pure routing hub: it renders nothing and runs no executor, and the engine routes
-    /// onward through this step's own guarded transitions (the transition guards carry the
-    /// branching predicates). Its `decision` attachment is OPTIONAL (issue #351): when ABSENT the
-    /// step is a pure edge-guard routing hub, and when PRESENT the [`DecisionSpec`] is a reserved
-    /// slot for a future outcome-based routing mode (the M11 sandbox seam), validated and type
-    /// checked at load but not yet consulted by the built-in edge-guard routing.
-    Decision,
-    /// A call into a subflow named by the step's `subflow` reference.
-    SubflowCall,
-    /// A terminal step: the journey leaves it only by completing.
-    Terminal,
-    /// The registration details (identifier plus password) first factor that CREATES an account
-    /// and mints the first session (issue #92, PR 8a). A BUILT-IN-ONLY kind: it may appear only in
-    /// an embedded built-in artifact, never a custom-authored one (see [`StepKind::is_builtin_only`]),
-    /// because it creates accounts and mints sessions. It wraps the existing
-    /// `registration::advance_registration` primitive.
-    Registration,
-    /// The recovery identifier entry that initiates account recovery (issue #92, PR 8a): the
-    /// anti-enumeration start step that delivers the one-time code uniformly. A BUILT-IN-ONLY kind
-    /// (it drives a session-minting recovery), it routes to [`StepKind::RecoveryVerify`] by an
-    /// UNCONDITIONAL edge, so it introduces no new outcome signal. It wraps
-    /// `recovery::advance_start`.
-    RecoveryStart,
-    /// The recovery one-time-code verification that mints the session on a genuine proof (issue
-    /// #92, PR 8a): the uniform acknowledgment plus code entry. A BUILT-IN-ONLY kind (it mints a
-    /// session and runs the post-mint counter reset), it wraps `recovery::advance_verify`.
-    RecoveryVerify,
-    /// Not a built-in kind: an unrecognized wire value, preserved so the load-time validator
-    /// can reject it cleanly. Carries the offending kind string.
-    Unknown(String),
+/// From that one list this generates the [`StepKind`] enum, [`StepKind::BUILT_IN`],
+/// [`StepKind::as_wire`], and [`StepKind::from_wire`].
+///
+/// ## Why this is a macro and not a list beside a match
+///
+/// It was a hand written `[&'static str; 11]` sitting beside a hand written enum and two hand
+/// written matches, guarded only by `assert_eq!(BUILT_IN.len(), 11)`, which compares the array to
+/// its own declared length and so can never fail. That let the four drift, and the drift was
+/// MEASURED: a twelfth variant could be added with `as_wire` and `from_wire` arms and every arm a
+/// downstream `match` needs, with `BUILT_IN` untouched, and the whole workspace stayed green. The
+/// consequence is a kind the load time validator ACCEPTS (it gates on
+/// [`StepKind::is_known`], never on `BUILT_IN`) that the published JSON Schema does not list and
+/// that `GrantedCapabilities::engine_default` never grants, so every bundle using it is refused
+/// for a capability nothing can grant. Fail closed, but a hole all the same.
+///
+/// A test comparing two lists cannot close this. Whatever shape it takes it must enumerate the
+/// variants a second time, and the second list is exactly the thing that fails to be updated. The
+/// only airtight form is to delete the second list: here `BUILT_IN`, the two matches, and the enum
+/// are one set of tokens expanded three ways, so a variant that exists has a wire string, a
+/// `BUILT_IN` entry, and a `from_wire` arm, and one that does not exist has none of them. Adding a
+/// variant without a wire string is a non exhaustive match and does not compile.
+///
+/// This is the [`ironauth_jose`] `token_profiles!` and the interchange module's
+/// `fixed_capabilities!` pattern, applied to the vocabulary those two exist to protect.
+macro_rules! step_kinds {
+    ($( $(#[$doc:meta])* $variant:ident => $wire:literal );+ $(;)?) => {
+        /// The built-in step kinds a journey step may declare (issue #92): the CLOSED orchestration
+        /// vocabulary, mirroring the engine's flow-state and step vocabulary. Each known kind names a
+        /// fixed Rust executor; the artifact never expresses step-internal logic. The wire form is
+        /// the `snake_case` tag.
+        ///
+        /// The [`StepKind::Unknown`] variant is NOT a built-in kind: it is the parse-tolerant carrier
+        /// for an unrecognized wire value, so the load-time validator rejects it with
+        /// [`crate::JourneyError::UnknownStepKind`] (carrying the offending name) rather than failing
+        /// the parse opaquely. The published JSON Schema lists ONLY the closed built-in set, so a
+        /// schema-level check still rejects an unknown kind.
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub enum StepKind {
+            $( $(#[$doc])* $variant, )+
+            /// Not a built-in kind: an unrecognized wire value, preserved so the load-time
+            /// validator can reject it cleanly. Carries the offending kind string.
+            Unknown(String),
+        }
+
+        impl StepKind {
+            /// Every built-in kind wire string, in declaration order: the closed set the published
+            /// JSON Schema enumerates, the set `GrantedCapabilities::engine_default` grants a
+            /// `step.<kind>` capability for, and the set the load-time validator accepts. The
+            /// length is COUNTED from the declaration list, so it is not the array's own declared
+            /// length restated. The three mint-family kinds ([`StepKind::Registration`],
+            /// [`StepKind::RecoveryStart`], [`StepKind::RecoveryVerify`]) are BUILT-IN-ONLY (see
+            /// [`StepKind::is_builtin_only`]).
+            pub const BUILT_IN: [&'static str; 0 $( + { let _ = stringify!($variant); 1 } )+] =
+                [ $( $wire, )+ ];
+
+            /// The wire string for this kind. For [`StepKind::Unknown`] it is the offending value
+            /// the parser preserved.
+            #[must_use]
+            pub fn as_wire(&self) -> &str {
+                match self {
+                    $( StepKind::$variant => $wire, )+
+                    StepKind::Unknown(raw) => raw.as_str(),
+                }
+            }
+
+            /// Parse a wire string into a kind, mapping any unrecognized value to
+            /// [`StepKind::Unknown`] so the load-time validator can reject it with a pointer.
+            #[must_use]
+            pub fn from_wire(raw: &str) -> Self {
+                match raw {
+                    $( $wire => StepKind::$variant, )+
+                    other => StepKind::Unknown(other.to_owned()),
+                }
+            }
+        }
+    };
+}
+
+step_kinds! {
+        /// The login identifier plus password first factor.
+        IdentifierPassword => "identifier_password";
+        /// A second factor challenge.
+        MfaChallenge => "mfa_challenge";
+        /// A second factor enrollment.
+        MfaEnroll => "mfa_enroll";
+        /// A progressive-profiling step that collects held later-login fields.
+        ProgressiveProfiling => "progressive_profiling";
+        /// An organization-picker step (issue #94, PR-B2): a multi-organization subject with no
+        /// `organization` request parameter chooses which of their live-and-active memberships this
+        /// login binds as its DURABLE org context. It READS the already-established subject to list
+        /// their memberships (so it is a [`StepKind::requires_subject`] kind), RENDERS the choice only
+        /// for a multi-org, no-parameter subject, and SKIPS (rendering nothing, so the flow auto-
+        /// advances) when the org context is already determined (a parameter was supplied, or the
+        /// subject has at most one active membership). It is NOT built-in-only (a custom journey may
+        /// use it, exactly like [`StepKind::ProgressiveProfiling`]).
+        OrgPicker => "org_picker";
+        /// A pure routing hub: it renders nothing and runs no executor, and the engine routes
+        /// onward through this step's own guarded transitions (the transition guards carry the
+        /// branching predicates). Its `decision` attachment is OPTIONAL (issue #351): when ABSENT the
+        /// step is a pure edge-guard routing hub, and when PRESENT the [`DecisionSpec`] is a reserved
+        /// slot for a future outcome-based routing mode (the M11 sandbox seam), validated and type
+        /// checked at load but not yet consulted by the built-in edge-guard routing.
+        Decision => "decision";
+        /// A call into a subflow named by the step's `subflow` reference.
+        SubflowCall => "subflow_call";
+        /// A terminal step: the journey leaves it only by completing.
+        Terminal => "terminal";
+        /// The registration details (identifier plus password) first factor that CREATES an account
+        /// and mints the first session (issue #92, PR 8a). A BUILT-IN-ONLY kind: it may appear only in
+        /// an embedded built-in artifact, never a custom-authored one (see [`StepKind::is_builtin_only`]),
+        /// because it creates accounts and mints sessions. It wraps the existing
+        /// `registration::advance_registration` primitive.
+        Registration => "registration";
+        /// The recovery identifier entry that initiates account recovery (issue #92, PR 8a): the
+        /// anti-enumeration start step that delivers the one-time code uniformly. A BUILT-IN-ONLY kind
+        /// (it drives a session-minting recovery), it routes to [`StepKind::RecoveryVerify`] by an
+        /// UNCONDITIONAL edge, so it introduces no new outcome signal. It wraps
+        /// `recovery::advance_start`.
+        RecoveryStart => "recovery_start";
+        /// The recovery one-time-code verification that mints the session on a genuine proof (issue
+        /// #92, PR 8a): the uniform acknowledgment plus code entry. A BUILT-IN-ONLY kind (it mints a
+        /// session and runs the post-mint counter reset), it wraps `recovery::advance_verify`.
+        RecoveryVerify => "recovery_verify";
 }
 
 impl StepKind {
-    /// The eleven built-in kind wire strings, in declaration order. This is the closed set the
-    /// published JSON Schema enumerates and the load-time validator accepts. The three
-    /// mint-family kinds ([`StepKind::Registration`], [`StepKind::RecoveryStart`],
-    /// [`StepKind::RecoveryVerify`]) are BUILT-IN-ONLY (see [`StepKind::is_builtin_only`]).
-    pub const BUILT_IN: [&'static str; 11] = [
-        "identifier_password",
-        "mfa_challenge",
-        "mfa_enroll",
-        "progressive_profiling",
-        "org_picker",
-        "decision",
-        "subflow_call",
-        "terminal",
-        "registration",
-        "recovery_start",
-        "recovery_verify",
-    ];
-
-    /// The wire string for this kind. For [`StepKind::Unknown`] it is the offending value the
-    /// parser preserved.
-    #[must_use]
-    pub fn as_wire(&self) -> &str {
-        match self {
-            StepKind::IdentifierPassword => "identifier_password",
-            StepKind::MfaChallenge => "mfa_challenge",
-            StepKind::MfaEnroll => "mfa_enroll",
-            StepKind::ProgressiveProfiling => "progressive_profiling",
-            StepKind::OrgPicker => "org_picker",
-            StepKind::Decision => "decision",
-            StepKind::SubflowCall => "subflow_call",
-            StepKind::Terminal => "terminal",
-            StepKind::Registration => "registration",
-            StepKind::RecoveryStart => "recovery_start",
-            StepKind::RecoveryVerify => "recovery_verify",
-            StepKind::Unknown(raw) => raw.as_str(),
-        }
-    }
-
-    /// Parse a wire string into a kind, mapping any unrecognized value to
-    /// [`StepKind::Unknown`] so the load-time validator can reject it with a pointer.
-    #[must_use]
-    pub fn from_wire(raw: &str) -> Self {
-        match raw {
-            "identifier_password" => StepKind::IdentifierPassword,
-            "mfa_challenge" => StepKind::MfaChallenge,
-            "mfa_enroll" => StepKind::MfaEnroll,
-            "progressive_profiling" => StepKind::ProgressiveProfiling,
-            "org_picker" => StepKind::OrgPicker,
-            "decision" => StepKind::Decision,
-            "subflow_call" => StepKind::SubflowCall,
-            "terminal" => StepKind::Terminal,
-            "registration" => StepKind::Registration,
-            "recovery_start" => StepKind::RecoveryStart,
-            "recovery_verify" => StepKind::RecoveryVerify,
-            other => StepKind::Unknown(other.to_owned()),
-        }
-    }
-
     /// Whether this is one of the closed built-in kinds (not [`StepKind::Unknown`]).
     #[must_use]
     pub fn is_known(&self) -> bool {
@@ -730,8 +739,58 @@ mod tests {
                 "{wire} stays custom-usable"
             );
         }
-        // The closed built-in set grew from seven to ten, then to eleven with org_picker.
+        // The closed built-in set grew from seven to ten, then to eleven with org_picker. This
+        // used to be a list compared to its own declared length and could not fail; `BUILT_IN` is
+        // now COUNTED from the `step_kinds!` declaration, so it is a real pin on the vocabulary
+        // size and a twelfth kind is a deliberate, visible edit rather than an accident.
         assert_eq!(StepKind::BUILT_IN.len(), 11);
+    }
+
+    /// The vocabulary the load-time validator gates on and the vocabulary everything downstream
+    /// enumerates are ONE list (issue #347).
+    ///
+    /// The validator accepts a kind through [`StepKind::is_known`], never through
+    /// [`StepKind::BUILT_IN`], while the published JSON Schema and the interchange archive's
+    /// `step.<kind>` capability grant both read `BUILT_IN`. When those were two hand written lists
+    /// a kind could be accepted at load and absent from the grant, so every bundle using it was
+    /// refused for a capability nothing could grant. `step_kinds!` makes them the same tokens; this
+    /// is the behavioural statement of that, in both directions.
+    #[test]
+    fn the_kind_the_validator_accepts_is_exactly_the_kind_the_vocabulary_publishes() {
+        // Forward: every published name parses to a KNOWN variant that renders back as itself.
+        for wire in StepKind::BUILT_IN {
+            let kind = StepKind::from_wire(wire);
+            assert!(kind.is_known(), "{wire} is published but parses as unknown");
+            assert_eq!(
+                kind.as_wire(),
+                wire,
+                "{wire} does not render back as itself"
+            );
+        }
+        // No duplicate, so the published set really has BUILT_IN.len() distinct members.
+        let unique: std::collections::BTreeSet<&str> = StepKind::BUILT_IN.into_iter().collect();
+        assert_eq!(
+            unique.len(),
+            StepKind::BUILT_IN.len(),
+            "BUILT_IN holds a duplicate wire name"
+        );
+        // Reverse: a name outside the published set is never accepted. `from_wire`'s arms are
+        // generated from the same list `BUILT_IN` is, so this holds by construction; these are the
+        // near misses that would catch a hand written arm sneaking back in.
+        for wire in [
+            "teleport",
+            "identifier_passwords",
+            "Identifier_Password",
+            "decision ",
+            "",
+        ] {
+            let kind = StepKind::from_wire(wire);
+            assert!(
+                !kind.is_known(),
+                "{wire:?} is accepted by the validator but is not in BUILT_IN"
+            );
+            assert!(!StepKind::BUILT_IN.contains(&wire));
+        }
     }
 
     #[test]

@@ -6,6 +6,23 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The node group vocabulary is now LOCKED to the `NodeGroup` enum across the crate boundary**
+  (issues #92 and #347). `ironauth-journey` is a pure crate and cannot depend on the flow engine,
+  so its `NODE_GROUPS` array is a hand maintained mirror of this crate's `NodeGroup` wire forms.
+  Its own doc comment said so, and nothing compared the two, which is the hand written list beside
+  an exhaustive match that keeps recurring here. The mirror is load bearing in BOTH directions: the
+  journey validator refuses any `node_group` outside it, and the new signed interchange archive
+  derives one `node_group.<group>` capability per entry, so a variant missing from the mirror is
+  both a step no custom journey may render and a capability an importing environment can never be
+  asked to grant. `flow::model`'s `the_journey_node_group_vocabulary_matches_this_enum` now asserts
+  set equality in both directions, taking the variant list from the `JsonSchema` derive rather than
+  from a second array, so a thirteenth variant enters the comparison the moment it is declared. The
+  first draft of this lock did use a variant array beside a compiler forced exhaustive match, and
+  it had a soft spot worth recording: a new variant handed a duplicate index in the match, with the
+  array not grown, is invisible to a loop that iterates the array. Reading the declaration through
+  the derive removes the second list rather than guarding it. Each name is also round tripped
+  through serde, since serde and not schemars decides what actually travels.
+
 - **A Logout Token was accepted as an `id_token_hint`** (issue #192). `end_session`
   attributes a logout by signature, issuer, and audience alone, with no store lookup
   behind it, and every token IronAuth mints for a client satisfies all three: one

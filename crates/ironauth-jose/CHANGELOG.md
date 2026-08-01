@@ -6,6 +6,29 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **A fourth token profile: `iaj+jws`, the signed journey interchange archive** (issue #347).
+  Added to the `token_profiles!` declaration, so the variant, its media type, and
+  `TokenTyp::ALL` all move together and `no_two_profiles_share_a_media_type` compares it to the
+  other three the moment it exists. The archive is minted by THIS system with a per-environment
+  Ed25519 key, so its importer states `ExpectedTyp::Required(TokenTyp::JourneyInterchange)` and
+  not `ExpectedTyp::ForeignIssuer`: the exporter is a foreign ORGANIZATION, but the protected
+  header is IronAuth's own, so `typ` is still a separator there and riding `ForeignIssuer` would
+  have surrendered it for nothing. Unlike `at+jwt`, `JWT`, and `logout+jwt` there is no RFC to
+  cite, because no standards body names this document; the media type is IronAuth's own and is
+  deliberately not registered with IANA. Its whole job is to be a value no other profile answers
+  to, which is what stops an access token being spent where an archive is expected and an archive
+  being spent as a token. One limitation is recorded rather than closed while this profile lands:
+  `parse_unique_object` (`src/json.rs`) refuses a duplicate key in the TOP-LEVEL header or claim
+  object only, because uniqueness is checked in its own `visit_map` and every nested object below
+  it is an ordinary `serde_json::Value` with last-value-wins. For a token that is immaterial (the
+  claims a verifier reads are top level); for a `.iaj` archive, whose `artifact` member is a whole
+  nested document, it means a signed archive carrying a duplicate key deep inside is AMBIGUOUS to a
+  third-party inspector, which may read the first value where IronAuth reads the last. It is not a
+  signature bypass: there is one parse and the tree that is checked is the tree that is acted on.
+  Making the parse recurse would change every token parse in the system, so the reach is documented
+  here and in the store's interchange module and locked by an acceptance case rather than widened
+  on the way past.
+
 - **RFC 9068 section 4: a verification policy now states which token profile it accepts,
   and it cannot decline to** (issue #192). `VerificationPolicy::new` takes an
   `ExpectedTyp` as a fifth positional argument, `verify` matches the protected header's

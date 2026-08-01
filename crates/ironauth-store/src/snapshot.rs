@@ -602,6 +602,23 @@ fn write_canonical(value: &serde_json::Value, out: &mut String) {
     }
 }
 
+/// The canonical JSON STRING of an arbitrary value, through the same writer
+/// [`Snapshot::to_canonical_string`] uses.
+///
+/// Exposed to the crate (issue #347) so the signed journey interchange archive canonicalizes its
+/// payload through the ONE canonical JSON writer this crate has, rather than growing a second one
+/// that would have to agree with this by inspection.
+pub(crate) fn canonical_json_string(value: &serde_json::Value) -> String {
+    let mut out = String::new();
+    write_canonical(value, &mut out);
+    out
+}
+
+/// The canonical JSON BYTES of an arbitrary value. See [`canonical_json_string`].
+pub(crate) fn canonical_json_bytes(value: &serde_json::Value) -> Vec<u8> {
+    canonical_json_string(value).into_bytes()
+}
+
 /// Append `text` as a JSON string literal (quoted and escaped) to `out`, reusing
 /// `serde_json`'s string encoder so the escaping matches the grammar exactly.
 fn write_json_string(text: &str, out: &mut String) {

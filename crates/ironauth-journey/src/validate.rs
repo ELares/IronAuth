@@ -27,6 +27,12 @@ use crate::eval::{PredicateTypeError, typecheck_predicate};
 /// depend on the flow engine), and a later PR that unifies the two engines makes it the one
 /// source. Any `node_group` outside this set is refused with
 /// [`JourneyError::UnknownNodeGroup`].
+///
+/// The mirror is LOCKED to its source by `the_journey_node_group_vocabulary_matches_this_enum`
+/// in `ironauth-oidc`'s `flow::model`, which is the only crate that can see both. It asserts set
+/// equality in both directions, and it reads the variant list out of the `JsonSchema` derive
+/// rather than out of a second array, so a new `NodeGroup` variant enters the comparison the
+/// moment it is declared and this mirror cannot silently fall behind it.
 pub const NODE_GROUPS: [&str; 12] = [
     "default",
     "password",
