@@ -59,6 +59,10 @@ fn signup_form_path(tenant: &str, environment: &str, client: &str) -> String {
     format!("/v1/tenants/{tenant}/environments/{environment}/applications/{client}/signup-form")
 }
 
+fn brand_path(tenant: &str, environment: &str, slug: &str) -> String {
+    format!("/v1/tenants/{tenant}/environments/{environment}/brands/{slug}")
+}
+
 fn organizations_path(tenant: &str, environment: &str) -> String {
     format!("/v1/tenants/{tenant}/environments/{environment}/organizations")
 }
@@ -1402,5 +1406,84 @@ async fn sudo_gate_covers_apply_promotion_invitations_and_dcr() {
         status,
         StatusCode::CREATED,
         "elevated create_dcr_policy succeeds: {resp}"
+    );
+}
+
+/// A brand write is SUDO-gated on BOTH mutating verbs, and the read is NOT.
+///
+/// The gate was wired on `PUT` and `DELETE` and nothing measured it, so removing either
+/// `require_fresh_privilege` call would have left CI green. A brand is the visible chrome of the
+/// auth pages, so rewriting one (or deleting it, which drops the environment back to the neutral
+/// default) is a social-engineering surface and demands fresh privilege exactly as the locale
+/// writes and the brand asset uploads do. The ungated `GET` is the control at the other end: it
+/// shows the gate is on the MUTATIONS rather than on the route prefix.
+#[tokio::test]
+async fn a_brand_write_is_sudo_gated() {
+    let (harness, clock) = Harness::start_with_sudo(600).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k1").await;
+    let path = brand_path(&tenant, &env, "acme");
+    let body = r#"{"product_name":"Acme"}"#;
+
+    // Without a fresh elevation the write is challenged and NOTHING is stored.
+    let (status, _, challenge) = harness.put(&path, body).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "the stale brand write is challenged: {challenge}"
+    );
+    assert!(
+        challenge.contains("insufficient_user_authentication"),
+        "the challenge body carries the RFC 9470 error: {challenge}"
+    );
+    let (status, _, _) = harness.get(&path).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the challenged write executed nothing"
+    );
+
+    // After elevation the same write succeeds.
+    let (status, _, elevated) = harness.post(&elevate_path(&tenant, &env), "e1", "{}").await;
+    assert_eq!(status, StatusCode::OK, "elevate: {elevated}");
+    let (status, _, stored) = harness.put(&path, body).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the elevated brand write succeeds: {stored}"
+    );
+
+    // The READ is ungated: it works with the same credential either side of the window.
+    let (status, _, _) = harness.get(&path).await;
+    assert_eq!(status, StatusCode::OK, "reading a brand needs no elevation");
+
+    // DELETE is gated on the SAME elevation, measured by letting the window lapse: the brand
+    // exists, the credential is unchanged, and only the freshness has gone.
+    clock.advance(Duration::from_secs(601));
+    let (status, _, challenge) = harness.delete(&path).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "the lapsed window challenges the delete: {challenge}"
+    );
+    assert!(
+        challenge.contains("insufficient_user_authentication"),
+        "{challenge}"
+    );
+    let (status, _, _) = harness.get(&path).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the challenged delete executed nothing"
+    );
+
+    // Re-elevate and the delete lands, which rules out "the delete was refused for some other
+    // reason".
+    let (status, _, _) = harness.post(&elevate_path(&tenant, &env), "e2", "{}").await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, _) = harness.delete(&path).await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "the re-elevated delete lands"
     );
 }

@@ -31,7 +31,8 @@
 //! The promotion engine operates on the promotable resource types that carry a
 //! SCOPE-INDEPENDENT natural key and whose full promotable state travels in the
 //! snapshot: resource servers (keyed by `audience`), DCR policies (keyed by
-//! `name`), environment variables (keyed by `name`), and custom-journey versions
+//! `name`), environment variables (keyed by `name`), brands (keyed by `slug`),
+//! locale bundles (keyed by the BCP47 `locale` tag), and custom-journey versions
 //! (keyed by `journey_id@version`). See [`PROMOTED_RESOURCE_TYPES`].
 //! Environment-IDENTITY (the environment itself, its
 //! signing keys, its issuer, its custom domains, its secrets' VALUES) is NEVER
@@ -47,6 +48,38 @@
 //! scope-independent public client identity, a snapshot-format question owned by a
 //! follow-up; this engine leaves the target's clients untouched rather than
 //! silently minting divergent copies.
+//!
+//! # Branding, localization, and signup fields (issues #86, #87, #475)
+//!
+//! Brands and locale bundles ARE promoted: a brand's `slug` and a bundle's BCP47
+//! `locale` tag are operator-authored strings that name the SAME logical resource in
+//! every environment, so they address correctly across a promotion. Three per-brand
+//! fields get per-type normalization, described on [`promoted_brand`]: the
+//! per-CLIENT selection key is normalized away (it is a scope-embedded
+//! [`crate::ClientId`], so it can never address the target's clients), the per-DOMAIN
+//! selection key is CANONICALIZED through the same fold the management writer and the
+//! selection matcher use (so a promoted host claim cannot slip past the per-scope unique
+//! index that makes brand selection unambiguous), and the brand's
+//! ASSET metadata travels by CONTENT REFERENCE (the sha256), sorted by kind, which the
+//! apply resolves against bytes the TARGET already holds and refuses when it cannot.
+//!
+//! Signup forms (issue #87) are carried in the snapshot EXPORT but are NOT promoted,
+//! for the SAME measured reason clients are not: a signup form's natural key IS an
+//! authorize `client_id`, which the management write path parses with
+//! [`crate::ClientId::parse_in_scope`], so the stored key is a scope-embedded id whose
+//! payload contains the SOURCE environment's bytes. Promoting a form would insert a row
+//! in the target keyed by a client that provably cannot exist there (a create of dead
+//! config) and would delete the target's own form for its own client (the target-only
+//! key looks like a source deletion), so promoting signup forms is not merely
+//! incomplete, it is destructive. Unlike an unresolved variable or a missing asset
+//! byte, there is NO action a target-environment operator could take to make such a
+//! promotion resolve, so a fail-closed gate here would be a permanent block on every
+//! cross-environment promotion rather than a safety net. Signup-form promotion is
+//! therefore blocked on exactly the missing primitive client promotion is blocked on: a
+//! stable, scope-independent public client identity. That is an owner-level
+//! snapshot-format decision, not something this engine invents, and
+//! `the_signup_form_key_is_a_scope_embedded_client_id_so_it_cannot_address_the_target`
+//! in `tests/config_promotion.rs` measures the blocker rather than describing it.
 //!
 //! # Custom-journey versions and the per-environment activation gate (issue #92)
 //!
@@ -79,20 +112,124 @@ use crate::error::StoreError;
 use crate::esv::Reference;
 use crate::snapshot::{FlowVersionSnapshot, Snapshot, SnapshotResources};
 
-/// The promotable resource types this engine diffs, plans, and applies.
+/// Declare the promoted resource types ONCE and generate every form the engine needs
+/// from that single list (issue #475): the [`PROMOTED_RESOURCE_TYPES`] array, its
+/// length, and the CLOSED [`PromotedResourceType`] enum the transactional apply
+/// dispatches on.
 ///
-/// Each has a SCOPE-INDEPENDENT natural key (an `audience` or a `name`, never a
-/// scope-embedded identifier) and carries its full promotable state in the
-/// snapshot, so it round-trips across environments: applying a source then
-/// re-diffing the source against the target yields an empty diff. This is a SUBSET
-/// of [`crate::snapshot::SNAPSHOT_RESOURCE_TYPES`] (which additionally carries
-/// `client`, excluded here per the module docs).
-pub const PROMOTED_RESOURCE_TYPES: [ResourceType; 4] = [
-    ResourceType::ResourceServer,
-    ResourceType::DcrPolicy,
-    ResourceType::Variable,
-    ResourceType::FlowVersion,
-];
+/// This is the DRIFT LOCK on the engine's hardest-to-see coupling. Before it, the
+/// constant, the [`promoted_projection`], and the repository's apply dispatch were
+/// three hand-maintained lists that nothing forced to agree, and all three had
+/// silently diverged (`brand`, `locale_bundle` and `signup_form` sat in the snapshot
+/// with an empty projection and no apply arm, so a promotion carried none of them).
+/// Generating the enum from the same list makes every per-type dispatch an EXHAUSTIVE
+/// match over it: adding a type here fails to COMPILE until its arm exists, which no
+/// test could be forgotten to run. FOUR sites are locked that way, which is the whole
+/// set of places a promoted type has to be wired:
+///
+/// - the repository's transactional apply dispatch (`apply_change`);
+/// - [`diff`], which iterates [`PromotedResourceType::ALL`] and matches exhaustively
+///   instead of calling one `diff_keyed` per type from a hand-written list;
+/// - the repository's TARGET read (`read_promoted_snapshot`), which fills each promoted
+///   collection from an exhaustive match instead of a hand-written struct literal;
+/// - [`promoted_projection`], which is a struct literal (so a NEW SNAPSHOT field is a
+///   compile error there) and is measured behaviourally besides.
+///
+/// The last two used to be the blind spot, and it was MEASURED rather than supposed: a
+/// seventh type (`Connector`) added to this list, wired into [`promoted_projection`] and
+/// given an apply arm but MISSING from `diff` and the target read compiled clean and
+/// passed all of `--lib promotion` and all of `tests/config_promotion.rs`, because both
+/// were hand-written lists that only per-type tests for today's six covered. Re-run that
+/// mutation now and the build fails in both places, which is the only form of proof a
+/// compile-time lock admits: a runtime test cannot observe a program that does not build.
+///
+/// The array's length is COUNTED from the declaration list rather than restated, so it
+/// cannot be a number checked against itself. The remaining two agreements (the
+/// projection carries exactly these types, and these types are a subset of the
+/// snapshot's) are measured behaviourally by
+/// `the_promoted_projection_carries_exactly_the_promoted_types` and
+/// `the_promoted_types_are_a_subset_of_the_snapshot_types`, which read the SERIALIZED
+/// projection keyed by [`ResourceType::as_str`] rather than a second hand-written list.
+macro_rules! promoted_resource_types {
+    ($( $(#[$doc:meta])* $variant:ident );+ $(;)?) => {
+        /// The promotable resource types this engine diffs, plans, and applies.
+        ///
+        /// Each has a SCOPE-INDEPENDENT natural key (an `audience`, a `name`, a `slug`, a
+        /// BCP47 tag, or a `journey_id@version`, never a scope-embedded identifier) and
+        /// carries its full promotable state in the snapshot, so it round-trips across
+        /// environments: applying a source then re-diffing the source against the target
+        /// yields an empty diff.
+        ///
+        /// This is a strict SUBSET of [`crate::snapshot::SNAPSHOT_RESOURCE_TYPES`], which
+        /// additionally carries the six types the engine does not apply: `client` and
+        /// `signup_form` (both keyed by a scope-embedded [`crate::ClientId`], so their
+        /// snapshot key cannot address the same logical resource in another environment),
+        /// and `connector`, `org_connection`, `routing_rule` and `upstream_token_grant`
+        /// (whose references must resolve against the target environment, a later slice).
+        /// The module docs give the reasoning for each; the subset relation itself is
+        /// enforced by `the_promoted_types_are_a_subset_of_the_snapshot_types`.
+        pub const PROMOTED_RESOURCE_TYPES:
+            [ResourceType; 0 $( + { let _ = stringify!($variant); 1 } )+] =
+            [ $( ResourceType::$variant, )+ ];
+
+        /// The CLOSED set of resource types the transactional apply dispatches on
+        /// (issue #475): exactly [`PROMOTED_RESOURCE_TYPES`], as an enum, so the
+        /// repository's dispatch is an EXHAUSTIVE match with no catch-all arm.
+        ///
+        /// [`ResourceType`] is `#[non_exhaustive]` and carries every management resource,
+        /// so a dispatch over it needs a wildcard and can silently fall through for a
+        /// newly promoted type. Narrowing to this generated enum first moves that failure
+        /// from run time to COMPILE time.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum PromotedResourceType {
+            $( $(#[$doc])* $variant, )+
+        }
+
+        impl PromotedResourceType {
+            /// Every promoted type, in declaration order: what the DIFF and the target READ
+            /// iterate so their per-type wiring is an EXHAUSTIVE match rather than a
+            /// hand-written call list (issue #475). Counted from the declaration list, like
+            /// [`PROMOTED_RESOURCE_TYPES`], so the length cannot be a number checked against
+            /// itself.
+            pub const ALL: [PromotedResourceType; 0 $( + { let _ = stringify!($variant); 1 } )+] =
+                [ $( PromotedResourceType::$variant, )+ ];
+
+            /// Narrow a [`ResourceType`] to a promoted one, or [`None`] when this engine
+            /// does not promote it. The apply turns [`None`] into a not-found rather than
+            /// a silent skip.
+            #[must_use]
+            pub fn from_resource_type(value: ResourceType) -> Option<Self> {
+                match value {
+                    $( ResourceType::$variant => Some(Self::$variant), )+
+                    _ => None,
+                }
+            }
+
+            /// Widen back to the management-facing [`ResourceType`].
+            #[must_use]
+            pub fn as_resource_type(self) -> ResourceType {
+                match self {
+                    $( Self::$variant => ResourceType::$variant, )+
+                }
+            }
+        }
+    };
+}
+
+promoted_resource_types! {
+    /// A registered resource server, keyed by `audience`.
+    ResourceServer;
+    /// A Dynamic Client Registration policy, keyed by `name`.
+    DcrPolicy;
+    /// A non-secret environment variable, keyed by `name`.
+    Variable;
+    /// A per-environment brand, keyed by `slug` (issue #86).
+    Brand;
+    /// A per-environment locale bundle, keyed by its BCP47 tag (issue #86, PR 2).
+    LocaleBundle;
+    /// An append-only custom-journey version, keyed by `journey_id@version` (issue #92).
+    FlowVersion;
+}
 
 /// Whether a resource change creates, updates, or deletes a target resource.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,32 +354,56 @@ impl ConfigDiff {
 ///
 /// Only [`PROMOTED_RESOURCE_TYPES`] are compared; any `client` in either snapshot
 /// is ignored (see the module docs), so the target's clients are never touched.
+///
+/// The per-type wiring is an EXHAUSTIVE match over [`PromotedResourceType`], walked in
+/// [`PromotedResourceType::ALL`] (declaration) order, NOT a hand-written call list:
+/// promoting a new resource type makes this match non-exhaustive and the crate fails to
+/// COMPILE until the type is diffed. Before that lock, a type could be wired into the
+/// projection and the apply and silently left out of the diff, so a promotion carried it
+/// in the revision but enumerated no change for it.
 #[must_use]
 pub fn diff(source: &Snapshot, target: &Snapshot) -> ConfigDiff {
     let mut changes = Vec::new();
-    diff_keyed(
-        ResourceType::ResourceServer,
-        &keyed_resource_servers(&source.resources),
-        &keyed_resource_servers(&target.resources),
-        &mut changes,
-    );
-    diff_keyed(
-        ResourceType::DcrPolicy,
-        &keyed_dcr_policies(&source.resources),
-        &keyed_dcr_policies(&target.resources),
-        &mut changes,
-    );
-    diff_keyed(
-        ResourceType::Variable,
-        &keyed_variables(&source.resources),
-        &keyed_variables(&target.resources),
-        &mut changes,
-    );
-    diff_flow_versions(
-        &keyed_flow_versions(&source.resources),
-        &keyed_flow_versions(&target.resources),
-        &mut changes,
-    );
+    for promoted in PromotedResourceType::ALL {
+        match promoted {
+            PromotedResourceType::ResourceServer => diff_keyed(
+                ResourceType::ResourceServer,
+                &keyed_resource_servers(&source.resources),
+                &keyed_resource_servers(&target.resources),
+                &mut changes,
+            ),
+            PromotedResourceType::DcrPolicy => diff_keyed(
+                ResourceType::DcrPolicy,
+                &keyed_dcr_policies(&source.resources),
+                &keyed_dcr_policies(&target.resources),
+                &mut changes,
+            ),
+            PromotedResourceType::Variable => diff_keyed(
+                ResourceType::Variable,
+                &keyed_variables(&source.resources),
+                &keyed_variables(&target.resources),
+                &mut changes,
+            ),
+            PromotedResourceType::Brand => diff_keyed(
+                ResourceType::Brand,
+                &keyed_brands(&source.resources),
+                &keyed_brands(&target.resources),
+                &mut changes,
+            ),
+            PromotedResourceType::LocaleBundle => diff_keyed(
+                ResourceType::LocaleBundle,
+                &keyed_locale_bundles(&source.resources),
+                &keyed_locale_bundles(&target.resources),
+                &mut changes,
+            ),
+            // Append-only, so this one is NOT `diff_keyed`: it never emits a delete.
+            PromotedResourceType::FlowVersion => diff_flow_versions(
+                &keyed_flow_versions(&source.resources),
+                &keyed_flow_versions(&target.resources),
+                &mut changes,
+            ),
+        }
+    }
     ConfigDiff { changes }
 }
 
@@ -394,6 +555,39 @@ fn keyed_dcr_policies(resources: &SnapshotResources) -> BTreeMap<String, serde_j
         .collect()
 }
 
+/// The brands of a snapshot, keyed by `slug`, each value the NORMALIZED promotable
+/// brand (issue #475).
+///
+/// The value is [`promoted_brand`], the same normalization the revision is computed
+/// over, so the diff and the revision can never disagree about what a brand's
+/// promotable state is: one function decides, both callers read it.
+fn keyed_brands(resources: &SnapshotResources) -> BTreeMap<String, serde_json::Value> {
+    resources
+        .brand
+        .iter()
+        .map(|brand| {
+            (
+                brand.slug.clone(),
+                serde_json::to_value(promoted_brand(brand)).unwrap_or(serde_json::Value::Null),
+            )
+        })
+        .collect()
+}
+
+/// The locale bundles of a snapshot, keyed by their BCP47 `locale` tag.
+fn keyed_locale_bundles(resources: &SnapshotResources) -> BTreeMap<String, serde_json::Value> {
+    resources
+        .locale_bundle
+        .iter()
+        .map(|bundle| {
+            (
+                bundle.locale.clone(),
+                serde_json::to_value(bundle).unwrap_or(serde_json::Value::Null),
+            )
+        })
+        .collect()
+}
+
 /// The environment variables of a snapshot, keyed by `name`.
 fn keyed_variables(resources: &SnapshotResources) -> BTreeMap<String, serde_json::Value> {
     resources
@@ -428,6 +622,108 @@ pub fn revision(snapshot: &Snapshot) -> Result<String, StoreError> {
     Ok(hex_lower(&digest))
 }
 
+/// The NORMALIZED promotable projection of one brand (issue #475): what a promotion
+/// actually carries for a brand, as opposed to what the snapshot EXPORT records.
+///
+/// One field is normalized AWAY, one is normalized IN PLACE, and one is re-ORDERED.
+///
+/// The field normalized away is the brand's per-CLIENT selection
+/// key. `BrandSnapshot::client_id` is an authorize `client_id`, which is a
+/// [`crate::ClientId`]: a scope-embedded identifier whose payload contains the SOURCE
+/// environment's bytes (`ClientId::parse_in_scope` under the target scope is a uniform
+/// not-found for it, by construction). Carrying it would do two bad things at once. It
+/// would write a selection key into the target that `select_brand`'s tier-1
+/// per-client match can never hit, so the promoted value is dead config; and, worse,
+/// it would OVERWRITE a target-environment admin's own per-client selection with that
+/// dead value, silently changing which brand a named relying party renders in the
+/// target. That is the same hazard the custom-journey `pinned` flag is normalized for
+/// (see the module docs): a per-environment activation key must never ride a
+/// promotion. The `brands_client_id_idx` partial unique index makes the key
+/// per-environment-exclusive too, so a carried key is also a latent unique-violation.
+/// The target-env admin sets the per-client selection deliberately, and a promotion
+/// leaves it alone.
+///
+/// Everything else IS the brand's promotable definition and travels as authored:
+///
+/// - `is_default` travels. Unlike a journey pin it gates no auth logic (it selects
+///   which cosmetic brand renders when nothing more specific matches), and a promotion
+///   that could not carry it would land every brand inert in the target, which is the
+///   opposite of the promise. The one-default-per-scope partial unique index is
+///   respected by the apply, which demotes any other default first, exactly as
+///   `Brands::set` does.
+/// - `host_pattern` travels as authored, CANONICALIZED through
+///   [`crate::brand::canonicalize_host`] (the field normalized in place). It is an
+///   operator-authored hostname, not a machine-minted scope-embedded id, so an operator
+///   CAN author the same value in two environments; where they differ, the shipped
+///   `BrandSnapshot::host_pattern` contract already says the target-env operator adjusts
+///   it, and the change is visible in the diff.
+///
+///   Folding it here is not cosmetic, it is the brand-selection UNIQUENESS invariant.
+///   `brands_host_pattern_idx` is a partial unique index on the RAW column, and the
+///   management writer canonicalizes at ingest so the index sees one spelling per host.
+///   A promotion is the SECOND writer of that column, so it must fold on the same
+///   function or a promoted `LOGIN.Acme.Test:8443` would sit beside a stored
+///   `login.acme.test` under a unique index that cannot see they are the same host,
+///   while `select_brand` (which normalizes both sides before comparing) resolves BOTH
+///   for the same request. That would falsify "first match is also the only match".
+///   Canonicalizing HERE rather than only at the apply's bind is what makes the
+///   promotion converge: the diff and the revision read this projection, so an apply
+///   that stored the folded form while the diff read the raw one would re-propose the
+///   same update on every plan, forever.
+///
+///   What carrying the field can DO to the target is stated precisely, because the
+///   obvious summary is wrong. It can de-select a per-host brand (the fallback is the
+///   env default), it can activate one (a target brand that claimed no host, or claimed
+///   a different one, can end up claiming a host the source names), and it can
+///   RE-POINT a host: a source that moves a claim from one slug to another moves which
+///   brand renders for that hostname in the target. All three are enumerated in the
+///   diff before an operator approves the plan, which is the actual safety property.
+///   The field is cosmetic selection, not auth logic, so unlike a journey pin it is not
+///   gated inert.
+/// - `assets` travel as by-reference METADATA (kind, sniffed content type, sha256,
+///   size), SORTED BY KIND (the re-ordered field). The bytes never enter the snapshot
+///   document; the apply resolves each asset's sha256 against bytes the TARGET already
+///   holds and REFUSES the whole promotion when it cannot, so a promotion can never
+///   leave the target with metadata pointing at bytes it does not have, and can never
+///   serve the source's bytes. The sort exists because the TARGET read orders a brand's
+///   assets by kind while a hand-authored document may list them in any order, and the
+///   diff compares the whole serialized element: without it a document listing
+///   `[logo, favicon]` would produce an Update on EVERY plan and the promotion would
+///   never reach [`PromotionOutcome::NoOp`].
+#[must_use]
+fn promoted_brand(brand: &crate::snapshot::BrandSnapshot) -> crate::snapshot::BrandSnapshot {
+    let mut assets = brand.assets.clone();
+    assets.sort_by(|a, b| a.kind.cmp(&b.kind));
+    crate::snapshot::BrandSnapshot {
+        slug: brand.slug.clone(),
+        is_default: brand.is_default,
+        product_name: brand.product_name.clone(),
+        show_wordmark: brand.show_wordmark,
+        brand_token: brand.brand_token.clone(),
+        tokens: brand.tokens.clone(),
+        tokens_dark: brand.tokens_dark.clone(),
+        slots: brand.slots.clone(),
+        // The selection-uniqueness fold: see the doc comment above.
+        host_pattern: promoted_host_pattern(brand.host_pattern.as_deref()),
+        // The per-environment activation gate: see the doc comment above.
+        client_id: None,
+        assets,
+    }
+}
+
+/// The CANONICAL form of a promoted brand's `host_pattern` (issue #475): the single
+/// spelling the diff, the revision, and the apply's bind all use.
+///
+/// One function so the three can never disagree. [`crate::brand::canonicalize_host`]
+/// is the same fold the management writer applies at ingest and the same one the OIDC
+/// selection matcher normalizes a request Host through, so a promoted host key lands in
+/// the form the per-scope unique index and the matcher both key on. An empty or
+/// whitespace-only pattern folds to [`None`]: there is no host to claim.
+#[must_use]
+pub(crate) fn promoted_host_pattern(raw: Option<&str>) -> Option<String> {
+    raw.and_then(crate::brand::canonicalize_host)
+}
+
 /// The snapshot projected to exactly the promoted resource types (the `client` and
 /// `connector` sets emptied), so a revision and a round-trip diff ignore their
 /// non-promoted divergence between environments.
@@ -458,19 +754,41 @@ fn promoted_projection(snapshot: &Snapshot) -> Snapshot {
             // yet (a grant's client / org-connection references must resolve against the
             // target env, a later slice), so the promoted projection omits them.
             upstream_token_grant: Vec::new(),
-            // Brands (issue #86) are carried in the config-snapshot EXPORT (a promotable,
-            // diffable, committable definition), but the transactional promotion ENGINE
-            // does not yet apply them (the apply arm is a later slice), so the promoted
-            // projection empties them exactly like `connector`, keeping the revision
-            // consistent between the source projection and the target read.
-            brand: Vec::new(),
-            // Locale bundles (issue #86, PR 2) are carried in the EXPORT but not applied by the
-            // transactional engine yet (a later slice), so the promoted projection empties them
-            // exactly like `brand`.
-            locale_bundle: Vec::new(),
-            // Signup forms (issue #87) are carried in the EXPORT but not applied by the
-            // transactional engine yet (a later slice), so the promoted projection empties them
-            // exactly like `brand` and `locale_bundle`.
+            // Brands (issue #86) ARE promoted (issue #475): the whole branding DEFINITION
+            // travels, NORMALIZED through `promoted_brand`, which drops only the
+            // per-CLIENT selection key (a scope-embedded `ClientId` that cannot address
+            // the target's clients). See that function for the full per-field reasoning.
+            brand: snapshot
+                .resources
+                .brand
+                .iter()
+                .map(promoted_brand)
+                .collect(),
+            // Locale bundles (issue #86, PR 2) ARE promoted (issue #475) and need no
+            // normalization: a bundle carries only its BCP47 tag, its env-default flag,
+            // and its plain-text entries map. No field is a scope-embedded identifier and
+            // no field gates auth (the default locale selects a language, not a journey),
+            // so the whole definition travels as authored.
+            locale_bundle: snapshot.resources.locale_bundle.clone(),
+            // Signup forms (issue #87) are carried in the EXPORT but are NOT promoted. This
+            // is a DELIBERATE, MEASURED exclusion, not a later slice, and the distinction
+            // matters: the other omissions above are work that is merely unwritten, while
+            // this one CANNOT be written until a missing primitive exists. A form's natural
+            // key is an authorize `client_id`, a scope-embedded `ClientId`, so it cannot
+            // address the same logical client in another environment. Promoting one would
+            // create a row for a client that provably cannot exist in the target AND delete
+            // the target's own form (its client's key looks like a source deletion), so it
+            // is not merely incomplete, it is destructive; and unlike a missing variable or
+            // a missing asset byte there is NO action a target operator could take to make
+            // it resolve, so even a fail-closed gate would be a permanent block rather than
+            // a safety net. The blocker is precisely the absence of a STABLE,
+            // SCOPE-INDEPENDENT PUBLIC CLIENT IDENTITY, the same primitive that blocks
+            // `client` promotion, and minting one is an owner-level snapshot-format
+            // decision rather than something this engine invents. The projection therefore
+            // empties them exactly like `client`, which is excluded for the identical
+            // reason, and the signup-form test in tests/config_promotion.rs measures the
+            // blocker (the source key does not parse in the target scope) rather than
+            // describing it.
             signup_form: Vec::new(),
             // Custom-journey versions (issue #92) ARE promoted by the transactional engine: the
             // append-only version DEFINITIONS travel and are reconstructed in the target. The
@@ -710,6 +1028,27 @@ pub enum PromotionApplyError {
         /// The version number that exists in the target with a different artifact.
         version: i32,
     },
+    /// The source carries a brand ASSET whose bytes the TARGET does not hold (issue
+    /// #475). A snapshot is a small, diffable TEXT document and deliberately carries an
+    /// asset by CONTENT REFERENCE (its sha256), never as an inline binary; the apply
+    /// therefore materializes an asset only from bytes already present in the target
+    /// scope with that exact digest. When no such bytes exist, there is no source for
+    /// them at all, so the apply FAILS CLOSED and the whole transaction rolls back
+    /// rather than writing metadata that points at bytes the target does not have (or,
+    /// worse, leaving the target serving a different image under the promoted digest).
+    ///
+    /// The operator's remedy is to upload the asset to the TARGET environment through
+    /// the management asset endpoint (creating the brand there first if needed) and
+    /// re-plan; the promotion then resolves the digest and binds it to the promoted
+    /// brand.
+    BrandAssetBytesUnavailable {
+        /// The brand slug whose asset could not be resolved.
+        slug: String,
+        /// The asset kind (`logo` or `favicon`).
+        kind: String,
+        /// The lowercase hex sha256 the source's metadata names, absent from the target.
+        sha256: String,
+    },
     /// A persistence fault while applying (the transaction rolled back).
     Store(StoreError),
 }
@@ -747,6 +1086,13 @@ impl core::fmt::Display for PromotionApplyError {
                 "custom-journey version {journey_id}@{version} already exists in the target with a \
                  different artifact; a version is append-only and its artifact never changes \
                  (re-author the change under a new version number)"
+            ),
+            PromotionApplyError::BrandAssetBytesUnavailable { slug, kind, sha256 } => write!(
+                f,
+                "brand {slug} carries a {kind} asset with digest {sha256}, whose bytes the \
+                 target environment does not hold; a snapshot carries an asset by content \
+                 reference, never as inline bytes, so upload the asset to the target \
+                 environment and re-plan"
             ),
             PromotionApplyError::Store(source) => write!(f, "promotion apply failed: {source}"),
         }
@@ -868,14 +1214,17 @@ fn plan_id_of(base_revision: &str, result_revision: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChangeKind, PROMOTED_RESOURCE_TYPES, PlanError, collect_references, diff, evaluate_plan,
-        revision,
+        ChangeKind, PROMOTED_RESOURCE_TYPES, PlanError, PromotedResourceType, collect_references,
+        diff, evaluate_plan, revision,
     };
     use crate::classification::{ResourceClassification, ResourceType, classify};
     use crate::esv::{Reference, ReferenceKind};
     use crate::snapshot::{
-        DcrPolicySnapshot, FlowVersionSnapshot, ResourceServerSnapshot, SNAPSHOT_SCHEMA_VERSION,
-        Snapshot, SnapshotResources, VariableSnapshot,
+        BrandAssetMetaSnapshot, BrandSnapshot, ClientSnapshot, ConnectorSnapshot,
+        DcrPolicySnapshot, FlowVersionSnapshot, LocaleBundleSnapshot, OrgConnectionSnapshot,
+        ResourceServerSnapshot, RoutingRuleSnapshot, SNAPSHOT_RESOURCE_TYPES,
+        SNAPSHOT_SCHEMA_VERSION, SignupFormSnapshot, Snapshot, SnapshotResources,
+        UpstreamTokenGrantSnapshot, VariableSnapshot,
     };
 
     fn snapshot(resources: SnapshotResources) -> Snapshot {
@@ -1084,6 +1433,402 @@ mod tests {
         assert!(!PROMOTED_RESOURCE_TYPES.contains(&ResourceType::Client));
     }
 
+    // =======================================================================
+    // The drift lock (issue #475).
+    //
+    // Three things must agree and, before this, nothing forced them to: the
+    // PROMOTED_RESOURCE_TYPES list, the `promoted_projection` that decides what a
+    // revision and a diff actually see, and the repository's transactional apply
+    // dispatch. All three had silently diverged, which is exactly why a promotion
+    // carried no branding, locales or signup fields while the export did.
+    //
+    // The dispatch agreement is locked at COMPILE time (the apply matches
+    // exhaustively on the generated `PromotedResourceType`, so a new entry in the
+    // macro list breaks the build until its arm exists). The two below are measured
+    // here, and deliberately measured WITHOUT restating the answer: the projection
+    // test reads the SERIALIZED projection keyed by `ResourceType::as_str`, so it
+    // holds no second copy of "which types are promoted" and no self-compared count.
+    // =======================================================================
+
+    /// One snapshot with EVERY snapshot resource type populated, for the projection
+    /// witness. Deliberately not `Default`-based: the point is that no array is empty,
+    /// so an array the projection empties is distinguishable from one it carries.
+    fn fully_populated_snapshot() -> Snapshot {
+        snapshot(SnapshotResources {
+            client: vec![ClientSnapshot {
+                client_id: "cli_source".to_owned(),
+                display_name: "App".to_owned(),
+                token_endpoint_auth_method: "none".to_owned(),
+                redirect_uris: vec!["https://app.test/cb".to_owned()],
+                post_logout_redirect_uris: Vec::new(),
+                frontchannel_logout_uri: None,
+                frontchannel_logout_session_required: false,
+                consent_mode: "explicit".to_owned(),
+                skip_consent: false,
+                store_skipped_consent: false,
+                require_pushed_authorization_requests: false,
+                require_auth_time: false,
+                jwks: None,
+                jwks_uri: None,
+                token_endpoint_auth_signing_alg: None,
+                refresh_rotation: None,
+                secret: None,
+            }],
+            resource_server: vec![resource_server("https://api.test", "at_jwt")],
+            dcr_policy: vec![DcrPolicySnapshot {
+                name: "open".to_owned(),
+                primitives: serde_json::json!([]),
+            }],
+            variable: vec![variable("flag", "on")],
+            connector: vec![ConnectorSnapshot {
+                connector_slug: "okta".to_owned(),
+                definition: serde_json::json!({"issuer": "https://idp.test"}),
+                enabled: true,
+                secret: None,
+            }],
+            org_connection: vec![OrgConnectionSnapshot {
+                organization_id: "org_a".to_owned(),
+                connector_id: "con_a".to_owned(),
+                overlay_min_acr: None,
+                max_age_secs: None,
+                overlay_min_class: None,
+                capture_upstream_tokens: false,
+                enabled: true,
+            }],
+            routing_rule: vec![RoutingRuleSnapshot {
+                rule_kind: "domain".to_owned(),
+                domain: Some("acme.test".to_owned()),
+                client_id: None,
+                user_bidx: None,
+                org_connection_id: "ocn_a".to_owned(),
+                priority: 1,
+                enabled: true,
+            }],
+            upstream_token_grant: vec![UpstreamTokenGrantSnapshot {
+                client_id: "cli_source".to_owned(),
+                org_connection_id: "ocn_a".to_owned(),
+                enabled: true,
+            }],
+            brand: vec![brand_fixture("acme")],
+            locale_bundle: vec![LocaleBundleSnapshot {
+                locale: "fr".to_owned(),
+                is_env_default: true,
+                entries: serde_json::json!({"1": "Bonjour"}),
+            }],
+            signup_form: vec![SignupFormSnapshot {
+                client_id: "cli_source".to_owned(),
+                fields: serde_json::json!([]),
+            }],
+            flow_version: vec![FlowVersionSnapshot {
+                journey_id: "login".to_owned(),
+                version: 1,
+                artifact: serde_json::json!({"id": "login_v1"}),
+                pinned: true,
+            }],
+        })
+    }
+
+    /// A brand fixture with every optional field filled, so a projection that drops one
+    /// is measurable.
+    fn brand_fixture(slug: &str) -> BrandSnapshot {
+        BrandSnapshot {
+            slug: slug.to_owned(),
+            is_default: true,
+            product_name: "Acme".to_owned(),
+            show_wordmark: true,
+            brand_token: Some("beta".to_owned()),
+            tokens: serde_json::json!({"color_bg": "#ffffff"}),
+            tokens_dark: Some(serde_json::json!({"color_bg": "#000000"})),
+            slots: serde_json::json!({"footer_legal": "<b>hi</b>"}),
+            host_pattern: Some("login.acme.test".to_owned()),
+            client_id: Some("cli_source".to_owned()),
+            assets: vec![BrandAssetMetaSnapshot {
+                kind: "logo".to_owned(),
+                content_type: "image/png".to_owned(),
+                sha256: "aa".repeat(32),
+                size_bytes: 12,
+            }],
+        }
+    }
+
+    /// The per-type resource arrays of a snapshot, keyed by the resource type's WIRE
+    /// name. Read out of the SERIALIZED document rather than by naming each field, so
+    /// this witness holds no hand-written list of resource types at all: a type the
+    /// snapshot gains appears here for free, and one it loses disappears.
+    fn resource_arrays(snapshot: &Snapshot) -> serde_json::Map<String, serde_json::Value> {
+        let value = serde_json::to_value(snapshot).expect("snapshot serializes");
+        value
+            .get("resources")
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .expect("a snapshot serializes its resources as an object")
+    }
+
+    /// EVERY snapshot resource type is populated in the fixture, so the projection
+    /// witness below can tell "the projection emptied it" from "it was never there".
+    ///
+    /// This is the guard that keeps the witness honest as the snapshot grows: a newly
+    /// added snapshot resource type with no fixture fails HERE, before it can quietly
+    /// pass the projection check by being empty on both sides.
+    #[test]
+    fn the_projection_witness_fixture_populates_every_snapshot_resource_type() {
+        let arrays = resource_arrays(&fully_populated_snapshot());
+        assert_eq!(
+            arrays.len(),
+            SNAPSHOT_RESOURCE_TYPES.len(),
+            "the serialized resources object must carry exactly one array per snapshot \
+             resource type: {:?}",
+            arrays.keys().collect::<Vec<_>>()
+        );
+        for resource in SNAPSHOT_RESOURCE_TYPES {
+            let array = arrays
+                .get(resource.as_str())
+                .and_then(serde_json::Value::as_array)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the fixture has no `{}` array; add one so the projection witness \
+                         can measure it",
+                        resource.as_str()
+                    )
+                });
+            assert!(
+                !array.is_empty(),
+                "the fixture must populate `{}` for the projection witness to be \
+                 non-vacuous",
+                resource.as_str()
+            );
+        }
+    }
+
+    /// THE DRIFT LOCK: `promoted_projection` carries exactly the types
+    /// `PROMOTED_RESOURCE_TYPES` names, and empties every other snapshot type.
+    ///
+    /// Both directions fail loudly. A type added to the constant whose projection is
+    /// still `Vec::new()` (the exact defect issue #475 records for `brand`,
+    /// `locale_bundle` and `signup_form`) fails the "must carry" half, because the
+    /// revision and the diff read the projection and would see nothing. A type the
+    /// projection carries that the constant does not name fails the "must empty" half,
+    /// because the target read would then have to carry it too or every promotion would
+    /// look like a permanent drift.
+    ///
+    /// The witness never restates which types are promoted: the expectation comes from
+    /// `PROMOTED_RESOURCE_TYPES` itself, and the observation comes from the serialized
+    /// projection keyed by `ResourceType::as_str`.
+    #[test]
+    fn the_promoted_projection_carries_exactly_the_promoted_types() {
+        let full = fully_populated_snapshot();
+        let projected = resource_arrays(&super::promoted_projection(&full));
+        for resource in SNAPSHOT_RESOURCE_TYPES {
+            let promoted = PROMOTED_RESOURCE_TYPES.contains(&resource);
+            let array = projected
+                .get(resource.as_str())
+                .and_then(serde_json::Value::as_array)
+                .unwrap_or_else(|| {
+                    panic!("the projection dropped the `{}` key", resource.as_str())
+                });
+            assert_eq!(
+                !array.is_empty(),
+                promoted,
+                "`{}` is {} PROMOTED_RESOURCE_TYPES, so the promoted projection must {} it; \
+                 the projection is the only thing `revision` and `diff` read, so a type in \
+                 the list with an empty projection promotes nothing",
+                resource.as_str(),
+                if promoted { "in" } else { "absent from" },
+                if promoted { "carry" } else { "empty" }
+            );
+        }
+    }
+
+    /// THE DRIFT LOCK, second half: the promoted set is a strict SUBSET of the
+    /// snapshot set.
+    ///
+    /// A type the engine applies but the snapshot does not export could never reach an
+    /// apply (the source document has nowhere to carry it) and would make every target
+    /// read look like drift. This also keeps the constant's own doc sentence honest: it
+    /// claims a subset relation, and this measures it.
+    #[test]
+    fn the_promoted_types_are_a_subset_of_the_snapshot_types() {
+        for resource in PROMOTED_RESOURCE_TYPES {
+            assert!(
+                SNAPSHOT_RESOURCE_TYPES.contains(&resource),
+                "`{}` is promoted but is not carried in the snapshot export, so a source \
+                 document could never carry it",
+                resource.as_str()
+            );
+        }
+        assert!(
+            PROMOTED_RESOURCE_TYPES.len() < SNAPSHOT_RESOURCE_TYPES.len(),
+            "the promoted set is a STRICT subset today (client, signup_form, connector, \
+             org_connection, routing_rule and upstream_token_grant are exported but not \
+             applied); if that stops being true, the constant's doc must stop saying it"
+        );
+    }
+
+    /// THE DRIFT LOCK, third half: the narrowing the apply dispatch runs on agrees with
+    /// the constant in BOTH directions.
+    ///
+    /// The dispatch itself is locked at compile time (it matches exhaustively on
+    /// `PromotedResourceType`), but that only proves every ENUM variant has an arm. This
+    /// proves the enum and the array are the same set, so the compile-time lock is
+    /// pointed at the right set: every promoted type narrows, every non-promoted type
+    /// does not, and the round trip is the identity.
+    #[test]
+    fn the_apply_dispatch_narrowing_matches_the_promoted_constant() {
+        for resource in ResourceType::ALL {
+            let narrowed = PromotedResourceType::from_resource_type(resource);
+            assert_eq!(
+                narrowed.is_some(),
+                PROMOTED_RESOURCE_TYPES.contains(&resource),
+                "`{}` narrows to a dispatchable type iff it is promoted; a type that \
+                 narrows without being promoted would be applied by a plan that never \
+                 enumerates it, and one that is promoted without narrowing would be \
+                 refused as a not-found at apply time",
+                resource.as_str()
+            );
+            if let Some(narrowed) = narrowed {
+                assert_eq!(narrowed.as_resource_type(), resource);
+            }
+        }
+    }
+
+    /// The per-CLIENT brand selection key is normalized OUT of the promoted projection,
+    /// asserted as BEHAVIOUR: two brands identical but for `client_id` promote as the
+    /// same revision and produce no diff.
+    ///
+    /// This is the brand analogue of the custom-journey activation gate. A `client_id`
+    /// is a scope-embedded id, so carrying it would overwrite the target admin's own
+    /// per-client brand selection with a value that can never match there.
+    #[test]
+    fn the_brand_per_client_selection_key_never_enters_the_revision_or_the_diff() {
+        let with_key = snapshot(SnapshotResources {
+            brand: vec![brand_fixture("acme")],
+            ..SnapshotResources::default()
+        });
+        let without_key = snapshot(SnapshotResources {
+            brand: vec![BrandSnapshot {
+                client_id: None,
+                ..brand_fixture("acme")
+            }],
+            ..SnapshotResources::default()
+        });
+        let other_key = snapshot(SnapshotResources {
+            brand: vec![BrandSnapshot {
+                client_id: Some("cli_target".to_owned()),
+                ..brand_fixture("acme")
+            }],
+            ..SnapshotResources::default()
+        });
+        assert_eq!(
+            revision(&with_key).expect("rev"),
+            revision(&without_key).expect("rev"),
+            "the per-client selection key must not perturb the promotable revision"
+        );
+        assert_eq!(
+            revision(&with_key).expect("rev"),
+            revision(&other_key).expect("rev"),
+            "a DIFFERENT per-client key must not perturb it either"
+        );
+        assert!(
+            diff(&with_key, &other_key).is_empty(),
+            "a promotion must not carry the per-client selection key into the diff"
+        );
+
+        // The control: a field that IS promotable definition still moves both.
+        let renamed = snapshot(SnapshotResources {
+            brand: vec![BrandSnapshot {
+                product_name: "Globex".to_owned(),
+                ..brand_fixture("acme")
+            }],
+            ..SnapshotResources::default()
+        });
+        assert_ne!(
+            revision(&with_key).expect("rev"),
+            revision(&renamed).expect("rev")
+        );
+        assert_eq!(diff(&with_key, &renamed).len(), 1);
+    }
+
+    /// A brand's per-DOMAIN key and its asset METADATA are promotable definition and DO
+    /// enter the revision and the diff (the counterpart to the test above): a promotion
+    /// that dropped them would silently leave the target's per-host selection and its
+    /// logo binding behind.
+    #[test]
+    fn the_brand_host_key_and_asset_metadata_are_promotable_definition() {
+        let base = snapshot(SnapshotResources {
+            brand: vec![brand_fixture("acme")],
+            ..SnapshotResources::default()
+        });
+        let rehosted = snapshot(SnapshotResources {
+            brand: vec![BrandSnapshot {
+                host_pattern: Some("id.acme.test".to_owned()),
+                ..brand_fixture("acme")
+            }],
+            ..SnapshotResources::default()
+        });
+        assert_ne!(
+            revision(&base).expect("rev"),
+            revision(&rehosted).expect("rev")
+        );
+        assert_eq!(diff(&base, &rehosted).len(), 1);
+
+        let relogoed = snapshot(SnapshotResources {
+            brand: vec![BrandSnapshot {
+                assets: vec![BrandAssetMetaSnapshot {
+                    sha256: "bb".repeat(32),
+                    ..brand_fixture("acme").assets.remove(0)
+                }],
+                ..brand_fixture("acme")
+            }],
+            ..SnapshotResources::default()
+        });
+        assert_ne!(
+            revision(&base).expect("rev"),
+            revision(&relogoed).expect("rev"),
+            "a changed logo digest is a promotable change the diff must show"
+        );
+        assert_eq!(diff(&base, &relogoed).len(), 1);
+    }
+
+    /// A locale bundle promotes WHOLE: the tag, the env-default flag, and the entries
+    /// map each move the revision and the diff, so nothing about a bundle is silently
+    /// per-environment.
+    #[test]
+    fn every_locale_bundle_field_is_promotable_definition() {
+        let bundle = |is_env_default: bool, greeting: &str| {
+            snapshot(SnapshotResources {
+                locale_bundle: vec![LocaleBundleSnapshot {
+                    locale: "fr".to_owned(),
+                    is_env_default,
+                    entries: serde_json::json!({ "1": greeting }),
+                }],
+                ..SnapshotResources::default()
+            })
+        };
+        let base = bundle(true, "Bonjour");
+        assert_ne!(
+            revision(&base).expect("rev"),
+            revision(&bundle(false, "Bonjour")).expect("rev"),
+            "the env-default flag is promotable definition"
+        );
+        assert_ne!(
+            revision(&base).expect("rev"),
+            revision(&bundle(true, "Salut")).expect("rev"),
+            "an entry string is promotable definition"
+        );
+        assert_eq!(diff(&base, &bundle(false, "Salut")).len(), 1);
+        // A different TAG is a different resource, not an update of this one.
+        let other_tag = snapshot(SnapshotResources {
+            locale_bundle: vec![LocaleBundleSnapshot {
+                locale: "de".to_owned(),
+                is_env_default: true,
+                entries: serde_json::json!({"1": "Bonjour"}),
+            }],
+            ..SnapshotResources::default()
+        });
+        let changes = diff(&base, &other_tag);
+        assert_eq!(changes.len(), 2, "one create and one delete: {changes:?}");
+    }
+
     #[test]
     fn diff_detects_create_update_and_delete() {
         let source = snapshot(SnapshotResources {
@@ -1282,5 +2027,93 @@ mod tests {
         let plan = evaluate_plan(&source, &target, |_| true).expect("plan");
         assert!(plan.diff().is_empty());
         assert_eq!(plan.base_revision(), plan.result_revision());
+    }
+
+    /// A brand with its assets listed in a different DOCUMENT ORDER is the SAME promotable
+    /// brand.
+    ///
+    /// The diff compares the whole serialized brand element, and the target read orders a
+    /// brand's assets by kind, so without the projection's own sort a hand authored document
+    /// listing `[logo, favicon]` produced an Update on every plan and the promotion never
+    /// reached `PromotionOutcome::NoOp`. Driven by the ORDER alone: both sides carry the same
+    /// two assets, so only the ordering can make this fail.
+    #[test]
+    fn a_brands_asset_document_order_is_not_a_promotable_difference() {
+        fn asset(kind: &str, marker: &str) -> BrandAssetMetaSnapshot {
+            BrandAssetMetaSnapshot {
+                kind: kind.to_owned(),
+                content_type: "image/png".to_owned(),
+                sha256: marker.repeat(64),
+                size_bytes: 9,
+            }
+        }
+        let mut authored = brand_fixture("acme");
+        authored.assets = vec![asset("logo", "a"), asset("favicon", "b")];
+        let mut read_back = brand_fixture("acme");
+        read_back.assets = vec![asset("favicon", "b"), asset("logo", "a")];
+
+        let source = snapshot(SnapshotResources {
+            brand: vec![authored],
+            ..SnapshotResources::default()
+        });
+        let target = snapshot(SnapshotResources {
+            brand: vec![read_back],
+            ..SnapshotResources::default()
+        });
+        assert!(
+            diff(&source, &target).is_empty(),
+            "asset document order must not be a change: {:?}",
+            diff(&source, &target).changes()
+        );
+        assert_eq!(
+            revision(&source).expect("rev"),
+            revision(&target).expect("rev"),
+            "asset document order must not perturb the promotable revision"
+        );
+    }
+
+    /// A brand's `host_pattern` is CANONICALIZED before it is diffed, hashed, or applied.
+    ///
+    /// Two spellings of one hostname are one host claim. The store column carries the folded
+    /// form (the management writer folds at ingest) and the selection matcher folds the
+    /// request Host, so a promotion that carried a raw spelling would store a second row the
+    /// per-scope unique index cannot see is a duplicate, and both brands would then resolve
+    /// for the same request. Measured on the projection's own output as well as through the
+    /// diff, because "the two agree" would also hold if BOTH sides kept the raw form.
+    #[test]
+    fn a_brand_host_pattern_is_canonicalized_before_it_is_diffed() {
+        let mut authored = brand_fixture("acme");
+        authored.host_pattern = Some("  LOGIN.Acme.Test:8443 ".to_owned());
+        let mut stored = brand_fixture("acme");
+        stored.host_pattern = Some("login.acme.test".to_owned());
+
+        assert_eq!(
+            super::promoted_brand(&authored).host_pattern.as_deref(),
+            Some("login.acme.test"),
+            "the projection carries the canonical host key, not the authored spelling"
+        );
+
+        let source = snapshot(SnapshotResources {
+            brand: vec![authored],
+            ..SnapshotResources::default()
+        });
+        let target = snapshot(SnapshotResources {
+            brand: vec![stored],
+            ..SnapshotResources::default()
+        });
+        assert!(
+            diff(&source, &target).is_empty(),
+            "two spellings of one host are one claim: {:?}",
+            diff(&source, &target).changes()
+        );
+        assert_eq!(
+            revision(&source).expect("rev"),
+            revision(&target).expect("rev")
+        );
+
+        // An empty pattern claims no host at all, rather than claiming the empty string.
+        let mut blank = brand_fixture("acme");
+        blank.host_pattern = Some("   ".to_owned());
+        assert_eq!(super::promoted_brand(&blank).host_pattern, None);
     }
 }

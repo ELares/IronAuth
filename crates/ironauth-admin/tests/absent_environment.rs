@@ -312,6 +312,18 @@ fn client_cases(base: &str, ids: &Ids) -> Vec<Case> {
             body: None,
         },
         Case {
+            label: "brands.setBrand",
+            method: "PUT",
+            path: format!("{base}/brands/default"),
+            body: Some(body_of(&serde_json::json!({ "product_name": "Sweep" }))),
+        },
+        Case {
+            label: "brands.deleteBrand",
+            method: "DELETE",
+            path: format!("{base}/brands/default"),
+            body: None,
+        },
+        Case {
             label: "brand_assets.deleteBrandFavicon",
             method: "DELETE",
             path: format!("{base}/brands/default/favicon"),

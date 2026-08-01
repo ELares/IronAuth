@@ -24,13 +24,13 @@ use crate::signing_algorithm::{
     ClientSigningAlgorithmView, SetClientSigningAlgorithmRequest, SigningRecommendationView,
 };
 use crate::views::{
-    BrandAssetView, BulkRevocationView, BulkRevokeSessionsRequest, ClientAdminConsentView,
-    ClientVerificationView, ConnectorCapabilitiesView, ConnectorHealthView, ConnectorList,
-    ConnectorView, ConsentRevocationView, CreateConnectorRequest, CreateDcrPolicyRequest,
-    CreateEnvironmentRequest, CreateFlowVersionRequest, CreateInitialAccessTokenRequest,
-    CreateInvitationRequest, CreateManagementKeyRequest, CreateMembershipRequest,
-    CreateOrganizationRequest, CreateTenantRequest, CreateUserRequest, DcrPolicyList,
-    DcrPolicyView, EnvironmentList, EnvironmentView, ExtendSignupQuarantineRequest,
+    BrandAssetView, BrandPage, BrandView, BulkRevocationView, BulkRevokeSessionsRequest,
+    ClientAdminConsentView, ClientVerificationView, ConnectorCapabilitiesView, ConnectorHealthView,
+    ConnectorList, ConnectorView, ConsentRevocationView, CreateConnectorRequest,
+    CreateDcrPolicyRequest, CreateEnvironmentRequest, CreateFlowVersionRequest,
+    CreateInitialAccessTokenRequest, CreateInvitationRequest, CreateManagementKeyRequest,
+    CreateMembershipRequest, CreateOrganizationRequest, CreateTenantRequest, CreateUserRequest,
+    DcrPolicyList, DcrPolicyView, EnvironmentList, EnvironmentView, ExtendSignupQuarantineRequest,
     FlowVersionView, GuardrailView, InitialAccessTokenCreated, InvitationCreatedView,
     InvitationCredentialTypeView, InvitationList, InvitationStateChangeView, InvitationStateView,
     InvitationView, LinkExternalIdRequest, LocaleBundleView, ManagementKeyCreated,
@@ -38,7 +38,7 @@ use crate::views::{
     OperatorView, OrganizationList, OrganizationView, RecoveryApprovalCaseView,
     RecoveryApprovalDecisionView, RecoveryApprovalList, RecoveryApprovalStateView,
     RefreshFamilyList, RefreshFamilyView, ResourceTypeView, ResourceTypesList,
-    RevokeSessionsRequest, SessionList, SessionRevocationView, SessionView,
+    RevokeSessionsRequest, SessionList, SessionRevocationView, SessionView, SetBrandRequest,
     SetClientAdminConsentRequest, SetLocaleRequest, SetSignupFormRequest, SetUserStateRequest,
     SignupFormFieldView, SignupFormView, SignupQuarantineCaseView, SignupQuarantineDecisionView,
     SignupQuarantineList, SignupQuarantineReasonView, SignupQuarantineStateView, TenantCreated,
@@ -140,6 +140,11 @@ use crate::views::{
                                              set (fail-fast validated against the active trait \
                                              schema, narrowing-only rules), get, and delete a \
                                              form keyed on the authorize client id"),
+        (name = "brands", description = "Per-environment branding definitions: list, set \
+                                        (create or overwrite), get, and delete a brand keyed on \
+                                        its slug. Design tokens are a closed typed grammar and \
+                                        rich-text slots are sanitized at ingest, so a brand can \
+                                        never carry raw CSS or markup"),
         (name = "brand-assets", description = "Per-environment brand assets: upload (magic-byte \
                                               sniffed, size-capped, sudo-gated raster) or delete a \
                                               brand's logo and favicon; svg is refused"),
@@ -273,6 +278,10 @@ use crate::views::{
         crate::client_admin_grants::set_client_admin_consent,
         crate::client_admin_grants::get_client_admin_consent,
         crate::client_admin_grants::delete_client_admin_consent,
+        crate::brands::list_brands,
+        crate::brands::set_brand,
+        crate::brands::get_brand,
+        crate::brands::delete_brand,
         crate::brand_assets::set_brand_logo,
         crate::brand_assets::delete_brand_logo,
         crate::brand_assets::set_brand_favicon,
@@ -410,6 +419,9 @@ use crate::views::{
         SetClientAdminConsentRequest,
         ClientAdminConsentView,
         BrandAssetView,
+        BrandPage,
+        BrandView,
+        SetBrandRequest,
         SessionView,
         SessionList,
         RefreshFamilyView,

@@ -6,6 +6,60 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **Brands and locale bundles are PROMOTED, not merely exported** (issue #475). Both types sat in
+  the snapshot with an empty promoted projection and no apply arm, so a promotion between
+  environments carried neither: the plan for an environment with branding was empty and the apply
+  was a no-op. The whole branding and localization DEFINITION now travels, transactionally, with
+  the target's row and audit trail committing together as every other promoted type does.
+  - **The drift lock that made the omission possible is closed.** The promoted types were three
+    hand-maintained lists nothing forced to agree, and all three had silently diverged. They are
+    now declared ONCE and the array, its counted length, and a closed `PromotedResourceType` enum
+    are generated from that declaration, so all FOUR places a promoted type must be wired (the
+    apply dispatch, the diff, the target read, and the projection) are exhaustive matches or
+    struct literals: adding a type fails to COMPILE until each carries it. The diff and the
+    target read were the remaining blind spot, and it was measured rather than assumed: a seventh
+    type wired into the projection and given an apply arm but missing from those two compiled
+    clean and passed every test.
+  - **A promoted brand is held to the same INGEST WALL as a brand write.** The apply is a second
+    full writer of `brands` and binds a submitted document's `tokens` and `slots` verbatim, while
+    document validation checks only that the two are JSON objects. The typed design-token grammar,
+    the allowlist slot sanitizer, the known-slot-key rule and the per-slot size cap now run on the
+    promotion source too, at PLAN time, so a hostile or hand authored document is a 400 naming
+    every faulty brand rather than a target whose promoted brand silently renders as the neutral
+    default because the render path re-sanitized it.
+  - **Per-brand normalization the promotion could not be correct without.** The per-CLIENT
+    selection key is dropped (it embeds the source environment, so it is dead config in the target
+    and would overwrite a target admin's own selection). The per-DOMAIN key is CANONICALIZED
+    through the same fold the brand writer and the selection matcher use, in the projection AND at
+    the apply's bind, so a promoted `LOGIN.Acme.Test:8443` cannot sit beside a stored
+    `login.acme.test` under a raw-column unique index that cannot see they are the same host,
+    which would have made two brands resolve for one request and falsified the
+    one-brand-per-host selection invariant. Asset metadata is sorted by kind, so a hand authored
+    document listing the assets in another order does not re-propose the same update forever.
+  - **Both of migration 0070's partial unique indexes get a release step, not just one.** A
+    promoted default demotes the target's other default; a promoted host claim now likewise
+    RELEASES every other claimant of that host first. Without it a legitimate promotion aborted
+    with a raw `23505` rendered as a 500, and whether it did depended on how the slugs happened to
+    sort; two brands SWAPPING host patterns could not be applied in any order at all.
+  - **Brand asset bytes cross by content reference, resolved before any write.** A snapshot
+    carries an asset as metadata, never inline bytes, so the apply materializes one only from
+    bytes the TARGET already holds under the same digest, content type and size, and refuses the
+    whole promotion (`BrandAssetBytesUnavailable`, a 422 on the wire) when it cannot. Every digest
+    is resolved in ONE pass up front: resolving per brand inside the apply loop made the refusal
+    order dependent and could make it FALSE, because a brand delete in the same loop sweeps the
+    departing brand's asset rows, so a source that merely RENAMED a brand while keeping its logo
+    was refused and told to upload an asset it had already uploaded.
+  - **Signup forms stay excluded, and that is now recorded as a measured decision rather than a
+    later slice.** A form's natural key is an authorize `client_id`, a scope-embedded identifier,
+    so promoting one would create a row for a client that provably cannot exist in the target AND
+    delete the target's own form. Unlike a missing variable or a missing asset byte there is no
+    action a target operator could take to make it resolve. The blocker is the absence of a
+    stable, scope-independent public client identity, the same primitive that blocks `client`
+    promotion, and a store test measures it rather than describing it.
+  - **`brand.delete` joins the audit vocabulary**, and the count in the `Action` doc's
+    foreign-key impossibility argument moves from seventeen and twelve to nineteen and thirteen
+    (the brand delete sweeps its own assets, which is the sixth prior-or-dependent delete).
+
 - **The signed journey interchange archive, whose safety manifest is a CHECKED CLAIM and never a
   trusted input** (issue #347). The new `interchange` module carries a journey artifact, its
   sub-flows, and a safety manifest across an ORGANIZATION boundary as a `.iaj` bundle: the RFC 7515

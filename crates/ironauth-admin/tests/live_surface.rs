@@ -1008,6 +1008,29 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             "DELETE",
             format!("{base}/applications/{client}/signup-form"),
         ),
+        // ---- brands (issue #475) ----
+        // A slug of its OWN, so the set/get/delete lifecycle below cannot disturb the seeded
+        // `{brand_slug}` brand the asset cases that follow address.
+        Case::json(
+            "brands.setBrand",
+            "PUT",
+            format!("{base}/brands/sweep"),
+            &serde_json::json!({ "product_name": "Sweep" }),
+        ),
+        Case::empty("brands.listBrands", "GET", format!("{base}/brands")),
+        // The READ addresses the SEEDED brand, not `sweep`: the soft-deleted-environment sweep
+        // requires every read to answer its LIVE answer there, and `sweep` exists only after
+        // the write above, which that sweep refuses.
+        Case::empty(
+            "brands.getBrand",
+            "GET",
+            format!("{base}/brands/{brand_slug}"),
+        ),
+        Case::empty(
+            "brands.deleteBrand",
+            "DELETE",
+            format!("{base}/brands/sweep"),
+        ),
         // ---- brand assets ----
         Case::raster(
             "brand_assets.setBrandFavicon",

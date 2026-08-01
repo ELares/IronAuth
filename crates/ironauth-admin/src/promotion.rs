@@ -86,6 +86,32 @@ fn violation_message(violations: &[SnapshotViolation]) -> String {
     format!("the source snapshot is invalid: {joined}")
 }
 
+/// Parse and FULLY validate a submitted promotion source document: the snapshot grammar, then
+/// the per-resource INGEST WALLS the promotion apply would otherwise bypass.
+///
+/// [`validate_document`] is the document grammar. It is deliberately shape-only for a brand: it
+/// checks that `tokens` and `slots` are JSON objects and stops. But the apply is a full WRITER of
+/// the `brands` table and binds those objects verbatim, so on this path alone a submitted
+/// document could store an unknown slot key, unsanitized markup, and a CSS breakout in a color
+/// token, none of which the brand management endpoint accepts. [`crate::brands::promoted_brand_faults`]
+/// is that endpoint's own wall, applied here, so the two doors into `brands` enforce ONE grammar.
+///
+/// Both the PLAN and the APPLY call this. Refusing at plan time is the point: an operator learns
+/// the document is unstorable before reviewing a plan built from it, rather than after approving
+/// one, and every faulty brand is reported at once.
+fn validated_source(bytes: &[u8]) -> Result<Snapshot, ApiError> {
+    let source = validate_document(bytes)
+        .map_err(|violations| ApiError::BadRequest(violation_message(&violations)))?;
+    let faults = crate::brands::promoted_brand_faults(&source);
+    if !faults.is_empty() {
+        return Err(ApiError::BadRequest(format!(
+            "the source snapshot is invalid: {}",
+            faults.join("; ")
+        )));
+    }
+    Ok(source)
+}
+
 /// Dry-run a promotion into the target environment, returning a reviewable plan.
 #[utoipa::path(
     post,
@@ -107,7 +133,10 @@ fn violation_message(violations: &[SnapshotViolation]) -> String {
          target's base and result revisions, the resolved references, and the structured diff \
          (per resource: create, update, or delete with before and after).",
          content_type = "application/json"),
-        (status = 400, description = "The source snapshot document is invalid", body = ErrorBody),
+        (status = 400, description = "The source snapshot document is invalid: either it \
+         violates the snapshot grammar, or a brand it carries is not storable as authored (an \
+         invalid design token, an unknown or oversize slot, a slot that is not sanitizer \
+         output, or two brands claiming one host or one default)", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
         (status = 404, description = "Target environment not found", body = ErrorBody),
@@ -129,8 +158,7 @@ pub async fn plan_config_promotion(
     // of one precondition, so a change to what LIVENESS means has one place to change.
     crate::org_context::require_live_environment(&state, &scope).await?;
 
-    let source = validate_document(&body)
-        .map_err(|violations| ApiError::BadRequest(violation_message(&violations)))?;
+    let source = validated_source(&body)?;
 
     match plan_promotion(&state.store().scoped(scope), &source).await? {
         Ok(plan) => {
@@ -170,14 +198,21 @@ pub async fn plan_config_promotion(
     responses(
         (status = 200, description = "The plan was applied (the applied diff) or was already \
          applied (a no-op).", content_type = "application/json"),
-        (status = 400, description = "The source snapshot document is invalid", body = ErrorBody),
+        (status = 400, description = "The source snapshot document is invalid: either it \
+         violates the snapshot grammar, or a brand it carries is not storable as authored (an \
+         invalid design token, an unknown or oversize slot, a slot that is not sanitizer \
+         output, or two brands claiming one host or one default). Nothing was changed",
+         body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
         (status = 404, description = "Target environment not found", body = ErrorBody),
-        (status = 409, description = "The target drifted since the plan was computed (a \
-         structured drift error); nothing was changed.", content_type = "application/json"),
+        (status = 409, description = "The target drifted since the plan was computed, or a \
+         promoted custom-journey version conflicts with an existing one (a structured error); \
+         nothing was changed.", content_type = "application/json"),
         (status = 422, description = "A reference does not resolve in the target environment at \
-         apply time; nothing was changed.", content_type = "application/json")
+         apply time, or a promoted brand names an asset whose bytes this environment does not \
+         hold (a snapshot carries an asset by content reference, never inline); nothing was \
+         changed.", content_type = "application/json")
     )
 )]
 pub async fn apply_config_promotion(
@@ -199,8 +234,7 @@ pub async fn apply_config_promotion(
 
     let request: ApplyConfigPromotionRequest = parse_json(&body)?;
     let source_bytes = serde_json::to_vec(&request.source).map_err(|_| ApiError::Internal)?;
-    let source: Snapshot = validate_document(&source_bytes)
-        .map_err(|violations| ApiError::BadRequest(violation_message(&violations)))?;
+    let source: Snapshot = validated_source(&source_bytes)?;
 
     let outcome = state
         .store()
@@ -255,6 +289,25 @@ pub async fn apply_config_promotion(
             });
             let body = serde_json::to_string(&payload).map_err(|_| ApiError::Internal)?;
             Ok(json(StatusCode::CONFLICT, body))
+        }
+        Err(PromotionApplyError::BrandAssetBytesUnavailable { slug, kind, sha256 }) => {
+            // A snapshot carries a brand asset by CONTENT REFERENCE, never as inline bytes,
+            // so the apply materializes one only from bytes the target already holds under
+            // that exact digest. It could not, so it changed NOTHING rather than leaving the
+            // target with metadata pointing at bytes it does not have. The operator uploads
+            // the asset to this environment (creating the brand here first if needed) and
+            // re-plans.
+            let payload = serde_json::json!({
+                "error": "brand_asset_bytes_unavailable",
+                "message": "a promoted brand names an asset whose bytes this environment does \
+                            not hold; a snapshot carries an asset by content reference, so \
+                            upload it here and re-plan. Nothing was changed",
+                "slug": slug,
+                "kind": kind,
+                "sha256": sha256,
+            });
+            let body = serde_json::to_string(&payload).map_err(|_| ApiError::Internal)?;
+            Ok(json(StatusCode::UNPROCESSABLE_ENTITY, body))
         }
         Err(PromotionApplyError::Store(error)) => Err(error.into()),
     }

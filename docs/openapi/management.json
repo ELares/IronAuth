@@ -1765,6 +1765,356 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/brands": {
+      "get": {
+        "tags": [
+          "brands"
+        ],
+        "summary": "List a per-environment's brands.",
+        "operationId": "listBrands",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The environment's brands, ordered by slug",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BrandPage"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}": {
+      "get": {
+        "tags": [
+          "brands"
+        ],
+        "summary": "Get a per-environment brand by slug.",
+        "operationId": "getBrand",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "slug",
+            "in": "path",
+            "description": "The brand slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The brand",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BrandView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (absent or in another scope)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "brands"
+        ],
+        "summary": "Set (create or overwrite) a per-environment brand.",
+        "operationId": "setBrand",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "slug",
+            "in": "path",
+            "description": "The brand slug (the per-environment natural key)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetBrandRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Set",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BrandView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "An invalid design token, an unknown slot key, or an oversize slot",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope, or sudo required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found, malformed slug, or a client_id selection key that names no client of this environment",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Another brand in this environment already claims the same host or client selection key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "brands"
+        ],
+        "summary": "Delete a per-environment brand by slug.",
+        "operationId": "deleteBrand",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "slug",
+            "in": "path",
+            "description": "The brand slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted, along with every asset installed under the slug"
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope, or sudo required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (absent or in another scope). The environment must be live too: an absent or soft-deleted one answers this same not-found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}/favicon": {
       "put": {
         "tags": [
@@ -2707,7 +3057,7 @@
             }
           },
           "400": {
-            "description": "The source snapshot document is invalid",
+            "description": "The source snapshot document is invalid: either it violates the snapshot grammar, or a brand it carries is not storable as authored (an invalid design token, an unknown or oversize slot, a slot that is not sanitizer output, or two brands claiming one host or one default). Nothing was changed",
             "content": {
               "application/json": {
                 "schema": {
@@ -2747,13 +3097,13 @@
             }
           },
           "409": {
-            "description": "The target drifted since the plan was computed (a structured drift error); nothing was changed.",
+            "description": "The target drifted since the plan was computed, or a promoted custom-journey version conflicts with an existing one (a structured error); nothing was changed.",
             "content": {
               "application/json": {}
             }
           },
           "422": {
-            "description": "A reference does not resolve in the target environment at apply time; nothing was changed.",
+            "description": "A reference does not resolve in the target environment at apply time, or a promoted brand names an asset whose bytes this environment does not hold (a snapshot carries an asset by content reference, never inline); nothing was changed.",
             "content": {
               "application/json": {}
             }
@@ -2824,7 +3174,7 @@
             }
           },
           "400": {
-            "description": "The source snapshot document is invalid",
+            "description": "The source snapshot document is invalid: either it violates the snapshot grammar, or a brand it carries is not storable as authored (an invalid design token, an unknown or oversize slot, a slot that is not sanitizer output, or two brands claiming one host or one default)",
             "content": {
               "application/json": {
                 "schema": {
@@ -14400,6 +14750,91 @@
           }
         }
       },
+      "BrandPage": {
+        "type": "object",
+        "description": "One page of a per-environment brand listing (issues #86, #475).",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BrandView"
+            },
+            "description": "The brands in this environment, ordered by slug."
+          }
+        }
+      },
+      "BrandView": {
+        "type": "object",
+        "description": "A per-environment brand, as returned by the management API (issues #86, #475).",
+        "required": [
+          "slug",
+          "is_default",
+          "product_name",
+          "show_wordmark",
+          "tokens",
+          "slots"
+        ],
+        "properties": {
+          "brand_token": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The optional plain-text brand-token badge."
+          },
+          "client_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The per-CLIENT selection key, if set."
+          },
+          "host_pattern": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The per-DOMAIN selection key, normalized, if set."
+          },
+          "is_default": {
+            "type": "boolean",
+            "description": "Whether this is the environment's default brand."
+          },
+          "product_name": {
+            "type": "string",
+            "description": "The plain-text product name / wordmark."
+          },
+          "show_wordmark": {
+            "type": "boolean",
+            "description": "Whether to show the wordmark header."
+          },
+          "slots": {
+            "type": "object",
+            "description": "The SANITIZED rich-text slots, as stored. Never the submitted markup.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "slug": {
+            "type": "string",
+            "description": "The brand slug (the per-environment natural key, and the promotion / diff key)."
+          },
+          "tokens": {
+            "type": "object",
+            "description": "The stored typed design tokens."
+          },
+          "tokens_dark": {
+            "type": "object",
+            "description": "The stored dark-mode token variants, if authored."
+          }
+        }
+      },
       "BulkRevocationView": {
         "type": "object",
         "description": "The result of a BULK session revocation (issue #32). States the post-condition; see\n[`SessionRevocationView`] for why.",
@@ -18114,6 +18549,66 @@
           }
         }
       },
+      "SetBrandRequest": {
+        "type": "object",
+        "description": "The body to set (create or overwrite) a per-environment brand (issues #86, #475).\n\nA brand is expressible ONLY through data that cannot become script, and this request shape\nis where that rule is enforced at ingest. `tokens` and `tokens_dark` must deserialize into\nthe CLOSED typed design-token grammar (hex-only colors, an allowlist font enum, clamped\nnumerics); a malformed or hostile token blob is a loud 400 and nothing is stored. `slots`\nvalues pass the ONE allowlist sanitizer and are stored as sanitizer output, never as the\nsubmitted markup. The plain wordmark fields are stored as plain text and escaped on render.",
+        "required": [
+          "product_name"
+        ],
+        "properties": {
+          "brand_token": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An optional plain-text brand-token badge (escaped on render)."
+          },
+          "client_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The per-CLIENT selection key: the authorize `client_id` this brand is selected for, or\nabsent. At most one brand per client per environment. This key is deliberately NOT\ncarried by a config promotion (a client id embeds its environment), so it is always a\ntarget-environment decision."
+          },
+          "host_pattern": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The per-DOMAIN selection key: the Host this brand is selected for, or absent. Normalized\n(trimmed, port-stripped, lowercased) at ingest. At most one brand per host per\nenvironment."
+          },
+          "is_default": {
+            "type": "boolean",
+            "description": "Whether this is the environment's DEFAULT brand (resolved when no per-client or\nper-domain selection matches). At most one default per environment; setting a new\ndefault demotes the previous one. Defaults to false."
+          },
+          "product_name": {
+            "type": "string",
+            "description": "The plain-text product name / wordmark (escaped on render, never markup)."
+          },
+          "show_wordmark": {
+            "type": "boolean",
+            "description": "Whether to show the wordmark header. Defaults to true."
+          },
+          "slots": {
+            "type": "object",
+            "description": "The rich-text slots, a map of slot key (`footer_legal`, `login_help`, `consent_notice`)\nto markup. Each value is SANITIZED at ingest and stored as sanitizer output; an unknown\nslot key is a loud 400 rather than silently dropped.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "tokens": {
+            "type": "object",
+            "description": "The TYPED light-mode design tokens. Every field is a validated scalar, never free-form\nCSS; omit to use the neutral defaults."
+          },
+          "tokens_dark": {
+            "type": "object",
+            "description": "The TYPED dark-mode token variants, or absent to reuse the neutral built-in dark block."
+          }
+        }
+      },
       "SetClientAdminConsentRequest": {
         "type": "object",
         "description": "The body to set (create or overwrite) a per-environment, per-client admin consent\npre-authorization (issue #88, PR 4).\n\nThe `scope` is the space-separated OAuth scope set the admin pre-authorizes for the\nthird-party client. A later authorization request whose requested scope is a SUBSET of this set\nSKIPS the user consent screen (the admin grant is the consent of record); a broader request is\nrefused with a \"requires administrator approval\" terminal.",
@@ -19168,6 +19663,10 @@
     {
       "name": "signup-forms",
       "description": "Per-environment, per-client signup forms as data: set (fail-fast validated against the active trait schema, narrowing-only rules), get, and delete a form keyed on the authorize client id"
+    },
+    {
+      "name": "brands",
+      "description": "Per-environment branding definitions: list, set (create or overwrite), get, and delete a brand keyed on its slug. Design tokens are a closed typed grammar and rich-text slots are sanitized at ingest, so a brand can never carry raw CSS or markup"
     },
     {
       "name": "brand-assets",

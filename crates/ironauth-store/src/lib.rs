@@ -186,9 +186,9 @@ pub use org_policy::{
 };
 pub use pow_challenge::{NewPowChallenge, PowChallengeView};
 pub use promotion::{
-    ChangeKind, ConfigDiff, PROMOTED_RESOURCE_TYPES, Plan, PlanError, PromotionApplyError,
-    PromotionOutcome, ResourceChange, collect_references, diff as diff_snapshots, evaluate_plan,
-    plan_promotion, revision as promotion_revision,
+    ChangeKind, ConfigDiff, PROMOTED_RESOURCE_TYPES, Plan, PlanError, PromotedResourceType,
+    PromotionApplyError, PromotionOutcome, ResourceChange, collect_references,
+    diff as diff_snapshots, evaluate_plan, plan_promotion, revision as promotion_revision,
 };
 pub use recovery::{
     NewRecoveryFlow, RecoveryCancelReason, RecoveryEntryPoint, RecoveryFlowRecord, RecoveryMethod,
@@ -298,9 +298,10 @@ pub use signup_form::{
 };
 pub use sms_otp::{ActiveSmsOtpCode, NewSmsOtpCode, SmsRouteStat, SmsTenantConfig};
 pub use snapshot::{
-    CLIENT_SECRET_REFERENCE, ClientSnapshot, DcrPolicySnapshot, FlowVersionSnapshot,
-    OrgConnectionSnapshot, ResourceServerSnapshot, RoutingRuleSnapshot, SNAPSHOT_RESOURCE_TYPES,
-    SNAPSHOT_SCHEMA_VERSION, SecretRef, Snapshot, SnapshotResources, SnapshotViolation,
+    BrandAssetMetaSnapshot, BrandSnapshot, CLIENT_SECRET_REFERENCE, ClientSnapshot,
+    DcrPolicySnapshot, FlowVersionSnapshot, LocaleBundleSnapshot, OrgConnectionSnapshot,
+    ResourceServerSnapshot, RoutingRuleSnapshot, SNAPSHOT_RESOURCE_TYPES, SNAPSHOT_SCHEMA_VERSION,
+    SecretRef, SignupFormSnapshot, Snapshot, SnapshotResources, SnapshotViolation,
     UpstreamTokenGrantSnapshot, VariableSnapshot, classification_coverage_gaps,
     export as export_snapshot, validate_document,
 };

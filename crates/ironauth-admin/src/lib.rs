@@ -45,6 +45,7 @@ mod auth;
 mod backfill;
 mod bans;
 mod brand_assets;
+mod brands;
 mod client_admin_grants;
 mod client_scopes;
 mod config;
@@ -580,6 +581,20 @@ pub fn management_router(state: AdminState) -> Router {
             put(client_admin_grants::set_client_admin_consent)
                 .get(client_admin_grants::get_client_admin_consent)
                 .delete(client_admin_grants::delete_client_admin_consent),
+        )
+        // Per-environment brands (issues #86, #475): list, and set (create or overwrite) / get /
+        // delete a branding definition keyed on its slug. This is the brand's birth path: before
+        // it, `brands` had a store-level writer and no management endpoint, so the asset PUTs
+        // below (which 404 on an absent brand) could never be reached for a new brand.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/brands",
+            get(brands::list_brands),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}",
+            put(brands::set_brand)
+                .get(brands::get_brand)
+                .delete(brands::delete_brand),
         )
         // Per-environment brand assets (issue #86, PR 3): upload (magic-byte sniffed, size capped,
         // sudo gated) or delete a brand's logo / favicon. The `/logo` and `/favicon` static

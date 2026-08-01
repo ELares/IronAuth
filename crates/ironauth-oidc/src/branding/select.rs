@@ -50,11 +50,14 @@ pub fn normalize_host(raw: &str) -> Option<String> {
 /// #86, PR 3). `host` is the raw request Host (normalized here); `client_id` is the authorize
 /// request's client id. Returns the index into `candidates` of the chosen brand, or [`None`]
 /// when nothing matches and no default is installed (the caller then renders the neutral
-/// default). The scan is deterministic (first match wins); because the store canonicalizes a
-/// brand's `host_pattern` at ingest through the same normalization used here (and `client_id` is
-/// matched exactly), the per-scope partial unique indexes on `host_pattern` and `client_id`
+/// default). The scan is deterministic (first match wins); because EVERY writer of
+/// `host_pattern` canonicalizes it through the same normalization used here (the management
+/// brand write at ingest, and the config-promotion apply, which is the second writer of that
+/// column and folds in its projection AND at its bind), and because `client_id` is matched
+/// exactly, the per-scope partial unique indexes on `host_pattern` and `client_id`
 /// reject two brands that would resolve for the same host or client, so at most one candidate can
-/// match either selector: "first match" is also "the only match".
+/// match either selector: "first match" is also "the only match". The indexes are on the RAW
+/// columns, so that conclusion rests on the fold being universal rather than on the index alone.
 #[must_use]
 pub fn select_brand(
     candidates: &[BrandCandidate<'_>],

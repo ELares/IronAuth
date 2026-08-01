@@ -12,6 +12,14 @@
 //! and re-validated on render), stored verbatim as `jsonb`. No field is ever raw HTML or
 //! CSS at the store boundary; a slot string is sanitizer output and a token blob is typed
 //! scalars.
+//!
+//! That is a claim about the CALLERS, since this module interprets nothing, so it is worth
+//! naming them: there are exactly TWO writers of `brands` and both carry the wall. The brand
+//! management endpoint sanitizes and typed-parses at ingest, and the config-promotion apply,
+//! which binds a submitted snapshot document's `tokens` and `slots` verbatim, is held to the
+//! SAME grammar by `ironauth_admin::brands::promoted_brand_faults` before a plan is built or an
+//! apply runs. Snapshot document validation alone would not be enough: it checks only that the
+//! two are JSON objects.
 
 /// Canonicalize a `host_pattern` (or a request Host) to the single form the per-domain brand
 /// selection keys on (issue #86, PR 3): trim, drop any `:port` suffix (an IPv6 literal keeps its
