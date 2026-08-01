@@ -1308,6 +1308,660 @@
         ]
       }
     },
+    "mfa_recovery_codes_already_shown_api": {
+      "contract_version": 2,
+      "expires_at": 900,
+      "id": "flw_golden00000000000000000000",
+      "journey": "login",
+      "state": "mfa_recovery_codes",
+      "transport": "api",
+      "ui": {
+        "action": "/t/tnt_golden/e/env_golden/flow/api/login/submit",
+        "messages": [],
+        "method": "POST",
+        "nodes": [
+          {
+            "attributes": {
+              "message": {
+                "context": {},
+                "id": 1030011,
+                "kind": "info",
+                "text": "Your recovery codes were shown once when they were created and cannot be shown again here. Your authenticator is set up; generate a fresh set from your account security settings whenever you need one."
+              },
+              "node_type": "text"
+            },
+            "group": "recovery_code",
+            "messages": []
+          },
+          {
+            "attributes": {
+              "disabled": false,
+              "input_type": "checkbox",
+              "name": "recovery_codes_acknowledged",
+              "node_type": "input",
+              "required": true
+            },
+            "group": "recovery_code",
+            "label": {
+              "context": {},
+              "id": 1030009,
+              "kind": "info",
+              "text": "I have saved my recovery codes"
+            },
+            "messages": [
+              {
+                "context": {},
+                "id": 4300004,
+                "kind": "error",
+                "text": "Confirm you have saved your recovery codes to continue."
+              }
+            ]
+          },
+          {
+            "attributes": {
+              "disabled": false,
+              "input_type": "submit",
+              "name": "method",
+              "node_type": "input",
+              "required": false,
+              "value": "recovery_codes_ack"
+            },
+            "group": "recovery_code",
+            "label": {
+              "context": {},
+              "id": 1030010,
+              "kind": "info",
+              "text": "Continue"
+            },
+            "messages": []
+          }
+        ]
+      }
+    },
+    "mfa_recovery_codes_already_shown_browser": {
+      "contract_version": 2,
+      "expires_at": 900,
+      "id": "flw_golden00000000000000000000",
+      "journey": "login",
+      "state": "mfa_recovery_codes",
+      "transport": "browser",
+      "ui": {
+        "action": "/t/tnt_golden/e/env_golden/flow/login",
+        "messages": [],
+        "method": "POST",
+        "nodes": [
+          {
+            "attributes": {
+              "disabled": false,
+              "input_type": "hidden",
+              "name": "flow",
+              "node_type": "input",
+              "required": true,
+              "value": "flw_golden00000000000000000000"
+            },
+            "group": "default",
+            "messages": []
+          },
+          {
+            "attributes": {
+              "message": {
+                "context": {},
+                "id": 1030011,
+                "kind": "info",
+                "text": "Your recovery codes were shown once when they were created and cannot be shown again here. Your authenticator is set up; generate a fresh set from your account security settings whenever you need one."
+              },
+              "node_type": "text"
+            },
+            "group": "recovery_code",
+            "messages": []
+          },
+          {
+            "attributes": {
+              "disabled": false,
+              "input_type": "checkbox",
+              "name": "recovery_codes_acknowledged",
+              "node_type": "input",
+              "required": true
+            },
+            "group": "recovery_code",
+            "label": {
+              "context": {},
+              "id": 1030009,
+              "kind": "info",
+              "text": "I have saved my recovery codes"
+            },
+            "messages": [
+              {
+                "context": {},
+                "id": 4300004,
+                "kind": "error",
+                "text": "Confirm you have saved your recovery codes to continue."
+              }
+            ]
+          },
+          {
+            "attributes": {
+              "disabled": false,
+              "input_type": "submit",
+              "name": "method",
+              "node_type": "input",
+              "required": false,
+              "value": "recovery_codes_ack"
+            },
+            "group": "recovery_code",
+            "label": {
+              "context": {},
+              "id": 1030010,
+              "kind": "info",
+              "text": "Continue"
+            },
+            "messages": []
+          }
+        ]
+      }
+    },
+    "mfa_recovery_codes_api": {
+      "contract_version": 2,
+      "expires_at": 900,
+      "id": "flw_golden00000000000000000000",
+      "journey": "login",
+      "state": "mfa_recovery_codes",
+      "transport": "api",
+      "ui": {
+        "action": "/t/tnt_golden/e/env_golden/flow/api/login/submit",
+        "messages": [],
+        "method": "POST",
+        "nodes": [
+          {
+            "attributes": {
+              "message": {
+                "context": {
+                  "count": "10"
+                },
+                "id": 1030007,
+                "kind": "info",
+                "text": "These one time recovery codes are shown once, now. Save them somewhere safe: each one signs you in if you lose your authenticator."
+              },
+              "node_type": "text"
+            },
+            "group": "recovery_code",
+            "messages": []
+          },
+          {
+            "attributes": {
+              "disabled": true,
+              "input_type": "text",
+              "name": "recovery_code_1",
+              "node_type": "input",
+              "required": false,
+              "value": "GOLD-ENRC-0001"
+            },
+            "group": "recovery_code",
+            "label": {
+              "context": {},
+              "id": 1030008,
+              "kind": "info",
+              "text": "Recovery code"
+            },
+            "messages": []
+          },
+          {
+            "attributes": {
+              "disabled": true,
+              "input_type": "text",
+              "name": "recovery_code_2",
+              "node_type": "input",
+              "required": false,
+              "value": "GOLD-ENRC-0002"
+            },
+            "group": "recovery_code",
+            "label": {
+              "context": {},
+              "id": 1030008,
+              "kind": "info",
+              "text": "Recovery code"
+            },
+            "messages": []
+          },
+          {
+            "attributes": {
+              "disabled": true,
+              "input_type": "text",
+              "name": "recovery_code_3",
+              "node_type": "input",
+              "required": false,
+              "value": "GOLD-ENRC-0003"
+            },
+            "group": "recovery_code",
+            "label": {
+              "context": {},
+              "id": 1030008,
+              "kind": "info",
+              "text": "Recovery code"
+            },
+            "messages": []
+          },
+          {
+            "attributes": {
+              "disabled": true,
+              "input_type": "text",
+              "name": "recovery_code_4",
+              "node_type": "input",
+              "required": false,
+              "value": "GOLD-ENRC-0004"
+            },
+            "group": "recovery_code",
+            "label": {
+              "context": {},
+              "id": 1030008,
+              "kind": "info",
+              "text": "Recovery code"
+            },
+            "messages": []
+          },
+          {
+            "attributes": {
+              "disabled": true,
+              "input_type": "text",
+              "name": "recovery_code_5",
+              "node_type": "input",
+              "required": false,
+              "value": "GOLD-ENRC-0005"
+            },
+            "group": "recovery_code",
+            "label": {
+              "context": {},
+              "id": 1030008,
+              "kind": "info",
+              "text": "Recovery code"
+            },
+            "messages": []
+          },
+          {
+            "attributes": {
+              "disabled": true,
+              "input_type": "text",
+              "name": "recovery_code_6",
+              "node_type": "input",
+              "required": false,
+              "value": "GOLD-ENRC-0006"
+            },
+            "group": "recovery_code",
+            "label": {
+              "context": {},
+              "id": 1030008,
+              "kind": "info",
+              "text": "Recovery code"
+            },
+            "messages": []
+          },
+          {
+            "attributes": {
+              "disabled": true,
+              "input_type": "text",
+              "name": "recovery_code_7",
+              "node_type": "input",
+              "required": false,
+              "value": "GOLD-ENRC-0007"
+            },
+            "group": "recovery_code",
+            "label": {
+              "context": {},
+              "id": 1030008,
+              "kind": "info",
+              "text": "Recovery code"
+            },
+            "messages": []
+          },
+          {
+            "attributes": {
+              "disabled": true,
+              "input_type": "text",
+              "name": "recovery_code_8",
+              "node_type": "input",
+              "required": false,
+              "value": "GOLD-ENRC-0008"
+            },
+            "group": "recovery_code",
+            "label": {
+              "context": {},
+              "id": 1030008,
+              "kind": "info",
+              "text": "Recovery code"
+            },
+            "messages": []
+          },
+          {
+            "attributes": {
+              "disabled": true,
+              "input_type": "text",
+              "name": "recovery_code_9",
+              "node_type": "input",
+              "required": false,
+              "value": "GOLD-ENRC-0009"
+            },
+            "group": "recovery_code",
+            "label": {
+              "context": {},
+              "id": 1030008,
+              "kind": "info",
+              "text": "Recovery code"
+            },
+            "messages": []
+          },
+          {
+            "attributes": {
+              "disabled": true,
+              "input_type": "text",
+              "name": "recovery_code_10",
+              "node_type": "input",
+              "required": false,
+              "value": "GOLD-ENRC-0010"
+            },
+            "group": "recovery_code",
+            "label": {
+              "context": {},
+              "id": 1030008,
+              "kind": "info",
+              "text": "Recovery code"
+            },
+            "messages": []
+          },
+          {
+            "attributes": {
+              "disabled": false,
+              "input_type": "checkbox",
+              "name": "recovery_codes_acknowledged",
+              "node_type": "input",
+              "required": true
+            },
+            "group": "recovery_code",
+            "label": {
+              "context": {},
+              "id": 1030009,
+              "kind": "info",
+              "text": "I have saved my recovery codes"
+            },
+            "messages": []
+          },
+          {
+            "attributes": {
+              "disabled": false,
+              "input_type": "submit",
+              "name": "method",
+              "node_type": "input",
+              "required": false,
+              "value": "recovery_codes_ack"
+            },
+            "group": "recovery_code",
+            "label": {
+              "context": {},
+              "id": 1030010,
+              "kind": "info",
+              "text": "Continue"
+            },
+            "messages": []
+          }
+        ]
+      }
+    },
+    "mfa_recovery_codes_browser": {
+      "contract_version": 2,
+      "expires_at": 900,
+      "id": "flw_golden00000000000000000000",
+      "journey": "login",
+      "state": "mfa_recovery_codes",
+      "transport": "browser",
+      "ui": {
+        "action": "/t/tnt_golden/e/env_golden/flow/login",
+        "messages": [],
+        "method": "POST",
+        "nodes": [
+          {
+            "attributes": {
+              "disabled": false,
+              "input_type": "hidden",
+              "name": "flow",
+              "node_type": "input",
+              "required": true,
+              "value": "flw_golden00000000000000000000"
+            },
+            "group": "default",
+            "messages": []
+          },
+          {
+            "attributes": {
+              "message": {
+                "context": {
+                  "count": "10"
+                },
+                "id": 1030007,
+                "kind": "info",
+                "text": "These one time recovery codes are shown once, now. Save them somewhere safe: each one signs you in if you lose your authenticator."
+              },
+              "node_type": "text"
+            },
+            "group": "recovery_code",
+            "messages": []
+          },
+          {
+            "attributes": {
+              "disabled": true,
+              "input_type": "text",
+              "name": "recovery_code_1",
+              "node_type": "input",
+              "required": false,
+              "value": "GOLD-ENRC-0001"
+            },
+            "group": "recovery_code",
+            "label": {
+              "context": {},
+              "id": 1030008,
+              "kind": "info",
+              "text": "Recovery code"
+            },
+            "messages": []
+          },
+          {
+            "attributes": {
+              "disabled": true,
+              "input_type": "text",
+              "name": "recovery_code_2",
+              "node_type": "input",
+              "required": false,
+              "value": "GOLD-ENRC-0002"
+            },
+            "group": "recovery_code",
+            "label": {
+              "context": {},
+              "id": 1030008,
+              "kind": "info",
+              "text": "Recovery code"
+            },
+            "messages": []
+          },
+          {
+            "attributes": {
+              "disabled": true,
+              "input_type": "text",
+              "name": "recovery_code_3",
+              "node_type": "input",
+              "required": false,
+              "value": "GOLD-ENRC-0003"
+            },
+            "group": "recovery_code",
+            "label": {
+              "context": {},
+              "id": 1030008,
+              "kind": "info",
+              "text": "Recovery code"
+            },
+            "messages": []
+          },
+          {
+            "attributes": {
+              "disabled": true,
+              "input_type": "text",
+              "name": "recovery_code_4",
+              "node_type": "input",
+              "required": false,
+              "value": "GOLD-ENRC-0004"
+            },
+            "group": "recovery_code",
+            "label": {
+              "context": {},
+              "id": 1030008,
+              "kind": "info",
+              "text": "Recovery code"
+            },
+            "messages": []
+          },
+          {
+            "attributes": {
+              "disabled": true,
+              "input_type": "text",
+              "name": "recovery_code_5",
+              "node_type": "input",
+              "required": false,
+              "value": "GOLD-ENRC-0005"
+            },
+            "group": "recovery_code",
+            "label": {
+              "context": {},
+              "id": 1030008,
+              "kind": "info",
+              "text": "Recovery code"
+            },
+            "messages": []
+          },
+          {
+            "attributes": {
+              "disabled": true,
+              "input_type": "text",
+              "name": "recovery_code_6",
+              "node_type": "input",
+              "required": false,
+              "value": "GOLD-ENRC-0006"
+            },
+            "group": "recovery_code",
+            "label": {
+              "context": {},
+              "id": 1030008,
+              "kind": "info",
+              "text": "Recovery code"
+            },
+            "messages": []
+          },
+          {
+            "attributes": {
+              "disabled": true,
+              "input_type": "text",
+              "name": "recovery_code_7",
+              "node_type": "input",
+              "required": false,
+              "value": "GOLD-ENRC-0007"
+            },
+            "group": "recovery_code",
+            "label": {
+              "context": {},
+              "id": 1030008,
+              "kind": "info",
+              "text": "Recovery code"
+            },
+            "messages": []
+          },
+          {
+            "attributes": {
+              "disabled": true,
+              "input_type": "text",
+              "name": "recovery_code_8",
+              "node_type": "input",
+              "required": false,
+              "value": "GOLD-ENRC-0008"
+            },
+            "group": "recovery_code",
+            "label": {
+              "context": {},
+              "id": 1030008,
+              "kind": "info",
+              "text": "Recovery code"
+            },
+            "messages": []
+          },
+          {
+            "attributes": {
+              "disabled": true,
+              "input_type": "text",
+              "name": "recovery_code_9",
+              "node_type": "input",
+              "required": false,
+              "value": "GOLD-ENRC-0009"
+            },
+            "group": "recovery_code",
+            "label": {
+              "context": {},
+              "id": 1030008,
+              "kind": "info",
+              "text": "Recovery code"
+            },
+            "messages": []
+          },
+          {
+            "attributes": {
+              "disabled": true,
+              "input_type": "text",
+              "name": "recovery_code_10",
+              "node_type": "input",
+              "required": false,
+              "value": "GOLD-ENRC-0010"
+            },
+            "group": "recovery_code",
+            "label": {
+              "context": {},
+              "id": 1030008,
+              "kind": "info",
+              "text": "Recovery code"
+            },
+            "messages": []
+          },
+          {
+            "attributes": {
+              "disabled": false,
+              "input_type": "checkbox",
+              "name": "recovery_codes_acknowledged",
+              "node_type": "input",
+              "required": true
+            },
+            "group": "recovery_code",
+            "label": {
+              "context": {},
+              "id": 1030009,
+              "kind": "info",
+              "text": "I have saved my recovery codes"
+            },
+            "messages": []
+          },
+          {
+            "attributes": {
+              "disabled": false,
+              "input_type": "submit",
+              "name": "method",
+              "node_type": "input",
+              "required": false,
+              "value": "recovery_codes_ack"
+            },
+            "group": "recovery_code",
+            "label": {
+              "context": {},
+              "id": 1030010,
+              "kind": "info",
+              "text": "Continue"
+            },
+            "messages": []
+          }
+        ]
+      }
+    },
     "recovery_ack_api": {
       "contract_version": 2,
       "expires_at": 900,

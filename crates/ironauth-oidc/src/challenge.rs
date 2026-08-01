@@ -901,7 +901,15 @@ enum StepResponse {
 ///   uniform.
 fn classify_step(state: FlowStateTag) -> StepResponse {
     match state {
-        FlowStateTag::MfaChallenge | FlowStateTag::MfaEnroll => StepResponse::Continuation,
+        // The show once recovery codes interstitial (issue #311) is also a step-up hold: it is
+        // reachable ONLY after a genuine primary success AND a genuine TOTP enrollment, and the
+        // native client CAN satisfy it (the acknowledgment is a plain field), so it carries the
+        // continuity handle and the login finishes. See `mfa_hints` for the residual: this endpoint
+        // renders no nodes, so it can no more show the codes than it can show the enrollment secret
+        // on the state before it.
+        FlowStateTag::MfaChallenge | FlowStateTag::MfaEnroll | FlowStateTag::MfaRecoveryCodes => {
+            StepResponse::Continuation
+        }
         // The organization picker (issue #94, PR-B2) is a browser CHOICE reached after primary
         // success; it cannot be satisfied by further headless credential input, so like progressive
         // profiling it escalates to the browser.
@@ -940,20 +948,38 @@ fn render_step_response(flow_id: &FlowId, flow: &Flow, submit_token: &str) -> Re
 /// The client facing step-up hints for an MFA render (issue #93, PR2), derived STRICTLY from the
 /// rendered node set (never from server state), so it discloses only what the rendered form already
 /// shows. A Totp `code` input asks for a one time code (`otp_required`); the enroll render also
-/// carries the `otpauth://` provisioning field (`otp_enroll_required`).
+/// carries the `otpauth://` provisioning field (`otp_enroll_required`); the show once recovery
+/// codes interstitial carries its acknowledgment checkbox (`recovery_codes_ack_required`, issue
+/// #311).
+///
+/// Every hint is a BOOLEAN. This endpoint answers a held step with an OAuth ERROR body, and an
+/// error body is the last place a plaintext recovery code belongs, so the codes are NOT relayed
+/// here even though the swallowed render carried them. That is the same boundary this endpoint
+/// already has one state earlier: it does not relay the `otpauth://` provisioning secret either, so
+/// a native client cannot drive a TOTP enrollment through this surface at all and in practice never
+/// reaches the interstitial. What the hint buys is honesty when it does: the client learns an
+/// acknowledgment is owed, resubmits it with its `auth_session`, and the login completes; the codes
+/// stay live and a fresh set is one call away on the account surface.
 fn mfa_hints(nodes: &[Node]) -> serde_json::Map<String, Value> {
     let mut otp_required = false;
     let mut otp_enroll_required = false;
+    let mut recovery_codes_ack_required = false;
     for node in nodes {
-        if node.group != NodeGroup::Totp {
+        let NodeAttributes::Input { name, .. } = &node.attributes else {
             continue;
-        }
-        if let NodeAttributes::Input { name, .. } = &node.attributes {
-            if name == "code" {
-                otp_required = true;
-            } else if name == "otpauth_uri" {
-                otp_enroll_required = true;
+        };
+        match node.group {
+            NodeGroup::Totp => {
+                if name == "code" {
+                    otp_required = true;
+                } else if name == "otpauth_uri" {
+                    otp_enroll_required = true;
+                }
             }
+            NodeGroup::RecoveryCode if name == crate::flow::RECOVERY_CODES_ACK_FIELD => {
+                recovery_codes_ack_required = true;
+            }
+            _ => {}
         }
     }
     let mut hints = serde_json::Map::new();
@@ -962,6 +988,9 @@ fn mfa_hints(nodes: &[Node]) -> serde_json::Map<String, Value> {
     }
     if otp_enroll_required {
         hints.insert("otp_enroll_required".to_owned(), Value::Bool(true));
+    }
+    if recovery_codes_ack_required {
+        hints.insert("recovery_codes_ack_required".to_owned(), Value::Bool(true));
     }
     hints
 }
@@ -1204,7 +1233,11 @@ mod tests {
     fn classify_step_maps_each_flow_state_group_to_the_right_response() {
         // The step-up holds carry the continuity handle (reachable only after a genuine primary
         // success, so they disclose only "a second factor is required").
-        for state in [FlowStateTag::MfaChallenge, FlowStateTag::MfaEnroll] {
+        for state in [
+            FlowStateTag::MfaChallenge,
+            FlowStateTag::MfaEnroll,
+            FlowStateTag::MfaRecoveryCodes,
+        ] {
             assert_eq!(
                 classify_step(state),
                 StepResponse::Continuation,

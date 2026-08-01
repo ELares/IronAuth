@@ -615,8 +615,17 @@ pub async fn initiate_recovery(
     let token = generate_cancel_token(state, &flow_id);
     let digest = cancel_token_digest(&token);
 
-    // Notify EVERY verified channel immediately, with the cancellation path. The link is
-    // built for the real transport; the coarse send seam records the alert for tests.
+    // Notify EVERY verified channel immediately. PRE-EXISTING and recorded rather than changed
+    // here, filed separately: the cancellation link is UNREACHABLE ON BOTH SURFACES. This is
+    // `cancel_link`'s only call site and it binds into `let _link`, and `notify_all_channels`
+    // below has no parameter a URL could ride, so the "this was not me" path that stops an
+    // attacker-initiated recovery inside its delay window is never delivered to anyone. The
+    // endpoint and the token machinery are real and work; only the delivery is missing.
+    //
+    // Wiring it is a genuine piece of work rather than a one line change, which is why it is filed:
+    // it needs a notice struct, a delivery seam method following the `NewDeviceNotice` precedent,
+    // a state wrapper, test doubles for both channels, and a new parameter threaded through
+    // `notify_all_channels`.
     let _link = cancel_link(state, &token);
     let channels_notified = notify_all_channels(state, scope, subject).await;
 

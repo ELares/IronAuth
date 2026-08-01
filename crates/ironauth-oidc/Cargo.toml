@@ -233,6 +233,16 @@ name = "flow_login_flip"
 path = "tests/flow_login_flip.rs"
 required-features = ["testing"]
 
+# The SHOW ONCE recovery codes a mid-login TOTP enrollment mints (issue #311): the codes render on
+# the ONE activating response and never again (re-render, replay, resume, inspector), the
+# acknowledgment gates the completion, the displayed codes are the REAL credentials (one redeems on
+# the next login), and no row of any table and no log line carries one. Over a real database
+# (DATABASE_URL); see scripts/with-test-db.sh.
+[[test]]
+name = "flow_mfa_recovery_codes"
+path = "tests/flow_mfa_recovery_codes.rs"
+required-features = ["testing"]
+
 # Adversarial probes for the login flip (issue #92, PR 8b): proves the flipped table engine
 # fails closed on a wrong second factor, a spoofed routing signal, a tampered post-primary step
 # with no subject, and a forged custom tag on a login row (no session minted in any case). Over a

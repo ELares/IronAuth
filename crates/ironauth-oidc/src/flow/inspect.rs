@@ -152,7 +152,10 @@ impl FlowPlanView {
 ///
 /// For a GENUINE [`Journey::Custom`] flow every step is the flat [`FlowStateTag::Custom`], so the
 /// projection folds to `[Custom, Completed]`; the custom half already drives from
-/// [`CompiledJourney::reachable`] and does not consult a plan.
+/// [`CompiledJourney::reachable`] and does not consult a plan. The one exception is a custom
+/// journey authored with an [`StepKind::MfaEnroll`] step, whose show once recovery codes
+/// interstitial (issue #311) is a render-override rather than a step, so the projection carries
+/// `[Custom, MfaRecoveryCodes, Completed]` and matches what such a flow is actually seen on.
 #[must_use]
 pub fn project_plan(journey: Journey, compiled: &CompiledJourney) -> Vec<FlowStateTag> {
     let mut plan: Vec<FlowStateTag> = Vec::new();
@@ -329,6 +332,14 @@ fn canonical_nodes(
         // the row and the inspector must not synthesize one.
         FlowStateTag::MfaChallenge | FlowStateTag::MfaEnroll => {
             mfa::challenge_start_nodes(transport, flow_id)
+        }
+        // The show once recovery codes interstitial (issue #311) projects the ACKNOWLEDGMENT alone.
+        // The `None` is not a redaction the inspector performs, it is the only value it could
+        // possibly pass: the codes existed once, in the mint result the enroll call already
+        // consumed, and were never written to the row this projection reads. An operator observing
+        // a flow parked on this state can never see a subject's recovery codes.
+        FlowStateTag::MfaRecoveryCodes => {
+            mfa::recovery_codes_nodes(transport, flow_id, None, false)
         }
         FlowStateTag::RecoveryStart => recovery::start_nodes(transport, flow_id),
         FlowStateTag::RecoveryAck => recovery::ack_nodes(transport, flow_id, false),
@@ -722,20 +733,22 @@ fn step_projection(
             reached: outcome.step_up_needed && !outcome.blocked,
             methods: vec![PRIMARY_METHOD.to_owned()],
         },
-        // The enroll step depends on the subject's enrolled factors, progressive profiling depends
+        // The enroll step depends on the subject's enrolled factors, its show once recovery codes
+        // interstitial (issue #311) is reachable only THROUGH it, progressive profiling depends
         // on the client's configured signup form and the subject's existing traits, and the org
         // picker depends on the subject's organization memberships; a pure dry run reads none of
-        // these, so all three are projected as not reached with only the primary factor proven
+        // these, so all four are projected as not reached with only the primary factor proven
         // (they are post-primary render-or-skip steps, so the primary method is already proven).
-        FlowStateTag::MfaEnroll | FlowStateTag::ProgressiveProfiling | FlowStateTag::OrgPicker => {
-            StepProjection {
-                policy: None,
-                step_up: None,
-                risk: None,
-                reached: false,
-                methods: vec![PRIMARY_METHOD.to_owned()],
-            }
-        }
+        FlowStateTag::MfaEnroll
+        | FlowStateTag::MfaRecoveryCodes
+        | FlowStateTag::ProgressiveProfiling
+        | FlowStateTag::OrgPicker => StepProjection {
+            policy: None,
+            step_up: None,
+            risk: None,
+            reached: false,
+            methods: vec![PRIMARY_METHOD.to_owned()],
+        },
         FlowStateTag::Completed => {
             // The completion is reached unless the scenario blocks. The proven methods gain
             // the second factor token when a step up was threaded.
@@ -785,6 +798,7 @@ fn terminal_state(plan: &[FlowStateTag], outcome: ScenarioOutcome) -> FlowStateT
 mod tests {
     use super::*;
     use crate::flow::golden::golden_flows;
+    use crate::flow::model::NodeAttributes;
 
     fn order() -> Vec<String> {
         step_up::default_acr_order()
@@ -949,8 +963,9 @@ mod tests {
     fn login_plan_projection_pins_the_static_list() {
         // The projection pin (issue #92, PR 8b): the EMBEDDED login artifact, driven through the
         // table engine, projects to the SAME ordered plan the static `Journey::Login.plan()` lists,
-        // `[IdentifierPassword, MfaChallenge, MfaEnroll, ProgressiveProfiling, OrgPicker, Completed]`.
-        // This
+        // `[IdentifierPassword, MfaChallenge, MfaEnroll, MfaRecoveryCodes, ProgressiveProfiling,
+        // OrgPicker, Completed]` (the show once recovery codes interstitial rides the enroll step's
+        // `render_override_states`, issue #311, so the BFS derives it rather than listing it). This
         // locks the load-bearing edge order (the `primary -> mfa_chal` edge before `primary ->
         // mfa_enrl`) that makes BOTH the engine's routing priority and this BFS plan match the
         // imperative login journey. It is the "one-time assertion pins the projection equals the old
@@ -1031,6 +1046,31 @@ mod tests {
         assert_eq!(
             project_plan(Journey::Custom, &compiled),
             vec![FlowStateTag::Custom, FlowStateTag::Completed]
+        );
+    }
+
+    #[test]
+    fn a_custom_journey_with_an_enroll_step_projects_the_show_once_interstitial() {
+        // Issue #311, and the one place a custom journey is NOT flat. `StepKind::MfaEnroll` is
+        // authorable in a custom artifact (it is not on `ironauth-journey`'s built-in-only list),
+        // and the executor's render-override does not consult the journey, so such a flow really is
+        // persisted on `MfaRecoveryCodes` while the acknowledgment is owed. The projection says so,
+        // which is what makes a client reading the plan able to render what it will actually be
+        // sent. The end to end proof that the executor agrees is in `tests/flow_custom.rs`.
+        let compiled = linear_builtin_journey(
+            "custom_enroll",
+            &[
+                ("primary", StepKind::IdentifierPassword, Some("password")),
+                ("enroll", StepKind::MfaEnroll, Some("totp")),
+            ],
+        );
+        assert_eq!(
+            project_plan(Journey::Custom, &compiled),
+            vec![
+                FlowStateTag::Custom,
+                FlowStateTag::MfaRecoveryCodes,
+                FlowStateTag::Completed
+            ]
         );
     }
 
@@ -1296,7 +1336,138 @@ mod tests {
             "the identifier is a boolean and a hostile signal name folds to the vocabulary"
         );
 
+        // The NODE RENDER half of the observe projection (issue #311), swept over every
+        // published wire state; see [`assert_no_canonical_render_carries_a_recovery_code`].
+        assert_no_canonical_render_carries_a_recovery_code();
+
         assert_no_sentinel_leaked(&serialized);
+    }
+
+    /// The NODE RENDER half of the observe projection (issue #311 brought a state whose LIVE render
+    /// carries plaintext recovery codes, so the inspector's canonical render of that state is now a
+    /// place a secret could appear). Sweep EVERY published wire state's canonical render, on both
+    /// transports, and assert none of them carries a recovery code.
+    ///
+    /// What this proves is a CHANNEL ABSENCE, and it is worth stating exactly. [`canonical_nodes`]
+    /// takes a state, a transport, a flow id and a connector slug: there is no parameter a recovery
+    /// code could arrive through, and the persisted row the projection reads never held one. So the
+    /// sweep cannot fail today, and that IS the claim. It fails the day someone gives the inspector
+    /// a source for them, which is the change this corpus exists to catch. The behavioural half (a
+    /// real flow parked on the state, real minted codes as the needles, a real observe) is pinned
+    /// end to end in `tests/flow_mfa_recovery_codes.rs`.
+    fn assert_no_canonical_render_carries_a_recovery_code() {
+        use std::fmt::Write as _;
+
+        let mut rendered = String::new();
+        for state in all_flow_states() {
+            for transport in [Transport::Api, Transport::Browser] {
+                let nodes = canonical_nodes(
+                    state,
+                    transport,
+                    "flw_corpus0000000000000000000a",
+                    Some("acme-oidc"),
+                );
+                write!(
+                    rendered,
+                    "{}",
+                    serde_json::to_string(&nodes).expect("serialize canonical nodes")
+                )
+                .expect("write");
+            }
+        }
+        assert!(
+            rendered.contains("identifier"),
+            "the canonical sweep rendered real node sets (it is not empty)"
+        );
+        assert!(
+            !rendered.contains("recovery_code_"),
+            "no canonical render carries a recovery code display node"
+        );
+        assert_no_sentinel_leaked(&rendered);
+
+        // The show once state renders the acknowledgment and the "not shown again" notice, and
+        // NOTHING that looks like a code.
+        let show_once = canonical_nodes(
+            FlowStateTag::MfaRecoveryCodes,
+            Transport::Api,
+            "flw_corpus0000000000000000000a",
+            None,
+        );
+        assert!(
+            show_once.iter().any(|node| matches!(
+                &node.attributes,
+                NodeAttributes::Input { name, .. } if name == "recovery_codes_acknowledged"
+            )),
+            "the inspector projects the acknowledgment"
+        );
+        assert!(
+            show_once.iter().all(|node| !matches!(
+                &node.attributes,
+                NodeAttributes::Input { name, .. } if name.starts_with("recovery_code_")
+            )),
+            "the inspector projects no recovery code"
+        );
+    }
+
+    /// Every published wire state, in declaration order. A hand-written list beside an exhaustive
+    /// match is how a sweep silently stops being total, so this one is not trusted: the test below
+    /// pins it against the vocabulary the PUBLISHED flow schema enumerates, which schemars derives
+    /// from the [`FlowStateTag`] declaration itself. A new variant therefore turns that test red
+    /// until this list is updated, and the corpus sweep above can never quietly miss a state.
+    fn all_flow_states() -> Vec<FlowStateTag> {
+        vec![
+            FlowStateTag::IdentifierPassword,
+            FlowStateTag::RegistrationDetails,
+            FlowStateTag::RegistrationAck,
+            FlowStateTag::MfaChallenge,
+            FlowStateTag::MfaEnroll,
+            FlowStateTag::MfaRecoveryCodes,
+            FlowStateTag::ProgressiveProfiling,
+            FlowStateTag::OrgPicker,
+            FlowStateTag::RecoveryStart,
+            FlowStateTag::RecoveryAck,
+            FlowStateTag::FederationStart,
+            FlowStateTag::ConsentPrompt,
+            FlowStateTag::Completed,
+            FlowStateTag::Custom,
+        ]
+    }
+
+    #[test]
+    fn the_flow_state_list_matches_the_published_vocabulary() {
+        // The anti-drift pin for `all_flow_states`, against the schemars projection of the enum
+        // DECLARATION (the same document `docs/flow-schema.json` is generated from), not against
+        // another hand-written list. Ordered comparison, so a reordering is caught too.
+        let schema = super::super::schema::flow_object_schema();
+        let published: Vec<String> = schema["$defs"]["FlowStateTag"]["oneOf"]
+            .as_array()
+            .expect("the published schema enumerates FlowStateTag")
+            .iter()
+            .map(|variant| {
+                variant["const"]
+                    .as_str()
+                    .expect("each wire state is a string constant")
+                    .to_owned()
+            })
+            .collect();
+        assert!(
+            !published.is_empty(),
+            "the published vocabulary is non-empty (the pin is not comparing two empty lists)"
+        );
+        let listed: Vec<String> = all_flow_states()
+            .into_iter()
+            .map(|state| {
+                serde_json::to_value(state)
+                    .expect("serialize a wire state")
+                    .as_str()
+                    .expect("a wire state serializes as a string")
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(
+            listed, published,
+            "the swept state list must equal the published FlowStateTag vocabulary"
+        );
     }
 
     /// The sentinels this corpus routes through the persisted state. Module scoped so the

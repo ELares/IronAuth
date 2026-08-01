@@ -62,6 +62,10 @@ pub use golden::{GoldenFlow, golden_corpus, golden_flows};
 pub use localize::{
     LanguageTag, LocaleBundle, ResolvedLocale, TextDirection, localize, resolve_locale,
 };
+/// The show once recovery codes acknowledgment field name (issue #311), re-exported so the
+/// first-party challenge surface derives its hint from the ONE name the node builder emits
+/// rather than a copy of the string beside it.
+pub(crate) use mfa::RECOVERY_CODES_ACK_FIELD;
 #[cfg(any(test, feature = "testing"))]
 pub use orchestration::EmbeddedJourneySource;
 pub use orchestration::{

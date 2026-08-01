@@ -615,6 +615,21 @@ pub(super) async fn drive_via_table(
             // whose render advances the wire position (registration's non-terminal Ack, PR 8c) sets
             // a state override; login sets `None`, so a login re-render stays on its real per-step
             // tag, byte-identical to the imperative driver.
+            //
+            // The override is applied with NO journey guard, and that is the honest behavior rather
+            // than an omission: the executors above do not know which journey they are running
+            // under, so whatever one of them overrides to, it overrides to on every journey that
+            // can route into it. Registration's Ack never reaches a custom journey only because
+            // `StepKind::Registration` is built-in-only and cannot be authored into a custom
+            // artifact. `StepKind::MfaEnroll` CAN be, so the show once recovery codes interstitial
+            // (issue #311) is reachable on a custom journey too, and `render_override_states`
+            // declares it for `Journey::Custom` so the published map and this line agree. Deriving
+            // the override from that map instead would be worse than redundant: the acknowledgment
+            // arm below discriminates on `scratch.step == FlowStateTag::MfaRecoveryCodes`, so
+            // leaving a custom flow on the flat state routes its NEXT submission, whatever it is,
+            // back into the plain enroll arm against the pending credential the activating hop
+            // released. Measured on exactly that variant: the submission after the interstitial is
+            // a `404 No such flow.` and the user cannot finish logging in.
             let mut next = table_state(journey, &scratch, &current.kind, &current_step_id);
             if let Some(tag) = state_override {
                 next.step = tag;
@@ -924,6 +939,47 @@ async fn run_step_executor(
                         post_reset: None,
                     })
                 }
+                // A CHALLENGE proves an already enrolled factor and mints nothing (issue #311): the
+                // show once recovery codes interstitial belongs to the ENROLL step alone, so this is
+                // unreachable and folds to the uniform not found rather than a fabricated render.
+                mfa::MfaStep::RecoveryCodes { .. } => Err(FlowError::NotFound),
+            }
+        }
+        // The enroll step owns TWO wire states (issue #311). Its own `MfaEnroll` is the
+        // provisioning + confirmation form; `MfaRecoveryCodes` is the render-override interstitial
+        // it moves to the instant a valid confirmation code activates the factor, carrying the show
+        // once recovery codes the shared ceremony minted. The PERSISTED wire state is the
+        // discriminator (`builtin_step_for` folds both back to this one step through
+        // `render_override_states`), so an acknowledgment submission re-enters HERE and takes the
+        // pure acknowledgment path instead of re-running a verify against a pending credential that
+        // no longer exists.
+        StepKind::MfaEnroll if scratch.step == FlowStateTag::MfaRecoveryCodes => {
+            let (subject_id, _) = super::mfa_context(scope, scratch)?;
+            match mfa::advance_recovery_codes_ack(record, submission) {
+                // The acknowledgment is missing: hold on the interstitial. The override must be
+                // re-asserted, or `table_state` would recompute the step's OWN wire state and
+                // silently walk the user back to the enrollment form.
+                mfa::MfaStep::RecoveryCodes { nodes } => Ok(StepOutcome::Render {
+                    nodes,
+                    messages: Vec::new(),
+                    state_override: Some(FlowStateTag::MfaRecoveryCodes),
+                }),
+                mfa::MfaStep::Complete { new_method } => {
+                    // The method token is already on the scratch from the activating hop; adding it
+                    // again is the deduplicated no-op that keeps this arm honest on its own terms.
+                    add_method(scratch, new_method);
+                    let signals =
+                        signals_after_second_factor(state, scope, record, &subject_id).await;
+                    Ok(StepOutcome::Advance {
+                        signals,
+                        // Risk is not recomputed on this hop (issue #355): the default Low. A guard
+                        // routing on risk is meaningful only on the post-login hop.
+                        risk: RiskView::default(),
+                        post_reset: None,
+                    })
+                }
+                // The pure acknowledgment step yields only those two outcomes.
+                mfa::MfaStep::Render { .. } => Err(FlowError::NotFound),
             }
         }
         StepKind::MfaEnroll => {
@@ -947,6 +1003,20 @@ async fn run_step_executor(
                     messages,
                     state_override: None,
                 }),
+                // The factor is ACTIVE and the codes are minted (issue #311): move the wire
+                // position to the show once interstitial, banking the genuinely proven TOTP token
+                // and releasing the now consumed pending credential id, and hold the flow OPEN. No
+                // session is minted on this hop, so the user cannot skip past their codes by
+                // completing; the walk to the terminal happens only on the acknowledgment.
+                mfa::MfaStep::RecoveryCodes { nodes } => {
+                    add_method(scratch, AuthMethod::Totp);
+                    scratch.enroll_credential = None;
+                    Ok(StepOutcome::Render {
+                        nodes,
+                        messages: Vec::new(),
+                        state_override: Some(FlowStateTag::MfaRecoveryCodes),
+                    })
+                }
                 mfa::MfaStep::Complete { new_method } => {
                     add_method(scratch, new_method);
                     scratch.enroll_credential = None;

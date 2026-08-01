@@ -131,6 +131,11 @@
           "type": "string"
         },
         {
+          "const": "mfa_recovery_codes",
+          "description": "The SHOW ONCE recovery codes an in flow TOTP enrollment just minted (issue #311): the\ninterstitial the enroll step renders IMMEDIATELY after a valid confirmation code activated\nthe factor, carrying the freshly minted one time recovery codes as display only nodes plus\nthe acknowledgment the user gives before the login completes. It is a RENDER OVERRIDE on the\nenroll step (see `render_override_states`), not a step of its own: the flow stays OPEN and no\nsession is minted until the acknowledgment arrives.\n\nSHOW ONCE is STRUCTURAL, not a promise. The codes live only in the transient mint result of\nthe ONE `flow_enroll_verify` call that activated the factor; nothing writes them to the flow\nrow, so a re-render, a replay, or a resumed flow on this state has no source to render them\nfrom and renders the acknowledgment ALONE (the store keeps only their Argon2 hashes, and the\naccount surface is where a user re-mints a set).",
+          "type": "string"
+        },
+        {
           "const": "progressive_profiling",
           "description": "A progressive profiling step (issue #87): a subsequent login collects the client form's\nlater-login signup fields as a HELD login step, injected where a successful primary (plus\nany second factor) login would otherwise mint the session. The step is always SKIPPABLE\n(a missing required later-login field prompts but never blocks the mint), so the flow\nstays OPEN on a re-render and mints on a skip or a valid submission.",
           "type": "string"

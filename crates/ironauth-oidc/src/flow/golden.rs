@@ -51,6 +51,16 @@ const GOLDEN_RESUME: &str = "/authorize?client_id=cli_golden";
 /// The federation connector slug the federation launcher goldens name.
 const GOLDEN_CONNECTOR: &str = "acme-oidc";
 
+/// The fixed recovery code set the show once interstitial goldens display (issue #311), in place
+/// of a live mint. Obviously synthetic placeholders in the real grouped Base32 shape, never real
+/// codes: the corpus is committed to a public repository, so it must be impossible to mistake one
+/// of these for a live credential. Ten of them, the default `oidc.totp_recovery_code_count`.
+fn golden_recovery_codes() -> Vec<String> {
+    (1..=10)
+        .map(|ordinal| format!("GOLD-ENRC-{ordinal:04}"))
+        .collect()
+}
+
 /// One named golden flow object (issue #84): the stable name (the key in `docs/flow-golden.json`
 /// and the diff a breaking change trips) plus the flow object itself.
 #[derive(Debug, Clone)]
@@ -125,9 +135,11 @@ pub fn golden_flows() -> Vec<GoldenFlow> {
         secret: "GOLD ENSE CRET GOLD ENSE CRET".to_owned(),
     };
 
+    let recovery_codes = golden_recovery_codes();
+
     let mut corpus = Vec::new();
     for transport in [Transport::Api, Transport::Browser] {
-        push_transport_goldens(&mut corpus, transport, &begin);
+        push_transport_goldens(&mut corpus, transport, &begin, &recovery_codes);
     }
     corpus
 }
@@ -138,6 +150,7 @@ fn push_transport_goldens(
     corpus: &mut Vec<GoldenFlow>,
     transport: Transport,
     begin: &FlowEnrollBegin,
+    recovery_codes: &[String],
 ) {
     let suffix = transport.as_str();
     let id = GOLDEN_FLOW_ID;
@@ -203,6 +216,10 @@ fn push_transport_goldens(
         None,
     ));
 
+    // The SHOW ONCE recovery codes interstitial (issue #311, see
+    // [`push_recovery_codes_goldens`]).
+    push_recovery_codes_goldens(corpus, transport, id, recovery_codes);
+
     // Recovery: the identifier start, the uniform acknowledgment plus code entry, and the
     // acknowledgment re-rendered with the uniform incorrect code error (an error carrying
     // flow).
@@ -262,6 +279,40 @@ fn push_transport_goldens(
     // Custom (issue #92, PR 4): a custom (declarative) journey's entry step (see
     // [`push_custom_golden`]).
     push_custom_golden(corpus, transport, id);
+}
+
+/// Push the SHOW ONCE recovery codes goldens for one transport (issue #311), in BOTH of the
+/// interstitial's two renders. The PAIR is the point. The minting render carries the codes the in
+/// flow enrollment just produced, as display only nodes; every later render of the SAME state (a
+/// back navigation, a replay, a resumed flow, the read only flow inspector) carries the
+/// acknowledgment ALONE, because nothing persisted the codes for it to read back. A change that let
+/// the second render grow a code node changes its committed golden and fails the freshness gate
+/// loudly, which is the whole reason both are in the corpus rather than just the first.
+fn push_recovery_codes_goldens(
+    corpus: &mut Vec<GoldenFlow>,
+    transport: Transport,
+    id: &str,
+    recovery_codes: &[String],
+) {
+    let suffix = transport.as_str();
+    corpus.push(golden(
+        leaked(format!("mfa_recovery_codes_{suffix}")),
+        transport,
+        Journey::Login,
+        FlowStateTag::MfaRecoveryCodes,
+        mfa::recovery_codes_nodes(transport, id, Some(recovery_codes), false),
+        Vec::new(),
+        None,
+    ));
+    corpus.push(golden(
+        leaked(format!("mfa_recovery_codes_already_shown_{suffix}")),
+        transport,
+        Journey::Login,
+        FlowStateTag::MfaRecoveryCodes,
+        mfa::recovery_codes_nodes(transport, id, None, true),
+        Vec::new(),
+        None,
+    ));
 }
 
 /// Push the custom (declarative) journey golden for one transport (issue #92, PR 4): a custom

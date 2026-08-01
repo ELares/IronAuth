@@ -14,7 +14,8 @@
 //! legible:
 //!
 //! - `10xxxxx` informational copy (labels, prompts, titles): `1010xxx` login, `1020xxx`
-//!   registration, `1030xxx` MFA (challenge and enrollment), `1070xxx` the generic signup
+//!   registration, `1030xxx` MFA (challenge, enrollment, and the issue #311 show once
+//!   recovery codes the enrollment mints), `1070xxx` the generic signup
 //!   field label (issue #87, one id for every configured field, the field pointer riding
 //!   the context so the registry stays finite), `1080xxx` consent (issue #88, the title,
 //!   the client identity and verification badges, the well known scope descriptions plus a
@@ -178,6 +179,24 @@ pub const MFA_SUBMIT_LABEL: MessageId = MessageId(1_030_003);
 pub const MFA_ENROLL_TITLE: MessageId = MessageId(1_030_004);
 /// The MFA enrollment instructions (scan the code, then enter a code to confirm).
 pub const MFA_ENROLL_INSTRUCTIONS: MessageId = MessageId(1_030_005);
+/// The show once recovery codes page title (issue #311).
+pub const MFA_RECOVERY_CODES_TITLE: MessageId = MessageId(1_030_006);
+/// The show once recovery codes instructions (issue #311): the codes are displayed exactly
+/// once, here, at the moment the in flow enrollment minted them. The number of codes rides the
+/// `count` structured context (the flow's answer to the direct account API's
+/// `recovery_codes_remaining` field), never the copy string.
+pub const MFA_RECOVERY_CODES_INSTRUCTIONS: MessageId = MessageId(1_030_007);
+/// The label on each display only recovery code node (issue #311).
+pub const MFA_RECOVERY_CODE_LABEL: MessageId = MessageId(1_030_008);
+/// The recovery codes acknowledgment checkbox label (issue #311).
+pub const MFA_RECOVERY_CODES_ACK_LABEL: MessageId = MessageId(1_030_009);
+/// The recovery codes continue button label (issue #311).
+pub const MFA_RECOVERY_CODES_CONTINUE_LABEL: MessageId = MessageId(1_030_010);
+/// The notice a RE-RENDER of the show once recovery codes state carries (issue #311): the codes
+/// were displayed once when they were minted and are NOT re-readable from the flow, so a back
+/// navigation, a replay, or a resume points the user at the account surface instead. Informational
+/// (nothing is lost; the codes are live and a fresh set can be minted there).
+pub const MFA_RECOVERY_CODES_UNAVAILABLE: MessageId = MessageId(1_030_011);
 
 /// The recovery page title.
 pub const RECOVERY_TITLE: MessageId = MessageId(1_040_001);
@@ -334,6 +353,10 @@ pub const MFA_CODE_INCORRECT: MessageId = MessageId(4_300_001);
 pub const MFA_CODE_REQUIRED: MessageId = MessageId(4_300_002);
 /// Too many second factor attempts (the #64/#72 second factor path throttle).
 pub const MFA_THROTTLED: MessageId = MessageId(4_300_003);
+/// The show once recovery codes acknowledgment is required (issue #311): a per node validation
+/// error on the acknowledgment checkbox, so the login does not complete until the user confirms
+/// they saved the codes. Carries no state and no user data, so it is never an oracle.
+pub const MFA_RECOVERY_CODES_ACK_REQUIRED: MessageId = MessageId(4_300_004);
 
 /// The recovery identifier field is required (a per node validation error). Existence
 /// INDEPENDENT (an empty field does not depend on whether the identifier exists), so it is
@@ -456,6 +479,51 @@ pub const REGISTRY: &[MessageSpec] = &[
         name: "mfa.enroll.instructions",
         kind: MessageKind::Info,
         text: "Add this secret to your authenticator app, then enter a code to confirm.",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: MFA_RECOVERY_CODES_TITLE,
+        name: "mfa.recovery_codes.title",
+        kind: MessageKind::Info,
+        text: "Save your recovery codes",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: MFA_RECOVERY_CODES_INSTRUCTIONS,
+        name: "mfa.recovery_codes.instructions",
+        kind: MessageKind::Info,
+        text: "These one time recovery codes are shown once, now. Save them somewhere safe: \
+               each one signs you in if you lose your authenticator.",
+        context_keys: &["count"],
+    },
+    MessageSpec {
+        id: MFA_RECOVERY_CODE_LABEL,
+        name: "mfa.recovery_codes.code.label",
+        kind: MessageKind::Info,
+        text: "Recovery code",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: MFA_RECOVERY_CODES_ACK_LABEL,
+        name: "mfa.recovery_codes.ack.label",
+        kind: MessageKind::Info,
+        text: "I have saved my recovery codes",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: MFA_RECOVERY_CODES_CONTINUE_LABEL,
+        name: "mfa.recovery_codes.continue.label",
+        kind: MessageKind::Info,
+        text: "Continue",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: MFA_RECOVERY_CODES_UNAVAILABLE,
+        name: "mfa.recovery_codes.unavailable",
+        kind: MessageKind::Info,
+        text: "Your recovery codes were shown once when they were created and cannot be shown \
+               again here. Your authenticator is set up; generate a fresh set from your account \
+               security settings whenever you need one.",
         context_keys: &[],
     },
     MessageSpec {
@@ -850,6 +918,13 @@ pub const REGISTRY: &[MessageSpec] = &[
         name: "mfa.throttled",
         kind: MessageKind::Error,
         text: "Too many attempts. Wait a moment and try again.",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: MFA_RECOVERY_CODES_ACK_REQUIRED,
+        name: "mfa.recovery_codes.ack_required",
+        kind: MessageKind::Error,
+        text: "Confirm you have saved your recovery codes to continue.",
         context_keys: &[],
     },
     MessageSpec {
