@@ -9,8 +9,14 @@
 //! - a native JSON client runs a custom journey compiled from a declarative artifact: create ->
 //!   identifier + password -> conditional MFA -> completion, with the SAME executor cores the
 //!   built-in login journey uses, so the amr is HONEST (`pwd`, or `pwd` + `totp`);
-//! - the wire `state` stays the FLAT `custom` for every custom step (the concrete step is server
-//!   side); a client renders each step from the `ui.nodes` alone;
+//! - the wire `state` stays the FLAT `custom` for every custom STEP (the concrete step is server
+//!   side); a client renders each step from the `ui.nodes` alone. There is exactly one wire state a
+//!   custom flow reaches that is not `custom`, and it is pinned below rather than described away: a
+//!   journey authored with an `mfa_enroll` step holds on the show once recovery codes interstitial
+//!   (`mfa_recovery_codes`, issue #311) between activating the factor and the acknowledgment,
+//!   because that state is a render-override of the enroll step and the executor that emits it does
+//!   not consult the journey. That is intended, so a custom-journey enroller sees the codes they
+//!   were just issued exactly as a login-journey one does;
 //! - a wrong credential re-renders and STAYS on the primary step with the flow OPEN (never a
 //!   completion oracle), exactly as the built-in login path;
 //! - a decision step routes with NO client round trip (the branch is traversed in-call);
@@ -140,6 +146,41 @@ fn decision_journey() -> Journey {
             },
             Transition {
                 from: "gate".to_owned(),
+                to: "done".to_owned(),
+                guard: None,
+                comment: None,
+            },
+        ],
+        subflows: None,
+        subflow_definitions: None,
+    }
+}
+
+/// A journey whose primary step routes UNCONDITIONALLY into TOTP enrollment (issue #311).
+/// `StepKind::MfaEnroll` is authorable in a custom artifact (it is not on `ironauth-journey`'s
+/// built-in-only list), so this is a journey a real author can write, and it is the shape that
+/// reaches the show once recovery codes interstitial off the login journey.
+fn enroll_journey() -> Journey {
+    Journey {
+        schema_version: JOURNEY_SCHEMA_VERSION.to_owned(),
+        id: JOURNEY_ID.to_owned(),
+        engine_version: JOURNEY_ENGINE_VERSION,
+        entry: "primary".to_owned(),
+        comment: None,
+        steps: vec![
+            step("primary", StepKind::IdentifierPassword, Some("password")),
+            step("enroll", StepKind::MfaEnroll, Some("totp")),
+            step("done", StepKind::Terminal, None),
+        ],
+        transitions: vec![
+            Transition {
+                from: "primary".to_owned(),
+                to: "enroll".to_owned(),
+                guard: None,
+                comment: None,
+            },
+            Transition {
+                from: "enroll".to_owned(),
                 to: "done".to_owned(),
                 guard: None,
                 comment: None,
@@ -537,6 +578,186 @@ async fn a_custom_journey_conditionally_steps_up_and_completes_with_pwd_plus_tot
         auth_methods.contains("totp"),
         "records the proven totp: {auth_methods}"
     );
+}
+
+// ------------------------------------------------------------------------------------------
+// Issue #311: a custom journey with an enroll step holds on the show once interstitial.
+// ------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_custom_journey_that_enrolls_totp_shows_its_recovery_codes_once_then_completes() {
+    // The one non flat wire state a custom journey reaches, driven end to end through the
+    // PRODUCTION `FlowVersionJourneySource` rather than asserted about. Three separate places used
+    // to promise a custom journey was flat everywhere (`wire_state_for`'s doc, this module's doc,
+    // and the `render_override_states` map, which said `(Custom, MfaEnroll) => &[]` while the
+    // executor emitted `MfaRecoveryCodes` regardless of journey). The map now matches the executor,
+    // and this pins WHICH of the two was corrected: the codes must be shown, because a custom
+    // journey user who just enrolled TOTP has exactly the same need as a login journey one, and
+    // suppressing the interstitial here would reintroduce the defect issue #311 exists to remove.
+    let (harness, _pool) = setup_custom(enroll_journey()).await;
+    let identifier = "custom-enroll@example.test";
+    let subject = harness.seed_user(identifier, PASSWORD).await;
+    let (flow_id, shown) = enroll_to_the_interstitial(&harness, identifier).await;
+
+    // The wire state the map now declares, and the codes the user was just issued.
+    assert_eq!(
+        shown["flow"]["state"], "mfa_recovery_codes",
+        "the activation holds on the show once interstitial: {shown}"
+    );
+    assert_ne!(
+        shown["state"], "completed",
+        "the acknowledgment is owed before a session is minted: {shown}"
+    );
+    let codes = displayed_recovery_codes(&shown);
+    assert_eq!(
+        codes.len(),
+        10,
+        "the custom journey enroller sees their codes: {shown}"
+    );
+    assert!(
+        has_node(&shown["flow"], "recovery_codes_acknowledged"),
+        "the acknowledgment is offered: {shown}"
+    );
+    let token = shown["submit_token"]
+        .as_str()
+        .expect("rotated token")
+        .to_owned();
+
+    // ONCE: a re-render of the same state carries no code node at all.
+    let (status, _h, again) = post_json(
+        &harness,
+        &submit_api_path(&harness),
+        &json!({ "id": flow_id, "submit_token": token, "nodes": {} }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "re-render: {again}");
+    assert_eq!(again["flow"]["state"], "mfa_recovery_codes");
+    assert!(
+        displayed_recovery_codes(&again).is_empty(),
+        "a later render carries no recovery code node: {again}"
+    );
+    for code in &codes {
+        assert!(
+            !again.to_string().contains(code.as_str()),
+            "{code} must not reappear on a later render"
+        );
+    }
+    let token = again["submit_token"]
+        .as_str()
+        .expect("rotated token")
+        .to_owned();
+
+    // AND IT FINISHES. This is the half that makes the alternative fix wrong. The acknowledgment
+    // arm discriminates on the persisted `mfa_recovery_codes` state, so a custom flow left on the
+    // flat `custom` re-enters the plain enroll arm against the pending credential the activating
+    // hop released. Measured by building that variant: the re-render above already comes back
+    // `404 No such flow.`, so the user is shown their codes and then cannot finish logging in.
+    let (status, headers, done) = post_json(
+        &harness,
+        &submit_api_path(&harness),
+        &json!({
+            "id": flow_id,
+            "submit_token": token,
+            "nodes": { "recovery_codes_acknowledged": true },
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "recovery codes ack: {done}");
+    assert_eq!(
+        done["state"], "completed",
+        "acknowledging completes the custom journey: {done}"
+    );
+    assert!(
+        headers
+            .get(header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .contains(SESSION_COOKIE),
+        "the completion sets the session cookie"
+    );
+    let auth_methods = latest_session_methods(&harness, &subject).await;
+    assert!(
+        auth_methods.contains("pwd") && auth_methods.contains("totp"),
+        "the honest combined amr survives the interstitial: {auth_methods}"
+    );
+}
+
+/// Drive the custom enroll journey to the show once interstitial (issue #311): primary factor,
+/// then a genuine current code for the seed the enroll step provisioned. Returns the flow id and
+/// the ONE render that carried the codes.
+async fn enroll_to_the_interstitial(harness: &Harness, identifier: &str) -> (String, Value) {
+    let (flow_id, token, _create) = api_create(harness).await;
+    let (status, _h, enroll) = post_json(
+        harness,
+        &submit_api_path(harness),
+        &json!({
+            "id": flow_id,
+            "submit_token": token,
+            "nodes": { "identifier": identifier, "password": PASSWORD },
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "primary: {enroll}");
+    // The enroll STEP itself is flat, exactly as the module doc says of every custom step.
+    assert_eq!(
+        enroll["flow"]["state"], "custom",
+        "the enroll step renders on the flat custom state: {enroll}"
+    );
+    let otpauth = enroll["flow"]["ui"]["nodes"]
+        .as_array()
+        .expect("nodes")
+        .iter()
+        .find(|node| node["attributes"]["name"] == "otpauth_uri")
+        .and_then(|node| node["attributes"]["value"].as_str())
+        .expect("the enroll render provisions a seed")
+        .to_owned();
+    let token = enroll["submit_token"]
+        .as_str()
+        .expect("rotated token")
+        .to_owned();
+
+    let code = code_at(
+        &extract_secret(&otpauth),
+        TotpParams::authenticator_default(),
+        now_secs(harness),
+    );
+    let (status, _h, shown) = post_json(
+        harness,
+        &submit_api_path(harness),
+        &json!({ "id": flow_id, "submit_token": token, "nodes": { "code": code } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "enroll confirm: {shown}");
+    (flow_id, shown)
+}
+
+/// The display only recovery code values a show once interstitial render carries (issue #311).
+fn displayed_recovery_codes(shown: &Value) -> Vec<String> {
+    shown["flow"]["ui"]["nodes"]
+        .as_array()
+        .expect("nodes")
+        .iter()
+        .filter(|node| {
+            node["attributes"]["name"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("recovery_code_"))
+        })
+        .map(|node| {
+            node["attributes"]["value"]
+                .as_str()
+                .expect("a displayed recovery code")
+                .to_owned()
+        })
+        .collect()
+}
+
+/// The decoded seed out of an `otpauth://` provisioning uri.
+fn extract_secret(uri: &str) -> Vec<u8> {
+    let marker = "secret=";
+    let start = uri.find(marker).expect("secret param") + marker.len();
+    let rest = &uri[start..];
+    let end = rest.find('&').unwrap_or(rest.len());
+    ironauth_jose::base32_decode(&rest[..end]).expect("decode secret")
 }
 
 // ------------------------------------------------------------------------------------------

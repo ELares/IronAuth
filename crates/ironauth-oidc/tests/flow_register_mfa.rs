@@ -612,16 +612,44 @@ async fn a_login_that_needs_enrollment_enrolls_totp_through_the_flow() {
         TotpParams::authenticator_default(),
         now_secs(&harness),
     );
-    let (status, headers, done) = post_json(
+    let (status, _headers, shown) = post_json(
         &harness,
         &submit_path(&harness, "login"),
         &json!({ "id": flow_id, "submit_token": token, "nodes": { "code": code } }),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "enroll confirm: {done}");
+    assert_eq!(status, StatusCode::OK, "enroll confirm: {shown}");
+    // Issue #311: the confirmation activates the factor and holds on the SHOW ONCE recovery codes
+    // interstitial, which carries the freshly minted codes; the login completes on the
+    // acknowledgment. (Before #311 the confirmation completed straight to a session and the codes
+    // were discarded in flow.) The exhaustive show once / not persisted / not logged properties
+    // live in flow_mfa_recovery_codes; here we pin only that the native JSON client sees the codes
+    // and can finish.
+    assert_eq!(
+        shown["flow"]["state"], "mfa_recovery_codes",
+        "the enrollment holds on the show once interstitial: {shown}"
+    );
+    assert_eq!(
+        displayed_recovery_codes(&shown).len(),
+        10,
+        "the native JSON client receives the minted recovery codes: {shown}"
+    );
+    let token = shown["submit_token"].as_str().expect("token").to_owned();
+
+    let (status, headers, done) = post_json(
+        &harness,
+        &submit_path(&harness, "login"),
+        &json!({
+            "id": flow_id,
+            "submit_token": token,
+            "nodes": { "recovery_codes_acknowledged": true },
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "recovery codes ack: {done}");
     assert_eq!(
         done["state"], "completed",
-        "enrollment completes the login: {done}"
+        "acknowledging the recovery codes completes the login: {done}"
     );
     let set_cookie = headers
         .get(header::SET_COOKIE)
@@ -667,6 +695,26 @@ async fn latest_session_methods(harness: &Harness, subject: &str) -> String {
     .await
     .expect("session row")
     .get("auth_methods")
+}
+
+/// The display only recovery code values a show once interstitial render carries (issue #311).
+fn displayed_recovery_codes(shown: &Value) -> Vec<String> {
+    shown["flow"]["ui"]["nodes"]
+        .as_array()
+        .expect("nodes")
+        .iter()
+        .filter(|node| {
+            node["attributes"]["name"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("recovery_code_"))
+        })
+        .map(|node| {
+            node["attributes"]["value"]
+                .as_str()
+                .expect("a displayed recovery code")
+                .to_owned()
+        })
+        .collect()
 }
 
 /// Extract the Base32 `secret` bytes from an `otpauth://` provisioning URI.

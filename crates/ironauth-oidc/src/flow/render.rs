@@ -313,6 +313,9 @@ fn flow_title(flow: &Flow) -> message::MessageId {
         }
         FlowStateTag::MfaChallenge => message::MFA_CHALLENGE_TITLE,
         FlowStateTag::MfaEnroll => message::MFA_ENROLL_TITLE,
+        // The show once recovery codes interstitial (issue #311) heads its own page: the user is
+        // being asked to save something, not to enter a code.
+        FlowStateTag::MfaRecoveryCodes => message::MFA_RECOVERY_CODES_TITLE,
         FlowStateTag::RecoveryStart | FlowStateTag::RecoveryAck => message::RECOVERY_TITLE,
         FlowStateTag::FederationStart => message::FEDERATION_TITLE,
         FlowStateTag::ConsentPrompt => message::CONSENT_TITLE,
@@ -593,6 +596,7 @@ mod tests {
             (FlowStateTag::RegistrationAck, Journey::Registration),
             (FlowStateTag::MfaChallenge, Journey::Login),
             (FlowStateTag::MfaEnroll, Journey::Login),
+            (FlowStateTag::MfaRecoveryCodes, Journey::Login),
             (FlowStateTag::RecoveryStart, Journey::Recovery),
             (FlowStateTag::RecoveryAck, Journey::Recovery),
             (FlowStateTag::FederationStart, Journey::Federation),

@@ -39,6 +39,12 @@ use super::message::Message;
 /// EXISTING [`NodeAttributes::Text`] and [`NodeAttributes::Input`] shapes with NO new field on
 /// any existing serialized struct (unlike the #87 `constraints` addition, which is what
 /// warranted the bump to 2). The golden snapshot gate covers the new journey's goldens.
+///
+/// NOT bumped for issue #311 (the show once recovery codes on a mid login TOTP enrollment)
+/// either, for the same reason: it adds one [`FlowStateTag::MfaRecoveryCodes`] enum variant and
+/// new message ids, renders through the EXISTING [`NodeAttributes::Text`] and
+/// [`NodeAttributes::Input`] shapes in the EXISTING [`NodeGroup::RecoveryCode`] group, and adds
+/// NO field to any serialized struct. The golden corpus gains the new state's goldens.
 pub const CONTRACT_VERSION: u32 = 2;
 
 /// The journey a flow drives (issue #84). One object renders every journey; there is no
@@ -127,14 +133,15 @@ impl Journey {
     pub fn plan(self) -> &'static [FlowStateTag] {
         use FlowStateTag::{
             Completed, ConsentPrompt, FederationStart, IdentifierPassword, MfaChallenge, MfaEnroll,
-            OrgPicker, ProgressiveProfiling, RecoveryAck, RecoveryStart, RegistrationAck,
-            RegistrationDetails,
+            MfaRecoveryCodes, OrgPicker, ProgressiveProfiling, RecoveryAck, RecoveryStart,
+            RegistrationAck, RegistrationDetails,
         };
         match self {
             Journey::Login => &[
                 IdentifierPassword,
                 MfaChallenge,
                 MfaEnroll,
+                MfaRecoveryCodes,
                 ProgressiveProfiling,
                 OrgPicker,
                 Completed,
@@ -198,6 +205,19 @@ pub enum FlowStateTag {
     MfaChallenge,
     /// A second factor enrollment is required.
     MfaEnroll,
+    /// The SHOW ONCE recovery codes an in flow TOTP enrollment just minted (issue #311): the
+    /// interstitial the enroll step renders IMMEDIATELY after a valid confirmation code activated
+    /// the factor, carrying the freshly minted one time recovery codes as display only nodes plus
+    /// the acknowledgment the user gives before the login completes. It is a RENDER OVERRIDE on the
+    /// enroll step (see `render_override_states`), not a step of its own: the flow stays OPEN and no
+    /// session is minted until the acknowledgment arrives.
+    ///
+    /// SHOW ONCE is STRUCTURAL, not a promise. The codes live only in the transient mint result of
+    /// the ONE `flow_enroll_verify` call that activated the factor; nothing writes them to the flow
+    /// row, so a re-render, a replay, or a resumed flow on this state has no source to render them
+    /// from and renders the acknowledgment ALONE (the store keeps only their Argon2 hashes, and the
+    /// account surface is where a user re-mints a set).
+    MfaRecoveryCodes,
     /// A progressive profiling step (issue #87): a subsequent login collects the client form's
     /// later-login signup fields as a HELD login step, injected where a successful primary (plus
     /// any second factor) login would otherwise mint the session. The step is always SKIPPABLE

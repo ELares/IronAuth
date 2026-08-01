@@ -868,6 +868,19 @@ async fn adversarial_user_code_brute_force_is_bounded_by_rate_limit() {
 async fn no_plaintext_device_or_user_code_in_logs() {
     // The acceptance CI check: capture the tracing output of a full device flow and
     // assert neither the device code nor the user code ever appears in plaintext.
+    //
+    // The capture is installed GLOBALLY, and that is load bearing rather than incidental.
+    // `tracing::subscriber::set_default` installs a THREAD LOCAL subscriber, while `tracing`
+    // caches each callsite's `Interest` PROCESS WIDE the first time it is evaluated. The other
+    // twenty-one tests in this binary run concurrently and drive the SAME device code issuing
+    // path, so one of them reaches a callsite first with no subscriber on its thread, the
+    // callsite caches `Interest::never`, and it is silenced for the rest of the process even
+    // after this test installs its capture. Measured with a real
+    // `tracing::info!(device_code = %device_code, ..)` planted at the issue site in
+    // `src/device.rs`: with `set_default` this test PASSED with the whole binary running and
+    // FAILED when run alone. A secret scanner that quietly stops looking is worse than none.
+    // `set_global_default` applies to every thread AND rebuilds the interest cache when it
+    // registers, so every event emitted after it lands in the buffer.
     let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
     let subscriber = tracing_subscriber::fmt()
         .with_writer(BufferWriter(Arc::clone(&buffer)))
@@ -875,7 +888,8 @@ async fn no_plaintext_device_or_user_code_in_logs() {
         .with_ansi(false)
         .without_time()
         .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
+    tracing::subscriber::set_global_default(subscriber)
+        .expect("this is the only test in this binary that installs a subscriber");
 
     let harness = Harness::start().await;
     let client = *harness.client_id();
@@ -897,13 +911,25 @@ async fn no_plaintext_device_or_user_code_in_logs() {
     let (status, _b) = poll(&harness, &device_code, &client_str).await;
     assert_eq!(status, StatusCode::OK);
 
-    // A marker so the assertion is not vacuous (the capturing subscriber is active).
+    // Markers so the assertions below are not vacuous, in BOTH of the ways this capture can go
+    // blind. The first is emitted from THIS thread; the second from ANOTHER, because the work the
+    // endpoints do is not guaranteed to stay on the test thread and a thread local capture would
+    // silently miss whatever ran off it.
     tracing::info!(target: "device_test", "device flow complete");
+    std::thread::spawn(|| {
+        tracing::info!(target: "device_test", "emitted from another thread");
+    })
+    .join()
+    .expect("the marker thread joins");
 
     let logs = String::from_utf8(buffer.lock().unwrap().clone()).expect("utf8 logs");
     assert!(
         logs.contains("device flow complete"),
-        "the capturing subscriber is active"
+        "the capturing subscriber is active on this thread"
+    );
+    assert!(
+        logs.contains("emitted from another thread"),
+        "the capturing subscriber is active on EVERY thread"
     );
     assert!(
         !logs.contains(&device_code),
