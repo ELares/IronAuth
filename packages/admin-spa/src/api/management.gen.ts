@@ -3981,13 +3981,18 @@ export interface components {
         /**
          * @description One recorded policy decision trace (issue #91).
          *
-         *     Every field is a bounded, non secret datum the store record already holds: `policy`
-         *     and `outcome` are closed sets, `subject` is an internal usr_ handle (a blind
-         *     reference, never raw PII), `reason` is a bounded hint, and `decision_inputs` is the
-         *     STRUCTURALLY REDACTED safe field projection (the acr floor and achieved acr, the auth
-         *     age, the risk signal names and levels, the connector slug and the mapped trait count),
-         *     serialized as a JSON string. There is deliberately NO field capable of holding a claim
-         *     value, a token, or a secret: those are unrepresentable in the record this view carries.
+         *     Every field is one the store record already holds and this view never widens: `policy`
+         *     and `outcome` are closed sets, `subject` is MEANT to be an internal usr_ handle (a
+         *     blind reference, never raw PII), `reason` a bounded hint, and `decision_inputs` the
+         *     allowlisted safe field projection (the acr floor and achieved acr, the auth age, the
+         *     risk signal names and levels, the connector slug and the mapped trait count),
+         *     serialized as a JSON string.
+         *
+         *     The projection is what redacts: a raw claim set or a token has no field to be carried
+         *     in, so it cannot reach here without the projection enum being widened first. It does
+         *     NOT follow that a secret is unrepresentable, which this doc used to say and which is
+         *     false (issue #423): `subject`, `reason` and most of the projection's fields are
+         *     free-form strings, and this view serves whatever the recorder put in them.
          */
         PolicyTraceView: {
             /**
