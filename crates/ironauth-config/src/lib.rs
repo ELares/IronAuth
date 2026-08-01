@@ -1450,6 +1450,40 @@ pub struct OidcConfig {
     /// (issue #29) may override this per audience.
     pub access_token_ttl_secs: u64,
 
+    /// ID-token lifetime in seconds. Must be at least 1 and at most
+    /// `OIDC_MAX_LIFETIME_SECS`.
+    ///
+    /// INDEPENDENT of `access_token_ttl_secs`, which it used to silently inherit
+    /// (issue #192). The two tokens answer different questions: an access token is
+    /// a bearer credential a resource server accepts for as long as it lives, while
+    /// an ID token is an authentication receipt the client consumes once, at login,
+    /// to learn who signed in. Tying the receipt's lifetime to the credential's
+    /// meant that shortening the credential silently shortened the receipt, and
+    /// lengthening the credential silently handed out longer-lived identity
+    /// assertions into the front channel, where an ID token can leak through a
+    /// referrer, a proxy log, or browser history.
+    ///
+    /// The default (300) is the value the ID token effectively had before the split,
+    /// so a deployment that never tuned `access_token_ttl_secs` sees ID tokens of
+    /// exactly the lifetime it saw before. Both directions of a tuned access TTL
+    /// change, and the two are NOT symmetric:
+    ///
+    /// * A deployment that RAISED `access_token_ttl_secs` above 300 gets a SHORTER ID
+    ///   token than before. That is the intended correction, in the safe direction.
+    /// * A deployment that LOWERED `access_token_ttl_secs` below 300, which is the
+    ///   standard hardening posture, gets a LONGER ID token than before: at
+    ///   `access_token_ttl_secs = 60` the ID token used to live 60 seconds and now
+    ///   lives 300. That is the unsafe direction, on the front channel, and it is the
+    ///   price of a flat default. A flat default is still the right call, because the
+    ///   alternative (an unset value falling back to the access TTL) writes the
+    ///   coupling into the documented contract and keeps it alive by default forever.
+    ///   So the case is surfaced instead of hidden: `id_token_ttl_secs` exceeding
+    ///   `access_token_ttl_secs` raises an operator warning at load.
+    ///
+    /// The blast radius of both is bounded because `enabled` is off by default and
+    /// this split is a gate that lands BEFORE the first real enablement.
+    pub id_token_ttl_secs: u64,
+
     /// The access-token format this environment mints when no resource server is
     /// targeted (issue #29). The spec-conform default (`at_jwt`) mints a
     /// self-contained RFC 9068 signed JWT whose audience is the client id, so
@@ -2346,6 +2380,7 @@ impl Default for OidcConfig {
             enabled: false,
             authorization_code_ttl_secs: 60,
             access_token_ttl_secs: 300,
+            id_token_ttl_secs: 300,
             default_access_token_format: TokenFormat::AtJwt,
             reuse_grace_secs: 10,
             session_ttl_secs: 3600,
@@ -4031,6 +4066,23 @@ pub enum Warning {
     /// an operator who genuinely wants the two toggles independent is never blocked; it just
     /// surfaces that the intended cutover will NOT take effect until the flow engine is also on.
     HostedPagesEnabledWithoutFlows,
+    /// `oidc.id_token_ttl_secs` is LONGER than `oidc.access_token_ttl_secs` (issue
+    /// #192). The two used to be one number, and the ID token's default is now a flat
+    /// 300 rather than an inheritance, so a deployment that lowered the access TTL as
+    /// a hardening measure and left the ID token alone silently lengthened the ID
+    /// token: at `access_token_ttl_secs = 60` it goes from 60 seconds to 300. The ID
+    /// token is the one that travels the FRONT channel, where a referrer, a proxy log,
+    /// or browser history can leak it, so the longer of the two lifetimes sitting on
+    /// the more exposed token is worth saying out loud. Advisory, never a boot error:
+    /// a longer receipt than credential is a legitimate choice (a client that consumes
+    /// the ID token well after the access token has expired), just rarely the intended
+    /// one. Never fires at the shipped defaults, which are equal.
+    IdTokenOutlivesAccessToken {
+        /// The configured `oidc.id_token_ttl_secs`.
+        id_token_ttl_secs: u64,
+        /// The configured `oidc.access_token_ttl_secs` it exceeds.
+        access_token_ttl_secs: u64,
+    },
 }
 
 impl fmt::Display for Warning {
@@ -4065,6 +4117,19 @@ impl fmt::Display for Warning {
                  through the flow engine, so the cutover is inert and the /authorize interaction \
                  redirects keep targeting the bootstrap login and registration pages. Set \
                  flows.enabled = true to make the hosted pages the live browser surface"
+            ),
+            Warning::IdTokenOutlivesAccessToken {
+                id_token_ttl_secs,
+                access_token_ttl_secs,
+            } => write!(
+                f,
+                "oidc.id_token_ttl_secs ({id_token_ttl_secs}) is longer than \
+                 oidc.access_token_ttl_secs ({access_token_ttl_secs}); the ID token \
+                 defaults to a flat 300 and no longer inherits the access-token lifetime \
+                 (issue #192), so lowering only the access token leaves the FRONT-channel \
+                 ID token, which a referrer, a proxy log, or browser history can leak, \
+                 living longer than the credential it accompanies. Set \
+                 oidc.id_token_ttl_secs explicitly if that is not what you meant"
             ),
         }
     }
@@ -4150,6 +4215,20 @@ impl Config {
         if self.hosted_pages.enabled && !self.flows.enabled {
             warnings.push(Warning::HostedPagesEnabledWithoutFlows);
         }
+        // The ID token's lifetime is its own setting now (issue #192) with a FLAT
+        // default of 300, so the coupling can no longer hide a change in either
+        // direction. Raising the access TTL shortens the ID token, which is safe and
+        // silent; LOWERING it lengthens the ID token, which is not, and is exactly what
+        // a deployment hardening its access tokens does. The comparison alone is the
+        // condition: at the shipped defaults the two are equal, so this never fires
+        // unless an operator tuned at least one of them into the shape where the
+        // front-channel token outlives the credential.
+        if self.oidc.id_token_ttl_secs > self.oidc.access_token_ttl_secs {
+            warnings.push(Warning::IdTokenOutlivesAccessToken {
+                id_token_ttl_secs: self.oidc.id_token_ttl_secs,
+                access_token_ttl_secs: self.oidc.access_token_ttl_secs,
+            });
+        }
         warnings
     }
 
@@ -4196,6 +4275,7 @@ impl Config {
             "oidc.access_token_ttl_secs",
             self.oidc.access_token_ttl_secs,
         )?;
+        check_oidc_lifetime("oidc.id_token_ttl_secs", self.oidc.id_token_ttl_secs)?;
         // The reuse grace window differs from the lifetimes: 0 is valid (it means
         // treat every reuse as genuine), so only the upper bound is enforced.
         if self.oidc.reuse_grace_secs > OIDC_MAX_LIFETIME_SECS {
@@ -7418,6 +7498,67 @@ mod tests {
         );
     }
 
+    /// The lowering case the flat `id_token_ttl_secs` default creates, and the ONLY
+    /// place it is visible to an operator (issue #192).
+    ///
+    /// Splitting the ID token's lifetime out of the access token's means the ID token
+    /// no longer follows it DOWN. A deployment that lowers `access_token_ttl_secs` as a
+    /// hardening measure and leaves the ID token alone has just lengthened the
+    /// front-channel token, in silence, by editing a different key. The assertion here
+    /// is over the LOWERING direction specifically, because raising is the safe one and
+    /// a test written at the equal defaults would pass whatever the rule was.
+    #[test]
+    fn a_lowered_access_ttl_warns_that_the_id_token_now_outlives_it() {
+        // The hardening posture: access token cut to a minute, ID token untouched, so it
+        // takes the flat 300 default and is now FIVE TIMES the access token.
+        let lowered = Config::from_toml_str("[oidc]\naccess_token_ttl_secs = 60\n", "<inline>")
+            .expect("a lowered access ttl loads (advisory, not a boot error)");
+        assert_eq!(
+            lowered.config.oidc.id_token_ttl_secs, 300,
+            "the flat default"
+        );
+        assert!(
+            lowered.warnings.iter().any(|w| matches!(
+                w,
+                Warning::IdTokenOutlivesAccessToken {
+                    id_token_ttl_secs: 300,
+                    access_token_ttl_secs: 60,
+                }
+            )),
+            "lowering only the access ttl warns: {:?}",
+            lowered.warnings
+        );
+        // The operator can read what to do from the message itself.
+        let message = lowered.warnings[0].to_string();
+        assert!(
+            message.contains("oidc.id_token_ttl_secs") && message.contains("300"),
+            "{message}"
+        );
+
+        // Setting the ID token DOWN with it is the posture that was meant, and it is
+        // silent.
+        let both = Config::from_toml_str(
+            "[oidc]\naccess_token_ttl_secs = 60\nid_token_ttl_secs = 60\n",
+            "<inline>",
+        )
+        .expect("valid");
+        assert!(both.warnings.is_empty(), "{:?}", both.warnings);
+
+        // RAISING the access ttl is the safe direction (the ID token gets shorter), so
+        // it does not warn; neither do the shipped defaults, which are equal.
+        for source in ["[oidc]\naccess_token_ttl_secs = 900\n", ""] {
+            let loaded = Config::from_toml_str(source, "<inline>").expect("valid");
+            assert!(
+                !loaded
+                    .warnings
+                    .iter()
+                    .any(|w| matches!(w, Warning::IdTokenOutlivesAccessToken { .. })),
+                "{source:?} must not warn: {:?}",
+                loaded.warnings
+            );
+        }
+    }
+
     #[test]
     fn oidc_section_defaults_and_rejects_bad_lifetimes_and_unknown_keys() {
         // Defaults: not mounted, 60s code, 300s access token, 10s reuse grace,
@@ -7426,6 +7567,9 @@ mod tests {
         assert!(!config.oidc.enabled);
         assert_eq!(config.oidc.authorization_code_ttl_secs, 60);
         assert_eq!(config.oidc.access_token_ttl_secs, 300);
+        // The ID-token lifetime is its OWN setting (issue #192), defaulting to the
+        // value it effectively had when it was welded to the access token's.
+        assert_eq!(config.oidc.id_token_ttl_secs, 300);
         // The environment default access-token format is the spec-conform at+jwt
         // (issue #29), so UserInfo and offline verification keep working.
         assert_eq!(config.oidc.default_access_token_format, TokenFormat::AtJwt);

@@ -1,0 +1,25 @@
+error[E0061]: this function takes 5 arguments but 4 arguments were supplied
+  --> tests/compile-fail/policy_requires_expected_typ.rs:17:13
+   |
+17 |       let _ = ironauth_jose::VerificationPolicy::new(
+   |  _____________^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^-
+18 | |         vec![ironauth_jose::JwsAlgorithm::EdDsa],
+19 | |         vec![key],
+20 | |         "https://issuer.example.test",
+21 | |         "client-abc",
+22 | |     );
+   | |_____- argument #5 of type `ExpectedTyp` is missing
+   |
+note: associated function defined here
+  --> src/policy.rs
+   |
+   |     pub fn new(
+   |            ^^^
+help: provide the argument
+   |
+17 |     let _ = ironauth_jose::VerificationPolicy::new(
+...
+21 |         "client-abc",
+22 ~         /* ExpectedTyp */,
+23 ~     );
+   |

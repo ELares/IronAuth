@@ -23,6 +23,16 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use ironauth_env::ManualClock;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 
+/// The media-type expectation the generic suites verify under.
+///
+/// The adversarial, CVE-corpus, claim-edge, property, and positive vectors are
+/// about the algorithm allowlist, key selection, structure, and claim rules, and
+/// their handcrafted headers carry no `typ` at all. Saying `ForeignIssuer` states
+/// that the media type is not what those vectors are pinning down. The media-type
+/// separation has its own suite, `token_confusion.rs`, where `typ` IS the subject.
+pub const TYP_NOT_UNDER_TEST: ironauth_jose::ExpectedTyp =
+    ironauth_jose::ExpectedTyp::ForeignIssuer;
+
 /// The expected issuer used by every vector.
 pub const ISS: &str = "https://issuer.example.test";
 /// The expected audience used by every vector.

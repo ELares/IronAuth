@@ -124,6 +124,12 @@ pub enum RejectReason {
     /// The header carried a `kid` that names no trusted key. A `kid` may only
     /// select among already-trusted keys; it never introduces one.
     UnknownKid,
+    /// The `typ` header did not name the token profile this verification was for,
+    /// or was absent where a profile was required. This is what stops an ID token
+    /// from being spent where an access token is expected (RFC 9068 section 4) and,
+    /// more generally, any two IronAuth tokens that share an issuer, a subject, an
+    /// audience, and a signing key from standing in for each other.
+    TypMismatch,
     /// The claimed algorithm's key type did not match any trusted key eligible
     /// for this verification (for example `RS256` presented against an EC key).
     KeyTypeMismatch,
@@ -170,6 +176,7 @@ impl RejectReason {
             RejectReason::CompressionPresent => "compression_present",
             RejectReason::UnsupportedHeaderParam => "unsupported_header_param",
             RejectReason::Pbes2Present => "pbes2_present",
+            RejectReason::TypMismatch => "typ_mismatch",
             RejectReason::UnknownKid => "unknown_kid",
             RejectReason::KeyTypeMismatch => "key_type_mismatch",
             RejectReason::SignatureInvalid => "signature_invalid",

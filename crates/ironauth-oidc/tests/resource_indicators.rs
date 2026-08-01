@@ -215,7 +215,8 @@ async fn multi_resource_authorization_is_narrowed_at_the_token_endpoint() {
         .as_str()
         .expect("access_token")
         .to_owned();
-    let verified = verify(&access, &harness.policy(RS_A), &verify_clock()).expect("verifies for A");
+    let verified = verify(&access, &harness.access_token_policy(RS_A), &verify_clock())
+        .expect("verifies for A");
     // A single resource yields a single-STRING aud (byte-identical to the pre-#28
     // wire form), and client_id stays the OAuth client.
     let aud = verified.claims().get("aud").expect("aud");
@@ -239,8 +240,9 @@ async fn multi_resource_authorization_is_narrowed_at_the_token_endpoint() {
         .expect("access_token")
         .to_owned();
     // Verifies against EITHER member (array membership), and the aud is an array.
-    let verified = verify(&access, &harness.policy(RS_A), &verify_clock()).expect("A member");
-    verify(&access, &harness.policy(RS_B), &verify_clock()).expect("B member");
+    let verified =
+        verify(&access, &harness.access_token_policy(RS_A), &verify_clock()).expect("A member");
+    verify(&access, &harness.access_token_policy(RS_B), &verify_clock()).expect("B member");
     let aud = verified.claims().get("aud").expect("aud");
     assert!(aud.is_array(), "two resources is an array aud: {aud}");
     let members = aud_members(aud);
@@ -269,15 +271,20 @@ async fn cross_resource_replay_is_rejected_by_audience_enforcement() {
         .to_owned();
 
     // The token minted for A is valid AT A.
-    verify(&access, &harness.policy(RS_A), &verify_clock()).expect("valid at A");
+    verify(&access, &harness.access_token_policy(RS_A), &verify_clock()).expect("valid at A");
     // The SAME token FAILS audience validation at B (confused-deputy / replay defense).
     assert!(
-        verify(&access, &harness.policy(RS_B), &verify_clock()).is_err(),
+        verify(&access, &harness.access_token_policy(RS_B), &verify_clock()).is_err(),
         "a token minted for resource A must not be accepted at resource B"
     );
     // It is also not a client-audience (UserInfo) token: it is resource-scoped.
     assert!(
-        verify(&access, &harness.policy(&client), &verify_clock()).is_err(),
+        verify(
+            &access,
+            &harness.access_token_policy(&client),
+            &verify_clock()
+        )
+        .is_err(),
         "a resource-scoped token is not valid at the client audience"
     );
 }
@@ -391,9 +398,9 @@ async fn refresh_downscopes_to_a_subset_but_expansion_is_rejected() {
     assert_eq!(status, StatusCode::OK, "refresh downscope: {body}");
     let refreshed = json(&body);
     let access = refreshed["access_token"].as_str().expect("access_token");
-    verify(access, &harness.policy(RS_A), &verify_clock()).expect("scoped to A");
+    verify(access, &harness.access_token_policy(RS_A), &verify_clock()).expect("scoped to A");
     assert!(
-        verify(access, &harness.policy(RS_B), &verify_clock()).is_err(),
+        verify(access, &harness.access_token_policy(RS_B), &verify_clock()).is_err(),
         "the refreshed token was downscoped away from B"
     );
     // A public client rotates on every refresh, so use the successor for the next call.
@@ -540,8 +547,12 @@ async fn no_resource_yields_the_client_audience_by_default() {
         .as_str()
         .expect("access_token")
         .to_owned();
-    let verified =
-        verify(&access, &harness.policy(&client), &verify_clock()).expect("client audience");
+    let verified = verify(
+        &access,
+        &harness.access_token_policy(&client),
+        &verify_clock(),
+    )
+    .expect("client audience");
     assert_eq!(
         verified.claims().get("aud").and_then(Value::as_str),
         Some(client.as_str()),
@@ -654,7 +665,7 @@ async fn a_rejected_expansion_refresh_does_not_burn_the_token() {
     );
     let refreshed = json(&body);
     let access = refreshed["access_token"].as_str().expect("access_token");
-    verify(access, &harness.policy(RS_A), &verify_clock()).expect("scoped to A");
+    verify(access, &harness.access_token_policy(RS_A), &verify_clock()).expect("scoped to A");
 }
 
 /// Gap-case (d): targeting resource servers of DIFFERENT token formats in one token
@@ -701,7 +712,8 @@ async fn a_duplicate_resource_dedups_and_a_case_variant_is_invalid_target() {
         .as_str()
         .expect("access_token")
         .to_owned();
-    let verified = verify(&access, &harness.policy(RS_A), &verify_clock()).expect("verifies for A");
+    let verified = verify(&access, &harness.access_token_policy(RS_A), &verify_clock())
+        .expect("verifies for A");
     let aud = verified.claims().get("aud").expect("aud");
     assert!(
         aud.is_string(),
@@ -803,8 +815,8 @@ async fn par_validates_resources_at_push_and_round_trips_a_valid_one() {
         .as_str()
         .expect("access_token")
         .to_owned();
-    let verified =
-        verify(&access, &harness.policy(RS_A), &verify_clock()).expect("scoped to the pushed RS");
+    let verified = verify(&access, &harness.access_token_policy(RS_A), &verify_clock())
+        .expect("scoped to the pushed RS");
     assert_eq!(
         verified.claims().get("aud").and_then(Value::as_str),
         Some(RS_A),

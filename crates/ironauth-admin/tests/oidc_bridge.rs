@@ -37,7 +37,9 @@ use http_body_util::BodyExt;
 use ironauth_admin::{AdminOidcBridge, AdminState, management_router};
 use ironauth_config::{AdminConfig, Secret, SecretString};
 use ironauth_env::Env;
-use ironauth_jose::{EmissionOptions, KeySet, SigningKey, SigningPolicy, sign_jws_with_policy};
+use ironauth_jose::{
+    EmissionOptions, KeySet, SigningKey, SigningPolicy, TokenTyp, sign_jws_with_policy,
+};
 use ironauth_oidc::{IssuerEntry, IssuerRegistry, JwksCacheWindow, PairwiseSalt};
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{EnvironmentId, EnvironmentType, GuardrailSet, Scope, TenantId};
@@ -169,7 +171,7 @@ impl BridgeHarness {
             entry.policy(),
             signer,
             &bytes,
-            &EmissionOptions::new().with_typ(typ),
+            &EmissionOptions::new().with_typ(typ), // invariant-allow: typ-via-declaration -- the caller-chosen media type IS this helper's purpose, so the wrong-typ vector can exist
         )
         .expect("sign at+jwt")
     }
@@ -383,7 +385,7 @@ async fn a_token_signed_by_a_foreign_key_is_rejected() {
         &SigningPolicy::eddsa_default(),
         &foreign,
         &bytes,
-        &EmissionOptions::new().with_typ("at+jwt"),
+        &EmissionOptions::new().with_token_typ(TokenTyp::AccessToken),
     )
     .expect("sign with foreign key");
 
@@ -538,7 +540,7 @@ async fn the_bridge_rejects_everything_when_disarmed() {
         entry.policy(),
         signer,
         &serde_json::to_vec(&claims).expect("ser"),
-        &EmissionOptions::new().with_typ("at+jwt"),
+        &EmissionOptions::new().with_token_typ(TokenTyp::AccessToken),
     )
     .expect("sign");
 

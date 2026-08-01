@@ -419,7 +419,7 @@ fn id_token(key: &SigningKey, nonce: &str, sub: &str, extra: Value) -> String {
         }
     }
     let payload = serde_json::to_vec(&claims).expect("payload");
-    sign_jws(key, &payload, &EmissionOptions::new().with_typ("JWT")).expect("sign")
+    sign_jws(key, &payload, &EmissionOptions::new().with_typ("JWT")).expect("sign") // invariant-allow: typ-via-declaration -- a simulated UPSTREAM issuer's ID token; its media type is that peer's, not an IronAuth profile
 }
 
 fn token_body(id_token: &str) -> String {

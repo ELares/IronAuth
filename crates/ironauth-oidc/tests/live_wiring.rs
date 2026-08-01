@@ -40,7 +40,7 @@ use common::{
     location_param,
 };
 use ironauth_config::OidcConfig;
-use ironauth_jose::{JwsAlgorithm, TrustedKey, VerificationPolicy, verify};
+use ironauth_jose::{ExpectedTyp, JwsAlgorithm, TokenTyp, TrustedKey, VerificationPolicy, verify};
 use ironauth_store::Scope;
 
 /// Drive the register-less bootstrap flow (authenticated, consenting subject ->
@@ -206,6 +206,7 @@ async fn live_registry_signs_with_a_stored_key_and_publishes_it_for_verification
         trusted.clone(),
         harness.issuer().to_owned(),
         client_id.clone(),
+        ExpectedTyp::Required(TokenTyp::AccessToken),
     )
     .expect("access policy builds");
     let verified = verify(&access_token, &access_policy, &common::verify_clock())
@@ -218,6 +219,7 @@ async fn live_registry_signs_with_a_stored_key_and_publishes_it_for_verification
         trusted,
         harness.issuer().to_owned(),
         client_id.clone(),
+        ExpectedTyp::Required(TokenTyp::IdToken),
     )
     .expect("id policy builds");
     let verified_id = verify(&id_token, &id_policy, &common::verify_clock())
@@ -336,6 +338,7 @@ async fn an_es256_only_environment_never_emits_a_non_es256_token() {
         vec![trusted],
         harness.issuer().to_owned(),
         client_id,
+        ExpectedTyp::Required(TokenTyp::AccessToken),
     )
     .expect("policy builds");
     let verified = verify(&access_token, &policy, &common::verify_clock())

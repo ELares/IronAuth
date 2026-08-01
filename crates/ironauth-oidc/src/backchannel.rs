@@ -36,7 +36,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use ironauth_env::Env;
-use ironauth_jose::{EmissionOptions, sign_jws_with_policy};
+use ironauth_jose::{EmissionOptions, TokenTyp, sign_jws_with_policy};
 use ironauth_store::{Scope, Store};
 use serde_json::json;
 
@@ -47,7 +47,11 @@ use crate::issuer::IssuerRegistry;
 pub const BACKCHANNEL_LOGOUT_EVENT: &str = "http://schemas.openid.net/event/backchannel-logout";
 
 /// The Logout Token header `typ` (OIDC Back-Channel Logout 2.4).
-pub const LOGOUT_TOKEN_TYP: &str = "logout+jwt";
+///
+/// Read from the ONE ironauth-jose declaration rather than spelled again here, so
+/// this constant and the media type the mint actually stamps cannot drift apart:
+/// they are the same bytes, not two literals that agree today.
+pub const LOGOUT_TOKEN_TYP: &str = TokenTyp::LogoutToken.media_type();
 
 /// The Logout Token lifetime: short, because it is a one-shot notification the RP acts on
 /// immediately (and dedups on `jti`), never a bearer credential it stores.
@@ -429,7 +433,7 @@ impl<S: LogoutSender> BackChannelLogoutWorker<S> {
             policy,
             signer,
             &payload,
-            &EmissionOptions::new().with_typ(LOGOUT_TOKEN_TYP),
+            &EmissionOptions::new().with_token_typ(TokenTyp::LogoutToken),
         )
         .map_err(|_| SendFailure::Transport)
     }

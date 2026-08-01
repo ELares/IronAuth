@@ -34,7 +34,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use ironauth_jose::{
-    JwsAlgorithm, VerificationPolicy, VerifiedToken, trusted_keys_from_jwks, verify,
+    ExpectedTyp, JwsAlgorithm, VerificationPolicy, VerifiedToken, trusted_keys_from_jwks, verify,
 };
 use ironauth_store::{
     CorrelationId, RecoveryEntryPoint, RecoveryFlowId, RecoveryMethod, Scope, UserId,
@@ -543,8 +543,20 @@ pub(crate) async fn idv_callback(
         return callback_rejected();
     }
     let audience = state.issuer_for(&scope);
-    let Ok(policy) = VerificationPolicy::new(algorithms, keys, provider.iss.clone(), audience)
-    else {
+    // The callback assertion is the registered EXTERNAL provider's, minted under its
+    // own keys with no media type IronAuth can dictate, so `typ` is not the separator
+    // here (issue #192): the provider's registered JWKS plus its pinned `iss` and this
+    // environment's issuer as the `aud` are. As at the other operator-registered sites
+    // that is a CONFIGURATION property, not a structural one: a provider registered
+    // with this environment's own issuer and JWKS would let IronAuth's tokens reach the
+    // signature check with `typ` unread. No default configuration reaches here at all.
+    let Ok(policy) = VerificationPolicy::new(
+        algorithms,
+        keys,
+        provider.iss.clone(),
+        audience,
+        ExpectedTyp::ForeignIssuer,
+    ) else {
         return callback_rejected();
     };
     // THE ONE signature verification: allowlist-driven algorithm, key only from the registered

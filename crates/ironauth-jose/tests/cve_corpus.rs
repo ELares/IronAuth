@@ -22,6 +22,7 @@ fn ed25519_policy(signer: &common::Ed25519Signer) -> VerificationPolicy {
         vec![key],
         common::ISS,
         common::AUD,
+        common::TYP_NOT_UNDER_TEST,
     )
     .expect("valid policy")
 }
@@ -113,6 +114,7 @@ fn rs_hs_confusion_hmac_with_rsa_public_key() {
         vec![rsa_key],
         common::ISS,
         common::AUD,
+        common::TYP_NOT_UNDER_TEST,
     )
     .expect("valid policy");
     assert_rejected_with(&token, &policy, RejectReason::UnsupportedAlg);
@@ -139,6 +141,7 @@ fn alg_key_family_mismatch_is_rejected() {
         vec![ec_key],
         common::ISS,
         common::AUD,
+        common::TYP_NOT_UNDER_TEST,
     )
     .expect("valid policy");
     // RS256 token (a real RSA-signed one) but only an EC key is trusted.
@@ -163,6 +166,7 @@ fn supported_alg_outside_allowlist_is_rejected() {
         vec![rsa_key, ed_key],
         common::ISS,
         common::AUD,
+        common::TYP_NOT_UNDER_TEST,
     )
     .expect("valid policy");
     assert_rejected_with(vectors::RS256_TOKEN, &policy, RejectReason::AlgNotAllowed);
@@ -191,6 +195,7 @@ fn embedded_jwk_injection_is_rejected() {
         vec![trusted],
         common::ISS,
         common::AUD,
+        common::TYP_NOT_UNDER_TEST,
     )
     .expect("valid policy");
     assert_rejected_with(&token, &policy, RejectReason::EmbeddedKeyInjection);
@@ -328,6 +333,7 @@ fn oversized_token_is_rejected_before_work() {
         vec![key],
         common::ISS,
         common::AUD,
+        common::TYP_NOT_UNDER_TEST,
     )
     .expect("valid policy")
     .with_caps(VerificationCaps {

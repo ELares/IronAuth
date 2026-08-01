@@ -19,7 +19,7 @@
 use std::time::{Duration, SystemTime};
 
 use ironauth_env::ManualClock;
-use ironauth_jose::{JwsAlgorithm, TrustedKey, VerificationPolicy, verify};
+use ironauth_jose::{ExpectedTyp, JwsAlgorithm, TrustedKey, VerificationPolicy, verify};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -40,6 +40,10 @@ fuzz_target!(|data: &[u8]| {
         vec![key],
         "https://issuer.example.test",
         "client-abc",
+        // The fuzzer drives the parser and the guard order over arbitrary bytes; a
+        // media-type requirement would short-circuit most inputs at stage 4b and
+        // starve the stages beyond it, so the corpus keeps reaching them.
+        ExpectedTyp::ForeignIssuer,
     ) else {
         return;
     };

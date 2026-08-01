@@ -63,7 +63,9 @@ use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 use ironauth_config::DiagnosticVerbosity;
 use ironauth_env::Env;
-use ironauth_jose::{JwsAlgorithm, RejectReason, TrustedKey, VerificationPolicy, verify};
+use ironauth_jose::{
+    ExpectedTyp, JwsAlgorithm, RejectReason, TrustedKey, VerificationPolicy, verify,
+};
 use ironauth_store::{
     ClientAuthDiagnosticReason, ClientAuthRecord, ClientId, DiagnosticExpectation, JtiOutcome,
     NewClientAuthDiagnostic, Scope, StoreError,
@@ -975,11 +977,23 @@ fn verify_assertion_claims(
         return Err(AssertionReject::NoUsableKey);
     }
     for audience in audiences {
+        // A `private_key_jwt` client assertion, signed with the CLIENT's own registered
+        // key. RFC 7523 registers no media type for it, so `typ` cannot be the
+        // separator (issue #192); the client's registered JWKS, `iss = sub =
+        // client_id`, and this deployment's token endpoint as the `aud` are.
+        //
+        // Unusually for a `ForeignIssuer` site, that is STRUCTURAL rather than a
+        // property of the configuration: the expected issuer here is a `ClientId`, a
+        // prefix-tagged base-encoded identifier, and an IronAuth issuer is a URL, so no
+        // registration can ever make an IronAuth token satisfy this policy's `iss`. The
+        // federated sites, whose issuer and keys BOTH come from operator config, do not
+        // have that and say so.
         let Ok(policy) = VerificationPolicy::new(
             algorithms.to_vec(),
             keys.to_vec(),
             client_id,
             audience.clone(),
+            ExpectedTyp::ForeignIssuer,
         ) else {
             return Err(AssertionReject::NoUsableKey);
         };

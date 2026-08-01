@@ -414,9 +414,11 @@ async fn exchange(harness: &Harness, client_id: &str, code: &str) -> (Value, Val
         .as_str()
         .expect("a refresh token is issued for the code flow")
         .to_owned();
-    let policy = harness.policy(client_id);
-    let id = verify(id_token, &policy, &common::verify_clock()).expect("id token verifies");
-    let at = verify(access_token, &policy, &common::verify_clock()).expect("access token verifies");
+    let id_policy = harness.id_token_policy(client_id);
+    let access_policy = harness.access_token_policy(client_id);
+    let id = verify(id_token, &id_policy, &common::verify_clock()).expect("id token verifies");
+    let at = verify(access_token, &access_policy, &common::verify_clock())
+        .expect("access token verifies");
     (
         Value::Object(id.claims().raw().clone()),
         Value::Object(at.claims().raw().clone()),
@@ -445,7 +447,7 @@ async fn refresh(harness: &Harness, client_id: &str, refresh_token: &str) -> (Va
         .to_owned();
     let verified = verify(
         access_token,
-        &harness.policy(client_id),
+        &harness.access_token_policy(client_id),
         &common::verify_clock(),
     )
     .expect("refreshed access token verifies");
@@ -1239,7 +1241,7 @@ async fn the_client_credentials_grant_carries_no_roles_even_when_configured_to()
         .to_owned();
     let verified = verify(
         &access_token,
-        &harness.policy(&client_id),
+        &harness.access_token_policy(&client_id),
         &common::verify_clock(),
     )
     .expect("m2m access token verifies");

@@ -615,6 +615,13 @@ name = "token_formats"
 path = "tests/token_formats.rs"
 required-features = ["testing"]
 
+[[test]]
+# The live-endpoint media-type separation suite (issue #192): an access token or a
+# Logout Token presented where an ID token is expected, and back.
+name = "token_confusion"
+path = "tests/token_confusion.rs"
+required-features = ["testing"]
+
 # The JWT-assertion client-authentication suite (issue #25): the private_key_jwt
 # per-algorithm matrix (RS/ES/PS/EdDSA) with an ES512-rejected negative, the
 # iss/sub/aud/exp/jti and audience-policy rules, cross-node jti replay through the

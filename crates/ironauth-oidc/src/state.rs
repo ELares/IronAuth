@@ -30,8 +30,8 @@ use ironauth_config::{
 };
 use ironauth_env::Env;
 use ironauth_jose::{
-    DpopExpectations, JwsAlgorithm, SigningKey, TrustedKey, VerificationPolicy, VerifiedToken,
-    access_token_hash, validate_dpop_proof, verify,
+    DpopExpectations, ExpectedTyp, JwsAlgorithm, SigningKey, TokenTyp, TrustedKey,
+    VerificationPolicy, VerifiedToken, access_token_hash, validate_dpop_proof, verify,
 };
 use ironauth_quota::QuotaEnforcer;
 use ironauth_store::{
@@ -453,6 +453,10 @@ struct Inner {
     issuer_base: String,
     code_ttl: Duration,
     access_token_ttl: Duration,
+    // The ID-token lifetime, INDEPENDENT of the access token's (issue #192). A
+    // resource server can shorten the access token per audience; the ID token is
+    // never a resource-server credential, so it has exactly one lifetime.
+    id_token_ttl: Duration,
     // The access-token format this environment mints when no resource server is
     // targeted (issue #29). A registered resource server overrides it per audience.
     // The spec-conform default is `at_jwt`, which keeps UserInfo working.
@@ -759,6 +763,7 @@ impl OidcState {
                 issuer_base: issuer_base.into(),
                 code_ttl: Duration::from_secs(config.authorization_code_ttl_secs),
                 access_token_ttl: Duration::from_secs(config.access_token_ttl_secs),
+                id_token_ttl: Duration::from_secs(config.id_token_ttl_secs),
                 default_access_token_format: map_token_format(config.default_access_token_format),
                 reuse_grace: Duration::from_secs(config.reuse_grace_secs),
                 session_ttl: Duration::from_secs(config.session_ttl_secs),
@@ -2114,6 +2119,16 @@ impl OidcState {
         self.inner.access_token_ttl
     }
 
+    /// The configured ID-token lifetime (issue #192).
+    ///
+    /// Its own setting, not a view of [`OidcState::access_token_ttl`]: an ID token
+    /// is an authentication receipt consumed once at login, not a bearer credential
+    /// a resource server holds, so tuning one must not move the other.
+    #[must_use]
+    pub fn id_token_ttl(&self) -> Duration {
+        self.inner.id_token_ttl
+    }
+
     /// The environment's default access-token format (issue #29): the format used
     /// when no resource server is targeted. `at_jwt` by default.
     #[must_use]
@@ -3384,8 +3399,19 @@ impl OidcState {
             }
         }
         let issuer = self.issuer_for(scope);
-        let policy = VerificationPolicy::new(algorithms, trusted, issuer, audience.to_owned())
-            .map_err(|_| ())?;
+        // RFC 9068 section 4: a resource server MUST reject a JWT whose `typ` is not
+        // `at+jwt`. Without it, the ID token minted by the SAME exchange, under the
+        // SAME issuer, subject, audience, and key, verifies here identically, and an
+        // ID token leaks through the front channel (referrer, proxy log, history)
+        // where an access token does not (issue #192).
+        let policy = VerificationPolicy::new(
+            algorithms,
+            trusted,
+            issuer,
+            audience.to_owned(),
+            ExpectedTyp::Required(TokenTyp::AccessToken),
+        )
+        .map_err(|_| ())?;
         verify(token, &policy, self.inner.env.clock()).map_err(|_| ())
     }
 
@@ -3554,9 +3580,28 @@ impl OidcState {
             }
         }
         let issuer = self.issuer_for(scope);
-        let policy = VerificationPolicy::new(algorithms, trusted, issuer, audience.to_owned())
-            .map_err(|_| ())?
-            .allow_expired(true);
+        // An `id_token_hint` is an ID TOKEN, so the media type is required to be the
+        // ID token's (issue #192). Without it a LOGOUT TOKEN verified and ended a
+        // session: it carries `aud = client_id`, this environment's issuer, and the
+        // very `sid` the caller reads to choose a session, and IronAuth itself POSTs
+        // one to the RP, so an RP that had been sent one could replay it as a hint.
+        //
+        // An access token also verified here, and the honest account of it is that a
+        // SECOND guard stopped it rather than this one: `build_access_token_claims`
+        // emits no `sid`, and the caller degrades a `sid`-less hint to the
+        // confirmation page. The media type is the layer that does not depend on that
+        // remaining true, which is the whole reason it is worth having: an access
+        // token that one day carries a `sid` must not become a logout credential by
+        // accident. Nothing else is relaxed; `allow_expired` still touches only `exp`.
+        let policy = VerificationPolicy::new(
+            algorithms,
+            trusted,
+            issuer,
+            audience.to_owned(),
+            ExpectedTyp::Required(TokenTyp::IdToken),
+        )
+        .map_err(|_| ())?
+        .allow_expired(true);
         verify(token, &policy, self.inner.env.clock()).map_err(|_| ())
     }
 }
@@ -3586,6 +3631,7 @@ impl std::fmt::Debug for OidcState {
             .field("issuer_base", &self.inner.issuer_base)
             .field("code_ttl", &self.inner.code_ttl)
             .field("access_token_ttl", &self.inner.access_token_ttl)
+            .field("id_token_ttl", &self.inner.id_token_ttl)
             .field("reuse_grace", &self.inner.reuse_grace)
             .finish_non_exhaustive()
     }

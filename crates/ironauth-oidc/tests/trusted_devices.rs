@@ -208,8 +208,12 @@ async fn a_remembered_device_skips_the_second_factor_and_the_token_is_honest() {
         .as_str()
         .expect("id_token")
         .to_owned();
-    let verified =
-        verify(&id_token, &h.policy(&client), &common::verify_clock()).expect("verifies");
+    let verified = verify(
+        &id_token,
+        &h.id_token_policy(&client),
+        &common::verify_clock(),
+    )
+    .expect("verifies");
     let claims = Value::Object(verified.claims().raw().clone());
     assert_eq!(
         claims["acr"],

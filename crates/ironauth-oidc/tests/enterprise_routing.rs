@@ -472,7 +472,7 @@ fn id_token(key: &SigningKey, nonce: &str, sub: &str) -> String {
         "nonce": nonce,
     });
     let payload = serde_json::to_vec(&claims).expect("payload");
-    sign_jws(key, &payload, &EmissionOptions::new().with_typ("JWT")).expect("sign")
+    sign_jws(key, &payload, &EmissionOptions::new().with_typ("JWT")).expect("sign") // invariant-allow: typ-via-declaration -- a simulated UPSTREAM issuer's ID token; its media type is that peer's, not an IronAuth profile
 }
 
 fn token_response(id_token: &str) -> String {
@@ -1216,7 +1216,7 @@ fn id_token_at(key: &SigningKey, nonce: &str, sub: &str, auth_time: Option<i64>)
         claims["auth_time"] = serde_json::json!(auth_time);
     }
     let payload = serde_json::to_vec(&claims).expect("payload");
-    sign_jws(key, &payload, &EmissionOptions::new().with_typ("JWT")).expect("sign")
+    sign_jws(key, &payload, &EmissionOptions::new().with_typ("JWT")).expect("sign") // invariant-allow: typ-via-declaration -- a simulated UPSTREAM issuer's ID token; its media type is that peer's, not an IronAuth profile
 }
 
 /// Follow a federated `authorize_uri` to the upstream, mint an `id_token` (optionally with
@@ -1375,7 +1375,7 @@ async fn a_broker_mfa_overlay_forces_a_real_ceremony_and_the_token_amr_is_honest
         .as_str()
         .expect("id_token")
         .to_owned();
-    let policy = harness.policy(&client);
+    let policy = harness.id_token_policy(&client);
     let verified = verify(&id_token, &policy, &verify_clock()).expect("id token verifies");
     let claims = serde_json::Value::Object(verified.claims().raw().clone());
     assert_eq!(
@@ -1458,7 +1458,7 @@ async fn a_no_overlay_federated_login_resumes_unchanged_at_the_federated_acr() {
         .as_str()
         .expect("id_token")
         .to_owned();
-    let policy = harness.policy(&client);
+    let policy = harness.id_token_policy(&client);
     let verified = verify(&id_token, &policy, &verify_clock()).expect("id token verifies");
     let claims = serde_json::Value::Object(verified.claims().raw().clone());
     assert_eq!(
@@ -1803,7 +1803,7 @@ async fn a_broker_mfa_overlay_over_an_oauth2_connector_forces_a_real_ceremony_an
         .as_str()
         .expect("id_token")
         .to_owned();
-    let policy = harness.policy(&client);
+    let policy = harness.id_token_policy(&client);
     let verified = verify(&id_token, &policy, &verify_clock()).expect("id token verifies");
     let claims = serde_json::Value::Object(verified.claims().raw().clone());
     assert_eq!(

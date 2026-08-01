@@ -130,7 +130,7 @@ async fn assert_single_redeem_no_reuse(harness: &Harness, client_id: &str, winne
         "a concurrent within-grace race is never audited as a reuse",
     );
 
-    let policy = harness.policy(client_id);
+    let policy = harness.access_token_policy(client_id);
     let jti = verify(winner_access, &policy, &common::verify_clock())
         .expect("winner token verifies")
         .claims()

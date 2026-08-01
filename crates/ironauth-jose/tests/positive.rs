@@ -11,8 +11,14 @@ use ironauth_jose::{JwsAlgorithm, TrustedKey, VerificationPolicy, verify};
 
 /// Verify a static token against a single trusted key and assert the claims.
 fn assert_verifies(alg: JwsAlgorithm, token: &str, key: TrustedKey, expect_kid: &str) {
-    let policy = VerificationPolicy::new(vec![alg], vec![key], common::ISS, common::AUD)
-        .expect("valid policy");
+    let policy = VerificationPolicy::new(
+        vec![alg],
+        vec![key],
+        common::ISS,
+        common::AUD,
+        common::TYP_NOT_UNDER_TEST,
+    )
+    .expect("valid policy");
     let verified = verify(token, &policy, &common::now_clock())
         .unwrap_or_else(|e| panic!("{alg:?} should verify: {:?}", e.reason()));
     assert_eq!(verified.algorithm(), alg);
@@ -130,8 +136,14 @@ fn kid_selects_among_multiple_trusted_keys() {
         TrustedKey::ed25519(Some(common::ED25519_KID.into()), signer.public_key())
             .expect("valid key"),
     ];
-    let policy = VerificationPolicy::new(vec![JwsAlgorithm::EdDsa], keys, common::ISS, common::AUD)
-        .expect("valid policy");
+    let policy = VerificationPolicy::new(
+        vec![JwsAlgorithm::EdDsa],
+        keys,
+        common::ISS,
+        common::AUD,
+        common::TYP_NOT_UNDER_TEST,
+    )
+    .expect("valid policy");
     let verified = verify(&token, &policy, &common::now_clock()).expect("should verify");
     assert_eq!(verified.key_id(), Some(common::ED25519_KID));
 }
@@ -147,6 +159,7 @@ fn verifies_without_kid_when_single_key() {
         vec![key],
         common::ISS,
         common::AUD,
+        common::TYP_NOT_UNDER_TEST,
     )
     .expect("valid policy");
     let verified = verify(&token, &policy, &common::now_clock()).expect("should verify");
@@ -172,6 +185,7 @@ fn array_audience_membership_is_accepted() {
         vec![key],
         common::ISS,
         common::AUD,
+        common::TYP_NOT_UNDER_TEST,
     )
     .expect("valid policy");
     let verified = verify(&token, &policy, &common::now_clock()).expect("array aud should verify");

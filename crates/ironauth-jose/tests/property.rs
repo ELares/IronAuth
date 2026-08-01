@@ -56,6 +56,7 @@ fn eddsa_policy(signer: &common::Ed25519Signer) -> VerificationPolicy {
         vec![key],
         common::ISS,
         common::AUD,
+        common::TYP_NOT_UNDER_TEST,
     )
     .expect("valid policy")
 }

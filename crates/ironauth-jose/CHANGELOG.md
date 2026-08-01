@@ -6,6 +6,66 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **RFC 9068 section 4: a verification policy now states which token profile it accepts,
+  and it cannot decline to** (issue #192). `VerificationPolicy::new` takes an
+  `ExpectedTyp` as a fifth positional argument, `verify` matches the protected header's
+  `typ` against it, and a mismatch is the new `RejectReason::TypMismatch`. Before this,
+  the verify core read `typ` for exactly one purpose, deciding whether a `crit` member
+  naming it was malformed, and never compared it to anything. That was the whole of the
+  separation between an ID token and an access token: IronAuth signs both with one
+  environment key under one issuer, and the code flow gives both `aud = client_id`, so
+  with the media type unread they are byte for byte the same token in every field a
+  verifier looks at, and an ID token travels through the front channel where a referrer,
+  a proxy log, or browser history can leak it.
+  - **Impossible to omit, not merely present.** `ExpectedTyp` is positional, has no
+    default, and has no setter, so a policy that says nothing about the profile it
+    accepts is a compile error. `tests/compile-fail/policy_requires_expected_typ.rs`
+    pins that: a runtime test can only show that a STATED expectation is honored, never
+    that a caller could not have left it unstated. An `Option` defaulting to "no
+    opinion" would have put every future verify site one forgotten line from the
+    confusion this argument exists to close.
+  - **One declaration, read by both sides.** The new `TokenTyp` enum names each profile
+    IronAuth mints and holds its media type behind an exhaustive `match` with no wildcard
+    arm, so a fourth profile does not compile until its media type is written against its
+    RFC. The mint stamps from it (`EmissionOptions::with_token_typ`) and the verifier
+    requires from it, so a profile cannot be minted under one spelling and required under
+    another. The enum, that match, and `TokenTyp::ALL` are all GENERATED from one
+    `token_profiles!` list, which is what keeps `ALL` from falling behind: a hand-written
+    array beside the enum would go on naming the original three, and every check that
+    iterates the profiles (`no_two_profiles_share_a_media_type` above all, since it is
+    what makes `typ` a separator) would simply never see the new one and would keep
+    passing. The workspace `typ-via-declaration` invariant lint keeps the raw
+    `EmissionOptions::with_typ` out of production mint paths, in both the method and the
+    UFCS spelling (the same function reached the second way is the same hole, and a rule
+    defeated by a spelling rather than by a decision is not a rule), across every Rust
+    tree in the repository rather than `crates/` alone; a foreign peer's dictated media
+    type, or a test forging the wrong one, carries an explicit allow marker and a written
+    reason.
+  - `ExpectedTyp::ForeignIssuer` is the one way to accept an arbitrary media type, and it
+    is a value an author has to write down. It is correct only where the trusted keys are
+    the foreign party's own and the issuer and audience pin one relationship, which is
+    what does the separating there. How strongly varies, and the doc says which: pinning
+    `iss == client_id` is structural, because a client id is a prefix-tagged identifier
+    that can never equal an issuer URL, while a pinned issuer and JWKS that both come
+    from operator configuration is a configuration property and nothing more. The new
+    `tests/token_confusion.rs` asserts exactly what the variant admits, so nobody can
+    believe it is doing a partial check.
+  - `typ` is decided in one more place in this crate, which the "one declaration" claim
+    does not cover: `validate_dpop_proof` requires `typ == "dpop+jwt"` byte-exactly. A
+    DPoP proof is minted by the client, not by IronAuth, and that check is stricter than
+    the media-type comparison here rather than a way around it.
+  - Media types are compared as media types: case-insensitively (RFC 2045 section 5.1)
+    with an optional `application/` prefix stripped (RFC 7515 section 4.1.9). A
+    non-string `typ` is `HeaderMalformed` rather than "no typ", so a hostile header
+    cannot have the member silently ignored.
+  - The check runs alongside the algorithm allowlist, before the signature. Like that
+    check it can only REJECT: acceptance still requires the signature, which
+    `the_media_type_guard_never_admits_an_unsigned_token` pins.
+  - `tests/token_confusion.rs` is the full CROSS PRODUCT of the three profiles against
+    the three policies, not the one pair the issue named. Asserting only "an ID token
+    fails an access-token policy" would have left the Logout Token, which carries
+    `aud = client_id` and a `sid`, free to stand in for either.
+
 - Pre-signature compact-length arithmetic (issue #98), three new public functions plus one
   accessor: `b64_no_pad_len`, `compact_len`, `protected_header`, and
   `SigningKey::signature_len`. Together they answer "how long will this token be" BEFORE the

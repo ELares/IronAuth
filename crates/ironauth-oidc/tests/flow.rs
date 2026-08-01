@@ -65,7 +65,7 @@ fn token_form(code: &str, client_id: &str) -> String {
 
 /// Extract the `jti` from a signed access token by verifying it.
 fn access_jti(harness: &Harness, access_token: &str, audience: &str) -> String {
-    let policy = harness.policy(audience);
+    let policy = harness.access_token_policy(audience);
     let verified = verify(access_token, &policy, &common::verify_clock()).expect("access verifies");
     verified
         .claims()
@@ -96,7 +96,7 @@ async fn full_code_flow_issues_verifiable_tokens_end_to_end() {
 
     // The ID token verifies through the ONE hardened verify path, against the
     // per-environment issuer and the client audience, and carries the bound nonce.
-    let policy = harness.policy(&client_id);
+    let policy = harness.id_token_policy(&client_id);
     let verified = verify(id_token, &policy, &common::verify_clock()).expect("id token verifies");
     assert_eq!(verified.claims().issuer(), harness.issuer());
     assert!(harness.issuer().starts_with(ISSUER_BASE));

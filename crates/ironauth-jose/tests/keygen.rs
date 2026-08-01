@@ -72,8 +72,14 @@ fn round_trip(key: &SigningKey, alg: JwsAlgorithm) {
     let payload = common::standard_claims().into_bytes();
     let token = sign_jws(key, &payload, &EmissionOptions::new()).expect("sign");
     let trusted = key.verifying_key().expect("public projection");
-    let policy = VerificationPolicy::new(vec![alg], vec![trusted], common::ISS, common::AUD)
-        .expect("valid policy");
+    let policy = VerificationPolicy::new(
+        vec![alg],
+        vec![trusted],
+        common::ISS,
+        common::AUD,
+        common::TYP_NOT_UNDER_TEST,
+    )
+    .expect("valid policy");
     let verified = verify(&token, &policy, &clock).expect("verify accepts the minted token");
     assert_eq!(verified.algorithm(), alg);
     assert_eq!(verified.claims().issuer(), common::ISS);

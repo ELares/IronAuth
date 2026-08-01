@@ -236,7 +236,7 @@ async fn a_logout_token_carries_the_rp_sid_the_events_claim_and_no_nonce() {
     // The token verifies under the environment's published key, with the RP as audience.
     let verified = verify(
         token,
-        &harness.policy(&client.to_string()),
+        &harness.logout_token_policy(&client.to_string()),
         &common::verify_clock(),
     )
     .expect("logout token verifies under the environment key");
@@ -299,7 +299,7 @@ async fn each_participating_rp_gets_its_own_token_with_no_cross_client_sid_leak(
         };
         let verified = verify(
             &token,
-            &harness.policy(&expected_client.to_string()),
+            &harness.logout_token_policy(&expected_client.to_string()),
             &common::verify_clock(),
         )
         .expect("verifies");
@@ -581,7 +581,7 @@ async fn a_worker_in_tenant_a_never_sends_tenant_b_logout_tokens() {
     assert_eq!(sent[0].0, "https://a.example/bc");
     let verified = verify(
         &sent[0].1,
-        &harness.policy(&client_a.to_string()),
+        &harness.logout_token_policy(&client_a.to_string()),
         &common::verify_clock(),
     )
     .expect("A's token verifies");

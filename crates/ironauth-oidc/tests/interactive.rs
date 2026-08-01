@@ -209,7 +209,7 @@ async fn a_user_can_register_consent_and_receive_tokens_end_to_end() {
     // The ID token verifies through the one hardened verify path, and its subject
     // is the registered user (a stable usr_ id), proving the flow bound the code to
     // the authenticated end user rather than a synthetic seam value.
-    let policy = harness.policy(&client_id);
+    let policy = harness.id_token_policy(&client_id);
     let verified = verify(id_token, &policy, &common::verify_clock()).expect("id token verifies");
     assert_eq!(verified.claims().issuer(), harness.issuer());
     assert_eq!(
