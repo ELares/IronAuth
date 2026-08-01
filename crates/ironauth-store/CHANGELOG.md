@@ -6,6 +6,95 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The signed journey interchange archive, whose safety manifest is a CHECKED CLAIM and never a
+  trusted input** (issue #347). The new `interchange` module carries a journey artifact, its
+  sub-flows, and a safety manifest across an ORGANIZATION boundary as a `.iaj` bundle: the RFC 7515
+  section 7.2.2 flattened JWS JSON serialization, signed with a per-environment Ed25519 key and
+  verified through `ironauth_jose::verify`, the one verification choke point.
+  - **The manifest is re-derived, not believed.** The exporter is the untrusted party here, so a
+    manifest the importer read and acted on would be decoration: a bundle that under-declared its
+    `required_capabilities` would walk past the capability check and the feature would be theatre.
+    `derive_capabilities` re-walks the artifact, its sub-flow REFERENCES, its inline sub-flow
+    DEFINITIONS, the definition-level `subflow_call` keys those bodies carry, and the composed
+    table, and the declaration is checked for EXACT equality against that derivation
+    (`CapabilityUnderDeclared` for the security-relevant direction, `CapabilityOverDeclared` for
+    the false-safety-summary one), and the grant check that actually gates the import reads the
+    DERIVED set and never the manifest. The acceptance suite proves this the only way it can be
+    proven: by re-signing a doctored payload with the exporter's own genuinely trusted key, once
+    per capability family, so the signature, the key, the issuer, and the media type are all
+    correct and the declaration is the only lie. Because the equality check makes the two sets the
+    same value by the time the grant check runs, one case makes a capability both undeclared AND
+    ungranted and asserts only that the import is refused, without pinning the variant, which is
+    the only shape that measures the grant check independently of the manifest check.
+  - **A sub-flow key resolves by TWO rules and the deriver models both.** A journey-level
+    `subflow_call` names an alias in `subflows`, but a call NESTED inside a `subflow_definitions`
+    body resolves against the global definition key set instead (every built-in name union every
+    inline definition id), and composition then erases the call. A bundle could therefore reach a
+    BUILT-IN sub-flow with no `SubflowRef` naming it and the deriver would name it nowhere: an
+    environment that had explicitly withheld `subflow.builtin.mfa_step_up` imported such a bundle
+    and got its own built-in body spliced in, while the same environment refused the honest bundle
+    that reached the same built-in through a reference. `walk_nested_subflow_calls` closes it,
+    walking the spliced built-in body too so a future built-in with a nested call of its own is
+    covered, and terminating on a cycle by construction.
+  - **The vocabulary cannot fall behind the format.** The walkers match exhaustively on the
+    journey crate's `Predicate`, `CmpOp`, `FieldSource`, `MemberSet`, `Literal`, and `DecisionSpec`
+    enums, so a new variant stops the crate compiling until it names a capability; the only way to
+    name one is a constant the `fixed_capabilities!` declaration generates (the `token_profiles!`
+    pattern), which also counts it into `ALL`; and each entry must spell `ENGINE_GRANTS` or
+    `ENGINE_WITHHOLDS`, so a capability cannot be granted by default because nobody thought about
+    it. Step kinds, node groups, and built-in subflow names are read from
+    `StepKind::as_wire`, `NODE_GROUPS`, and `builtin_subflows()` themselves, so those have no
+    second list at all.
+  - **Seven capabilities are withheld, each measured.** `predicate.member` and its group and scope
+    vocabulary and the two subject-set field sources, because `source_is_engine_live`
+    (`ironauth-journey/src/eval.rs:590`) marks `subject_groups` and `subject_scopes` NOT-LIVE and
+    the load-time type check refuses every predicate that could reach them; and BOTH decision
+    entries, `decision.sandbox` and `decision.predicate`, because the shipped engine does not
+    consult a decision attachment at all. Withholding the pair together is the same standard that
+    withholds `predicate.member`: `decision.predicate` cannot be derived without `decision.sandbox`
+    being derived alongside it, so granting it would have been a grant that changes no outcome
+    while reading as though the engine executed decision predicates. A bundle needing the sandbox
+    is refused at load with a precise message and imports unchanged once both are granted.
+  - **The verified bytes and the parsed bytes are the same object.** Import joins the three
+    RECEIVED base64url members into the compact form, hands that to the verifier, and reads the
+    artifact out of the verifier's SINGLE parse of the signature-covered payload. It never
+    re-canonicalizes and compares, which would reintroduce the second derivation that makes
+    "signed canonical bytes" a bypass surface in the first place. Canonicalization is an EXPORT
+    determinism property only, through `snapshot`'s existing canonical JSON writer rather than a
+    second one. How far the duplicate-key rejection reaches is stated exactly rather than rounded
+    up, because it does not reach everywhere: a duplicate CONTAINER member and a duplicate
+    TOP-LEVEL payload key are both refused, but a duplicate key NESTED inside `artifact` is
+    accepted with the last value winning, since `ironauth-jose`'s `parse_unique_object` enforces
+    uniqueness only in its own `visit_map`. That is not a signature bypass (the one parse is the
+    tree that is checked and acted on); the residual exposure is that such an archive is ambiguous
+    to a third-party inspector. Making the parse recurse would change every token parse in the
+    system, so the limitation is documented and locked by a test instead.
+  - **A refusal message is an operator-facing surface the EXPORTER writes into.** A
+    cross-organization exporter chooses its own sub-flow ids and its own manifest capability
+    tokens, so a rendered error echoes attacker-chosen text: measured at 4106 bytes carrying a raw
+    newline and an ANSI escape, which is log forging and log flooding rather than a leak (no
+    end-user value can reach an error, because the deriver never reads a literal, a pointer, or a
+    member-set name). Every echoed value now goes through one `echo` helper that replaces anything
+    outside ASCII graphic-or-space and truncates, and every echoed list is bounded with the tail
+    summarized by count.
+  - **A fail-closed constraint that was satisfied vacuously.** The transport rule is universally
+    quantified over what the importing environment OFFERS, so an environment offering NOTHING
+    proved it for free and a manifest permitting only a transport no deployment has ever served
+    imported cleanly. An empty offer set is now `EnvironmentServesNoTransport`.
+  - **What is refused rather than ignored.** `min_engine_version` and `requires_sandbox` are
+    derived and compared; `allowed_transports` is author intent and cannot be derived, so it is
+    enforced in the only fail-closed direction available (every transport the importing
+    environment offers must be permitted), because nothing can pin a stored journey to a subset of
+    an environment's transports. A fourth container member, an extra payload member, an array
+    `aud`, a segment carrying a `.`, and two bodies for one sub-flow id are all refusals.
+  - **Trust has no home yet, and that is stated rather than invented.** `TrustedExporter` is an
+    argument, built from operator-supplied key material; nothing in the archive names a key or a
+    URL, so this path fetches nothing and has no SSRF surface. The tree's existing
+    `external_assertion_issuers` registry is deliberately NOT reused: a row there means assertions
+    from that issuer may authenticate a principal under RFC 7523, and registering a journey
+    exporter would silently confer that too. Cross-organization exporter trust needs an
+    operator-facing registry of its own, and there is no HTTP import surface until it exists.
+
 - **FORTY-SEVEN comments used an idiom that asserts a foreign key from `audit_log` to the
   row the sentence is about, and for every table but two there is no such foreign key**
   (issue #404). `audit_log` (0002) carries exactly two, to `tenants` and to `environments`,

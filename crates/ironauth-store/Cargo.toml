@@ -103,6 +103,14 @@ name = "rls"
 path = "tests/rls.rs"
 required-features = ["testing"]
 
+# The signed journey interchange archive (issue #347): the adversarial acceptance for the
+# `.iaj` bundle. DATABASE FREE (the interchange module is pure value logic, exactly like
+# flow_version), so it carries no required-features and runs on every lane, exactly like
+# the config_snapshot suite.
+[[test]]
+name = "journey_interchange"
+path = "tests/journey_interchange.rs"
+
 # Declarative federation connectors (issue #75): the connector CRUD repo (secret
 # sealed inline, capability columns from the definition), the secret-free snapshot
 # export (the client secret is a reference, never the value), and cross-tenant RLS,

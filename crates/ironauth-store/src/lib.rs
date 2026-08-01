@@ -63,6 +63,7 @@ pub mod flow;
 pub mod flow_version;
 mod id;
 pub mod identifier;
+pub mod interchange;
 pub mod locale_bundle;
 mod migrate;
 pub mod org_policy;
@@ -167,6 +168,12 @@ pub use id::{
 pub use identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
     normalize_routing_domain,
+};
+pub use interchange::{
+    Capability, ExportRequest, FixedCapability, GrantedCapabilities, INTERCHANGE_AUDIENCE,
+    ImportEnvironment, ImportedBundle, InterchangeError, LaunchConstraints, MAX_ARCHIVE_BYTES,
+    SafetyManifest, SignedArchive, TrustedExporter, derive_capabilities, derive_min_engine_version,
+    export_archive, import_archive,
 };
 pub use locale_bundle::{LocaleBundleRecord, NewLocaleBundle};
 pub use migrate::{Migration, MigrationError, MigrationReport, MigrationRunner, Phase};

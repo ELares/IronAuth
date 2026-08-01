@@ -498,6 +498,20 @@ token_profiles! {
     /// `application/logout+jwt` media type). RFC 8471 is the Token Binding
     /// Protocol and has nothing to do with logout tokens.
     LogoutToken => "logout+jwt",
+    /// A signed journey interchange archive (issue #347): `iaj+jws`, the media type
+    /// of the `.iaj` bundle carrying a journey artifact, its sub-flows, and its
+    /// safety manifest. Unlike the three profiles above there is no RFC to cite: no
+    /// standards body names this document, so the media type is IronAuth's own and
+    /// is deliberately NOT registered with IANA. Its whole job is to be a value no
+    /// other profile in this declaration answers to, which
+    /// `no_two_profiles_share_a_media_type` checks, so an access token, an ID token,
+    /// or a logout token can never be presented where an archive is expected and an
+    /// archive can never be presented as a token. The archive is minted by THIS
+    /// system (a per-environment Ed25519 key), so the importer states
+    /// [`ExpectedTyp::Required`] and never [`ExpectedTyp::ForeignIssuer`]: the
+    /// exporter is a foreign ORGANIZATION, but the header shape is IronAuth's, so
+    /// `typ` stays a separator here.
+    JourneyInterchange => "iaj+jws",
 }
 
 impl TokenTyp {
@@ -774,6 +788,9 @@ mod tests {
                 TokenTyp::IdToken => "JWT",
                 // OpenID Connect Back-Channel Logout 1.0 section 2.4.
                 TokenTyp::LogoutToken => "logout+jwt",
+                // Issue #347. No RFC: an IronAuth-defined, deliberately
+                // unregistered media type for the signed `.iaj` journey archive.
+                TokenTyp::JourneyInterchange => "iaj+jws",
             };
             assert_eq!(typ.media_type(), expected, "{typ:?}");
         }
