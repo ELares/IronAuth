@@ -6,6 +6,168 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **One transactional outbox and lease based job queue, and the session-ended fan-out moved
+  onto it** (issue #104, PR 1 of the sequence). Every outbound subsystem this milestone adds
+  needs the same three things: a row that commits with the domain write that caused it, a
+  queue several workers can drain at once without double processing, and a bounded retry
+  that ends in a dead letter rather than an infinite redelivery loop. Two tables already did
+  parts of it and neither did all of it, so the next consumer would have hand-rolled a third.
+  Migration 0099 lands their union plus the two things neither needed, and the first real
+  consumer is on it rather than a fixture.
+  - **The union, not a third variant.** `session_ended_events` (0024) had the transactional
+    enqueue, the `FOR UPDATE SKIP LOCKED` claim and the visibility lease, and no attempts
+    counter, no backoff gate and no dead letter, so a consumer that kept failing redelivered
+    forever. `backchannel_logout_deliveries` (0025) had the attempts counter, the backoff
+    gate and the dead letter, welded to one recipient shape. `outbox_messages` has all of it
+    once, under a CONSUMER discriminator so one table serves many independent drains.
+  - **Per-aggregate ordering is enforced by the CLAIM, not promised in prose.** A message is
+    claimable only when no non-terminal message of its `(consumer, ordering_key)` group holds
+    a lower sequence, so at most one message per aggregate is ever eligible and the group
+    advances one at a time. The rule keys on TERMINALITY rather than on the lease, which is
+    what makes it hold under concurrency: a competing worker's in-flight claim on the head
+    does not retire the head, so the successor stays blocked whether the head succeeds, fails
+    into a backoff, or is abandoned by a crashed worker. The costs are stated where they can
+    be read rather than discovered: a group's head blocks its group until it reaches a
+    terminal state, parallelism within a consumer is bounded by the number of distinct
+    ordering keys with due work, and the claim carries one extra anti-join per candidate,
+    served by a dedicated partial index. A consumer that needs no ordering passes a
+    per-message ordering key and pays none of it.
+  - **What ordering the substrate keeps, and the PRECONDITION for the strong form.** The
+    unconditional guarantee is about claims: only a group's lowest-sequenced non-terminal
+    message is ever leased, it keeps blocking its group until it is terminal, and a worker
+    whose lease has lapsed cannot retire it out from under the worker that now holds it. The
+    stronger reading a consumer would like to assume, that two messages of one aggregate are
+    never handled at the same time and arrive in enqueue order, additionally requires that
+    two enqueues under one ordering key do not have OVERLAPPING TRANSACTIONS, and that is a
+    property of the producers rather than of this substrate: sequences are assigned at
+    INSERT, so two overlapping producers can commit in the opposite order to their sequences
+    and the earlier one then becomes claimable while the later one is still in flight. A
+    domain write that holds the aggregate's own row lock in the transaction it enqueues from
+    meets the precondition by construction; a scheduled job, a replay, or a bare
+    `OutboxRepo::enqueue` does not. The shipped session-ended consumer meets it in the
+    strongest way and by a structural accident that does not generalize: its ordering key,
+    its idempotency key and the session id are one value, so the unique constraint makes
+    every one of its groups a singleton.
+  - **A lifecycle write is FENCED on the lease it was handed.** A claim now returns the
+    instant it stamped, and completing or failing a message presents that instant back. A
+    worker that stalled past its visibility timeout, and whose message another worker has
+    legitimately re-claimed, is refused: without the fence its completion still succeeded,
+    which retired a message the live worker was inside its handler for and released the
+    ordering group under it, and its failure could dead-letter that same message. The refusal
+    is the outcome the worker already handled, so nothing new can go wrong with it. The token
+    is strictly increasing per message rather than merely unique, because a re-claim is only
+    possible once the previous lease is older than the whole timeout.
+  - **The claim batch is a bound again.** `outbox.claim_batch` was expressed as
+    `WHERE id IN (SELECT ... LIMIT n ...)`, and that is a limit the query planner may decline:
+    when it chooses a rescanning semi join, the selection is re-evaluated per candidate row
+    against the rows the same statement has already stamped, the earlier picks drop out of it,
+    and the whole eligible set is leased. Measured on Postgres 18.4 against one table of ten
+    due messages: with statistics present, `LIMIT 3` leased 3 under a hash semi join; with the
+    table freshly written and not yet analysed, the same `LIMIT 3` leased all 10 under a
+    nested loop semi join with `loops=10`. So a configured, range-checked batch was doing
+    nothing, and the failure it opened onto is one worker leasing an entire backlog into
+    memory under a single lease it cannot finish inside. The selection is now a MATERIALIZED
+    CTE, which is evaluated exactly once by definition, and the bound is pinned by a test.
+  - **The batch does not share one deadline.** A claim leases its whole batch at one instant,
+    so a shared lease makes the governing quantity `batch size x handler duration`: at the
+    shipped defaults any handler slower than about 469ms puts the tail of a batch past its own
+    lease and another worker starts redelivering messages the first has not reached. Each
+    message's lease is now re-stamped immediately before it is handed over, so the visibility
+    timeout has to exceed ONE handler; and a message whose lease has meanwhile gone to another
+    worker is skipped rather than handled a second time, counted in a new
+    `DrainStats::lease_lost`, which is also the signal that a consumer's handlers are slow
+    relative to its timeout.
+  - **A consumer PANIC costs its message an attempt and the pool nothing.** A panic out of a
+    handler used to abort the worker task: `shutdown` discarded the `JoinError`, the pool went
+    on reporting its configured size, and the poison message stayed at zero attempts forever,
+    so the finite bound never fired and its aggregate was wedged permanently along with every
+    aggregate the dead workers would have served. Measured: two workers, one poison message,
+    and healthy work in a different ordering group was never handled again. The handler is now
+    called inside a catch, a panic is recorded as a retryable failure labelled
+    `consumer_panic`, and the message dead-letters on the bound like any other failure. This
+    is the unwind case, which is what the workspace ships; under `panic = "abort"` there is
+    nothing to catch and recovery is the ordinary crash path. `OutboxWorkerPool::size` is now
+    the LIVE worker count, with `configured_size` alongside it, so a death that the catch does
+    not cover is visible to a health surface instead of being remembered as healthy.
+  - **The bound on retries is load-bearing twice.** It stops a failing message, and it is
+    what RELEASES that message's aggregate. An unbounded retry would wedge the aggregate
+    forever, so there is no unlimited value for `outbox.max_attempts` and there will not be
+    one. A consumer that knows another attempt cannot succeed says so and is dead-lettered on
+    the first failure rather than blocking real work for the length of a schedule.
+  - **The consumer framework is a pool and never a singleton.** The field's cautionary
+    example is Ory Kratos's courier, a mandatory singleton with no health endpoint that
+    duplicates sends when misrun. Here the safety is in the queue rather than in a promise
+    about deployment, so several workers in one process and several replicas of that process
+    are both safe with no coordination, no leader election, and no lock service. Registering
+    two consumers under one name is REFUSED, because either resolution of the clash presents
+    in production as "some events just never arrive".
+  - **The session-ended fan-out (#35) is the first consumer, and its behaviour is unchanged.**
+    `SessionEventOutboxRepo` is now a typed facade over the queue; the back-channel logout
+    worker's logic is untouched. Of its nine tests, three are byte-identical against the
+    previous release and six changed, and every change is necessary rather than incidental:
+    the id-prefix assertion, the two raw adversarial probes that now write `outbox_messages`,
+    the skip-locked concurrency test whose raw claim had to move to the new table, and the
+    two that retire an event, which now present the lease they were claimed under. Three
+    things moved in the surface and
+    all are visible on purpose: a drained event's id is now an `obx_` outbox id rather than a
+    `sev_` one (still an opaque, stable, scope-embedding dedup handle, and because 0099
+    backfills nothing one logical event can never exist under both prefixes, so a dedup
+    cannot be defeated across the boundary); `SessionEndedEvent` carries the lease it was
+    claimed under; and `mark_delivered` takes that claimed event rather than a bare id,
+    because retiring an event is fenced on the lease like every other lifecycle write.
+    Migrating the back-channel logout delivery worker is PR 2: a botched migration of logout
+    DELIVERY is a security-relevant regression and it gets its own review.
+  - **What 0099 deliberately does not do, and what that obliges an operator to do.** It does
+    not move the rows already sitting in `session_ended_events`. No migration in this chain
+    has ever moved data, and a set based copy would have to read a table with row-level
+    security FORCED as its owner, so it would either be refused or silently depend on the
+    deployment's migration role happening to be a superuser, which is a worse property than
+    the one it would fix. The old table is left completely intact and readable, so an old
+    binary mid rolling upgrade keeps working.
+
+    The consequence, stated precisely rather than left as "should drain first". The only
+    consumer of `session_ended_events` is gated on `oidc.backchannel_logout_enabled`, which
+    defaults false, so a DEFAULT deployment loses nothing. A deployment with back-channel
+    logout ON loses every row still `delivered_at IS NULL` when the last old replica stops,
+    and `OutboxRepo::depth()` counts only `outbox_messages`, so that orphaned tail is
+    INVISIBLE to the new metrics surface. A pure rolling upgrade does not satisfy the drain
+    on its own, because new replicas already route session ends to `outbox_messages` while
+    old ones drain the old table, so the old tail only shrinks. **Before retiring the last
+    old replica, run**
+
+    ```sql
+    SELECT count(*) FROM session_ended_events WHERE delivered_at IS NULL;
+    ```
+
+    **and require it to reach 0.**
+  - **No retention, deliberately, and it is an obligation not an omission.** `outbox_messages`
+    grows monotonically: completed and dead-lettered rows are never removed, neither role is
+    granted DELETE, and there is no reaper. A reaper that deletes queue rows is its own
+    review, and the dead-letter tail is evidence an operator must not lose by accident, so
+    retention is carried later in the #104 sequence rather than guessed at here.
+  - **Least privilege on the new table is wider than the table it replaces, not narrower.**
+    The drain holds column-scoped UPDATE on the six lifecycle columns and nothing else, so it
+    cannot rewrite a message's payload, cannot retarget it at another consumer, and cannot
+    move it into another ordering group to jump that group's queue. The control plane can
+    enqueue and read and holds no UPDATE of any shape. What the six columns DO permit is
+    recorded in the grant comment rather than left to be discovered: `completed_at` is
+    writable, so the data plane can also write NULL to it and RESURRECT a completed message
+    (measured: one row affected, and it redrains). The `one_terminal_state` CHECK stops a row
+    being completed and dead-lettered at once, not being un-completed, so terminality is
+    enforced by the repository's inline predicate on every write rather than by the schema
+    alone. This is the same shape 0024 granted on `delivered_at`, so it is not a widening.
+  - **One more index than the two partial ones, for the ordered all-states listing.** Both
+    partial indexes cover only the live tail, and `list()` returns a consumer's messages in
+    ANY state, newest first, with a limit: the completed and dead-lettered rows it is mostly
+    for are exactly what they exclude. Measured at 205k rows over 100 scopes, that read was a
+    bitmap scan of the scope's whole history plus a top-N heapsort (2050 rows, 2075 shared
+    buffers, 2.345ms) and is now an index scan backward (53 buffers, 0.102ms), and the cost
+    of not having it grows with the scope's history rather than the page size. The obvious
+    second argument for the index does NOT hold and is recorded as not holding: `depth()` and
+    the referential-integrity probe a tenant or environment DELETE runs are already served by
+    the implicit index behind the unique constraint, which leads with the same three columns,
+    and measured at the same scale they plan identically with and without it.
+
 - **Brands and locale bundles are PROMOTED, not merely exported** (issue #475). Both types sat in
   the snapshot with an empty promoted projection and no apply arm, so a promotion between
   environments carried neither: the plan for an environment with branding was empty and the apply

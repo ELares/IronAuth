@@ -126,9 +126,13 @@ async fn a_terminal_end_enqueues_one_event_but_a_rotation_enqueues_none() {
     );
     assert_eq!(event.subject, subject, "names the user");
     assert_eq!(event.cause, SessionEndCause::Revoked, "carries the cause");
+    // Since issue #104 the event is a message on the generic outbox, so its id is a
+    // scoped `obx_` outbox message id rather than the `sev_` id migration 0024's own
+    // table minted. It is still what it always was to a consumer: a stable, opaque,
+    // scope-embedding handle to dedup redelivery on.
     assert!(
-        event.id.starts_with("sev_"),
-        "the event id is a scoped sev_ id (the idempotency key)"
+        event.id.starts_with("obx_"),
+        "the event id is a scoped obx_ id (the idempotency key)"
     );
     assert!(
         event.correlation_id.starts_with("req_"),
@@ -362,11 +366,12 @@ async fn the_outbox_is_isolated_across_tenants() {
         &scope_b.environment().to_string(),
     )
     .await;
-    let visible: i64 = sqlx::query("SELECT count(*) AS n FROM session_ended_events")
-        .fetch_one(&mut *tx)
-        .await
-        .expect("count")
-        .get("n");
+    let visible: i64 =
+        sqlx::query("SELECT count(*) AS n FROM outbox_messages WHERE consumer = 'session_ended'")
+            .fetch_one(&mut *tx)
+            .await
+            .expect("count")
+            .get("n");
     assert_eq!(
         visible, 0,
         "RLS hides A's events from a B-scoped connection"
@@ -416,17 +421,21 @@ async fn claim_leases_then_marks_delivered_and_a_delivered_event_never_redrains(
     assert_eq!(reclaimed.len(), 1, "a lapsed lease reappears the event");
     assert_eq!(reclaimed[0].id, event_id, "the same event reappears");
 
-    // Marking it delivered is the terminal step; it flips once and reports true.
+    // Marking it delivered is the terminal step; it flips once and reports true. The
+    // event carries the lease the RE-CLAIM stamped, which is what authorizes the write
+    // (issue #104): a lease is per-claim, and the first claim's is dead.
+    let held = &reclaimed[0];
     assert!(
-        outbox.mark_delivered(&env, &event_id).await.expect("mark"),
+        held.lease_stamp_unix_micros.is_some(),
+        "a claimed event carries its lease"
+    );
+    assert!(
+        outbox.mark_delivered(&env, held).await.expect("mark"),
         "the first mark-delivered flips the event"
     );
     // A second mark is idempotent (a re-claim racing a mark, or a double mark): false.
     assert!(
-        !outbox
-            .mark_delivered(&env, &event_id)
-            .await
-            .expect("mark again"),
+        !outbox.mark_delivered(&env, held).await.expect("mark again"),
         "mark-delivered is idempotent: it flips at most once"
     );
 
@@ -492,9 +501,9 @@ async fn two_concurrent_claimers_lease_disjoint_event_sets_via_skip_locked() {
         .expect("begin worker A claim tx");
     bind_scope(&mut worker_a, &tenant, &environment).await;
     let a_rows = sqlx::query(
-        "SELECT id FROM session_ended_events \
-         WHERE tenant_id = $1 AND environment_id = $2 \
-         AND delivered_at IS NULL AND claimed_at IS NULL \
+        "SELECT id FROM outbox_messages \
+         WHERE tenant_id = $1 AND environment_id = $2 AND consumer = 'session_ended' \
+         AND completed_at IS NULL AND dead_lettered_at IS NULL AND claimed_at IS NULL \
          ORDER BY sequence LIMIT 2 FOR UPDATE SKIP LOCKED",
     )
     .bind(&tenant)
@@ -579,7 +588,21 @@ async fn a_foreign_scope_or_malformed_id_is_a_uniform_no_op_on_mark_delivered() 
         .revoke(&env, &session, SessionEndCause::Revoked, false, None)
         .await
         .expect("revoke");
-    let event_id = pending(&db, scope_a).await[0].id.clone();
+    // A REAL claim in A's scope, so the event below carries a LIVE lease and the only
+    // thing wrong with the two calls that follow is the scope or the id. Presenting an
+    // unclaimed event would be refused for the wrong reason and would measure nothing
+    // about the boundary.
+    let held = db
+        .store()
+        .scoped(scope_a)
+        .session_events()
+        .claim(&env, Duration::from_secs(60), 100)
+        .await
+        .expect("claim in A")
+        .remove(0);
+    assert!(held.lease_stamp_unix_micros.is_some());
+    let mut malformed = held.clone();
+    malformed.id = "not-an-id".to_owned();
 
     // Marking A's event through B's scope is a uniform no-op: the id parses out of B's
     // scope, so the row is never touched and never revealed.
@@ -587,7 +610,7 @@ async fn a_foreign_scope_or_malformed_id_is_a_uniform_no_op_on_mark_delivered() 
         !db.store()
             .scoped(scope_b)
             .session_events()
-            .mark_delivered(&env, &event_id)
+            .mark_delivered(&env, &held)
             .await
             .expect("cross-scope mark"),
         "a foreign-scope event id is a no-op, never a cross-tenant write"
@@ -597,16 +620,29 @@ async fn a_foreign_scope_or_malformed_id_is_a_uniform_no_op_on_mark_delivered() 
         !db.store()
             .scoped(scope_a)
             .session_events()
-            .mark_delivered(&env, "not-an-id")
+            .mark_delivered(&env, &malformed)
             .await
             .expect("malformed mark"),
         "a malformed id is a uniform no-op"
     );
-    // A's event is still pending (nothing marked it).
-    assert_eq!(
-        pending(&db, scope_a).await.len(),
-        1,
-        "A's event is untouched"
+    // The control at the other end: the SAME event, in its OWN scope, with the same live
+    // lease, does flip. Without it the two refusals would pass against a `mark_delivered`
+    // that refused everything.
+    assert!(
+        db.store()
+            .scoped(scope_a)
+            .session_events()
+            .mark_delivered(&env, &held)
+            .await
+            .expect("own-scope mark"),
+        "the identical call inside A's scope succeeds"
+    );
+    // And the ONLY thing that retired A's event was A's own call: the two refusals left
+    // it exactly where it was, which is why the count reaching zero here reads as "A did
+    // it" rather than "something did".
+    assert!(
+        pending(&db, scope_a).await.is_empty(),
+        "A's event is retired by A's own mark, and by nothing else"
     );
 }
 
@@ -628,43 +664,50 @@ async fn the_app_role_can_drain_but_cannot_rewrite_the_immutable_event_body() {
     let tenant = scope.tenant().to_string();
     let environment = scope.environment().to_string();
 
-    // The app role CAN stamp the two lifecycle columns a drain touches (its
-    // column-scoped grant), proving the drain works on the low-privilege role.
+    // The app role CAN stamp the lifecycle columns a drain touches (its column-scoped
+    // grant), proving the drain works on the low-privilege role. Since issue #104 the
+    // event lives on the generic outbox, so the terminal marker is `completed_at` rather
+    // than the retired `delivered_at`; the grant SHAPE, which is what this test is about,
+    // is unchanged.
     {
         let mut tx = db.app_pool().begin().await.expect("begin app tx");
         bind_scope(&mut tx, &tenant, &environment).await;
-        let claimed =
-            sqlx::query("UPDATE session_ended_events SET claimed_at = now() WHERE id = $1")
-                .bind(&event_id)
-                .execute(&mut *tx)
-                .await
-                .expect("app stamps claimed_at")
-                .rows_affected();
+        let claimed = sqlx::query("UPDATE outbox_messages SET claimed_at = now() WHERE id = $1")
+            .bind(&event_id)
+            .execute(&mut *tx)
+            .await
+            .expect("app stamps claimed_at")
+            .rows_affected();
         assert_eq!(claimed, 1, "the app role can stamp claimed_at");
         let delivered =
-            sqlx::query("UPDATE session_ended_events SET delivered_at = now() WHERE id = $1")
+            sqlx::query("UPDATE outbox_messages SET completed_at = now() WHERE id = $1")
                 .bind(&event_id)
                 .execute(&mut *tx)
                 .await
-                .expect("app stamps delivered_at")
+                .expect("app stamps completed_at")
                 .rows_affected();
-        assert_eq!(delivered, 1, "the app role can stamp delivered_at");
+        assert_eq!(delivered, 1, "the app role can stamp completed_at");
         tx.commit().await.expect("commit lifecycle stamps");
     }
 
-    // The app role is REFUSED (permission denied, 42501) on every immutable body column:
-    // there is NO table-wide UPDATE grant (the #31 lesson), so cause, subject, actor,
-    // and occurred_at can never be rewritten by a data-plane path.
+    // The app role is REFUSED (permission denied, 42501) on every immutable column: there
+    // is NO table-wide UPDATE grant (the #31 lesson). The set is WIDER than it was before
+    // the move, not narrower: the event body is now one `payload` column, and the generic
+    // outbox adds three ROUTING columns that a drain must not be able to rewrite either.
+    // Retargeting `consumer` would hand this event to another subsystem's handler, and
+    // retargeting `ordering_key` would move it into another aggregate and let it jump
+    // that aggregate's queue.
     for column_set in [
-        "cause = 'logged_out'",
-        "subject = 'usr_forged'",
-        "actor_id = 'svc_forged'",
-        "occurred_at = TIMESTAMPTZ 'epoch'",
+        "payload = '{\"cause\":\"logged_out\"}'::jsonb",
+        "consumer = 'webhook_delivery'",
+        "ordering_key = 'ses_forged'",
+        "idempotency_key = 'ses_forged'",
+        "enqueued_at = TIMESTAMPTZ 'epoch'",
     ] {
         let mut tx = db.app_pool().begin().await.expect("begin app tx");
         bind_scope(&mut tx, &tenant, &environment).await;
         let denied = sqlx::query(&format!(
-            "UPDATE session_ended_events SET {column_set} WHERE id = $1"
+            "UPDATE outbox_messages SET {column_set} WHERE id = $1"
         ))
         .bind(&event_id)
         .execute(&mut *tx)

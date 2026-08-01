@@ -161,11 +161,128 @@ pub struct Config {
     /// operator-visible name.
     pub token_claims: TokenClaimsConfig,
 
+    /// Transactional outbox and job queue settings (issue #104): the tuning of the
+    /// at-least-once dispatch substrate every async path (webhook delivery,
+    /// back-channel logout delivery, SIEM sinks, migration jobs, notification
+    /// fan-out) drains through. Worker concurrency, the visibility timeout, the
+    /// poll cadence, the claim batch, and the retry bound are all settings with
+    /// safe defaults per the tunability principle, because the right value depends
+    /// on the deployment's connection pool, its consumers' handler latency, and how
+    /// long its operators are willing to wait for a crashed worker's messages.
+    ///
+    /// A top-level section rather than a field on any one consumer's section
+    /// deliberately: the substrate is shared, so one set of knobs governs every
+    /// consumer's workers and an operator tunes the QUEUE once rather than
+    /// rediscovering the same four settings under each subsystem.
+    ///
+    /// There is no mode selection here and no mention of a durable message bus.
+    /// The Postgres queue is the only implementation that exists, and a knob whose
+    /// value does nothing is worse than an absent knob; mode selection lands with
+    /// the implementation it selects.
+    pub outbox: OutboxConfig,
+
     /// Feature toggles keyed by registered feature name. Enabling an
     /// experimental feature additionally requires `ack` equal to the
     /// feature's exact current version; see the feature reference in the
     /// generated docs/CONFIG.md.
     pub features: BTreeMap<String, FeatureToggle>,
+}
+
+/// Transactional outbox and job queue settings (issue #104).
+///
+/// These are the knobs of the shared dispatch substrate, not of any one consumer. Every
+/// value has a safe default, and the defaults are chosen so a deployment that never opens
+/// this section still gets: bounded retries that end in a dead letter rather than an
+/// infinite redelivery loop, a visibility timeout longer than any handler the tree ships,
+/// and a worker count above one, because a pool of one is the singleton posture this
+/// substrate exists to avoid.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct OutboxConfig {
+    /// How many worker tasks ONE process runs per consumer. Workers claim independently
+    /// (`FOR UPDATE SKIP LOCKED` under a visibility lease), so raising this needs no
+    /// coordination and cannot reorder an aggregate's messages: per-aggregate ordering is
+    /// enforced by the claim itself.
+    ///
+    /// The default (2) is deliberately not 1. A single worker is exactly the mandatory
+    /// singleton posture the field's cautionary example (Ory Kratos's courier) is stuck
+    /// in, and shipping 1 as the default would make "we are not a singleton" a property
+    /// nobody exercises until the first operator raises it. It is also not large: the
+    /// real ceiling is the database connection pool, since every claiming worker holds a
+    /// connection.
+    ///
+    /// `0` is refused rather than read as "disabled", because a pool configured to run
+    /// no workers looks healthy while the queue fills. Must be at least 1 and at most
+    /// [`OUTBOX_MAX_WORKER_CONCURRENCY`].
+    pub worker_concurrency: u32,
+
+    /// The visibility timeout in seconds: how long a claim hides a message from other
+    /// workers. A crashed worker's messages are reclaimed this long after they were
+    /// claimed, so this is the worst-case redelivery latency AND the deadline every
+    /// handler must finish inside. Setting it below a handler's real duration causes
+    /// duplicate delivery of everything that consumer handles, which is safe (delivery is
+    /// at-least-once and consumers are idempotent) but wasteful.
+    ///
+    /// The default (30) exceeds the slowest outbound handler this tree ships, whose own
+    /// per-request budget is ten seconds. Must be at least 1 and at most
+    /// `OIDC_MAX_LIFETIME_SECS`.
+    pub visibility_timeout_secs: u64,
+
+    /// How often, in seconds, an idle worker polls for due work. It bounds the latency
+    /// between a message being enqueued and being picked up, and it is a straight trade
+    /// against database load: every worker of every consumer issues one claim per
+    /// interval per scope even when the queue is empty.
+    ///
+    /// The default (5) matches the cadence the back-channel logout worker already runs
+    /// at. Must be at least 1 and at most `OIDC_MAX_LIFETIME_SECS`.
+    pub poll_interval_secs: u64,
+
+    /// The largest number of messages one claim leases, and a HARD bound: the worker
+    /// re-stamps each message's lease immediately before handing it over, so the batch
+    /// does NOT share one deadline and `visibility_timeout_secs` has to cover one handler
+    /// rather than `claim_batch` of them.
+    ///
+    /// What a large batch does cost is the tail of it sitting claimed but unhandled while
+    /// the worker works forward: past `visibility_timeout_secs` of work, another worker
+    /// takes what this one has not reached. Nothing is lost or duplicated (the message is
+    /// handed off cleanly and counted), but the claim round trip that leased it was
+    /// wasted, so a batch far larger than one worker can clear inside the timeout buys
+    /// nothing.
+    ///
+    /// The default (64) matches the batch the back-channel logout worker already claims.
+    /// Must be at least 1 and at most [`OUTBOX_MAX_CLAIM_BATCH`].
+    pub claim_batch: u32,
+
+    /// The total number of attempts a message gets before it is DEAD-LETTERED. `1` means
+    /// no retry at all: the first failure is terminal.
+    ///
+    /// This bound is not only a politeness to a failing endpoint. A message that shares
+    /// an ordering key with others BLOCKS them until it reaches a terminal state, so the
+    /// dead letter is what releases the aggregate; an unbounded retry would wedge that
+    /// aggregate forever, which is why there is no "unlimited" value here and never will
+    /// be. The default (5) is conservative. Must be at least 1.
+    pub max_attempts: u32,
+
+    /// The base delay in seconds of the exponential backoff between retries. The nth
+    /// retry waits about `base * 2^(n-1)` seconds plus a jitter of up to `base`, both
+    /// drawn from the deterministic clock and entropy seams, capped at one hour.
+    ///
+    /// The default (10) is conservative. Must be at least 1 and at most
+    /// `OIDC_MAX_LIFETIME_SECS`.
+    pub retry_base_secs: u64,
+}
+
+impl Default for OutboxConfig {
+    fn default() -> Self {
+        Self {
+            worker_concurrency: 2,
+            visibility_timeout_secs: 30,
+            poll_interval_secs: 5,
+            claim_batch: 64,
+            max_attempts: 5,
+            retry_base_secs: 10,
+        }
+    }
 }
 
 /// Headless flow API settings (issue #84).
@@ -201,6 +318,21 @@ pub const ORGANIZATIONS_DEFAULT_MAX_GROUP_DEPTH: u32 = 8;
 /// The store mirrors this value and clamps to it independently, so even a miswired
 /// caller cannot exceed it; a cross-crate test pins the two together.
 pub const ORGANIZATIONS_MAX_GROUP_DEPTH_CEILING: u32 = 32;
+
+/// The hard ceiling on `outbox.worker_concurrency` (issue #104). Config load refuses
+/// any larger value. Every worker holds a database connection while it claims, so the
+/// bound that matters is the pool, not the CPU: a concurrency far above the pool size
+/// buys nothing and turns claim latency into connection-acquire latency. 64 is well
+/// above any real deployment's pool and still finite, which is the point: an unbounded
+/// setting would let one typo exhaust the pool for every other subsystem in the process.
+pub const OUTBOX_MAX_WORKER_CONCURRENCY: u32 = 64;
+
+/// The hard ceiling on `outbox.claim_batch` (issue #104). A claim materializes its whole
+/// batch in the worker's memory and leases every row in it at once, so an oversized batch
+/// is both a memory cost and a pile of rows sitting claimed but unhandled while the worker
+/// works forward, which another worker then takes off it. 1024 is far past useful and
+/// still bounds both to something an operator can reason about.
+pub const OUTBOX_MAX_CLAIM_BATCH: u32 = 1_024;
 
 /// The default client-authentication diagnostic retention, in seconds (seven days).
 ///
@@ -4364,6 +4496,7 @@ impl Config {
         validate_diagnostics(&self.diagnostics)?;
         validate_organizations(&self.organizations)?;
         validate_token_claims(&self.token_claims)?;
+        validate_outbox(&self.outbox)?;
         Ok(())
     }
 }
@@ -4440,6 +4573,79 @@ fn validate_organizations(organizations: &OrganizationsConfig) -> Result<(), Con
                 organizations.max_group_depth
             ),
         });
+    }
+    Ok(())
+}
+
+/// Validate the outbox and job queue settings (issue #104), kept out of
+/// [`Config::validate`] so each stays within the readable-length lint.
+///
+/// Every bound here has a failure it is preventing, and none of them is "a large number
+/// looks wrong". A `worker_concurrency` of 0 runs no workers while the queue fills, and
+/// one above the ceiling exhausts the connection pool for every other subsystem. A
+/// `max_attempts` of 0 would mean a message that can never reach a terminal state, which
+/// wedges its whole ordering group forever. The three second-valued knobs are bounded
+/// like every other second-valued knob in this file: a zero is meaningless and a value
+/// past the ceiling is a misconfiguration. A `claim_batch` of 0 claims nothing.
+///
+/// What is deliberately NOT validated is the relationship between
+/// `visibility_timeout_secs` and how long a handler takes, which is the one real
+/// constraint here. Config load cannot know a handler's duration, so stating it in that
+/// setting's documentation is honest where a made-up cross check would not be. It is
+/// notably NOT a constraint involving `claim_batch`: the worker re-stamps each message's
+/// lease before handling it, so the batch size does not multiply into the deadline.
+fn validate_outbox(outbox: &OutboxConfig) -> Result<(), ConfigError> {
+    if outbox.worker_concurrency < 1 {
+        return Err(ConfigError::Invalid {
+            message: "outbox.worker_concurrency must be at least 1".to_owned(),
+        });
+    }
+    if outbox.worker_concurrency > OUTBOX_MAX_WORKER_CONCURRENCY {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "outbox.worker_concurrency ({}) must not exceed {OUTBOX_MAX_WORKER_CONCURRENCY}",
+                outbox.worker_concurrency
+            ),
+        });
+    }
+    if outbox.claim_batch < 1 {
+        return Err(ConfigError::Invalid {
+            message: "outbox.claim_batch must be at least 1".to_owned(),
+        });
+    }
+    if outbox.claim_batch > OUTBOX_MAX_CLAIM_BATCH {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "outbox.claim_batch ({}) must not exceed {OUTBOX_MAX_CLAIM_BATCH}",
+                outbox.claim_batch
+            ),
+        });
+    }
+    if outbox.max_attempts < 1 {
+        return Err(ConfigError::Invalid {
+            message: "outbox.max_attempts must be at least 1".to_owned(),
+        });
+    }
+    for (name, value) in [
+        (
+            "outbox.visibility_timeout_secs",
+            outbox.visibility_timeout_secs,
+        ),
+        ("outbox.poll_interval_secs", outbox.poll_interval_secs),
+        ("outbox.retry_base_secs", outbox.retry_base_secs),
+    ] {
+        if value < 1 {
+            return Err(ConfigError::Invalid {
+                message: format!("{name} must be at least 1 second"),
+            });
+        }
+        if value > OIDC_MAX_LIFETIME_SECS {
+            return Err(ConfigError::Invalid {
+                message: format!(
+                    "{name} ({value}) must not exceed {OIDC_MAX_LIFETIME_SECS} seconds"
+                ),
+            });
+        }
     }
     Ok(())
 }
@@ -6420,6 +6626,120 @@ mod tests {
             .expect("off is valid")
             .config;
         assert_eq!(off.diagnostics.verbosity, DiagnosticVerbosity::Off);
+    }
+
+    #[test]
+    fn the_outbox_section_defaults_safely_and_refuses_every_setting_that_would_stall_it() {
+        // Defaults (issue #104). Each is asserted by VALUE rather than against the
+        // `Default` impl, because a test that compares the impl to itself would pass
+        // whatever the impl said, and these particular numbers are the whole safe-default
+        // claim: more than one worker (not the singleton posture), a visibility timeout
+        // longer than the slowest handler in the tree, and a FINITE attempts bound.
+        let config = Config::from_toml_str("", "<inline>").expect("valid").config;
+        assert_eq!(
+            config.outbox.worker_concurrency, 2,
+            "the default pool is a POOL: a default of 1 would ship the singleton posture"
+        );
+        assert_eq!(config.outbox.visibility_timeout_secs, 30);
+        assert_eq!(config.outbox.poll_interval_secs, 5);
+        assert_eq!(config.outbox.claim_batch, 64);
+        assert_eq!(
+            config.outbox.max_attempts, 5,
+            "the attempts bound is finite: it is what releases a blocked ordering group"
+        );
+        assert_eq!(config.outbox.retry_base_secs, 10);
+
+        // Every refusal, each with the failure it prevents. A zero worker count runs no
+        // workers while the queue fills; a zero attempts bound leaves a message that can
+        // never reach a terminal state, so its whole ordering group is wedged forever; a
+        // zero batch claims nothing; and the two over-ceiling values would exhaust the
+        // connection pool and outlive their own lease respectively.
+        for (label, toml) in [
+            (
+                "zero workers",
+                "[outbox]\nworker_concurrency = 0\n".to_owned(),
+            ),
+            (
+                "workers above the ceiling",
+                format!(
+                    "[outbox]\nworker_concurrency = {}\n",
+                    OUTBOX_MAX_WORKER_CONCURRENCY + 1
+                ),
+            ),
+            ("zero batch", "[outbox]\nclaim_batch = 0\n".to_owned()),
+            (
+                "batch above the ceiling",
+                format!("[outbox]\nclaim_batch = {}\n", OUTBOX_MAX_CLAIM_BATCH + 1),
+            ),
+            ("zero attempts", "[outbox]\nmax_attempts = 0\n".to_owned()),
+            (
+                "zero visibility timeout",
+                "[outbox]\nvisibility_timeout_secs = 0\n".to_owned(),
+            ),
+            (
+                "visibility timeout above the ceiling",
+                format!(
+                    "[outbox]\nvisibility_timeout_secs = {}\n",
+                    OIDC_MAX_LIFETIME_SECS + 1
+                ),
+            ),
+            (
+                "zero poll interval",
+                "[outbox]\npoll_interval_secs = 0\n".to_owned(),
+            ),
+            (
+                "zero retry base",
+                "[outbox]\nretry_base_secs = 0\n".to_owned(),
+            ),
+        ] {
+            let err = Config::from_toml_str(&toml, "ironauth.toml")
+                .expect_err(&format!("{label} must be refused at load"));
+            assert!(
+                matches!(err, ConfigError::Invalid { .. }),
+                "{label} must be a boot-time Invalid: {err:?}"
+            );
+        }
+
+        // The controls at the other end: each ceiling value itself, and the smallest
+        // legal value of each knob, all LOAD. Without these the refusals above would pass
+        // just as well against a validator that rejected everything.
+        let at_bounds = format!(
+            "[outbox]\nworker_concurrency = {OUTBOX_MAX_WORKER_CONCURRENCY}\n\
+             claim_batch = {OUTBOX_MAX_CLAIM_BATCH}\n\
+             visibility_timeout_secs = {OIDC_MAX_LIFETIME_SECS}\n\
+             poll_interval_secs = {OIDC_MAX_LIFETIME_SECS}\n\
+             retry_base_secs = {OIDC_MAX_LIFETIME_SECS}\n\
+             max_attempts = 1\n"
+        );
+        let config = Config::from_toml_str(&at_bounds, "<inline>")
+            .expect("the ceilings themselves are valid")
+            .config;
+        assert_eq!(
+            config.outbox.worker_concurrency,
+            OUTBOX_MAX_WORKER_CONCURRENCY
+        );
+        assert_eq!(
+            config.outbox.max_attempts, 1,
+            "one attempt is a valid posture: the first failure is terminal"
+        );
+        let minimal = Config::from_toml_str(
+            "[outbox]\nworker_concurrency = 1\nclaim_batch = 1\n\
+             visibility_timeout_secs = 1\npoll_interval_secs = 1\nretry_base_secs = 1\n\
+             max_attempts = 1\n",
+            "<inline>",
+        )
+        .expect("the smallest legal value of every knob is valid")
+        .config;
+        assert_eq!(minimal.outbox.claim_batch, 1);
+
+        // The section rejects unknown keys, so a typo is a startup failure rather than a
+        // silently ignored queue setting. This is the one that matters most here: a
+        // misspelled `visibility_timeout_secs` that was ignored would leave the default
+        // in place and an operator convinced they had raised it.
+        assert!(
+            Config::from_toml_str("[outbox]\nvisibility_timeout_sec = 60\n", "<inline>").is_err(),
+            "a misspelled key in [outbox] must fail the load"
+        );
     }
 
     #[test]

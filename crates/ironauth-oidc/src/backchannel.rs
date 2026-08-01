@@ -323,11 +323,14 @@ impl<S: LogoutSender> BackChannelLogoutWorker<S> {
                 .backchannel_deliveries()
                 .enqueue_for_event(&self.env, &event.id, &event.session_id)
                 .await?;
-            // The deliveries are durably queued; retire the outbox event. Idempotent, so
-            // a re-drain before this mark simply re-explodes into the same rows.
+            // The deliveries are durably queued; retire the outbox event. The mark is
+            // FENCED on the lease this claim was handed (issue #104), so if the explode
+            // outran the visibility timeout and another worker has since taken the event,
+            // this one does not retire it out from under that worker. Either way it is
+            // idempotent: a re-drain simply re-explodes into the same rows.
             scoped
                 .session_events()
-                .mark_delivered(&self.env, &event.id)
+                .mark_delivered(&self.env, event)
                 .await?;
             stats.events_exploded += 1;
         }

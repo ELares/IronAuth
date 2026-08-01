@@ -589,12 +589,31 @@ impl ScopedKind for InvitationKind {
 /// domain enqueues on EVERY terminal session end (issue #35). The transactional-outbox
 /// substrate the back-channel logout worker (#34) and the external webhooks (M11)
 /// drain off one seam. Tenant scoped like every other resource, so a scope can never
-/// drain another tenant's session-ended events; the id doubles as the IDEMPOTENCY KEY a
-/// consumer dedups redelivery on. An INTERNAL tracking row, never a bearer credential.
+/// drain another tenant's session-ended events. An INTERNAL tracking row, never a bearer
+/// credential.
+///
+/// Since issue #104 the session-ended fan-out is a CONSUMER on the generic outbox, so
+/// nothing mints one of these any more and a drained event carries an `obx_` id. The kind
+/// is kept because migration 0024's table is kept: it still exists, still forces
+/// row-level security, and any row already in it still has an id of this shape. It is not
+/// a slot to fill; the substrate's id is [`OutboxMessageId`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SessionEventKind;
 impl ScopedKind for SessionEventKind {
     const PREFIX: &'static str = "sev";
+}
+
+/// Marker for a generic outbox message (`obx_`), one row of the transactional outbox and
+/// lease based job queue every async path drains (issue #104). Tenant scoped like every
+/// other resource, so a scope can never claim another tenant's messages. The id is the
+/// SUBSTRATE's handle on the row; the producer's dedup handle is the separate
+/// `idempotency_key` column, because a producer retrying an enqueue can reconstruct a
+/// key derived from the domain fact and cannot reconstruct a freshly minted identifier.
+/// An INTERNAL tracking row, never a bearer credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OutboxMessageKind;
+impl ScopedKind for OutboxMessageKind {
+    const PREFIX: &'static str = "obx";
 }
 
 /// Marker for a per-RP back-channel-logout delivery (`bld_`), one row per participating
@@ -1544,6 +1563,9 @@ pub type InvitationId = ScopedId<InvitationKind>;
 /// A session-ended outbox event identifier (`sev_...`), the durable row enqueued on
 /// every terminal session end and the idempotency key a consumer dedups on (issue #35).
 pub type SessionEventId = ScopedId<SessionEventKind>;
+/// A generic outbox message identifier (`obx_...`), one row of the transactional outbox
+/// and lease based job queue (issue #104).
+pub type OutboxMessageId = ScopedId<OutboxMessageKind>;
 /// A per-RP back-channel-logout delivery identifier (`bld_...`), one row in the
 /// at-least-once delivery queue per participating relying party (issue #34).
 pub type BackChannelDeliveryId = ScopedId<BackChannelDeliveryKind>;

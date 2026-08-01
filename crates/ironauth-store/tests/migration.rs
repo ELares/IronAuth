@@ -616,7 +616,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
     );
     assert_eq!(
         report.already_applied(),
-        98,
+        99,
         "a migration was added to or removed from the production chain; this count is a \
          deliberate checkpoint, not a bug, so read the new migration, satisfy yourself that it \
          belongs in the shipped chain, then update this number and the subject list below and \
@@ -647,7 +647,8 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
          organization role assignments, organization authentication policies, permission \
          vocabulary, role-to-permission mapping, organization default role, resource-server \
          permission claims, token size event budget columns, client allowed scopes, \
-         email-factor downgrade configuration, control-plane dead-surface grants."
+         email-factor downgrade configuration, control-plane dead-surface grants, generic \
+         transactional outbox."
     );
 
     // The ledger holds exactly the shipped versions, contiguous and in order.
@@ -658,7 +659,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
             46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67,
             68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89,
-            90, 91, 92, 93, 94, 95, 96, 97, 98
+            90, 91, 92, 93, 94, 95, 96, 97, 98, 99
         ]
     );
     let phase_of = |version: i64| async move {
@@ -2658,6 +2659,33 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
         assert!(
             column_exists(pool, "backchannel_logout_deliveries", column).await,
             "backchannel_logout_deliveries.{column} exists"
+        );
+    }
+    // The generic transactional outbox and lease based job queue (issue #104): the ONE
+    // at-least-once dispatch substrate every async path drains, which the session-ended
+    // fan-out above is now the first consumer on. Its routing columns (consumer,
+    // idempotency_key, ordering_key) and its payload are immutable once enqueued; the six
+    // lifecycle columns are the only ones a drain is granted UPDATE on.
+    assert!(
+        table_exists(pool, "outbox_messages").await,
+        "outbox_messages exists"
+    );
+    for column in [
+        "consumer",
+        "idempotency_key",
+        "ordering_key",
+        "payload",
+        "attempts",
+        "next_attempt_at",
+        "claimed_at",
+        "last_error",
+        "completed_at",
+        "dead_lettered_at",
+        "enqueued_at",
+    ] {
+        assert!(
+            column_exists(pool, "outbox_messages", column).await,
+            "outbox_messages.{column} exists"
         );
     }
     // The Front-Channel Logout per-client registration (issue #39): the two additive
@@ -6914,5 +6942,282 @@ async fn the_control_plane_holds_exactly_the_dead_surface_grants_0098_adds() {
     assert!(
         role_has_table_privilege(pool, "ironauth_app", "abuse_bans", "SELECT").await,
         "the data plane holds the abuse_bans SELECT that enforcement reads"
+    );
+}
+
+/// The generic outbox table's isolation, its two partial indexes, its terminal-state
+/// CHECK, and its least-privilege grants (issue #104, migration 0099).
+///
+/// Its own test rather than more lines in the production-chain assertions, for the reason
+/// the 0090, 0093, and 0094 tests record. What it pins that the chain sweep cannot: the
+/// head-of-group index the per-aggregate ordering rule depends on for its cost, and the
+/// grant shape that makes a message's ROUTING immutable to the plane that drains it.
+#[tokio::test]
+async fn outbox_messages_carries_its_isolation_and_its_structural_state_constraints() {
+    let db = TestDatabase::start().await;
+    let pool = db.owner_pool();
+
+    // EXPAND: one new table, two new indexes, one policy, two grants. Nothing existing is
+    // altered and no data is moved, which is what makes it safe for an old binary still
+    // writing the table this consumer moved off.
+    let phase: String = sqlx::query("SELECT phase FROM _schema_migrations WHERE version = 99")
+        .fetch_one(pool)
+        .await
+        .expect("0099 is in the ledger")
+        .get("phase");
+    assert_eq!(phase, "expand");
+
+    // Isolation: enabled AND forced, so the policy binds even for the table owner, plus
+    // the (tenant, environment) policy and the nonempty-scope CHECK every scoped table
+    // carries.
+    assert!(
+        rls_enabled_and_forced(pool, "outbox_messages").await,
+        "outbox_messages must have row-level security ENABLED and FORCED"
+    );
+    assert!(
+        policy_exists(pool, "outbox_messages", "outbox_messages_tenant_isolation").await,
+        "outbox_messages carries its (tenant, environment) isolation policy"
+    );
+    assert!(
+        check_constraint_exists(pool, "outbox_messages", "outbox_messages_scope_nonempty").await,
+        "outbox_messages carries the nonempty-scope CHECK"
+    );
+    // An empty consumer would be claimable by no registered drain and would sit in the
+    // queue forever; an empty ordering key would collapse a consumer's whole queue into
+    // one ordering group and serialize it.
+    assert!(
+        check_constraint_exists(pool, "outbox_messages", "outbox_messages_routing_nonempty").await,
+        "outbox_messages refuses an empty consumer, idempotency key, or ordering key"
+    );
+    // The two terminal markers are mutually exclusive. Without this a row could read as
+    // completed AND dead-lettered at once, and the "not terminal" predicate the claim and
+    // the head-of-group rule SHARE would be satisfied by neither reading.
+    assert!(
+        check_constraint_exists(
+            pool,
+            "outbox_messages",
+            "outbox_messages_one_terminal_state"
+        )
+        .await,
+        "a message is completed or dead-lettered, never both"
+    );
+    assert!(
+        check_constraint_exists(
+            pool,
+            "outbox_messages",
+            "outbox_messages_attempts_nonnegative"
+        )
+        .await,
+        "the attempts counter cannot go negative"
+    );
+
+    // Enqueue idempotency, made structural: one message per (consumer, domain fact).
+    let unique_columns = sqlx::query(
+        "SELECT a.attname AS name \
+         FROM pg_constraint c \
+         JOIN unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord) ON true \
+         JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum \
+         WHERE c.conrelid = 'outbox_messages'::regclass AND c.contype = 'u' \
+         ORDER BY k.ord",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("read the unique constraint columns")
+    .iter()
+    .map(|row| row.get::<String, _>("name"))
+    .collect::<Vec<_>>();
+    assert_eq!(
+        unique_columns,
+        vec![
+            "tenant_id".to_owned(),
+            "environment_id".to_owned(),
+            "consumer".to_owned(),
+            "idempotency_key".to_owned()
+        ],
+        "the dedup key is scoped to a consumer: two consumers may reuse one key"
+    );
+
+    // The table this consumer moved OFF is left completely intact, which is what makes
+    // 0099 old-binary safe: a replica still running the previous binary keeps writing and
+    // draining it without error while the rollout completes.
+    assert!(
+        table_exists(pool, "session_ended_events").await,
+        "0099 must not drop or alter the table the session-ended consumer moved off"
+    );
+}
+
+/// The generic outbox's three indexes (issue #104, migration 0099): two PARTIAL ones over
+/// the live tail, and one NON-PARTIAL one over every state.
+///
+/// Split from the isolation test above only because the combined body outran the
+/// readable-length lint. What it pins is not decoration: the head-of-group index is what
+/// keeps the per-aggregate ordering rule from turning the claim into a scan of a group,
+/// BOTH partial predicates have to name BOTH terminal markers or the anti-join reports a
+/// retired message as a blocker, and the third index has to be non-partial or the ordered
+/// all-states listing an operator reads the dead-letter tail through sorts the scope's
+/// entire history on every page.
+#[tokio::test]
+async fn outbox_messages_carries_the_three_indexes_the_drain_the_ordering_and_the_listing_need() {
+    let db = TestDatabase::start().await;
+    let pool = db.owner_pool();
+
+    // The candidate scan index: a consumer's non-terminal messages in drain order.
+    assert!(
+        partial_index_exists(pool, "outbox_messages", "outbox_messages_pending_idx").await,
+        "the pending drain index is PARTIAL, so the working set is the live tail"
+    );
+    assert_eq!(
+        index_columns(pool, "outbox_messages", "outbox_messages_pending_idx").await,
+        vec![
+            "tenant_id".to_owned(),
+            "environment_id".to_owned(),
+            "consumer".to_owned(),
+            "sequence".to_owned()
+        ],
+        "the drain scans one consumer's scope in sequence order"
+    );
+    // THE index the per-aggregate ordering rule rests on. The claim asks, per candidate,
+    // whether its group holds a non-terminal message with a lower sequence; with this
+    // index that is one probe of the group's minimum. Without it the ordering guarantee
+    // would still be CORRECT and would turn the claim into a scan of the group, which is
+    // why the index is pinned here and not left to the planner's luck.
+    assert!(
+        partial_index_exists(pool, "outbox_messages", "outbox_messages_group_head_idx").await,
+        "the head-of-group index is PARTIAL on the non-terminal messages"
+    );
+    assert_eq!(
+        index_columns(pool, "outbox_messages", "outbox_messages_group_head_idx").await,
+        vec![
+            "tenant_id".to_owned(),
+            "environment_id".to_owned(),
+            "consumer".to_owned(),
+            "ordering_key".to_owned(),
+            "sequence".to_owned()
+        ],
+        "the head-of-group probe is keyed by (scope, consumer, ordering key, sequence)"
+    );
+    // Both predicates must name BOTH terminal markers. One that mentioned only
+    // completed_at would exclude nothing dead-lettered from the index and the anti-join
+    // would keep reporting a dead-lettered head as a blocker, wedging its group forever.
+    for index in [
+        "outbox_messages_pending_idx",
+        "outbox_messages_group_head_idx",
+    ] {
+        let predicate = index_predicate(pool, "outbox_messages", index).await;
+        assert!(
+            predicate.contains("completed_at IS NULL")
+                && predicate.contains("dead_lettered_at IS NULL"),
+            "{index} must be partial on BOTH terminal markers, got `{predicate}`"
+        );
+    }
+
+    // The third index is the one that must NOT be partial, and that is the whole reason
+    // it exists: `list` returns a consumer's messages in ANY state, newest first, with a
+    // limit, and the completed and dead-lettered rows it is mostly for are exactly what
+    // the two partial indexes above exclude. Measured at 205k rows over 100 scopes,
+    // without it that read is a bitmap scan of the scope's whole history plus a top-N
+    // heapsort (2075 buffers) instead of an index scan backward (53).
+    // Existence first: `index_columns` returns an empty vector for an index that is not
+    // there, so this comparison is what proves the index exists at all, and the
+    // not-partial check below would pass vacuously without it.
+    assert_eq!(
+        index_columns(pool, "outbox_messages", "outbox_messages_scope_idx").await,
+        vec![
+            "tenant_id".to_owned(),
+            "environment_id".to_owned(),
+            "consumer".to_owned(),
+            "sequence".to_owned()
+        ],
+        "the all-states index leads with the scope the RI probe keys on and extends \
+         through the consumer and the order the listing sorts by"
+    );
+    assert!(
+        !partial_index_exists(pool, "outbox_messages", "outbox_messages_scope_idx").await,
+        "the all-states scope index must NOT be partial: the readers it serves span every \
+         state, and a partial index would exclude exactly the rows they are for"
+    );
+}
+
+/// The generic outbox's grant shape (issue #104, migration 0099): what each plane may do
+/// to a queued message, and the much longer list of what it may not.
+///
+/// Split from the schema test above only because the combined body outran the
+/// readable-length lint; the two halves are one obligation. The grant shape is the
+/// structural half of the ordering and routing guarantees: a drain that could rewrite
+/// `consumer` or `ordering_key` could defeat both without touching a line of Rust.
+#[tokio::test]
+async fn outbox_messages_holds_its_lifecycle_only_grants_on_both_planes() {
+    let db = TestDatabase::start().await;
+    let pool = db.owner_pool();
+
+    // The data plane ENQUEUEs (inside the domain transaction), READs, and mutates the six
+    // lifecycle columns.
+    for privilege in ["SELECT", "INSERT"] {
+        assert!(
+            role_has_table_privilege(pool, "ironauth_app", "outbox_messages", privilege).await,
+            "the data plane needs {privilege} to enqueue and drain"
+        );
+    }
+    for column in [
+        "attempts",
+        "next_attempt_at",
+        "claimed_at",
+        "last_error",
+        "completed_at",
+        "dead_lettered_at",
+    ] {
+        assert!(
+            role_has_column_privilege(pool, "ironauth_app", "outbox_messages", column, "UPDATE")
+                .await,
+            "the drain must be able to write the lifecycle column {column}"
+        );
+    }
+    // And NOTHING else. A drain that could rewrite `consumer` could hand another
+    // subsystem's message to itself; one that could rewrite `ordering_key` could move a
+    // message into another aggregate and jump the queue; one that could rewrite `payload`
+    // could change what a consumer is asked to do after the domain write that authorized
+    // it committed.
+    for column in [
+        "id",
+        "tenant_id",
+        "environment_id",
+        "consumer",
+        "idempotency_key",
+        "ordering_key",
+        "payload",
+        "enqueued_at",
+    ] {
+        assert!(
+            !role_has_column_privilege(pool, "ironauth_app", "outbox_messages", column, "UPDATE")
+                .await,
+            "outbox_messages.{column} must be immutable by GRANT for the data plane"
+        );
+    }
+    assert!(
+        !role_has_table_privilege(pool, "ironauth_app", "outbox_messages", "UPDATE").await,
+        "0099 must not grant the data plane a table-wide UPDATE (the #31 lesson)"
+    );
+    assert!(
+        !role_has_table_privilege(pool, "ironauth_app", "outbox_messages", "DELETE").await,
+        "a drain retires a message by marking it terminal, never by deleting it"
+    );
+
+    // The control plane can enqueue (its own domain writes must be able to emit a message
+    // in their own transaction) and read (queue depth, the dead-letter tail), and it does
+    // not drain, so it holds no UPDATE of any shape and cannot retire another plane's
+    // message or extend a lease.
+    for privilege in ["SELECT", "INSERT"] {
+        assert!(
+            role_has_table_privilege(pool, "ironauth_control", "outbox_messages", privilege).await,
+            "the control plane needs {privilege} on outbox_messages"
+        );
+    }
+    assert!(
+        !role_has_any_column_privilege(pool, "ironauth_control", "outbox_messages", "UPDATE").await,
+        "the control plane does not drain, so it holds no UPDATE on outbox_messages"
+    );
+    assert!(
+        !role_has_table_privilege(pool, "ironauth_control", "outbox_messages", "DELETE").await,
+        "the control plane cannot delete a queued message"
     );
 }
