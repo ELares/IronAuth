@@ -6,6 +6,71 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **FORTY-SEVEN comments used an idiom that asserts a foreign key from `audit_log` to the
+  row the sentence is about, and for every table but two there is no such foreign key**
+  (issue #404). `audit_log` (0002) carries exactly two, to `tenants` and to `environments`,
+  and it could carry no more: `target_id` is a single polymorphic `text` column naming the
+  target of all 215 `Action` variants, and a column can reference only one table.
+  SEVENTEEN hard `DELETE FROM` statements in `repository.rs` run inside an audited write
+  closure, and TWELVE of those delete the very row the audit row names (`ClientDelete`,
+  `ConnectorDelete`, `BrandAssetDelete`, `LocaleDelete`, `SignupFormDelete`,
+  `EnvironmentVariableDelete`, `EnvironmentSecretDelete`, `AaguidRuleRemove`,
+  `CredentialClassPolicyRemove`, `ScopeStepUpPolicyRemove`, `AdminConsentRevoke`,
+  `AbuseBanLift`), so such a key would break shipped behaviour on day one. The RETENTION
+  the comments describe is real and unchanged; only the stated reason was wrong.
+  The counts, measured two independent ways (a whole-file normaliser over the base tree,
+  and `scripts/audit-fk-claim-scan.sh` with its frozen list neutralised): forty-seven
+  occurrences across twenty files, of which THIRTY-SIX in eleven files are editable and
+  ELEVEN in nine shipped, checksummed migrations are not. Every editable one now either
+  names the table the foreign key really references or says the audit row's target stays
+  resolvable as an APPLICATION rule; the true/false split across the forty-seven was not
+  tallied, because the same edit is the right one either way and a number nobody counted
+  is what this entry is correcting. The reasoning lives once on `Action`, and the scan
+  bans the idiom so it cannot come back, pinning the frozen set by file AND by occurrence
+  count so a new migration repeating it fails and an edit adding one to a frozen file
+  fails too.
+- **A migration `.sql` file that was never registered in `registry()` was caught by
+  nothing** (issue #446). The chain-count tripwire asserts a hardcoded number against the
+  LIVE ledger, and an unregistered file never reaches the ledger, so both numbers agreed
+  while both were wrong about what is on disk. Five unit tests in `migrate.rs` now compare
+  the directory against the registry in both directions, by name and by CONTENT (which
+  catches an `include_str!` path crossed to another migration), and require the versions to
+  be contiguous from one and the directory to hold only `.sql` files. The chain-count
+  tripwire is UNTOUCHED: it forces a human to read every added migration, which a derived
+  check cannot do (issue #390).
+- **The obligation to add a new tenant-scoped table to `scripts/query-audit.sh` was prose
+  in two places and enforced in neither** (issue #446). A forced-row-level-security table
+  absent from that list is simply never grepped for, so raw SQL against it from any crate
+  passes silently, which is the isolation bypass the lint exists to prevent.
+  `scripts/scoped-table-registration.sh` now derives the set from the migrations and
+  compares it against the list both ways: 103 forced tables against 105 registered names
+  and the two documented exceptions, agreeing exactly. It also refuses a table with
+  row-level security ENABLED but never FORCED, which is the shape that would be invisible
+  to both sides at once, and pins the size of the derived set so a statement spelling that
+  quietly stops matching fails instead of reporting a smaller clean run. The derivation is
+  statement-based rather than line-based, so a wrapped `ALTER TABLE`, a schema-qualified
+  name, and a migration in a subdirectory are all seen.
+- `ClientAuthDiagnosticReason::ALL`, `DiagnosticExpectation::ALL` and `TokenSizeReason::ALL`
+  (issue #404 review): the single definition of "every variant" for each, so a caller in
+  another crate that must cover them all iterates one of these instead of writing its own
+  list, which is where a new variant silently fails to appear. Three such lists existed in
+  `ironauth-oidc`, each pinned by a total `match` beside it, and that pin does not work: a
+  variant added to the enum and to the `match` leaves the list short, and nothing outside
+  the `match` can observe a variant the list omits, so no assertion written over the list
+  can notice. Measured on all three. Completeness here is instead a MEASUREMENT:
+  `variant_lists_match_the_enum_declarations` parses the variant identifiers out of
+  `repository.rs` and compares them against the arrays, the same principle `ironauth-config`
+  applies to `DiagnosticVerbosity::ALL` with a different witness. Adding a variant remains a
+  compile error in each enum's `as_str`; what the test adds is catching the array that then
+  stays at its old length.
+- CORRECTION to the redaction claims on `NewClientAuthDiagnostic`, `NewPolicyDecisionTrace`,
+  `PolicyDecisionInputs` and both read-back record types, which said the corpus proves no
+  secret sentinel can reach a serialized record (issue #423). It proves no such thing for a
+  `&str`: those fields would record one verbatim, several are attacker influenced, and the
+  corpus builds its records from safe literals. Each type now states the guarantee in the
+  two tiers it holds in, structural where a closed enum or a bounded integer makes it
+  provable and caller discipline where it does not. The header of migration 0073 states the
+  old claim and is checksummed, so the correction for it lives on `PolicyDecisionInputs`.
 - **A WRITE into a `(tenant, environment)` scope that was never created answers the uniform
   not-found instead of a database fault** (issues #409, #449). Row-level security already
   made a READ in an absent scope indistinguishable from a read in an empty one, but a write
@@ -1162,7 +1227,8 @@ range per docs/RELEASING.md.
     tenant nor an environment).
   - **Soft-delete on organizations.** `migration 0027` adds a nullable
     `organizations.deleted_at` so an organization deactivates without ever hard-deleting
-    a row the append-only audit log references, exactly as tenants and environments do.
+    a row the append-only audit log NAMES (no foreign key enforces that; retention of an
+    audited organization is an application rule), exactly as tenants and environments do.
     The control role gains `SELECT, INSERT` and a COLUMN-SCOPED `UPDATE (deleted_at)`
     (never a table-wide UPDATE: the #31 lesson). The existing `ENABLE`/`FORCE` row-level
     security, the `(tenant, environment)` isolation policy, and the nonempty-scope CHECK
@@ -1946,8 +2012,8 @@ range per docs/RELEASING.md.
     tenant-RLS-scoped, because an operator-plane POST is looked up before any
     tenant exists). Both are added to `scripts/query-audit.sh`'s scoped-table
     list. `tenants` and `environments` gain a `deleted_at` soft-delete column, so
-    a DELETE is a deactivation that keeps the row and the append-only audit
-    foreign keys satisfiable.
+    a DELETE is a deactivation that keeps the row and the two foreign keys from
+    `audit_log`, to `tenants` and to `environments`, satisfiable.
   - New id types and helpers: `ManagementKeyId` (`mak_`, scoped),
     `ScopedId::parse_declared_scope` (recovers a credential token's declared scope
     without a caller scope, for self-authenticating tokens only),

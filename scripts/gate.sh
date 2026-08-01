@@ -25,12 +25,18 @@ scripts/invariant-lints.sh
 
 echo "==> query audit (no scoped-table SQL outside the repository module)"
 scripts/query-audit.sh
+echo "==> scoped table registration (every forced-RLS table in the migrations is in the query audit list)"
+scripts/scoped-table-registration.sh
+echo "==> audit foreign key claims (no comment asserts an audit_log foreign key that does not exist)"
+scripts/audit-fk-claim-scan.sh
+echo "==> test registration (every tests/*.rs file has a [[test]] entry; autotests are off)"
+scripts/test-registration.sh
 
 echo "==> classification lint (every resource type is classified; all three classes used)"
 scripts/classification-lint.sh
 echo "==> pii encryption (every classified PII/secret column is envelope-encrypted)"
 scripts/pii-encryption-scan.sh
-echo "==> diagnostics redaction corpus (no secret sentinel can reach a diagnostic record)"
+echo "==> diagnostics redaction corpus (a sentinel in any free-form diagnostic field would be seen)"
 scripts/diagnostics-redaction-scan.sh
 
 echo "==> canonicalization seam (every identifier comparison routes through the one seam)"

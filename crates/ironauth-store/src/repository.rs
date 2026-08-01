@@ -10726,6 +10726,45 @@ pub enum ClientAuthDiagnosticReason {
 }
 
 impl ClientAuthDiagnosticReason {
+    /// Every reason, in declaration order.
+    ///
+    /// The SINGLE definition of "every reason", so a caller that must cover them all
+    /// iterates this rather than writing its own list in another crate, where a new
+    /// variant would silently not appear. The redaction closed-vocabulary sweep in
+    /// `ironauth_oidc::client_auth` is that caller.
+    ///
+    /// Completeness here is a MEASUREMENT rather than a convention, and it has to be,
+    /// because the obvious alternative does not work.
+    /// `the_variant_lists_match_the_enum_declarations` parses the variant identifiers
+    /// out of THIS FILE and compares them against this array, so a variant added above
+    /// and not added here turns that test red.
+    ///
+    /// Be exact about which half is a compile error, because a list beside an
+    /// exhaustive `match` is the trap this replaced. Adding a variant IS a compile
+    /// error, in [`ClientAuthDiagnosticReason::as_str`] below, which is total. What no
+    /// compiler catches is this array staying at its old LENGTH once that arm is added:
+    /// nothing outside the `match` can observe a variant the array omits, so no runtime
+    /// assertion written against the array can notice the omission. Only a witness
+    /// derived from the enum's own declaration can, which is what the test above is.
+    pub const ALL: [ClientAuthDiagnosticReason; 16] = [
+        ClientAuthDiagnosticReason::Unparsable,
+        ClientAuthDiagnosticReason::UnknownClient,
+        ClientAuthDiagnosticReason::MethodMismatch,
+        ClientAuthDiagnosticReason::BadSecret,
+        ClientAuthDiagnosticReason::AssertionInvalid,
+        ClientAuthDiagnosticReason::AssertionBadSignature,
+        ClientAuthDiagnosticReason::AssertionExpired,
+        ClientAuthDiagnosticReason::AssertionClockSkew,
+        ClientAuthDiagnosticReason::AssertionAudienceMismatch,
+        ClientAuthDiagnosticReason::AssertionKidUnknown,
+        ClientAuthDiagnosticReason::AssertionAlgorithmDisallowed,
+        ClientAuthDiagnosticReason::ReplayedJti,
+        ClientAuthDiagnosticReason::ClientSecretJwtUnsupported,
+        ClientAuthDiagnosticReason::AssertionIssuerUntrusted,
+        ClientAuthDiagnosticReason::AssertionSubjectUnmapped,
+        ClientAuthDiagnosticReason::ScopeNotAllowlisted,
+    ];
+
     /// The stable wire string recorded in the diagnostics row.
     #[must_use]
     pub fn as_str(self) -> &'static str {
@@ -10768,6 +10807,14 @@ pub enum DiagnosticExpectation {
 }
 
 impl DiagnosticExpectation {
+    /// Every hint, in declaration order. One today.
+    ///
+    /// Pinned the same way as [`ClientAuthDiagnosticReason::ALL`], and for the same
+    /// reason: `the_variant_lists_match_the_enum_declarations` compares this array
+    /// against the variant identifiers parsed out of this file, because a list beside
+    /// an exhaustive `match` cannot notice a variant it omits.
+    pub const ALL: [DiagnosticExpectation; 1] = [DiagnosticExpectation::KidNotInRegisteredJwks];
+
     /// The stable wire string recorded in the diagnostics row's `expected` column.
     #[must_use]
     pub fn as_str(self) -> &'static str {
@@ -10791,15 +10838,24 @@ impl DiagnosticExpectation {
 /// A client-authentication failure diagnostic to record (issue #25, widened for the
 /// M9 flow inspector in #91). Carries the rich, structured detail kept OFF the wire.
 ///
-/// STRUCTURAL REDACTION GUARANTEE (issue #91): every field is a bounded, non-secret
-/// datum by construction. There is deliberately NO field capable of holding an
-/// assertion body, a client secret, or a token value, so a secret is not scrubbed
-/// after the fact, it is UNREPRESENTABLE here. `client_id`, `key_id`, and
-/// `signing_alg` are attacker-INFLUENCED but non-secret identifiers the attempt
-/// itself presented; `reason`, `skew_seconds`, and `expected` are derived,
-/// bounded-cardinality values. The redaction corpus CI gate
-/// (`scripts/diagnostics-redaction-scan.sh`) proves no secret sentinel can reach a
-/// serialized record.
+/// REDACTION (issue #91), stated in the two tiers it actually holds in (issue #423).
+///
+/// STRUCTURAL, and provable: `reason`, `skew_seconds`, and `expected` are a closed
+/// enum, a bounded integer, and a closed enum. Their whole value space is finite and
+/// contains no secret, which `the_closed_diagnostic_vocabularies_cannot_express_a_sentinel`
+/// establishes by enumerating it. There is deliberately NO field capable of holding an
+/// assertion body, a client secret, or a token VALUE, so those three classes of material
+/// have no field to land in at all.
+///
+/// CALLER DISCIPLINE, not a property of the type: `client_id`, `auth_method`, `key_id`
+/// and `signing_alg` are `&str`. They are attacker-INFLUENCED (the first is whatever the
+/// failed attempt claimed; the last two are lifted from an attacker-presented assertion
+/// header), and a sentinel placed in one would be recorded VERBATIM. Nothing here
+/// prevents that. What the redaction corpus
+/// (`scripts/diagnostics-redaction-scan.sh`) proves is narrower and true: the safe-field
+/// EXTRACTION never lifts a sentinel out of a secret position into one of these fields,
+/// and a `should_panic` probe beside each of the four proves the corpus's scan can see
+/// that field, so a leak through one would be reported rather than silently passed.
 #[derive(Debug, Clone, Copy)]
 pub struct NewClientAuthDiagnostic<'a> {
     /// The client identifier the attempt claimed (best effort on a failure).
@@ -10826,8 +10882,9 @@ pub struct NewClientAuthDiagnostic<'a> {
 
 /// A read-back client-authentication diagnostic row (issue #25, widened in #91), for
 /// the M9 admin flow inspector and for tests asserting a failure was recorded out of
-/// band. Carries only the bounded, non-secret fields the record can hold (the same
-/// structural redaction guarantee as [`NewClientAuthDiagnostic`]).
+/// band. Carries the same field set as [`NewClientAuthDiagnostic`], owned, under the
+/// same two-tier redaction statement: closed enums and a bounded integer are
+/// structurally safe, the four free-form strings are caller discipline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientAuthDiagnosticRecord {
     /// The random per-row identifier (the pagination cursor key for the M9 view).
@@ -11130,12 +11187,26 @@ pub struct PolicyTraceSignal {
     pub level: String,
 }
 
-/// The STRUCTURALLY REDACTED, allowlisted safe field projection of a traced policy
-/// decision's inputs (issue #91). Every variant carries only bounded, non secret
-/// fields; there is deliberately NO field capable of holding a claim value, a token,
-/// or a secret, so a secret is UNREPRESENTABLE here, not scrubbed after the fact. The
-/// recorder builds one of these from typed safe fields, and the repository serializes
-/// it into the trace row's `decision_inputs` jsonb.
+/// The allowlisted safe field PROJECTION of a traced policy decision's inputs (issue
+/// #91). The recorder builds one of these from typed safe fields, and the repository
+/// serializes it into the trace row's `decision_inputs` jsonb.
+///
+/// The projection is what does the redacting: a raw claim set, an ID token, and an IP
+/// address have no variant to be carried in, so the recorder cannot pass one through
+/// without adding a field here first. That is a real and useful property and it is a
+/// property of the ENUM.
+///
+/// It is NOT the same as saying a secret is unrepresentable, which this doc used to say
+/// and which is false (issue #423): `required_acr`, `achieved_acr`, `level`,
+/// `connector`, `failure_kind` and both fields of [`PolicyTraceSignal`] are `String`,
+/// and a sentinel placed in any of them would be serialized verbatim. For those the
+/// guarantee is about the CALLER; the integers and booleans alongside them are the part
+/// that is structural. `the_sentinel_scan_catches_a_leak_through_*` in
+/// `ironauth-oidc/src/policy_trace.rs` carries one probe per free-form field.
+///
+/// The header of migration 0073 still states the stronger claim. It is SHIPPED and
+/// checksummed, so its text cannot be corrected without making every deployed database
+/// refuse to boot on `ChecksumMismatch`; this doc is where that correction lives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyDecisionInputs {
     /// The step up requirement evaluation inputs: the acr floor and achieved acr, the auth age
@@ -11183,8 +11254,9 @@ pub enum PolicyDecisionInputs {
 
 impl PolicyDecisionInputs {
     /// The safe field projection as a JSON string for the trace row's `decision_inputs`
-    /// jsonb. Only the typed safe fields of the variant are emitted; no claim value,
-    /// token, or secret is representable, so none can appear.
+    /// jsonb. Only the typed safe fields of the variant are emitted, so a field that is
+    /// not on the variant cannot appear. A secret placed by the caller INTO one of the
+    /// variant's free-form `String` fields does appear; see the type's own doc.
     #[must_use]
     pub fn to_json(&self) -> String {
         let value = match self {
@@ -11233,13 +11305,20 @@ impl PolicyDecisionInputs {
 /// A policy decision trace to record (issue #91). Carries the rich, structured detail
 /// of WHY a policy decision came out the way it did, kept OFF the request path.
 ///
-/// STRUCTURAL REDACTION GUARANTEE (issue #91): every field is a bounded, non secret
-/// datum by construction. `subject` is the internal usr_ handle (a blind reference,
-/// never raw PII, exactly as `risk_decisions.subject`); `inputs` is the allowlisted
-/// safe field projection ([`PolicyDecisionInputs`]) with no field capable of holding a
-/// claim value, a token, or a secret. The redaction corpus CI gate
-/// (`scripts/diagnostics-redaction-scan.sh`) proves no secret sentinel can reach a
-/// serialized trace.
+/// REDACTION (issue #91), stated in the two tiers it actually holds in (issue #423).
+///
+/// STRUCTURAL: `policy` and `outcome` are closed enums, and `inputs` is the allowlisted
+/// projection ([`PolicyDecisionInputs`]), so a raw claim set or an ID token has no field
+/// to be carried in and the recorder cannot pass one through without widening the enum.
+///
+/// CALLER DISCIPLINE: `subject` and `reason` are `String`. `subject` is MEANT to be the
+/// internal usr_ handle (a blind reference, never raw PII, exactly as
+/// `risk_decisions.subject`) and `reason` a bounded hint, but the type enforces neither,
+/// and a sentinel placed in either would be serialized verbatim. The same is true of the
+/// free-form fields INSIDE the inputs projection. The redaction corpus
+/// (`scripts/diagnostics-redaction-scan.sh`) does not prove that cannot happen, because
+/// it builds its records from safe literals; what it proves, through one `should_panic`
+/// probe per free-form field, is that if it ever did happen the scan would see it.
 #[derive(Debug, Clone)]
 pub struct NewPolicyDecisionTrace {
     /// Which policy decision this trace records.
@@ -11255,8 +11334,9 @@ pub struct NewPolicyDecisionTrace {
 }
 
 /// A read back policy decision trace row (issue #91), for the M9 admin flow inspector
-/// and for tests. Carries only the bounded, non secret fields the record can hold (the
-/// same structural redaction guarantee as [`NewPolicyDecisionTrace`]).
+/// and for tests. Carries the same field set as [`NewPolicyDecisionTrace`], under the
+/// same two-tier redaction statement: the closed enums and the shape of the projection
+/// are structural, the free-form strings are caller discipline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyDecisionTraceRecord {
     /// The random per row identifier.
@@ -11521,6 +11601,22 @@ pub enum TokenSizeReason {
 }
 
 impl TokenSizeReason {
+    /// Every reason, in declaration order.
+    ///
+    /// Pinned the same way as [`ClientAuthDiagnosticReason::ALL`], and for the same
+    /// reason. The list this replaced lived in `ironauth_oidc::policy_trace` beside a
+    /// total `match` that gave each variant a slot, plus an
+    /// `assert_eq!(EVERY_REASON.len(), 4)`. That looked stronger than it was: a fifth
+    /// variant added to the enum and given a slot in the `match` left the list at four,
+    /// the four assertions still held, and the sweeps that iterate the list never saw
+    /// the new variant (measured, issue #404 review).
+    pub const ALL: [TokenSizeReason; 4] = [
+        TokenSizeReason::BudgetApproaching,
+        TokenSizeReason::BudgetOverflowCount,
+        TokenSizeReason::BudgetOverflowBytes,
+        TokenSizeReason::RolesOnlyStillOversize,
+    ];
+
     /// The stable wire string recorded in the event row's `reason` column.
     #[must_use]
     pub fn as_str(self) -> &'static str {
@@ -37242,7 +37338,8 @@ impl ActingTenantRepo<'_> {
         }
 
         // The audit scope needs an environment of this tenant; pick the oldest
-        // (retained through soft delete, so its row satisfies the audit foreign key).
+        // (retained through soft delete, so its row still satisfies the composite
+        // foreign key from `audit_log` to `environments`).
         let scope_env = sqlx::query(
             "SELECT id FROM environments WHERE tenant_id = $1 ORDER BY created_at, id LIMIT 1",
         )
@@ -37342,15 +37439,16 @@ impl ActingTenantRepo<'_> {
         .await
     }
 
-    /// Deactivate a tenant (soft delete) and OFFBOARD it: cascade the
-    /// deactivation to its child environments and their management credentials and
-    /// FENCE every environment's data plane, all in one audited transaction. This is
-    /// the GRACE stage of the offboarding pipeline (issue #46): the tenant enters a
-    /// restorable soft-deleted state, its keys are LEFT INTACT (no crypto-shred here,
-    /// deferred to the terminal [`ActingTenantRepo::hard_delete`] per the issue's
-    /// out-of-scope), so [`ActingTenantRepo::restore`] inside the retention window
-    /// brings it back with no data loss. Audited scoped to the tenant and its oldest
-    /// environment (which is retained, so the audit foreign key holds).
+    /// Deactivate a tenant (soft delete) and OFFBOARD it: cascade the deactivation to
+    /// its child environments and their management credentials and FENCE every
+    /// environment's data plane, all in one audited transaction. This is the GRACE
+    /// stage of the offboarding pipeline (issue #46): the tenant enters a restorable
+    /// soft-deleted state, its keys are LEFT INTACT (no crypto-shred here, deferred to
+    /// the terminal [`ActingTenantRepo::hard_delete`] per the issue's out-of-scope), so
+    /// [`ActingTenantRepo::restore`] inside the retention window brings it back with no
+    /// data loss. Audited scoped to the tenant and its oldest environment (which is
+    /// retained, so the composite foreign key from `audit_log` to `environments` still
+    /// holds).
     ///
     /// The credential and environment cascade is what makes a deleted tenant's
     /// environments stop listing and its keys stop authenticating; the join in
@@ -37364,9 +37462,10 @@ impl ActingTenantRepo<'_> {
     /// [`StoreError::NotFound`] if no live tenant matched under this operator.
     #[allow(clippy::too_many_lines)]
     pub async fn delete(&self, env: &Env, id: &TenantId) -> Result<(), StoreError> {
-        // The audit scope needs an environment of this tenant; pick the oldest
-        // (it is retained through soft delete, so its row satisfies the audit
-        // foreign key). A tenant always has its first environment.
+        // The audit scope needs an environment of this tenant; pick the oldest (it is
+        // retained through soft delete, so its row still satisfies the composite
+        // foreign key from `audit_log` to `environments`). A tenant always has its
+        // first environment.
         let scope_env = sqlx::query(
             "SELECT id FROM environments WHERE tenant_id = $1 ORDER BY created_at, id LIMIT 1",
         )
@@ -38019,9 +38118,9 @@ impl ActingEnvironmentRepo<'_> {
     }
 
     /// Deactivate an environment (soft delete) under this tenant and CASCADE the
-    /// deactivation to its management credentials, in the audited transaction so
-    /// it stays atomic. Audited scoped to `(tenant, environment)`. The rows are
-    /// retained, so the audit foreign key holds.
+    /// deactivation to its management credentials, in the audited transaction so it
+    /// stays atomic. Audited scoped to `(tenant, environment)`. The rows are retained,
+    /// so the composite foreign key from `audit_log` to `environments` still holds.
     ///
     /// # Errors
     ///
@@ -38270,9 +38369,10 @@ impl ActingOrganizationRepo<'_> {
     }
 
     /// Deactivate an organization (soft delete) in this scope and audit
-    /// `organization.delete` in the same transaction. The row is retained (only
-    /// the column-scoped `deleted_at` is written), so the audit foreign key to it
-    /// stays satisfiable.
+    /// `organization.delete` in the same transaction. The row is retained (only the
+    /// column-scoped `deleted_at` is written), so this audit row's target stays
+    /// resolvable (the retention rule on [`Action`]: an APPLICATION rule, because
+    /// `audit_log` carries no foreign key to this table).
     ///
     /// # Errors
     ///
@@ -38496,9 +38596,11 @@ impl ActingOrgMembershipRepo<'_> {
 
     /// Remove a membership (soft delete) in this scope and audit
     /// `organization.membership.remove` in the same transaction. The row is retained
-    /// (only the column-scoped `deleted_at` and `updated_at` are written), so the
-    /// audit foreign key to it stays satisfiable. A repeat remove of an already
-    /// removed membership matches no live row and is the uniform not-found.
+    /// (only the column-scoped `deleted_at` and `updated_at` are written), so this
+    /// audit row's target stays resolvable (the retention rule on [`Action`]: an
+    /// APPLICATION rule, because `audit_log` carries no foreign key to this table). A
+    /// repeat remove of an already removed membership matches no live row and is the
+    /// uniform not-found.
     ///
     /// # The attachment cascade (issue #97)
     ///
@@ -38924,11 +39026,12 @@ impl ActingOrgAuthPolicyRepo<'_> {
     /// organization inherits the environment result unchanged.
     ///
     /// The row is RETAINED (only the column-scoped `deleted_at` and `updated_at` are
-    /// written), so the audit foreign key to it stays satisfiable; because the
-    /// uniqueness index is partial over live rows, the organization is immediately
-    /// free to receive a NEW policy, which inserts a FRESH row with a FRESH id rather
-    /// than reviving this one. Removing a policy is a security operation and must not
-    /// be quietly reversible.
+    /// written), so this audit row's target stays resolvable (the retention rule on
+    /// [`Action`]: an APPLICATION rule, because `audit_log` carries no foreign key to
+    /// this table); because the uniqueness index is partial over live rows, the
+    /// organization is immediately free to receive a NEW policy, which inserts a FRESH
+    /// row with a FRESH id rather than reviving this one. Removing a policy is a
+    /// security operation and must not be quietly reversible.
     ///
     /// A repeat remove matches no live row and is the uniform not-found.
     ///
@@ -39210,13 +39313,14 @@ impl ActingOrgRoleRepo<'_> {
         .await
     }
 
-    /// Delete a role (soft delete) in this scope and audit
-    /// `organization.role.delete` in the same transaction. The row is retained
-    /// (only the column-scoped `deleted_at` and `updated_at` are written), so the
-    /// audit foreign key to it stays satisfiable; because the uniqueness index is
-    /// partial over live rows, the deleted role's slug is immediately available to
-    /// a new role. A repeat delete of an already deleted role matches no live row
-    /// and is the uniform not-found.
+    /// Delete a role (soft delete) in this scope and audit `organization.role.delete`
+    /// in the same transaction. The row is retained (only the column-scoped
+    /// `deleted_at` and `updated_at` are written), so this audit row's target stays
+    /// resolvable (the retention rule on [`Action`]: an APPLICATION rule, because
+    /// `audit_log` carries no foreign key to this table); because the uniqueness index
+    /// is partial over live rows, the deleted role's slug is immediately available to a
+    /// new role. A repeat delete of an already deleted role matches no live row and is
+    /// the uniform not-found.
     ///
     /// # Errors
     ///
@@ -39759,12 +39863,13 @@ impl ActingPermissionRepo<'_> {
     /// in the same transaction.
     ///
     /// The row is retained (only the column-scoped `deleted_at` and `updated_at` are
-    /// written), so the audit foreign key to it stays satisfiable; DELETE is granted
-    /// to nobody on either plane. Because the uniqueness index is partial over live
-    /// rows, the deleted permission's slug is immediately available to a NEW
-    /// permission, and re-using it mints a FRESH id rather than reviving this row.
-    /// A repeat delete of an already deleted permission matches no live row and is
-    /// the uniform not-found.
+    /// written), so this audit row's target stays resolvable (the retention rule on
+    /// [`Action`]: an APPLICATION rule, because `audit_log` carries no foreign key to
+    /// this table); DELETE is granted to nobody on either plane. Because the uniqueness
+    /// index is partial over live rows, the deleted permission's slug is immediately
+    /// available to a NEW permission, and re-using it mints a FRESH id rather than
+    /// reviving this row. A repeat delete of an already deleted permission matches no
+    /// live row and is the uniform not-found.
     ///
     /// # Errors
     ///
@@ -40235,13 +40340,14 @@ impl ActingOrgGroupRepo<'_> {
         .await
     }
 
-    /// Delete a group (soft delete) in this scope and audit
-    /// `organization.group.delete` in the same transaction. The row is retained
-    /// (only the column-scoped `deleted_at` and `updated_at` are written), so the
-    /// audit foreign key to it stays satisfiable; because the uniqueness index is
-    /// partial over live rows, the deleted group's slug is immediately available to
-    /// a new group. A repeat delete of an already deleted group matches no live row
-    /// and is the uniform not-found.
+    /// Delete a group (soft delete) in this scope and audit `organization.group.delete`
+    /// in the same transaction. The row is retained (only the column-scoped
+    /// `deleted_at` and `updated_at` are written), so this audit row's target stays
+    /// resolvable (the retention rule on [`Action`]: an APPLICATION rule, because
+    /// `audit_log` carries no foreign key to this table); because the uniqueness index
+    /// is partial over live rows, the deleted group's slug is immediately available to
+    /// a new group. A repeat delete of an already deleted group matches no live row and
+    /// is the uniform not-found.
     ///
     /// A group's CHILDREN are not deleted with it and are not rewritten. They keep
     /// pointing at the dead row, and because every hierarchy walk filters
@@ -40459,9 +40565,11 @@ impl ActingOrgGroupMemberRepo<'_> {
     /// `organization.group.member.remove` in the same transaction.
     ///
     /// The row is retained (only the column-scoped `deleted_at` and `updated_at` are
-    /// written), so the audit foreign key to it stays satisfiable; because the
-    /// uniqueness index is partial over live rows, the pair is immediately available
-    /// again. A repeat remove matches no live row and is the uniform not-found.
+    /// written), so this audit row's target stays resolvable (the retention rule on
+    /// [`Action`]: an APPLICATION rule, because `audit_log` carries no foreign key to
+    /// this table); because the uniqueness index is partial over live rows, the pair is
+    /// immediately available again. A repeat remove matches no live row and is the
+    /// uniform not-found.
     ///
     /// # Containment
     ///
@@ -40617,11 +40725,12 @@ impl ActingOrgGroupRoleRepo<'_> {
     /// Withdraw a role from a group (soft delete) and audit
     /// `organization.group.role.unassign` in the same transaction.
     ///
-    /// The row is retained so the audit foreign key to it stays satisfiable, and the
-    /// (group, role) pair is immediately available again. A repeat unassign matches
-    /// no live row and is the uniform not-found. `organization_id` is part of the
-    /// ADDRESS and is carried as a predicate, for the containment reason spelled out
-    /// on [`ActingOrgGroupMemberRepo::remove`].
+    /// The row is retained so this audit row's target stays resolvable (the retention
+    /// rule on [`Action`]: an APPLICATION rule, because `audit_log` carries no foreign
+    /// key to this table), and the (group, role) pair is immediately available again. A
+    /// repeat unassign matches no live row and is the uniform not-found.
+    /// `organization_id` is part of the ADDRESS and is carried as a predicate, for the
+    /// containment reason spelled out on [`ActingOrgGroupMemberRepo::remove`].
     ///
     /// # Errors
     ///
@@ -40765,11 +40874,12 @@ impl ActingOrgMembershipRoleRepo<'_> {
     /// Withdraw a direct role grant from a membership (soft delete) and audit
     /// `organization.membership.role.unassign` in the same transaction.
     ///
-    /// The row is retained so the audit foreign key to it stays satisfiable, and the
-    /// (membership, role) pair is immediately available again. A repeat unassign
-    /// matches no live row and is the uniform not-found. `organization_id` is part of
-    /// the ADDRESS and is carried as a predicate, for the containment reason spelled
-    /// out on [`ActingOrgGroupMemberRepo::remove`].
+    /// The row is retained so this audit row's target stays resolvable (the retention
+    /// rule on [`Action`]: an APPLICATION rule, because `audit_log` carries no foreign
+    /// key to this table), and the (membership, role) pair is immediately available
+    /// again. A repeat unassign matches no live row and is the uniform not-found.
+    /// `organization_id` is part of the ADDRESS and is carried as a predicate, for the
+    /// containment reason spelled out on [`ActingOrgGroupMemberRepo::remove`].
     ///
     /// # Errors
     ///
@@ -49219,5 +49329,150 @@ mod upstream_token_seal_tests {
             .is_err(),
             "an access ciphertext must NOT open under another session's AAD"
         );
+    }
+}
+
+/// The hand-written `ALL` arrays against the enum declarations they claim to
+/// enumerate (issue #404 review).
+///
+/// # Why a source parse and not a `match`
+///
+/// The natural pin for a list beside an enum is a total `match`, and it does not
+/// work. A total `match` makes ADDING a variant a compile error, which is real and
+/// valuable, but the minimal edit that restores the build is to name the variant in
+/// one more arm, and after that edit nothing can observe that the list still omits
+/// it: no expression outside the `match` can produce a variant the list does not
+/// contain, so no assertion written over the list can notice. Comparing the list's
+/// length against a literal does not help either, because the literal is not forced
+/// by anything the compiler checks. Measured on the shipped
+/// `policy_trace::tests::every_reason_is_listed`, which had slot indices and an
+/// `assert_eq!(EVERY_REASON.len(), 4)` and still passed with a fifth variant added
+/// to the enum and to the `match`.
+///
+/// The only witness of an enum's cardinality that is independent of the code
+/// iterating it is the enum's own declaration. `ironauth-config` reaches the same
+/// conclusion for `DiagnosticVerbosity::ALL` and `PermissionOverflow::ALL` and uses
+/// the variant list `schemars` derives from the type; these three enums carry no
+/// derive that exposes their variants, so the declaration is read from source. Same
+/// principle, different witness.
+#[cfg(test)]
+mod variant_lists_match_the_enum_declarations {
+    use super::{ClientAuthDiagnosticReason, DiagnosticExpectation, TokenSizeReason};
+
+    /// This very file, resolved from the crate root rather than the process working
+    /// directory, so the result does not depend on where the runner was invoked.
+    fn source() -> String {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("repository.rs");
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    }
+
+    /// The variant identifiers of `pub enum <name>`, in declaration order.
+    ///
+    /// Deliberately strict about the shape it accepts rather than lenient: the enum
+    /// header must occur exactly once, the block must close, and the block must hold
+    /// at least one variant. A parser that silently matches nothing would turn every
+    /// assertion below into a comparison of two empty lists, which is the vacuous
+    /// pass this whole module exists to make impossible.
+    fn declared_variants(text: &str, name: &str) -> Vec<String> {
+        let header = format!("\npub enum {name} {{\n");
+        let occurrences = text.matches(header.as_str()).count();
+        assert_eq!(
+            occurrences, 1,
+            "expected exactly one `pub enum {name}` declaration in repository.rs, found \
+             {occurrences}. If the enum was renamed, moved, or reformatted, update this \
+             parser; a parser that finds nothing proves nothing."
+        );
+        let start = text
+            .find(header.as_str())
+            .expect("occurrence counted above")
+            + header.len();
+        let rest = &text[start..];
+        let end = rest.find("\n}\n").unwrap_or_else(|| {
+            panic!(
+                "the `pub enum {name}` block is never closed by a `}}` at \
+                                       column zero"
+            )
+        });
+        let body = &rest[..end];
+
+        let mut variants = Vec::new();
+        for line in body.lines() {
+            // A variant is an identifier at the enum's own indent. Doc comments,
+            // attributes, and the inner lines of a struct-like variant are indented
+            // further or start with a marker, so they fall out here.
+            let Some(candidate) = line.strip_prefix("    ") else {
+                continue;
+            };
+            if candidate.starts_with(' ')
+                || candidate.starts_with("//")
+                || candidate.starts_with('#')
+            {
+                continue;
+            }
+            let ident: String = candidate
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if !ident.is_empty() && ident.starts_with(|c: char| c.is_ascii_uppercase()) {
+                variants.push(ident);
+            }
+        }
+        assert!(
+            !variants.is_empty(),
+            "parsed no variants out of `pub enum {name}`, so the comparison below would be \
+             two empty lists agreeing with each other. Fix the parser."
+        );
+        variants
+    }
+
+    /// The `Debug` rendering of a unit variant is its identifier, which is what makes
+    /// the array comparable against the parsed declaration without a second list.
+    fn rendered<T: std::fmt::Debug>(all: &[T]) -> Vec<String> {
+        all.iter().map(|v| format!("{v:?}")).collect()
+    }
+
+    #[test]
+    fn client_auth_diagnostic_reason_all_holds_every_declared_variant() {
+        let text = source();
+        assert_eq!(
+            rendered(&ClientAuthDiagnosticReason::ALL),
+            declared_variants(&text, "ClientAuthDiagnosticReason"),
+            "ClientAuthDiagnosticReason::ALL must hold every variant the enum declares, in \
+             declaration order. A variant missing here escapes every sweep that iterates \
+             ALL, and the total `match` in as_str cannot say so."
+        );
+    }
+
+    #[test]
+    fn diagnostic_expectation_all_holds_every_declared_variant() {
+        let text = source();
+        assert_eq!(
+            rendered(&DiagnosticExpectation::ALL),
+            declared_variants(&text, "DiagnosticExpectation"),
+            "DiagnosticExpectation::ALL must hold every variant the enum declares, in \
+             declaration order"
+        );
+    }
+
+    #[test]
+    fn token_size_reason_all_holds_every_declared_variant() {
+        let text = source();
+        assert_eq!(
+            rendered(&TokenSizeReason::ALL),
+            declared_variants(&text, "TokenSizeReason"),
+            "TokenSizeReason::ALL must hold every variant the enum declares, in declaration \
+             order"
+        );
+    }
+
+    /// The parser's own negative control: it must REFUSE a name it cannot find,
+    /// rather than returning an empty list that would make every test above pass
+    /// against an empty array.
+    #[test]
+    #[should_panic(expected = "expected exactly one `pub enum NoSuchEnumExistsHere`")]
+    fn the_declaration_parser_refuses_an_enum_it_cannot_find() {
+        let _ = declared_variants(&source(), "NoSuchEnumExistsHere");
     }
 }

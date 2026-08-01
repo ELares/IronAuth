@@ -390,7 +390,8 @@ async fn absent_deleted_and_foreign_scope_permissions_are_all_the_same_not_found
     let absent = PermissionId::generate(&env, &scope_a);
     assert!(matches!(repo.get(&absent).await, Err(StoreError::NotFound)));
 
-    // 2. Soft-deleted: retained for the audit foreign key, invisible to every read.
+    // 2. Soft-deleted: retained so a `permission.delete` audit row's target stays
+    // resolvable, invisible to every read.
     assert!(matches!(
         repo.get(&deleted).await,
         Err(StoreError::NotFound)
@@ -1482,8 +1483,9 @@ async fn a_permission_round_trips_through_the_audited_write_repository() {
         ]
     );
 
-    // The delete is SOFT: the row is retained so the audit foreign key to it stays
-    // satisfiable, and every read filters it out.
+    // The delete is SOFT: the row is retained so the `permission.delete` audit row's
+    // target stays resolvable (an application rule; `audit_log` carries no foreign key
+    // to `permissions`), and every read filters it out.
     remove(&db, &env, scope, &id).await.expect("delete");
     assert!(matches!(
         control.management().permissions(scope).get(&id).await,
@@ -1786,8 +1788,9 @@ async fn the_grants_are_exactly_what_the_write_path_needs_and_nothing_more() {
         Vec::<String>::new()
     );
 
-    // DELETE is granted to NOBODY on either plane: removal is the soft delete, which
-    // is what keeps the audit foreign key satisfiable.
+    // DELETE is granted to NOBODY on either plane: removal is the soft delete, which is
+    // what keeps a `permission.delete` audit row's target resolvable (an application
+    // rule; `audit_log` carries no foreign key to `permissions`).
     for role in ["ironauth_control", "ironauth_app"] {
         assert!(
             !has_table_privilege(&db, role, "DELETE").await,

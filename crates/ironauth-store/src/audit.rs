@@ -116,6 +116,45 @@ impl fmt::Display for ActorRef {
 /// mistype. Each variant renders to a stable dotted string (`client.create`)
 /// that is what the OCSF mapping (M11) will key on. Adding a mutation is a
 /// deliberate act: it must add a variant here.
+///
+/// # Soft delete, and the retention rule the variants below refer to
+///
+/// Many of the delete variants below are written by a SOFT delete that RETAINS
+/// the row it names. The reason is that the audit row's `target_id` must stay
+/// RESOLVABLE: a hard delete would leave the audit row naming an id nothing can
+/// look up.
+///
+/// No foreign key enforces that, and there deliberately is none. `audit_log`
+/// (migration 0002) stores `target_id` as free text and references only
+/// `tenants` and `environments`, because an append-only audit trail must not be
+/// constrained by a data table's lifecycle. It could not be constrained by one
+/// here in any case: `target_id` is a single polymorphic column naming the
+/// target of every variant in this enum, and a column can reference only one
+/// table. Retention is therefore an APPLICATION rule, carried by the repository
+/// writing `deleted_at` instead of issuing a DELETE and by the GRANTs that
+/// withhold DELETE from both planes. Migration 0092 records the same reasoning
+/// from the schema side.
+///
+/// The rule is not universal, which is the clearest evidence that no such
+/// foreign key could be added later. SEVENTEEN hard `DELETE FROM` statements in
+/// `repository.rs` run inside an audited write closure, and TWELVE of them delete
+/// the very row the enclosing audit row addresses: [`Action::ClientDelete`],
+/// [`Action::ConnectorDelete`], [`Action::BrandAssetDelete`],
+/// [`Action::LocaleDelete`], [`Action::SignupFormDelete`],
+/// [`Action::EnvironmentVariableDelete`], [`Action::EnvironmentSecretDelete`],
+/// [`Action::AaguidRuleRemove`], [`Action::CredentialClassPolicyRemove`],
+/// [`Action::ScopeStepUpPolicyRemove`], [`Action::AdminConsentRevoke`] and
+/// [`Action::AbuseBanLift`]. Those audit rows name an id that is already gone by
+/// the time the row is inserted. (The other five clear PRIOR rows rather than the
+/// target: an OTP or magic-link issue invalidates the outstanding code, a TOTP
+/// enrolment supersedes a pending one, and an SMS config update rewrites the
+/// country allowlist.)
+///
+/// The count matters because the argument is one of impossibility, not of taste.
+/// It was first written as two variants, which understated it by ten and made a
+/// true conclusion rest on a thin premise; it was measured by mapping every
+/// `DELETE FROM` in `repository.rs` to the `write_audited` call whose closure
+/// encloses it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Action {
@@ -192,7 +231,8 @@ pub enum Action {
     /// per-environment organization shell M10 later extends with membership.
     OrganizationCreate,
     /// An organization was deactivated (management plane, issue #41): a soft
-    /// delete that retains the row so the audit foreign key to it stays intact.
+    /// delete that retains the row, so this audit row's target stays resolvable
+    /// (the retention rule above).
     OrganizationDelete,
     /// An organization's lifecycle STATE was changed (management plane, issue #94):
     /// the enable or disable action toggled the org between 'active' and 'disabled'.
@@ -205,8 +245,9 @@ pub enum Action {
     /// invitation that carried an org-context. The target is the new membership.
     OrganizationMembershipAdd,
     /// A user was REMOVED from an organization (issue #94): the membership was
-    /// soft-deleted through the admin surface, so the audit foreign key to it stays
-    /// satisfiable. The target is the removed membership.
+    /// soft-deleted through the admin surface, so this audit row's target stays
+    /// resolvable (the retention rule above). The target is the removed
+    /// membership.
     OrganizationMembershipRemove,
     /// A named role was DEFINED in an organization (issue #97). The target is the
     /// new role. A role in M10 is a name only; what it grants is issue #98.
@@ -217,8 +258,9 @@ pub enum Action {
     /// changed. The target is the renamed role.
     OrganizationRoleUpdate,
     /// An organization role was DELETED (issue #97): a soft delete that retains
-    /// the row, so the audit foreign key to it stays satisfiable and the slug is
-    /// freed for a new role. The target is the deleted role.
+    /// the row, so this audit row's target stays resolvable (the retention rule
+    /// above), and the slug is freed for a new role. The target is the deleted
+    /// role.
     OrganizationRoleDelete,
     /// A named group was DEFINED in an organization (issue #97), possibly directly
     /// under a parent group. The target is the new group. A group in M10 is a name
@@ -232,8 +274,9 @@ pub enum Action {
     /// position in the hierarchy changed. The target is the renamed group.
     OrganizationGroupUpdate,
     /// An organization group was DELETED (issue #97): a soft delete that retains
-    /// the row, so the audit foreign key to it stays satisfiable and the slug is
-    /// freed for a new group. The target is the deleted group.
+    /// the row, so this audit row's target stays resolvable (the retention rule
+    /// above), and the slug is freed for a new group. The target is the deleted
+    /// group.
     OrganizationGroupDelete,
     /// An organization group was MOVED within its organization's group forest
     /// (issue #97): given a new parent, or promoted to a root. Deliberately its
@@ -249,8 +292,9 @@ pub enum Action {
     /// action can only ever appear for someone who is already in the organization.
     OrganizationGroupMemberAdd,
     /// An organization membership was UNBOUND from a group (issue #97): a soft
-    /// delete that retains the row, so the audit foreign key to it stays
-    /// satisfiable and the (group, member) pair is free again. The target is the
+    /// delete that retains the row, so this audit row's target stays resolvable
+    /// (the retention rule above), and the (group, member) pair is free again.
+    /// The target is the
     /// removed binding. A binding removed as part of the membership cascade is NOT
     /// reported here (it is not individually addressed by the request that caused
     /// it); see [`Action::OrganizationMembershipAttachmentsRevoke`].
@@ -261,8 +305,9 @@ pub enum Action {
     /// issuance, because roles flow down the group forest.
     OrganizationGroupRoleAssign,
     /// A role was WITHDRAWN from a group (issue #97): a soft delete that retains
-    /// the row, so the audit foreign key to it stays satisfiable and the (group,
-    /// role) pair is free again. The target is the withdrawn assignment. Its blast
+    /// the row, so this audit row's target stays resolvable (the retention rule
+    /// above), and the (group, role) pair is free again. The target is the
+    /// withdrawn assignment. Its blast
     /// radius is the same descendant set the assignment had.
     OrganizationGroupRoleUnassign,
     /// A role was GRANTED DIRECTLY to one organization membership, with no group
@@ -270,8 +315,9 @@ pub enum Action {
     /// radius really is just that one membership.
     OrganizationMembershipRoleAssign,
     /// A direct role grant was WITHDRAWN from an organization membership (issue
-    /// #97): a soft delete that retains the row, so the audit foreign key to it
-    /// stays satisfiable and the (membership, role) pair is free again. The target
+    /// #97): a soft delete that retains the row, so this audit row's target stays
+    /// resolvable (the retention rule above), and the (membership, role) pair is
+    /// free again. The target
     /// is the withdrawn assignment. A grant withdrawn as part of the membership
     /// cascade is NOT reported here; see
     /// [`Action::OrganizationMembershipAttachmentsRevoke`].
@@ -338,8 +384,9 @@ pub enum Action {
     /// `permission.update` as "a label changed" and nothing more.
     PermissionUpdate,
     /// A permission was DELETED from an environment's vocabulary (issue #98): a soft
-    /// delete that retains the row, so the audit foreign key to it stays satisfiable
-    /// and the slug is freed for a new permission. The target is the deleted row.
+    /// delete that retains the row, so this audit row's target stays resolvable
+    /// (the retention rule above), and the slug is freed for a new permission. The
+    /// target is the deleted row.
     ///
     /// A re-create of the same slug mints a FRESH id and is never a revival, so this
     /// action is not reversible in its authorization effects: whatever a later PR of
@@ -361,9 +408,9 @@ pub enum Action {
     /// as the delta contract for a mapping.
     OrganizationRolePermissionAssign,
     /// A permission was DETACHED from an organization's role (issue #98): a soft
-    /// delete that retains the row, so the audit foreign key to it stays satisfiable
-    /// and the (role, permission) pair is free again. The target is the withdrawn
-    /// mapping.
+    /// delete that retains the row, so this audit row's target stays resolvable
+    /// (the retention rule above), and the (role, permission) pair is free again.
+    /// The target is the withdrawn mapping.
     ///
     /// Its blast radius is the same member set the attachment had. A re-attach mints
     /// a FRESH row rather than reviving this one, so a detachment is never quietly

@@ -1801,3 +1801,100 @@ pub struct BrandAssetView {
     /// The stored payload length in bytes.
     pub size_bytes: i64,
 }
+
+#[cfg(test)]
+mod redacting_debug_tests {
+    use super::{InitialAccessTokenCreated, ManagementKeyCreated};
+
+    /// A sentinel standing in for a live credential. Distinct and improbable, so a hit
+    /// in the formatted output is unambiguous.
+    const SECRET_SENTINEL: &str = "LIVEMANAGEMENTKEYSECRETSENTINEL";
+
+    /// [`ManagementKeyCreated`]'s doc says a live token can never reach a log line
+    /// through `{value:?}`. That was a hand-written `Debug` and a sentence, with nothing
+    /// exercising it (issue #423). This is the check.
+    #[test]
+    fn management_key_debug_redacts_the_live_secret() {
+        let view = ManagementKeyCreated {
+            id: "mak_safe".to_owned(),
+            display_name: "ci".to_owned(),
+            secret: Some(SECRET_SENTINEL.to_owned()),
+            secret_already_issued: false,
+            created_at_unix_ms: 0,
+        };
+        let rendered = format!("{view:?}");
+        assert!(
+            !rendered.contains(SECRET_SENTINEL),
+            "the live secret reached a Debug rendering: {rendered}"
+        );
+        // The positive control: the redaction marker IS present, so the field was
+        // rendered and merely masked rather than the struct having dropped it (which
+        // would make the negative assertion pass for the wrong reason). The safe fields
+        // are present too, so the rendering is real.
+        assert!(
+            rendered.contains(ironauth_config::REDACTED)
+                && rendered.contains("mak_safe")
+                && rendered.contains("ci"),
+            "the masked secret and the safe fields must both be rendered: {rendered}"
+        );
+    }
+
+    /// The absent case: an idempotent replay carries no secret, and the rendering must
+    /// say so rather than printing the marker, which would be indistinguishable from a
+    /// masked live one.
+    #[test]
+    fn management_key_debug_distinguishes_an_absent_secret_from_a_masked_one() {
+        let view = ManagementKeyCreated {
+            id: "mak_safe".to_owned(),
+            display_name: "ci".to_owned(),
+            secret: None,
+            secret_already_issued: true,
+            created_at_unix_ms: 0,
+        };
+        let rendered = format!("{view:?}");
+        assert!(
+            !rendered.contains(ironauth_config::REDACTED),
+            "an absent secret must not render as a masked one: {rendered}"
+        );
+    }
+
+    /// The same for [`InitialAccessTokenCreated`], whose doc makes the same promise.
+    #[test]
+    fn initial_access_token_debug_redacts_the_live_token() {
+        let view = InitialAccessTokenCreated {
+            id: "iat_safe".to_owned(),
+            token: Some(SECRET_SENTINEL.to_owned()),
+            token_already_issued: false,
+            expires_at_unix_ms: 0,
+            max_uses: Some(1),
+            created_at_unix_ms: 0,
+        };
+        let rendered = format!("{view:?}");
+        assert!(
+            !rendered.contains(SECRET_SENTINEL),
+            "the live token reached a Debug rendering: {rendered}"
+        );
+        assert!(
+            rendered.contains(ironauth_config::REDACTED) && rendered.contains("iat_safe"),
+            "the masked token and the safe fields must both be rendered: {rendered}"
+        );
+    }
+
+    /// The absent case for the token view.
+    #[test]
+    fn initial_access_token_debug_distinguishes_an_absent_token_from_a_masked_one() {
+        let view = InitialAccessTokenCreated {
+            id: "iat_safe".to_owned(),
+            token: None,
+            token_already_issued: true,
+            expires_at_unix_ms: 0,
+            max_uses: None,
+            created_at_unix_ms: 0,
+        };
+        let rendered = format!("{view:?}");
+        assert!(
+            !rendered.contains(ironauth_config::REDACTED),
+            "an absent token must not render as a masked one: {rendered}"
+        );
+    }
+}

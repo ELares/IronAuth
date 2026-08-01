@@ -6,6 +6,10 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- CORRECTION to `DiagnosticVerbosity`'s doc, which attributed a structural redaction
+  guarantee to the diagnostic record types that they do not have (issue #423). The true and
+  useful half is unchanged and now stands on its own: no verbosity setting ADDS a field, so
+  no setting makes an assertion body, a secret, or a token value representable.
 - CORRECTION to `[token_claims]`'s section doc, which said the management plane's verdict
   rides the effective-roles read alone and that the attach carried no budget field (issue
   #425 has since added it). The section now names BOTH surfaces and, more importantly, the

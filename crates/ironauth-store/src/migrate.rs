@@ -36,6 +36,30 @@
 //! isolation schema does. It must also be added to `scripts/query-audit.sh`'s
 //! scoped-table list. The tenant-isolation discipline does not stop at the first
 //! migration; it extends to every one.
+//!
+//! That last obligation used to be prose in two places and enforced in neither, so
+//! a new forced-row-level-security table absent from the scoped-table list was
+//! simply never grepped for and raw SQL against it passed silently.
+//! `scripts/scoped-table-registration.sh` now derives the set from the migrations
+//! and compares it against the list in both directions (issue #446).
+//!
+//! ## Registration obligation, and what enforces it
+//!
+//! [`registry`] is a hand-written list of `include_str!` entries, so a `.sql`
+//! file dropped into `migrations/` without its entry is simply not in the chain.
+//! That failure used to be silent in both of the controls that look like they
+//! would catch it: the chain-count tripwire in `tests/migration.rs` asserts a
+//! hardcoded number against the LIVE ledger, and an unregistered file never
+//! reaches the ledger, so the ledger and the hardcoded number agreed with each
+//! other while both were wrong about what is on disk (issue #446).
+//!
+//! The `registry_matches_the_migrations_directory` tests below close that by
+//! reading the directory and comparing it against [`registry`] in BOTH
+//! directions, by file name and by content. They are deliberately ADDITIONAL to
+//! the chain-count tripwire rather than a replacement for it: the tripwire's
+//! value is forcing a human to read every added migration (issue #390), which a
+//! derived check cannot do, and the derived check catches a file nobody wired
+//! in, which the tripwire cannot see.
 
 use std::collections::BTreeMap;
 
@@ -1029,5 +1053,157 @@ impl<'a> MigrationRunner<'a> {
             newly_applied,
             already_applied: applied.len(),
         })
+    }
+}
+
+/// The registry against the directory it embeds from (issue #446).
+///
+/// [`registry`] is private, so these live inside the crate rather than in
+/// `tests/`. They are pure file reads and need no database.
+#[cfg(test)]
+mod registry_matches_the_migrations_directory {
+    use super::registry;
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
+
+    /// The directory [`super::registry`] embeds from, resolved from the crate
+    /// root rather than the process working directory, so the result does not
+    /// depend on where the test runner was invoked from.
+    fn migrations_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations")
+    }
+
+    /// Every file name in the migrations directory, whatever its extension.
+    ///
+    /// Deliberately unfiltered: filtering to `*.sql` here would hide exactly the
+    /// mistakes `only_sql_files_live_in_the_migrations_directory` is there to
+    /// catch, such as a `0099_thing.sql.bak` left behind by an editor.
+    fn file_names_on_disk() -> BTreeSet<String> {
+        let dir = migrations_dir();
+        std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("read the migrations directory {}: {e}", dir.display()))
+            .map(|entry| {
+                entry
+                    .expect("read a migrations directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect()
+    }
+
+    /// The file name a registry entry claims, derived from the two fields the
+    /// ledger records. This is the naming convention the whole chain follows:
+    /// a zero-padded four-digit version, an underscore, the name, `.sql`.
+    fn expected_file_name(version: i64, name: &str) -> String {
+        format!("{version:04}_{name}.sql")
+    }
+
+    /// Whether a directory entry is a migration SQL file, by EXTENSION rather than
+    /// by suffix, so `0099_thing.sql.bak` is a stray rather than a migration.
+    fn is_sql(name: &str) -> bool {
+        std::path::Path::new(name)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("sql"))
+    }
+
+    /// The registry's own file names.
+    fn file_names_in_registry() -> BTreeSet<String> {
+        registry()
+            .iter()
+            .map(|m| expected_file_name(m.version, m.name))
+            .collect()
+    }
+
+    #[test]
+    fn every_sql_file_on_disk_is_registered() {
+        // The #446 direction: a `.sql` file added to the directory and never
+        // wired into registry() is not in the chain, and neither the hardcoded
+        // chain count nor the live ledger can see it, because it never reaches
+        // the ledger at all.
+        let registered = file_names_in_registry();
+        let unregistered: Vec<String> = file_names_on_disk()
+            .into_iter()
+            .filter(|f| is_sql(f) && !registered.contains(f))
+            .collect();
+        assert!(
+            unregistered.is_empty(),
+            "these migration files exist on disk but are in no registry() entry, so they are \
+             NOT in the shipped chain and would never run: {unregistered:?}. Add a Migration \
+             entry for each in crates/ironauth-store/src/migrate.rs, or delete the file."
+        );
+    }
+
+    #[test]
+    fn every_registered_migration_has_its_file_on_disk() {
+        // The other direction. A missing file is a compile error today (the
+        // include_str! would not resolve), but a RENAME is not: renaming both
+        // the file and the include_str! path while leaving `name` or `version`
+        // stale still compiles, and this is what says so.
+        let on_disk = file_names_on_disk();
+        let missing: Vec<String> = file_names_in_registry()
+            .into_iter()
+            .filter(|f| !on_disk.contains(f))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these registry() entries name a file that is not in \
+             crates/ironauth-store/migrations: {missing:?}. A registry entry's version and name \
+             must derive its file name exactly (NNNN_name.sql)."
+        );
+    }
+
+    #[test]
+    fn every_registered_migration_embeds_the_file_its_version_and_name_derive() {
+        // Stronger than comparing the two SETS, and the reason the sets are
+        // compared by DERIVED name rather than by the include_str! literal: an
+        // entry whose path points at a DIFFERENT (also registered) file passes
+        // both set comparisons, because both names are present on both sides.
+        // Comparing embedded text against the derived path catches it.
+        let dir = migrations_dir();
+        for migration in registry() {
+            let expected = expected_file_name(migration.version, migration.name);
+            let path = dir.join(&expected);
+            let on_disk = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            assert_eq!(
+                migration.sql, on_disk,
+                "version {} ({}) embeds text that is not the contents of {expected}; its \
+                 include_str! path does not match its version and name",
+                migration.version, migration.name
+            );
+        }
+    }
+
+    #[test]
+    fn registry_versions_are_contiguous_from_one() {
+        // run() already refuses a chain that is not strictly ascending, but it
+        // cannot object to a GAP: skipping a number is silent there and is the
+        // other easy mistake when adding a migration. A gap also breaks the
+        // derived file name of everything a human counts by eye.
+        let versions: Vec<i64> = registry().iter().map(|m| m.version).collect();
+        let expected: Vec<i64> =
+            (1..=i64::try_from(versions.len()).expect("chain length fits i64")).collect();
+        assert_eq!(
+            versions, expected,
+            "migration versions must be 1..=N with no gaps, no duplicates, and in ascending order"
+        );
+    }
+
+    #[test]
+    fn only_sql_files_live_in_the_migrations_directory() {
+        // Without this, `every_sql_file_on_disk_is_registered` is evadable by
+        // accident: a stray `0099_thing.sql.bak` or `.sql.tmp` is not a `.sql`
+        // file, so that test skips it, and a reader scanning the directory sees
+        // a migration that is not in the chain.
+        let strays: Vec<String> = file_names_on_disk()
+            .into_iter()
+            .filter(|f| !is_sql(f))
+            .collect();
+        assert!(
+            strays.is_empty(),
+            "crates/ironauth-store/migrations holds only migration SQL; these do not belong \
+             and would be skipped by the registration check: {strays:?}"
+        );
     }
 }

@@ -6,6 +6,33 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The diagnostics redaction corpora could not see most of the fields they claimed to
+  guard** (issue #423). Both the client-authentication corpus and the policy-trace corpus
+  built their records from SAFE literals, so their sentinel scan compared one hardcoded list
+  against another and deleting the call would have gone unnoticed. Every free-form field of
+  `NewClientAuthDiagnostic`, `NewPolicyDecisionTrace` and `PolicyDecisionInputs` now has a
+  `should_panic` probe that routes a REAL sentinel through it, fourteen in all, plus a sweep
+  that proves the closed vocabularies cannot express one by enumerating their whole value
+  space. Writing the client-auth sweep found that the corpus covered eight of the sixteen
+  `ClientAuthDiagnosticReason` variants; it now covers all sixteen, held total by
+  `ClientAuthDiagnosticReason::ALL`. `scripts/diagnostics-redaction-scan.sh` runs the
+  probes as well as the corpora, and pins the EXACT set of test names each of its groups
+  must contain, so a renamed, deleted, or silently added probe fails the gate.
+- **The sweeps' variant lists were pinned by a device that does not pin anything, and two
+  more were added in the same shape before it was measured** (issue #404 review). A hand
+  written list beside a total `match` looks enforced and is not: adding
+  `ClientAuthDiagnosticReason::ProbeNewVariant` whose `as_str` renders a real sentinel, and
+  adding it ONLY to the `match` arms, left `cargo test -p ironauth-oidc --lib
+  client_auth::tests::` at 26 passed with `the_closed_diagnostic_vocabularies_cannot_
+  express_a_sentinel` green. The pre-existing `policy_trace::tests::every_reason_is_listed`
+  was no better despite slot indices and an `assert_eq!(EVERY_REASON.len(), 4)`, because a
+  length compared against a literal nothing forces is not a pin. All three lists are gone.
+  The sweeps now walk `ClientAuthDiagnosticReason::ALL`, `DiagnosticExpectation::ALL` and
+  `TokenSizeReason::ALL`, which `ironauth-store` compares against the variant identifiers
+  parsed out of the enum declarations themselves, and `PermissionStatus` is derived from
+  the already-pinned `PermissionOverflow::ALL` rather than listed. The redaction gate runs
+  those comparisons too, because the structural half of what it claims is worth exactly
+  what they are worth.
 - **WIRE CHANGE. `POST /t/{tenant}/e/{environment}/device` answers an environment that
   never existed byte for byte as it answers a real one, where it used to answer `500`
   against that real environment's `200`** (issue #449). No credential of any kind was

@@ -17483,7 +17483,7 @@
       },
       "PolicyTraceView": {
         "type": "object",
-        "description": "One recorded policy decision trace (issue #91).\n\nEvery field is a bounded, non secret datum the store record already holds: `policy`\nand `outcome` are closed sets, `subject` is an internal usr_ handle (a blind\nreference, never raw PII), `reason` is a bounded hint, and `decision_inputs` is the\nSTRUCTURALLY REDACTED safe field projection (the acr floor and achieved acr, the auth\nage, the risk signal names and levels, the connector slug and the mapped trait count),\nserialized as a JSON string. There is deliberately NO field capable of holding a claim\nvalue, a token, or a secret: those are unrepresentable in the record this view carries.",
+        "description": "One recorded policy decision trace (issue #91).\n\nEvery field is one the store record already holds and this view never widens: `policy`\nand `outcome` are closed sets, `subject` is MEANT to be an internal usr_ handle (a\nblind reference, never raw PII), `reason` a bounded hint, and `decision_inputs` the\nallowlisted safe field projection (the acr floor and achieved acr, the auth age, the\nrisk signal names and levels, the connector slug and the mapped trait count),\nserialized as a JSON string.\n\nThe projection is what redacts: a raw claim set or a token has no field to be carried\nin, so it cannot reach here without the projection enum being widened first. It does\nNOT follow that a secret is unrepresentable, which this doc used to say and which is\nfalse (issue #423): `subject`, `reason` and most of the projection's fields are\nfree-form strings, and this view serves whatever the recorder put in them.",
         "required": [
           "policy",
           "outcome",

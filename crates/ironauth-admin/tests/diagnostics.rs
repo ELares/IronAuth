@@ -244,9 +244,11 @@ async fn the_response_carries_only_the_safe_non_secret_fields() {
     let items = list_items(&body);
     assert_eq!(items.len(), 1, "{body}");
 
-    // The record type is structurally incapable of holding a secret, an assertion body,
-    // or a token; assert the SERIALIZED item exposes exactly the safe field set, so a
-    // future field can never silently widen the wire projection past the redaction line.
+    // The record type has no field for a secret, an assertion body, or a token, which is
+    // where the structural half of the guarantee stops: its four free-form strings would
+    // carry one (issue #423). What this assertion adds is the part that IS enforceable
+    // here: the SERIALIZED item exposes exactly the safe field set, so a future field can
+    // never silently widen the wire projection past the redaction line.
     let keys: std::collections::BTreeSet<&str> = items[0]
         .as_object()
         .expect("item object")

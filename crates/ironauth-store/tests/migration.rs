@@ -4926,8 +4926,10 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
                  on org_roles.{column}"
             );
         }
-        // Removal is a soft delete: neither plane may hard-DELETE a role, which
-        // would break the retention the append-only audit_log foreign key needs.
+        // Removal is a soft delete: neither plane may hard-DELETE a role, which would
+        // break the retention that keeps a `organization.role.delete` audit row's
+        // target resolvable (an application rule; `audit_log` carries no foreign key
+        // here).
         assert!(
             !role_has_table_privilege(pool, role, "org_roles", "DELETE").await,
             "{role} must NOT hold DELETE on org_roles (deletion is a soft delete)"
@@ -6309,7 +6311,8 @@ async fn org_role_permissions_carries_its_isolation_indexes_and_least_privilege_
             );
         }
         // DELETE is granted to nobody on either plane: removal is the soft delete,
-        // which is what keeps the audit foreign key satisfiable.
+        // which is what keeps a detach audit row's target resolvable (an application
+        // rule; `audit_log` carries no foreign key here).
         assert!(
             !role_has_table_privilege(pool, role, "org_role_permissions", "DELETE").await,
             "{role} must NOT hold DELETE on org_role_permissions (removal is a soft delete)"

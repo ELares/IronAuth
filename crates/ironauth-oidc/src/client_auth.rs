@@ -1624,17 +1624,21 @@ mod tests {
         );
     }
 
-    /// The STRUCTURAL REDACTION CORPUS (issue #91): a HOSTILE corpus stuffs known
-    /// secret / token / assertion / JWKS-private sentinels into every SECRET-bearing
-    /// input, the safe-field extraction (the SAME peek the record path uses) builds a
-    /// diagnostic from each, and NO sentinel may appear in ANY serialization of the
-    /// resulting record (its `Debug`, its reason, its expected hint, or any field).
+    /// The REDACTION CORPUS (issue #91): a HOSTILE corpus stuffs known secret / token /
+    /// assertion / JWKS-private sentinels into every SECRET-bearing input, the safe-field
+    /// extraction (the SAME peek the record path uses) builds a diagnostic from each, and
+    /// NO sentinel may appear in ANY serialization of the resulting record (its `Debug`,
+    /// its reason, its expected hint, or any field).
     ///
-    /// The guarantee is structural first: `NewClientAuthDiagnostic` /
-    /// `ClientAuthDiagnosticRecord` have NO field capable of holding an assertion
-    /// body, a secret, or a token, so a secret is UNREPRESENTABLE, not scrubbed. This
-    /// corpus is the CI belt-and-suspenders that proves the extraction never lifts a
-    /// sentinel out of a secret position into a safe field. The shell wrapper is
+    /// What this proves, precisely (issue #423). It proves the EXTRACTION never lifts a
+    /// sentinel out of a secret position into a safe field, which is a real and useful
+    /// property, because the hostile assertion is fed through the same `peek` the record
+    /// path uses. It does NOT prove that a sentinel cannot reach a serialized record: four
+    /// of the record's fields (`client_id`, `auth_method`, `key_id`, `signing_alg`) are
+    /// `&str` and would record one verbatim. This corpus supplies them from safe literals
+    /// and from the peek, so it can only see a leak that comes through the extraction. The
+    /// four `should_panic` probes below cover the other route, by routing a real sentinel
+    /// through each free-form field and proving the scan sees it. The shell wrapper is
     /// `scripts/diagnostics-redaction-scan.sh`.
     #[test]
     fn diagnostics_redaction_corpus_leaks_no_secret_sentinel() {
@@ -1642,15 +1646,6 @@ mod tests {
 
         use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
         use ironauth_store::{ClientAuthDiagnosticRecord, DiagnosticExpectation};
-
-        // Distinct sentinels, one per class of secret material a hostile attempt could
-        // carry. None of these is a client id, a kid, or an alg (the safe fields).
-        const SENTINELS: &[&str] = &[
-            "SUPERSECRETASSERTIONBODYSENTINEL",
-            "WRONGCLIENTSECRETSENTINEL",
-            "OVERSIZEDBEARERTOKENSENTINEL",
-            "JWKSPRIVATEKEYDSENTINEL",
-        ];
 
         // A hostile assertion: a VALID header (safe alg + kid, the only fields the peek
         // reads from the header) over a payload that buries the assertion-body and
@@ -1737,10 +1732,169 @@ mod tests {
         );
 
         // The GUARANTEE: no secret sentinel appears anywhere in any serialization.
+        assert_no_sentinel_leaked(&serialized);
+    }
+
+    /// Distinct sentinels, one per class of secret material a hostile attempt could carry.
+    /// None of these is a client id, a kid, or an alg (the safe fields). Module scoped so
+    /// the corpus and the probes that prove the scan is not vacuous share the SAME strings.
+    const SENTINELS: &[&str] = &[
+        "SUPERSECRETASSERTIONBODYSENTINEL",
+        "WRONGCLIENTSECRETSENTINEL",
+        "OVERSIZEDBEARERTOKENSENTINEL",
+        "JWKSPRIVATEKEYDSENTINEL",
+    ];
+
+    /// The corpus's guarantee as a reusable check, so the probes below can drive the SAME
+    /// scan over a deliberately leaky record. A scan that only ever runs over material that
+    /// cannot leak asserts nothing (issue #423).
+    fn assert_no_sentinel_leaked(serialized: &str) {
         for sentinel in SENTINELS {
             assert!(
                 !serialized.contains(sentinel),
                 "a secret sentinel leaked into a diagnostic record: {sentinel}"
+            );
+        }
+    }
+
+    /// A diagnostic built with its four free-form positions as PARAMETERS rather than
+    /// literals, serialized both as the write shape and as the read-back shape (issue
+    /// #423).
+    ///
+    /// `client_id`, `auth_method`, `key_id` and `signing_alg` are the record's only
+    /// free-form fields. Every other field is a closed enum ([`ClientAuthDiagnosticReason`],
+    /// `DiagnosticExpectation`) or a bounded integer, which the sweep below covers by
+    /// enumeration instead.
+    fn diagnostic_serialization(
+        client_id: &str,
+        auth_method: &str,
+        key_id: &str,
+        signing_alg: &str,
+    ) -> String {
+        use std::fmt::Write as _;
+
+        use ironauth_store::{ClientAuthDiagnosticRecord, DiagnosticExpectation};
+
+        let mut serialized = String::new();
+        let new = NewClientAuthDiagnostic {
+            client_id,
+            auth_method,
+            reason: ClientAuthDiagnosticReason::AssertionKidUnknown,
+            key_id: Some(key_id),
+            signing_alg: Some(signing_alg),
+            skew_seconds: Some(-42),
+            expected: Some(DiagnosticExpectation::KidNotInRegisteredJwks),
+        };
+        let record = ClientAuthDiagnosticRecord {
+            id: "diag_safe".to_owned(),
+            client_id: new.client_id.to_owned(),
+            auth_method: new.auth_method.to_owned(),
+            failure_reason: new.reason.as_str().to_owned(),
+            key_id: new.key_id.map(str::to_owned),
+            signing_alg: new.signing_alg.map(str::to_owned),
+            skew_seconds: new.skew_seconds,
+            expected: new.expected.map(|e| e.as_str().to_owned()),
+            occurred_at_micros: 0,
+        };
+        write!(serialized, "{new:?}{record:?}").expect("write to string");
+
+        // Positive control: all four free-form positions DID reach the serialization, so a
+        // probe cannot pass because the record silently dropped the field it targets.
+        assert!(
+            serialized.contains(client_id)
+                && serialized.contains(auth_method)
+                && serialized.contains(key_id)
+                && serialized.contains(signing_alg),
+            "every free-form diagnostic position must reach the serialization"
+        );
+        serialized
+    }
+
+    /// The scan CAN see `client_id`, which is ATTACKER SUPPLIED: it is whatever the failed
+    /// attempt claimed, so it is the field a sentinel is most likely to arrive in (#423).
+    ///
+    /// One test per field, so a scan that saw only some of them would still fail. This is
+    /// not a claim that a sentinel cannot reach the field; it is the weaker, TRUE claim
+    /// that if one ever did, the corpus would say so.
+    #[test]
+    #[should_panic(expected = "a secret sentinel leaked")]
+    fn the_sentinel_scan_catches_a_leak_through_the_client_id() {
+        assert_no_sentinel_leaked(&diagnostic_serialization(
+            SENTINELS[1],
+            "private_key_jwt",
+            "safe-kid",
+            "RS256",
+        ));
+    }
+
+    /// The scan CAN see `auth_method` (issue #423).
+    #[test]
+    #[should_panic(expected = "a secret sentinel leaked")]
+    fn the_sentinel_scan_catches_a_leak_through_the_auth_method() {
+        assert_no_sentinel_leaked(&diagnostic_serialization(
+            "cli_safe",
+            SENTINELS[0],
+            "safe-kid",
+            "RS256",
+        ));
+    }
+
+    /// The scan CAN see `key_id`, which is lifted out of an attacker-presented assertion
+    /// header (issue #423).
+    #[test]
+    #[should_panic(expected = "a secret sentinel leaked")]
+    fn the_sentinel_scan_catches_a_leak_through_the_key_id() {
+        assert_no_sentinel_leaked(&diagnostic_serialization(
+            "cli_safe",
+            "private_key_jwt",
+            SENTINELS[3],
+            "RS256",
+        ));
+    }
+
+    /// The scan CAN see `signing_alg`, the other header field the peek lifts (#423).
+    #[test]
+    #[should_panic(expected = "a secret sentinel leaked")]
+    fn the_sentinel_scan_catches_a_leak_through_the_signing_alg() {
+        assert_no_sentinel_leaked(&diagnostic_serialization(
+            "cli_safe",
+            "private_key_jwt",
+            "safe-kid",
+            SENTINELS[2],
+        ));
+    }
+
+    /// The diagnostic's CLOSED fields cannot express a sentinel, and that is proved by
+    /// enumerating their whole value space rather than asserted (issue #423).
+    ///
+    /// This is the honest other half of the two-tier claim: a closed enum or a bounded
+    /// integer genuinely CANNOT hold a sentinel, so for these fields the guarantee really
+    /// is structural, while for the four above it is caller discipline.
+    ///
+    /// The sweep is total only if the lists it walks are, and that totality is NOT
+    /// established here. It comes from [`ClientAuthDiagnosticReason::ALL`] and
+    /// [`ironauth_store::DiagnosticExpectation::ALL`], each of which is compared in
+    /// `ironauth-store` against the variant identifiers parsed out of the enum's own
+    /// declaration. This test used to carry its own copies of both lists, each pinned by
+    /// an exhaustive `match` beside it, and that pin did not work: a variant added to the
+    /// enum and to the `match` arm left the list short and every test here stayed green
+    /// (measured, issue #404 review).
+    #[test]
+    fn the_closed_diagnostic_vocabularies_cannot_express_a_sentinel() {
+        for reason in ClientAuthDiagnosticReason::ALL {
+            assert_no_sentinel_leaked(reason.as_str());
+        }
+        for expectation in ironauth_store::DiagnosticExpectation::ALL {
+            assert_no_sentinel_leaked(expectation.as_str());
+        }
+        // The skew bucket is an i64: its entire value space renders as digits and a sign.
+        for skew in [i64::MIN, -1, 0, 42, i64::MAX] {
+            let rendered = skew.to_string();
+            assert!(
+                rendered
+                    .chars()
+                    .all(|character| character.is_ascii_digit() || character == '-'),
+                "a skew bucket renders as digits only: {rendered}"
             );
         }
     }
