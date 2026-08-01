@@ -823,6 +823,20 @@ impl Harness {
         self.send(request).await
     }
 
+    /// An authenticated operator PUT with a RAW BYTE body, for the endpoints whose payload is
+    /// not JSON (the brand asset uploads, whose bodies are sniffed rasters). A raster's magic
+    /// bytes are not valid UTF-8, so they cannot ride [`Harness::put`]'s `&str`.
+    pub async fn put_bytes(&self, path: &str, body: &[u8]) -> (StatusCode, HeaderMap, String) {
+        let request = Request::builder()
+            .method("PUT")
+            .uri(path)
+            .header(header::AUTHORIZATION, bearer(OPERATOR_TOKEN))
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .body(Body::from(body.to_vec()))
+            .expect("request builds");
+        self.send(request).await
+    }
+
     /// An authenticated operator PATCH with a JSON body (no Idempotency-Key: a PATCH
     /// is a partial edit, not a create).
     pub async fn patch(&self, path: &str, body: &str) -> (StatusCode, HeaderMap, String) {

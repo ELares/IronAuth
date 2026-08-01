@@ -108,6 +108,7 @@ fn operation_ids_are_the_stable_set() {
             "createPermission",
             "createTenant",
             "createUser",
+            "deleteBrand",
             "deleteBrandFavicon",
             "deleteBrandLogo",
             "deleteClientAdminConsent",
@@ -129,6 +130,7 @@ fn operation_ids_are_the_stable_set() {
             "exportConfigSnapshot",
             "exportIdentities",
             "extendSignupQuarantine",
+            "getBrand",
             "getClientAdminConsent",
             "getClientAllowedScopes",
             "getClientAuthDiagnostics",
@@ -163,6 +165,7 @@ fn operation_ids_are_the_stable_set() {
             "liftBan",
             "linkUserExternalId",
             "listBans",
+            "listBrands",
             "listConnectors",
             "listDcrPolicies",
             "listEnvironments",
@@ -204,6 +207,7 @@ fn operation_ids_are_the_stable_set() {
             "revokeSession",
             "revokeUserConsent",
             "revokeUserSessions",
+            "setBrand",
             "setBrandFavicon",
             "setBrandLogo",
             "setClientAdminConsent",
@@ -367,6 +371,7 @@ fn documented_paths_are_the_expected_set() {
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/admin-consent",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/signup-form",
+            "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}/favicon",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}/logo",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/connectors/{connector_id}",
@@ -395,6 +400,8 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/abuse/bans",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/admin-consent",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/signup-form",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/brands",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/allowed-scopes",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/config/snapshot",
@@ -497,6 +504,7 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/suspend",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/admin-consent",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/signup-form",
+            "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}/favicon",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}/logo",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/allowed-scopes",
@@ -597,7 +605,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        143,
+        147,
         "the documented route count is pinned"
     );
 

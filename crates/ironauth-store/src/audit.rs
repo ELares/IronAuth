@@ -136,19 +136,21 @@ impl fmt::Display for ActorRef {
 /// from the schema side.
 ///
 /// The rule is not universal, which is the clearest evidence that no such
-/// foreign key could be added later. SEVENTEEN hard `DELETE FROM` statements in
-/// `repository.rs` run inside an audited write closure, and TWELVE of them delete
+/// foreign key could be added later. NINETEEN hard `DELETE FROM` statements in
+/// `repository.rs` run inside an audited write closure, and THIRTEEN of them delete
 /// the very row the enclosing audit row addresses: [`Action::ClientDelete`],
-/// [`Action::ConnectorDelete`], [`Action::BrandAssetDelete`],
+/// [`Action::ConnectorDelete`], [`Action::BrandDelete`],
+/// [`Action::BrandAssetDelete`],
 /// [`Action::LocaleDelete`], [`Action::SignupFormDelete`],
 /// [`Action::EnvironmentVariableDelete`], [`Action::EnvironmentSecretDelete`],
 /// [`Action::AaguidRuleRemove`], [`Action::CredentialClassPolicyRemove`],
 /// [`Action::ScopeStepUpPolicyRemove`], [`Action::AdminConsentRevoke`] and
 /// [`Action::AbuseBanLift`]. Those audit rows name an id that is already gone by
-/// the time the row is inserted. (The other five clear PRIOR rows rather than the
-/// target: an OTP or magic-link issue invalidates the outstanding code, a TOTP
-/// enrolment supersedes a pending one, and an SMS config update rewrites the
-/// country allowlist.)
+/// the time the row is inserted. (The other six clear PRIOR or DEPENDENT rows
+/// rather than the target: an OTP or magic-link issue invalidates the outstanding
+/// code, a TOTP enrolment supersedes a pending one, an SMS config update rewrites
+/// the country allowlist, and a brand delete sweeps the assets installed under its
+/// slug.)
 ///
 /// The count matters because the argument is one of impossibility, not of taste.
 /// It was first written as two variants, which understated it by ten and made a
@@ -818,6 +820,10 @@ pub enum Action {
     /// variants, wordmark, and sanitized rich-text slots). The audit row names the brand
     /// id and scope; the branding values themselves are not recorded here.
     BrandSet,
+    /// A per-environment BRAND was deleted through the management API (issue #475). The audit
+    /// row names the brand id and scope. The delete also sweeps every asset installed under
+    /// the brand's slug, in the same transaction, so no orphaned bytes survive the brand.
+    BrandDelete,
     /// A per-environment brand ASSET was uploaded through the management API (issue #86, PR 3):
     /// a first write or an overwrite of a magic-byte-sniffed raster (a logo or favicon). The
     /// audit row names the brand id and scope; the asset bytes themselves are not recorded here.
@@ -1382,6 +1388,7 @@ impl Action {
             Action::CustomDomainChallengeFail => "custom_domain.challenge.fail",
             Action::CustomDomainCertificateStore => "custom_domain.certificate.store",
             Action::BrandSet => "brand.set",
+            Action::BrandDelete => "brand.delete",
             Action::BrandAssetSet => "brand.asset.set",
             Action::BrandAssetDelete => "brand.asset.delete",
             Action::LocaleSet => "locale.set",

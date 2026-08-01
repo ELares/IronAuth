@@ -244,6 +244,42 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/brands": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List a per-environment's brands. */
+        get: operations["listBrands"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get a per-environment brand by slug. */
+        get: operations["getBrand"];
+        /** Set (create or overwrite) a per-environment brand. */
+        put: operations["setBrand"];
+        post?: never;
+        /** Delete a per-environment brand by slug. */
+        delete: operations["deleteBrand"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}/favicon": {
         parameters: {
             query?: never;
@@ -1957,6 +1993,36 @@ export interface components {
             size_bytes: number;
             /** @description The brand slug this asset belongs to. */
             slug: string;
+        };
+        /** @description One page of a per-environment brand listing (issues #86, #475). */
+        BrandPage: {
+            /** @description The brands in this environment, ordered by slug. */
+            items: components["schemas"]["BrandView"][];
+        };
+        /** @description A per-environment brand, as returned by the management API (issues #86, #475). */
+        BrandView: {
+            /** @description The optional plain-text brand-token badge. */
+            brand_token?: string | null;
+            /** @description The per-CLIENT selection key, if set. */
+            client_id?: string | null;
+            /** @description The per-DOMAIN selection key, normalized, if set. */
+            host_pattern?: string | null;
+            /** @description Whether this is the environment's default brand. */
+            is_default: boolean;
+            /** @description The plain-text product name / wordmark. */
+            product_name: string;
+            /** @description Whether to show the wordmark header. */
+            show_wordmark: boolean;
+            /** @description The SANITIZED rich-text slots, as stored. Never the submitted markup. */
+            slots: {
+                [key: string]: string;
+            };
+            /** @description The brand slug (the per-environment natural key, and the promotion / diff key). */
+            slug: string;
+            /** @description The stored typed design tokens. */
+            tokens: Record<string, never>;
+            /** @description The stored dark-mode token variants, if authored. */
+            tokens_dark?: Record<string, never>;
         };
         /**
          * @description The result of a BULK session revocation (issue #32). States the post-condition; see
@@ -4365,6 +4431,58 @@ export interface components {
             user_agent?: string | null;
         };
         /**
+         * @description The body to set (create or overwrite) a per-environment brand (issues #86, #475).
+         *
+         *     A brand is expressible ONLY through data that cannot become script, and this request shape
+         *     is where that rule is enforced at ingest. `tokens` and `tokens_dark` must deserialize into
+         *     the CLOSED typed design-token grammar (hex-only colors, an allowlist font enum, clamped
+         *     numerics); a malformed or hostile token blob is a loud 400 and nothing is stored. `slots`
+         *     values pass the ONE allowlist sanitizer and are stored as sanitizer output, never as the
+         *     submitted markup. The plain wordmark fields are stored as plain text and escaped on render.
+         */
+        SetBrandRequest: {
+            /** @description An optional plain-text brand-token badge (escaped on render). */
+            brand_token?: string | null;
+            /**
+             * @description The per-CLIENT selection key: the authorize `client_id` this brand is selected for, or
+             *     absent. At most one brand per client per environment. This key is deliberately NOT
+             *     carried by a config promotion (a client id embeds its environment), so it is always a
+             *     target-environment decision.
+             */
+            client_id?: string | null;
+            /**
+             * @description The per-DOMAIN selection key: the Host this brand is selected for, or absent. Normalized
+             *     (trimmed, port-stripped, lowercased) at ingest. At most one brand per host per
+             *     environment.
+             */
+            host_pattern?: string | null;
+            /**
+             * @description Whether this is the environment's DEFAULT brand (resolved when no per-client or
+             *     per-domain selection matches). At most one default per environment; setting a new
+             *     default demotes the previous one. Defaults to false.
+             */
+            is_default?: boolean;
+            /** @description The plain-text product name / wordmark (escaped on render, never markup). */
+            product_name: string;
+            /** @description Whether to show the wordmark header. Defaults to true. */
+            show_wordmark?: boolean;
+            /**
+             * @description The rich-text slots, a map of slot key (`footer_legal`, `login_help`, `consent_notice`)
+             *     to markup. Each value is SANITIZED at ingest and stored as sanitizer output; an unknown
+             *     slot key is a loud 400 rather than silently dropped.
+             */
+            slots?: {
+                [key: string]: string;
+            };
+            /**
+             * @description The TYPED light-mode design tokens. Every field is a validated scalar, never free-form
+             *     CSS; omit to use the neutral defaults.
+             */
+            tokens?: Record<string, never>;
+            /** @description The TYPED dark-mode token variants, or absent to reuse the neutral built-in dark block. */
+            tokens_dark?: Record<string, never>;
+        };
+        /**
          * @description The body to set (create or overwrite) a per-environment, per-client admin consent
          *     pre-authorization (issue #88, PR 4).
          *
@@ -6274,6 +6392,240 @@ export interface operations {
             };
         };
     };
+    listBrands: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The environment's brands, ordered by slug */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BrandPage"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Environment not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    getBrand: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The brand slug */
+                slug: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The brand */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BrandView"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found (absent or in another scope) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    setBrand: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The brand slug (the per-environment natural key) */
+                slug: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetBrandRequest"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BrandView"];
+                };
+            };
+            /** @description An invalid design token, an unknown slot key, or an oversize slot */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope, or sudo required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Environment not found, malformed slug, or a client_id selection key that names no client of this environment */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Another brand in this environment already claims the same host or client selection key */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    deleteBrand: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The brand slug */
+                slug: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted, along with every asset installed under the slug */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope, or sudo required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found (absent or in another scope). The environment must be live too: an absent or soft-deleted one answers this same not-found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     setBrandFavicon: {
         parameters: {
             query?: never;
@@ -6873,7 +7225,7 @@ export interface operations {
                     "application/json": unknown;
                 };
             };
-            /** @description The source snapshot document is invalid */
+            /** @description The source snapshot document is invalid: either it violates the snapshot grammar, or a brand it carries is not storable as authored (an invalid design token, an unknown or oversize slot, a slot that is not sanitizer output, or two brands claiming one host or one default). Nothing was changed */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -6909,7 +7261,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description The target drifted since the plan was computed (a structured drift error); nothing was changed. */
+            /** @description The target drifted since the plan was computed, or a promoted custom-journey version conflicts with an existing one (a structured error); nothing was changed. */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -6918,7 +7270,7 @@ export interface operations {
                     "application/json": unknown;
                 };
             };
-            /** @description A reference does not resolve in the target environment at apply time; nothing was changed. */
+            /** @description A reference does not resolve in the target environment at apply time, or a promoted brand names an asset whose bytes this environment does not hold (a snapshot carries an asset by content reference, never inline); nothing was changed. */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -6960,7 +7312,7 @@ export interface operations {
                     "application/json": unknown;
                 };
             };
-            /** @description The source snapshot document is invalid */
+            /** @description The source snapshot document is invalid: either it violates the snapshot grammar, or a brand it carries is not storable as authored (an invalid design token, an unknown or oversize slot, a slot that is not sanitizer output, or two brands claiming one host or one default) */
             400: {
                 headers: {
                     [name: string]: unknown;

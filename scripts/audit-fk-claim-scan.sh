@@ -7,8 +7,8 @@
 # to `environments`, and nothing anywhere references `audit_log`. `target_id` is a
 # single polymorphic `text` column naming the target of every Action variant, so a
 # foreign key from it to a data table is not merely absent, it is unaddable: a
-# column can reference only one table, and seventeen hard DELETE statements in
-# repository.rs run inside an audited write closure, twelve of them deleting the
+# column can reference only one table, and nineteen hard DELETE statements in
+# repository.rs run inside an audited write closure, thirteen of them deleting the
 # very row the audit row names.
 #
 # The idiom this scan bans is the ADJECTIVAL form: "the audit foreign key", "the

@@ -26,7 +26,8 @@ snapshot is diffable and reviewable.
 - Object keys are recursively **sorted** (by Unicode code point; RFC 8785-aligned
   for the ASCII key space the document uses).
 - Collections are ordered by a **stable natural key**: clients by `client_id`,
-  resource servers by `audience`, DCR policies by `name`.
+  resource servers by `audience`, DCR policies by `name`, and so on for every
+  type in the table below.
 - Compact separators, **no insignificant whitespace**.
 - **No volatile fields**: no timestamps, counters, row insertion order, or
   internal scoped ids leak into the document. Nothing is drawn from wall-clock
@@ -57,13 +58,22 @@ private JWK parameter (`d`, `p`, `q`, `dp`, `dq`, `qi`, `k`).
 
 The set of resource types is not a hand-maintained list: it is exactly the types
 the resource-model classification (issue #41) marks **promotable**. Today that is
-three types:
+twelve types:
 
-| Resource type     | Key               | Natural order |
-| ----------------- | ----------------- | ------------- |
-| `client`          | `resources.client`          | `client_id` |
-| `resource_server` | `resources.resource_server` | `audience`  |
-| `dcr_policy`      | `resources.dcr_policy`      | `name`      |
+| Resource type          | Key                                | Natural order              |
+| ---------------------- | ---------------------------------- | -------------------------- |
+| `client`               | `resources.client`                 | `client_id`                |
+| `resource_server`      | `resources.resource_server`        | `audience`                 |
+| `dcr_policy`           | `resources.dcr_policy`             | `name`                     |
+| `variable`             | `resources.variable`               | `name`                     |
+| `connector`            | `resources.connector`              | `connector_slug`           |
+| `org_connection`       | `resources.org_connection`         | `(organization_id, connector_id)` |
+| `routing_rule`         | `resources.routing_rule`           | `(rule_kind, selector, org_connection_id)` |
+| `upstream_token_grant` | `resources.upstream_token_grant`   | `(client_id, org_connection_id)` |
+| `brand`                | `resources.brand`                  | `slug`                     |
+| `locale_bundle`        | `resources.locale_bundle`          | `locale`                   |
+| `signup_form`          | `resources.signup_form`            | `client_id`                |
+| `flow_version`         | `resources.flow_version`           | `(journey_id, version)`    |
 
 Environment-identity types (the environment itself, its signing keys, its
 management credentials, its issuer) and runtime types (users, sessions, grants,
@@ -71,6 +81,87 @@ audit) are **excluded by construction**: the export never reads them, and a
 document that references one is rejected. When a new promotable type is added to
 the classification, a store test fails until the snapshot covers it, so coverage
 cannot silently drift.
+
+### Exported is not the same as promoted
+
+Every type above is EXPORTED. A strict subset of them is also applied by the
+transactional promotion engine (issue #44): `resource_server`, `dcr_policy`,
+`variable`, `brand`, `locale_bundle` and `flow_version`. The other six are
+carried for export, diff and review but are left untouched in a target:
+
+- `client` and `signup_form` are keyed by an authorize `client_id`, which is a
+  **scope-embedded** identifier: the same logical application has a different
+  `client_id` in every environment, so a source key cannot address the target's
+  resource. This is a **deliberate, measured exclusion, not a later slice**, and
+  the difference matters. Promoting a signup form would create a row in the
+  target keyed by a client that provably cannot exist there **and** delete the
+  target's own form (its client's key reads as a source deletion), so it is not
+  merely incomplete, it is destructive. Unlike an unresolved variable or a
+  missing asset byte, there is **no action a target-environment operator could
+  take** to make it resolve, so even a fail-closed gate would be a permanent
+  block rather than a safety net. The blocker is precisely the absence of a
+  **stable, scope-independent public client identity**, the same missing
+  primitive that blocks `client` promotion. Minting one is an owner-level
+  snapshot-format decision, not an engine one, and a store test measures the
+  blocker (a source client id does not parse under the target scope) rather than
+  describing it.
+- `connector`, `org_connection`, `routing_rule` and `upstream_token_grant` carry
+  references (an upstream secret, an organization, a connector, a client) that
+  must resolve against the target environment. Those four ARE later slices: the
+  work is merely unwritten, and no missing primitive blocks it.
+
+`ironauth_store::promotion::PROMOTED_RESOURCE_TYPES` is the single declaration of
+the promoted subset; the apply dispatch is generated from it, so the two cannot
+drift, and a store test measures that the promoted set is a subset of this one.
+
+### A promoted brand is held to the same ingest wall as a brand write
+
+A promotion apply is a full **writer** of the `brands` table, so a submitted
+document is not merely shape-checked. Before a plan is built and before an apply
+runs, every brand the document carries is validated against exactly the grammar
+`PUT .../brands/{slug}` enforces, and a fault is a **400** naming it:
+
+- `tokens` and `tokens_dark` must fit the closed typed design-token grammar
+  (hex-only colors, an allowlisted font enum, clamped numerics). Never CSS.
+- every `slots` key must be a known slot id, within the per-slot size cap, and
+  the value must already be **sanitizer output**. The export emits sanitizer
+  output and the sanitizer is idempotent, so an exported document round-trips;
+  raw markup is refused rather than silently rewritten, because a rewritten
+  document would mean the plan an operator reviewed and the bytes the apply
+  stored were different documents.
+- no two brands may claim the same host, and no two may be the environment
+  default. Within an environment each selects at most one brand, so a document
+  that names two could never converge.
+
+A brand's `host_pattern` is **canonicalized** (trimmed, port-stripped,
+lowercased) on the way in, by the same fold the brand write and the per-domain
+selection matcher use. Without it a promoted `LOGIN.Acme.Test:8443` would sit
+beside a stored `login.acme.test` under a unique index that cannot see they are
+the same host, and both would resolve for the same request.
+
+`client_id`, the per-**client** selection key, is the one brand field a
+promotion never carries: it embeds its environment, so it can only name a client
+of the source. The target-environment admin sets it deliberately.
+
+### Brand assets cross by content reference, never as bytes
+
+A snapshot carries a brand's logo and favicon as **metadata** (kind, sniffed
+content type, sha256, size), never as inline bytes: a snapshot stays a small,
+diffable text document and is never a binary side channel. A promotion therefore
+materializes an asset only from bytes the **target** already holds under that
+exact digest, content type and size. When the target holds no such bytes, the
+apply **fails closed** (422 `brand_asset_bytes_unavailable`) and changes nothing,
+rather than leaving the target with metadata pointing at bytes it does not have,
+or binding the promoted brand to some different image. The operator uploads the
+asset to the target environment (creating the brand there first through
+`PUT .../brands/{slug}`) and re-plans.
+
+Every digest the promotion needs is resolved in ONE pass **before any change is
+applied**, so the refusal is order-independent and cannot be false. Resolving
+per brand inside the apply loop was neither: the loop runs in natural-key order
+and a brand delete sweeps that brand's asset rows, so a source that merely
+RENAMED a brand while keeping its logo was refused whenever the departing slug
+happened to sort first, and told to upload an asset it had already uploaded.
 
 ## Validation and import
 
@@ -99,8 +190,12 @@ the caller learns all faults at once. It fails closed on:
 
 ## Scope: what this format does NOT yet cover
 
-- **Diff / plan / transactional apply** between environments: the promotion engine
-  (issue #44). This format is the input it consumes.
-- **Secret and variable reference resolution** against a target environment: issue
-  #45. This format only defines *where* references appear.
+- **Promotion of the six exported-but-not-applied types** listed above: a stable
+  cross-environment client identity (for `client` and `signup_form`) and
+  target-side reference resolution (for `connector`, `org_connection`,
+  `routing_rule` and `upstream_token_grant`).
 - **User / identity data**: out of scope (the exit-friendliness covenant, M6).
+
+The diff / plan / transactional apply engine (issue #44) and secret / variable
+reference resolution against a target environment (issue #45) DO ship; this format
+is the input they consume, and it defines where references appear.

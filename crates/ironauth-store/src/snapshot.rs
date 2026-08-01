@@ -348,8 +348,13 @@ pub struct BrandSnapshot {
     /// embedded as parsed JSON.
     pub slots: serde_json::Value,
     /// The per-DOMAIN selection key (issue #86, PR 3): the normalized Host this brand is
-    /// selected for, or absent. It is PROMOTABLE per-brand selection config that a promotion
-    /// copies as authored; the target-env operator adjusts hostnames if they differ (the same
+    /// selected for, or absent. It is PROMOTABLE per-brand selection config, carried across a
+    /// promotion CANONICALIZED (trimmed, port-stripped, lowercased) through
+    /// [`crate::canonicalize_host`], the one fold the management writer and the OIDC selection
+    /// matcher also use: two spellings are one host claim, and the per-scope unique index that
+    /// makes per-domain selection unambiguous is on the raw column, so a promotion that carried
+    /// an authored spelling verbatim could sit beside a stored one the index cannot see is a
+    /// duplicate. The target-env operator adjusts hostnames if they differ (the same
     /// "reference travels, value is env-local" spirit as [`SecretRef`]).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub host_pattern: Option<String>,

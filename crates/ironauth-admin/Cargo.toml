@@ -127,6 +127,15 @@ name = "pagination"
 path = "tests/pagination.rs"
 required-features = ["testing"]
 
+# Per-environment brand management endpoints (issue #475): the operator list / set / get /
+# delete lifecycle, the two ingest walls (the closed typed design-token grammar and the
+# allowlist slot sanitizer), and the brand BIRTH PATH a logo upload and the promotion asset
+# transport both depend on. Needs a real database.
+[[test]]
+name = "brands"
+path = "tests/brands.rs"
+required-features = ["testing"]
+
 # Per-environment, per-client signup form management endpoint (issue #87): the operator
 # set / get / delete lifecycle, and the fail-fast write validation (an unknown step and a
 # field referencing a trait with no active schema are precise 400s). Needs a real database.

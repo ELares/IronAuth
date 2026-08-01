@@ -1785,6 +1785,94 @@ pub struct ClientAdminConsentView {
     pub scope: String,
 }
 
+/// The body to set (create or overwrite) a per-environment brand (issues #86, #475).
+///
+/// A brand is expressible ONLY through data that cannot become script, and this request shape
+/// is where that rule is enforced at ingest. `tokens` and `tokens_dark` must deserialize into
+/// the CLOSED typed design-token grammar (hex-only colors, an allowlist font enum, clamped
+/// numerics); a malformed or hostile token blob is a loud 400 and nothing is stored. `slots`
+/// values pass the ONE allowlist sanitizer and are stored as sanitizer output, never as the
+/// submitted markup. The plain wordmark fields are stored as plain text and escaped on render.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct SetBrandRequest {
+    /// Whether this is the environment's DEFAULT brand (resolved when no per-client or
+    /// per-domain selection matches). At most one default per environment; setting a new
+    /// default demotes the previous one. Defaults to false.
+    #[serde(default)]
+    pub is_default: bool,
+    /// The plain-text product name / wordmark (escaped on render, never markup).
+    pub product_name: String,
+    /// Whether to show the wordmark header. Defaults to true.
+    #[serde(default = "crate::brands::default_true")]
+    pub show_wordmark: bool,
+    /// An optional plain-text brand-token badge (escaped on render).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brand_token: Option<String>,
+    /// The TYPED light-mode design tokens. Every field is a validated scalar, never free-form
+    /// CSS; omit to use the neutral defaults.
+    #[schema(value_type = Object)]
+    #[serde(default)]
+    pub tokens: Option<serde_json::Value>,
+    /// The TYPED dark-mode token variants, or absent to reuse the neutral built-in dark block.
+    #[schema(value_type = Object)]
+    #[serde(default)]
+    pub tokens_dark: Option<serde_json::Value>,
+    /// The rich-text slots, a map of slot key (`footer_legal`, `login_help`, `consent_notice`)
+    /// to markup. Each value is SANITIZED at ingest and stored as sanitizer output; an unknown
+    /// slot key is a loud 400 rather than silently dropped.
+    #[serde(default)]
+    pub slots: std::collections::BTreeMap<String, String>,
+    /// The per-DOMAIN selection key: the Host this brand is selected for, or absent. Normalized
+    /// (trimmed, port-stripped, lowercased) at ingest. At most one brand per host per
+    /// environment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_pattern: Option<String>,
+    /// The per-CLIENT selection key: the authorize `client_id` this brand is selected for, or
+    /// absent. At most one brand per client per environment. This key is deliberately NOT
+    /// carried by a config promotion (a client id embeds its environment), so it is always a
+    /// target-environment decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+}
+
+/// A per-environment brand, as returned by the management API (issues #86, #475).
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct BrandView {
+    /// The brand slug (the per-environment natural key, and the promotion / diff key).
+    pub slug: String,
+    /// Whether this is the environment's default brand.
+    pub is_default: bool,
+    /// The plain-text product name / wordmark.
+    pub product_name: String,
+    /// Whether to show the wordmark header.
+    pub show_wordmark: bool,
+    /// The optional plain-text brand-token badge.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub brand_token: Option<String>,
+    /// The stored typed design tokens.
+    #[schema(value_type = Object)]
+    pub tokens: serde_json::Value,
+    /// The stored dark-mode token variants, if authored.
+    #[schema(value_type = Object)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_dark: Option<serde_json::Value>,
+    /// The SANITIZED rich-text slots, as stored. Never the submitted markup.
+    pub slots: std::collections::BTreeMap<String, String>,
+    /// The per-DOMAIN selection key, normalized, if set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_pattern: Option<String>,
+    /// The per-CLIENT selection key, if set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+}
+
+/// One page of a per-environment brand listing (issues #86, #475).
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct BrandPage {
+    /// The brands in this environment, ordered by slug.
+    pub items: Vec<BrandView>,
+}
+
 /// A stored brand asset's METADATA, as returned by the management API upload (issue #86, PR 3).
 /// The bytes are never echoed back; only the by-reference metadata is (the same shape the brand
 /// snapshot carries).

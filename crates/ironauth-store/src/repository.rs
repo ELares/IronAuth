@@ -23648,6 +23648,68 @@ impl ActingBrandRepo<'_> {
         .await
     }
 
+    /// Delete the brand named `id` AND every asset installed under its slug, auditing
+    /// `brand.delete` in the same transaction (issue #475). A delete of an id out of scope,
+    /// or of a slug with no row, is a uniform [`StoreError::NotFound`], so a delete never
+    /// discloses a foreign scope's brands.
+    ///
+    /// The assets go with the brand deliberately. `brand_assets` is keyed by the brand's
+    /// SLUG rather than by a foreign key onto `brands`, so orphaned asset rows would survive
+    /// the brand and be silently inherited by any later brand that reused the slug. Both
+    /// deletes and the audit row commit together or not at all.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `id` is out of scope or names no installed brand;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn delete(&self, env: &Env, id: &BrandId, slug: &str) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let target = *id;
+        let scope = self.scope;
+        let slug = slug.to_owned();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::BrandDelete,
+                target: &target,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "DELETE FROM brand_assets \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND brand_slug = $3",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&slug)
+                .execute(&mut **tx)
+                .await?;
+                let affected = sqlx::query(
+                    "DELETE FROM brands \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND id = $3",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(target.to_string())
+                .execute(&mut **tx)
+                .await?
+                .rows_affected();
+                // A delete of a slug with no row rolls the audit row (and the asset sweep)
+                // back too, so a not-found delete records nothing and destroys nothing.
+                if affected == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
     /// The stored id of the brand named `slug`, or [`None`] for a first write.
     async fn brand_id_for_slug(&self, slug: &str) -> Result<Option<String>, StoreError> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
@@ -46169,7 +46231,11 @@ impl ActingStore<'_> {
     ///
     /// [`PromotionApplyError::Drift`] on a stale plan;
     /// [`PromotionApplyError::UnresolvedReference`] on a reference absent in the
-    /// target; [`PromotionApplyError::Store`] on a persistence fault.
+    /// target; [`PromotionApplyError::FlowVersionArtifactConflict`] on an append-only
+    /// custom-journey version conflict;
+    /// [`PromotionApplyError::BrandAssetBytesUnavailable`] when a promoted brand names
+    /// asset bytes the target does not hold; [`PromotionApplyError::Store`] on a
+    /// persistence fault.
     #[allow(
         clippy::too_many_lines,
         reason = "the single-transaction apply keeps the drift check, the reference \
@@ -46265,6 +46331,18 @@ impl ActingStore<'_> {
         // the plan's diff (the drift check proved current == base).
         let plan_diff = crate::promotion::diff(source, &current);
         let now_micros = epoch_micros(env.clock().now_utc());
+        // Resolve EVERY promoted brand asset's bytes UP FRONT, before any change is
+        // applied, and refuse the whole promotion here if one cannot be resolved. Doing
+        // it per brand inside the loop below made the refusal ORDER DEPENDENT and could
+        // make it FALSE: the loop applies changes in natural-key order, a brand DELETE
+        // sweeps that brand's asset rows, and a later brand resolving the same digest
+        // would then find the donor bytes already gone. Measured: a source that renames
+        // a brand while keeping its logo (target `aaa` deleted, source `zzz` created,
+        // same digest) failed `BrandAssetBytesUnavailable` for `zzz`, and the identical
+        // promotion with the slugs swapped succeeded. The refusal's own contract already
+        // says it happens before any write; resolving here is what makes that true.
+        let asset_bytes =
+            resolve_promoted_brand_asset_bytes(&mut tx, scope, source, &plan_diff).await?;
         // The actor provenance a promoted custom-journey version records in `created_by`,
         // computed once (every version this apply imports is authored by this apply's actor).
         let actor = self.acting.actor();
@@ -46292,7 +46370,19 @@ impl ActingStore<'_> {
                 ChangeKind::Update => updates += 1,
                 ChangeKind::Delete => deletes += 1,
             }
-            apply_change(&mut tx, scope, env, source, change, &created_by, now_micros).await?;
+            apply_change(
+                &mut tx,
+                scope,
+                change,
+                &PromotionApplyContext {
+                    env,
+                    source,
+                    created_by: &created_by,
+                    now_micros,
+                    asset_bytes: &asset_bytes,
+                },
+            )
+            .await?;
         }
 
         // One audit row, naming the environment and the change counts (operator-safe;
@@ -46327,10 +46417,95 @@ impl ActingStore<'_> {
 /// key in Rust, collation-independent), so the revision computed from this matches
 /// the revision the plan captured from the canonical export. The `client` set is
 /// left empty: clients are not promoted.
+///
+/// The per-type wiring is an EXHAUSTIVE match over
+/// [`crate::promotion::PromotedResourceType`] (issue #475), walked in declaration order:
+/// each promoted collection starts EMPTY in the literal below and is filled by the arm
+/// that names it, so promoting a new resource type makes the match non-exhaustive and the
+/// crate fails to COMPILE until this read carries it. The surrounding struct LITERAL is
+/// kept (rather than a `..Default::default()`) so the other lock still holds too: a new
+/// field on [`crate::snapshot::SnapshotResources`] is a compile error here until someone
+/// decides, in writing, whether a promotion reads it.
+///
+/// Before both locks this was a hand-written struct literal, and a type wired into the
+/// projection and the apply but missing HERE compiled clean and passed every test: the
+/// target side of its diff read empty, so the promotion re-created it on every apply.
 async fn read_promoted_snapshot(
     tx: &mut Transaction<'_, Postgres>,
     scope: Scope,
 ) -> Result<crate::snapshot::Snapshot, StoreError> {
+    use crate::promotion::PromotedResourceType;
+
+    let mut resources = crate::snapshot::SnapshotResources {
+        // The NON-promoted types, empty by construction. Each is named rather than
+        // defaulted so adding a snapshot resource type is a compile error here.
+        //
+        // Clients are not promoted: a `ClientId` embeds its `(tenant, environment)`, so a
+        // source key cannot address the target's client.
+        client: Vec::new(),
+        // Connectors (issue #75) are not promoted by the transactional engine yet
+        // (their upstream secret reference must resolve against the target env, a
+        // later slice), so the promoted target read omits them exactly like
+        // `client`, keeping the promotion revision consistent.
+        connector: Vec::new(),
+        // Org connections and routing rules (issue #77) are likewise not promoted
+        // by the engine yet, so the promoted target read omits them too.
+        org_connection: Vec::new(),
+        routing_rule: Vec::new(),
+        // Upstream-token grants (issue #77, PR 3) are likewise not promoted yet.
+        upstream_token_grant: Vec::new(),
+        // Signup forms (issue #87) are exported and diffable but are NOT promoted, and
+        // that is a DELIBERATE, MEASURED exclusion, not a deferral: a form's natural key
+        // is an authorize `client_id`, a scope-embedded id that cannot address the same
+        // logical client in another environment, and the missing primitive is a stable,
+        // scope-independent public client identity (see `crate::promotion`). The promoted
+        // target read omits them exactly like `client`, which is excluded for the
+        // identical reason, keeping the promotion revision consistent.
+        signup_form: Vec::new(),
+        // The PROMOTED types, filled by the exhaustive dispatch below.
+        resource_server: Vec::new(),
+        dcr_policy: Vec::new(),
+        variable: Vec::new(),
+        brand: Vec::new(),
+        locale_bundle: Vec::new(),
+        flow_version: Vec::new(),
+    };
+
+    for promoted in PromotedResourceType::ALL {
+        match promoted {
+            PromotedResourceType::ResourceServer => {
+                resources.resource_server = read_promoted_resource_servers(tx, scope).await?;
+            }
+            PromotedResourceType::DcrPolicy => {
+                resources.dcr_policy = read_promoted_dcr_policies(tx, scope).await?;
+            }
+            PromotedResourceType::Variable => {
+                resources.variable = read_promoted_variables(tx, scope).await?;
+            }
+            PromotedResourceType::Brand => {
+                resources.brand = read_promoted_brands(tx, scope).await?;
+            }
+            PromotedResourceType::LocaleBundle => {
+                resources.locale_bundle = read_promoted_locale_bundles(tx, scope).await?;
+            }
+            PromotedResourceType::FlowVersion => {
+                resources.flow_version = read_promoted_flow_versions(tx, scope).await?;
+            }
+        }
+    }
+
+    Ok(crate::snapshot::Snapshot {
+        schema_version: crate::snapshot::SNAPSHOT_SCHEMA_VERSION.to_owned(),
+        resources,
+    })
+}
+
+/// Read the target's promoted RESOURCE SERVERS inside the caller's transaction, ordered
+/// by `audience`.
+async fn read_promoted_resource_servers(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+) -> Result<Vec<crate::snapshot::ResourceServerSnapshot>, StoreError> {
     // Every PROMOTABLE column of the row, and the column list is hard coded rather
     // than shared with `RESOURCE_SERVER_SELECT_COLUMNS` because the two projections
     // answer different questions: that one is the runtime record (it carries `id`,
@@ -46361,7 +46536,15 @@ async fn read_promoted_snapshot(
     })
     .collect();
     resource_server.sort_by(|a, b| a.audience.cmp(&b.audience));
+    Ok(resource_server)
+}
 
+/// Read the target's promoted DCR POLICIES inside the caller's transaction, ordered by
+/// `name`.
+async fn read_promoted_dcr_policies(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+) -> Result<Vec<crate::snapshot::DcrPolicySnapshot>, StoreError> {
     let mut dcr_policy = Vec::new();
     for row in sqlx::query(
         "SELECT name, primitives FROM dcr_policies \
@@ -46381,7 +46564,15 @@ async fn read_promoted_snapshot(
         });
     }
     dcr_policy.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(dcr_policy)
+}
 
+/// Read the target's promoted ENVIRONMENT VARIABLES inside the caller's transaction,
+/// ordered by `name`.
+async fn read_promoted_variables(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+) -> Result<Vec<crate::snapshot::VariableSnapshot>, StoreError> {
     let mut variable: Vec<crate::snapshot::VariableSnapshot> = sqlx::query(
         "SELECT name, value FROM environment_variables \
          WHERE tenant_id = $1 AND environment_id = $2",
@@ -46397,7 +46588,15 @@ async fn read_promoted_snapshot(
     })
     .collect();
     variable.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(variable)
+}
 
+/// Read the target's promoted CUSTOM-JOURNEY VERSIONS inside the caller's transaction,
+/// ordered by `(journey_id, version)`.
+async fn read_promoted_flow_versions(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+) -> Result<Vec<crate::snapshot::FlowVersionSnapshot>, StoreError> {
     // Custom-journey versions (issue #92): the append-only version DEFINITIONS ARE promoted.
     // Read each version's `(journey_id, version, artifact)` WITHOUT joining the pin table and
     // report every version UNPINNED (`pinned = false`): the promoted projection normalizes the
@@ -46427,41 +46626,121 @@ async fn read_promoted_snapshot(
     flow_version.sort_by(|a, b| {
         (a.journey_id.as_str(), a.version).cmp(&(b.journey_id.as_str(), b.version))
     });
+    Ok(flow_version)
+}
 
-    Ok(crate::snapshot::Snapshot {
-        schema_version: crate::snapshot::SNAPSHOT_SCHEMA_VERSION.to_owned(),
-        resources: crate::snapshot::SnapshotResources {
-            client: Vec::new(),
-            resource_server,
-            dcr_policy,
-            variable,
-            // Connectors (issue #75) are not promoted by the transactional engine yet
-            // (their upstream secret reference must resolve against the target env, a
-            // later slice), so the promoted target read omits them exactly like
-            // `client`, keeping the promotion revision consistent.
-            connector: Vec::new(),
-            // Org connections and routing rules (issue #77) are likewise not promoted
-            // by the engine yet, so the promoted target read omits them too.
-            org_connection: Vec::new(),
-            routing_rule: Vec::new(),
-            // Upstream-token grants (issue #77, PR 3) are likewise not promoted yet.
-            upstream_token_grant: Vec::new(),
-            // Brands (issue #86) are exported and diffable but not applied by the
-            // transactional engine yet (a later slice), so the promoted target read omits
-            // them exactly like `client`, keeping the promotion revision consistent.
-            brand: Vec::new(),
-            // Locale bundles (issue #86, PR 2) are likewise exported and diffable but not
-            // applied by the transactional engine yet, so the promoted target read omits them.
-            locale_bundle: Vec::new(),
-            // Signup forms (issue #87) are likewise exported and diffable but not applied by the
-            // transactional engine yet, so the promoted target read omits them.
-            signup_form: Vec::new(),
-            // Custom-journey versions (issue #92) ARE promoted: their append-only definitions are
-            // read above (pin-normalized), so the target read carries them and the revision tracks
-            // them.
-            flow_version,
-        },
-    })
+/// Read the target's promoted BRANDS inside the caller's transaction (issue #475),
+/// ordered by slug, mirroring the canonical export's projection with ONE normalization.
+///
+/// The per-CLIENT selection key is reported as ABSENT, exactly as the source's
+/// `crate::promotion::promoted_brand` normalizes it away (it is a scope-embedded
+/// [`ClientId`], so it can never address the target's clients). Normalizing on BOTH sides
+/// is what keeps the revision selection-key-independent, so a target whose admin set a
+/// per-client brand never reads as permanent drift.
+///
+/// Each brand's asset METADATA rides by reference (kind, sniffed content type, sha256,
+/// size), never the bytes: the bytes are resolved by digest at apply time. The metadata is
+/// read in one pass and grouped by slug, as the canonical export does.
+async fn read_promoted_brands(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+) -> Result<Vec<crate::snapshot::BrandSnapshot>, StoreError> {
+    let decode = |text: String| -> Result<serde_json::Value, StoreError> {
+        serde_json::from_str(&text)
+            .map_err(|error| StoreError::Database(sqlx::Error::Decode(Box::new(error))))
+    };
+    let mut assets_by_slug: std::collections::BTreeMap<
+        String,
+        Vec<crate::snapshot::BrandAssetMetaSnapshot>,
+    > = std::collections::BTreeMap::new();
+    for row in sqlx::query(
+        "SELECT brand_slug, kind, content_type, sha256, size_bytes FROM brand_assets \
+         WHERE tenant_id = $1 AND environment_id = $2",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_all(&mut **tx)
+    .await?
+    {
+        let slug: String = row.get("brand_slug");
+        assets_by_slug
+            .entry(slug)
+            .or_default()
+            .push(crate::snapshot::BrandAssetMetaSnapshot {
+                kind: row.get("kind"),
+                content_type: row.get("content_type"),
+                sha256: row.get("sha256"),
+                size_bytes: i64::from(row.get::<i32, _>("size_bytes")),
+            });
+    }
+    let mut brand = Vec::new();
+    for row in sqlx::query(
+        "SELECT slug, is_default, product_name, show_wordmark, brand_token, \
+                tokens::text AS tokens, tokens_dark::text AS tokens_dark, \
+                slots::text AS slots, host_pattern \
+         FROM brands WHERE tenant_id = $1 AND environment_id = $2",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_all(&mut **tx)
+    .await?
+    {
+        let tokens = decode(row.get("tokens"))?;
+        let tokens_dark = match row.get::<Option<String>, _>("tokens_dark") {
+            Some(text) => Some(decode(text)?),
+            None => None,
+        };
+        let slots = decode(row.get("slots"))?;
+        let slug: String = row.get("slug");
+        let mut assets = assets_by_slug.remove(&slug).unwrap_or_default();
+        assets.sort_by(|a, b| a.kind.cmp(&b.kind));
+        brand.push(crate::snapshot::BrandSnapshot {
+            slug,
+            is_default: row.get("is_default"),
+            product_name: row.get("product_name"),
+            show_wordmark: row.get("show_wordmark"),
+            brand_token: row.get("brand_token"),
+            tokens,
+            tokens_dark,
+            slots,
+            host_pattern: row.get("host_pattern"),
+            // The per-environment activation gate: never read, so never diffed.
+            client_id: None,
+            assets,
+        });
+    }
+    brand.sort_by(|a, b| a.slug.cmp(&b.slug));
+    Ok(brand)
+}
+
+/// Read the target's promoted LOCALE BUNDLES inside the caller's transaction (issue #475),
+/// ordered by BCP47 tag. No field needs normalizing: the tag, the env-default flag and the
+/// entries map are all promotable definition.
+async fn read_promoted_locale_bundles(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+) -> Result<Vec<crate::snapshot::LocaleBundleSnapshot>, StoreError> {
+    let mut locale_bundle = Vec::new();
+    for row in sqlx::query(
+        "SELECT locale, is_env_default, entries::text AS entries FROM locale_bundles \
+         WHERE tenant_id = $1 AND environment_id = $2",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_all(&mut **tx)
+    .await?
+    {
+        let entries_text: String = row.get("entries");
+        let entries: serde_json::Value = serde_json::from_str(&entries_text)
+            .map_err(|error| StoreError::Database(sqlx::Error::Decode(Box::new(error))))?;
+        locale_bundle.push(crate::snapshot::LocaleBundleSnapshot {
+            locale: row.get("locale"),
+            is_env_default: row.get("is_env_default"),
+            entries,
+        });
+    }
+    locale_bundle.sort_by(|a, b| a.locale.cmp(&b.locale));
+    Ok(locale_bundle)
 }
 
 /// Whether a secret of `name` exists in `scope`, read inside the caller's
@@ -46486,33 +46765,81 @@ async fn secret_exists_tx(
 /// Apply one promotion change to the target, inside the caller's transaction
 /// (issue #44). Creates mint a fresh target-scoped identifier; updates and deletes
 /// match the existing target row by its scope-independent natural key.
+///
+/// The dispatch narrows the change's [`ResourceType`] to the CLOSED
+/// [`crate::promotion::PromotedResourceType`] first and then matches it EXHAUSTIVELY,
+/// with no catch-all arm (issue #475). That is the drift lock on this file: the enum is
+/// generated from the same declaration list as
+/// [`crate::promotion::PROMOTED_RESOURCE_TYPES`], so promoting a new resource type makes
+/// this match non-exhaustive and the crate FAILS TO COMPILE until its apply arm exists.
+/// Before that, the dispatch was a hand-written list of four beside a constant of four
+/// with a `_ => NotFound` wildcard, and the two had silently diverged from the snapshot's
+/// twelve for three whole resource types.
+///
+/// The per-change inputs that do not vary across the loop travel as one
+/// [`PromotionApplyContext`], so the dispatch reads as "apply THIS change in THAT context"
+/// rather than as an eight-argument forwarding list.
 async fn apply_change(
     tx: &mut Transaction<'_, Postgres>,
     scope: Scope,
-    env: &Env,
-    source: &crate::snapshot::Snapshot,
     change: &crate::promotion::ResourceChange,
-    created_by: &str,
-    now_micros: i64,
-) -> Result<(), StoreError> {
-    match change.resource_type {
-        ResourceType::ResourceServer => {
-            apply_resource_server_change(tx, scope, env, source, change).await
+    ctx: &PromotionApplyContext<'_>,
+) -> Result<(), crate::promotion::PromotionApplyError> {
+    use crate::promotion::{PromotedResourceType, PromotionApplyError};
+    let PromotionApplyContext {
+        env,
+        source,
+        created_by,
+        now_micros,
+        asset_bytes,
+    } = *ctx;
+    // A type this engine does not promote can only reach here as a programmer error (the
+    // diff never emits one), so it is a not-found rather than a silent skip.
+    let promoted = PromotedResourceType::from_resource_type(change.resource_type)
+        .ok_or(StoreError::NotFound)?;
+    match promoted {
+        PromotedResourceType::ResourceServer => {
+            apply_resource_server_change(tx, scope, env, source, change)
+                .await
+                .map_err(PromotionApplyError::from)
         }
-        ResourceType::DcrPolicy => {
-            apply_dcr_policy_change(tx, scope, env, source, change, now_micros).await
+        PromotedResourceType::DcrPolicy => {
+            apply_dcr_policy_change(tx, scope, env, source, change, now_micros)
+                .await
+                .map_err(PromotionApplyError::from)
         }
-        ResourceType::Variable => {
-            apply_variable_change(tx, scope, env, source, change, now_micros).await
+        PromotedResourceType::Variable => {
+            apply_variable_change(tx, scope, env, source, change, now_micros)
+                .await
+                .map_err(PromotionApplyError::from)
         }
-        ResourceType::FlowVersion => {
-            apply_flow_version_change(tx, scope, env, source, change, created_by, now_micros).await
+        PromotedResourceType::Brand => {
+            apply_brand_change(tx, scope, env, source, change, now_micros, asset_bytes).await
         }
-        // The promotion engine only ever emits changes for the promoted resource
-        // types; any other type is a programmer error, surfaced as a not-found
-        // rather than a silent skip.
-        _ => Err(StoreError::NotFound),
+        PromotedResourceType::LocaleBundle => {
+            apply_locale_bundle_change(tx, scope, env, source, change, now_micros)
+                .await
+                .map_err(PromotionApplyError::from)
+        }
+        PromotedResourceType::FlowVersion => {
+            apply_flow_version_change(tx, scope, env, source, change, created_by, now_micros)
+                .await
+                .map_err(PromotionApplyError::from)
+        }
     }
+}
+
+/// Everything one transactional promotion apply holds constant across its change loop: the
+/// SOURCE document each change reads its value from, the environment (for minting scoped ids
+/// and for the clock reading already taken), the actor provenance a promoted custom-journey
+/// version records, and the brand asset bytes resolved before the first write.
+#[derive(Clone, Copy)]
+struct PromotionApplyContext<'a> {
+    env: &'a Env,
+    source: &'a crate::snapshot::Snapshot,
+    created_by: &'a str,
+    now_micros: i64,
+    asset_bytes: &'a ResolvedAssetBytes,
 }
 
 /// Apply a resource-server create/update/delete, matched by `audience`.
@@ -46741,6 +47068,552 @@ async fn apply_variable_change(
             Ok(())
         }
     }
+}
+
+/// Apply a per-environment brand create/update/delete, matched by `slug` (issues #86,
+/// #475).
+///
+/// The brand ROW mirrors `ActingBrandRepo::set`'s transaction discipline exactly, for BOTH
+/// of migration 0070's per-scope partial unique indexes, which have the identical shape and
+/// therefore need the identical treatment:
+///
+/// - `brands_default_idx` tolerates one `is_default` per scope, so when the promoted brand
+///   is the environment default any OTHER default is DEMOTED first.
+/// - `brands_host_pattern_idx` tolerates one `host_pattern` per scope, so when the promoted
+///   brand claims a host, every OTHER claimant of that host in scope is RELEASED first
+///   (its `host_pattern` set to NULL).
+///
+/// Neither pre-step is an unenumerated change of intent: the source carries at most one
+/// default and at most one claimant per host (its own indexes guarantee it, and the
+/// management ingest wall refuses a submitted document that violates either), so every
+/// other brand's `is_default = false` and released host claim is exactly what the source
+/// says the target should hold, whether that brand is itself in the diff or being deleted
+/// by it. Each brand's own change then sets its final value.
+///
+/// The host release is what makes a legitimate promotion CONVERGE rather than abort. Changes
+/// apply in natural-key order, so without it success depended on how slugs sort: source
+/// `aaa` claiming `h.test` created before target `zzz` claiming `h.test` was deleted raised
+/// a raw `23505 duplicate key value violates unique constraint "brands_host_pattern_idx"`,
+/// which the management surface renders as an opaque 500 on a well formed plan, while the
+/// same logical promotion with the slugs swapped succeeded. Two brands SWAPPING host
+/// patterns (both present on both sides, no delete at all) could not be applied in ANY key
+/// order. All three are measured in `tests/config_promotion.rs`.
+///
+/// The management writer deliberately does NOT release: a `Brands::set` that collides is a
+/// LOUD 409 telling one operator another brand holds the host. A promotion is not one write,
+/// it is the target being made to match a whole source document that already resolved the
+/// contention, so the same collision there carries no ambiguity to report.
+///
+/// The `host_pattern` value bound is the CANONICAL one
+/// (`crate::promotion::promoted_host_pattern`), the same fold the management writer applies
+/// at ingest and the same one the diff and the revision read, so a promotion cannot store a
+/// second spelling of a host that the raw-column unique index cannot see is a duplicate.
+///
+/// The per-CLIENT selection key is NEVER written. It is normalized out of both the source
+/// projection and the target read (see `crate::promotion::promoted_brand`), so it is not in
+/// the diff, and writing it would silently overwrite a target admin's own per-client brand
+/// selection with a scope-embedded id that can never match there. A create leaves the column
+/// NULL and an update leaves it untouched.
+///
+/// The brand's ASSETS are reconciled by [`apply_brand_assets`] in the same transaction from
+/// `asset_bytes`, the bytes [`resolve_promoted_brand_asset_bytes`] already resolved before
+/// any change was applied: the bytes never travel in the snapshot, so an asset is
+/// materialized only from bytes the TARGET already held under the same digest, content type
+/// and size, and the whole apply was refused before this ran when it could not be.
+async fn apply_brand_change(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    env: &Env,
+    source: &crate::snapshot::Snapshot,
+    change: &crate::promotion::ResourceChange,
+    now_micros: i64,
+    asset_bytes: &ResolvedAssetBytes,
+) -> Result<(), crate::promotion::PromotionApplyError> {
+    use crate::promotion::ChangeKind;
+    let brand = match change.kind {
+        ChangeKind::Create | ChangeKind::Update => Some(
+            source
+                .resources
+                .brand
+                .iter()
+                .find(|brand| brand.slug == change.key)
+                .ok_or(StoreError::NotFound)?,
+        ),
+        ChangeKind::Delete => None,
+    };
+    if let Some(brand) = brand {
+        let columns = PromotedBrandColumns::of(brand)?;
+        if brand.is_default {
+            demote_other_default_brands(tx, scope, &brand.slug, now_micros).await?;
+        }
+        if let Some(host) = columns.host_pattern.as_deref() {
+            release_other_host_claims(tx, scope, &brand.slug, host, now_micros).await?;
+        }
+        match change.kind {
+            ChangeKind::Create => {
+                insert_promoted_brand(tx, scope, env, brand, &columns, now_micros).await?;
+            }
+            ChangeKind::Update => {
+                update_promoted_brand(tx, scope, brand, &columns, now_micros).await?;
+            }
+            ChangeKind::Delete => unreachable!("a delete carries no source brand"),
+        }
+        apply_brand_assets(
+            tx,
+            scope,
+            &brand.slug,
+            &brand.assets,
+            now_micros,
+            asset_bytes,
+        )
+        .await?;
+        return Ok(());
+    }
+    // A delete removes the brand AND its assets: `brand_assets` is keyed by the brand's
+    // SLUG (not by a foreign key onto `brands`), so leaving the asset rows behind would
+    // leave orphaned bytes that a later brand of the same slug would silently inherit.
+    delete_brand_assets(tx, scope, &change.key).await?;
+    sqlx::query("DELETE FROM brands WHERE tenant_id = $1 AND environment_id = $2 AND slug = $3")
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(&change.key)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// The serialized, NORMALIZED column values one promoted brand writes: the jsonb blobs as
+/// text and the canonical host key. Computed once so the create and the update arms cannot
+/// drift on how a column is derived, and so the host fold happens exactly once.
+struct PromotedBrandColumns {
+    tokens: String,
+    tokens_dark: Option<String>,
+    slots: String,
+    host_pattern: Option<String>,
+}
+
+impl PromotedBrandColumns {
+    fn of(brand: &crate::snapshot::BrandSnapshot) -> Result<Self, StoreError> {
+        let encode = |value: &serde_json::Value| -> Result<String, StoreError> {
+            serde_json::to_string(value)
+                .map_err(|error| StoreError::Database(sqlx::Error::Decode(Box::new(error))))
+        };
+        Ok(Self {
+            tokens: encode(&brand.tokens)?,
+            tokens_dark: brand.tokens_dark.as_ref().map(encode).transpose()?,
+            slots: encode(&brand.slots)?,
+            // The selection-uniqueness fold, applied on the way to the column exactly as the
+            // diff and the revision apply it on the way to the projection.
+            host_pattern: crate::promotion::promoted_host_pattern(brand.host_pattern.as_deref()),
+        })
+    }
+}
+
+/// INSERT one promoted brand, minting a fresh target-scoped id. `client_id` is deliberately
+/// absent from the column list (the per-environment activation gate), so a create leaves it
+/// NULL.
+async fn insert_promoted_brand(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    env: &Env,
+    brand: &crate::snapshot::BrandSnapshot,
+    columns: &PromotedBrandColumns,
+    now_micros: i64,
+) -> Result<(), StoreError> {
+    let id = BrandId::generate(env, &scope);
+    sqlx::query(
+        "INSERT INTO brands \
+         (id, tenant_id, environment_id, slug, is_default, product_name, \
+          show_wordmark, brand_token, tokens, tokens_dark, slots, host_pattern, \
+          created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb, \
+                 $11::jsonb, $12, \
+                 TIMESTAMPTZ 'epoch' + ($13::text || ' microseconds')::interval, \
+                 TIMESTAMPTZ 'epoch' + ($13::text || ' microseconds')::interval)",
+    )
+    .bind(id.to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(&brand.slug)
+    .bind(brand.is_default)
+    .bind(&brand.product_name)
+    .bind(brand.show_wordmark)
+    .bind(brand.brand_token.as_deref())
+    .bind(&columns.tokens)
+    .bind(columns.tokens_dark.as_deref())
+    .bind(&columns.slots)
+    .bind(columns.host_pattern.as_deref())
+    .bind(now_micros)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// UPDATE one promoted brand, matched by slug: every promotable brand column in one SET list.
+/// `client_id` is deliberately absent (the per-environment activation gate), so an update
+/// leaves a target admin's own per-client selection untouched.
+async fn update_promoted_brand(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    brand: &crate::snapshot::BrandSnapshot,
+    columns: &PromotedBrandColumns,
+    now_micros: i64,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "UPDATE brands \
+         SET is_default = $1, product_name = $2, show_wordmark = $3, \
+             brand_token = $4, tokens = $5::jsonb, tokens_dark = $6::jsonb, \
+             slots = $7::jsonb, host_pattern = $8, \
+             updated_at = TIMESTAMPTZ 'epoch' + \
+                 ($9::text || ' microseconds')::interval \
+         WHERE tenant_id = $10 AND environment_id = $11 AND slug = $12",
+    )
+    .bind(brand.is_default)
+    .bind(&brand.product_name)
+    .bind(brand.show_wordmark)
+    .bind(brand.brand_token.as_deref())
+    .bind(&columns.tokens)
+    .bind(columns.tokens_dark.as_deref())
+    .bind(&columns.slots)
+    .bind(columns.host_pattern.as_deref())
+    .bind(now_micros)
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(&brand.slug)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Demote every OTHER default brand in `scope`, so the partial unique index
+/// `brands_default_idx` (one default per scope) is never violated. Mirrors the identical
+/// step in `ActingBrandRepo::set`.
+async fn demote_other_default_brands(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    slug: &str,
+    now_micros: i64,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "UPDATE brands SET is_default = false, \
+             updated_at = TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval \
+         WHERE tenant_id = $1 AND environment_id = $2 AND is_default AND slug <> $4",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(now_micros)
+    .bind(slug)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// RELEASE every OTHER brand's claim on `host` in `scope`, so the partial unique index
+/// `brands_host_pattern_idx` (one host claimant per scope) is never violated by an apply.
+///
+/// The mirror of [`demote_other_default_brands`], for the second index of the same shape,
+/// and it exists for the same reason: the target may transiently hold a claimant the
+/// source's own brand is about to take over from, and whether that transient overlap is
+/// ever observed depends only on how the two slugs happen to sort. A released claim is not
+/// left dangling: the source has at most one claimant of `host`, so a released brand either
+/// carries its own change later in the same apply (which sets its final `host_pattern`) or
+/// is being deleted by it.
+///
+/// `host` must already be canonical (see `crate::promotion::promoted_host_pattern`): the
+/// column stores the folded form, so comparing a raw spelling here would release nothing.
+async fn release_other_host_claims(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    slug: &str,
+    host: &str,
+    now_micros: i64,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "UPDATE brands SET host_pattern = NULL, \
+             updated_at = TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval \
+         WHERE tenant_id = $1 AND environment_id = $2 AND host_pattern = $4 AND slug <> $5",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(now_micros)
+    .bind(host)
+    .bind(slug)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Delete every asset row belonging to one brand slug in `scope`.
+async fn delete_brand_assets(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    slug: &str,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "DELETE FROM brand_assets \
+         WHERE tenant_id = $1 AND environment_id = $2 AND brand_slug = $3",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(slug)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// The BYTES of every promoted brand asset, resolved by content reference BEFORE any
+/// change is applied (issue #475), keyed by the `(sha256, content_type, size_bytes)`
+/// triple the resolution matches on.
+///
+/// The triple rather than the digest alone, so the metadata the apply writes is EXACTLY
+/// what the source described and the round-trip property (apply, then re-diff, yields
+/// empty) holds.
+type ResolvedAssetBytes = std::collections::BTreeMap<(String, String, i32), Vec<u8>>;
+
+/// Resolve the bytes of EVERY asset this promotion's brand changes will bind, against
+/// bytes the TARGET already holds, BEFORE the apply writes anything (issue #475).
+///
+/// A snapshot is a small, diffable TEXT document and deliberately carries an asset as
+/// metadata (kind, sniffed content type, sha256, size) rather than as inline bytes; that
+/// design is not re-litigated here. So the ONLY honest way for an asset to cross an
+/// environment boundary is by CONTENT REFERENCE: the apply looks for bytes the TARGET
+/// already holds whose digest, sniffed content type and size all match the metadata, and
+/// binds those bytes to the promoted brand.
+///
+/// When no such bytes exist there is no source for them at all, so this FAILS CLOSED with
+/// [`crate::promotion::PromotionApplyError::BrandAssetBytesUnavailable`] and the whole
+/// promotion rolls back. The two failure modes that refusal exists to prevent are leaving
+/// the target with metadata pointing at bytes it does not have, and quietly binding the
+/// promoted brand to whatever different image the target happens to hold under that kind.
+/// The operator's remedy is to upload the asset to the target environment (creating the
+/// brand there first through the brand management API) and re-plan.
+///
+/// Resolving in ONE pass up front, rather than per brand inside the apply loop, is what
+/// makes that remedy honest. Resolution reads `brand_assets` as it stands AT THAT MOMENT,
+/// and a brand DELETE inside the same loop sweeps a departing brand's asset rows, so a
+/// per-brand resolution made the refusal ORDER DEPENDENT and could make it FALSE: a source
+/// that renames a brand while keeping its logo refused with
+/// `BrandAssetBytesUnavailable` whenever the donor slug sorted first, telling the operator
+/// to upload an asset they had already uploaded. Doing it here also puts the refusal ahead
+/// of every write, which is what the error's own documentation already claims.
+///
+/// `LIMIT 1` is not a choice between candidates: every row matching the digest, content
+/// type and size carries the same content.
+async fn resolve_promoted_brand_asset_bytes(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    source: &crate::snapshot::Snapshot,
+    diff: &crate::promotion::ConfigDiff,
+) -> Result<ResolvedAssetBytes, crate::promotion::PromotionApplyError> {
+    use crate::promotion::{ChangeKind, PromotionApplyError};
+    let mut resolved: ResolvedAssetBytes = std::collections::BTreeMap::new();
+    for change in diff.changes() {
+        if change.resource_type != ResourceType::Brand || matches!(change.kind, ChangeKind::Delete)
+        {
+            continue;
+        }
+        let brand = source
+            .resources
+            .brand
+            .iter()
+            .find(|brand| brand.slug == change.key)
+            .ok_or(StoreError::NotFound)?;
+        for asset in &brand.assets {
+            let unavailable = || PromotionApplyError::BrandAssetBytesUnavailable {
+                slug: brand.slug.clone(),
+                kind: asset.kind.clone(),
+                sha256: asset.sha256.clone(),
+            };
+            let size_bytes = i32::try_from(asset.size_bytes).map_err(|_| unavailable())?;
+            let key = (asset.sha256.clone(), asset.content_type.clone(), size_bytes);
+            if resolved.contains_key(&key) {
+                continue;
+            }
+            let row = sqlx::query(
+                "SELECT bytes FROM brand_assets \
+                 WHERE tenant_id = $1 AND environment_id = $2 AND sha256 = $3 \
+                   AND content_type = $4 AND size_bytes = $5 \
+                 LIMIT 1",
+            )
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .bind(&asset.sha256)
+            .bind(&asset.content_type)
+            .bind(size_bytes)
+            .fetch_optional(&mut **tx)
+            .await?;
+            let Some(row) = row else {
+                return Err(unavailable());
+            };
+            resolved.insert(key, row.get("bytes"));
+        }
+    }
+    Ok(resolved)
+}
+
+/// Reconcile one promoted brand's ASSETS against the target, inside the apply's
+/// transaction (issue #475), from the bytes [`resolve_promoted_brand_asset_bytes`] already
+/// resolved before any change was applied.
+///
+/// This writes only: every refusal happened up front, so nothing here can discover a
+/// missing asset half way through a promotion. A digest absent from `asset_bytes` is
+/// unreachable (the resolver walked exactly the brand creates and updates this loop
+/// applies), and is treated as the same fail-closed refusal rather than a silent skip.
+///
+/// An asset kind the source does NOT carry is REMOVED from the target, so an asset a source
+/// brand dropped does not survive the promotion.
+async fn apply_brand_assets(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    slug: &str,
+    assets: &[crate::snapshot::BrandAssetMetaSnapshot],
+    now_micros: i64,
+    asset_bytes: &ResolvedAssetBytes,
+) -> Result<(), crate::promotion::PromotionApplyError> {
+    use crate::promotion::PromotionApplyError;
+    for asset in assets {
+        let unavailable = || PromotionApplyError::BrandAssetBytesUnavailable {
+            slug: slug.to_owned(),
+            kind: asset.kind.clone(),
+            sha256: asset.sha256.clone(),
+        };
+        let size_bytes = i32::try_from(asset.size_bytes).map_err(|_| unavailable())?;
+        let key = (asset.sha256.clone(), asset.content_type.clone(), size_bytes);
+        let Some(bytes) = asset_bytes.get(&key) else {
+            return Err(unavailable());
+        };
+        sqlx::query(
+            "INSERT INTO brand_assets \
+             (tenant_id, environment_id, brand_slug, kind, content_type, bytes, sha256, \
+              size_bytes, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, \
+                     TIMESTAMPTZ 'epoch' + ($9::text || ' microseconds')::interval, \
+                     TIMESTAMPTZ 'epoch' + ($9::text || ' microseconds')::interval) \
+             ON CONFLICT (tenant_id, environment_id, brand_slug, kind) DO UPDATE \
+             SET content_type = EXCLUDED.content_type, \
+                 bytes = EXCLUDED.bytes, \
+                 sha256 = EXCLUDED.sha256, \
+                 size_bytes = EXCLUDED.size_bytes, \
+                 updated_at = EXCLUDED.updated_at",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(slug)
+        .bind(&asset.kind)
+        .bind(&asset.content_type)
+        .bind(bytes.as_slice())
+        .bind(&asset.sha256)
+        .bind(size_bytes)
+        .bind(now_micros)
+        .execute(&mut **tx)
+        .await?;
+    }
+    // Remove any target asset kind the source brand does not carry.
+    let kinds: Vec<String> = assets.iter().map(|asset| asset.kind.clone()).collect();
+    sqlx::query(
+        "DELETE FROM brand_assets \
+         WHERE tenant_id = $1 AND environment_id = $2 AND brand_slug = $3 \
+           AND kind <> ALL($4)",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(slug)
+    .bind(&kinds)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Apply a per-environment locale-bundle create/update/delete, matched by its BCP47
+/// `locale` tag (issues #86, #475).
+///
+/// Mirrors `ActingLocaleBundleRepo::set`'s transaction discipline: when the promoted bundle
+/// is the environment default, any OTHER default is demoted FIRST, because
+/// `locale_bundles_default_idx` is a partial unique index tolerating one default per scope.
+/// No field of a locale bundle is per-environment state: the tag, the env-default flag and
+/// the entries map are all promotable definition, so all three travel.
+async fn apply_locale_bundle_change(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    env: &Env,
+    source: &crate::snapshot::Snapshot,
+    change: &crate::promotion::ResourceChange,
+    now_micros: i64,
+) -> Result<(), StoreError> {
+    use crate::promotion::ChangeKind;
+    if change.kind == ChangeKind::Delete {
+        sqlx::query(
+            "DELETE FROM locale_bundles \
+             WHERE tenant_id = $1 AND environment_id = $2 AND locale = $3",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(&change.key)
+        .execute(&mut **tx)
+        .await?;
+        return Ok(());
+    }
+    let bundle = source
+        .resources
+        .locale_bundle
+        .iter()
+        .find(|bundle| bundle.locale == change.key)
+        .ok_or(StoreError::NotFound)?;
+    let entries = serde_json::to_string(&bundle.entries)
+        .map_err(|error| StoreError::Database(sqlx::Error::Decode(Box::new(error))))?;
+    if bundle.is_env_default {
+        sqlx::query(
+            "UPDATE locale_bundles SET is_env_default = false, \
+                 updated_at = TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval \
+             WHERE tenant_id = $1 AND environment_id = $2 AND is_env_default AND locale <> $4",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(now_micros)
+        .bind(&bundle.locale)
+        .execute(&mut **tx)
+        .await?;
+    }
+    match change.kind {
+        ChangeKind::Create => {
+            let id = LocaleBundleId::generate(env, &scope);
+            sqlx::query(
+                "INSERT INTO locale_bundles \
+                 (id, tenant_id, environment_id, locale, entries, is_env_default, \
+                  created_at, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5::jsonb, $6, \
+                         TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval, \
+                         TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval)",
+            )
+            .bind(id.to_string())
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .bind(&bundle.locale)
+            .bind(&entries)
+            .bind(bundle.is_env_default)
+            .bind(now_micros)
+            .execute(&mut **tx)
+            .await?;
+        }
+        ChangeKind::Update => {
+            sqlx::query(
+                "UPDATE locale_bundles \
+                 SET entries = $1::jsonb, is_env_default = $2, \
+                     updated_at = TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval \
+                 WHERE tenant_id = $4 AND environment_id = $5 AND locale = $6",
+            )
+            .bind(&entries)
+            .bind(bundle.is_env_default)
+            .bind(now_micros)
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .bind(&bundle.locale)
+            .execute(&mut **tx)
+            .await?;
+        }
+        ChangeKind::Delete => unreachable!("handled above"),
+    }
+    Ok(())
 }
 
 /// Apply a custom-journey version CREATE, matched by `journey_id@version` (issue #92).

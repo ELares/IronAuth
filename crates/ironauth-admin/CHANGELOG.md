@@ -6,6 +6,40 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **WIRE ADDITION. Per-environment BRANDS have a management surface** (issue #475): `GET`,
+  `PUT` and `DELETE` on `/v1/tenants/{tenant_id}/environments/{environment_id}/brands` and
+  `.../brands/{slug}`. `brands` shipped with a store-level writer and no endpoint, so a brand
+  could not be created through the public API at all: both asset endpoints 404 while the brand
+  row is absent, which left a brand's only birth path a config promotion, and blocked the
+  promotion asset transport itself, since an operator must be able to create the target brand
+  before uploading the bytes a promotion resolves by digest. Reachable by the operator or by a
+  management key scoped to exactly this environment, exactly like the locale bundles and signup
+  forms it mirrors. The two mutating verbs are SUDO-gated (a brand is the visible chrome of the
+  auth pages, a social-engineering surface); `GET` is not. The gate is measured on both verbs.
+- **Every brand write is validated before it is stored, on BOTH doors into the table.**
+  `tokens` and `tokens_dark` must fit the closed typed design-token grammar (hex-only colors, an
+  allowlisted font enum, clamped numerics), never CSS; a `slots` key must be a known slot id
+  within the per-slot size cap and its value passes the one allowlist sanitizer at ingest, so a
+  stored slot is sanitizer output and an unknown key is a loud 400 rather than a silent drop;
+  `client_id`, the per-client selection key, must parse as a real client id IN THIS SCOPE, since
+  a foreign environment's id there is dead config no authorize request could ever match. The
+  config-promotion PLAN and APPLY now run that same wall over their source document, which they
+  previously bypassed entirely: snapshot validation checks only that a brand's `tokens` and
+  `slots` are JSON objects, so a submitted document could store an unknown slot key, unsanitized
+  markup and a CSS breakout in a color token. Refusing at plan time (a 400 naming every faulty
+  brand at once) means an operator learns the document is unstorable before reviewing a plan
+  built from it. A document that names two brands claiming one host, or two environment
+  defaults, is refused for the same reason: the apply releases the other claimant, so a document
+  with two could never converge.
+- **WIRE ADDITION. `applyConfigPromotion` can answer 422 `brand_asset_bytes_unavailable`.** A
+  snapshot carries a brand's logo and favicon by content reference (the sha256), never as inline
+  bytes, so the apply materializes one only from bytes the target already holds under that exact
+  digest. When it cannot, it changes NOTHING rather than leaving the target with metadata
+  pointing at bytes it does not have; the body names the slug, kind and digest, and the remedy is
+  to upload the asset here and re-plan. That remedy is now honest in every key order: the digests
+  are resolved before any change is applied, so the refusal cannot be a false one aimed at an
+  asset the operator already uploaded.
+
 - The console `at+jwt` bridge's `typ == at+jwt` check is no longer bolted on after
   `verify` returns; it is part of the `VerificationPolicy` (issue #192), which cannot be
   built without naming the profile it accepts. Same rule, same RFC 9068 section 4, one
