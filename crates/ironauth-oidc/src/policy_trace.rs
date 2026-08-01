@@ -20,11 +20,18 @@
 //! configuration. Read that function's doc comment before concluding the missing gate is
 //! a bug.
 //!
-//! And the recorded fields are STRUCTURALLY safe: the trace input builders
+//! And the recorded fields are a PROJECTION: the trace input builders
 //! ([`ironauth_store::PolicyDecisionInputs`]) accept only typed safe fields (an acr value,
-//! a signal name and level, a connector slug, a bounded failure kind), so no claim value,
-//! token, or secret is representable, let alone recorded. The redaction corpus CI gate
-//! (`scripts/diagnostics-redaction-scan.sh`) proves it.
+//! a signal name and level, a connector slug, a bounded failure kind), so a raw claim set
+//! or an ID token has no field to be carried in and cannot be passed through without
+//! widening the enum first.
+//!
+//! That is not the same as saying a secret is unrepresentable, which this doc used to say
+//! and which is false (issue #423): most of those typed safe fields are `String`, and a
+//! secret placed in one by the caller would be recorded verbatim. The redaction corpus CI
+//! gate (`scripts/diagnostics-redaction-scan.sh`) does not prove otherwise, because it
+//! builds its records from safe literals. What it proves, through the `should_panic` probe
+//! beside each free-form field, is that a leak through any of them would be SEEN.
 
 use ironauth_config::DiagnosticVerbosity;
 use ironauth_store::{
@@ -465,79 +472,46 @@ mod tests {
     /// The redaction corpus for the policy trace and token size record types (issue #91),
     /// the sibling of the client auth diagnostics corpus. It builds every record shape the
     /// safe field builders accept, serializes each, and asserts NO sentinel appears
-    /// anywhere. The guarantee is structural first: the builders accept only typed safe
-    /// fields (an acr, a signal name and level, a connector slug, a bounded failure kind, a
-    /// byte size, a client id), so a claim value has NOWHERE to go. This is the CI belt and
-    /// suspenders. The shell wrapper is `scripts/diagnostics-redaction-scan.sh`.
+    /// anywhere. This is the CI belt and suspenders; the shell wrapper is
+    /// `scripts/diagnostics-redaction-scan.sh`.
+    ///
+    /// What this corpus does and does NOT prove (issue #423). It builds its records from
+    /// SAFE literals, so on its own it compares one hardcoded list against another and a
+    /// pass means nothing about a field it cannot see. The claim it used to carry, that it
+    /// proves no sentinel can reach a serialized trace, was false for every free-form
+    /// field: `NewPolicyDecisionTrace.subject` and `.reason`, and the `String` fields of
+    /// every [`PolicyDecisionInputs`] variant, would record a sentinel verbatim. What makes
+    /// the corpus non-vacuous is the `should_panic` probe beside each of those fields,
+    /// which routes a REAL sentinel through it and proves the scan can see it. The honest
+    /// two-tier statement is:
+    ///
+    /// - a closed enum or a bounded integer CANNOT hold a sentinel, which
+    ///   `the_closed_budget_vocabularies_cannot_express_a_sentinel` proves by enumerating
+    ///   the whole value space;
+    /// - a `String` or `&str` CAN, so the guarantee there is about the CALLER, and the only
+    ///   thing a test can establish is that if one ever arrived the corpus would say so.
     ///
     /// Issue #98 adds the five PERMISSION-BUDGET dimensions to the token size record, and
     /// the corpus carries the argument for each in prose at the site rather than leaving it
     /// to be assumed. Three of the five are structurally safe (two closed enums and an
-    /// integer) and two are free-form strings whose safety is a property of the CALLER, and
-    /// that difference is spelled out below rather than blurred. The two `should_panic`
-    /// probes beside this test prove the scan can actually SEE the free-form two, and
-    /// `the_closed_budget_vocabularies_cannot_express_a_sentinel` proves the other three
-    /// have nowhere to put one.
+    /// integer) and two are free-form strings whose safety is a property of the CALLER.
     #[test]
     fn redaction_corpus_leaks_no_secret_sentinel() {
-        use std::fmt::Write as _;
-
         let mut serialized = String::new();
 
-        // A step up trace built from server vocabulary acr values (never a claim value).
-        let step_up = NewPolicyDecisionTrace {
-            policy: PolicyKind::StepUp,
-            // The subject is a usr_ handle (a blind reference); the sentinel here has
-            // nowhere to become a claim value.
-            subject: Some("usr_safehandle".to_owned()),
-            outcome: PolicyOutcome::StepUpRequired,
-            reason: Some("acr_unmet".to_owned()),
-            inputs: PolicyDecisionInputs::StepUp {
-                required_acr: Some("urn:ironauth:acr:mfa".to_owned()),
-                achieved_acr: "urn:ironauth:acr:pwd".to_owned(),
-                max_auth_age_secs: Some(300),
-                auth_age_secs: Some(42),
-                acr_unmet: true,
-                age_lapsed: false,
-            },
-        };
-        write!(serialized, "{step_up:?}{}", step_up.inputs.to_json()).expect("write");
-
-        // A risk trace built from signal NAMES and levels (never the raw IP or counts).
-        let risk = NewPolicyDecisionTrace {
-            policy: PolicyKind::Risk,
-            subject: Some("usr_safehandle".to_owned()),
-            outcome: PolicyOutcome::Deny,
-            reason: Some("block".to_owned()),
-            inputs: PolicyDecisionInputs::Risk {
-                level: "high".to_owned(),
-                signals: vec![
-                    PolicyTraceSignal {
-                        name: "new_device".to_owned(),
-                        level: "med".to_owned(),
-                    },
-                    PolicyTraceSignal {
-                        name: "velocity".to_owned(),
-                        level: "high".to_owned(),
-                    },
-                ],
-            },
-        };
-        write!(serialized, "{risk:?}{}", risk.inputs.to_json()).expect("write");
-
-        // A claim mapping trace: the connector slug and a bounded failure kind only.
-        let mapping = NewPolicyDecisionTrace {
-            policy: PolicyKind::ClaimMapping,
-            subject: None,
-            outcome: PolicyOutcome::Deny,
-            reason: Some("missing_required_claim".to_owned()),
-            inputs: PolicyDecisionInputs::ClaimMapping {
-                connector: "octa".to_owned(),
-                mapped_trait_count: None,
-                failure_kind: Some("missing_required_claim".to_owned()),
-            },
-        };
-        write!(serialized, "{mapping:?}{}", mapping.inputs.to_json()).expect("write");
+        // The three trace shapes, each through the same parameterised builder its probes
+        // drive, called here with SAFE values.
+        serialized.push_str(&step_up_trace_serialization(
+            "usr_safehandle",
+            "acr_unmet",
+            "urn:ironauth:acr:mfa",
+            "urn:ironauth:acr:pwd",
+        ));
+        serialized.push_str(&risk_trace_serialization("high", "new_device", "med"));
+        serialized.push_str(&claim_mapping_trace_serialization(
+            "octa",
+            "missing_required_claim",
+        ));
 
         // Both TOKEN SIZE record shapes, serialized by the helper below (which carries the
         // per field argument for the issue #98 dimensions beside the record it is about).
@@ -551,6 +525,211 @@ mod tests {
 
         // The GUARANTEE: no secret sentinel appears anywhere in any serialization.
         assert_no_sentinel_leaked(&serialized);
+    }
+
+    /// The STEP UP trace shape, with its four free-form `String` positions as PARAMETERS
+    /// rather than literals, which is what lets the probes below route a real sentinel
+    /// through each one (issue #423).
+    ///
+    /// `subject` and `reason` are fields of [`NewPolicyDecisionTrace`] itself; `required_acr`
+    /// and `achieved_acr` are the two `String` fields of the `StepUp` inputs variant. All
+    /// four are free-form: the recorder is expected to pass a `usr_` handle, a bounded
+    /// reason hint and acr tokens, and nothing in the type enforces that. The remaining
+    /// `StepUp` fields are integers and booleans, whose value space is digits, a sign, and
+    /// two keywords.
+    fn step_up_trace_serialization(
+        subject: &str,
+        reason: &str,
+        required_acr: &str,
+        achieved_acr: &str,
+    ) -> String {
+        use std::fmt::Write as _;
+
+        let mut serialized = String::new();
+        let step_up = NewPolicyDecisionTrace {
+            policy: PolicyKind::StepUp,
+            subject: Some(subject.to_owned()),
+            outcome: PolicyOutcome::StepUpRequired,
+            reason: Some(reason.to_owned()),
+            inputs: PolicyDecisionInputs::StepUp {
+                required_acr: Some(required_acr.to_owned()),
+                achieved_acr: achieved_acr.to_owned(),
+                max_auth_age_secs: Some(300),
+                auth_age_secs: Some(42),
+                acr_unmet: true,
+                age_lapsed: false,
+            },
+        };
+        write!(serialized, "{step_up:?}{}", step_up.inputs.to_json()).expect("write");
+
+        // Positive control: every free-form position DID reach the serialization, so a scan
+        // over this string is running over all four rather than over a record that dropped
+        // one. Without it a probe could pass for the wrong reason.
+        assert!(
+            serialized.contains(subject)
+                && serialized.contains(reason)
+                && serialized.contains(required_acr)
+                && serialized.contains(achieved_acr),
+            "every free-form step up position must reach the serialization"
+        );
+        serialized
+    }
+
+    /// The RISK trace shape, with its three free-form `String` positions as parameters: the
+    /// combined `level`, and a signal's `name` and `level` (issue #423).
+    ///
+    /// The signal vector is the interesting one: a sentinel could arrive inside a
+    /// [`PolicyTraceSignal`] nested in a `Vec`, which a scan over the outer struct only
+    /// sees because `Debug` recurses. That is worth proving rather than assuming.
+    fn risk_trace_serialization(level: &str, signal_name: &str, signal_level: &str) -> String {
+        use std::fmt::Write as _;
+
+        let mut serialized = String::new();
+        let risk = NewPolicyDecisionTrace {
+            policy: PolicyKind::Risk,
+            subject: Some("usr_safehandle".to_owned()),
+            outcome: PolicyOutcome::Deny,
+            reason: Some("block".to_owned()),
+            inputs: PolicyDecisionInputs::Risk {
+                level: level.to_owned(),
+                signals: vec![PolicyTraceSignal {
+                    name: signal_name.to_owned(),
+                    level: signal_level.to_owned(),
+                }],
+            },
+        };
+        write!(serialized, "{risk:?}{}", risk.inputs.to_json()).expect("write");
+
+        assert!(
+            serialized.contains(level)
+                && serialized.contains(signal_name)
+                && serialized.contains(signal_level),
+            "every free-form risk position must reach the serialization"
+        );
+        serialized
+    }
+
+    /// The CLAIM MAPPING trace shape, with its two free-form `String` positions as
+    /// parameters: the connector slug and the failure kind (issue #423).
+    fn claim_mapping_trace_serialization(connector: &str, failure_kind: &str) -> String {
+        use std::fmt::Write as _;
+
+        let mut serialized = String::new();
+        let mapping = NewPolicyDecisionTrace {
+            policy: PolicyKind::ClaimMapping,
+            subject: None,
+            outcome: PolicyOutcome::Deny,
+            reason: Some("missing_required_claim".to_owned()),
+            inputs: PolicyDecisionInputs::ClaimMapping {
+                connector: connector.to_owned(),
+                mapped_trait_count: None,
+                failure_kind: Some(failure_kind.to_owned()),
+            },
+        };
+        write!(serialized, "{mapping:?}{}", mapping.inputs.to_json()).expect("write");
+
+        assert!(
+            serialized.contains(connector) && serialized.contains(failure_kind),
+            "every free-form claim mapping position must reach the serialization"
+        );
+        serialized
+    }
+
+    /// The scan CAN see `NewPolicyDecisionTrace.subject` (issue #423).
+    ///
+    /// One test per field rather than one test over all of them, for the reason the budget
+    /// probes give: a scan that saw only some of the fields would still fail here. None of
+    /// these is a claim that a sentinel cannot reach the field, because it can; each is the
+    /// weaker, TRUE claim that if one ever did, the corpus would say so.
+    #[test]
+    #[should_panic(expected = "a secret sentinel leaked")]
+    fn the_sentinel_scan_catches_a_leak_through_the_trace_subject() {
+        assert_no_sentinel_leaked(&step_up_trace_serialization(
+            SENTINELS[2],
+            "acr_unmet",
+            "urn:ironauth:acr:mfa",
+            "urn:ironauth:acr:pwd",
+        ));
+    }
+
+    /// The scan CAN see `NewPolicyDecisionTrace.reason` (issue #423).
+    #[test]
+    #[should_panic(expected = "a secret sentinel leaked")]
+    fn the_sentinel_scan_catches_a_leak_through_the_trace_reason() {
+        assert_no_sentinel_leaked(&step_up_trace_serialization(
+            "usr_safehandle",
+            SENTINELS[0],
+            "urn:ironauth:acr:mfa",
+            "urn:ironauth:acr:pwd",
+        ));
+    }
+
+    /// The scan CAN see the step up `required_acr` (issue #423). The acr floor may fold a
+    /// value the CLIENT sent in its own `acr_values` request parameter, so this is the one
+    /// inputs field an outside party influences most directly.
+    #[test]
+    #[should_panic(expected = "a secret sentinel leaked")]
+    fn the_sentinel_scan_catches_a_leak_through_the_required_acr() {
+        assert_no_sentinel_leaked(&step_up_trace_serialization(
+            "usr_safehandle",
+            "acr_unmet",
+            SENTINELS[0],
+            "urn:ironauth:acr:pwd",
+        ));
+    }
+
+    /// The scan CAN see the step up `achieved_acr` (issue #423).
+    #[test]
+    #[should_panic(expected = "a secret sentinel leaked")]
+    fn the_sentinel_scan_catches_a_leak_through_the_achieved_acr() {
+        assert_no_sentinel_leaked(&step_up_trace_serialization(
+            "usr_safehandle",
+            "acr_unmet",
+            "urn:ironauth:acr:mfa",
+            SENTINELS[0],
+        ));
+    }
+
+    /// The scan CAN see the risk `level` (issue #423).
+    #[test]
+    #[should_panic(expected = "a secret sentinel leaked")]
+    fn the_sentinel_scan_catches_a_leak_through_the_risk_level() {
+        assert_no_sentinel_leaked(&risk_trace_serialization(SENTINELS[1], "new_device", "med"));
+    }
+
+    /// The scan CAN see a risk signal's `name`, nested inside the signal vector (#423).
+    #[test]
+    #[should_panic(expected = "a secret sentinel leaked")]
+    fn the_sentinel_scan_catches_a_leak_through_a_risk_signal_name() {
+        assert_no_sentinel_leaked(&risk_trace_serialization("high", SENTINELS[2], "med"));
+    }
+
+    /// The scan CAN see a risk signal's `level`, nested inside the signal vector (#423).
+    #[test]
+    #[should_panic(expected = "a secret sentinel leaked")]
+    fn the_sentinel_scan_catches_a_leak_through_a_risk_signal_level() {
+        assert_no_sentinel_leaked(&risk_trace_serialization(
+            "high",
+            "new_device",
+            SENTINELS[1],
+        ));
+    }
+
+    /// The scan CAN see the claim mapping `connector` slug (issue #423).
+    #[test]
+    #[should_panic(expected = "a secret sentinel leaked")]
+    fn the_sentinel_scan_catches_a_leak_through_the_connector_slug() {
+        assert_no_sentinel_leaked(&claim_mapping_trace_serialization(
+            SENTINELS[2],
+            "missing_required_claim",
+        ));
+    }
+
+    /// The scan CAN see the claim mapping `failure_kind` (issue #423).
+    #[test]
+    #[should_panic(expected = "a secret sentinel leaked")]
+    fn the_sentinel_scan_catches_a_leak_through_the_failure_kind() {
+        assert_no_sentinel_leaked(&claim_mapping_trace_serialization("octa", SENTINELS[0]));
     }
 
     /// The token size half of the corpus above: the issue #91 ID-token BLOAT event and the
@@ -710,19 +889,36 @@ mod tests {
     /// by enumeration rather than asserted (issue #98).
     ///
     /// `reason` and `permission_status` are closed enums, so their entire value space is
-    /// the two lists below and this sweep is total over it; `permission_count` is an `i64`,
-    /// whose whole value space is digits and a sign. A guarantee about a finite value space
-    /// is the one kind of "cannot happen" a test can actually establish, which is why the
-    /// free-form pair get probes instead.
+    /// the two lists this walks and this sweep is total over it; `permission_count` is an
+    /// `i64`, whose whole value space is digits and a sign. A guarantee about a finite
+    /// value space is the one kind of "cannot happen" a test can actually establish, which
+    /// is why the free-form pair get probes instead.
+    ///
+    /// Both lists are pinned somewhere a variant cannot escape them, which is the point
+    /// this test previously got wrong. [`TokenSizeReason::ALL`] is compared in
+    /// `ironauth-store` against the variant identifiers parsed out of the enum's own
+    /// declaration. `PermissionStatus` is derived here from
+    /// [`ironauth_config::PermissionOverflow::ALL`], which `ironauth-config` compares
+    /// against the variant list `schemars` derives from that enum; the two types are 1:1
+    /// by construction (see `PermissionStatus::as_str`, which delegates), so deriving
+    /// rather than listing inherits that measurement. Stated exactly: a `PermissionStatus`
+    /// variant added with NO `PermissionOverflow` counterpart would break the 1:1 and
+    /// escape this sweep, and nothing here would say so.
     #[test]
     fn the_closed_budget_vocabularies_cannot_express_a_sentinel() {
-        for reason in EVERY_REASON {
+        for reason in TokenSizeReason::ALL {
             assert_no_sentinel_leaked(reason.as_str());
         }
-        for status in [
-            PermissionStatus::BudgetExceeded,
-            PermissionStatus::PdpRequired,
-        ] {
+        let statuses = ironauth_config::PermissionOverflow::ALL.map(PermissionStatus::from);
+        let distinct: std::collections::BTreeSet<&str> =
+            statuses.iter().map(|s| s.as_str()).collect();
+        assert_eq!(
+            distinct.len(),
+            statuses.len(),
+            "the derived status list must be one distinct status per overflow mode; a \
+             collision means the 1:1 this sweep leans on has broken"
+        );
+        for status in statuses {
             assert_no_sentinel_leaked(status.as_str());
         }
         // The integer dimension: every value it can hold renders as digits, so a sentinel
@@ -738,44 +934,24 @@ mod tests {
         }
     }
 
-    /// Every [`TokenSizeReason`], exhaustively. `every_reason_is_listed` is what keeps this
-    /// total: a variant added to the enum stops compiling there rather than quietly
-    /// escaping the sweeps that iterate this.
-    const EVERY_REASON: &[TokenSizeReason] = &[
-        TokenSizeReason::BudgetApproaching,
-        TokenSizeReason::BudgetOverflowCount,
-        TokenSizeReason::BudgetOverflowBytes,
-        TokenSizeReason::RolesOnlyStillOversize,
-    ];
-
-    /// The exhaustiveness pin for [`EVERY_REASON`]: the `match` is total, so a new variant
-    /// is a compile error here, and the index it maps to must be the slot the list holds.
-    #[test]
-    fn every_reason_is_listed() {
-        for reason in EVERY_REASON {
-            let slot = match reason {
-                TokenSizeReason::BudgetApproaching => 0,
-                TokenSizeReason::BudgetOverflowCount => 1,
-                TokenSizeReason::BudgetOverflowBytes => 2,
-                TokenSizeReason::RolesOnlyStillOversize => 3,
-            };
-            assert_eq!(
-                EVERY_REASON[slot], *reason,
-                "EVERY_REASON must list every variant, in the order the match spells"
-            );
-        }
-        assert_eq!(EVERY_REASON.len(), 4, "and hold nothing else");
-    }
-
     /// The closed reason vocabulary round-trips through its own wire strings (issue #98),
     /// over the FULL variant list, so the read side's `from_wire` can never drift from the
     /// write side's `as_str`. A variant added without a `from_wire` arm turns this red.
+    ///
+    /// "The FULL variant list" is [`TokenSizeReason::ALL`], and what makes that claim true
+    /// is the declaration comparison in `ironauth-store`, not anything here. The list this
+    /// used to walk was local, and the `every_reason_is_listed` test that guarded it looked
+    /// strong (a total `match` giving each variant a slot, plus
+    /// `assert_eq!(EVERY_REASON.len(), 4)`) and was not: a fifth variant added to the enum
+    /// and to the `match` left the list at four and every test in this module stayed green,
+    /// including this round trip, which then never asked `from_wire` about the new value
+    /// (measured, issue #404 review).
     #[test]
     fn the_permission_budget_reason_vocabulary_round_trips() {
-        for reason in EVERY_REASON {
+        for reason in TokenSizeReason::ALL {
             assert_eq!(
                 TokenSizeReason::from_wire(reason.as_str()),
-                Some(*reason),
+                Some(reason),
                 "the recorded wire string must parse back to the same reason"
             );
         }

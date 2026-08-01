@@ -220,9 +220,12 @@ pub const DIAGNOSTICS_MAX_RETENTION_SECS: u64 = 90 * 24 * 60 * 60;
 
 /// How much of a client-authentication failure a diagnostic captures (issue #91).
 ///
-/// Verbosity NEVER widens what a diagnostic can REPRESENT (the structural redaction
-/// guarantee: no diagnostic field can hold an assertion body, a secret, or a token,
-/// at any verbosity). It only chooses which SAFE, bounded fields populate.
+/// Verbosity NEVER widens what a diagnostic can REPRESENT: it adds no field at any
+/// setting, so no setting makes an assertion body, a secret, or a token value
+/// representable. It only chooses which of the existing bounded fields populate. What it
+/// cannot promise is that the fields it populates hold nothing sensitive; that is the
+/// recorder's discipline, and the record type's own doc is precise about which of its
+/// fields are structurally safe and which are not (issue #423).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticVerbosity {

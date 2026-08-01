@@ -11,12 +11,13 @@
 //! collapses to the uniform not-found rather than leaking existence.
 //!
 //! Delete is a soft deactivation, idempotent IN EFFECT per RFC 9110: the row is
-//! retained (so the append-only audit log's foreign key to it stays satisfiable),
-//! and a live organization is deactivated and reads as absent thereafter, exactly
-//! as tenants and environments behave. A soft-deleted organization reads as absent
-//! (get is a 404), so the delete's STATUS CODE is not itself idempotent: the first
-//! delete of a live organization is a 204, and a repeat delete of an
-//! already-deactivated organization, like a delete of an absent one, is the uniform
+//! retained so the `organization.delete` audit row's target stays resolvable (an
+//! application rule: `audit_log` carries no foreign key to `organizations`), and a live
+//! organization is deactivated and reads as absent thereafter, exactly as tenants and
+//! environments behave. A soft-deleted organization reads as absent (get is a 404), so
+//! the delete's STATUS CODE is not itself idempotent: the first delete of a live
+//! organization is a 204, and a repeat delete of an already-deactivated organization,
+//! like a delete of an absent one, is the uniform
 //! 404. That anti-oracle 404 is the same not-found the get returns, so delete never
 //! discloses whether a not-found id was once live.
 //!

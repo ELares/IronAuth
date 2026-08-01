@@ -369,7 +369,7 @@
       "type": "object"
     },
     "DiagnosticVerbosity": {
-      "description": "How much of a client-authentication failure a diagnostic captures (issue #91).\n\nVerbosity NEVER widens what a diagnostic can REPRESENT (the structural redaction\nguarantee: no diagnostic field can hold an assertion body, a secret, or a token,\nat any verbosity). It only chooses which SAFE, bounded fields populate.",
+      "description": "How much of a client-authentication failure a diagnostic captures (issue #91).\n\nVerbosity NEVER widens what a diagnostic can REPRESENT: it adds no field at any\nsetting, so no setting makes an assertion body, a secret, or a token value\nrepresentable. It only chooses which of the existing bounded fields populate. What it\ncannot promise is that the fields it populates hold nothing sensitive; that is the\nrecorder's discipline, and the record type's own doc is precise about which of its\nfields are structurally safe and which are not (issue #423).",
       "oneOf": [
         {
           "const": "off",

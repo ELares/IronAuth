@@ -19,12 +19,16 @@
 //! management key, and the store read runs under forced row level security, so a
 //! cross tenant or cross environment read resolves to no rows.
 //!
-//! The response exposes ONLY the safe, non secret diagnostic fields. That guarantee
-//! is STRUCTURAL, not a filter here: the store record type
-//! ([`ironauth_store::ClientAuthDiagnosticRecord`]) has no field capable of holding
-//! an assertion body, a client secret, or a token, so a secret is not scrubbed on
-//! the way out, it is unrepresentable. This view carries the same bounded fields
-//! forward, never widening them.
+//! The response exposes ONLY the fields the store record already holds, and this view
+//! never widens them. What the record type
+//! ([`ironauth_store::ClientAuthDiagnosticRecord`]) gives structurally is that there is no
+//! field capable of holding an assertion body, a client secret, or a token VALUE, so those
+//! classes of material have nowhere to land and are not scrubbed on the way out.
+//!
+//! It does NOT follow that a secret cannot reach this response (issue #423): the record's
+//! `client_id`, `auth_method`, `key_id` and `signing_alg` are free-form strings, attacker
+//! influenced, and whatever the recorder put in them is what this view serves. That
+//! guarantee is about the recorder, not about the type; see the record's own doc.
 
 use axum::extract::{Json, Path, Query, State};
 use axum::http::StatusCode;
@@ -250,13 +254,18 @@ pub async fn get_client_auth_diagnostics(
 
 /// One recorded policy decision trace (issue #91).
 ///
-/// Every field is a bounded, non secret datum the store record already holds: `policy`
-/// and `outcome` are closed sets, `subject` is an internal usr_ handle (a blind
-/// reference, never raw PII), `reason` is a bounded hint, and `decision_inputs` is the
-/// STRUCTURALLY REDACTED safe field projection (the acr floor and achieved acr, the auth
-/// age, the risk signal names and levels, the connector slug and the mapped trait count),
-/// serialized as a JSON string. There is deliberately NO field capable of holding a claim
-/// value, a token, or a secret: those are unrepresentable in the record this view carries.
+/// Every field is one the store record already holds and this view never widens: `policy`
+/// and `outcome` are closed sets, `subject` is MEANT to be an internal usr_ handle (a
+/// blind reference, never raw PII), `reason` a bounded hint, and `decision_inputs` the
+/// allowlisted safe field projection (the acr floor and achieved acr, the auth age, the
+/// risk signal names and levels, the connector slug and the mapped trait count),
+/// serialized as a JSON string.
+///
+/// The projection is what redacts: a raw claim set or a token has no field to be carried
+/// in, so it cannot reach here without the projection enum being widened first. It does
+/// NOT follow that a secret is unrepresentable, which this doc used to say and which is
+/// false (issue #423): `subject`, `reason` and most of the projection's fields are
+/// free-form strings, and this view serves whatever the recorder put in them.
 #[derive(Serialize, ToSchema)]
 pub struct PolicyTraceView {
     /// The traced policy (`step_up`, `risk`, or `claim_mapping`).

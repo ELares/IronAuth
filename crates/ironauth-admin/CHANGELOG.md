@@ -6,6 +6,15 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- CORRECTION to the diagnostics module doc and to `PolicyTraceView`, which said a secret is
+  unrepresentable in the records these views serve (issue #423). The records' free-form
+  string fields would carry one, so the views serve whatever the recorder put there. Both
+  now separate what the PROJECTION guarantees (a field that does not exist cannot be served)
+  from what it does not. The two hand-written redacting `Debug` impls in `views.rs`
+  (`ManagementKeyCreated`, `InitialAccessTokenCreated`) promised in prose that a live
+  credential can never reach a log line through `{value:?}` and had no test; they now
+  have four, covering the masked and the absent case for each, so the promise is checked
+  rather than asserted.
 - **WIRE CHANGE. `impl From<StoreError> for ApiError` is now EXHAUSTIVE and no longer
   collapses every unmapped store refusal into an opaque 500** (issues #442, #449, #279).
   It mapped five variants explicitly and wildcarded the other seventeen, so a typed refusal
@@ -671,5 +680,7 @@ range per docs/RELEASING.md.
   - First resource endpoints proving the discipline end to end: tenants CRUD
     (operator plane), environments CRUD (under a tenant), and management-key CRUD
     (under an environment). Idempotent PUT/DELETE semantics (RFC 9110): DELETE is
-    a soft deactivation that is idempotent and keeps the append-only audit log's
-    foreign keys satisfiable.
+    a soft deactivation that is idempotent and RETAINS the row, so the audit row
+    naming it keeps a resolvable target. For tenants and environments `audit_log`
+    really does carry a foreign key to the retained row; for a management key it
+    does not, and the retention is an application rule.

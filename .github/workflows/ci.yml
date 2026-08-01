@@ -167,9 +167,15 @@ jobs:
         run: scripts/invariant-lints.sh
       - name: query audit (no scoped-table SQL outside the repository module)
         run: scripts/query-audit.sh
+      - name: scoped table registration (every forced-RLS table in the migrations is in the query audit list)
+        run: scripts/scoped-table-registration.sh
+      - name: audit foreign key claims (no comment asserts an audit_log foreign key that does not exist)
+        run: scripts/audit-fk-claim-scan.sh
+      - name: test registration (every tests/*.rs file has a [[test]] entry; autotests are off)
+        run: scripts/test-registration.sh
       - name: classification lint (every resource type is classified; all three classes used)
         run: scripts/classification-lint.sh
-      - name: diagnostics redaction corpus (no secret sentinel can reach a diagnostic record)
+      - name: diagnostics redaction corpus (a sentinel in any free-form diagnostic field would be seen)
         run: scripts/diagnostics-redaction-scan.sh
       - name: canonicalization seam (every identifier comparison routes through the one seam)
         run: scripts/canonicalization-seam.sh

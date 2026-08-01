@@ -3,17 +3,19 @@
 //! Least-privilege enforcement of the data-plane role on `organizations` (issue
 //! #41 and #94, applying the #31 lesson to the other role).
 //!
-//! The organization LIFECYCLE is entirely a control-plane operation: no data-plane
-//! path creates, mutates, or soft-deletes organizations. Migration 0027 REVOKED the
+//! The organization LIFECYCLE is entirely a control-plane operation: no data-plane path
+//! creates, mutates, or soft-deletes organizations. Migration 0027 REVOKED the
 //! over-broad grant the isolation root (0001) gave the low-privilege `ironauth_app`
-//! role when the level was a schema slot only; migration 0084 (M10) re-grants ONLY
-//! the data-plane SELECT (membership resolution and org-context validation READ an
-//! organization). This proves the shape: as `ironauth_app`, SELECT is now allowed
-//! (and still RLS-scoped), but every MUTATING statement on `organizations` is refused
-//! as insufficient privilege, so the role can neither HARD DELETE a row (which would
-//! break the soft-delete retention the append-only `audit_log` foreign key depends
-//! on) nor INSERT or UPDATE any column. The positive control confirms the control
-//! role `ironauth_control` keeps its column-scoped soft delete.
+//! role when the level was a schema slot only; migration 0084 (M10) re-grants ONLY the
+//! data-plane SELECT (membership resolution and org-context validation READ an
+//! organization). This proves the shape: as `ironauth_app`, SELECT is now allowed (and
+//! still RLS-scoped), but every MUTATING statement on `organizations` is refused as
+//! insufficient privilege, so the role can neither HARD DELETE a row nor INSERT or
+//! UPDATE any column. A hard delete would break the soft-delete retention that keeps an
+//! `organization.delete` audit row's target resolvable, which is an application rule
+//! and not a database one: `audit_log` carries no foreign key to `organizations`. The
+//! positive control confirms the control role `ironauth_control` keeps its
+//! column-scoped soft delete.
 
 use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
@@ -74,9 +76,11 @@ async fn app_role_has_read_only_grant_on_organizations_while_control_soft_delete
     );
 
     // The two hazards the reviewer called out: a hard DELETE would erase a row and
-    // break the soft-delete retention the append-only audit_log foreign key needs,
-    // and a non-deleted_at UPDATE would rewrite any column (id, tenant_id,
-    // environment_id, display_name). Both are refused as insufficient privilege.
+    // break the soft-delete retention that keeps an `organization.delete` audit row's
+    // target resolvable (an application rule; `audit_log` carries no foreign key to
+    // `organizations`), and a non-deleted_at UPDATE would rewrite any column (id,
+    // tenant_id, environment_id, display_name). Both are refused as insufficient
+    // privilege.
     assert_denied_in_scope(pool, &tenant, &environment, "DELETE FROM organizations").await;
     assert_denied_in_scope(
         pool,

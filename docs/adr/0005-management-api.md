@@ -97,7 +97,8 @@ transaction, then writing the audit row scoped to that fresh
 insert runs, so its foreign keys and the row-level-security check are satisfied.
 Environment CRUD under an existing tenant scopes the audit to `(tenant, the
 environment)`. Tenant deactivation scopes to `(tenant, its oldest environment)`,
-which is retained (see soft delete below), so the audit foreign key holds. The
+which is retained (see soft delete below), so the composite foreign key from
+`audit_log` to `environments` still holds. The
 well-known bootstrap operator ROW is ensured idempotently inside the create
 transaction; that is platform self-bootstrap (like a migration), not a
 caller-visible mutation, so it is the one control-plane write that is not itself
@@ -114,9 +115,12 @@ still confined to the repository module by `scripts/query-audit.sh`.
 
 DELETE is idempotent per RFC 9110. Tenants, environments, and management keys are
 DEACTIVATED (a `deleted_at` timestamp) rather than hard-deleted: the row is
-retained so the append-only audit log's foreign key to it stays satisfiable
-forever (an audit row can never be removed, so a hard delete of an audited
-resource is structurally impossible). Reads filter `deleted_at IS NULL`, so a
+retained so the audit row naming it keeps a resolvable target forever (an audit
+row can never be removed, so a hard delete of an audited resource would leave an
+audit row pointing at an id nothing can look up). `audit_log` references only
+`tenants` and `environments`, so for those two the retention is enforced by a
+foreign key; for a management key nothing enforces it and the retention is an
+application rule. Reads filter `deleted_at IS NULL`, so a
 deactivated resource returns not-found; repeating the delete has the same effect.
 
 ## Two wrong-scope behaviors

@@ -289,8 +289,9 @@ pub struct OidcState {
     // records (issue #91). Kept OUTSIDE `Inner` and set through the builder because it
     // is sourced from the TOP-LEVEL `[diagnostics]` config section
     // (`diagnostics.verbosity`), not from `OidcConfig`, exactly like `flows_enabled`.
-    // Verbosity NEVER widens what a diagnostic can REPRESENT (the structural redaction
-    // guarantee holds at every verbosity); it only chooses which safe fields populate.
+    // Verbosity NEVER widens what a diagnostic can REPRESENT: no setting adds a field, so
+    // no setting makes an assertion body, a secret, or a token value representable. It only
+    // chooses which of the existing bounded fields populate (issue #423).
     // Default: `Standard` (the rich failure reason plus the assertion header, without
     // the derived skew / hint), so the existing behavior is unchanged until an operator
     // opts into `verbose` or silences the sink with `off`.

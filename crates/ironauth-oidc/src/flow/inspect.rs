@@ -1229,12 +1229,6 @@ mod tests {
         // NOWHERE to go.
         use std::fmt::Write as _;
 
-        const SENTINELS: &[&str] = &[
-            "SUPERSECRETSUBMITTOKENSENTINEL",
-            "RECOVERYIDENTIFIERPIISENTINEL",
-            "ENROLLMENTSECRETSENTINEL",
-        ];
-
         let mut serialized = String::new();
 
         // A persisted state with sentinels stuffed into every text position: the recovery
@@ -1302,11 +1296,49 @@ mod tests {
             "the identifier is a boolean and a hostile signal name folds to the vocabulary"
         );
 
+        assert_no_sentinel_leaked(&serialized);
+    }
+
+    /// The sentinels this corpus routes through the persisted state. Module scoped so the
+    /// corpus and the probe below use the SAME strings (issue #423).
+    const SENTINELS: &[&str] = &[
+        "SUPERSECRETSUBMITTOKENSENTINEL",
+        "RECOVERYIDENTIFIERPIISENTINEL",
+        "ENROLLMENTSECRETSENTINEL",
+    ];
+
+    /// The corpus's guarantee as a reusable check, so the probe below can drive the SAME
+    /// scan over a deliberately leaky string (issue #423).
+    fn assert_no_sentinel_leaked(serialized: &str) {
         for sentinel in SENTINELS {
             assert!(
                 !serialized.contains(sentinel),
                 "a secret sentinel leaked into an inspector projection: {sentinel}"
             );
         }
+    }
+
+    /// The corpus above is already non-vacuous, because it seeds REAL sentinels into the
+    /// persisted state it projects from. This probe covers the other half: that the scan
+    /// itself fires rather than being a loop nothing exercises (issue #423).
+    ///
+    /// Deleting the loop's body, or the call at the end of the corpus, turns this red. A
+    /// context view built DIRECTLY from a state whose subject carries a sentinel is the
+    /// leaky input: `subject` is the one free-form string the view does carry forward.
+    #[test]
+    #[should_panic(expected = "a secret sentinel leaked")]
+    fn the_sentinel_scan_catches_a_leak_through_the_context_subject() {
+        let leaky = PersistedState {
+            step: FlowStateTag::RecoveryAck,
+            subject: Some(SENTINELS[1].to_owned()),
+            methods: vec!["pwd".to_owned()],
+            enroll_credential: None,
+            identifier: None,
+            connector: None,
+            custom_step: None,
+            org_context: None,
+        };
+        let context = FlowContextView::from_state(&leaky);
+        assert_no_sentinel_leaked(&serde_json::to_string(&context).expect("serialize context"));
     }
 }

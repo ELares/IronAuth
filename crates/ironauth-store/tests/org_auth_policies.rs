@@ -493,8 +493,9 @@ async fn a_set_replaces_the_whole_document_and_a_remove_soft_deletes_it() {
         "every dimension the new document left unset is cleared"
     );
 
-    // Removal is a soft delete: the row is retained (so the audit foreign key stays
-    // satisfiable) and the organization reads as having no policy again.
+    // Removal is a soft delete: the row is retained (so the removal audit row's target
+    // stays resolvable; an application rule, since `audit_log` carries no foreign key
+    // here) and the organization reads as having no policy again.
     let removed = remove_policy(&db, &env, scope, &org)
         .await
         .expect("remove the policy");

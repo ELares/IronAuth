@@ -2,12 +2,11 @@
 
 //! Tenant CRUD (operator plane).
 //!
-//! Creating a tenant also creates its first environment, in one transaction, and
-//! audits the creation scoped to that fresh `(tenant, environment)` pair (the
-//! operator-plane audit resolution). Delete is a soft deactivation, idempotent
-//! per RFC 9110: the tenant row is retained (so the append-only audit log's
-//! foreign key to it stays satisfiable), reads stop returning it, and repeating
-//! the delete has the same effect.
+//! Creating a tenant also creates its first environment, in one transaction, and audits
+//! the creation scoped to that fresh `(tenant, environment)` pair (the operator-plane
+//! audit resolution). Delete is a soft deactivation, idempotent per RFC 9110: the
+//! tenant row is retained (so the foreign key from `audit_log` to `tenants` still
+//! holds), reads stop returning it, and repeating the delete has the same effect.
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
