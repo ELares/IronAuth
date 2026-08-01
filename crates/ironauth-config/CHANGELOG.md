@@ -6,6 +6,36 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- `[outbox]` (issue #104): the tuning of the shared transactional outbox and job queue every
+  async path dispatches through, as a top-level section rather than knobs rediscovered under
+  each subsystem. `worker_concurrency`, `visibility_timeout_secs`, `poll_interval_secs`,
+  `claim_batch`, `max_attempts`, and `retry_base_secs`, each with a safe default and each
+  range-checked at load. Two defaults are choices rather than roundings: the worker count
+  defaults to 2, because a default of 1 would ship the mandatory-singleton posture this
+  substrate exists to avoid and leave "we are not a singleton" a property nobody exercises;
+  and `max_attempts` has no unlimited value, because a message that can never reach a
+  terminal state wedges its whole ordering group forever. There is no mode selection here and
+  no mention of a durable message bus: the Postgres queue is the only implementation that
+  exists, and a knob whose value does nothing is worse than an absent knob. The six defaults
+  are pinned against `ironauth_store`'s `WorkerSettings::default()` by a cross-crate test, so
+  the two declarations of the same numbers cannot drift; the store cannot depend on this
+  crate, so without that pin nothing would notice.
+
+  Two of the settings are documented against the substrate's real behaviour rather than the
+  behaviour a batch queue usually has, because the store side re-stamps each message's lease
+  before handing it to a handler: `visibility_timeout_secs` must exceed ONE handler call, not
+  `claim_batch` of them, and `claim_batch` is therefore a memory and wasted-lease knob rather
+  than a divisor of the timeout.
+
+  **Operator note for a deployment with `oidc.backchannel_logout_enabled` set.** Migration
+  0099 does not move the rows already in `session_ended_events`, and the new queue-depth
+  metrics do not count them, so an undelivered tail there is invisible after the upgrade. A
+  default deployment is unaffected (the only consumer of that table is off by default). With
+  back-channel logout ON, before retiring the LAST replica running the previous binary, run
+  `SELECT count(*) FROM session_ended_events WHERE delivered_at IS NULL;` and require it to
+  reach 0. A rolling upgrade alone does not achieve this: new replicas already write the new
+  table while old ones drain the old one.
+
 - `oidc.id_token_ttl_secs` (issue #192): the ID-token lifetime, split out of
   `oidc.access_token_ttl_secs`, which it used to silently inherit. Defaults to 300, the
   value the ID token effectively had, and is range-checked exactly like the other OIDC

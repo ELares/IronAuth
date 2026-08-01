@@ -88,12 +88,12 @@ use crate::id::{
     LocaleBundleId, MagicLinkTokenId, ManagementKeyId, Mds3BlobCacheId, MigrationRunId,
     MigrationRunRecordId, OperatorId, OrgAuthPolicyId, OrgConnectionId, OrgGroupId,
     OrgGroupMemberId, OrgGroupRoleId, OrgMembershipId, OrgMembershipRoleId, OrgRoleId,
-    OrgRolePermissionId, OrganizationId, PermissionId, PowChallengeId, PushedRequestId,
-    RecoveryApprovalId, RecoveryCodeId, RecoveryContactConfirmationId, RecoveryFlowId,
-    RecoveryIdvSessionId, RecoveryTrustedContactId, RefreshFamilyId, RefreshTokenId,
-    ResourceServerId, RiskDecisionId, RiskDisavowalId, RiskLoginGeoId, RiskSignalId, RoutingRuleId,
-    ScopeStepUpPolicyId, ServiceAccountId, SessionEventId, SessionId, SigningKeyId, SignupFormId,
-    SignupQuarantineId, SmsOtpCodeId, SmsRouteStatId, TenantId, TotpCredentialId,
+    OrgRolePermissionId, OrganizationId, OutboxMessageId, PermissionId, PowChallengeId,
+    PushedRequestId, RecoveryApprovalId, RecoveryCodeId, RecoveryContactConfirmationId,
+    RecoveryFlowId, RecoveryIdvSessionId, RecoveryTrustedContactId, RefreshFamilyId,
+    RefreshTokenId, ResourceServerId, RiskDecisionId, RiskDisavowalId, RiskLoginGeoId,
+    RiskSignalId, RoutingRuleId, ScopeStepUpPolicyId, ServiceAccountId, SessionId, SigningKeyId,
+    SignupFormId, SignupQuarantineId, SmsOtpCodeId, SmsRouteStatId, TenantId, TotpCredentialId,
     TraitMigrationJobId, TraitSchemaId, TrustedDeviceId, UpstreamTokenGrantId, UpstreamTokenId,
     UserId, UserIdentifierId, VariableId, WebauthnChallengeId, WebauthnCredentialId,
 };
@@ -507,6 +507,20 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn client_sessions(&self) -> ClientSessionRepo<'a> {
         ClientSessionRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The generic transactional outbox and lease based job queue for this scope
+    /// (issue #104): the ONE at-least-once dispatch substrate every async path drains,
+    /// with a `consumer` discriminator so one table serves many independent drains.
+    /// Off the audited path (queue bookkeeping, like the outbox drain and the device-code
+    /// poll): the durable record of what happened is the domain write the message was
+    /// enqueued alongside and its audit sibling, never a delivery attempt.
+    #[must_use]
+    pub fn outbox(&self) -> OutboxRepo<'a> {
+        OutboxRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -18267,13 +18281,19 @@ impl<'a> SessionEndedEmit<'a> {
     }
 }
 
-/// Enqueue ONE durable session-ended event into the outbox inside the OPEN revocation
-/// transaction (issue #35), so it commits with the session flip or not at all (the
-/// transactional-outbox guarantee: never emitted for a rolled-back revoke, never lost
-/// for a committed one). Called ONLY on a real terminal flip, so a rotation and a
-/// no-op revoke enqueue nothing. The row's `id` is the idempotency key a consumer
-/// dedups redelivery on; `sequence`, `claimed_at`, and `delivered_at` are assigned or
-/// set later by the drain, never here.
+/// Enqueue ONE durable session-ended event onto the generic outbox inside the OPEN
+/// revocation transaction (issue #35, moved onto the #104 substrate), so it commits with
+/// the session flip or not at all (the transactional-outbox guarantee: never emitted for
+/// a rolled-back revoke, never lost for a committed one). Called ONLY on a real terminal
+/// flip, so a rotation and a no-op revoke enqueue nothing.
+///
+/// The ended SESSION is both the idempotency key and the ordering key. As the idempotency
+/// key it reproduces exactly what 0024's `UNIQUE (tenant, environment, session_id)` gave
+/// this consumer: a session ends at most once, so a second enqueue for the same session
+/// is a bug and fails loudly rather than double-fanning-out. As the ordering key it puts
+/// each session in its own aggregate, which is the correct granularity (the fan-out of
+/// one session's end must not overtake itself) and which also means this consumer never
+/// pays the head-of-group blocking cost: a group of one is never blocked.
 async fn enqueue_session_ended_event(
     tx: &mut Transaction<'_, Postgres>,
     emit: &SessionEndedEmit<'_>,
@@ -18283,28 +18303,891 @@ async fn enqueue_session_ended_event(
     cause: SessionEndCause,
     occurred_micros: i64,
 ) -> Result<(), StoreError> {
-    let event_id = SessionEventId::generate(emit.env, &scope);
     let actor = emit.actor;
-    sqlx::query(
-        "INSERT INTO session_ended_events \
-         (id, tenant_id, environment_id, session_id, subject, cause, \
-          actor_kind, actor_id, correlation_id, occurred_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
-                 TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval)",
+    let payload = serde_json::json!({
+        "session_id": session_text,
+        "subject": subject,
+        "cause": cause.as_str(),
+        "actor_kind": actor.kind_str(),
+        "actor_id": actor.id_string(),
+        "correlation_id": emit.correlation.to_string(),
+        "occurred_at_unix_micros": occurred_micros,
+    });
+    enqueue_outbox_in_tx(
+        tx,
+        emit.env,
+        scope,
+        &NewOutboxMessage {
+            consumer: SESSION_ENDED_CONSUMER,
+            idempotency_key: session_text,
+            ordering_key: session_text,
+            payload,
+        },
     )
-    .bind(event_id.to_string())
-    .bind(scope.tenant().to_string())
-    .bind(scope.environment().to_string())
-    .bind(session_text)
-    .bind(subject)
-    .bind(cause.as_str())
-    .bind(actor.kind_str())
-    .bind(actor.id_string())
-    .bind(emit.correlation.to_string())
-    .bind(occurred_micros)
-    .execute(&mut **tx)
     .await?;
     Ok(())
+}
+
+/// The registered consumer name the session-ended fan-out drains under (issue #104).
+/// One value of the `consumer` discriminator on the generic outbox; the typed facade
+/// [`SessionEventOutboxRepo`] is the only thing that reads or writes it.
+pub const SESSION_ENDED_CONSUMER: &str = "session_ended";
+
+/// The largest exponential-backoff delay, in seconds, a retry schedule may reach
+/// (issue #104). The doubling is capped here rather than left to overflow, so a
+/// long-lived poison message's next attempt stays a number an operator can reason about
+/// (an hour) instead of drifting to a date past the heat death of the queue.
+const OUTBOX_MAX_BACKOFF_SECS: u64 = 3_600;
+
+/// One message on the generic outbox (issue #104): the typed row a consumer receives.
+///
+/// The substrate owns the ROUTING and the LIFECYCLE and is deliberately blind to the
+/// body: `payload` is whatever the producer wrote, decoded by the consumer that
+/// registered under `consumer`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboxMessage {
+    /// The message id (an `obx_` id).
+    pub id: String,
+    /// The database-assigned monotonic drain order, and the key that defines "earlier"
+    /// for the per-aggregate ordering rule. It is a drain-order HINT and NOT a safe
+    /// high-water-mark: it is assigned at INSERT, so under concurrent producers a lower
+    /// sequence can become visible after a higher one. Delivery is at-least-once per
+    /// ROW; consumers dedup on `idempotency_key` (or on `id`).
+    ///
+    /// It is a GLOBAL identity, drawn from one `GENERATED ALWAYS AS IDENTITY` counter
+    /// shared by every tenant, every environment and every consumer, and it is exposed
+    /// on this public type. The consequence is stated rather than left to be found: the
+    /// GAP between two of one scope's consecutive sequences is a direct count of the
+    /// messages every OTHER scope enqueued in between, so a tenant who reads its own
+    /// queue can measure the platform's async volume. It is a volume side channel and
+    /// nothing more: no id, no key, no payload and no scope of another tenant is
+    /// reachable through it, and row-level security is what stops those.
+    ///
+    /// It is not made per-scope, and that is a decision with a measured cost rather
+    /// than an oversight. A per-scope counter cannot come from an identity column
+    /// (Postgres has one counter per column), so it would have to be a counter ROW per
+    /// scope, incremented inside the enqueuing transaction. That row is then held under
+    /// an exclusive lock for the whole remaining life of the DOMAIN transaction the
+    /// enqueue rides in, which serializes every concurrent domain write in the scope
+    /// behind the slowest one. Measured on Postgres 18.4, one scope, one writer holding
+    /// its transaction open for two seconds after its enqueue: through the identity
+    /// column the second writer waited 0.02s (they do not interact, and both got their
+    /// own sequence); through a counter row it waited 1.60s, blocked until the first
+    /// COMMITTED. Trading the concurrency of every domain write in a tenant for the
+    /// concealment of another tenant's message COUNT is not a trade worth making, so the
+    /// channel is documented instead. `sequence` is also the substrate's definition of
+    /// "earlier", so any replacement has to be monotonic within a scope, which a counter
+    /// row is and a random id is not.
+    pub sequence: i64,
+    /// The registered consumer name that owns this message.
+    pub consumer: String,
+    /// The producer's dedup handle, unique within (tenant, environment, consumer).
+    pub idempotency_key: String,
+    /// The aggregate identity ordering is preserved within.
+    pub ordering_key: String,
+    /// The message body, opaque to the substrate.
+    pub payload: serde_json::Value,
+    /// How many delivery attempts have been recorded against this message.
+    pub attempts: i32,
+    /// The most recent failure reason, if an attempt has failed.
+    pub last_error: Option<String>,
+    /// When the message next becomes eligible (the backoff gate), in epoch microseconds.
+    pub next_attempt_at_unix_micros: i64,
+    /// When the message was enqueued, in epoch microseconds (clock seam).
+    pub enqueued_at_unix_micros: i64,
+    /// The visibility lease stamp on the row, in epoch microseconds, and the FENCING
+    /// TOKEN [`OutboxRepo::complete`] and [`OutboxRepo::fail`] require (issue #104).
+    ///
+    /// `None` on a message that is not currently leased, which is what
+    /// [`OutboxRepo::pending`] and [`OutboxRepo::list`] mostly return; `Some` on every
+    /// message [`OutboxRepo::claim`] hands out, carrying the instant THAT claim stamped.
+    ///
+    /// Why a lifecycle write needs it: a worker whose lease lapsed is indistinguishable
+    /// from a live one by id alone, so without the token a stalled worker could complete
+    /// or dead-letter a message another worker has legitimately re-claimed and is still
+    /// inside its handler for, which both loses the second worker's outcome and releases
+    /// the ordering group early. The token makes the write conditional on still holding
+    /// the lease it was handed.
+    ///
+    /// The token is strictly increasing per message rather than merely unique: a
+    /// re-claim is only possible once `claimed_at < now - lease`, so any later stamp
+    /// exceeds the one it replaced by more than the visibility timeout. A stale holder
+    /// therefore cannot collide with the live one by presenting an old instant.
+    pub lease_stamp_unix_micros: Option<i64>,
+    /// When the message was completed, if it was, in epoch microseconds.
+    pub completed_at_unix_micros: Option<i64>,
+    /// When the message was given up on, if it was, in epoch microseconds.
+    pub dead_lettered_at_unix_micros: Option<i64>,
+}
+
+/// A message about to be enqueued on the generic outbox (issue #104).
+#[derive(Debug, Clone)]
+pub struct NewOutboxMessage<'a> {
+    /// The registered consumer name that will drain it.
+    pub consumer: &'a str,
+    /// The producer's dedup handle. Derived from the DOMAIN FACT (a session id, a
+    /// webhook event id), never minted from entropy, so a producer can reconstruct it.
+    /// Unique within (tenant, environment, consumer): a second enqueue under the same
+    /// key is a unique violation, which is deliberate. In a TRANSACTIONAL outbox the
+    /// producer does not retry an enqueue on its own (the whole transaction retries and
+    /// the previous attempt rolled back), so a conflict means two distinct domain writes
+    /// claimed the same fact, and failing loudly is better than silently dropping one.
+    pub idempotency_key: &'a str,
+    /// The aggregate this message belongs to. Two messages sharing it are delivered in
+    /// enqueue order and are never in flight at once. A consumer that needs no ordering
+    /// passes something unique per message (its `idempotency_key` is the obvious choice),
+    /// which makes every group a singleton and removes the head-of-group blocking.
+    pub ordering_key: &'a str,
+    /// The message body.
+    pub payload: serde_json::Value,
+}
+
+/// The bounded-retry schedule a failed attempt is held to (issue #104). Sourced from
+/// configuration (`[outbox]`) rather than baked in, per the tunability principle.
+#[derive(Debug, Clone, Copy)]
+pub struct RetryPolicy {
+    /// The total number of attempts a message gets before it is DEAD-LETTERED. A value
+    /// of 1 means no retry at all: the first failure is terminal.
+    pub max_attempts: u32,
+    /// The base delay of the exponential backoff. The nth retry waits about
+    /// `base * 2^(n-1)` plus a jitter of up to `base`, both drawn from the clock and
+    /// entropy seams, capped at [`OUTBOX_MAX_BACKOFF_SECS`].
+    pub retry_base: Duration,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 5,
+            retry_base: Duration::from_secs(10),
+        }
+    }
+}
+
+/// What recording a failed attempt did to the message (issue #104).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureOutcome {
+    /// The attempts bound is not yet reached: the lease was released and the message
+    /// becomes eligible again at `next_attempt_at_unix_micros`.
+    Retrying {
+        /// The attempts recorded after this failure.
+        attempts: i32,
+        /// When the message next becomes eligible, in epoch microseconds.
+        next_attempt_at_unix_micros: i64,
+    },
+    /// The attempts bound is reached: the message is DEAD-LETTERED and never drains
+    /// again. This is also what UNBLOCKS the message's ordering group, which is why the
+    /// bound must be finite.
+    DeadLettered {
+        /// The attempts recorded after this failure.
+        attempts: i32,
+    },
+    /// This caller holds no non-terminal message with that id in this scope. A malformed
+    /// id, a foreign-scope id, an already-terminal message, and a lease that has lapsed
+    /// and been taken by another worker are all this same outcome (the anti-oracle
+    /// boundary), so a caller learns nothing about another tenant and a stale worker
+    /// learns nothing about the live one. In every case the meaning to the caller is the
+    /// same: the outcome of this message is not yours to record.
+    NotFound,
+}
+
+/// The per-consumer queue depth (issue #104): the numbers a metrics exporter and an
+/// operator status surface read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OutboxDepth {
+    /// Non-terminal messages that are DUE and not currently leased: the backlog a worker
+    /// would claim right now.
+    pub ready: i64,
+    /// Non-terminal messages currently held under an unexpired lease.
+    pub in_flight: i64,
+    /// Non-terminal messages whose backoff gate is still in the future.
+    pub scheduled: i64,
+    /// Messages given up on. This is the number an alert should fire on: a dead letter
+    /// is work that will never happen unless an operator replays it.
+    pub dead_lettered: i64,
+}
+
+/// The columns every outbox read selects, in one place so the claim, the pending peek,
+/// and the full listing return the identical shape. The `_us` projections reconstruct
+/// the exact microsecond instants (PostgreSQL 14+ returns a numeric `EXTRACT(EPOCH ...)`,
+/// so this is exact on the supported deployment).
+const OUTBOX_COLUMNS: &str = "id, sequence, consumer, idempotency_key, ordering_key, \
+     payload, attempts, last_error, \
+     (EXTRACT(EPOCH FROM next_attempt_at) * 1000000)::bigint AS next_attempt_us, \
+     (EXTRACT(EPOCH FROM enqueued_at) * 1000000)::bigint AS enqueued_us, \
+     (EXTRACT(EPOCH FROM claimed_at) * 1000000)::bigint AS claimed_us, \
+     (EXTRACT(EPOCH FROM completed_at) * 1000000)::bigint AS completed_us, \
+     (EXTRACT(EPOCH FROM dead_lettered_at) * 1000000)::bigint AS dead_us";
+
+/// Reconstruct an [`OutboxMessage`] from a selected row.
+fn outbox_message_from_row(row: &PgRow) -> OutboxMessage {
+    OutboxMessage {
+        id: row.get("id"),
+        sequence: row.get("sequence"),
+        consumer: row.get("consumer"),
+        idempotency_key: row.get("idempotency_key"),
+        ordering_key: row.get("ordering_key"),
+        payload: row.get("payload"),
+        attempts: row.get("attempts"),
+        last_error: row.get("last_error"),
+        next_attempt_at_unix_micros: row.get("next_attempt_us"),
+        enqueued_at_unix_micros: row.get("enqueued_us"),
+        lease_stamp_unix_micros: row.get("claimed_us"),
+        completed_at_unix_micros: row.get("completed_us"),
+        dead_lettered_at_unix_micros: row.get("dead_us"),
+    }
+}
+
+/// Enqueue ONE message onto the generic outbox inside an OPEN domain transaction
+/// (issue #104). This is the transactional-outbox guarantee itself: the message row and
+/// the domain write commit together or neither does, so a rolled-back domain write emits
+/// nothing and a committed one never loses its message.
+///
+/// It takes the caller's transaction rather than opening its own, deliberately. A
+/// producer that enqueued on a separate connection would have a window where the domain
+/// write committed and the message did not (or the reverse), which is the whole class of
+/// defect an outbox exists to remove.
+///
+/// Crate-internal because `scripts/query-audit.sh` confines SQL against a scoped table to
+/// this module: a producer in another crate reaches the outbox through a repository
+/// method here, not by threading a transaction across a crate boundary.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] on a persistence fault, including the unique violation a
+/// second enqueue under the same `(consumer, idempotency_key)` raises.
+pub(crate) async fn enqueue_outbox_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    env: &Env,
+    scope: Scope,
+    message: &NewOutboxMessage<'_>,
+) -> Result<OutboxMessageId, StoreError> {
+    let id = OutboxMessageId::generate(env, &scope);
+    let now_micros = epoch_micros(env.clock().now_utc());
+    sqlx::query(
+        "INSERT INTO outbox_messages \
+         (id, tenant_id, environment_id, consumer, idempotency_key, ordering_key, \
+          payload, next_attempt_at, enqueued_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, \
+                 TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval, \
+                 TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval)",
+    )
+    .bind(id.to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(message.consumer)
+    .bind(message.idempotency_key)
+    .bind(message.ordering_key)
+    .bind(&message.payload)
+    .bind(now_micros)
+    .execute(&mut **tx)
+    .await?;
+    Ok(id)
+}
+
+/// The generic transactional outbox and lease based job queue (issue #104), keyed to one
+/// scope: the ONE at-least-once dispatch substrate every async path in this milestone
+/// drains, in place of a hand-rolled queue per consumer.
+///
+/// It is the union of the two queues that preceded it: the transactional enqueue, the
+/// `FOR UPDATE SKIP LOCKED` claim and the visibility lease of the session-ended outbox
+/// (#35), plus the attempts counter, the `next_attempt_at` backoff gate and the
+/// dead-letter terminal state of the back-channel logout delivery queue (#34). It adds
+/// the two things neither needed: a `consumer` discriminator so one table serves many
+/// independent drains, and per-aggregate ORDERING.
+///
+/// # Per-aggregate ordering, and what it costs
+///
+/// [`claim`](OutboxRepo::claim) will not lease a message while a NON-TERMINAL message of
+/// the same `(consumer, ordering_key)` group holds a lower `sequence`. Only the group's
+/// head is ever eligible, so two messages of one aggregate can never be in flight at
+/// once and the group advances strictly in enqueue order. The rule keys on TERMINALITY,
+/// not on the lease, which is what makes it hold under concurrency: a competing worker's
+/// in-flight claim on the head does not retire the head, so the second message stays
+/// blocked whether the first succeeds, fails into a backoff, or is abandoned by a crashed
+/// worker.
+///
+/// Three costs follow and none of them is hidden:
+///
+/// - A group's head BLOCKS its group. A message that keeps failing holds its aggregate
+///   until the attempts bound dead-letters it, which is why [`RetryPolicy::max_attempts`]
+///   must be finite.
+/// - Parallelism within a consumer is bounded by the number of distinct ordering keys
+///   with due work, not by the worker count. A consumer that needs no ordering passes a
+///   per-message ordering key, making every group a singleton.
+/// - The claim carries one extra correlated anti-join per candidate row, served by the
+///   `outbox_messages_group_head_idx` partial index (migration 0099), so it is an index
+///   probe of the group's minimum rather than a scan of the group.
+///
+/// # The PRODUCER precondition, which is part of the guarantee and not a footnote
+///
+/// Everything above is a statement about CLAIMS. It becomes a statement about ORDER only
+/// when the sequences it compares were assigned in the order the producers intended, and
+/// that is a property of the producers, not of this module.
+///
+/// `sequence` is assigned at INSERT, which can be long before COMMIT. Two producer
+/// transactions that OVERLAP on one ordering key can therefore commit in the opposite
+/// order to their sequences: producer 1 takes sequence 10 and holds, producer 2 takes 11
+/// and commits, a drain claims 11 and is inside its handler, producer 1 commits, and 10
+/// becomes the group's head and claimable WHILE 11 IS STILL LEASED. That is not merely
+/// out-of-order delivery, it is two messages of one aggregate in flight at once, which is
+/// the very thing the head-of-group rule exists to prevent. It is unreachable from this
+/// module because the window opens before either row exists to be claimed.
+///
+/// So the substrate keeps this UNCONDITIONALLY:
+///
+/// - at most one message per `(consumer, ordering_key)` group is claimable at a time, out
+///   of the messages VISIBLE when the claim runs, and it is that group's lowest-sequenced
+///   non-terminal message;
+/// - a message stays its group's blocker until it is completed or dead-lettered, whatever
+///   happens to its lease;
+/// - a lifecycle write is fenced on the lease the writer was handed
+///   ([`OutboxMessage::lease_stamp_unix_micros`]), so a stalled worker cannot retire a
+///   message a live worker holds and release the successor under it.
+///
+/// And it keeps the STRONG form, "two messages sharing an `ordering_key` are never
+/// handled at the same time and arrive in enqueue order", exactly when the producers meet
+/// this precondition:
+///
+/// > Two enqueues under one `(consumer, ordering_key)` must not have overlapping
+/// > transactions. Serializing them on the aggregate's own row lock, taken in the same
+/// > transaction as the enqueue, is what a domain write naturally does and is the
+/// > supported way to meet it.
+///
+/// A producer that cannot meet it (a scheduled job, an operator-triggered replay, and
+/// anything going through [`enqueue`](OutboxRepo::enqueue), which holds no aggregate lock
+/// at all) gets the unconditional list and must not assume the strong form.
+///
+/// The shipped session-ended consumer meets it in the strongest possible way, and by a
+/// structural accident worth naming rather than generalizing from: its ordering key, its
+/// idempotency key and the ended session id are all the same value, so the UNIQUE
+/// `(tenant, environment, consumer, idempotency_key)` constraint makes every one of its
+/// groups a SINGLETON and there is no second message to be out of order with. That is a
+/// property of that consumer, not of the substrate, and the eight consumers that follow
+/// do not inherit it.
+pub struct OutboxRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl OutboxRepo<'_> {
+    /// Enqueue ONE message in its OWN transaction (issue #104), for a producer that has
+    /// no surrounding domain write to ride: a scheduled job, an operator-triggered
+    /// replay, a test fixture.
+    ///
+    /// A producer that DOES have a domain write must not use this. The atomicity the
+    /// outbox exists for comes from sharing the domain write's transaction, which is what
+    /// [`enqueue_outbox_in_tx`] does; enqueuing separately reintroduces the window where
+    /// one of the two writes survives a crash and the other does not.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault, including the unique violation a
+    /// second enqueue under the same `(consumer, idempotency_key)` raises.
+    pub async fn enqueue(
+        &self,
+        env: &Env,
+        message: &NewOutboxMessage<'_>,
+    ) -> Result<String, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let id = enqueue_outbox_in_tx(&mut tx, env, scope, message).await?;
+        tx.commit().await?;
+        Ok(id.to_string())
+    }
+
+    /// Atomically CLAIM up to `limit` DUE messages for `consumer` in this scope
+    /// (issue #104), stamping each with a visibility lease that expires `lease` from now.
+    ///
+    /// A message is claimable when all four hold: it belongs to `consumer`, it is neither
+    /// completed nor dead-lettered, its backoff gate has passed (`next_attempt_at <=
+    /// now`), and it is not held under an unexpired lease. `FOR UPDATE SKIP LOCKED`
+    /// inside the same statement takes the row locks, so concurrent workers on the same
+    /// consumer never claim the same message and never BLOCK on each other. A crashed
+    /// worker's message reappears once its lease lapses, which is what "reclaim" means
+    /// here: it is the absence of a live lease, not a separate call an operator has to
+    /// remember to make.
+    ///
+    /// A fifth condition enforces per-aggregate ordering: the message must be the HEAD of
+    /// its `(consumer, ordering_key)` group, meaning no non-terminal message of that
+    /// group has a lower `sequence`. See the type-level documentation for the full
+    /// argument and its costs.
+    ///
+    /// `limit` is a HARD bound on the returned batch, and the implementation note below
+    /// says why that took a materialized CTE rather than a subquery: as a subquery the
+    /// bound was one the query planner could decline, and it declined it whenever it
+    /// chose a rescanning semi join.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault.
+    pub async fn claim(
+        &self,
+        env: &Env,
+        consumer: &str,
+        lease: Duration,
+        limit: i64,
+    ) -> Result<Vec<OutboxMessage>, StoreError> {
+        let scope = self.scope;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let lease_micros = i64::try_from(lease.as_micros()).unwrap_or(i64::MAX);
+        // The outer UPDATE stamps a fresh lease start (`claimed_at = now`); the lease
+        // expiry is `claimed_at + lease`, so the reappear condition is
+        // `claimed_at < now - lease`, expressed in microseconds below.
+        //
+        // The NOT EXISTS is the ordering rule. It reads TERMINAL state only, so it is
+        // unaffected by another worker's concurrent claim on the head: under READ
+        // COMMITTED a competing claim changes `claimed_at`, never `completed_at` or
+        // `dead_lettered_at`, so the head keeps blocking its group for everyone while the
+        // head itself is skipped by SKIP LOCKED. Two workers therefore take zero messages
+        // from a one-message group rather than one each.
+        //
+        // The selection is a CTE, and `MATERIALIZED` is load-bearing rather than a
+        // stylistic preference. Written as `WHERE id IN (SELECT ... LIMIT $6 ...)` the
+        // planner is free to run the subquery ONCE (a hash semi join, which honours the
+        // limit) or ONCE PER CANDIDATE ROW (a nested loop semi join, which does not): each
+        // rescan re-evaluates the `claimed_at` gate against the rows THIS STATEMENT has
+        // already stamped, so the previous picks drop out and the next ones take their
+        // place until the whole eligible set is leased. Measured on Postgres 18.4, one
+        // table, one set of ten due messages: with statistics present the planner chose a
+        // Hash Semi Join and `LIMIT 3` leased 3; with the table freshly written and not
+        // yet analysed it chose a Nested Loop Semi Join with `loops=10` and the same
+        // `LIMIT 3` leased all 10. So `outbox.claim_batch` was not a bound at all, it was
+        // a bound the planner could decline, and the failure mode it declines into is a
+        // single worker leasing an entire backlog into memory. As a MATERIALIZED CTE the
+        // pick is evaluated exactly once by definition; the same probe leases 3.
+        let sql = format!(
+            "WITH picked AS MATERIALIZED ( \
+                 SELECT m.id AS picked_id FROM outbox_messages m \
+                 WHERE m.tenant_id = $2 AND m.environment_id = $3 AND m.consumer = $4 \
+                 AND m.completed_at IS NULL AND m.dead_lettered_at IS NULL \
+                 AND m.next_attempt_at <= TIMESTAMPTZ 'epoch' \
+                     + ($1::text || ' microseconds')::interval \
+                 AND (m.claimed_at IS NULL \
+                      OR m.claimed_at < TIMESTAMPTZ 'epoch' \
+                         + (($1::bigint - $5)::text || ' microseconds')::interval) \
+                 AND NOT EXISTS ( \
+                     SELECT 1 FROM outbox_messages b \
+                     WHERE b.tenant_id = m.tenant_id \
+                     AND b.environment_id = m.environment_id \
+                     AND b.consumer = m.consumer \
+                     AND b.ordering_key = m.ordering_key \
+                     AND b.completed_at IS NULL AND b.dead_lettered_at IS NULL \
+                     AND b.sequence < m.sequence \
+                 ) \
+                 ORDER BY m.sequence \
+                 LIMIT $6 \
+                 FOR UPDATE SKIP LOCKED \
+             ) \
+             UPDATE outbox_messages \
+             SET claimed_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+             FROM picked WHERE outbox_messages.id = picked.picked_id \
+             RETURNING {OUTBOX_COLUMNS}"
+        );
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let rows = sqlx::query(&sql)
+            .bind(now_micros)
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .bind(consumer)
+            .bind(lease_micros)
+            .bind(limit)
+            .fetch_all(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(rows.iter().map(outbox_message_from_row).collect())
+    }
+
+    /// Read up to `limit` non-terminal messages for `consumer` in this scope, oldest
+    /// first, WITHOUT claiming them (issue #104): a read-only peek at the queue for
+    /// diagnostics and tests. A real drain goes through [`claim`](OutboxRepo::claim) so
+    /// the lease, the skip-locked semantics, and the ordering rule apply.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault.
+    pub async fn pending(
+        &self,
+        consumer: &str,
+        limit: i64,
+    ) -> Result<Vec<OutboxMessage>, StoreError> {
+        let scope = self.scope;
+        let sql = format!(
+            "SELECT {OUTBOX_COLUMNS} FROM outbox_messages \
+             WHERE tenant_id = $1 AND environment_id = $2 AND consumer = $3 \
+             AND completed_at IS NULL AND dead_lettered_at IS NULL \
+             ORDER BY sequence LIMIT $4"
+        );
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let rows = sqlx::query(&sql)
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .bind(consumer)
+            .bind(limit)
+            .fetch_all(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(rows.iter().map(outbox_message_from_row).collect())
+    }
+
+    /// Read up to `limit` messages for `consumer` in this scope in ANY state
+    /// (issue #104), newest first: the full listing an operator status surface and the
+    /// tests read, including the completed and dead-lettered rows the peek hides.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault.
+    pub async fn list(&self, consumer: &str, limit: i64) -> Result<Vec<OutboxMessage>, StoreError> {
+        let scope = self.scope;
+        let sql = format!(
+            "SELECT {OUTBOX_COLUMNS} FROM outbox_messages \
+             WHERE tenant_id = $1 AND environment_id = $2 AND consumer = $3 \
+             ORDER BY sequence DESC LIMIT $4"
+        );
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let rows = sqlx::query(&sql)
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .bind(consumer)
+            .bind(limit)
+            .fetch_all(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(rows.iter().map(outbox_message_from_row).collect())
+    }
+
+    /// The per-consumer queue depth in this scope (issue #104): ready, in flight,
+    /// scheduled, and dead-lettered. The observability primitive a metrics exporter reads
+    /// on a cadence; `ready` is consumer lag and `dead_lettered` is the number an alert
+    /// fires on.
+    ///
+    /// `lease` must be the same visibility timeout the drain claims with, because "in
+    /// flight" means "leased and the lease has not lapsed" and nothing about the row says
+    /// how long its lease was for.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault.
+    pub async fn depth(
+        &self,
+        env: &Env,
+        consumer: &str,
+        lease: Duration,
+    ) -> Result<OutboxDepth, StoreError> {
+        let scope = self.scope;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let lease_micros = i64::try_from(lease.as_micros()).unwrap_or(i64::MAX);
+        let mut tx = begin_scoped(self.store, scope).await?;
+        // `$4` is now and `$4 - $5` is the lease horizon, both built in SQL from epoch
+        // microseconds exactly as every other instant in this module is, so the whole
+        // module speaks one dialect and nothing here depends on a driver-side
+        // timestamp mapping.
+        let row = sqlx::query(
+            "WITH bounds AS ( \
+               SELECT TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval AS now_at, \
+                      TIMESTAMPTZ 'epoch' \
+                        + (($4::bigint - $5)::text || ' microseconds')::interval AS lease_at) \
+             SELECT \
+               count(*) FILTER ( \
+                 WHERE completed_at IS NULL AND dead_lettered_at IS NULL \
+                 AND next_attempt_at <= bounds.now_at \
+                 AND (claimed_at IS NULL OR claimed_at < bounds.lease_at)) AS ready, \
+               count(*) FILTER ( \
+                 WHERE completed_at IS NULL AND dead_lettered_at IS NULL \
+                 AND claimed_at IS NOT NULL AND claimed_at >= bounds.lease_at) AS in_flight, \
+               count(*) FILTER ( \
+                 WHERE completed_at IS NULL AND dead_lettered_at IS NULL \
+                 AND next_attempt_at > bounds.now_at \
+                 AND (claimed_at IS NULL OR claimed_at < bounds.lease_at)) AS scheduled, \
+               count(*) FILTER (WHERE dead_lettered_at IS NOT NULL) AS dead_lettered \
+             FROM outbox_messages, bounds \
+             WHERE tenant_id = $1 AND environment_id = $2 AND consumer = $3",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(consumer)
+        .bind(now_micros)
+        .bind(lease_micros)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(OutboxDepth {
+            ready: row.get("ready"),
+            in_flight: row.get("in_flight"),
+            scheduled: row.get("scheduled"),
+            dead_lettered: row.get("dead_lettered"),
+        })
+    }
+
+    /// RE-STAMP the visibility lease on a message this worker holds (issue #104), just
+    /// before handing it to a handler, and update `message`'s fencing token to the new
+    /// stamp. Returns whether the lease was still ours to renew.
+    ///
+    /// This is what makes a BATCH claim safe. A claim leases the whole batch under ONE
+    /// stamp, so without this the lease of the batch's tail is already
+    /// `batch_size * handler_duration` old by the time the tail is handled, and the
+    /// governing quantity for the visibility timeout would be that product rather than a
+    /// single handler's duration (at the shipped defaults, `claim_batch = 64` and
+    /// `visibility_timeout_secs = 30`, any handler slower than about 469ms puts the tail
+    /// past its own lease). Renewing per message resets the clock at the moment the
+    /// handler starts, so the timeout has to exceed ONE handler and the two lines of
+    /// documentation that say so become true.
+    ///
+    /// `false` means another worker legitimately re-claimed the message while this one
+    /// was working through the earlier part of its batch, or the message went terminal
+    /// under that worker. Neither is an error and neither is recoverable here: the
+    /// message now belongs to somebody else, so the caller must SKIP it rather than hand
+    /// it to a handler. That is the clean hand-off the batch used to resolve by
+    /// double-handling.
+    ///
+    /// The renewal is fenced on the token it is replacing, so it cannot steal a lease
+    /// back from the worker that took it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault.
+    pub async fn renew_lease(
+        &self,
+        env: &Env,
+        message: &mut OutboxMessage,
+    ) -> Result<bool, StoreError> {
+        let scope = self.scope;
+        let Ok(message_id) = OutboxMessageId::parse_in_scope(&message.id, &scope) else {
+            return Ok(false);
+        };
+        let Some(held) = message.lease_stamp_unix_micros else {
+            return Ok(false);
+        };
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let renewed = sqlx::query(
+            "UPDATE outbox_messages \
+             SET claimed_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+             WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 \
+             AND claimed_at = TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval \
+             AND completed_at IS NULL AND dead_lettered_at IS NULL",
+        )
+        .bind(now_micros)
+        .bind(message_id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(held)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        if renewed.rows_affected() == 0 {
+            return Ok(false);
+        }
+        message.lease_stamp_unix_micros = Some(now_micros);
+        Ok(true)
+    }
+
+    /// Mark ONE message COMPLETE (issue #104), the terminal success state, so it never
+    /// drains again and its ordering group advances. Returns whether THIS call flipped
+    /// it.
+    ///
+    /// It takes the whole [`OutboxMessage`] rather than an id because completing is
+    /// FENCED on [`OutboxMessage::lease_stamp_unix_micros`]: the row is flipped only
+    /// while it still carries the exact lease this caller was handed. Three cases
+    /// collapse into one uniform `false`, and every one of them is a case where somebody
+    /// else owns the outcome: the message went terminal already (a double complete), the
+    /// lease lapsed and another worker re-claimed it (a stale holder, whose completion
+    /// would otherwise release the ordering group while the live worker is still inside
+    /// its handler for the predecessor), and the message was never leased at all. A
+    /// foreign-scope or malformed id is the same `false`, never an oracle.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault.
+    pub async fn complete(&self, env: &Env, message: &OutboxMessage) -> Result<bool, StoreError> {
+        self.complete_leased(env, &message.id, message.lease_stamp_unix_micros)
+            .await
+    }
+
+    /// [`complete`](OutboxRepo::complete) against a raw id and lease token, for the typed
+    /// facades that hand a consumer their own event type instead of an
+    /// [`OutboxMessage`]. Crate-internal precisely so the token cannot be skipped from
+    /// outside: every public completion path goes through a value a claim produced.
+    pub(crate) async fn complete_leased(
+        &self,
+        env: &Env,
+        id: &str,
+        lease_stamp_unix_micros: Option<i64>,
+    ) -> Result<bool, StoreError> {
+        let scope = self.scope;
+        let Ok(message_id) = OutboxMessageId::parse_in_scope(id, &scope) else {
+            return Ok(false);
+        };
+        let Some(held) = lease_stamp_unix_micros else {
+            return Ok(false);
+        };
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let flipped = sqlx::query(
+            "UPDATE outbox_messages \
+             SET completed_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval, \
+                 claimed_at = NULL \
+             WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 \
+             AND claimed_at = TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval \
+             AND completed_at IS NULL AND dead_lettered_at IS NULL",
+        )
+        .bind(now_micros)
+        .bind(message_id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(held)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(flipped.rows_affected() > 0)
+    }
+
+    /// Record a FAILED attempt on `message` (issue #104): count the attempt, record the
+    /// bounded `error` label, release the lease, and then either schedule the next
+    /// backoff retry or DEAD-LETTER the message once `policy.max_attempts` is reached.
+    ///
+    /// The count and the decision are taken under the message's ROW LOCK in one
+    /// transaction, so two workers that both failed the same message after a lapsed lease
+    /// each advance the counter exactly once and cannot both decide "one attempt left".
+    /// That is not a claim about Postgres in the abstract: deleting the `FOR UPDATE`
+    /// makes `four_concurrent_failures_each_count_exactly_one_attempt_under_the_row_lock`
+    /// go red, because without it four transactions all read the same counter, all report
+    /// the same attempt number, and the bound is never reached.
+    ///
+    /// The retry instant itself is computed in Rust from the clock and entropy seams, so
+    /// the schedule is exact under a manual clock in tests, which a SQL-side `random()`
+    /// or `now()` would destroy.
+    ///
+    /// Like [`complete`](OutboxRepo::complete), this is FENCED on
+    /// [`OutboxMessage::lease_stamp_unix_micros`]: a worker whose lease lapsed cannot
+    /// burn an attempt on, or dead-letter, a message the live worker is still handling.
+    ///
+    /// A foreign-scope id, a malformed id, a stale or absent lease, and an
+    /// already-terminal message all return [`FailureOutcome::NotFound`] (the anti-oracle
+    /// boundary), which the worker already treats as "the outcome belongs to somebody
+    /// else".
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault.
+    pub async fn fail(
+        &self,
+        env: &Env,
+        message: &OutboxMessage,
+        error: &str,
+        policy: RetryPolicy,
+    ) -> Result<FailureOutcome, StoreError> {
+        let scope = self.scope;
+        let Ok(message_id) = OutboxMessageId::parse_in_scope(&message.id, &scope) else {
+            return Ok(FailureOutcome::NotFound);
+        };
+        let Some(held) = message.lease_stamp_unix_micros else {
+            return Ok(FailureOutcome::NotFound);
+        };
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let tenant = scope.tenant().to_string();
+        let environment = scope.environment().to_string();
+        let mut tx = begin_scoped(self.store, scope).await?;
+        // Take the row lock BEFORE reading the counter: this is what serializes two
+        // workers that both hold (or both lost) a lease on the same message. The lease
+        // token is checked HERE, inside the lock, rather than on the UPDATEs below, so a
+        // stale holder is refused before it can advance the counter at all.
+        let locked = sqlx::query(
+            "SELECT attempts FROM outbox_messages \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
+             AND claimed_at = TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+             AND completed_at IS NULL AND dead_lettered_at IS NULL \
+             FOR UPDATE",
+        )
+        .bind(message_id.to_string())
+        .bind(&tenant)
+        .bind(&environment)
+        .bind(held)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = locked else {
+            tx.rollback().await?;
+            return Ok(FailureOutcome::NotFound);
+        };
+        let attempts_before: i32 = row.get("attempts");
+        let attempts = attempts_before.saturating_add(1);
+        let cap = i32::try_from(policy.max_attempts)
+            .unwrap_or(i32::MAX)
+            .max(1);
+        let outcome = if attempts >= cap {
+            sqlx::query(
+                // The inline terminality guard repeats what the lock above already
+                // guarantees, and is kept for the reason `complete` carries the same one:
+                // it is the ONLY thing standing between a lost lock and a row stamped
+                // dead-lettered on top of an already-terminal state. Measured: with the
+                // `FOR UPDATE` deleted and this guard absent, three concurrent failures
+                // each restamped `dead_lettered_at` over a terminal row.
+                "UPDATE outbox_messages \
+                 SET attempts = $1, last_error = $2, claimed_at = NULL, \
+                     dead_lettered_at = TIMESTAMPTZ 'epoch' \
+                         + ($3::text || ' microseconds')::interval \
+                 WHERE id = $4 AND tenant_id = $5 AND environment_id = $6 \
+                 AND completed_at IS NULL AND dead_lettered_at IS NULL",
+            )
+            .bind(attempts)
+            .bind(error)
+            .bind(now_micros)
+            .bind(message_id.to_string())
+            .bind(&tenant)
+            .bind(&environment)
+            .execute(&mut *tx)
+            .await?;
+            FailureOutcome::DeadLettered { attempts }
+        } else {
+            let next = next_attempt_micros(env, now_micros, attempts, policy.retry_base);
+            sqlx::query(
+                // Guarded for the same reason as the dead-letter arm above.
+                "UPDATE outbox_messages \
+                 SET attempts = $1, last_error = $2, claimed_at = NULL, \
+                     next_attempt_at = TIMESTAMPTZ 'epoch' \
+                         + ($3::text || ' microseconds')::interval \
+                 WHERE id = $4 AND tenant_id = $5 AND environment_id = $6 \
+                 AND completed_at IS NULL AND dead_lettered_at IS NULL",
+            )
+            .bind(attempts)
+            .bind(error)
+            .bind(next)
+            .bind(message_id.to_string())
+            .bind(&tenant)
+            .bind(&environment)
+            .execute(&mut *tx)
+            .await?;
+            FailureOutcome::Retrying {
+                attempts,
+                next_attempt_at_unix_micros: next,
+            }
+        };
+        tx.commit().await?;
+        Ok(outcome)
+    }
+}
+
+/// The instant (epoch microseconds) the `attempts`-th retry becomes due:
+/// `now + base * 2^(attempts-1)` plus a jitter of up to `base`, both drawn from the
+/// deterministic clock and entropy seams so the schedule is exact under a manual clock in
+/// tests. The exponential term is capped at [`OUTBOX_MAX_BACKOFF_SECS`] so a long-lived
+/// poison message cannot schedule an absurd or overflowing delay.
+fn next_attempt_micros(env: &Env, now_micros: i64, attempts: i32, base: Duration) -> i64 {
+    let base_secs = base.as_secs().max(1);
+    let shift = u32::try_from(attempts.saturating_sub(1))
+        .unwrap_or(0)
+        .min(16);
+    let backoff = base_secs
+        .saturating_mul(1_u64 << shift)
+        .min(OUTBOX_MAX_BACKOFF_SECS);
+    let mut bytes = [0_u8; 8];
+    env.entropy().fill_bytes(&mut bytes);
+    let jitter = u64::from_le_bytes(bytes) % base_secs;
+    let total = backoff.saturating_add(jitter).min(OUTBOX_MAX_BACKOFF_SECS);
+    let delta_micros = i64::try_from(total)
+        .unwrap_or(i64::MAX)
+        .saturating_mul(1_000_000);
+    now_micros.saturating_add(delta_micros)
 }
 
 /// A drained session-ended event (issue #35): the STABLE typed contract a consumer
@@ -18316,7 +19199,11 @@ async fn enqueue_session_ended_event(
 /// target by joining `client_sessions` on `session_id` at delivery time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionEndedEvent {
-    /// The outbox event id (an `sev_` id): the IDEMPOTENCY KEY a consumer dedups on.
+    /// The outbox event id (an `obx_` id since issue #104, a `sev_` id before it): the
+    /// IDEMPOTENCY KEY a consumer dedups on. It stays an opaque, stable, scope-embedding
+    /// handle across that change, and because 0099 backfills nothing, one logical event
+    /// can never exist under both prefixes, so a dedup cannot be defeated across the
+    /// boundary.
     pub id: String,
     /// The monotonic drain-order key the database assigned. It is a best-effort
     /// ordering HINT that sorts the visible undelivered tail, NOT a safe high-water-mark:
@@ -18336,39 +19223,62 @@ pub struct SessionEndedEvent {
     pub correlation_id: String,
     /// When the session ended, in microseconds since the Unix epoch (clock seam).
     pub occurred_at_unix_micros: i64,
+    /// The visibility lease stamp this event was handed under, and the FENCING TOKEN
+    /// [`SessionEventOutboxRepo::mark_delivered`] requires (issue #104). `Some` on an
+    /// event from [`claim`](SessionEventOutboxRepo::claim), `None` on one from the
+    /// unclaimed peek. See [`OutboxMessage::lease_stamp_unix_micros`].
+    pub lease_stamp_unix_micros: Option<i64>,
 }
 
-/// The columns every outbox read selects, in one place so the claim and the pending
-/// read return the identical shape. `sequence` is the drain order; the `occurred_us`
-/// projection reconstructs the exact microsecond instant (PostgreSQL 14+ returns a
-/// numeric `EXTRACT(EPOCH ...)`, so this is exact on the supported deployment).
-const SESSION_EVENT_COLUMNS: &str = "id, sequence, session_id, subject, cause, \
-     actor_kind, actor_id, correlation_id, \
-     (EXTRACT(EPOCH FROM occurred_at) * 1000000)::bigint AS occurred_us";
-
-/// Reconstruct a [`SessionEndedEvent`] from a selected outbox row. A row whose stored
-/// cause or actor does not decode is a corrupt or forward-versioned row; it surfaces
-/// as a [`StoreError::Database`] rather than a panic.
-fn session_event_from_row(row: &PgRow) -> Result<SessionEndedEvent, StoreError> {
-    let cause_str: String = row.get("cause");
+/// Reconstruct a [`SessionEndedEvent`] from an outbox message carrying this consumer's
+/// payload. A message whose payload is missing a field, or whose stored cause or actor
+/// does not decode, is a corrupt or forward-versioned row; it surfaces as a
+/// [`StoreError::Database`] rather than a panic.
+///
+/// This decode is the one thing the generic substrate CANNOT do for a consumer, and it
+/// is the price of genericity: the typed columns 0024 could constrain in the schema are
+/// now payload fields the consumer validates on the way out.
+fn session_event_from_message(message: &OutboxMessage) -> Result<SessionEndedEvent, StoreError> {
+    let decode_error = |what: &str| {
+        StoreError::Database(sqlx::Error::Decode(
+            format!(
+                "session-ended outbox message {} carries no valid {what}",
+                message.id
+            )
+            .into(),
+        ))
+    };
+    let field = |name: &str| -> Result<String, StoreError> {
+        message
+            .payload
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| decode_error(name))
+    };
+    let cause_str = field("cause")?;
     let cause = SessionEndCause::from_wire(&cause_str).ok_or_else(|| {
         StoreError::Database(sqlx::Error::Decode(
-            format!("session_ended_events row carries an unknown cause: {cause_str}").into(),
+            format!("session-ended outbox message carries an unknown cause: {cause_str}").into(),
         ))
     })?;
-    let actor_kind: String = row.get("actor_kind");
-    let actor_id: String = row.get("actor_id");
-    let actor = ActorRef::from_parts(&actor_kind, &actor_id)
+    let actor = ActorRef::from_parts(&field("actor_kind")?, &field("actor_id")?)
         .map_err(|e| StoreError::Database(sqlx::Error::Decode(Box::new(e))))?;
+    let occurred_at_unix_micros = message
+        .payload
+        .get("occurred_at_unix_micros")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| decode_error("occurred_at_unix_micros"))?;
     Ok(SessionEndedEvent {
-        id: row.get("id"),
-        sequence: row.get("sequence"),
-        session_id: row.get("session_id"),
-        subject: row.get("subject"),
+        id: message.id.clone(),
+        sequence: message.sequence,
+        session_id: field("session_id")?,
+        subject: field("subject")?,
         cause,
         actor,
-        correlation_id: row.get("correlation_id"),
-        occurred_at_unix_micros: row.get("occurred_us"),
+        correlation_id: field("correlation_id")?,
+        occurred_at_unix_micros,
+        lease_stamp_unix_micros: message.lease_stamp_unix_micros,
     })
 }
 
@@ -18378,17 +19288,33 @@ fn session_event_from_row(row: &PgRow) -> Result<SessionEndedEvent, StoreError> 
 /// an audited business event, and the durable record of the end is the outbox row and
 /// its audit sibling, both written when the session flipped.
 ///
+/// Since issue #104 this is a TYPED FACADE over the generic outbox
+/// ([`OutboxRepo`]) rather than a queue of its own: it is the first real consumer on the
+/// substrate, and it is what holds the substrate to real usage instead of to a fixture.
+/// Its whole surface is unchanged, so the worker that drains it and every test that
+/// exercised it are untouched; what moved is the physical row, from `session_ended_events`
+/// to `outbox_messages` under the [`SESSION_ENDED_CONSUMER`] discriminator.
+///
 /// Delivery is AT-LEAST-ONCE. [`claim`](SessionEventOutboxRepo::claim) atomically leases
-/// a batch of undelivered events (stamping `claimed_at`, skipping rows another worker
-/// holds), the consumer acts idempotently, then [`mark_delivered`](SessionEventOutboxRepo::mark_delivered)
-/// sets `delivered_at`. A consumer that crashes after acting but before marking sees the
-/// event again once its lease lapses, so consumers MUST dedup on the event `id`.
+/// a batch of undelivered events (stamping the visibility lease, skipping rows another
+/// worker holds), the consumer acts idempotently, then
+/// [`mark_delivered`](SessionEventOutboxRepo::mark_delivered) retires the event. A
+/// consumer that crashes after acting but before marking sees the event again once its
+/// lease lapses, so consumers MUST dedup on the event `id`.
 pub struct SessionEventOutboxRepo<'a> {
     store: &'a Store,
     scope: Scope,
 }
 
 impl SessionEventOutboxRepo<'_> {
+    /// The generic queue this facade is a typed view of.
+    fn outbox(&self) -> OutboxRepo<'_> {
+        OutboxRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
     /// Atomically CLAIM up to `limit` undelivered session-ended events in this scope,
     /// oldest first, stamping each with a visibility lease that expires `lease` from
     /// now (issue #35). A row another worker holds an unexpired lease on is SKIPPED, so
@@ -18406,40 +19332,11 @@ impl SessionEventOutboxRepo<'_> {
         lease: Duration,
         limit: i64,
     ) -> Result<Vec<SessionEndedEvent>, StoreError> {
-        let scope = self.scope;
-        let now_micros = epoch_micros(env.clock().now_utc());
-        let lease_micros = i64::try_from(lease.as_micros()).unwrap_or(i64::MAX);
-        // A row is claimable when it is undelivered AND (never claimed OR its lease has
-        // lapsed). The outer UPDATE stamps a fresh lease start (`claimed_at = now`); the
-        // lease expiry is `claimed_at + lease`, so the reappear condition is
-        // `claimed_at < now - lease`, expressed as `claimed_at`'s microseconds below.
-        let sql = format!(
-            "UPDATE session_ended_events \
-             SET claimed_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
-             WHERE id IN ( \
-                 SELECT id FROM session_ended_events \
-                 WHERE tenant_id = $2 AND environment_id = $3 \
-                 AND delivered_at IS NULL \
-                 AND (claimed_at IS NULL \
-                      OR claimed_at < TIMESTAMPTZ 'epoch' \
-                         + (($1::bigint - $4)::text || ' microseconds')::interval) \
-                 ORDER BY sequence \
-                 LIMIT $5 \
-                 FOR UPDATE SKIP LOCKED \
-             ) \
-             RETURNING {SESSION_EVENT_COLUMNS}"
-        );
-        let mut tx = begin_scoped(self.store, scope).await?;
-        let rows = sqlx::query(&sql)
-            .bind(now_micros)
-            .bind(scope.tenant().to_string())
-            .bind(scope.environment().to_string())
-            .bind(lease_micros)
-            .bind(limit)
-            .fetch_all(&mut *tx)
+        let claimed = self
+            .outbox()
+            .claim(env, SESSION_ENDED_CONSUMER, lease, limit)
             .await?;
-        tx.commit().await?;
-        rows.iter().map(session_event_from_row).collect()
+        claimed.iter().map(session_event_from_message).collect()
     }
 
     /// Read up to `limit` undelivered session-ended events in this scope, oldest first,
@@ -18451,57 +19348,34 @@ impl SessionEventOutboxRepo<'_> {
     ///
     /// [`StoreError::Database`] on a persistence fault or an undecodable stored row.
     pub async fn pending(&self, limit: i64) -> Result<Vec<SessionEndedEvent>, StoreError> {
-        let scope = self.scope;
-        let sql = format!(
-            "SELECT {SESSION_EVENT_COLUMNS} FROM session_ended_events \
-             WHERE tenant_id = $1 AND environment_id = $2 AND delivered_at IS NULL \
-             ORDER BY sequence LIMIT $3"
-        );
-        let mut tx = begin_scoped(self.store, scope).await?;
-        let rows = sqlx::query(&sql)
-            .bind(scope.tenant().to_string())
-            .bind(scope.environment().to_string())
-            .bind(limit)
-            .fetch_all(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        rows.iter().map(session_event_from_row).collect()
+        let pending = self.outbox().pending(SESSION_ENDED_CONSUMER, limit).await?;
+        pending.iter().map(session_event_from_message).collect()
     }
 
-    /// Mark ONE claimed session-ended event DELIVERED by its `id` (issue #35), so it
-    /// never drains again. Idempotent: it flips `delivered_at` only while it is still
-    /// NULL, so a double mark (or a mark racing a re-claim after a lapsed lease) sets it
-    /// once and reports `false` the second time. A foreign-scope or malformed id is a
-    /// uniform no-op (`false`), never an oracle. A column-scoped UPDATE of
-    /// `delivered_at` alone, the only mutation a consumer is granted (never a
-    /// table-wide UPDATE, the #31 lesson). Returns whether THIS call flipped it.
+    /// Mark ONE CLAIMED session-ended event DELIVERED (issue #35), so it never drains
+    /// again. Returns whether THIS call flipped it.
+    ///
+    /// It takes the claimed `event` rather than its id because the flip is FENCED on the
+    /// lease that event was handed under (issue #104): a worker whose lease lapsed while
+    /// it was exploding the event cannot retire it out from under the worker that has
+    /// since re-claimed it. Idempotent, and uniform: a double mark, a mark racing a
+    /// re-claim, an event from the unclaimed peek, a foreign-scope id and a malformed id
+    /// are all the same `false`, never an oracle.
+    ///
+    /// The explode stage is idempotent, so losing this race costs a re-explode into the
+    /// same delivery rows and never a lost or duplicated logout.
     ///
     /// # Errors
     ///
     /// [`StoreError::Database`] on a persistence fault.
-    pub async fn mark_delivered(&self, env: &Env, id: &str) -> Result<bool, StoreError> {
-        let scope = self.scope;
-        // A malformed or foreign-scope id resolves to a uniform no-op (the anti-oracle
-        // boundary), never a query against another tenant's row.
-        let Ok(event_id) = SessionEventId::parse_in_scope(id, &scope) else {
-            return Ok(false);
-        };
-        let now_micros = epoch_micros(env.clock().now_utc());
-        let mut tx = begin_scoped(self.store, scope).await?;
-        let flipped = sqlx::query(
-            "UPDATE session_ended_events \
-             SET delivered_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
-             WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 \
-             AND delivered_at IS NULL",
-        )
-        .bind(now_micros)
-        .bind(event_id.to_string())
-        .bind(scope.tenant().to_string())
-        .bind(scope.environment().to_string())
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(flipped.rows_affected() > 0)
+    pub async fn mark_delivered(
+        &self,
+        env: &Env,
+        event: &SessionEndedEvent,
+    ) -> Result<bool, StoreError> {
+        self.outbox()
+            .complete_leased(env, &event.id, event.lease_stamp_unix_micros)
+            .await
     }
 }
 
@@ -18515,7 +19389,9 @@ impl SessionEventOutboxRepo<'_> {
 pub struct LogoutDelivery {
     /// The delivery id (a `bld_` id).
     pub id: String,
-    /// The `sev_` session-ended outbox event this delivery was exploded from.
+    /// The session-ended outbox event this delivery was exploded from: an `obx_` id
+    /// since issue #104, a `sev_` id before it. There is no foreign key to either table,
+    /// so the prefix change is a value change and nothing more.
     pub event_id: String,
     /// The SSO session (a `ses_` id) that ended.
     pub session_id: String,

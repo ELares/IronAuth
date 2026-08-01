@@ -884,6 +884,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0098_control_plane_dead_surface_grants.sql"),
         },
+        Migration {
+            version: 99,
+            name: "outbox_messages",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0099_outbox_messages.sql"),
+        },
     ]
 }
 

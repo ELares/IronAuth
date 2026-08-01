@@ -1547,6 +1547,55 @@
       },
       "type": "object"
     },
+    "OutboxConfig": {
+      "additionalProperties": false,
+      "description": "Transactional outbox and job queue settings (issue #104).\n\nThese are the knobs of the shared dispatch substrate, not of any one consumer. Every\nvalue has a safe default, and the defaults are chosen so a deployment that never opens\nthis section still gets: bounded retries that end in a dead letter rather than an\ninfinite redelivery loop, a visibility timeout longer than any handler the tree ships,\nand a worker count above one, because a pool of one is the singleton posture this\nsubstrate exists to avoid.",
+      "properties": {
+        "claim_batch": {
+          "default": 64,
+          "description": "The largest number of messages one claim leases, and a HARD bound: the worker\nre-stamps each message's lease immediately before handing it over, so the batch\ndoes NOT share one deadline and `visibility_timeout_secs` has to cover one handler\nrather than `claim_batch` of them.\n\nWhat a large batch does cost is the tail of it sitting claimed but unhandled while\nthe worker works forward: past `visibility_timeout_secs` of work, another worker\ntakes what this one has not reached. Nothing is lost or duplicated (the message is\nhanded off cleanly and counted), but the claim round trip that leased it was\nwasted, so a batch far larger than one worker can clear inside the timeout buys\nnothing.\n\nThe default (64) matches the batch the back-channel logout worker already claims.\nMust be at least 1 and at most [`OUTBOX_MAX_CLAIM_BATCH`].",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_attempts": {
+          "default": 5,
+          "description": "The total number of attempts a message gets before it is DEAD-LETTERED. `1` means\nno retry at all: the first failure is terminal.\n\nThis bound is not only a politeness to a failing endpoint. A message that shares\nan ordering key with others BLOCKS them until it reaches a terminal state, so the\ndead letter is what releases the aggregate; an unbounded retry would wedge that\naggregate forever, which is why there is no \"unlimited\" value here and never will\nbe. The default (5) is conservative. Must be at least 1.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "poll_interval_secs": {
+          "default": 5,
+          "description": "How often, in seconds, an idle worker polls for due work. It bounds the latency\nbetween a message being enqueued and being picked up, and it is a straight trade\nagainst database load: every worker of every consumer issues one claim per\ninterval per scope even when the queue is empty.\n\nThe default (5) matches the cadence the back-channel logout worker already runs\nat. Must be at least 1 and at most `OIDC_MAX_LIFETIME_SECS`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "retry_base_secs": {
+          "default": 10,
+          "description": "The base delay in seconds of the exponential backoff between retries. The nth\nretry waits about `base * 2^(n-1)` seconds plus a jitter of up to `base`, both\ndrawn from the deterministic clock and entropy seams, capped at one hour.\n\nThe default (10) is conservative. Must be at least 1 and at most\n`OIDC_MAX_LIFETIME_SECS`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "visibility_timeout_secs": {
+          "default": 30,
+          "description": "The visibility timeout in seconds: how long a claim hides a message from other\nworkers. A crashed worker's messages are reclaimed this long after they were\nclaimed, so this is the worst-case redelivery latency AND the deadline every\nhandler must finish inside. Setting it below a handler's real duration causes\nduplicate delivery of everything that consumer handles, which is safe (delivery is\nat-least-once and consumers are idempotent) but wasteful.\n\nThe default (30) exceeds the slowest outbound handler this tree ships, whose own\nper-request budget is ten seconds. Must be at least 1 and at most\n`OIDC_MAX_LIFETIME_SECS`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "worker_concurrency": {
+          "default": 2,
+          "description": "How many worker tasks ONE process runs per consumer. Workers claim independently\n(`FOR UPDATE SKIP LOCKED` under a visibility lease), so raising this needs no\ncoordination and cannot reorder an aggregate's messages: per-aggregate ordering is\nenforced by the claim itself.\n\nThe default (2) is deliberately not 1. A single worker is exactly the mandatory\nsingleton posture the field's cautionary example (Ory Kratos's courier) is stuck\nin, and shipping 1 as the default would make \"we are not a singleton\" a property\nnobody exercises until the first operator raises it. It is also not large: the\nreal ceiling is the database connection pool, since every claiming worker holds a\nconnection.\n\n`0` is refused rather than read as \"disabled\", because a pool configured to run\nno workers looks healthy while the queue fills. Must be at least 1 and at most\n[`OUTBOX_MAX_WORKER_CONCURRENCY`].",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "PasswordHashingConfig": {
       "additionalProperties": false,
       "description": "Password-hashing settings (issue #62): the Argon2id parameters for NEWLY set\npasswords and the dedicated, admission-controlled hashing worker pool.\n\nPassword hashing is the hottest and most denial-of-service-prone operation an\nidentity provider performs, so it runs in a bounded worker pool kept OFF the\nasync request threads, fronted by the per-tenant fair-share admission of the\n[`QuotaConfig`] layer (issue #50): one tenant's credential-stuffing storm\ndegrades only that tenant, never the instance.\n\nThe Argon2id parameters are per-environment in spirit (dev/staging/prod may\ndiffer) and safe by default (the OWASP recommendation: `m = 19456` KiB,\n`t = 2`, `p = 1`); a parameter change applies to NEW hashes, and an existing\nhash upgrades transparently through the rehash-on-successful-login path,\nbecause the parameters are stored per hash in the PHC string. The process\nvalue is the deployment default until per-environment overrides ride the M5\npromotion pipeline, mirroring the other promotable settings.\n\nThe pool sizing and queue depth are host infrastructure, not a per-environment\nconcern: they bound the whole process. The `ironauth hash-probe` CLI (and the\nin-admin tuning helper) run a measured probe on the actual host and recommend\nparameters that meet `probe_target_latency_ms`.",
@@ -2742,6 +2791,18 @@
         "max_group_depth": 8
       },
       "description": "Organization settings (issue #97): the structural safety bound on how deep\nan organization's group hierarchy may nest. A top-level section rather than\na field on `[admin]` deliberately, because the bound is consumed on BOTH\nplanes: the management API enforces it at write time and the token-issuance\npath uses it as the hard termination guard on the ancestor walk that\nresolves a subject's effective roles."
+    },
+    "outbox": {
+      "$ref": "#/$defs/OutboxConfig",
+      "default": {
+        "claim_batch": 64,
+        "max_attempts": 5,
+        "poll_interval_secs": 5,
+        "retry_base_secs": 10,
+        "visibility_timeout_secs": 30,
+        "worker_concurrency": 2
+      },
+      "description": "Transactional outbox and job queue settings (issue #104): the tuning of the\nat-least-once dispatch substrate every async path (webhook delivery,\nback-channel logout delivery, SIEM sinks, migration jobs, notification\nfan-out) drains through. Worker concurrency, the visibility timeout, the\npoll cadence, the claim batch, and the retry bound are all settings with\nsafe defaults per the tunability principle, because the right value depends\non the deployment's connection pool, its consumers' handler latency, and how\nlong its operators are willing to wait for a crashed worker's messages.\n\nA top-level section rather than a field on any one consumer's section\ndeliberately: the substrate is shared, so one set of knobs governs every\nconsumer's workers and an operator tunes the QUEUE once rather than\nrediscovering the same four settings under each subsystem.\n\nThere is no mode selection here and no mention of a durable message bus.\nThe Postgres queue is the only implementation that exists, and a knob whose\nvalue does nothing is worse than an absent knob; mode selection lands with\nthe implementation it selects."
     },
     "password_hashing": {
       "$ref": "#/$defs/PasswordHashingConfig",

@@ -512,8 +512,8 @@ mod tests {
     /// This file's own source, so each declaration's `via` builder can be checked
     /// against the install body it claims to describe rather than trusted.
     const THIS_SOURCE: &str = include_str!("shared_config.rs");
-    /// The boot path's own source, for the classification claims that are statements
-    /// ABOUT the boot path (see [`Reach::UnreadAtBoot`]).
+    /// The boot path's own source. Kept as an ANCHOR for the whole-tree scan below
+    /// (see [`crate_sources`]), which must find at least this file and its contents.
     const BOOT_SOURCE: &str = include_str!("main.rs");
     /// The management plane's state, for the both-planes builder census.
     const ADMIN_STATE_SOURCE: &str = include_str!("../../ironauth-admin/src/state.rs");
@@ -532,7 +532,18 @@ mod tests {
         /// ABOUT this crate's source, so
         /// [`no_key_classified_unread_is_read_by_the_boot_path`] measures it rather
         /// than trusting the prose.
-        UnreadAtBoot,
+        ///
+        /// `config_type` is the name of the section's TYPE in `ironauth_config`, and it
+        /// is required rather than optional because the accessor scan alone does not
+        /// close the hole. Measured: with only a `.key` scan, a real read written as a
+        /// struct-destructuring bind of the section out of `Config` survives, and so
+        /// does one through a function parameter typed as the section's own type. A
+        /// section cannot reach a boot path without its type being NAMED, so the type
+        /// name is the second half of the check and between them there is no shape left.
+        ///
+        /// This file may name each declared type exactly ONCE, in the declaration
+        /// below, which the check counts rather than exempts.
+        UnreadAtBoot { config_type: &'static str },
     }
 
     /// Every top-level `Config` key the boot path does NOT install on BOTH plane
@@ -619,7 +630,9 @@ mod tests {
         ),
         (
             "identifiers",
-            Reach::UnreadAtBoot,
+            Reach::UnreadAtBoot {
+                config_type: "IdentifiersConfig",
+            },
             "inert: no boot path reads it from Config, on either plane. Tracked as issue \
              #459, which is a decision about what the section should MEAN rather than a \
              wiring gap.",
@@ -642,9 +655,28 @@ mod tests {
         ),
         (
             "byok",
-            Reach::UnreadAtBoot,
+            Reach::UnreadAtBoot {
+                config_type: "ByokConfig",
+            },
             "inert: no boot path reads it from Config, on either plane. Tracked as issue \
              #459, alongside identifiers and for the same reason.",
+        ),
+        (
+            "outbox",
+            Reach::UnreadAtBoot {
+                config_type: "OutboxConfig",
+            },
+            "the transactional outbox and job queue tuning (issue #104, PR 1). Read by no \
+             boot path YET, and deliberately so: PR 1 lands the substrate, the consumer \
+             framework and the first consumer, and registers no consumer that runs as a \
+             worker POOL, so there is nothing for these knobs to size. The first reader is \
+             the back-channel logout worker's migration onto the framework in PR 2 of the \
+             same issue, which is where the boot path builds a WorkerSettings from this \
+             section. Classified here rather than left unstated so that `unread` is a fact \
+             this crate MEASURES (see no_key_classified_unread_is_read_by_the_boot_path) \
+             rather than a promise in a changelog: if a later change starts reading it and \
+             forgets to reclassify, that test goes red. PR 2 is a NEW MODULE in this crate, \
+             which is precisely the shape the check had to be widened to catch.",
         ),
         (
             "features",
@@ -781,17 +813,86 @@ mod tests {
         }
     }
 
+    /// Every `.rs` file under this crate's `src/` tree, as (relative path, contents).
+    ///
+    /// Derived from the TREE rather than from a hand written list of `include_str!`s,
+    /// because the list was the hole. Measured against a two-file list of `main.rs`
+    /// and `shared_config.rs`: a real accessor read of a section classified
+    /// `UnreadAtBoot`, placed in A NEW MODULE FILE OF THIS CRATE, survived the check
+    /// (verified a genuine rebuild, not a stale artifact). A new module is the natural
+    /// shape of the very next change these classifications are a promise about.
+    ///
+    /// `src/` and not the whole crate, deliberately and not by omission: the claim is
+    /// about the BOOT PATH, which is what `src/` is. A `tests/` file that names a
+    /// section's type is exercising it, not booting it, and the cross-crate defaults
+    /// pin under `tests/` is exactly that.
+    fn crate_sources() -> Vec<(String, String)> {
+        fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<(String, String)>) {
+            let entries = std::fs::read_dir(dir)
+                .unwrap_or_else(|e| panic!("the crate source tree must be readable: {e}"));
+            for entry in entries {
+                let path = entry.expect("a readable directory entry").path();
+                if path.is_dir() {
+                    walk(&path, root, out);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    let name = path
+                        .strip_prefix(root)
+                        .unwrap_or(&path)
+                        .display()
+                        .to_string();
+                    let body = std::fs::read_to_string(&path)
+                        .unwrap_or_else(|e| panic!("{name} must be readable: {e}"));
+                    out.push((name, body));
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut out = Vec::new();
+        walk(&root, &root, &mut out);
+        out.sort();
+        out
+    }
+
     #[test]
     fn no_key_classified_unread_is_read_by_the_boot_path() {
-        // Anchor: the scanned source is the boot path we mean, not an empty string.
+        let sources = crate_sources();
+        // Anchors, and there are three of them because each is a way this check has
+        // previously been able to pass over nothing.
+        //
+        // First: the walk found the whole tree, not one file and not zero.
+        let names: Vec<&str> = sources.iter().map(|(name, _)| name.as_str()).collect();
         assert!(
-            BOOT_SOURCE.contains("fn serve(") && BOOT_SOURCE.contains("assemble_planes"),
-            "the scanned source must be the boot path"
+            names.contains(&"main.rs") && names.contains(&"shared_config.rs"),
+            "the scan must cover the crate's own modules; it found {names:?}"
         );
-        let unread: Vec<&str> = PLANE_LOCAL_KEYS
+        assert!(
+            sources.len() >= 3,
+            "the scan must cover EVERY module in src/, not just the two that used to be \
+             named here; it found {names:?}"
+        );
+        // Second: the file it found really is the boot path, with the same content the
+        // previous `include_str!` anchor checked.
+        let boot = sources
             .iter()
-            .filter(|(_, reach, _)| *reach == Reach::UnreadAtBoot)
-            .map(|(name, _, _)| *name)
+            .find(|(name, _)| name == "main.rs")
+            .map(|(_, body)| body.as_str())
+            .expect("main.rs is in the tree");
+        assert!(
+            boot.contains("fn serve(") && boot.contains("assemble_planes"),
+            "the scanned main.rs must be the boot path"
+        );
+        assert_eq!(
+            boot, BOOT_SOURCE,
+            "the tree walk reads the same bytes the compiler does; a mismatch means the \
+             scan is looking at the wrong tree"
+        );
+        // Third: the classification kind is exercised.
+        let unread: Vec<(&str, &str)> = PLANE_LOCAL_KEYS
+            .iter()
+            .filter_map(|(name, reach, _)| match reach {
+                Reach::UnreadAtBoot { config_type } => Some((*name, *config_type)),
+                Reach::OnePlaneOrNoState => None,
+            })
             .collect();
         assert!(
             !unread.is_empty(),
@@ -799,17 +900,36 @@ mod tests {
              this check would pass over an empty list. Remove the kind rather than \
              leave it inert."
         );
-        // A field read is `something.key`. Scanning for the accessor rather than the
-        // bare word keeps the classification list's own quoted key names from matching
-        // themselves.
-        for key in unread {
-            let read = format!(".{key}");
-            for (file, source) in [("main.rs", BOOT_SOURCE), ("shared_config.rs", THIS_SOURCE)] {
+
+        for (key, config_type) in unread {
+            // A field read is `something.key`. Scanning for the accessor rather than the
+            // bare word keeps the classification list's own quoted key names from
+            // matching themselves.
+            let accessor = format!(".{key}");
+            for (file, source) in &sources {
                 assert!(
-                    !source.contains(&read),
-                    "`{key}` is classified as read by NO boot path, but {file} contains \
-                     `{read}`. Either the claim is stale (reclassify it) or the read is \
-                     new, and if BOTH planes now receive it, declare it shared."
+                    !source.contains(&accessor),
+                    "`{key}` is classified as read by NO boot path, but src/{file} \
+                     contains `{accessor}`. Either the claim is stale (reclassify it) or \
+                     the read is new, and if BOTH planes now receive it, declare it shared."
+                );
+                // The accessor scan alone is not enough, and that is measured rather than
+                // assumed: a struct-destructuring bind of the section out of `Config`,
+                // and a function parameter typed as the section's own type, both survive
+                // it. A section cannot reach any boot path without its TYPE being named
+                // somewhere, so the type name is the second half of the check.
+                //
+                // THIS file is allowed exactly ONE mention, the declaration in
+                // PLANE_LOCAL_KEYS above, and it is COUNTED rather than exempted: a
+                // second mention here is a read like any other.
+                let allowed = usize::from(file == "shared_config.rs");
+                assert_eq!(
+                    source.matches(config_type).count(),
+                    allowed,
+                    "`{key}` is classified as read by NO boot path, but src/{file} names \
+                     its type `{config_type}` more often than the {allowed} time(s) the \
+                     classification itself needs. A destructuring bind or a typed \
+                     parameter reads the section without ever writing `{accessor}`."
                 );
             }
         }
