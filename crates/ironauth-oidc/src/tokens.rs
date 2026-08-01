@@ -62,8 +62,8 @@ use std::time::{Duration, SystemTime};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ironauth_jose::{
-    Confirmation, EmissionOptions, SigningKey, SigningPolicy, compact_len, protected_header,
-    sign_jws_with_policy,
+    Confirmation, EmissionOptions, SigningKey, SigningPolicy, TokenTyp, compact_len,
+    protected_header, sign_jws_with_policy,
 };
 use ironauth_store::{
     IssuedTokenId, RefreshTokenId, Scope, TokenFormat, opaque_access_token_digest,
@@ -907,7 +907,7 @@ pub fn mint_client_credentials_access_token(
                 policy,
                 signer,
                 &serde_json::to_vec(&claims).map_err(|_| ())?,
-                &EmissionOptions::new().with_typ("at+jwt"),
+                &EmissionOptions::new().with_token_typ(TokenTyp::AccessToken),
             )
             .map_err(|_| ())?;
             MintedAccessToken::Jwt { token, jti }
@@ -962,12 +962,13 @@ fn generate_opaque_access_token(state: &OidcState, jti: &IssuedTokenId) -> Strin
 
 /// Mint the ID token and the access token for a successful exchange (issue #29).
 ///
-/// The ID token is ALWAYS a signed `at+jwt`-adjacent JWT (OIDC Core), signed with
-/// the environment key; its lifetime is the environment access-token lifetime, as
-/// before. The access token takes the resolved `target`'s format: an RFC 9068
-/// `at+jwt` (signed, `jti` recorded in `issued_tokens`) or an opaque reference
-/// token (random + digest, recorded in `opaque_access_tokens`), with the target's
-/// audience and lifetime. The `jti`s are drawn from the entropy seam.
+/// The ID token is ALWAYS a signed JWT (OIDC Core, `typ = JWT`), signed with the
+/// environment key; its lifetime is the environment's own `id_token_ttl_secs`,
+/// independent of the access token's (issue #192). The access token takes the
+/// resolved `target`'s format: an RFC 9068 `at+jwt` (signed, `jti` recorded in
+/// `issued_tokens`) or an opaque reference token (random + digest, recorded in
+/// `opaque_access_tokens`), with the target's audience and lifetime. The `jti`s
+/// are drawn from the entropy seam.
 ///
 /// # Errors
 ///
@@ -986,9 +987,11 @@ pub fn mint(
 ) -> Result<IssuedTokens, ()> {
     let now = state.now();
     let iat = epoch_secs(now);
-    // The ID token keeps the environment access-token lifetime (unchanged); the
+    // The ID token uses the environment's OWN id-token lifetime (issue #192); the
     // access token uses the target lifetime (a resource server may shorten it).
-    let id_exp = iat.saturating_add(secs(state.access_token_ttl()));
+    // These were the same number, read from the same setting, which meant tuning
+    // the access token silently retuned the identity receipt.
+    let id_exp = iat.saturating_add(secs(state.id_token_ttl()));
     let access_ttl_secs = secs(target.ttl);
 
     let id_jti = IssuedTokenId::generate(state.env(), &request.scope);
@@ -1011,7 +1014,7 @@ pub fn mint(
         policy,
         id_signer,
         &serde_json::to_vec(&id_claims).map_err(|_| ())?,
-        &EmissionOptions::new().with_typ("JWT"),
+        &EmissionOptions::new().with_token_typ(TokenTyp::IdToken),
     )
     .map_err(|_| ())?;
 
@@ -1142,7 +1145,7 @@ fn mint_at_jwt(
     let jti = IssuedTokenId::generate(state.env(), &request.scope);
     let jti_text = jti.to_string();
     let audience = target.aud_claim();
-    let options = EmissionOptions::new().with_typ("at+jwt");
+    let options = EmissionOptions::new().with_token_typ(TokenTyp::AccessToken);
     let build = |permission: PermissionClaim<'_>| {
         build_access_token_claims(request, iat, exp, &jti_text, &audience, permission)
     };
@@ -1249,7 +1252,7 @@ pub fn mint_refresh_token(state: &OidcState, scope: &Scope) -> MintedRefreshToke
 /// ([`build_id_token_claims`]) and signing path as [`mint`]; it never mints an
 /// access token, because the authorization endpoint never issues one (RFC 9700
 /// 2.1.2, a permanent non-goal). The ID token's lifetime matches a token-endpoint
-/// ID token (the configured access-token lifetime), and its `jti` is drawn from
+/// ID token (the configured `id_token_ttl_secs`), and its `jti` is drawn from
 /// the entropy seam and returned so the caller can record it against the grant (or
 /// simply meter it, for the stateless implicit flow).
 ///
@@ -1271,7 +1274,9 @@ pub fn mint_id_token(
 ) -> Result<(String, IssuedTokenId), ()> {
     let now = state.now();
     let iat = epoch_secs(now);
-    let exp = iat.saturating_add(secs(state.access_token_ttl()));
+    // The SAME id-token lifetime a token-endpoint ID token gets (issue #192): the
+    // front channel does not get a different receipt lifetime from the back one.
+    let exp = iat.saturating_add(secs(state.id_token_ttl()));
     let id_jti = IssuedTokenId::generate(state.env(), &request.scope);
     let id_claims =
         build_id_token_claims(request, iat, exp, &id_jti.to_string()).map_err(|error| {
@@ -1289,7 +1294,7 @@ pub fn mint_id_token(
         policy,
         id_signer,
         &serde_json::to_vec(&id_claims).map_err(|_| ())?,
-        &EmissionOptions::new().with_typ("JWT"),
+        &EmissionOptions::new().with_token_typ(TokenTyp::IdToken),
     )
     .map_err(|_| ())?;
     Ok((id_token, id_jti))

@@ -350,7 +350,7 @@ async fn a_per_scope_acr_floor_runs_the_second_factor_and_issues_fresh_acr_and_a
         .as_str()
         .expect("id_token")
         .to_owned();
-    let policy = harness.policy(&client);
+    let policy = harness.id_token_policy(&client);
     let verified = verify(&id_token, &policy, &common::verify_clock()).expect("id token verifies");
     let claims = Value::Object(verified.claims().raw().clone());
 

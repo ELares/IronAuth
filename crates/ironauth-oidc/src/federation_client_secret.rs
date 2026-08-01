@@ -121,7 +121,7 @@ fn epoch_secs(at: SystemTime) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use ironauth_jose::{JwsAlgorithm, TrustedKey, VerificationPolicy, verify};
+    use ironauth_jose::{ExpectedTyp, JwsAlgorithm, TrustedKey, VerificationPolicy, verify};
 
     use super::*;
 
@@ -166,6 +166,9 @@ mod tests {
             vec![trusted],
             "TEAMID1234",
             "https://appleid.apple.com",
+            // Apple dictates this assertion's header (`{alg: ES256, kid}`), so
+            // IronAuth stamps no media type on it and cannot require one back.
+            ExpectedTyp::ForeignIssuer,
         )
         .expect("policy");
         let (env, _clock) = ironauth_env::Env::deterministic(now(), 1);
@@ -216,6 +219,7 @@ mod tests {
             vec![signing.verifying_key().unwrap()],
             "TEAMID1234",
             "https://appleid.apple.com",
+            ExpectedTyp::ForeignIssuer,
         )
         .unwrap();
         let (env, _clock) = ironauth_env::Env::deterministic(later, 1);

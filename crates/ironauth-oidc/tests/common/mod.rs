@@ -19,8 +19,8 @@ use http_body_util::BodyExt;
 use ironauth_config::{OidcConfig, QuotaConfig};
 use ironauth_env::{Env, ManualClock};
 use ironauth_jose::{
-    EmissionOptions, JwsAlgorithm, KeySet, SigningKey, SigningPolicy, TrustedKey,
-    VerificationPolicy, sign_jws_with_policy,
+    EmissionOptions, ExpectedTyp, JwsAlgorithm, KeySet, SigningKey, SigningPolicy, TokenTyp,
+    TrustedKey, VerificationPolicy, sign_jws_with_policy,
 };
 use ironauth_oidc::{
     ClientAuthMethod, ClientKeyResolver, DiscoveryCapabilities, DiscoveryState, IssuerEntry,
@@ -908,13 +908,16 @@ impl Harness {
         &self.clock
     }
 
-    /// Sign a synthetic `at+jwt` access token over `claims` with the environment's
+    /// Sign a synthetic token of profile `typ` over `claims` with the environment's
     /// LIVE signing key and policy (the same key/policy the mint signs with, resolved
     /// through the issuer registry), for a test that needs a token shape the mint does
-    /// not produce today. Used by the issue #22 introspection guard test to forge a
-    /// JSON-array `aud` (RFC 7519 / #28), reusing a real token's `jti` so its store row
-    /// still resolves.
-    pub async fn sign_at_jwt(&self, claims: &serde_json::Value) -> String {
+    /// not produce today.
+    ///
+    /// The profile is an ARGUMENT, not a constant (issue #192). This helper signs with
+    /// the environment key under the environment issuer, which is precisely the
+    /// position an attacker would love to be in, so a caller forging a hint has to say
+    /// which token it is forging and the verify side then holds it to that.
+    pub async fn sign_as(&self, claims: &serde_json::Value, typ: TokenTyp) -> String {
         let entry = self
             .registry
             .entry_for(&self.scope, self.state.now())
@@ -928,9 +931,16 @@ impl Harness {
             entry.policy(),
             signer,
             &bytes,
-            &EmissionOptions::new().with_typ("at+jwt"),
+            &EmissionOptions::new().with_token_typ(typ),
         )
-        .expect("sign at+jwt")
+        .expect("sign")
+    }
+
+    /// Sign a synthetic RFC 9068 `at+jwt` access token over `claims`. Used by the issue
+    /// #22 introspection guard test to forge a JSON-array `aud` (RFC 7519 / #28),
+    /// reusing a real token's `jti` so its store row still resolves.
+    pub async fn sign_at_jwt(&self, claims: &serde_json::Value) -> String {
+        self.sign_as(claims, TokenTyp::AccessToken).await
     }
 
     /// The per-environment issuer the tokens carry.
@@ -1383,16 +1393,41 @@ impl Harness {
     }
 
     /// A verification policy that trusts the environment's public key and expects
-    /// the harness issuer and the given audience.
+    /// the harness issuer, the given audience, and the given token profile.
+    ///
+    /// There is deliberately no profile-agnostic variant (issue #192). The
+    /// environment signs the ID token, the access token, and the Logout Token with
+    /// ONE key under ONE issuer, and the code flow gives the first two the same
+    /// `aud`, so a policy that did not name the profile would accept all three and
+    /// every test built on it would assert against a token it never pinned down.
     #[must_use]
-    pub fn policy(&self, audience: &str) -> VerificationPolicy {
+    fn policy_for(&self, audience: &str, expected_typ: ExpectedTyp) -> VerificationPolicy {
         VerificationPolicy::new(
             vec![JwsAlgorithm::EdDsa],
             vec![self.verifying_key.clone()],
             self.issuer.clone(),
             audience.to_owned(),
+            expected_typ,
         )
         .expect("policy builds")
+    }
+
+    /// A policy that accepts ONLY an RFC 9068 `at+jwt` access token for `audience`.
+    #[must_use]
+    pub fn access_token_policy(&self, audience: &str) -> VerificationPolicy {
+        self.policy_for(audience, ExpectedTyp::Required(TokenTyp::AccessToken))
+    }
+
+    /// A policy that accepts ONLY an ID token for `audience`.
+    #[must_use]
+    pub fn id_token_policy(&self, audience: &str) -> VerificationPolicy {
+        self.policy_for(audience, ExpectedTyp::Required(TokenTyp::IdToken))
+    }
+
+    /// A policy that accepts ONLY a Back-Channel Logout Token for `audience`.
+    #[must_use]
+    pub fn logout_token_policy(&self, audience: &str) -> VerificationPolicy {
+        self.policy_for(audience, ExpectedTyp::Required(TokenTyp::LogoutToken))
     }
 
     /// Drive one request through the router.

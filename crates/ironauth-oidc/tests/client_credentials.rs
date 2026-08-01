@@ -62,8 +62,12 @@ async fn set_custom_claims(
 /// exchange, verified against the environment key and the given audience, as a JSON
 /// object (so members are read with `claims["name"]`).
 fn verified_claims(harness: &Harness, token: &str, audience: &str) -> serde_json::Value {
-    let verified =
-        verify(token, &harness.policy(audience), &verify_clock()).expect("at+jwt verifies");
+    let verified = verify(
+        token,
+        &harness.access_token_policy(audience),
+        &verify_clock(),
+    )
+    .expect("at+jwt verifies");
     serde_json::Value::Object(verified.claims().raw().clone())
 }
 

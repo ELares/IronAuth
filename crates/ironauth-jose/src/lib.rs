@@ -33,6 +33,28 @@
 //!   presence is fail-closed, never silently ignored.
 //! - **`crit`** naming any extension is rejected: this core understands no
 //!   critical extensions, and a malformed or duplicate `crit` is rejected too.
+//! - **`typ`** must name the token profile the policy was built for. It selects
+//!   nothing; it can only narrow what is accepted. See below.
+//!
+//! # One token is never another token
+//!
+//! Two tokens IronAuth mints can share an issuer, a subject, an audience, and a
+//! signing key: an ID token and an access token issued by the same code exchange
+//! differ only in their media type, and an ID token travels through the front
+//! channel, where a referrer header, a proxy log, or browser history can leak it.
+//! So the media type has to be load bearing, and it is: every policy states an
+//! [`ExpectedTyp`] as a positional argument of [`VerificationPolicy::new`], which
+//! makes a policy with no opinion about the profile it accepts a compile error
+//! rather than a quiet default.
+//!
+//! The two sides read ONE declaration. [`TokenTyp`] names each profile IronAuth
+//! mints and holds its RFC media type; the mint stamps it through
+//! [`EmissionOptions::with_token_typ`] and the verifier requires it through
+//! [`ExpectedTyp::Required`]. Where the token comes from a foreign party whose
+//! header IronAuth does not control (an upstream OP's ID token, a client's
+//! `private_key_jwt` assertion), the policy says [`ExpectedTyp::ForeignIssuer`]
+//! out loud, and separation there rests on the foreign party's own keys plus the
+//! pinned issuer and audience.
 //!
 //! # No HMAC in the verify core, by design
 //!
@@ -93,7 +115,9 @@
 //! ```
 //! use std::time::{Duration, SystemTime};
 //! use ironauth_env::ManualClock;
-//! use ironauth_jose::{verify, JwsAlgorithm, TrustedKey, VerificationPolicy};
+//! use ironauth_jose::{
+//!     verify, ExpectedTyp, JwsAlgorithm, TokenTyp, TrustedKey, VerificationPolicy,
+//! };
 //!
 //! # fn demo(token: &str, public_key: &[u8; 32]) -> Result<(), Box<dyn std::error::Error>> {
 //! let policy = VerificationPolicy::new(
@@ -101,6 +125,7 @@
 //!     vec![TrustedKey::ed25519(Some("key-1".into()), public_key)?],
 //!     "https://issuer.example.test",
 //!     "client-abc",
+//!     ExpectedTyp::Required(TokenTyp::AccessToken),
 //! )?
 //! .with_skew(Duration::from_secs(30));
 //!
@@ -162,8 +187,8 @@ pub use mint::{
     b64_no_pad_len, compact_len, protected_header, sign_jws, sign_jws_with_policy,
 };
 pub use policy::{
-    JwsAlgorithm, KeyError, KeyFamily, PolicyError, TrustedKey, VerificationCaps,
-    VerificationPolicy,
+    ExpectedTyp, JwsAlgorithm, KeyError, KeyFamily, PolicyError, TokenTyp, TrustedKey,
+    VerificationCaps, VerificationPolicy,
 };
 pub use redact::Redacted;
 pub use rotation::{KeySet, RotationError, RotationParams, includes_downgrade_key};

@@ -64,9 +64,10 @@ impl VerifiedToken {
 ///
 /// Returns [`VerifyError`] for every rejection: an oversized or malformed token,
 /// a header that steers trust (`alg: none`, an unsupported or non-allowlisted
-/// algorithm, embedded key material, `crit`, compression, or encryption), a key
-/// mismatch, an invalid signature, or a failed claim (`exp`/`nbf`/`iat` outside
-/// skew, or a wrong `iss`/`aud`).
+/// algorithm, embedded key material, `crit`, compression, or encryption), a `typ`
+/// that is not the profile the policy expects, a key mismatch, an invalid
+/// signature, or a failed claim (`exp`/`nbf`/`iat` outside skew, or a wrong
+/// `iss`/`aud`).
 pub fn verify(
     token: &str,
     policy: &VerificationPolicy,
@@ -99,6 +100,18 @@ pub fn verify(
     // Stage 4: the claimed algorithm must be in the caller's allowlist.
     if !policy.algorithms.contains(&header.alg) {
         return reject(RejectReason::AlgNotAllowed);
+    }
+
+    // Stage 4b: the claimed media type must be the profile this verification is
+    // for (RFC 9068 section 4 for an access token, generalized to every profile
+    // IronAuth mints). This runs here, on the not-yet-authenticated header, for the
+    // same reason the allowlist check above does: it can only ever REJECT. Nothing
+    // is accepted on the strength of the header, because the signature check is
+    // still ahead, so a forged `typ` buys an attacker a rejection, and a valid
+    // token whose media type says it is a different profile is refused before any
+    // crypto is spent on it.
+    if !policy.expected_typ.accepts(header.typ.as_deref()) {
+        return reject(RejectReason::TypMismatch);
     }
 
     // Stage 5: select the trusted key(s) eligible for this token.

@@ -51,7 +51,7 @@ fn legacy_enabled() -> OidcConfig {
 /// Verify a front-channel ID token through the one hardened verify path and return
 /// its claims as a JSON object.
 fn verified_claims(harness: &Harness, audience: &str, id_token: &str) -> Value {
-    let policy = harness.policy(audience);
+    let policy = harness.id_token_policy(audience);
     let verified = verify(id_token, &policy, &common::verify_clock()).expect("id token verifies");
     Value::Object(verified.claims().raw().clone())
 }

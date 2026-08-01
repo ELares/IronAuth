@@ -43,7 +43,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use ironauth_jose::{
-    JwsAlgorithm, VerificationPolicy, VerifiedToken, trusted_keys_from_jwks, verify,
+    ExpectedTyp, JwsAlgorithm, VerificationPolicy, VerifiedToken, trusted_keys_from_jwks, verify,
 };
 use ironauth_store::{ActorRef, CorrelationId, NewRiskSignal, ServiceId, StoreError, UserId};
 use serde_json::Value;
@@ -145,7 +145,22 @@ pub(crate) async fn ingest(
         return rejected();
     }
     let audience = state.issuer_for(&scope);
-    let Ok(policy) = VerificationPolicy::new(algorithms, keys, source.iss.clone(), audience) else {
+    // A Security Event Token from a registered EXTERNAL transmitter. RFC 8417 section
+    // 2.2 only RECOMMENDS the `secevent+jwt` media type, and transmitters vary, so
+    // requiring it would refuse conforming SETs for no gain: the transmitter's own
+    // registered JWKS, its pinned `iss`, and this environment's issuer as the `aud`
+    // are what separate this token from every other (issue #192). A CONFIGURATION
+    // property, not a structural one: both the keys and the `iss` come from an
+    // operator-registered transmitter, so registering this environment as its own
+    // transmitter would let IronAuth's tokens reach the signature check with `typ`
+    // unread. No default configuration reaches here at all.
+    let Ok(policy) = VerificationPolicy::new(
+        algorithms,
+        keys,
+        source.iss.clone(),
+        audience,
+        ExpectedTyp::ForeignIssuer,
+    ) else {
         return rejected();
     };
 

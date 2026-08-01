@@ -140,7 +140,7 @@ async fn granted_scope(harness: &Harness, client_id: &str, code: &str) -> String
     assert_eq!(status, StatusCode::OK, "token exchange: {body}");
     let value: serde_json::Value = serde_json::from_str(&body).expect("json");
     let access = value["access_token"].as_str().expect("access_token");
-    let policy = harness.policy(client_id);
+    let policy = harness.access_token_policy(client_id);
     let verified = verify(access, &policy, &common::verify_clock()).expect("access verifies");
     verified
         .claims()

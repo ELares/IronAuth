@@ -999,7 +999,7 @@ async fn the_device_flow_id_token_carries_the_approving_sessions_sid() {
 
     // The device ID token carries a sid, and it is the SAME sid the code flow would
     // issue for the approving (client, session) pair.
-    let policy = harness.policy(&client_str);
+    let policy = harness.id_token_policy(&client_str);
     let verified = verify(&id_token, &policy, &common::verify_clock()).expect("id token verifies");
     let claims = verified.claims().raw();
     let expected_sid = harness

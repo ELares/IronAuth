@@ -21,6 +21,7 @@ fn policy_with_skew(signer: &common::Ed25519Signer, skew: Duration) -> Verificat
         vec![key],
         common::ISS,
         common::AUD,
+        common::TYP_NOT_UNDER_TEST,
     )
     .expect("valid policy")
     .with_skew(skew)
@@ -87,6 +88,7 @@ fn allow_expired_accepts_a_past_exp_but_still_requires_every_other_check() {
             vec![key.clone()],
             common::ISS,
             common::AUD,
+            common::TYP_NOT_UNDER_TEST,
         )
         .expect("valid policy")
         .with_skew(Duration::from_secs(60))
@@ -307,6 +309,7 @@ fn require_iat_rejects_when_absent() {
         vec![key],
         common::ISS,
         common::AUD,
+        common::TYP_NOT_UNDER_TEST,
     )
     .expect("valid policy")
     .require_iat(true);
@@ -440,14 +443,43 @@ fn policy_requires_issuer_and_audience() {
     let signer = common::Ed25519Signer::new();
     let key = || TrustedKey::ed25519(None, signer.public_key()).expect("valid key");
     assert!(
-        VerificationPolicy::new(vec![JwsAlgorithm::EdDsa], vec![key()], "", common::AUD).is_err()
+        VerificationPolicy::new(
+            vec![JwsAlgorithm::EdDsa],
+            vec![key()],
+            "",
+            common::AUD,
+            common::TYP_NOT_UNDER_TEST
+        )
+        .is_err()
     );
     assert!(
-        VerificationPolicy::new(vec![JwsAlgorithm::EdDsa], vec![key()], common::ISS, "").is_err()
+        VerificationPolicy::new(
+            vec![JwsAlgorithm::EdDsa],
+            vec![key()],
+            common::ISS,
+            "",
+            common::TYP_NOT_UNDER_TEST
+        )
+        .is_err()
     );
-    assert!(VerificationPolicy::new(vec![], vec![key()], common::ISS, common::AUD).is_err());
     assert!(
-        VerificationPolicy::new(vec![JwsAlgorithm::EdDsa], vec![], common::ISS, common::AUD)
-            .is_err()
+        VerificationPolicy::new(
+            vec![],
+            vec![key()],
+            common::ISS,
+            common::AUD,
+            common::TYP_NOT_UNDER_TEST
+        )
+        .is_err()
+    );
+    assert!(
+        VerificationPolicy::new(
+            vec![JwsAlgorithm::EdDsa],
+            vec![],
+            common::ISS,
+            common::AUD,
+            common::TYP_NOT_UNDER_TEST
+        )
+        .is_err()
     );
 }

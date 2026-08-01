@@ -19,8 +19,8 @@ use ironauth_env::FixedEntropy;
 use ironauth_jose::seams::{ClientAuthMethod, GrantType, TokenBindingMethod};
 use ironauth_jose::{
     ClientSecret, ClientSecretContext, Confirmation, EmissionOptions, EnvironmentKeyStore, Jwk,
-    JwkSet, JwsAlgorithm, MacAlgorithm, RejectReason, SigningKey, SigningPolicy, TrustedKey,
-    VerificationPolicy, b64_no_pad_len, compact_len, protected_header, sign_jws,
+    JwkSet, JwsAlgorithm, MacAlgorithm, RejectReason, SigningKey, SigningPolicy, TokenTyp,
+    TrustedKey, VerificationPolicy, b64_no_pad_len, compact_len, protected_header, sign_jws,
     sign_jws_with_policy, verify,
 };
 use serde_json::{Map, Value, json};
@@ -67,7 +67,14 @@ fn signing_key_for(alg: JwsAlgorithm) -> SigningKey {
 
 /// A single-key, single-algorithm verification policy.
 fn policy_for(alg: JwsAlgorithm, key: TrustedKey) -> VerificationPolicy {
-    VerificationPolicy::new(vec![alg], vec![key], common::ISS, common::AUD).expect("valid policy")
+    VerificationPolicy::new(
+        vec![alg],
+        vec![key],
+        common::ISS,
+        common::AUD,
+        common::TYP_NOT_UNDER_TEST,
+    )
+    .expect("valid policy")
 }
 
 /// Decode the `alg` header parameter from a compact JWS.
@@ -144,8 +151,10 @@ fn full_matrix_signs_and_round_trips_through_verify() {
 fn emission_shapes() -> [EmissionOptions; 3] {
     [
         EmissionOptions::new(),
-        EmissionOptions::new().with_typ("at+jwt"),
-        EmissionOptions::new().fully_specified(true).with_typ("JWT"),
+        EmissionOptions::new().with_token_typ(TokenTyp::AccessToken),
+        EmissionOptions::new()
+            .fully_specified(true)
+            .with_token_typ(TokenTyp::IdToken),
     ]
 }
 
@@ -252,7 +261,7 @@ fn compact_len_is_exact_through_the_policy_wrapper_the_mint_uses() {
     for alg in MATRIX {
         let key = signing_key_for(alg);
         let policy = SigningPolicy::new(vec![alg]).expect("single-algorithm policy");
-        let options = EmissionOptions::new().with_typ("at+jwt");
+        let options = EmissionOptions::new().with_token_typ(TokenTyp::AccessToken);
         let header = protected_header(&key, &options).expect("protected header");
         for n in [0_usize, 1, 2, 31] {
             let payload = vec![b'x'; n];

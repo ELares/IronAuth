@@ -6,6 +6,87 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **A Logout Token was accepted as an `id_token_hint`** (issue #192). `end_session`
+  attributes a logout by signature, issuer, and audience alone, with no store lookup
+  behind it, and every token IronAuth mints for a client satisfies all three: one
+  environment key, one issuer, `aud = client_id`. A Logout Token, which IronAuth itself
+  POSTs to the RP and which carries the very `sid` this path reads to choose a session,
+  could therefore be replayed straight back to end that exact session.
+  `verify_logout_hint` now requires the ID-token media type and `verify_access_token`
+  requires `at+jwt` (RFC 9068 section 4), through the `ExpectedTyp` a policy can no
+  longer be built without.
+  - Both of the other two pairs were ALREADY refused before this change, by a different
+    layer each, and the media type is the second layer rather than the one that was
+    holding the line. Said plainly because it is the difference between a fix and a
+    hardening.
+    - An ACCESS TOKEN as an `id_token_hint` did verify and did attribute, and then
+      degraded to the confirmation page, because `build_access_token_claims` emits no
+      `sid` and a hint with no `sid` names no session to end. The media type now refuses
+      it earlier. The witness in `tests/token_confusion.rs` is therefore not the plain
+      access token, which fails the same way either way: it is the access token's own
+      claims WITH a `sid` added, re-signed as an access token, where the `sid` gate is
+      satisfied and the media type is the only refusal left.
+    - An ID TOKEN as a Bearer credential at `UserInfo` and at introspection was refused
+      by the STORE: an ID token's `jti` is recorded with `token_kind = 'id'` and
+      `resolve_access_token` filters to `'access'`.
+    - In both cases the value of the second layer is that a future change to the first
+      (an access token that starts carrying `sid`, a resolve that stops filtering) does
+      not silently open the endpoint.
+  - `tests/token_confusion.rs` drives the real endpoints against a real Postgres, and
+    every rejection is paired with a CONTROL that differs ONLY in the media type and is
+    ACCEPTED. For the Logout Token the control is the byte-identical claim set signed as
+    an ID token; without it a passing rejection would be indistinguishable from a request
+    that was malformed for some unrelated reason.
+  - The foreign-issuer verify sites say so out loud rather than by omission: the upstream
+    OP's ID token, an RFC 7523 assertion, a `private_key_jwt` client assertion, a
+    registered risk transmitter's Security Event Token, and Apple's dictated
+    client-secret assertion are all `ExpectedTyp::ForeignIssuer`, each with the reason
+    written at the call site. None of them is a media type IronAuth controls. The
+    strength of the separation differs by site and the comments now say which, because
+    "an IronAuth token cannot get here" was being asserted uniformly and is only
+    sometimes true:
+    - STRUCTURAL at the `private_key_jwt` client assertion. The policy pins
+      `iss == client_id`, a `ClientId` is a prefix-tagged base-encoded identifier, and an
+      IronAuth issuer is a URL, so no registration can make the two equal.
+    - A CONFIGURATION property at `federation`, `jwt_bearer`, `risk_signals`, and
+      `advanced_recovery`, which take BOTH their trusted keys and their expected issuer
+      from an operator-registered connector, grant, transmitter, or provider. A
+      deployment that registered its own issuer and JWKS as a foreign party would have
+      its own tokens reach the signature check with `typ` unread, and `jwt_bearer`'s
+      acceptable audiences include the issuer itself. Not exploitable in any default
+      configuration and none of it is reachable without a registration, which is why the
+      sites are still `ForeignIssuer`; the claim is what changed, not the code.
+  - The test harness's `policy(audience)` helper is gone, replaced by
+    `access_token_policy`, `id_token_policy`, and `logout_token_policy`. There is
+    deliberately no profile-agnostic variant: the old one accepted all three, so every
+    test built on it asserted against a token it had never pinned down.
+
+- **The ID token silently inherited the access token's lifetime** (issue #192). It is now
+  its own setting, `oidc.id_token_ttl_secs`. The two answer different questions: an
+  access token is a bearer credential a resource server accepts for as long as it lives,
+  an ID token is an authentication receipt the client consumes once at login. Welded
+  together, shortening the credential silently shortened the receipt, and lengthening the
+  credential silently pushed longer-lived identity assertions into the front channel.
+  - **The default is a literal 300, not an inheritance.** 300 is the value the ID token
+    effectively had, so a deployment that never tuned `access_token_ttl_secs` sees
+    byte-identical ID tokens. The alternative, an unset value falling back to the access
+    token's, preserves behaviour for everyone but keeps the coupling alive by default
+    forever and writes the defect into the config documentation.
+  - **The behaviour delta runs BOTH ways, and only one of them is safe.** A deployment
+    that raised `access_token_ttl_secs` above 300 gets a shorter ID token, which is the
+    intended correction. A deployment that LOWERED it, which is the standard hardening
+    posture, gets a LONGER one: measured through the real authorize and token exchange,
+    `access_token_ttl_secs = 60` with the ID token untouched yields a 60-second ID token
+    before this change and a 300-second one after, a 5x lengthening of the token that
+    travels the front channel, pinned end to end by
+    `lowering_only_the_access_ttl_lengthens_the_front_channel_id_token` so the number in
+    this entry cannot rot. That is the price of the flat default, and it is paid
+    openly rather than hidden: `oidc.id_token_ttl_secs` exceeding
+    `oidc.access_token_ttl_secs` now raises an operator warning at config load (never a
+    boot error, and never at the shipped defaults, which are equal). Both directions are
+    bounded by `oidc.enabled` being off by default, with this landing as a
+    pre-enablement gate.
+
 - **The diagnostics redaction corpora could not see most of the fields they claimed to
   guard** (issue #423). Both the client-authentication corpus and the policy-trace corpus
   built their records from SAFE literals, so their sentinel scan compared one hardcoded list

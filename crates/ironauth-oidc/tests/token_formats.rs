@@ -22,7 +22,7 @@ use common::{
     verify_clock,
 };
 use ironauth_config::{OidcConfig, TokenFormat as ConfigTokenFormat};
-use ironauth_jose::{JwsAlgorithm, VerificationPolicy, verify};
+use ironauth_jose::{ExpectedTyp, JwsAlgorithm, TokenTyp, VerificationPolicy, verify};
 use ironauth_oidc::{OPAQUE_ACCESS_TOKEN_PREFIX, ResourceTargetError};
 use ironauth_store::{
     ActorRef, CorrelationId, NewResourceServer, ResourceServerId, ServiceId, TokenFormat,
@@ -206,8 +206,12 @@ async fn at_jwt_access_token_conforms_to_rfc9068_and_verifies_under_eddsa() {
 
     // Verifies through the ONE hardened verify path against the environment key and
     // the client audience (the no-resource case).
-    let verified = verify(access_token, &harness.policy(&client), &verify_clock())
-        .expect("at+jwt verifies under EdDSA");
+    let verified = verify(
+        access_token,
+        &harness.access_token_policy(&client),
+        &verify_clock(),
+    )
+    .expect("at+jwt verifies under EdDSA");
     let claims = verified.claims();
 
     // Every RFC 9068 section 2.2 required claim is present and well formed.
@@ -299,8 +303,12 @@ async fn at_jwt_carries_acr_and_auth_time_from_an_authenticated_flow() {
 
     // Verify against the harness clock at the ADVANCED mint instant, so the token's
     // (later-than-epoch) iat/exp fall within the verify window.
-    let verified = verify(&access_token, &harness.policy(&client), &**harness.clock())
-        .expect("at+jwt verifies");
+    let verified = verify(
+        &access_token,
+        &harness.access_token_policy(&client),
+        &**harness.clock(),
+    )
+    .expect("at+jwt verifies");
     let claims = verified.claims();
     assert!(
         claims.get("acr").and_then(|v| v.as_str()).is_some(),
@@ -351,6 +359,7 @@ async fn at_jwt_access_token_verifies_under_an_es256_environment() {
         vec![harness.verifying_key()],
         harness.issuer().to_owned(),
         client.clone(),
+        ExpectedTyp::Required(TokenTyp::AccessToken),
     )
     .expect("es256 policy builds");
     let verified = verify(&access_token, &policy, &verify_clock()).expect("ES256 at+jwt verifies");

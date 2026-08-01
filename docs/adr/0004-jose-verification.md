@@ -51,6 +51,46 @@ outside it:
 - **`crit`** naming any extension is rejected: the core understands no critical
   extensions in M1, and a malformed, empty, duplicate, or registered-parameter
   `crit` is rejected too.
+- **`typ`** must name the token profile the policy was built for (issue #192,
+  amending this ADR). It selects nothing and can only narrow what is accepted.
+
+### The media type is load bearing, so stating it is mandatory
+
+M1 read `typ` only to decide whether a `crit` member naming it was malformed.
+That left the media type doing no work, and the media type is the ONLY thing
+separating two tokens IronAuth mints under one environment key, one issuer, and
+one audience: an ID token and an RFC 9068 access token from the same code
+exchange are otherwise byte for byte identical in every field a verifier reads,
+and the ID token travels through the front channel where a referrer, a proxy
+log, or browser history can leak it. RFC 9068 section 4 states the specific rule
+for access tokens; the general property is that no profile is spendable where
+another is expected.
+
+`VerificationPolicy::new` therefore takes an `ExpectedTyp` as a positional
+argument with no default and no setter, so a policy that says nothing about the
+profile it accepts does not compile (pinned by a `trybuild` case, because no
+runtime test can witness the line a caller never wrote). `TokenTyp` is the one
+declaration binding each profile IronAuth mints to its RFC media type, and BOTH
+sides read it: the mint stamps from it and the verifier requires from it, so a
+profile cannot be minted under one spelling and required under another. The enum,
+its exhaustive `media_type` match, and `TokenTyp::ALL` are all generated from a
+single `token_profiles!` list, so a fourth profile cannot exist without a media
+type and cannot exist outside the checks that iterate the profiles (above all the
+pairwise "no two profiles share a media type", which is what makes `typ` a
+separator at all).
+
+Two boundaries on that "one declaration". It covers the profiles IronAuth MINTS
+under `VerificationPolicy`; the DPoP proof is a client-minted artifact validated
+by its own path, and `validate_dpop_proof` requires `typ == "dpop+jwt"`
+byte-exactly against a private constant. That is stricter than the media-type
+comparison here, not a way around it, but it is a second place `typ` is decided.
+And `ExpectedTyp::ForeignIssuer` is the explicit, named opt-out for a token whose
+header a foreign party controls, where the separation is instead that party's own
+keys plus the pinned issuer and audience. At the client-assertion site that is
+structural (the policy pins `iss == client_id`, and a client id is a prefix-tagged
+identifier that can never equal an issuer URL); at the sites whose keys and issuer
+both come from operator configuration it is a configuration property, and the call
+sites say so.
 
 ### No HMAC, by design
 

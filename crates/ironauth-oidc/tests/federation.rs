@@ -252,7 +252,7 @@ fn id_token(key: &SigningKey, base: serde_json::Value, overrides: serde_json::Va
         }
     }
     let payload = serde_json::to_vec(&claims).expect("payload");
-    sign_jws(key, &payload, &EmissionOptions::new().with_typ("JWT")).expect("sign")
+    sign_jws(key, &payload, &EmissionOptions::new().with_typ("JWT")).expect("sign") // invariant-allow: typ-via-declaration -- a simulated UPSTREAM issuer's ID token; its media type is that peer's, not an IronAuth profile
 }
 
 /// The base `id_token` claims for a valid upstream token bound to `nonce`.
@@ -1118,7 +1118,7 @@ fn mint(key: &SigningKey, issuer: &str, client_id: &str, nonce: &str, sub: &str)
         "nonce": nonce,
     });
     let payload = serde_json::to_vec(&claims).expect("payload");
-    sign_jws(key, &payload, &EmissionOptions::new().with_typ("JWT")).expect("sign")
+    sign_jws(key, &payload, &EmissionOptions::new().with_typ("JWT")).expect("sign") // invariant-allow: typ-via-declaration -- a simulated UPSTREAM issuer's ID token; its media type is that peer's, not an IronAuth profile
 }
 
 /// The user id the session cookie of a successful callback resolves to.

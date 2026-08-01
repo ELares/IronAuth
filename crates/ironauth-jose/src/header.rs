@@ -15,13 +15,17 @@ use crate::error::RejectReason;
 use crate::json::parse_unique_object;
 use crate::policy::{JwsAlgorithm, VerificationCaps};
 
-/// The two non-trust values extracted from a validated protected header.
+/// The three non-trust values extracted from a validated protected header.
 pub(crate) struct ProtectedHeader {
     /// The claimed algorithm, already confirmed supported (not `none`, not
     /// HMAC). Still to be checked against the policy allowlist and key family.
     pub(crate) alg: JwsAlgorithm,
     /// The optional key id, used only to select among trusted keys.
     pub(crate) kid: Option<String>,
+    /// The claimed media type, used only to be matched against the policy's
+    /// [`crate::ExpectedTyp`]. It can only narrow what is accepted; it never
+    /// selects a key, an algorithm, or a code path.
+    pub(crate) typ: Option<String>,
 }
 
 /// Registered JOSE header parameters. A `crit` member naming any of these is
@@ -98,7 +102,17 @@ pub(crate) fn parse(
         Some(_) => return Err(RejectReason::HeaderMalformed),
     };
 
-    Ok(ProtectedHeader { alg, kid })
+    // typ: the claimed media type (RFC 7515 section 4.1.9). Read here ONLY so the
+    // verifier can match it against the policy's expectation; it steers nothing.
+    // A non-string `typ` is structurally malformed rather than "no typ", so a
+    // hostile header cannot present `{"typ": 0}` and have the value ignored.
+    let typ = match object.get("typ") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(_) => return Err(RejectReason::HeaderMalformed),
+    };
+
+    Ok(ProtectedHeader { alg, kid, typ })
 }
 
 /// Classify the `alg` header value into a supported algorithm or a reject.

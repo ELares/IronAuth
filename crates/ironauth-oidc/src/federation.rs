@@ -46,7 +46,7 @@ use ironauth_connector::{
 };
 use ironauth_env::Clock;
 use ironauth_fetch::{FetchError, FetchPurpose, FetchRequest, Fetcher};
-use ironauth_jose::{JwsAlgorithm, TrustedKey, VerificationPolicy, verify};
+use ironauth_jose::{ExpectedTyp, JwsAlgorithm, TrustedKey, VerificationPolicy, verify};
 use ironauth_store::{
     AccountLinkId, AccountLinkMethod, ConnectorId, FederationLoginStateId, IdentifierType,
     NewAccountLink, NewAdminUser, NewFederationLoginState, NewUpstreamTokens, OrgConnectionId,
@@ -407,11 +407,26 @@ pub fn validate_upstream_id_token(
             "the upstream advertised no signing algorithm the core can verify".to_owned(),
         ));
     }
+    // The token is the UPSTREAM OP's own ID token, minted by a party whose protected
+    // header IronAuth does not control: many OPs stamp `JWT`, some stamp nothing, and
+    // requiring either would be an interop break, not a hardening. Separation here is
+    // the upstream's own published keys plus the pinned issuer and audience (issue
+    // #192).
+    //
+    // Be precise about the strength of that: it is a CONFIGURATION property, not a
+    // structural one. Both the trusted keys and the expected issuer come from an
+    // operator-registered connector, so an operator who registered this deployment's
+    // OWN issuer and JWKS as an upstream would have IronAuth's own tokens reach this
+    // signature check with nothing left to separate them. No default configuration
+    // does that and nothing here is reachable without registering a connector, but
+    // "an IronAuth token cannot get here" is true of the deployments we ship, not of
+    // the code.
     let verification = VerificationPolicy::new(
         policy.allowed_algs.to_vec(),
         keys,
         policy.expected_issuer,
         policy.expected_audience,
+        ExpectedTyp::ForeignIssuer,
     )
     .map_err(|err| ConnectorError::Config(err.to_string()))?;
 
@@ -2246,7 +2261,7 @@ mod tests {
 
     fn sign(key: &SigningKey, claims: &serde_json::Value) -> String {
         let payload = serde_json::to_vec(claims).expect("serialize");
-        sign_jws(key, &payload, &EmissionOptions::new().with_typ("JWT")).expect("sign")
+        sign_jws(key, &payload, &EmissionOptions::new().with_typ("JWT")).expect("sign") // invariant-allow: typ-via-declaration -- a simulated UPSTREAM issuer's ID token; its media type is that peer's, not an IronAuth profile
     }
 
     fn id_token(key: &SigningKey, extra: serde_json::Value) -> String {

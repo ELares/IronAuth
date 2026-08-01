@@ -20,7 +20,9 @@ use std::time::{Duration, SystemTime};
 
 use ironauth_admin::{DayOneSigningKeys, backfill_signing_algorithms};
 use ironauth_env::{Env, ManualClock};
-use ironauth_jose::{EmissionOptions, JwsAlgorithm, VerificationPolicy, sign_jws, verify};
+use ironauth_jose::{
+    EmissionOptions, ExpectedTyp, JwsAlgorithm, VerificationPolicy, sign_jws, verify,
+};
 use ironauth_oidc::{IssuerRegistry, JwksCacheWindow};
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
@@ -265,8 +267,17 @@ async fn per_algorithm_round_trip_mint() {
         let token = sign_jws(key, &payload, &EmissionOptions::new())
             .unwrap_or_else(|e| panic!("{alg:?} signs: {e}"));
         let trusted = key.verifying_key().expect("verifying key");
-        let policy = VerificationPolicy::new(vec![alg], vec![trusted], issuer, audience)
-            .expect("valid policy");
+        // The round-trip under test is the algorithm matrix, and the token is minted
+        // with the bare emission options (no `typ`), so the profile is not what this
+        // vector pins down.
+        let policy = VerificationPolicy::new(
+            vec![alg],
+            vec![trusted],
+            issuer,
+            audience,
+            ExpectedTyp::ForeignIssuer,
+        )
+        .expect("valid policy");
         let clock = ManualClock::new(now());
         let verified = verify(&token, &policy, &clock)
             .unwrap_or_else(|e| panic!("{alg:?} verifies: {:?}", e.reason()));

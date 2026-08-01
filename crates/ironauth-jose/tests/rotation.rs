@@ -16,8 +16,8 @@ use std::time::{Duration, SystemTime};
 
 use ironauth_env::ManualClock;
 use ironauth_jose::{
-    EmissionOptions, JwsAlgorithm, KeySet, RotationParams, SignError, SigningKey, SigningPolicy,
-    VerificationPolicy, sign_jws, sign_jws_with_policy, verify,
+    EmissionOptions, ExpectedTyp, JwsAlgorithm, KeySet, RotationParams, SignError, SigningKey,
+    SigningPolicy, TokenTyp, VerificationPolicy, sign_jws, sign_jws_with_policy, verify,
 };
 use serde_json::json;
 
@@ -140,7 +140,7 @@ fn rotation_prepublishes_retains_and_verifies_across_the_boundary() {
     let k1_token = sign_jws(
         k1_signer,
         &claims(sign_time, token_exp),
-        &EmissionOptions::new().with_typ("JWT"),
+        &EmissionOptions::new().with_token_typ(TokenTyp::IdToken),
     )
     .expect("sign with k1");
 
@@ -159,6 +159,7 @@ fn rotation_prepublishes_retains_and_verifies_across_the_boundary() {
         vec![k1_pub.clone(), k2_pub.clone()],
         ISS,
         AUD,
+        ExpectedTyp::Required(TokenTyp::IdToken),
     )
     .expect("policy");
     let verified = verify(&k1_token, &rp_policy, &clock_at(activate + 50));
@@ -224,7 +225,7 @@ fn policy_is_enforced_at_signing_both_ways() {
     let eddsa_key = ed25519("ed", 0x11);
     let es256_key = es256("es");
     let payload = claims(BASE_SECS, BASE_SECS + 300);
-    let opts = EmissionOptions::new().with_typ("JWT");
+    let opts = EmissionOptions::new().with_token_typ(TokenTyp::IdToken);
 
     // ES256-only policy refuses to sign with the EdDSA key, but signs with ES256.
     assert_eq!(

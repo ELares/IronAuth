@@ -165,8 +165,12 @@ async fn valid_dpop_proof_binds_the_at_jwt_cnf_and_the_refresh_family() {
 
     // The at+jwt carries the cnf confirmation, read through the SAME path production
     // uses, and its jkt equals the RFC 7638 thumbprint of the proof key.
-    let verified =
-        verify(access_token, &harness.policy(&client), &verify_clock()).expect("at+jwt verifies");
+    let verified = verify(
+        access_token,
+        &harness.access_token_policy(&client),
+        &verify_clock(),
+    )
+    .expect("at+jwt verifies");
     let confirmation = Confirmation::from_claims(verified.claims())
         .expect("cnf parses")
         .expect("the bound at+jwt carries a cnf claim");
@@ -236,8 +240,12 @@ async fn no_dpop_header_issues_a_plain_bearer_token() {
         .expect("access_token")
         .to_owned();
 
-    let verified =
-        verify(&access_token, &harness.policy(&client), &verify_clock()).expect("at+jwt verifies");
+    let verified = verify(
+        &access_token,
+        &harness.access_token_policy(&client),
+        &verify_clock(),
+    )
+    .expect("at+jwt verifies");
     assert!(
         Confirmation::from_claims(verified.claims())
             .expect("cnf parses")

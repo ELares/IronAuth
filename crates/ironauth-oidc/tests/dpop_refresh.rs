@@ -109,8 +109,12 @@ async fn refresh_family_jkt(harness: &Harness, client_id: &str) -> Option<String
 /// The `cnf` confirmation on an at+jwt access token, read through the SAME path
 /// production uses, or [`None`] for a plain bearer token.
 fn cnf_of(harness: &Harness, client: &str, access_token: &str) -> Option<Confirmation> {
-    let verified =
-        verify(access_token, &harness.policy(client), &verify_clock()).expect("at+jwt verifies");
+    let verified = verify(
+        access_token,
+        &harness.access_token_policy(client),
+        &verify_clock(),
+    )
+    .expect("at+jwt verifies");
     Confirmation::from_claims(verified.claims()).expect("cnf parses")
 }
 

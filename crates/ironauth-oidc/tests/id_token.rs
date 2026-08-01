@@ -79,7 +79,7 @@ async fn id_token_claims(
         .expect("id_token present")
         .to_owned();
 
-    let policy = harness.policy(client_id);
+    let policy = harness.id_token_policy(client_id);
     let verified = verify(&id_token, &policy, &common::verify_clock()).expect("id token verifies");
     Value::Object(verified.claims().raw().clone())
 }

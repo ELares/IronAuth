@@ -22,6 +22,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::{Map, Value};
 
+use crate::policy::TokenTyp;
 use crate::redact::Redacted;
 use crate::sign;
 use crate::signing_key::SigningKey;
@@ -62,7 +63,28 @@ impl EmissionOptions {
         self
     }
 
-    /// Set the `typ` header (for example `JWT`, `at+jwt`, `logout+jwt`).
+    /// Set the `typ` header to the media type of an IronAuth token profile.
+    ///
+    /// This is how every IronAuth mint stamps its media type. It reads the media
+    /// type from [`TokenTyp`], the same declaration the verifier's
+    /// [`crate::ExpectedTyp`] reads, so the stamped value and the required value
+    /// are the same bytes by construction rather than by two string literals in
+    /// two files happening to agree. The `typ-via-declaration` invariant lint
+    /// keeps [`EmissionOptions::with_typ`] out of production mint paths, so this
+    /// is the only way in.
+    #[must_use]
+    pub fn with_token_typ(self, typ: TokenTyp) -> Self {
+        self.with_typ(typ.media_type()) // invariant-allow: typ-via-declaration -- this IS the declaration-driven stamp the rule funnels every mint through
+    }
+
+    /// Set the `typ` header to a raw media-type string.
+    ///
+    /// For a token whose media type is dictated by a FOREIGN specification or peer
+    /// rather than by an IronAuth profile, and for tests that must mint a token
+    /// carrying the wrong media type on purpose. Production mint paths use
+    /// [`EmissionOptions::with_token_typ`]; the `typ-via-declaration` invariant
+    /// lint enforces that, so reaching this function requires an explicit
+    /// `invariant-allow` marker and a written reason.
     #[must_use]
     pub fn with_typ(mut self, typ: impl Into<String>) -> Self {
         self.typ = Some(typ.into());

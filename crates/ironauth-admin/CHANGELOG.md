@@ -6,6 +6,12 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- The console `at+jwt` bridge's `typ == at+jwt` check is no longer bolted on after
+  `verify` returns; it is part of the `VerificationPolicy` (issue #192), which cannot be
+  built without naming the profile it accepts. Same rule, same RFC 9068 section 4, one
+  fewer line a future edit can drop. The existing wrong-`typ` 401 vector is unchanged and
+  still passes, which is what shows the enforcement moved rather than went away.
+
 - CORRECTION to the diagnostics module doc and to `PolicyTraceView`, which said a secret is
   unrepresentable in the records these views serve (issue #423). The records' free-form
   string fields would carry one, so the views serve whatever the recorder put there. Both

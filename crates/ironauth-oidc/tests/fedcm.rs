@@ -665,7 +665,7 @@ async fn assertion_happy_path_mints_a_verifiable_id_token() {
         .expect("token present")
         .to_owned();
     // The token verifies under the per-env JWKS with aud=client, iss=per-env issuer.
-    let policy = harness.policy(&client_id);
+    let policy = harness.id_token_policy(&client_id);
     let verified = verify(&token, &policy, &common::verify_clock()).expect("id token verifies");
     let claims = Value::Object(verified.claims().raw().clone());
     assert_eq!(claims["iss"], Value::String(harness.issuer().to_owned()));
@@ -697,7 +697,7 @@ async fn assertion_sub_is_byte_compatible_with_the_redirect_flow() {
     // The redirect flow's ID token for the SAME session cookie (same subject/client).
     let redirect_token = mint_id_token(&harness, &client_id, &cookie).await;
 
-    let policy = harness.policy(&client_id);
+    let policy = harness.id_token_policy(&client_id);
     let fedcm =
         verify(&fedcm_token, &policy, &common::verify_clock()).expect("fedcm id token verifies");
     let redirect = verify(&redirect_token, &policy, &common::verify_clock())

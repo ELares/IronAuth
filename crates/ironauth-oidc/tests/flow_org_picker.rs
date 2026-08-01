@@ -286,9 +286,11 @@ async fn exchange_claims(harness: &Harness, client_id: &str, code: &str) -> (Val
     let access_token = value["access_token"]
         .as_str()
         .expect("access_token present");
-    let policy = harness.policy(client_id);
-    let id = verify(id_token, &policy, &common::verify_clock()).expect("id token verifies");
-    let at = verify(access_token, &policy, &common::verify_clock()).expect("access token verifies");
+    let id_policy = harness.id_token_policy(client_id);
+    let access_policy = harness.access_token_policy(client_id);
+    let id = verify(id_token, &id_policy, &common::verify_clock()).expect("id token verifies");
+    let at = verify(access_token, &access_policy, &common::verify_clock())
+        .expect("access token verifies");
     (
         Value::Object(id.claims().raw().clone()),
         Value::Object(at.claims().raw().clone()),

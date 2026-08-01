@@ -503,8 +503,27 @@ async fn exchange_raw(
 
 /// Verify a compact access token for `audience` and return its claims.
 fn claims_of(harness: &Harness, token: &str, audience: &str) -> Value {
-    let verified = verify(token, &harness.policy(audience), &common::verify_clock())
-        .expect("the access token verifies");
+    let verified = verify(
+        token,
+        &harness.access_token_policy(audience),
+        &common::verify_clock(),
+    )
+    .expect("the access token verifies");
+    Value::Object(verified.claims().raw().clone())
+}
+
+/// Verify a compact ID token for `audience` and return its claims.
+///
+/// Separate from [`claims_of`] because the two profiles are separate: the policies
+/// require their own media type (issue #192), so an ID token read through the
+/// access-token policy is refused, which is the point.
+fn id_claims_of(harness: &Harness, token: &str, audience: &str) -> Value {
+    let verified = verify(
+        token,
+        &harness.id_token_policy(audience),
+        &common::verify_clock(),
+    )
+    .expect("the id token verifies");
     Value::Object(verified.claims().raw().clone())
 }
 
@@ -1923,7 +1942,7 @@ async fn a_users_own_stored_claim_can_never_forge_permissions_through_the_live_p
     assert_eq!(status, StatusCode::OK, "token exchange: {body}");
     let value = json(&body);
     let id_token = value["id_token"].as_str().expect("an id token is issued");
-    let id_claims = claims_of(&harness, id_token, &client_id);
+    let id_claims = id_claims_of(&harness, id_token, &client_id);
     assert!(
         id_claims.get("permissions").is_none(),
         "a self-asserted permissions claim is DROPPED from the id token: {id_claims}"

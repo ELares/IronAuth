@@ -21,7 +21,7 @@ use std::time::SystemTime;
 
 use ironauth_config::{AdminConfig, SecretError, SecretString, TokenClaimsConfig};
 use ironauth_env::Env;
-use ironauth_jose::{JwsAlgorithm, TrustedKey, VerificationPolicy, verify};
+use ironauth_jose::{ExpectedTyp, JwsAlgorithm, TokenTyp, TrustedKey, VerificationPolicy, verify};
 use ironauth_oidc::IssuerRegistry;
 use ironauth_store::{
     ActorRef, HumanId, MANAGEMENT_LIST_HARD_CAP, ManagementKeyId, OperatorId, Scope, ServiceId,
@@ -38,12 +38,6 @@ use crate::hash::{constant_time_eq, sha256_hex};
 /// issuer that lacks this scope is rejected, so a broad interactive login cannot
 /// be replayed against the management API.
 const MANAGEMENT_SCOPE: &str = "ironauth.manage";
-
-/// The RFC 9068 access-token media type the console bearer must declare in its
-/// protected header (issue #90, PR 2). Enforced AFTER signature verification (the
-/// header is integrity-protected by the signature), so an opaque bootstrap token
-/// or a `mak_` key, which are not compact JWSs at all, never reach this arm.
-const AT_JWT_TYP: &str = "at+jwt";
 
 /// The seed bytes of the well-known bootstrap identities. The bootstrap operator
 /// (operator plane) and its audit service-actor are fixed, well-known identities
@@ -386,9 +380,10 @@ impl AdminState {
     /// issuer's PUBLISHED signing keys ONLY, `iss` must equal the issuer the shared
     /// registry derives for the admin scope, `aud` must EQUAL the configured
     /// management audience (the cross-RP replay defense), and `exp`/`nbf`/`iat` and
-    /// the algorithm allowlist (which forbids `alg=none` and HMAC/RSA confusion) are
-    /// enforced by the policy. It then additionally requires `typ == at+jwt`, the
-    /// `ironauth.manage` scope, and a `sub` on the operator-subject allowlist.
+    /// the algorithm allowlist (which forbids `alg=none` and HMAC/RSA confusion) and
+    /// the RFC 9068 `typ == at+jwt` media type are enforced by the policy. It then
+    /// additionally requires the `ironauth.manage` scope and a `sub` on the
+    /// operator-subject allowlist.
     ///
     /// Returns `Ok(Some(Operator))` for a listed subject, and `Ok(None)` for EVERY
     /// other outcome (bridge disarmed, not a JWS, no keys, any verification failure,
@@ -446,23 +441,23 @@ impl AdminState {
         // itself would publish for this scope. `aud` is the configured management
         // audience, matched EXACTLY (the cross-RP replay defense).
         let issuer = bridge.issuers.issuer_for(&bridge.issuer_scope);
+        // `typ == at+jwt` (RFC 9068 section 4) is part of the policy, so a token
+        // minted for a different media type (an id token, a logout token) is refused
+        // inside `verify` itself rather than by a check bolted on afterwards that a
+        // future edit could drop (issue #192). It is not optional: the policy cannot
+        // be constructed without naming the profile it accepts.
         let Ok(policy) = VerificationPolicy::new(
             algorithms,
             trusted,
             issuer,
             bridge.management_audience.clone(),
+            ExpectedTyp::Required(TokenTyp::AccessToken),
         ) else {
             return Ok(None);
         };
         let Ok(verified) = verify(token, &policy, self.inner.env.clock()) else {
             return Ok(None);
         };
-        // `typ == at+jwt` (RFC 9068). The header is integrity-protected by the now
-        // verified signature, so reading it here is trusted; a token minted for a
-        // different media type (an id token, a logout token) is rejected.
-        if compact_jws_typ(token).as_deref() != Some(AT_JWT_TYP) {
-            return Ok(None);
-        }
         // The `ironauth.manage` scope must be present: an ordinary end-user login
         // token for the same issuer, lacking it, is rejected here.
         let has_manage_scope = verified
@@ -922,26 +917,6 @@ impl AdminState {
         } else {
             Ok(None)
         }
-    }
-}
-
-/// Read the `typ` from a compact JWS's protected header (issue #90, PR 2).
-///
-/// The header is the FIRST segment; this decodes it and reads the `typ` string.
-/// It is only ever called AFTER [`ironauth_jose::verify`] has validated the
-/// signature over that exact header, so the value read here is integrity-protected
-/// (a tampered `typ` would have failed the signature). Returns `None` when the
-/// token is malformed, the header is not a JSON object, or no string `typ` is
-/// present, so a missing `typ` fails closed at the caller.
-fn compact_jws_typ(token: &str) -> Option<String> {
-    use base64::Engine as _;
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    let header_b64 = token.split('.').next()?;
-    let bytes = URL_SAFE_NO_PAD.decode(header_b64.as_bytes()).ok()?;
-    let value: Value = serde_json::from_slice(&bytes).ok()?;
-    match value.get("typ") {
-        Some(Value::String(typ)) => Some(typ.clone()),
-        _ => None,
     }
 }
 

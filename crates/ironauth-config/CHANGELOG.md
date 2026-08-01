@@ -6,6 +6,19 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- `oidc.id_token_ttl_secs` (issue #192): the ID-token lifetime, split out of
+  `oidc.access_token_ttl_secs`, which it used to silently inherit. Defaults to 300, the
+  value the ID token effectively had, and is range-checked exactly like the other OIDC
+  lifetimes.
+
+- New `Warning::IdTokenOutlivesAccessToken`, raised when `oidc.id_token_ttl_secs` is
+  longer than `oidc.access_token_ttl_secs` (issue #192). A flat 300 default for the ID
+  token means it no longer follows the access token DOWN, so a deployment that lowers
+  the access TTL as a hardening measure and leaves the ID token alone has lengthened the
+  front-channel token by editing a different key. Advisory, like every other warning:
+  a longer receipt than credential is a legitimate posture, just rarely the intended one.
+  It cannot fire at the shipped defaults, which are equal.
+
 - CORRECTION to `DiagnosticVerbosity`'s doc, which attributed a structural redaction
   guarantee to the diagnostic record types that they do not have (issue #423). The true and
   useful half is unchanged and now stands on its own: no verbosity setting ADDS a field, so

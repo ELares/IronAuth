@@ -85,7 +85,7 @@ use axum::response::Response;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ironauth_jose::{
-    JwsAlgorithm, RejectReason, TrustedKey, VerificationPolicy, VerifiedToken, verify,
+    ExpectedTyp, JwsAlgorithm, RejectReason, TrustedKey, VerificationPolicy, VerifiedToken, verify,
 };
 use ironauth_store::{
     ClientAuthDiagnosticReason, ClientCredentialsAccess, ClientId, CorrelationId,
@@ -501,9 +501,23 @@ fn verify_external_assertion(
         return None;
     }
     for audience in audiences {
-        let Ok(policy) =
-            VerificationPolicy::new(algorithms.to_vec(), keys.to_vec(), issuer, audience.clone())
-        else {
+        // An RFC 7523 assertion from an external issuer, signed with ITS keys. RFC 7523
+        // registers no media type for the assertion, so `typ` cannot be the separator
+        // (issue #192); the registered issuer, its keys, and this deployment's own
+        // token endpoint as the `aud` are. Both the issuer and the keys come from an
+        // operator-registered grant, so that separation is a CONFIGURATION property,
+        // not a structural one, and the acceptable audiences include this issuer
+        // itself: an operator who registered this deployment as its own external
+        // issuer would have IronAuth's tokens reach the signature check with `typ`
+        // unread. No default configuration does, and nothing here is reachable without
+        // registering the grant.
+        let Ok(policy) = VerificationPolicy::new(
+            algorithms.to_vec(),
+            keys.to_vec(),
+            issuer,
+            audience.clone(),
+            ExpectedTyp::ForeignIssuer,
+        ) else {
             return None;
         };
         let policy = policy.with_skew(skew);

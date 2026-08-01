@@ -980,6 +980,13 @@
           "description": "Whether the Global Token Revocation receiver (issue #36) HARD-KILLS the\nsubject's `offline_access` refresh families too, not only the session-bound\nones. This has effect ONLY when the experimental `global-token-revocation`\nfeature is enabled (the endpoint is otherwise unmounted). The SAFE default\n(`false`) matches the platform-wide revoke-everything semantic: offline\n(consented long-lived) grants survive a revoke unless a hard kill is asked for\n(issue #21/#32), so a routine global revoke does not silently strip a user's\nstanding offline authorizations. Set it to `true` for an account-takeover\nposture, where a global revoke must terminate absolutely everything the subject\nholds, offline grants included, so every already-issued token dies at once.",
           "type": "boolean"
         },
+        "id_token_ttl_secs": {
+          "default": 300,
+          "description": "ID-token lifetime in seconds. Must be at least 1 and at most\n`OIDC_MAX_LIFETIME_SECS`.\n\nINDEPENDENT of `access_token_ttl_secs`, which it used to silently inherit\n(issue #192). The two tokens answer different questions: an access token is\na bearer credential a resource server accepts for as long as it lives, while\nan ID token is an authentication receipt the client consumes once, at login,\nto learn who signed in. Tying the receipt's lifetime to the credential's\nmeant that shortening the credential silently shortened the receipt, and\nlengthening the credential silently handed out longer-lived identity\nassertions into the front channel, where an ID token can leak through a\nreferrer, a proxy log, or browser history.\n\nThe default (300) is the value the ID token effectively had before the split,\nso a deployment that never tuned `access_token_ttl_secs` sees ID tokens of\nexactly the lifetime it saw before. Both directions of a tuned access TTL\nchange, and the two are NOT symmetric:\n\n* A deployment that RAISED `access_token_ttl_secs` above 300 gets a SHORTER ID\n  token than before. That is the intended correction, in the safe direction.\n* A deployment that LOWERED `access_token_ttl_secs` below 300, which is the\n  standard hardening posture, gets a LONGER ID token than before: at\n  `access_token_ttl_secs = 60` the ID token used to live 60 seconds and now\n  lives 300. That is the unsafe direction, on the front channel, and it is the\n  price of a flat default. A flat default is still the right call, because the\n  alternative (an unset value falling back to the access TTL) writes the\n  coupling into the documented contract and keeps it alive by default forever.\n  So the case is surfaced instead of hidden: `id_token_ttl_secs` exceeding\n  `access_token_ttl_secs` raises an operator warning at load.\n\nThe blast radius of both is bounded because `enabled` is off by default and\nthis split is a gate that lands BEFORE the first real enablement.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "issue_refresh_tokens": {
           "default": true,
           "description": "Whether the authorization-code grant issues a refresh token (issue #21).\nDefault `true`: a successful code exchange returns a rotating refresh token\nalongside the access token. A refresh token issued WITHOUT the\n`offline_access` scope is session-bound (it is revoked when the end user's\nRP session is logged out); one issued WITH `offline_access` survives RP\nlogout and gets the separate offline lifecycle. Set it to `false` for an\nenvironment that mints access tokens only.",
@@ -2586,6 +2593,7 @@
         },
         "frontchannel_logout_enabled": false,
         "global_token_revocation_hard_kill": false,
+        "id_token_ttl_secs": 300,
         "issue_refresh_tokens": true,
         "jwks_cache_max_age_secs": 600,
         "lazy_migration": {

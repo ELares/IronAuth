@@ -26,6 +26,7 @@ use common::{
     location_param,
 };
 use ironauth_config::OidcConfig;
+use ironauth_jose::TokenTyp;
 use ironauth_oidc::SESSION_COOKIE;
 use ironauth_store::{
     AuthorizationCodeId, ClientId, CorrelationId, GrantId, IssueCode, NewRefreshFamily, NewSession,
@@ -38,6 +39,10 @@ use std::time::Duration;
 /// Re-sign `hint`'s claims with the environment's LIVE signing key after DROPPING the
 /// `sid` claim: a validly-signed, correctly-audienced `id_token_hint` that carries no
 /// cryptographic tie to any specific session.
+///
+/// Re-signed AS AN ID TOKEN. It stands in for a real hint, and `end_session` requires
+/// the ID-token media type (issue #192), so signing it as anything else would be
+/// testing the media-type guard rather than the missing-`sid` rule it is here for.
 async fn hint_without_sid(harness: &Harness, hint: &str) -> String {
     let segment = hint.split('.').nth(1).expect("payload segment");
     let bytes = URL_SAFE_NO_PAD.decode(segment).expect("base64url payload");
@@ -45,7 +50,9 @@ async fn hint_without_sid(harness: &Harness, hint: &str) -> String {
         serde_json::from_slice(&bytes).expect("claims json");
     claims.remove("sid");
     assert!(!claims.contains_key("sid"), "the sid claim is dropped");
-    harness.sign_at_jwt(&Value::Object(claims)).await
+    harness
+        .sign_as(&Value::Object(claims), TokenTyp::IdToken)
+        .await
 }
 
 const SELF_ORIGIN: &str = "https://issuer.test";
