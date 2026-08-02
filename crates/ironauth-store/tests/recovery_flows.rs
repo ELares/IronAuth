@@ -539,6 +539,53 @@ async fn cooldown_count_sees_recent_initiations() {
 }
 
 #[tokio::test]
+async fn the_completion_audit_records_the_strength_the_completed_row_holds() {
+    // Issue #247, the #395 / #438 shape. `complete` takes a `recover_acr` from its
+    // caller, and the live caller (the hosted advanced-recovery finish) passes a value it
+    // read from the flow EARLIER in the request. The audit row must describe the row this
+    // write actually committed, not what someone believed before it ran, and the write's
+    // own RETURNING has the authoritative value in hand.
+    //
+    // The two are separated here by passing a recover_acr that is deliberately NOT the
+    // one the flow holds. Auditing the argument would record `...:stale`; auditing the
+    // RETURNING records the row's own `...:pwd`.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let subject = register_user(&db, &env, scope, RECIPIENT).await;
+    let id = initiate(&db, &env, scope, &subject, "ira_rcv_acr~s", None).await;
+
+    let completed = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .recovery_flows()
+        .complete(&env, &id, "urn:ironauth:acr:stale")
+        .await
+        .expect("complete");
+    assert!(completed, "the flow completed");
+
+    let detail: Option<String> = sqlx::query(
+        "SELECT detail FROM audit_log \
+         WHERE tenant_id = $1 AND environment_id = $2 AND action = $3 AND target_id = $4",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(Action::RecoveryComplete.as_str())
+    .bind(id.to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("read the completion audit row")
+    .get("detail");
+    assert_eq!(
+        detail.as_deref(),
+        Some("urn:ironauth:acr:pwd"),
+        "the completion audit records the strength the COMPLETED ROW holds, not the \
+         value the caller passed in"
+    );
+}
+
+#[tokio::test]
 async fn every_transition_writes_one_audit_row_targeting_the_flow() {
     let db = TestDatabase::start().await;
     let env = Env::system();

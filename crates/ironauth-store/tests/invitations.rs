@@ -9,17 +9,19 @@
 //! CONCURRENT double-accept storm redeem AT MOST ONCE (never two activations); a
 //! stale invite is refused against the clock; a revoked invitation is unacceptable;
 //! the invited identifier is envelope-encrypted (no plaintext dump) and never leaks
-//! across tenants; a token minted in one tenant never resolves in another; and every
-//! lifecycle mutation is audited.
+//! across tenants; a token minted in one tenant never resolves in another; every
+//! lifecycle mutation is audited; and the create is ATOMIC, so a failure at any of the
+//! three seams inside it leaves no user, no invitation, no audit row and no stored
+//! Idempotency-Key, and the same key then creates cleanly (issue #247).
 
 use std::time::{Duration, SystemTime};
 
 use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
-    CorrelationId, InvitationCredentialType, InvitationId, InvitationState, MintedInvitationToken,
-    NewAdminUser, NewInvitation, Scope, StoreError, UserId, UserState, invitation_token_digest,
-    mint_invitation_token, mint_invitation_token_for,
+    CorrelationId, InvitationCreateFailurePoint, InvitationCredentialType, InvitationId,
+    InvitationState, MintedInvitationToken, NewAdminUser, NewInvitedUser, Scope, StoreError,
+    UserId, UserState, invitation_token_digest, mint_invitation_token, mint_invitation_token_for,
 };
 use sqlx::Row;
 
@@ -54,43 +56,31 @@ async fn create_invitation(
 ) -> (InvitationId, UserId, String) {
     let created = now_micros(env);
     let MintedInvitationToken { token, digest, id } = mint_invitation_token(env, &scope);
-    // Create and invitation-create are CONTROL-plane (admin) operations: the
-    // migration grants INSERT on user_invitations to the control role only, exactly
-    // as the admin API uses the control-plane store.
+    // The joined create is a CONTROL-plane (admin) operation: the migration grants
+    // INSERT on users and user_invitations to the control role only, exactly as the
+    // admin API uses the control-plane store. This is the SAME call the management
+    // surface makes, so every fixture below exercises the production path.
     let user_id = db
         .control_store()
         .scoped(scope)
         .acting(db.test_actor(env), CorrelationId::generate(env))
-        .users()
-        .admin_create(
-            env,
-            NewAdminUser {
-                id: None,
-                identifier,
-                password_hash: None,
-                claims_json: None,
-                external_id: None,
-                state: UserState::PendingVerification,
-                foreign_password_hash: None,
-                foreign_password_algo: None,
-                traits_json: None,
-                traits_schema_version: None,
-            },
-            created,
-            None,
-        )
-        .await
-        .expect("create pending user");
-    db.control_store()
-        .scoped(scope)
-        .acting(db.test_actor(env), CorrelationId::generate(env))
         .invitations()
-        .create(
+        .create_with_user(
             env,
-            NewInvitation {
-                id: &id,
-                user_id: &user_id,
-                target_identifier: identifier,
+            NewInvitedUser {
+                user: NewAdminUser {
+                    id: None,
+                    identifier,
+                    password_hash: None,
+                    claims_json: None,
+                    external_id: None,
+                    state: UserState::PendingVerification,
+                    foreign_password_hash: None,
+                    foreign_password_algo: None,
+                    traits_json: None,
+                    traits_schema_version: None,
+                },
+                invitation_id: &id,
                 token_digest: &digest,
                 credential_type,
                 org_context: None,
@@ -100,7 +90,7 @@ async fn create_invitation(
             None,
         )
         .await
-        .expect("create invitation");
+        .expect("create the invited user and invitation");
     (id, user_id, token)
 }
 
@@ -605,6 +595,405 @@ async fn create_redeem_and_revoke_are_each_audited() {
             "the audit log records {expected}; saw {actions:?}"
         );
     }
+}
+
+/// The `NewInvitedUser` spec the joined create takes for one invited identity.
+fn invited_user<'a>(
+    identifier: &'a str,
+    user_id: &'a UserId,
+    invitation_id: &'a InvitationId,
+    digest: &'a str,
+    expires_at_unix_micros: i64,
+) -> NewInvitedUser<'a> {
+    NewInvitedUser {
+        user: NewAdminUser {
+            id: Some(user_id),
+            identifier,
+            password_hash: None,
+            claims_json: None,
+            external_id: None,
+            state: UserState::PendingVerification,
+            foreign_password_hash: None,
+            foreign_password_algo: None,
+            traits_json: None,
+            traits_schema_version: None,
+        },
+        invitation_id,
+        token_digest: digest,
+        credential_type: InvitationCredentialType::Password,
+        org_context: None,
+        expires_at_unix_micros,
+    }
+}
+
+/// How many rows of `table` exist in `scope`, read as the OWNER (bypassing row-level
+/// security), so a row hidden from a role still counts.
+async fn count_in_scope(db: &TestDatabase, scope: Scope, table: &str) -> i64 {
+    // `table` is one of two literals chosen by this test file, never caller input.
+    let sql =
+        format!("SELECT COUNT(*) AS n FROM {table} WHERE tenant_id = $1 AND environment_id = $2");
+    sqlx::query(&sql)
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .fetch_one(db.owner_pool())
+        .await
+        .expect("count rows")
+        .get::<i64, _>("n")
+}
+
+/// The audit actions recorded in `scope`, in the order the log holds them.
+async fn audit_actions(db: &TestDatabase, scope: Scope) -> Vec<String> {
+    db.store()
+        .scoped(scope)
+        .audit()
+        .list()
+        .await
+        .expect("audit list")
+        .into_iter()
+        .map(|row| row.action)
+        .collect()
+}
+
+/// How many `idempotency_keys` rows carry `key`, read as the owner.
+async fn idempotency_rows(db: &TestDatabase, key: &str) -> i64 {
+    sqlx::query("SELECT COUNT(*) AS n FROM idempotency_keys WHERE idempotency_key = $1")
+        .bind(key)
+        .fetch_one(db.owner_pool())
+        .await
+        .expect("count idempotency rows")
+        .get::<i64, _>("n")
+}
+
+// One linear failure-then-retry narrative: injecting the failure, asserting the four
+// post-conditions, retrying, and asserting the five the commit owes. Splitting it would
+// hide which assertions belong to which half.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn a_failed_invitation_create_leaves_nothing_and_the_same_key_then_succeeds() {
+    // THE DECISIVE TEST for issue #247. The create used to run the #52 audited user
+    // create in one transaction and the invitation (which also committed the
+    // Idempotency-Key record) in a SECOND. A failure of the second after the first
+    // committed left an orphaned pending_verification user with no invitation and no
+    // stored key: the retry under the SAME key missed the replay store, re-ran the user
+    // create, hit the identifier unique violation and answered a CONFLICT, and the
+    // identifier stayed wedged behind the ghost until an operator deleted it.
+    //
+    // The failure is injected at exactly that instant, through the testing-only probe,
+    // and the two halves of the claim are asserted: NOTHING survives the failure, and
+    // the SAME key with the SAME identifier then creates cleanly.
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0xA1);
+    let scope = db.seed_scope(&env).await;
+    let identifier = "wedged@example.test";
+    let key = "inv-atomic-key";
+    let created = now_micros(&env);
+
+    let users_before = count_in_scope(&db, scope, "users").await;
+
+    // The failing attempts, one at EACH of the three seams a split create could be
+    // reintroduced at. Injecting only after the user (the old split) leaves the other end
+    // unmeasured: MEASURED, a mutation that committed everything staged so far and
+    // finished in a SECOND transaction survived a suite that probed only that one point.
+    for at in [
+        InvitationCreateFailurePoint::AfterIdempotency,
+        InvitationCreateFailurePoint::AfterUser,
+        InvitationCreateFailurePoint::BeforeCommit,
+    ] {
+        let MintedInvitationToken { digest, id, .. } = mint_invitation_token(&env, &scope);
+        let user_id = UserId::generate(&env, &scope);
+        let failed = db
+            .control_store()
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .invitations()
+            .create_with_user_injecting_failure(
+                &env,
+                invited_user(identifier, &user_id, &id, &digest, created + 1_000_000_000),
+                created,
+                Some(ironauth_store::IdempotencyWrite {
+                    credential_ref: "cred-247",
+                    key,
+                    request_fingerprint: "fp-247",
+                    response_status: 201,
+                    response_body: "{}",
+                }),
+                at,
+            )
+            .await;
+        assert!(
+            failed.is_err(),
+            "the failure injected at {at:?} must fail: {failed:?}"
+        );
+
+        // NOTHING survives it: no ghost user, no invitation, neither audit row, and no
+        // idempotency record the replay store would have to honor.
+        assert_eq!(
+            count_in_scope(&db, scope, "users").await,
+            users_before,
+            "a create rolled back at {at:?} leaves no ghost pending_verification user"
+        );
+        assert_eq!(
+            count_in_scope(&db, scope, "user_invitations").await,
+            0,
+            "a create rolled back at {at:?} leaves no invitation"
+        );
+        // Neither audit row survives. The scope's audit log is NOT empty (provisioning
+        // the scope's KEK and DEK is idempotent, commits on its own, and audits itself;
+        // a provisioned DEK left behind by a rolled-back create is not a partial
+        // invitation, it is a scope that is ready to seal), so the assertion is over the
+        // two actions this create owes rather than over a row count.
+        let after_failure = audit_actions(&db, scope).await;
+        for absent in ["user.create", "invitation.create"] {
+            assert!(
+                !after_failure.iter().any(|a| a == absent),
+                "a create rolled back at {at:?} leaves no {absent} audit row; saw {after_failure:?}"
+            );
+        }
+        assert_eq!(
+            idempotency_rows(&db, key).await,
+            0,
+            "a create rolled back at {at:?} stores no Idempotency-Key record"
+        );
+    }
+
+    // The RETRY: the SAME Idempotency-Key and the SAME identifier. Before the fix this
+    // is where the wedge showed, as a conflict on an identifier no live row held.
+    let MintedInvitationToken {
+        digest: retry_digest,
+        id: retry_id,
+        ..
+    } = mint_invitation_token(&env, &scope);
+    let retry_user_id = UserId::generate(&env, &scope);
+    let landed = db
+        .control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .invitations()
+        .create_with_user(
+            &env,
+            invited_user(
+                identifier,
+                &retry_user_id,
+                &retry_id,
+                &retry_digest,
+                created + 1_000_000_000,
+            ),
+            created,
+            Some(ironauth_store::IdempotencyWrite {
+                credential_ref: "cred-247",
+                key,
+                request_fingerprint: "fp-247",
+                response_status: 201,
+                response_body: "{}",
+            }),
+        )
+        .await
+        .expect("the same key and identifier retry cleanly after a failed create");
+    assert_eq!(landed, retry_user_id, "the create lands on the supplied id");
+
+    // And the retry committed the whole thing: the user, the invitation bound to it,
+    // both audit rows, and the idempotency record a replay will serve.
+    let record = db
+        .control_store()
+        .scoped(scope)
+        .invitations()
+        .get(&retry_id)
+        .await
+        .expect("the retried invitation is readable");
+    assert_eq!(record.user_id, retry_user_id);
+    assert_eq!(record.target_identifier, identifier);
+    assert_eq!(record.state, InvitationState::Pending);
+    assert_eq!(
+        idempotency_rows(&db, key).await,
+        1,
+        "the successful retry stores the Idempotency-Key record"
+    );
+    let actions = audit_actions(&db, scope).await;
+    for expected in ["user.create", "invitation.create"] {
+        assert!(
+            actions.iter().any(|a| a == expected),
+            "the committed create writes {expected}; saw {actions:?}"
+        );
+    }
+    assert_eq!(
+        actions.iter().filter(|a| *a == "user.create").count(),
+        1,
+        "exactly ONE user.create: the rolled-back attempt contributed none"
+    );
+}
+
+// Four creates in one narrative, each one the CONTRAST for the previous: the same
+// identifier, then a repeated mint, then a repeated user id, then the identifier the
+// repeated user id named. Splitting it would separate an assertion from the state that
+// makes it mean something.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn a_taken_identifier_and_a_mint_collision_are_different_errors() {
+    // The joined create folds two writes that used to report the same
+    // `StoreError::Conflict` for very different reasons: the invited LOGIN HANDLE is
+    // taken (a 409 the caller can act on) and one of the THREE values this path mints
+    // from 256 bits collided (not a caller fault, an opaque server error). The three are
+    // the `usr_` id of the account it provisions, the `inv_` handle, and the token
+    // digest, and all three are asserted here, because the `usr_` id rides the SAME
+    // insert as the login handle and so is the one a naive mapping folds back into the
+    // 409. Conflating them would tell an operator that the identifier they chose is
+    // taken when it is not.
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0xA2);
+    let scope = db.seed_scope(&env).await;
+    let created = now_micros(&env);
+    let expires = created + 1_000_000_000;
+
+    let MintedInvitationToken { digest, id, .. } = mint_invitation_token(&env, &scope);
+    let user_id = UserId::generate(&env, &scope);
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .invitations()
+        .create_with_user(
+            &env,
+            invited_user("taken@example.test", &user_id, &id, &digest, expires),
+            created,
+            None,
+        )
+        .await
+        .expect("the first create lands");
+
+    // A SECOND create for the same identifier, with a FRESH handle and digest: the
+    // identifier is what collides, so it is the caller-facing conflict.
+    let MintedInvitationToken {
+        digest: fresh_digest,
+        id: fresh_id,
+        ..
+    } = mint_invitation_token(&env, &scope);
+    let second_user = UserId::generate(&env, &scope);
+    let taken = db
+        .control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .invitations()
+        .create_with_user(
+            &env,
+            invited_user(
+                "taken@example.test",
+                &second_user,
+                &fresh_id,
+                &fresh_digest,
+                expires,
+            ),
+            created,
+            None,
+        )
+        .await;
+    assert!(
+        matches!(taken, Err(StoreError::Conflict)),
+        "a taken identifier is the caller-facing conflict: {taken:?}"
+    );
+
+    // A create with a FRESH identifier but the ALREADY-STORED handle and digest: the
+    // mint is what collided, which the caller neither caused nor can act on.
+    let third_user = UserId::generate(&env, &scope);
+    let collided = db
+        .control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .invitations()
+        .create_with_user(
+            &env,
+            invited_user("fresh@example.test", &third_user, &id, &digest, expires),
+            created,
+            None,
+        )
+        .await;
+    assert!(
+        matches!(collided, Err(StoreError::InvitationMintCollision)),
+        "a handle or digest collision is its OWN error, never the identifier 409: {collided:?}"
+    );
+
+    // A create with a FRESH identifier, a FRESH handle and a FRESH digest, but the
+    // ALREADY-STORED `usr_` id. This is the asymmetric case: the collision is on the
+    // users PRIMARY KEY, which rides the same INSERT as the login-handle blind index, so
+    // a mapping that folds every unique violation on that insert into `Conflict` answers
+    // 409 about an identifier that is demonstrably free (this create's own
+    // `mint-collision@example.test`, which the last assertion then uses successfully).
+    let MintedInvitationToken {
+        digest: id_race_digest,
+        id: id_race_id,
+        ..
+    } = mint_invitation_token(&env, &scope);
+    let duplicate_user = db
+        .control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .invitations()
+        .create_with_user(
+            &env,
+            invited_user(
+                "mint-collision@example.test",
+                &user_id,
+                &id_race_id,
+                &id_race_digest,
+                expires,
+            ),
+            created,
+            None,
+        )
+        .await;
+    assert!(
+        matches!(duplicate_user, Err(StoreError::InvitationMintCollision)),
+        "a collision on the MINTED user id is a mint collision, not the identifier 409: \
+         {duplicate_user:?}"
+    );
+    let free_user = UserId::generate(&env, &scope);
+    let MintedInvitationToken {
+        digest: free_digest,
+        id: free_id,
+        ..
+    } = mint_invitation_token(&env, &scope);
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .invitations()
+        .create_with_user(
+            &env,
+            invited_user(
+                "mint-collision@example.test",
+                &free_user,
+                &free_id,
+                &free_digest,
+                expires,
+            ),
+            created,
+            None,
+        )
+        .await
+        .expect("the identifier the user-id collision named was never taken");
+
+    // And the collided attempt left no ghost either: the fresh identifier is still free.
+    let fourth_user = UserId::generate(&env, &scope);
+    let MintedInvitationToken {
+        digest: ok_digest,
+        id: ok_id,
+        ..
+    } = mint_invitation_token(&env, &scope);
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .invitations()
+        .create_with_user(
+            &env,
+            invited_user(
+                "fresh@example.test",
+                &fourth_user,
+                &ok_id,
+                &ok_digest,
+                expires,
+            ),
+            created,
+            None,
+        )
+        .await
+        .expect("the identifier a collided create named is still free");
 }
 
 #[tokio::test]

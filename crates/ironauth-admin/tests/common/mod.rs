@@ -71,6 +71,31 @@ impl Harness {
         }
     }
 
+    /// Start a fresh database and router over a CALLER-SUPPLIED environment seam, so a
+    /// test can install its own clock or entropy double and drive what the handlers mint.
+    ///
+    /// The issue #247 atomicity test uses it to REPEAT a mint: an entropy source that can
+    /// be rewound makes two different requests mint the same invitation handle, which is
+    /// how a create's SECOND write is made to fail on real infrastructure without a
+    /// production failure-injection knob in the admin crate.
+    pub async fn start_with_env(default_page_size: u32, env: Env) -> Self {
+        let db = TestDatabase::start().await;
+        let config = AdminConfig {
+            bootstrap_operator_token: Some(Secret::Literal(SecretString::new(OPERATOR_TOKEN))),
+            max_page_size: 200,
+            default_page_size,
+            ..AdminConfig::default()
+        };
+        let state =
+            AdminState::new(db.control_store().clone(), env, &config).expect("admin state builds");
+        let router = management_router(state);
+        Self {
+            db,
+            router,
+            outbound_scope: None,
+        }
+    }
+
     /// Start a fresh database and router with an explicit organization group nesting
     /// bound (issue #97), so a test can drive the depth refusal with a handful of
     /// groups instead of the shipped default's nine.

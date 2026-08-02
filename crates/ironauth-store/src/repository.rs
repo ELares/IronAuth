@@ -14282,6 +14282,175 @@ pub struct NewAdminUser<'a> {
     pub traits_schema_version: Option<i32>,
 }
 
+/// The user id an admin create lands on: the caller's supplied one (which must be in
+/// THIS scope, so a foreign id is the uniform not-found and never a cross-scope
+/// create), or a freshly minted one from the entropy seam.
+///
+/// # Errors
+///
+/// [`StoreError::NotFound`] if a supplied id belongs to another scope.
+fn resolve_admin_user_id(
+    env: &Env,
+    scope: Scope,
+    supplied: Option<&UserId>,
+) -> Result<UserId, StoreError> {
+    match supplied {
+        Some(supplied) => {
+            if supplied.scope() != scope {
+                return Err(StoreError::NotFound);
+            }
+            Ok(*supplied)
+        }
+        None => Ok(UserId::generate(env, &scope)),
+    }
+}
+
+/// INSERT one admin-created user row into the caller's OPEN transaction (issue #52):
+/// seal the login handle, the claim document, the external id and the traits document
+/// under the scope's active DEK, blind-index the handle and the external id, and write
+/// the row.
+///
+/// This is the ONE expression of what an admin-created user IS on a column. Two paths
+/// reach it, [`ActingUserRepo::admin_create`] and the joined invitation create
+/// ([`ActingInvitationRepo::create_with_user`], issue #247), and because it is one
+/// function they cannot drift into sealing, blind-indexing, or defaulting a user
+/// differently: an invited account is byte-for-byte the account the admin create
+/// writes. It takes an OPEN transaction rather than opening its own, which is the
+/// whole point on the joined path: the user row, the invitation row, both audit rows
+/// and the Idempotency-Key record commit together or not at all.
+///
+/// `created_at_micros` is bound to both `created_at` and `updated_at` from the
+/// CALLER's clock read (never the database clock), so the response body built before
+/// the write matches the stored row exactly and paging stays deterministic under a
+/// manual clock.
+///
+/// `id_collision` is the error a collision on the `users` PRIMARY KEY reports, which is
+/// NOT the same judgement on the two paths (issue #247). The #52 admin create may be
+/// handed an id preserved from an exported record, so there a duplicate id is the
+/// caller's [`StoreError::Conflict`]; the joined invitation create mints the id from 256
+/// bits inside the request that uses it, so there a duplicate id is a mint collision the
+/// caller neither caused nor can act on, and reporting it as a taken identifier would
+/// assert something false about their request. Every OTHER unique index on the table
+/// (the login-handle and external-id blind indexes) is a genuine caller conflict on both
+/// paths and is reported as one.
+///
+/// # Errors
+///
+/// `id_collision` on a collision with the id primary key; [`StoreError::Conflict`] on a
+/// collision with the login-handle or external-id blind index (a caller-facing 409,
+/// never a persistence fault); [`StoreError::Database`] on a persistence failure. On any
+/// of them, the caller's transaction is left for rollback, so a rejected create leaves
+/// neither a user row nor an audit row.
+// One linear seal-and-insert: the field list (identifier, claims, external id, and
+// traits, each sealed then bound) reads top to bottom as the column map, with no
+// extractable logic, so the length lint is not meaningful here. The eighth argument is
+// `id_collision`, whose whole purpose is that the two callers judge a duplicate id
+// DIFFERENTLY; folding it into the spec struct would put a per-call-site judgement
+// inside the value both call sites share.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+async fn insert_admin_user_row(
+    tx: &mut Transaction<'_, Postgres>,
+    env: &Env,
+    master: &MasterKey,
+    scope: Scope,
+    id: &UserId,
+    spec: &NewAdminUser<'_>,
+    created_at_micros: i64,
+    id_collision: StoreError,
+) -> Result<(), StoreError> {
+    let identifier_bidx = user_identifier_blind_index(master, scope, spec.identifier);
+    let external_id_bidx = spec
+        .external_id
+        .map(|value| user_external_id_blind_index(master, scope, value).into_bytes());
+    let password_hash = spec.password_hash.unwrap_or(USER_UNUSABLE_PASSWORD_HASH);
+    let claims_json = spec.claims_json.unwrap_or("{}");
+    let external_id = spec.external_id;
+    // The identity-traits document (issue #53) is sealed VERBATIM below, exactly like
+    // the claim document, when the create carries one (the streaming-import /
+    // exit-restore path, issue #58). It is deliberately NOT routed through the
+    // validating trait-write path (`set_traits`), because a lossless round-trip restores
+    // traits that already validated in the SOURCE instance as-is, even into a fresh
+    // scope with no active schema. A create without traits leaves the three columns
+    // NULL, and its recorded schema version is preserved verbatim.
+    let traits_json = spec.traits_json;
+    // `spec.foreign_password_hash` and `spec.foreign_password_algo` (issue #55) are bound
+    // straight through, AS-IS, with the non-secret algorithm tag. An imported foreign
+    // hash is credential material, not PII, so it is not sealed (exactly like the native
+    // password_hash); a user with no foreign credential stores NULL for both.
+    let (dek_version, dek) = fetch_active_dek(tx, scope, master).await?;
+    let identifier_sealed = dek.seal(
+        env.entropy(),
+        &user_pii_seal_aad(scope, USER_IDENTIFIER_PURPOSE, dek_version),
+        spec.identifier.as_bytes(),
+    );
+    let claims_sealed = dek.seal(
+        env.entropy(),
+        &user_pii_seal_aad(scope, USER_CLAIMS_PURPOSE, dek_version),
+        claims_json.as_bytes(),
+    );
+    let external_id_sealed = external_id.map(|value| {
+        dek.seal(
+            env.entropy(),
+            &user_pii_seal_aad(scope, USER_EXTERNAL_ID_PURPOSE, dek_version),
+            value.as_bytes(),
+        )
+        .into_bytes()
+    });
+    let external_id_dek_version = external_id.map(|_| dek_version);
+    let traits_sealed = traits_json.map(|value| {
+        dek.seal(
+            env.entropy(),
+            &user_pii_seal_aad(scope, USER_TRAITS_PURPOSE, dek_version),
+            value.as_bytes(),
+        )
+        .into_bytes()
+    });
+    let traits_dek_version = traits_json.map(|_| dek_version);
+    let result = sqlx::query(
+        "INSERT INTO users \
+         (id, tenant_id, environment_id, identifier_bidx, identifier_sealed, \
+          password_hash, claims_sealed, pii_dek_version, state, \
+          external_id_bidx, external_id_sealed, external_id_dek_version, \
+          created_at, updated_at, foreign_password_hash, foreign_password_algo, \
+          traits_sealed, traits_dek_version, traits_schema_version) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, \
+                 TIMESTAMPTZ 'epoch' + ($13::text || ' microseconds')::interval, \
+                 TIMESTAMPTZ 'epoch' + ($13::text || ' microseconds')::interval, \
+                 $14, $15, $16, $17, $18)",
+    )
+    .bind(id.to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(identifier_bidx.into_bytes())
+    .bind(identifier_sealed.into_bytes())
+    .bind(password_hash)
+    .bind(claims_sealed.into_bytes())
+    .bind(dek_version)
+    .bind(spec.state.as_str())
+    .bind(external_id_bidx)
+    .bind(external_id_sealed)
+    .bind(external_id_dek_version)
+    .bind(created_at_micros)
+    .bind(spec.foreign_password_hash)
+    .bind(spec.foreign_password_algo)
+    .bind(traits_sealed)
+    .bind(traits_dek_version)
+    .bind(spec.traits_schema_version)
+    .execute(&mut **tx)
+    .await;
+    match result {
+        Ok(_) => Ok(()),
+        Err(error) if is_unique_violation(&error) => {
+            if unique_violation_constraint(&error) == Some(USERS_ID_CONSTRAINT) {
+                Err(id_collision)
+            } else {
+                Err(StoreError::Conflict)
+            }
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// A scope's lazy-migration progress (issue #56): the counts an operator watches to
 /// decide when the migration tail has flattened and the hook can be disabled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15287,10 +15456,6 @@ impl ActingUserRepo<'_> {
     /// id is already taken in the scope (a 409); [`StoreError::IdempotencyConflict`]
     /// if the idempotency key is already stored; [`StoreError::Encryption`] if no
     /// master key is configured; [`StoreError::Database`] on a persistence failure.
-    // One linear seal-and-insert: the field list (identifier, claims, external id,
-    // and now traits, each sealed then bound) reads top to bottom as the column map,
-    // with no extractable logic, so the length lint is not meaningful here.
-    #[allow(clippy::too_many_lines)]
     pub async fn admin_create(
         &self,
         env: &Env,
@@ -15301,44 +15466,7 @@ impl ActingUserRepo<'_> {
         let master = self.store.master().ok_or(StoreError::Encryption)?;
         self.ensure_scope_keys(env, master).await?;
         let scope = self.scope;
-        // A supplied id must be in THIS scope (a foreign id is the uniform not-found,
-        // never a cross-scope create). An absent id mints a fresh one.
-        let id = match spec.id {
-            Some(supplied) => {
-                if supplied.scope() != scope {
-                    return Err(StoreError::NotFound);
-                }
-                *supplied
-            }
-            None => UserId::generate(env, &scope),
-        };
-        let identifier_bidx = user_identifier_blind_index(master, scope, spec.identifier);
-        let external_id_bidx = spec
-            .external_id
-            .map(|value| user_external_id_blind_index(master, scope, value).into_bytes());
-        let password_hash = spec.password_hash.unwrap_or(USER_UNUSABLE_PASSWORD_HASH);
-        let claims_json = spec.claims_json.unwrap_or("{}");
-        let external_id = spec.external_id;
-        let state = spec.state;
-        // The imported foreign hash (issue #55) is stored AS-IS with its non-secret
-        // algorithm tag. It is credential material, not PII, so it is not sealed
-        // (exactly like the native password_hash). A user with no foreign credential
-        // stores NULL for both.
-        let foreign_password_hash = spec.foreign_password_hash;
-        let foreign_password_algo = spec.foreign_password_algo;
-        // The identity-traits document (issue #53) is sealed VERBATIM here, exactly
-        // like the claim document, when the create carries one (the streaming-import /
-        // exit-restore path, issue #58). It is deliberately NOT routed through the
-        // validating trait-write path (`set_traits`), because a lossless round-trip
-        // restores traits that already validated in the SOURCE instance as-is, even
-        // into a fresh scope with no active schema. A create without traits leaves the
-        // three columns NULL. Its recorded schema version is preserved verbatim.
-        let traits_json = spec.traits_json;
-        let traits_schema_version = spec.traits_schema_version;
-        // created_at and updated_at are bound from the caller's clock read (not the
-        // database clock), so the response body built before the write matches the
-        // stored row exactly and paging stays deterministic under a manual clock.
-        let now_micros = created_at_micros;
+        let id = resolve_admin_user_id(env, scope, spec.id)?;
         write_audited(
             AuditedWrite {
                 store: self.store,
@@ -15349,78 +15477,21 @@ impl ActingUserRepo<'_> {
                 target: &id,
             },
             async move |tx| {
-                let (dek_version, dek) = fetch_active_dek(tx, scope, master).await?;
-                let identifier_sealed = dek.seal(
-                    env.entropy(),
-                    &user_pii_seal_aad(scope, USER_IDENTIFIER_PURPOSE, dek_version),
-                    spec.identifier.as_bytes(),
-                );
-                let claims_sealed = dek.seal(
-                    env.entropy(),
-                    &user_pii_seal_aad(scope, USER_CLAIMS_PURPOSE, dek_version),
-                    claims_json.as_bytes(),
-                );
-                let external_id_sealed = external_id.map(|value| {
-                    dek.seal(
-                        env.entropy(),
-                        &user_pii_seal_aad(scope, USER_EXTERNAL_ID_PURPOSE, dek_version),
-                        value.as_bytes(),
-                    )
-                    .into_bytes()
-                });
-                let external_id_dek_version = external_id.map(|_| dek_version);
-                // Seal the traits document verbatim under the same active DEK when the
-                // create carries one; a traits-less create leaves all three columns NULL.
-                let traits_sealed = traits_json.map(|value| {
-                    dek.seal(
-                        env.entropy(),
-                        &user_pii_seal_aad(scope, USER_TRAITS_PURPOSE, dek_version),
-                        value.as_bytes(),
-                    )
-                    .into_bytes()
-                });
-                let traits_dek_version = traits_json.map(|_| dek_version);
-                let result = sqlx::query(
-                    "INSERT INTO users \
-                     (id, tenant_id, environment_id, identifier_bidx, identifier_sealed, \
-                      password_hash, claims_sealed, pii_dek_version, state, \
-                      external_id_bidx, external_id_sealed, external_id_dek_version, \
-                      created_at, updated_at, foreign_password_hash, foreign_password_algo, \
-                      traits_sealed, traits_dek_version, traits_schema_version) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, \
-                             TIMESTAMPTZ 'epoch' + ($13::text || ' microseconds')::interval, \
-                             TIMESTAMPTZ 'epoch' + ($13::text || ' microseconds')::interval, \
-                             $14, $15, $16, $17, $18)",
+                // A duplicate id is the caller's conflict here: this path may be handed
+                // an id preserved from an exported record (the #58 restore), so a
+                // collision is a re-import of a user that already exists and the import
+                // engine's idempotent skip depends on seeing it as one.
+                insert_admin_user_row(
+                    tx,
+                    env,
+                    master,
+                    scope,
+                    &id,
+                    &spec,
+                    created_at_micros,
+                    StoreError::Conflict,
                 )
-                .bind(id.to_string())
-                .bind(scope.tenant().to_string())
-                .bind(scope.environment().to_string())
-                .bind(identifier_bidx.into_bytes())
-                .bind(identifier_sealed.into_bytes())
-                .bind(password_hash)
-                .bind(claims_sealed.into_bytes())
-                .bind(dek_version)
-                .bind(state.as_str())
-                .bind(external_id_bidx)
-                .bind(external_id_sealed)
-                .bind(external_id_dek_version)
-                .bind(now_micros)
-                .bind(foreign_password_hash)
-                .bind(foreign_password_algo)
-                .bind(traits_sealed)
-                .bind(traits_dek_version)
-                .bind(traits_schema_version)
-                .execute(&mut **tx)
-                .await;
-                match result {
-                    Ok(_) => {}
-                    // A collision on the id primary key, the login-handle blind index,
-                    // or the external-id blind index is a caller-facing conflict (a
-                    // 409), never a persistence fault. The audited write rolls back, so
-                    // a rejected create leaves neither a user row nor an audit row.
-                    Err(error) if is_unique_violation(&error) => return Err(StoreError::Conflict),
-                    Err(error) => return Err(error.into()),
-                }
+                .await?;
                 insert_idempotency(tx, idempotency).await?;
                 Ok(())
             },
@@ -22010,19 +22081,28 @@ impl ActingRecoveryFlowRepo<'_> {
 
     /// COMPLETE a pending recovery flow (issue #81): a COLUMN-scoped UPDATE that sets
     /// `state='completed'` and `completed_at` on a flow still `initiated` or `held`.
-    /// A cancelled flow is never completed (the UPDATE matches no row). A successful
-    /// completion writes one `recovery.complete` audit row targeting the flow with the
-    /// recover-factor strength in `detail`. Returns whether a row was flipped.
+    /// A cancelled flow is never completed (the UPDATE matches no row). It writes one
+    /// `recovery.complete` audit row targeting the flow with the recover-factor strength
+    /// in `detail`. Returns whether a row was flipped.
+    ///
+    /// That strength is read from THIS write's own `RETURNING` (issue #247, the #395 and
+    /// #438 shape): the row describes what the completion committed, not the
+    /// `recover_acr` the caller read earlier and passed back in, which is what the live
+    /// caller does. When nothing flipped there is no committed row to describe, so the
+    /// audit row records the strength the caller ASKED to complete at; it is written
+    /// either way, exactly as it always was.
     ///
     /// DEFENSE IN DEPTH (issue #81 MEDIUM-3): a `held` flow whose `hold_until` is still in
     /// the FUTURE is REFUSED (the UPDATE guards `hold_until IS NULL OR hold_until <= now`),
     /// so completion can never erase the delay gate before the notified window has elapsed.
-    /// An `initiated` flow (no hold) completes as before. Completion is M9-deferred, so
-    /// there is no live caller today; the guard closes the trap for whoever wires it.
+    /// An `initiated` flow (no hold) completes as before. The guarded UPDATE is
+    /// [`complete_recovery_flow`], shared with the joined admin approve-and-complete
+    /// (issue #247), so the delay gate has ONE expression and neither path can be given a
+    /// weaker one.
     ///
     /// BY DESIGN, the `hold_until` delay is enforced in the APPLICATION LAYER: the `now`
-    /// compared against `hold_until` in the WHERE is the env CLOCK SEAM (`env.clock()`, bound
-    /// as `$4`), NOT the database wall clock. A DB-level temporal trigger using `now()` is
+    /// compared against `hold_until` in the WHERE is the env CLOCK SEAM (`env.clock()`),
+    /// NOT the database wall clock. A DB-level temporal trigger using `now()` is
     /// INTENTIONALLY NOT used because it would read the DB WALL CLOCK and break the
     /// deterministic clock seam: tests advance a frozen clock to cross the delay, and a
     /// wall-clock trigger would reject those legitimate post-delay completions (and, more
@@ -22044,40 +22124,27 @@ impl ActingRecoveryFlowRepo<'_> {
         let scope = self.scope;
         let id_text = id.to_string();
         let now_micros = epoch_micros(env.clock().now_utc());
-        let mut flipped = false;
-        write_audited_detailed(
-            AuditedWrite {
-                store: self.store,
-                scope,
-                acting: &self.acting,
-                env,
-                action: Action::RecoveryComplete,
-                target: id,
-            },
-            async |tx| {
-                let affected = sqlx::query(
-                    "UPDATE recovery_flows SET state = 'completed', \
-                     completed_at = TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
-                     WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
-                     AND state IN ('initiated', 'held') \
-                     AND (hold_until IS NULL OR hold_until <= \
-                          TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval)",
-                )
-                .bind(&id_text)
-                .bind(scope.tenant().to_string())
-                .bind(scope.environment().to_string())
-                .bind(now_micros)
-                .execute(&mut **tx)
-                .await?
-                .rows_affected();
-                flipped = affected > 0;
-                Ok(())
-            },
-            false,
-            Some(recover_acr),
-        )
-        .await?;
-        Ok(flipped)
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let committed_acr = complete_recovery_flow(&mut tx, scope, &id_text, now_micros).await?;
+        // The audit row records the strength the COMMITTED row holds, read from this
+        // write's own RETURNING, rather than the `recover_acr` the caller read earlier
+        // and passed back in (the #395 / #438 shape: a mutation audits what it wrote,
+        // not what someone believed before it ran). When nothing flipped there is no
+        // committed row to describe, so the row falls back to the strength the caller
+        // ASKED to complete at. The row is still written either way, exactly as it was
+        // before, so the recovery log gains and loses nothing here.
+        let detail = committed_acr.as_deref().unwrap_or(recover_acr);
+        let audit = AuditedWrite {
+            store: self.store,
+            scope,
+            acting: &self.acting,
+            env,
+            action: Action::RecoveryComplete,
+            target: id,
+        };
+        insert_audit_row(&mut tx, &audit, Some(detail)).await?;
+        tx.commit().await?;
+        Ok(committed_acr.is_some())
     }
 
     /// RECORD a factor-change decision against the downgrade invariant (issue #81): an
@@ -22312,6 +22379,61 @@ pub struct ActingRecoveryApprovalRepo<'a> {
     acting: ActingContext,
 }
 
+/// Where the testing-only atomicity probe forces the joined recovery approve to fail
+/// (issue #247). Compiled ONLY under the `testing` feature, so a production build holds
+/// no failure-injection seam and no name for one.
+///
+/// The variants are the three SEAMS a split approve could be reintroduced at, and the
+/// LAST one is the one that had to be added: with only the seam before the completion,
+/// a mutant that committed the decision and completed in a SECOND transaction (the
+/// defect itself) SURVIVED, because poisoning BEFORE a split rolls the mutant's first
+/// transaction back too (MEASURED, the same lesson the invitation site learned).
+#[cfg(feature = "testing")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryApproveFailurePoint {
+    /// Immediately after the Idempotency-Key record and BEFORE the decision: the instant
+    /// at which a split would commit the replay record with nothing standing behind it,
+    /// so a retry replays a stored 200 for a case that was never decided.
+    AfterIdempotency,
+    /// Immediately after the approval flip and its `recovery.approved` audit row, and
+    /// BEFORE the completion: the exact instant the old two-transaction path had
+    /// COMMITTED the decision (and the Idempotency-Key record) and had not yet attempted
+    /// the completion.
+    AfterDecision,
+    /// After the LAST write (the `recovery.complete` audit row, when the flow flipped)
+    /// and BEFORE the commit. This is the ONE point at which a split at the last seam is
+    /// detectable: a mutant that commits the decision and completes in a second
+    /// transaction behaves identically on every SUCCESSFUL approve, and differs only
+    /// when the write after the split fails.
+    BeforeCommit,
+}
+
+/// The armed failure seam the joined approve honors.
+#[cfg(feature = "testing")]
+type ArmedRecoveryApproveFailure = Option<RecoveryApproveFailurePoint>;
+
+/// The armed failure seam, in a build without the `testing` feature: [`Infallible`] has
+/// no value, so the only inhabitant is [`None`] and every probe in the joined approve is
+/// compiled out.
+///
+/// [`Infallible`]: std::convert::Infallible
+#[cfg(not(feature = "testing"))]
+type ArmedRecoveryApproveFailure = Option<std::convert::Infallible>;
+
+/// Force a guaranteed in-transaction failure when the caller armed the probe for `here`.
+/// A no-op on every production path, which passes [`None`].
+#[cfg(feature = "testing")]
+async fn poison_recovery_approve(
+    tx: &mut Transaction<'_, Postgres>,
+    armed: ArmedRecoveryApproveFailure,
+    here: RecoveryApproveFailurePoint,
+) -> Result<(), StoreError> {
+    if armed == Some(here) {
+        sqlx::query("SELECT 1 / 0").execute(&mut **tx).await?;
+    }
+    Ok(())
+}
+
 impl ActingRecoveryApprovalRepo<'_> {
     /// OPEN a pending approval for an admin-approved recovery flow (issue #82, PR 3). A plain
     /// scoped write (the data plane lands the case for the admin queue); the audited decision
@@ -22349,12 +22471,32 @@ impl ActingRecoveryApprovalRepo<'_> {
         Ok(id)
     }
 
-    /// APPROVE an admin-approved recovery (issue #82, PR 3): mark the open approval `approved`
-    /// and stamp the deciding admin actor, in one audited transaction
-    /// (`recovery.approved`, targeting the flow). Idempotent over `pending`/`approved`, so an
-    /// admin can re-approve after the delay window to finalize. This satisfies the method
-    /// precondition ONLY; the caller then runs [`ActingRecoveryFlowRepo::complete`], whose
-    /// `hold_until` guard still enforces the #81 delay.
+    /// APPROVE an admin-approved recovery AND complete the flow it unblocks, in ONE
+    /// transaction (issues #82 PR 3, #247): mark the open approval `approved`, stamp the
+    /// deciding admin actor, write the `recovery.approved` audit row, then attempt the
+    /// #81 completion (whose `hold_until <= now` guard is unchanged and still enforces the
+    /// delay) and, when it flips, its `recovery.complete` audit row. The
+    /// Idempotency-Key record commits in the same transaction as all of it.
+    ///
+    /// Returns whether the recovery flow was COMPLETED. `false` means the approval stands
+    /// but the #81 delay window has not elapsed (or the flow is absent, cancelled, or
+    /// already completed), which is the designed hold: an admin re-approves after the
+    /// window to finalize, and this call is idempotent over `pending`/`approved` so that
+    /// re-approve is accepted.
+    ///
+    /// # Why the two are joined (issue #247)
+    ///
+    /// The admin surface used to approve in one transaction and then complete in a
+    /// SECOND, discarding its result. Because the Idempotency-Key record committed with
+    /// the FIRST, a failure of the completion left an approved-but-unfinished flow that
+    /// the replay store could not see: a retry under the same key replayed the stored
+    /// 200 and never re-attempted the completion, so the flow stayed stranded and only a
+    /// FRESH key could finish it. Joined, either both land or neither does, and a retry
+    /// under the same key re-executes.
+    ///
+    /// The completion's `recover_acr` is read INSIDE this transaction, so the strength
+    /// recorded on the audit row is the one the completed row actually holds rather than
+    /// one read earlier and possibly since changed.
     ///
     /// # Errors
     ///
@@ -22366,15 +22508,129 @@ impl ActingRecoveryApprovalRepo<'_> {
         env: &Env,
         flow_id: &RecoveryFlowId,
         idempotency: Option<IdempotencyWrite<'_>>,
-    ) -> Result<(), StoreError> {
-        self.decide(
+    ) -> Result<bool, StoreError> {
+        self.approve_inner(
             env,
             flow_id,
-            "approved",
-            Action::RecoveryApproved,
             idempotency,
+            ArmedRecoveryApproveFailure::default(),
         )
         .await
+    }
+
+    /// Testing-only atomicity probe (issue #247): run the joined approve up to `at`, then
+    /// force a guaranteed error INSIDE the transaction.
+    ///
+    /// The variants of [`RecoveryApproveFailurePoint`] are the three SEAMS a split
+    /// approve could be reintroduced at, so a test can assert the same post-condition at
+    /// each: after this call the approval is still `pending`, the flow is not completed,
+    /// neither audit row survives, and no idempotency record survives to make a retry
+    /// under the same key a permanent no-op. The public [`approve`](Self::approve) never
+    /// poisons.
+    ///
+    /// The LAST of them is not decoration. This probe once offered only the seam before
+    /// the completion, and a mutation that committed the decision and completed in a
+    /// SECOND transaction (the exact defect this method exists to close) SURVIVED eleven
+    /// green tests, because poisoning before a split rolls the mutant's first
+    /// transaction back too and hides it (MEASURED).
+    ///
+    /// # Errors
+    ///
+    /// Always errors (that is the point): the injected failure rolls the whole
+    /// transaction back.
+    #[cfg(feature = "testing")]
+    pub async fn approve_injecting_failure(
+        &self,
+        env: &Env,
+        flow_id: &RecoveryFlowId,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        at: RecoveryApproveFailurePoint,
+    ) -> Result<bool, StoreError> {
+        self.approve_inner(env, flow_id, idempotency, Some(at))
+            .await
+    }
+
+    /// Shared body of the joined approve. `poison` is always unarmed for the public
+    /// mutator; the testing-only atomicity probe supplies a failure point.
+    async fn approve_inner(
+        &self,
+        env: &Env,
+        flow_id: &RecoveryFlowId,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        poison: ArmedRecoveryApproveFailure,
+    ) -> Result<bool, StoreError> {
+        // Without the `testing` feature the seam type has no inhabited variant, so
+        // `poison` cannot be armed and every probe below is compiled out.
+        #[cfg(not(feature = "testing"))]
+        if let Some(armed) = poison {
+            match armed {}
+        }
+        if flow_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let flow_text = flow_id.to_string();
+        // Bespoke committing path (like the refresh redeem): the approval flip, its audit
+        // row, the completion, its audit row and the Idempotency-Key record share ONE
+        // transaction, and every audit row is still written in the same transaction as
+        // the mutation it describes.
+        let mut tx = begin_scoped(self.store, scope).await?;
+        // The idempotency insert stays FIRST, exactly where the single-write decide put
+        // it: a concurrent same-key race must surface as IdempotencyConflict (which the
+        // caller resolves by replaying the committed original) rather than as the
+        // not-found the already-decided approval would answer with.
+        insert_idempotency(&mut tx, idempotency).await?;
+        #[cfg(feature = "testing")]
+        poison_recovery_approve(
+            &mut tx,
+            poison,
+            RecoveryApproveFailurePoint::AfterIdempotency,
+        )
+        .await?;
+        if !flip_recovery_approval(
+            &mut tx,
+            scope,
+            &self.acting,
+            &flow_text,
+            "approved",
+            now_micros,
+        )
+        .await?
+        {
+            return Err(StoreError::NotFound);
+        }
+        let approved_audit = AuditedWrite {
+            store: self.store,
+            scope,
+            acting: &self.acting,
+            env,
+            action: Action::RecoveryApproved,
+            target: flow_id,
+        };
+        insert_audit_row(&mut tx, &approved_audit, None).await?;
+        #[cfg(feature = "testing")]
+        poison_recovery_approve(&mut tx, poison, RecoveryApproveFailurePoint::AfterDecision)
+            .await?;
+        // Complete THROUGH the #81 gate. An absent flow completes nothing and is not an
+        // error: the approval stands on its own, exactly as it did when the admin layer
+        // skipped the completion for a flow it could not read.
+        let completed = complete_recovery_flow(&mut tx, scope, &flow_text, now_micros).await?;
+        if let Some(recover_acr) = completed.as_deref() {
+            let complete_audit = AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::RecoveryComplete,
+                target: flow_id,
+            };
+            insert_audit_row(&mut tx, &complete_audit, Some(recover_acr)).await?;
+        }
+        #[cfg(feature = "testing")]
+        poison_recovery_approve(&mut tx, poison, RecoveryApproveFailurePoint::BeforeCommit).await?;
+        tx.commit().await?;
+        Ok(completed.is_some())
     }
 
     /// REJECT an admin-approved recovery (issue #82, PR 3): mark the open approval `rejected`
@@ -22418,17 +22674,9 @@ impl ActingRecoveryApprovalRepo<'_> {
         }
         let scope = self.scope;
         let now_micros = epoch_micros(env.clock().now_utc());
-        let actor = self.acting.actor();
-        let (actor_kind, actor_id) = (actor.kind_str().to_owned(), actor.id_string());
         let flow_text = flow_id.to_string();
-        // Approve is idempotent over pending/approved (an admin can re-approve after the
-        // delay to finalize); reject decides only a still-open pending case.
-        let from_states: &[&str] = if to_state == "approved" {
-            &["pending", "approved"]
-        } else {
-            &["pending"]
-        };
         let to_state = to_state.to_owned();
+        let acting = self.acting;
         write_audited(
             AuditedWrite {
                 store: self.store,
@@ -22440,25 +22688,9 @@ impl ActingRecoveryApprovalRepo<'_> {
             },
             async move |tx| {
                 insert_idempotency(tx, idempotency).await?;
-                let updated = sqlx::query(
-                    "UPDATE recovery_approvals SET state = $1, \
-                         reviewed_by_kind = $2, reviewed_by_id = $3, \
-                         reviewed_at = TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
-                     WHERE flow_id = $5 AND tenant_id = $6 AND environment_id = $7 \
-                     AND state = ANY($8)",
-                )
-                .bind(&to_state)
-                .bind(&actor_kind)
-                .bind(&actor_id)
-                .bind(now_micros)
-                .bind(&flow_text)
-                .bind(scope.tenant().to_string())
-                .bind(scope.environment().to_string())
-                .bind(from_states)
-                .execute(&mut **tx)
-                .await?
-                .rows_affected();
-                if updated == 0 {
+                if !flip_recovery_approval(tx, scope, &acting, &flow_text, &to_state, now_micros)
+                    .await?
+                {
                     return Err(StoreError::NotFound);
                 }
                 Ok(())
@@ -22467,6 +22699,86 @@ impl ActingRecoveryApprovalRepo<'_> {
         )
         .await
     }
+}
+
+/// Flip one recovery approval to `to_state` and stamp the deciding admin actor, inside
+/// the caller's OPEN transaction. Returns whether a row matched.
+///
+/// The from-state set is a property of the DESTINATION, expressed here once: approve is
+/// idempotent over `pending`/`approved` (an admin re-approves after the #81 delay window
+/// to finalize), reject decides only a still-open `pending` case, so a rejected approval
+/// can never be re-approved. Both callers, the single-write reject and the joined
+/// approve-and-complete (issue #247), read that rule from this one place.
+async fn flip_recovery_approval(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    acting: &ActingContext,
+    flow_text: &str,
+    to_state: &str,
+    now_micros: i64,
+) -> Result<bool, StoreError> {
+    let actor = acting.actor();
+    let from_states: &[&str] = if to_state == "approved" {
+        &["pending", "approved"]
+    } else {
+        &["pending"]
+    };
+    let updated = sqlx::query(
+        "UPDATE recovery_approvals SET state = $1, \
+             reviewed_by_kind = $2, reviewed_by_id = $3, \
+             reviewed_at = TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+         WHERE flow_id = $5 AND tenant_id = $6 AND environment_id = $7 \
+         AND state = ANY($8)",
+    )
+    .bind(to_state)
+    .bind(actor.kind_str())
+    .bind(actor.id_string())
+    .bind(now_micros)
+    .bind(flow_text)
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(from_states)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    Ok(updated > 0)
+}
+
+/// COMPLETE one recovery flow inside the caller's OPEN transaction (issue #81), through
+/// the delay gate. Returns the completed row's `recover_acr` when this call flipped it,
+/// or [`None`] when it matched nothing (absent, cancelled, already completed, or still
+/// HELD because `hold_until` has not elapsed).
+///
+/// The strength comes back from the write's own `RETURNING`, so the value an audit row
+/// records is the one the row it describes actually holds rather than one read earlier
+/// (the issue #395 / #438 lesson).
+///
+/// BY DESIGN, the `hold_until` delay is compared against the APPLICATION clock seam
+/// (bound as `$4`), never the database wall clock: tests advance a frozen clock to cross
+/// the delay, and a database-level temporal trigger would reject those legitimate
+/// post-delay completions and, more broadly, ignore any operator-controlled time source.
+async fn complete_recovery_flow(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    flow_text: &str,
+    now_micros: i64,
+) -> Result<Option<String>, StoreError> {
+    let row = sqlx::query(
+        "UPDATE recovery_flows SET state = 'completed', \
+         completed_at = TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+         WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
+         AND state IN ('initiated', 'held') \
+         AND (hold_until IS NULL OR hold_until <= \
+              TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval) \
+         RETURNING recover_acr",
+    )
+    .bind(flow_text)
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(now_micros)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(row.map(|row| row.get::<String, _>("recover_acr")))
 }
 
 /// One designated trusted contact opened for notification (issue #82, PR 3): the `rtc_` id
@@ -31345,6 +31657,154 @@ pub struct NewInvitation<'a> {
     pub expires_at_unix_micros: i64,
 }
 
+/// One invitation for a NEW identity (issue #247): the `pending_verification` user to
+/// provision AND the invitation that activates it, written together by
+/// [`ActingInvitationRepo::create_with_user`] in one transaction.
+///
+/// There is no `target_identifier` field, deliberately. The invitation targets the
+/// identifier of the user it provisions, so it is read from [`NewInvitedUser::user`]
+/// rather than supplied a second time: two fields that must agree are two fields that
+/// can disagree, and an invitation targeting an identifier its own user does not hold
+/// is exactly the state this type exists to make unrepresentable.
+#[derive(Debug)]
+pub struct NewInvitedUser<'a> {
+    /// The user to provision. Its `state` is the caller's (the management create
+    /// surface uses [`UserState::PendingVerification`]), and its `id` may be supplied
+    /// so the caller can render the response body BEFORE the write, or left [`None`]
+    /// to mint one (the write returns whichever it landed on).
+    pub user: NewAdminUser<'a>,
+    /// The invitation id minted by [`mint_invitation_token`] alongside the token.
+    pub invitation_id: &'a InvitationId,
+    /// The SHA-256 hex digest of the whole token; the plaintext token is never stored.
+    pub token_digest: &'a str,
+    /// The primary-login credential the invitee enrolls on accept.
+    pub credential_type: InvitationCredentialType,
+    /// The opaque org handle M10 layers membership on, or [`None`].
+    pub org_context: Option<&'a str>,
+    /// The token expiry, in microseconds since the Unix epoch (the clock seam).
+    pub expires_at_unix_micros: i64,
+}
+
+/// INSERT one invitation row into the caller's OPEN transaction (issue #60): seal and
+/// blind-index the invited identifier under the scope's active DEK and write the row
+/// `pending`.
+///
+/// This is the ONE expression of what an invitation IS on a column, shared by
+/// [`ActingInvitationRepo::create`] and the joined create
+/// ([`ActingInvitationRepo::create_with_user`], issue #247). It takes an OPEN
+/// transaction rather than opening its own, which is what lets the joined path commit
+/// the invitation, the user it invites, both audit rows and the Idempotency-Key record
+/// together or not at all.
+///
+/// # Errors
+///
+/// [`StoreError::Conflict`] on a unique violation (the `inv_` handle or the token
+/// digest); [`StoreError::Encryption`] if the scope's active DEK cannot be read;
+/// [`StoreError::Database`] on a persistence failure. On any of them the caller's
+/// transaction is left for rollback.
+async fn insert_invitation_row(
+    tx: &mut Transaction<'_, Postgres>,
+    env: &Env,
+    master: &MasterKey,
+    scope: Scope,
+    spec: &NewInvitation<'_>,
+    created_at_micros: i64,
+) -> Result<(), StoreError> {
+    let bidx = invitation_identifier_blind_index(master, scope, spec.target_identifier);
+    let (dek_version, dek) = fetch_active_dek(tx, scope, master).await?;
+    let identifier_sealed = dek.seal(
+        env.entropy(),
+        &invitation_identifier_seal_aad(scope, dek_version),
+        spec.target_identifier.as_bytes(),
+    );
+    let result = sqlx::query(
+        "INSERT INTO user_invitations \
+         (id, tenant_id, environment_id, user_id, token_digest, \
+          target_identifier_sealed, target_identifier_bidx, pii_dek_version, \
+          credential_type, state, org_context, expires_at, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending', $10, \
+                 TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval, \
+                 TIMESTAMPTZ 'epoch' + ($12::text || ' microseconds')::interval, \
+                 TIMESTAMPTZ 'epoch' + ($12::text || ' microseconds')::interval)",
+    )
+    .bind(spec.id.to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(spec.user_id.to_string())
+    .bind(spec.token_digest)
+    .bind(identifier_sealed.into_bytes())
+    .bind(bidx.into_bytes())
+    .bind(dek_version)
+    .bind(spec.credential_type.as_str())
+    .bind(spec.org_context)
+    .bind(spec.expires_at_unix_micros)
+    .bind(created_at_micros)
+    .execute(&mut **tx)
+    .await;
+    match result {
+        Ok(_) => Ok(()),
+        Err(error) if is_unique_violation(&error) => Err(StoreError::Conflict),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Where the testing-only atomicity probe forces the joined invitation create to fail
+/// (issue #247). Compiled ONLY under the `testing` feature, so a production build holds
+/// no failure-injection seam and no name for one.
+///
+/// The variants are the three SEAMS a split create could be reintroduced at, and all
+/// three had to be named: an earlier version of this seam offered only [`AfterUser`],
+/// and a mutation that committed everything staged so far and finished in a SECOND
+/// transaction SURVIVED the suite (MEASURED). That mutant is the same defect at the
+/// other end, so the probe reaches both ends and the middle.
+///
+/// [`AfterUser`]: InvitationCreateFailurePoint::AfterUser
+#[cfg(feature = "testing")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvitationCreateFailurePoint {
+    /// Immediately after the Idempotency-Key record and BEFORE any data row: the instant
+    /// at which a split would commit the replay record with nothing standing behind it,
+    /// so a retry replays a stored 201 describing an invitation that does not exist.
+    AfterIdempotency,
+    /// Immediately after the user row and its `user.create` audit row: the exact instant
+    /// the old two-transaction path had COMMITTED the user and had not yet written the
+    /// invitation.
+    AfterUser,
+    /// After the LAST write (the `invitation.create` audit row) and BEFORE the commit.
+    /// This is the ONE point at which a split at the last seam is detectable: a mutant
+    /// that commits everything staged so far and finishes in a second transaction
+    /// behaves identically on every SUCCESSFUL create, and differs only when the write
+    /// after the split fails. Poisoning before that seam only ever rolls the mutant back
+    /// too, which is why a probe that stopped earlier left that mutant ALIVE (MEASURED).
+    BeforeCommit,
+}
+
+/// The armed failure seam the joined create honors.
+#[cfg(feature = "testing")]
+type ArmedInvitationFailure = Option<InvitationCreateFailurePoint>;
+
+/// The armed failure seam, in a build without the `testing` feature: [`Infallible`] has
+/// no value, so the only inhabitant is [`None`] and every probe in the joined create is
+/// compiled out.
+///
+/// [`Infallible`]: std::convert::Infallible
+#[cfg(not(feature = "testing"))]
+type ArmedInvitationFailure = Option<std::convert::Infallible>;
+
+/// Force a guaranteed in-transaction failure when the caller armed the probe for `here`.
+/// A no-op on every production path, which passes [`None`].
+#[cfg(feature = "testing")]
+async fn poison_invitation_create(
+    tx: &mut Transaction<'_, Postgres>,
+    armed: ArmedInvitationFailure,
+    here: InvitationCreateFailurePoint,
+) -> Result<(), StoreError> {
+    if armed == Some(here) {
+        sqlx::query("SELECT 1 / 0").execute(&mut **tx).await?;
+    }
+    Ok(())
+}
+
 /// A pending invitation resolved from a presented token (issue #60): enough for the
 /// accept surface to authorize the invitee (the user the invitation activates) and to
 /// validate the request against the credential type. Never carries the token digest.
@@ -31598,19 +32058,31 @@ impl ActingInvitationRepo<'_> {
         Ok(())
     }
 
-    /// CREATE an invitation (issue #60): seal and blind-index the invited identifier
-    /// under the scope's DEK, store the token DIGEST (never the token), and write one
-    /// `invitation.create` audit row (its operator-safe `detail` records the credential
-    /// type) in the same transaction. The `pending_verification` user this invitation
-    /// activates is created SEPARATELY through the #52 admin-create repo before this.
+    /// FIXTURE PATH (issue #247): create an invitation for a user that ALREADY EXISTS,
+    /// with its own transaction and its own `invitation.create` audit row.
+    ///
+    /// This is the un-joined shape the management surface used to have, and it is
+    /// `#[cfg(feature = "testing")]` precisely so that it CANNOT be that again: a
+    /// production build has no `create` on this repository at all, so a future handler
+    /// cannot provision a user in one transaction and reach for this in a second. The
+    /// production create is [`create_with_user`](Self::create_with_user), which writes
+    /// the user, the invitation, both audit rows and the Idempotency-Key record
+    /// together.
+    ///
+    /// It survives because several fixtures legitimately need an invitation attached to
+    /// a user they created and then USED (bound into an organization, given roles)
+    /// before the invitation existed, which the joined create cannot express. Fixtures
+    /// that do NOT need that use the joined call, so they exercise the production path.
     ///
     /// # Errors
     ///
-    /// [`StoreError::Conflict`] on a digest collision (a 256-bit-entropy token, so
-    /// astronomically unlikely); [`StoreError::IdempotencyConflict`] if the
-    /// Idempotency-Key was already used with a different request;
-    /// [`StoreError::Encryption`] if no master key is configured;
+    /// [`StoreError::Conflict`] on a handle or digest collision;
+    /// [`StoreError::IdempotencyConflict`] if the Idempotency-Key was already used;
+    /// [`StoreError::NotFound`] if an id is out of this scope;
+    /// [`StoreError::InvalidOrgContext`] if `org_context` is not an organization id in
+    /// this scope; [`StoreError::Encryption`] if no master key is configured;
     /// [`StoreError::Database`] on a persistence failure.
+    #[cfg(feature = "testing")]
     pub async fn create(
         &self,
         env: &Env,
@@ -31618,24 +32090,13 @@ impl ActingInvitationRepo<'_> {
         created_at_micros: i64,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<InvitationId, StoreError> {
-        if spec.id.scope() != self.scope || spec.user_id.scope() != self.scope {
+        if spec.user_id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
-        // Validate the org-context (issue #94): when present it MUST parse as an
-        // organization id in THIS scope, so a malformed or cross-scope handle is a
-        // clean early error rather than a foreign-key surprise at accept. A malformed
-        // value and a foreign-scope value are rejected identically (never an existence
-        // oracle). Existence and the active-state check are the admin layer's job; the
-        // membership foreign key is the ultimate existence backstop at accept.
-        if let Some(org_context) = spec.org_context {
-            OrganizationId::parse_in_scope(org_context, &self.scope)
-                .map_err(|_| StoreError::InvalidOrgContext)?;
-        }
-        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let master = self.prepare_invitation_write(spec.id, spec.org_context)?;
         self.ensure_scope_keys(env, master).await?;
         let scope = self.scope;
         let id = *spec.id;
-        let bidx = invitation_identifier_blind_index(master, scope, spec.target_identifier);
         let detail = format!("credential_type={}", spec.credential_type.as_str());
         write_audited_detailed(
             AuditedWrite {
@@ -31647,45 +32108,7 @@ impl ActingInvitationRepo<'_> {
                 target: &id,
             },
             async move |tx| {
-                let (dek_version, dek) = fetch_active_dek(tx, scope, master).await?;
-                let identifier_sealed = dek.seal(
-                    env.entropy(),
-                    &invitation_identifier_seal_aad(scope, dek_version),
-                    spec.target_identifier.as_bytes(),
-                );
-                let result = sqlx::query(
-                    "INSERT INTO user_invitations \
-                     (id, tenant_id, environment_id, user_id, token_digest, \
-                      target_identifier_sealed, target_identifier_bidx, pii_dek_version, \
-                      credential_type, state, org_context, expires_at, created_at, updated_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending', $10, \
-                             TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval, \
-                             TIMESTAMPTZ 'epoch' + ($12::text || ' microseconds')::interval, \
-                             TIMESTAMPTZ 'epoch' + ($12::text || ' microseconds')::interval)",
-                )
-                .bind(id.to_string())
-                .bind(scope.tenant().to_string())
-                .bind(scope.environment().to_string())
-                .bind(spec.user_id.to_string())
-                .bind(spec.token_digest)
-                .bind(identifier_sealed.into_bytes())
-                .bind(bidx.into_bytes())
-                .bind(dek_version)
-                .bind(spec.credential_type.as_str())
-                .bind(spec.org_context)
-                .bind(spec.expires_at_unix_micros)
-                .bind(created_at_micros)
-                .execute(&mut **tx)
-                .await;
-                match result {
-                    Ok(_) => {}
-                    Err(error) if is_unique_violation(&error) => return Err(StoreError::Conflict),
-                    Err(error) => return Err(error.into()),
-                }
-                // The Idempotency-Key row shares this transaction, so a replay of the
-                // POST returns the original response and writes no second audit row.
-                // The stored response body NEVER carries the raw token (only its digest
-                // is persisted anywhere), so a database dump yields nothing replayable.
+                insert_invitation_row(tx, env, master, scope, &spec, created_at_micros).await?;
                 insert_idempotency(tx, idempotency).await?;
                 Ok(())
             },
@@ -31694,6 +32117,254 @@ impl ActingInvitationRepo<'_> {
         )
         .await?;
         Ok(id)
+    }
+
+    /// The scope and org-context fences an invitation create must clear, plus the
+    /// master key it seals under.
+    ///
+    /// The org-context validation (issue #94) is here: when present it MUST parse as an
+    /// organization id in THIS scope, so a malformed or cross-scope handle is a clean
+    /// early error rather than a foreign-key surprise at accept. A malformed value and a
+    /// foreign-scope value are rejected identically (never an existence oracle).
+    /// Existence and the active-state check are the admin layer's job; the membership
+    /// foreign key is the ultimate existence backstop at accept.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the invitation id is out of this scope;
+    /// [`StoreError::InvalidOrgContext`] if `org_context` is not an organization id in
+    /// this scope; [`StoreError::Encryption`] if no master key is configured.
+    fn prepare_invitation_write(
+        &self,
+        id: &InvitationId,
+        org_context: Option<&str>,
+    ) -> Result<&MasterKey, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        if let Some(org_context) = org_context {
+            OrganizationId::parse_in_scope(org_context, &self.scope)
+                .map_err(|_| StoreError::InvalidOrgContext)?;
+        }
+        self.store.master().ok_or(StoreError::Encryption)
+    }
+
+    /// CREATE an invitation AND the `pending_verification` user it activates, in ONE
+    /// transaction (issue #247).
+    ///
+    /// # What this closes
+    ///
+    /// The management create surface used to run two UN-JOINED transactions: the #52
+    /// audited admin user create, and then the invitation create that also committed
+    /// the caller's `Idempotency-Key` record. A failure of the second AFTER the first
+    /// committed left an orphaned `pending_verification` user with no invitation and no
+    /// stored idempotency record, so a retry under the SAME key missed the replay store,
+    /// re-ran the user create, hit the identifier unique violation, and answered 409
+    /// instead of replaying. The identifier stayed wedged behind the ghost account until
+    /// an operator deleted it. A CONCURRENT same-key create degraded the same way, the
+    /// loser getting that 409 rather than the winner's original 201 body, and JOINING THE
+    /// WRITES DID NOT CLOSE THAT HALF: see the ordering note below, which did.
+    ///
+    /// This is a BESPOKE COMMITTING PATH (like the refresh redeem and the grant
+    /// revoke): the Idempotency-Key record, the user row, its `user.create` audit row,
+    /// the invitation row and its `invitation.create` audit row all share ONE
+    /// transaction. A failure at ANY point rolls back ALL of it, so a partial create
+    /// leaves NOTHING: no ghost user, no invitation, no audit row and no idempotency
+    /// record. A retry therefore re-executes cleanly.
+    ///
+    /// The Idempotency-Key record is written FIRST, which is what makes the CONCURRENT
+    /// same-key answer right rather than merely atomic. Joining alone does not fix that
+    /// race: with the record written LAST the loser blocks on the identifier unique
+    /// index and still surfaces [`StoreError::Conflict`], which is the 409 that says the
+    /// caller's identifier is taken when it is only their own concurrent request holding
+    /// it (MEASURED over HTTP: `409 conflict` against the winner's `201`). Writing it
+    /// first means the loser blocks on `idempotency_keys` instead and reaches
+    /// [`StoreError::IdempotencyConflict`], which the caller resolves by replaying the
+    /// winner's committed response. `ActingRecoveryApprovalRepo::approve` orders its
+    /// writes the same way, for the same reason.
+    ///
+    /// The invitation TARGETS the identifier of the user it provisions, by construction:
+    /// the target identifier is read from the user spec rather than supplied twice, so
+    /// the two can never disagree.
+    ///
+    /// Returns the user id the create landed on. `created_at_micros` flows from the
+    /// application clock seam, never the database clock, and stamps the user and the
+    /// invitation identically.
+    ///
+    /// # The user id is always a FRESH MINT here
+    ///
+    /// Unlike the #52 admin create, whose id may be preserved from an exported record,
+    /// this path only ever provisions a NEW account: `spec.user.id` is minted from 256
+    /// bits inside the request that uses it (the management handler mints it because the
+    /// stored response body has to name the user before the write). So a collision on
+    /// the `users` PRIMARY KEY here is a mint collision and not a caller fault, exactly
+    /// like the `inv_` handle, and it is reported as such. Only a collision on the login
+    /// handle is the caller's 409.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Conflict`] if the INVITED IDENTIFIER is already taken in this scope,
+    /// which is the caller's 409; [`StoreError::InvitationMintCollision`] if any of the
+    /// three values this path mints from 256 bits collided (the `usr_` id, the `inv_`
+    /// handle, or the token digest), which is NOT a caller fault and is deliberately a
+    /// distinct error; [`StoreError::NotFound`] if the invitation id or the supplied user
+    /// id is out of this scope; [`StoreError::InvalidOrgContext`] if `org_context` is not
+    /// an organization id in this scope; [`StoreError::IdempotencyConflict`] if a
+    /// concurrent request already stored this Idempotency-Key;
+    /// [`StoreError::Encryption`] if no master key is configured;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn create_with_user(
+        &self,
+        env: &Env,
+        spec: NewInvitedUser<'_>,
+        created_at_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<UserId, StoreError> {
+        self.create_with_user_inner(
+            env,
+            spec,
+            created_at_micros,
+            idempotency,
+            ArmedInvitationFailure::default(),
+        )
+        .await
+    }
+
+    /// Testing-only atomicity probe (issue #247): run the joined create up to `at`, then
+    /// force a guaranteed error INSIDE the transaction.
+    ///
+    /// The variants of [`InvitationCreateFailurePoint`] are the three SEAMS a split
+    /// create could be reintroduced at, so a test can assert the same post-condition at
+    /// each: after this call no user row, no invitation row, neither audit row and no
+    /// idempotency record survives, and a retry under the SAME Idempotency-Key with the
+    /// SAME identifier therefore succeeds instead of answering 409. The public
+    /// [`create_with_user`](Self::create_with_user) never poisons.
+    ///
+    /// # Errors
+    ///
+    /// Always errors (that is the point): the injected failure rolls the whole
+    /// transaction back.
+    #[cfg(feature = "testing")]
+    pub async fn create_with_user_injecting_failure(
+        &self,
+        env: &Env,
+        spec: NewInvitedUser<'_>,
+        created_at_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        at: InvitationCreateFailurePoint,
+    ) -> Result<UserId, StoreError> {
+        self.create_with_user_inner(env, spec, created_at_micros, idempotency, Some(at))
+            .await
+    }
+
+    /// Shared body of the joined create. `poison` is always [`None`] for the public
+    /// mutator; the testing-only atomicity probe supplies a failure point.
+    async fn create_with_user_inner(
+        &self,
+        env: &Env,
+        spec: NewInvitedUser<'_>,
+        created_at_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        poison: ArmedInvitationFailure,
+    ) -> Result<UserId, StoreError> {
+        // Without the `testing` feature the seam type has no inhabited variant, so
+        // `poison` cannot be armed and every probe below is compiled out.
+        #[cfg(not(feature = "testing"))]
+        if let Some(armed) = poison {
+            match armed {}
+        }
+        let master = self.prepare_invitation_write(spec.invitation_id, spec.org_context)?;
+        // Provisioning the scope's KEK and DEK is idempotent and commits on its own,
+        // exactly as it does for both single writes. It is key material for the scope,
+        // not part of this create: leaving a provisioned DEK behind after a rolled-back
+        // create is not a partial invitation, it is a scope that is ready to seal.
+        self.ensure_scope_keys(env, master).await?;
+        let scope = self.scope;
+        let user_id = resolve_admin_user_id(env, scope, spec.user.id)?;
+        let invitation_id = *spec.invitation_id;
+        // The invitation targets the identifier of the user it provisions, read from
+        // the user spec rather than supplied a second time.
+        let invitation = NewInvitation {
+            id: &invitation_id,
+            user_id: &user_id,
+            target_identifier: spec.user.identifier,
+            token_digest: spec.token_digest,
+            credential_type: spec.credential_type,
+            org_context: spec.org_context,
+            expires_at_unix_micros: spec.expires_at_unix_micros,
+        };
+        let detail = format!("credential_type={}", spec.credential_type.as_str());
+        let mut tx = begin_scoped(self.store, scope).await?;
+        // 1. The Idempotency-Key record, FIRST. Order inside one transaction changes
+        // nothing about what commits, but it decides which unique index a CONCURRENT
+        // same-key request blocks on, and therefore which error it surfaces. Written
+        // first, the loser blocks here and reaches IdempotencyConflict, which the caller
+        // resolves by replaying the winner's committed response. Written last, it blocks
+        // on the login-handle index instead and reports the caller's identifier taken
+        // when only their own concurrent request holds it (MEASURED). This is where
+        // `ActingRecoveryApprovalRepo::approve` puts it too, for the same reason.
+        insert_idempotency(&mut tx, idempotency).await?;
+        #[cfg(feature = "testing")]
+        poison_invitation_create(
+            &mut tx,
+            poison,
+            InvitationCreateFailurePoint::AfterIdempotency,
+        )
+        .await?;
+        // 2. The user, and 3. its `user.create` audit row: the same pair
+        // `ActingUserRepo::admin_create` writes, through the same insert. The `usr_` id
+        // is a fresh mint on this path, so a collision on the users PRIMARY KEY is a
+        // mint collision rather than the caller's 409, exactly like the `inv_` handle
+        // below; only the login handle is the caller-facing conflict.
+        insert_admin_user_row(
+            &mut tx,
+            env,
+            master,
+            scope,
+            &user_id,
+            &spec.user,
+            created_at_micros,
+            StoreError::InvitationMintCollision,
+        )
+        .await?;
+        let user_audit = AuditedWrite {
+            store: self.store,
+            scope,
+            acting: &self.acting,
+            env,
+            action: Action::UserCreate,
+            target: &user_id,
+        };
+        insert_audit_row(&mut tx, &user_audit, None).await?;
+        #[cfg(feature = "testing")]
+        poison_invitation_create(&mut tx, poison, InvitationCreateFailurePoint::AfterUser).await?;
+        // 4. The invitation. A unique violation here is a collision on the `inv_` handle
+        // or the token digest, both minted from 256 bits of entropy, so it is reported
+        // as its OWN error: the identifier is not what collided and telling the caller
+        // it was would be false.
+        match insert_invitation_row(&mut tx, env, master, scope, &invitation, created_at_micros)
+            .await
+        {
+            Ok(()) => {}
+            Err(StoreError::Conflict) => return Err(StoreError::InvitationMintCollision),
+            Err(error) => return Err(error),
+        }
+        // 5. Its `invitation.create` audit row, carrying the same operator-safe detail
+        // the single-write path records.
+        let invitation_audit = AuditedWrite {
+            store: self.store,
+            scope,
+            acting: &self.acting,
+            env,
+            action: Action::InvitationCreate,
+            target: &invitation_id,
+        };
+        insert_audit_row(&mut tx, &invitation_audit, Some(&detail)).await?;
+        #[cfg(feature = "testing")]
+        poison_invitation_create(&mut tx, poison, InvitationCreateFailurePoint::BeforeCommit)
+            .await?;
+        tx.commit().await?;
+        Ok(user_id)
     }
 
     /// REVOKE a PENDING invitation (issue #60): a guarded pending -> revoked flip that
@@ -32366,6 +33037,26 @@ fn is_unique_violation(error: &sqlx::Error) -> bool {
         .and_then(sqlx::error::DatabaseError::code)
         .as_deref()
         == Some("23505")
+}
+
+/// The PRIMARY KEY constraint on `users`, named by Postgres from the table name (the
+/// column is declared `id text PRIMARY KEY` in migration 0006 and no migration renames
+/// it). A unique violation naming it is a duplicate USER ID, which the joined invitation
+/// create judges differently from a duplicate login handle (issue #247). The name is
+/// asserted against a LIVE database by
+/// `a_taken_identifier_and_a_mint_collision_are_different_errors` in
+/// `crates/ironauth-store/tests/invitations.rs`, which drives a duplicate user id
+/// through the real insert: if the constraint were ever renamed, that create would fall
+/// back to the caller-facing conflict and the test would fail.
+const USERS_ID_CONSTRAINT: &str = "users_pkey";
+
+/// The constraint a Postgres integrity violation names, when it names one. Used to tell
+/// two unique indexes on ONE insert apart when they mean opposite things: a duplicate
+/// value the caller supplied, and a collision on a value the server minted.
+fn unique_violation_constraint(error: &sqlx::Error) -> Option<&str> {
+    error
+        .as_database_error()
+        .and_then(sqlx::error::DatabaseError::constraint)
 }
 
 /// Whether a database error is a Postgres check-constraint violation (SQLSTATE
@@ -45624,7 +46315,22 @@ impl ActingEnvelopeRepo<'_> {
                 .bind(master.id())
                 .bind(wrapped.into_bytes())
                 .execute(&mut **tx)
-                .await?;
+                .await
+                // The version read above is a CHECK-then-INSERT, so two concurrent first
+                // writes into a fresh scope both see no KEK and both insert. The
+                // `UNIQUE (tenant_id, environment_id, version)` index decides it, and
+                // the loser is the SAME already-provisioned outcome the read arm reports:
+                // reporting it as a persistence fault instead made `ensure_scope_keys`'s
+                // documented tolerance of a conflict unreachable under an actual race,
+                // so the first concurrent pair of writes into a new environment answered
+                // 500 (MEASURED, issue #247's concurrency test found it).
+                .map_err(|error| {
+                    if is_unique_violation(&error) {
+                        StoreError::Conflict
+                    } else {
+                        error.into()
+                    }
+                })?;
                 Ok(())
             },
             false,
@@ -45743,7 +46449,17 @@ impl ActingEnvelopeRepo<'_> {
                 .bind(kek_version)
                 .bind(wrapped.into_bytes())
                 .execute(&mut **tx)
-                .await?;
+                .await
+                // Same check-then-insert race as `provision_kek`: the unique index is
+                // the arbiter, and losing it means the scope's day-one DEK already
+                // exists, which is the conflict the read arm above reports.
+                .map_err(|error| {
+                    if is_unique_violation(&error) {
+                        StoreError::Conflict
+                    } else {
+                        error.into()
+                    }
+                })?;
                 Ok(())
             },
             false,

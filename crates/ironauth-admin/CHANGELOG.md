@@ -6,6 +6,66 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **BEHAVIOR FIX. A failed invitation create no longer wedges the identifier it named**
+  (issue #247). `POST /v1/tenants/{tenant_id}/environments/{environment_id}/invitations`
+  provisioned the `pending_verification` user in one store transaction and wrote the
+  invitation (with the Idempotency-Key record) in a second. A failure of the second after
+  the first committed left an orphaned user with no invitation and no stored key: the retry
+  under the SAME key missed the replay store, re-ran the user create, hit the identifier
+  unique violation and answered **409**, and the identifier stayed unusable behind a ghost
+  account until an operator deleted it through #52. The handler now makes ONE store call
+  that writes the user, the invitation, both audit rows and the idempotency record in one
+  transaction, so a partial create leaves NOTHING and the retry re-executes cleanly
+  (MEASURED over HTTP by
+  `a_create_whose_second_write_fails_leaves_no_ghost_and_the_same_key_then_creates`: the
+  retry that used to be a 409 is a 201). The user id is minted in the handler now, because
+  both the response body and the body stored under the key name the user and so must be
+  knowable before the write. The 409 stays exactly what it always was, a genuinely taken
+  login handle; the astronomically-improbable collision on one of the three values the path
+  mints from 256 bits (that `usr_` id, the `inv_` handle, the token digest) keeps its own
+  500 and can no longer be mistaken for one. No wire change.
+- **BEHAVIOR FIX. A CONCURRENT same-key invitation create now replays the winner instead of
+  answering 409** (issue #247). This is a SEPARATE half of the same defect, and joining the
+  two writes did not fix it. Both racers pass the replay lookup and reach the store, so one
+  blocks on a unique index; which index it blocks on is what it gets told. With the
+  Idempotency-Key record written last inside the joined transaction the loser blocked on
+  the login-handle index and still answered 409 "a user or invitation with this identifier
+  already exists", naming the caller's identifier as taken when nothing but their own
+  in-flight twin held it (MEASURED against a live cluster: `201` against `409`). The record
+  is written FIRST now, so the loser blocks on `idempotency_keys`, reaches the idempotency
+  race, and replays the winner's committed 201, which is what the header contract promises
+  (MEASURED over HTTP by
+  `two_concurrent_same_key_creates_land_once_and_the_loser_replays_the_winner`). No wire
+  change.
+- **BEHAVIOR FIX. Approving an admin-gated recovery no longer strands the flow on a failed
+  completion** (issue #247, same shape). `POST .../recovery-approvals/{flow_id}/approve` ran
+  the audited decision (which committed the Idempotency-Key record) and then completed the
+  recovery in a SECOND store call whose result it discarded. A failed completion therefore
+  left an approved-but-unfinished flow that the replay store could not see: a retry under
+  the same key replayed the stored 200 and never re-attempted the completion, so only a
+  FRESH Idempotency-Key could ever finish that flow. The decision and the completion are one
+  store transaction now. The #81 delay gate is unchanged: an approve inside the hold window
+  still decides the case and still declines to complete, and the admin re-approves after the
+  window to finalize. No wire change.
+- **AUDIT LOG CHANGE on the recovery-approval approve.** A HELD approve used to write a
+  `recovery.complete` audit row unconditionally, because the old second call went through
+  `write_audited_detailed`, which audits whether or not the guarded UPDATE matched. The
+  joined path writes that row only when the flow actually FLIPPED. So an approve inside the
+  #81 hold window now records `recovery.approved` alone, where it used to record a
+  `recovery.complete` for a completion that did not happen. This is more accurate and it is
+  a change to what the recovery audit log CONTAINS: an operator query counting
+  `recovery.complete` rows will see fewer of them, and the ones it sees are now completions.
+- **BEHAVIOR FIX. Two concurrent first writes into a brand-new environment no longer answer
+  500** (issue #247, found by the concurrency test above). The scope's day-one KEK and DEK
+  are provisioned lazily by a check-then-insert, and `ensure_scope_keys` already tolerated
+  the resulting conflict, but the insert reported its unique violation as a persistence
+  fault rather than as that conflict, so the tolerance was unreachable under an actual race
+  and the loser got an opaque server error (MEASURED at the store: `duplicate key value
+  violates unique constraint "tenant_keks_tenant_id_environment_id_version_key"`; the
+  management create path races on the DEK rather than the KEK, measured by reverting the
+  KEK half alone, which the concurrency test survives, and then both halves, which it does
+  not). Losing that race means the key already exists,
+  which is exactly what the read arm reports.
 - **BEHAVIOR FIX. `POST /v1/tenants/{tenant_id}/restore` reports the status it actually
   committed** (issue #438). The 200 body was built BEFORE the store call, hardcoded to
   `active` and commented as the deterministic post-condition, and that same string was

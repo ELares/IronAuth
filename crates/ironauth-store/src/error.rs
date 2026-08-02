@@ -88,6 +88,18 @@ pub enum StoreError {
     ///
     /// [`NotFound`]: StoreError::NotFound
     InvalidOrgContext,
+    /// An invitation create collided on one of the THREE values it mints from 256 bits
+    /// of entropy: the `usr_` id of the account it provisions, the `inv_` handle (the
+    /// invitation row's primary key), or the token digest (issue #247). DELIBERATELY
+    /// distinct from [`Conflict`], which on the joined invitation-create path means the
+    /// INVITED LOGIN HANDLE is already taken (a genuine 409 the caller can act on). A
+    /// mint collision is not a caller fault and there is nothing they could change about
+    /// the request, so it is an opaque server error; conflating the two would tell an
+    /// operator that the identifier they chose is taken when it is not. Carries no
+    /// tenant data.
+    ///
+    /// [`Conflict`]: StoreError::Conflict
+    InvitationMintCollision,
     /// A custom-domain registration submitted a value that is not a plain
     /// registrable hostname (issue #47): an IP literal, an internal single-label
     /// name, or a value carrying a scheme, port, path, or whitespace. Rejected
@@ -326,9 +338,14 @@ impl StoreError {
     pub fn into_wire(self) -> StoreErrorWire {
         match self {
             StoreError::NotFound => StoreErrorWire::NotFound,
-            StoreError::Database(_) | StoreError::Migration(_) | StoreError::Encryption => {
-                StoreErrorWire::Internal
-            }
+            // An invitation mint collision joins the genuine faults: 256 bits of
+            // entropy collided, which the caller neither caused nor can act on, and
+            // which no typed refusal could describe without asserting something false
+            // about their request.
+            StoreError::Database(_)
+            | StoreError::Migration(_)
+            | StoreError::Encryption
+            | StoreError::InvitationMintCollision => StoreErrorWire::Internal,
             StoreError::IdempotencyConflict => StoreErrorWire::IdempotencyRace,
             // Collisions. A uniqueness violation is the obvious one; a migration-run edge
             // the state machine forbids is the less obvious one, and it belongs here
@@ -381,6 +398,7 @@ impl fmt::Display for StoreError {
             StoreError::InvalidOrgContext => {
                 f.write_str("org_context is not a valid organization id")
             }
+            StoreError::InvitationMintCollision => f.write_str("invitation create mint collision"),
             StoreError::InvalidCustomDomain => f.write_str("invalid custom domain"),
             StoreError::InvalidName => f.write_str("invalid secret or variable name"),
             StoreError::InvalidIdentifier => f.write_str("invalid login identifier"),
@@ -440,6 +458,7 @@ impl std::error::Error for StoreError {
             | StoreError::QuotaExceeded
             | StoreError::Encryption
             | StoreError::InvalidOrgContext
+            | StoreError::InvitationMintCollision
             | StoreError::InvalidCustomDomain
             | StoreError::InvalidName
             | StoreError::InvalidIdentifier
