@@ -46,20 +46,28 @@ The lint is a COUNT, not a proof of correctness. What it buys is that no session
 site can be added silently: the author has to come here and write down what mints and under
 what gate.
 
+The doc check matches the FULL PATH from the inventory, which is why the table below carries
+full paths rather than the bare file names it used to. It matched a BASENAME until issue #241,
+and that degraded the rule to a bare count for any new mint file whose basename collided with
+one already listed: the inventory diff fired, the author regenerated, and the doc check then
+passed on a file nobody had written a row for. Measured on the sibling
+`user-token-mint-registry` rule, whose check had the identical bug, by adding a second
+`token.rs` under a subdirectory.
+
 ## The registry
 
 | File | What mints there | Gated by |
 |------|------------------|----------|
-| `login.rs` (3) | The hosted password login, the MFA continuation, and the trusted-device continuation | The password credential itself; MFA where enrolled. Not a `GatedSessionPath`: a password is not a weak possession factor, and whether enrolling a passkey should raise the floor for a password login is issue #267's stated non-question |
-| `register.rs` | The self-service registration completion | The registration itself (a brand-new account holds no stronger factor to downgrade past) |
-| `email_otp.rs` | `POST /otp/verify` | `GatedSessionPath::EmailOtpVerify` |
-| `magic_link.rs` | `POST /magic/consume` | `GatedSessionPath::MagicLinkConsume` |
-| `sms_otp.rs` | `POST /otp/sms/verify` | `GatedSessionPath::SmsOtpVerify` |
-| `flow/mod.rs` | The headless flow engine's completion mint (login, registration, recovery, MFA) | `GatedSessionPath::FlowRecoveryVerify` on the recovery journey; the flow's own step preconditions otherwise |
-| `webauthn.rs` (2) | The passkey authentication ceremony and the passkey-first registration ceremony | The ceremony. A passkey is the TOP of the ladder, so there is no downgrade to gate |
-| `federation.rs` | The upstream-IdP callback | The verified upstream assertion |
-| `device_verify.rs` | The device-authorization user-code approval | The approving user's own session |
-| `advanced_recovery.rs` | `POST /recover/finalize` (issue #295) | **The deliberate exception.** Gated by `finalize_recovery`: the mode precondition AND the store `complete`'s `hold_until <= now` delay guard. NOT in `GatedSessionPath::ALL`, named instead by `factor_downgrade::UngatedSessionMint::RecoveryFinalize`. See that type's doc for why registering it would fail the issue #267 sweeps by construction |
+| `crates/ironauth-oidc/src/login.rs` (3) | The hosted password login, the MFA continuation, and the trusted-device continuation | The password credential itself; MFA where enrolled. Not a `GatedSessionPath`: a password is not a weak possession factor, and whether enrolling a passkey should raise the floor for a password login is issue #267's stated non-question |
+| `crates/ironauth-oidc/src/register.rs` | The self-service registration completion | The registration itself (a brand-new account holds no stronger factor to downgrade past) |
+| `crates/ironauth-oidc/src/email_otp.rs` | `POST /otp/verify` | `GatedSessionPath::EmailOtpVerify` |
+| `crates/ironauth-oidc/src/magic_link.rs` | `POST /magic/consume` | `GatedSessionPath::MagicLinkConsume` |
+| `crates/ironauth-oidc/src/sms_otp.rs` | `POST /otp/sms/verify` | `GatedSessionPath::SmsOtpVerify` |
+| `crates/ironauth-oidc/src/flow/mod.rs` | The headless flow engine's completion mint (login, registration, recovery, MFA) | `GatedSessionPath::FlowRecoveryVerify` on the recovery journey; the flow's own step preconditions otherwise |
+| `crates/ironauth-oidc/src/webauthn.rs` (2) | The passkey authentication ceremony and the passkey-first registration ceremony | The ceremony. A passkey is the TOP of the ladder, so there is no downgrade to gate |
+| `crates/ironauth-oidc/src/federation.rs` | The upstream-IdP callback | The verified upstream assertion |
+| `crates/ironauth-oidc/src/device_verify.rs` | The device-authorization user-code approval | The approving user's own session |
+| `crates/ironauth-oidc/src/advanced_recovery.rs` | `POST /recover/finalize` (issue #295) | **The deliberate exception.** Gated by `finalize_recovery`: the mode precondition AND the store `complete`'s `hold_until <= now` delay guard. NOT in `GatedSessionPath::ALL`, named instead by `factor_downgrade::UngatedSessionMint::RecoveryFinalize`. See that type's doc for why registering it would fail the issue #267 sweeps by construction |
 
 ## Adding a session-minting surface
 

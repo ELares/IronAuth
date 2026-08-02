@@ -101,11 +101,26 @@ expect_exact() {
 #    a sentinel" is a claim about a hand-written list, not about the enum: a variant
 #    added to the enum and to the total `match` beside the list left the list short
 #    and every sweep stayed green (measured, issue #404 review).
+#
+#    The last two entries are NOT diagnostic vocabularies, and they are listed here
+#    anyway because this gate pins the module EXACTLY and that module is where the
+#    `declared_variants` source parser lives. `UserState` is a LIFECYCLE vocabulary
+#    (issue #241): `user_state_all_holds_every_declared_variant` pins its `ALL` against
+#    the enum's own declaration, and `every_reachable_non_authenticatable_state_ends_sessions`
+#    pins the three-way relation across `can_authenticate`, `ends_sessions` and
+#    `can_transition_to` that the token-mint fences rest on. Measured during the #241
+#    review: a state that is non-authenticatable, a valid transition target, and not
+#    session-ending compiles at every one of the six match sites and silently reopens
+#    four user-bound mint paths, and only that relation test catches it. So they cover a
+#    mint invariant rather than a redaction one, and they belong to this list only
+#    because they share the parser this gate is asserting about.
 expect_exact ironauth-store "closed vocabulary lists match their enum declarations" \
   repository::variant_lists_match_the_enum_declarations:: \
   repository::variant_lists_match_the_enum_declarations::client_auth_diagnostic_reason_all_holds_every_declared_variant \
   repository::variant_lists_match_the_enum_declarations::diagnostic_expectation_all_holds_every_declared_variant \
   repository::variant_lists_match_the_enum_declarations::token_size_reason_all_holds_every_declared_variant \
+  repository::variant_lists_match_the_enum_declarations::user_state_all_holds_every_declared_variant \
+  repository::variant_lists_match_the_enum_declarations::every_reachable_non_authenticatable_state_ends_sessions \
   repository::variant_lists_match_the_enum_declarations::the_declaration_parser_refuses_an_enum_it_cannot_find
 
 # 1. The client-authentication diagnostic corpus: a hostile assertion with secret,

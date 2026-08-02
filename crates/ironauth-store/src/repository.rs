@@ -10737,6 +10737,21 @@ pub enum ClientAuthDiagnosticReason {
     /// it answers `invalid_scope` only after the client has authenticated as the
     /// owner of the allowlist in question.
     ScopeNotAllowlisted,
+    /// A JWT bearer assertion grant assertion verified and its subject DID resolve to
+    /// a registered mapping rule, but the mapped principal is a LIFECYCLE BEARING user
+    /// that may not authenticate: blocked, disabled, deleted, absent, or awaiting
+    /// verification (issue #241).
+    ///
+    /// Distinct from [`ClientAuthDiagnosticReason::AssertionSubjectUnmapped`] on
+    /// purpose, and the distinction is the whole operational value of the row. An
+    /// unmapped subject means the operator never wrote a rule for it; this means the
+    /// rule is there and correct and the ACCOUNT behind it was fenced. Recording both
+    /// under one reason would tell an operator to go add a mapping that already exists.
+    ///
+    /// Recorded ONLY for a principal that parses as a `usr_` id: a workload or
+    /// service-account principal carries no lifecycle and is never checked, so it can
+    /// never land here.
+    PrincipalNotAuthenticatable,
 }
 
 impl ClientAuthDiagnosticReason {
@@ -10760,7 +10775,7 @@ impl ClientAuthDiagnosticReason {
     /// nothing outside the `match` can observe a variant the array omits, so no runtime
     /// assertion written against the array can notice the omission. Only a witness
     /// derived from the enum's own declaration can, which is what the test above is.
-    pub const ALL: [ClientAuthDiagnosticReason; 16] = [
+    pub const ALL: [ClientAuthDiagnosticReason; 17] = [
         ClientAuthDiagnosticReason::Unparsable,
         ClientAuthDiagnosticReason::UnknownClient,
         ClientAuthDiagnosticReason::MethodMismatch,
@@ -10777,6 +10792,7 @@ impl ClientAuthDiagnosticReason {
         ClientAuthDiagnosticReason::AssertionIssuerUntrusted,
         ClientAuthDiagnosticReason::AssertionSubjectUnmapped,
         ClientAuthDiagnosticReason::ScopeNotAllowlisted,
+        ClientAuthDiagnosticReason::PrincipalNotAuthenticatable,
     ];
 
     /// The stable wire string recorded in the diagnostics row.
@@ -10803,6 +10819,9 @@ impl ClientAuthDiagnosticReason {
             ClientAuthDiagnosticReason::AssertionIssuerUntrusted => "assertion_issuer_untrusted",
             ClientAuthDiagnosticReason::AssertionSubjectUnmapped => "assertion_subject_unmapped",
             ClientAuthDiagnosticReason::ScopeNotAllowlisted => "scope_not_allowlisted",
+            ClientAuthDiagnosticReason::PrincipalNotAuthenticatable => {
+                "principal_not_authenticatable"
+            }
         }
     }
 }
@@ -13901,6 +13920,36 @@ pub enum UserState {
 }
 
 impl UserState {
+    /// Every declared state, in declaration order (issue #241).
+    ///
+    /// It exists so the three predicates below can be checked AGAINST EACH OTHER rather
+    /// than each on its own. [`UserState::can_authenticate`], [`UserState::ends_sessions`]
+    /// and [`UserState::can_transition_to`] together decide whether a fenced user keeps
+    /// minting tokens, and they decide it jointly: the code exchange, the device grant, the
+    /// implicit and hybrid front-channel ID token, and the FedCM assertion are all fenced by
+    /// the SESSION CASCADE rather than by a direct lifecycle read, and the cascade is
+    /// equivalent to a direct read only because every state that (a) can be transitioned
+    /// INTO and (b) cannot authenticate also (c) ends the user's sessions. Today that holds
+    /// because `ends_sessions` is exactly {blocked, disabled} while `can_authenticate` is
+    /// exactly {active, scheduled-offboarding}, and the apparent gap (pending-verification,
+    /// waitlisted) is closed by `can_transition_to` refusing both as TARGETS, so a user can
+    /// only be in one of them from creation, holding no session and no authorization code.
+    ///
+    /// That is a three-way relation held in three separate functions with nothing tying
+    /// them together. A state that is non-authenticatable, a valid transition target, and
+    /// not session-ending would silently REOPEN all four of those mint paths, with no
+    /// compile error anywhere. `variant_lists_match_the_enum_declarations` asserts the
+    /// relation over this array, and asserts this array against the enum's own declaration
+    /// so it cannot go stale.
+    pub const ALL: [UserState; 6] = [
+        UserState::Active,
+        UserState::Blocked,
+        UserState::Disabled,
+        UserState::PendingVerification,
+        UserState::ScheduledOffboarding,
+        UserState::Waitlisted,
+    ];
+
     /// The stable wire string stored in `users.state`.
     #[must_use]
     pub fn as_str(&self) -> &'static str {
@@ -13942,6 +13991,12 @@ impl UserState {
     /// Whether entering this state ENDS the user's live sessions: blocking or
     /// disabling a user cascades to its sessions and non-offline refresh families
     /// and publishes to the session-ended fan-out (issue #35).
+    ///
+    /// NARROWING THIS IS A TOKEN-MINT CHANGE, not a session change. Four mint paths are
+    /// fenced by the cascade rather than by a lifecycle read, and they are equivalent to
+    /// one only under the relation recorded on [`UserState::ALL`]. Removing a state from
+    /// here, or adding a non-authenticatable state that is a valid transition target
+    /// without adding it here, reopens all four. The test over `ALL` is what says so.
     #[must_use]
     pub fn ends_sessions(&self) -> bool {
         matches!(self, UserState::Blocked | UserState::Disabled)
@@ -13962,6 +14017,12 @@ impl UserState {
     /// disabled, never the reverse). Every other move between live states is
     /// permitted; the store additionally requires a timestamp for a move to
     /// scheduled-offboarding. An invalid transition is refused fail closed.
+    ///
+    /// WIDENING THE TARGET SET IS A TOKEN-MINT CHANGE. Pending-verification and waitlisted
+    /// are non-authenticatable and do NOT end sessions, which is safe only because they are
+    /// unreachable as targets: such a user was created that way and holds no session and no
+    /// authorization code. Making either a valid target, or admitting a new state like
+    /// them, reopens the four cascade-fenced mint paths. See [`UserState::ALL`].
     #[must_use]
     pub fn can_transition_to(self, to: UserState) -> bool {
         if self == to {
@@ -51441,7 +51502,7 @@ mod upstream_token_seal_tests {
 /// principle, different witness.
 #[cfg(test)]
 mod variant_lists_match_the_enum_declarations {
-    use super::{ClientAuthDiagnosticReason, DiagnosticExpectation, TokenSizeReason};
+    use super::{ClientAuthDiagnosticReason, DiagnosticExpectation, TokenSizeReason, UserState};
 
     /// This very file, resolved from the crate root rather than the process working
     /// directory, so the result does not depend on where the runner was invoked.
@@ -51549,6 +51610,94 @@ mod variant_lists_match_the_enum_declarations {
             "TokenSizeReason::ALL must hold every variant the enum declares, in declaration \
              order"
         );
+    }
+
+    #[test]
+    fn user_state_all_holds_every_declared_variant() {
+        let text = source();
+        assert_eq!(
+            rendered(&UserState::ALL),
+            declared_variants(&text, "UserState"),
+            "UserState::ALL must hold every variant the enum declares, in declaration \
+             order. It is the witness the lifecycle relation below is checked over, so a \
+             state missing here is a state that relation never examines."
+        );
+    }
+
+    /// The three-way lifecycle relation the SESSION CASCADE rests on (issue #241).
+    ///
+    /// Four user-bound token mints are fenced by the cascade rather than by a direct
+    /// lifecycle read: the session-carrying authorization-code exchange, the device grant,
+    /// the implicit and hybrid front-channel ID token, and the FedCM id-assertion. Each
+    /// reads live SSO-session state and mints if it finds one. That is equivalent to
+    /// asking whether the account may still authenticate ONLY IF a user who may not
+    /// authenticate can never be holding a live session, and whether that holds is decided
+    /// jointly by three predicates that live apart and know nothing of each other:
+    ///
+    /// - `can_authenticate` = {`Active`, `ScheduledOffboarding`};
+    /// - `ends_sessions` = {`Blocked`, `Disabled`};
+    /// - `can_transition_to` refuses `PendingVerification` and `Waitlisted` as TARGETS.
+    ///
+    /// The apparent gap is those last two: they cannot authenticate and they do not end
+    /// sessions. It is closed by the third predicate, not the second. They are
+    /// creation-time states only, so a user in one has never held a session or a code, and
+    /// there is nothing for the cascade to have failed to end.
+    ///
+    /// Add a state that is non-authenticatable, a valid transition target, and not
+    /// session-ending, and all four mint paths silently reopen with no compile error
+    /// anywhere. That is the exact failure shape issue #241 exists to prevent, one layer
+    /// below where #241 found it. This is the test that refuses it.
+    #[test]
+    fn every_reachable_non_authenticatable_state_ends_sessions() {
+        // A state is REACHABLE by transition when some other state may move into it.
+        // Driven off ALL on both sides so a new state is both a candidate target and a
+        // candidate source without any list here being edited.
+        let reachable =
+            |to: UserState| UserState::ALL.iter().any(|from| from.can_transition_to(to));
+
+        let must_end_sessions: Vec<UserState> = UserState::ALL
+            .into_iter()
+            .filter(|state| !state.can_authenticate() && reachable(*state))
+            .collect();
+
+        // NON-VACUITY, and it is the whole reason this is not a comparison of two empty
+        // lists: if `can_transition_to` were tightened to refuse every target, or
+        // `can_authenticate` widened to accept every state, the filter above would empty
+        // and the assertion below would pass while checking nothing.
+        assert!(
+            !must_end_sessions.is_empty(),
+            "no state is both a valid transition target and non-authenticatable, so the \
+             relation below is vacuously true and proves nothing. Either the state machine \
+             changed shape or this test has rotted."
+        );
+
+        for state in must_end_sessions {
+            assert!(
+                state.ends_sessions(),
+                "{state:?} cannot authenticate and IS reachable by transition, so a user \
+                 can be moved into it while holding a live SSO session, yet entering it \
+                 does not end that user's sessions. Four token mints (the code exchange, \
+                 the device grant, the implicit/hybrid front-channel id_token, and the \
+                 FedCM assertion) are fenced ONLY by the session cascade, so that user \
+                 keeps minting. Either add {state:?} to UserState::ends_sessions, or make \
+                 it a creation-time state that can_transition_to refuses as a target, or \
+                 give those four mint paths a direct lifecycle read."
+            );
+        }
+
+        // The other half of the same relation, stated so the creation-time argument above
+        // is measured rather than asserted in prose: a non-authenticatable state that does
+        // NOT end sessions must be unreachable by transition.
+        for state in UserState::ALL {
+            if state.can_authenticate() || state.ends_sessions() {
+                continue;
+            }
+            assert!(
+                !reachable(state),
+                "{state:?} neither authenticates nor ends sessions, so it is safe only \
+                 while no transition can put a session-holding user into it"
+            );
+        }
     }
 
     /// The parser's own negative control: it must REFUSE a name it cannot find,

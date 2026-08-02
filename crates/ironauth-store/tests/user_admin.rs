@@ -979,17 +979,24 @@ async fn idor_harness_denies_cross_scope_user_surfaces_uniformly() {
             "users.update_claims",
             "users.external_id.link",
             "users.external_id.unlink",
+            "users.state_for_subject",
+            "users.claims_for_subject",
+            "users.by_identifier",
         ],
-        "every scope-embedding admin user surface is registered"
+        "every scope-embedding user surface is registered, the by-subject data-plane \
+         reads included (issue #241)"
     );
 
-    // The foreign references include victim B's REAL external-id value, so the
-    // by_external_id probe hunts a foreign row of its own key type (a cross-tenant
-    // lookup must resolve none) rather than being vacuous.
+    // The foreign references include victim B's REAL external-id value AND its REAL login
+    // identifier, so the by_external_id and by_identifier probes each hunt a foreign row
+    // of their OWN key type (a cross-tenant lookup must resolve none) rather than being
+    // vacuous. The two `usr_` ids carry the id-keyed probes, state_for_subject and
+    // claims_for_subject among them.
     let foreign = [
         victim_b.to_string(),
         victim_a2.to_string(),
         "vb-external-id".to_owned(),
+        "vb@example.test".to_owned(),
         absent_in_a,
     ];
     let foreign_refs: Vec<&str> = foreign.iter().map(String::as_str).collect();
@@ -999,17 +1006,83 @@ async fn idor_harness_denies_cross_scope_user_surfaces_uniformly() {
         "cross-scope user leak detected: {leaks:?}"
     );
 
-    // Positive control: the by_external_id probe is not vacuous. Tenant B CAN resolve
-    // its own user by the same external-id value, so a caller with the RIGHT scope
-    // finds it while the cross-tenant caller above found nothing.
+    // The probes above all report `Denied`, and `Denied` is also what a probe hunting a
+    // row that was never planted reports. So every keyed READ gets a positive control: the
+    // victim's OWN scope resolves the identical argument that read nothing under the
+    // caller's. See the helper for what that does and does not cover.
+    assert_every_keyed_read_resolves_in_its_own_scope(&db, scope_b, &victim_b.to_string()).await;
+}
+
+/// The non-vacuity half of `idor_harness_denies_cross_scope_user_surfaces_uniformly`.
+///
+/// Each of the FIVE keyed user READS (`users.get`, `users.by_external_id`,
+/// `users.state_for_subject`, `users.claims_for_subject`, `users.by_identifier`) is driven
+/// under the VICTIM's scope with the same argument the harness just drove cross-scope, and
+/// each must resolve. Without this the whole suite would score a clean pass against a user
+/// that does not exist: `Denied` is the outcome for "the scope filter refused" and for
+/// "there was nothing there", and only this tells them apart.
+///
+/// # What this does NOT control, stated rather than implied
+///
+/// The harness registers ELEVEN probes. Ten are keyed; `users.list` is the one that is not
+/// (it takes no key, and its foreign row is asserted absent from a page that is otherwise
+/// populated, which is its own non-vacuity argument). Of the ten keyed probes, five are the
+/// reads above and five are MUTATIONS: `users.delete`, `users.set_state`,
+/// `users.update_claims`, `users.external_id.link`, `users.external_id.unlink`.
+///
+/// The five mutations get no control of this shape, and cannot: driving one under the
+/// victim's own scope to prove it "resolves" would DELETE, BLOCK, or REWRITE the very row
+/// the read controls above are asserting they can still see, so the controls would have to
+/// be ordered against each other and the fixture would no longer be a fixed point. Their
+/// non-vacuity rests on something else: each takes the same `usr_` id the read probes take,
+/// and `users.get` is proven above to resolve that exact id in the victim's scope, so the
+/// argument every mutation probe is handed is a key that names a real row. That is weaker
+/// than a control and it is written down here rather than left as a silent gap.
+async fn assert_every_keyed_read_resolves_in_its_own_scope(
+    db: &TestDatabase,
+    victim_scope: Scope,
+    victim: &str,
+) {
+    let users = || db.store().scoped(victim_scope).users();
+    // `users.get`, the id-keyed management read. It carried no control until issue #241's
+    // fold, which is why the sentence above used to say "every keyed probe" while naming
+    // four of five: the probe that reads a user BY ITS ID, the plainest one in the set, was
+    // the one nobody had proved was hunting a planted row.
+    let victim_id = users().parse_id(victim).expect("the victim id parses");
     assert!(
-        db.store()
-            .scoped(scope_b)
-            .users()
+        users().get(&victim_id).await.is_ok(),
+        "tenant B reads its own user by id (the probe hunts a real row)"
+    );
+    assert!(
+        users()
             .by_external_id("vb-external-id")
             .await
-            .expect("read")
+            .expect("external id read")
             .is_some(),
         "tenant B resolves its own user by external id (the probe hunts a real row)"
+    );
+    assert!(
+        users()
+            .state_for_subject(victim)
+            .await
+            .expect("state read")
+            .is_some(),
+        "tenant B reads its own user's lifecycle state (the probe hunts a real row)"
+    );
+    assert!(
+        users()
+            .claims_for_subject(victim)
+            .await
+            .expect("claims read")
+            .is_some(),
+        "tenant B opens its own user's claim document (the probe hunts a real row)"
+    );
+    assert!(
+        users()
+            .by_identifier("vb@example.test")
+            .await
+            .expect("identifier read")
+            .is_some(),
+        "tenant B resolves its own user by login handle (the probe hunts a real row)"
     );
 }

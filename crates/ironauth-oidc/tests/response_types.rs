@@ -547,3 +547,130 @@ async fn the_implicit_and_hybrid_id_tokens_carry_the_same_sid_the_code_flow_issu
         "the hybrid id_token must carry the code flow's sid: {hybrid_claims}"
     );
 }
+
+/// A consenting subject with a live SSO session on the harness client: returns
+/// `(subject, cookie)`. Distinct per call, so several can coexist in one harness.
+async fn consenting_subject(harness: &Harness, client_id: &str) -> (String, String) {
+    let subject = harness.seed_unique_user().await;
+    harness.grant_consent(&subject, client_id).await;
+    let cookie = harness.session_cookie(&subject).await;
+    (subject, cookie)
+}
+
+/// The front-channel query for `response_type`, with PKCE parameters that the
+/// code-issuing hybrid needs and the pure implicit ignores.
+fn front_channel_query(response_type: &str, client_id: &str, nonce: &str) -> String {
+    format!(
+        "response_type={}&client_id={client_id}&redirect_uri={}&nonce={nonce}&state=s-fence&\
+         code_challenge={PKCE_CHALLENGE}&code_challenge_method=S256",
+        enc(response_type),
+        enc(REDIRECT_URI),
+    )
+}
+
+#[tokio::test]
+async fn a_fenced_user_mints_no_front_channel_id_token() {
+    // The registry row for `crates/ironauth-oidc/src/authorize.rs` says the implicit and
+    // hybrid front-channel ID tokens are fenced by the SESSION CASCADE, and that
+    // `resolve_front_channel_sid` has no session-less branch to fence because
+    // `Resolved::session_ref` is a non-optional `&str`. Both halves of that were true and
+    // neither was measured: no test anywhere put a blocked, disabled, or deleted user
+    // against this endpoint. On the milestone that found three unfenced mint paths by
+    // enumerating rather than by arguing, a verdict resting on prose alone is the shape a
+    // defect takes, so the row now rests on this.
+    //
+    // What it proves is the CASCADE, end to end: the lifecycle write ends the subject's
+    // sessions in the same transaction, so the cookie the browser still holds resolves to
+    // no live session and the mint is never reached.
+    let harness = Harness::start_with(legacy_enabled()).await;
+    let client_id = harness.client_id().to_string();
+
+    // CONTROL FIRST, and it is load bearing: it proves this fixture reaches the mint at
+    // all. Without it every assertion below is satisfied by a request that failed for
+    // some unrelated reason (an unenabled response type, a missing consent, a rejected
+    // redirect) and the test would score a clean pass against nothing.
+    let (_active, active_cookie) = consenting_subject(&harness, &client_id).await;
+    let (status, headers, body) = harness
+        .authorize_with_cookie(
+            &front_channel_query("id_token", &client_id, "n-active"),
+            &active_cookie,
+        )
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "active implicit: {body}");
+    let control_token =
+        location_fragment_param(&headers, "id_token").expect("an ACTIVE user gets an id_token");
+    // Verified, not merely present: the control has to reach the SIGNING mint, because
+    // that is the thing the fenced cases below must not reach.
+    assert_eq!(
+        verified_claims(&harness, &client_id, &control_token)["nonce"],
+        "n-active"
+    );
+
+    // BLOCKED, on the pure implicit flow: an ID token is the whole response here, so
+    // there is no second artifact to hide behind.
+    let (blocked, blocked_cookie) = consenting_subject(&harness, &client_id).await;
+    harness
+        .set_user_state(&blocked, ironauth_store::UserState::Blocked)
+        .await;
+    let (_status, headers, body) = harness
+        .authorize_with_cookie(
+            &front_channel_query("id_token", &client_id, "n-blocked"),
+            &blocked_cookie,
+        )
+        .await;
+    assert!(
+        location_fragment_param(&headers, "id_token").is_none(),
+        "a BLOCKED user must not receive a front-channel id_token: {:?}",
+        location(&headers)
+    );
+    assert!(
+        !body.contains("id_token"),
+        "and none in the response body either: {body}"
+    );
+
+    // DISABLED, same flow. Distinct from blocked only in operator intent, and the
+    // registry verdict covers both, so both are driven rather than one standing in for
+    // the other.
+    let (disabled, disabled_cookie) = consenting_subject(&harness, &client_id).await;
+    harness
+        .set_user_state(&disabled, ironauth_store::UserState::Disabled)
+        .await;
+    let (_status, headers, body) = harness
+        .authorize_with_cookie(
+            &front_channel_query("id_token", &client_id, "n-disabled"),
+            &disabled_cookie,
+        )
+        .await;
+    assert!(
+        location_fragment_param(&headers, "id_token").is_none(),
+        "a DISABLED user must not receive a front-channel id_token: {:?}",
+        location(&headers)
+    );
+    assert!(!body.contains("id_token"), "{body}");
+
+    // DELETED, on the HYBRID flow, which mints an ID token AND an authorization code.
+    // The code matters as much as the token: a code issued here would be redeemable at
+    // the token endpoint later, so "no id_token" alone would be an incomplete answer.
+    let (deleted, deleted_cookie) = consenting_subject(&harness, &client_id).await;
+    harness.delete_user(&deleted).await;
+    let (_status, headers, body) = harness
+        .authorize_with_cookie(
+            &front_channel_query("code id_token", &client_id, "n-deleted"),
+            &deleted_cookie,
+        )
+        .await;
+    assert!(
+        location_fragment_param(&headers, "id_token").is_none(),
+        "a DELETED user must not receive a hybrid id_token: {:?}",
+        location(&headers)
+    );
+    assert!(
+        location_fragment_param(&headers, "code").is_none(),
+        "nor a hybrid authorization code, which would redeem later: {:?}",
+        location(&headers)
+    );
+    assert!(
+        !body.contains("id_token") && !body.contains("\"code\""),
+        "{body}"
+    );
+}

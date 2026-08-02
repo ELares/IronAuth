@@ -704,14 +704,30 @@ async fn authenticate_client(
 /// correlate to any OP session, which quietly breaks back-channel logout for that
 /// token while looking like a success.
 ///
-/// A grant with NO `session_ref` at all (not an interactive code flow) legitimately has
-/// no SSO session and resolves to [`None`]: no session to check, no `sid` to emit.
+/// A grant with NO `session_ref` at all has no SSO session and emits no `sid`, but it is
+/// NOT unchecked (issue #241). Every code this build mints carries one: `issue_code_core`
+/// passes `session_ref: Some(resolved.session_ref)` and `Resolved::session_ref` is a
+/// non-optional `&str`, on the browser path and the browserless first-party challenge
+/// path alike. So [`None`] here is reachable only for a code ROW persisted by an older
+/// build and redeemed across a rolling upgrade, inside the short code TTL.
+///
+/// That narrow window used to be the code exchange's blind spot, and on an
+/// `offline_access` exchange it was total: the doc above counts the whole fence for that
+/// scope as the two reads in THIS function, and both of them are downstream of the `else`
+/// this comment sits on. A legacy-shaped code for a blocked subject would have minted an
+/// access token, an ID token, and an offline refresh family that deliberately survives
+/// the session cascade. So the branch asks the user directly instead:
+/// [`ensure_subject_can_authenticate`] is the SAME read the refresh grant is fenced by,
+/// and it fails closed on a blocked, disabled, deleted, or absent subject and on a store
+/// fault. "No session to check" now means "checked the user instead", never "checked
+/// nothing".
 async fn resolve_code_exchange_sid(
     state: &OidcState,
     scope: Scope,
     bindings: &CodeBindings,
 ) -> Result<Option<String>, TokenError> {
     let Some(session_ref) = bindings.session_ref.as_deref() else {
+        ensure_subject_can_authenticate(state, scope, &bindings.subject).await?;
         return Ok(None);
     };
     // A session_ref that does not parse in the exchange scope names no session we could
@@ -1644,6 +1660,25 @@ async fn issue_refresh_for_code(
 /// `$9 = family.offline`. Rungs 3 and 4 do not run at all, and the WHOLE fence is the
 /// two reads inside [`resolve_code_exchange_sid`], one edit apart.
 ///
+/// # The rung counts above assume the grant HAS a session, and all four do (issue #241)
+///
+/// Every count in this comment is conditioned on `session_ref` being present, and each
+/// rung is separately conditioned on it, which is easy to miss because they are in three
+/// different places. Rungs 1 and 2 sit behind [`resolve_code_exchange_sid`]'s
+/// `let Some(session_ref) = .. else`. Rung 3, `lock_bound_session_live`, returns `Ok(true)`
+/// outright for a NULL `session_ref` ("not session-bound: open unconditionally"). Rung 4's
+/// `INSERT ... SELECT` predicate is `AND ($9 OR g.session_ref IS NULL OR EXISTS(..))` and
+/// the middle disjunct satisfies it.
+///
+/// So for a grant with NO session the ladder was not shorter, it was ABSENT, on the
+/// `openid` scope as much as on `offline_access`: a blocked or soft-deleted subject's code
+/// minted an access token, an ID token, and a refresh family. That is reachable only for a
+/// code row an older build persisted and a rolling upgrade redeems inside the code TTL, so
+/// it is narrow, but it was the widest of the three holes issue #241 closed. The `else`
+/// branch now calls [`ensure_subject_can_authenticate`] directly, and
+/// `a_fenced_user_cannot_exchange_a_session_less_authorization_code` in
+/// `crates/ironauth-oidc/tests/refresh.rs` is what keeps it there.
+///
 /// Both scopes are pinned, separately, by
 /// `a_fenced_user_cannot_exchange_an_outstanding_authorization_code` and
 /// `a_fenced_user_cannot_exchange_an_offline_access_authorization_code` in
@@ -1684,22 +1719,51 @@ async fn issue_refresh_for_code(
 /// disabled, pending-verification) or is absent/deleted, and treats a store fault as
 /// fail-closed too, never fail-open. A NORMAL active (or scheduled-offboarding) user
 /// is authenticatable, so an ordinary refresh is unaffected.
-async fn ensure_subject_can_authenticate(
+pub(crate) async fn ensure_subject_can_authenticate(
     state: &OidcState,
     scope: Scope,
     subject: &str,
 ) -> Result<(), TokenError> {
-    match state
+    match subject_can_authenticate(state, scope, subject).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(TokenError::InvalidGrant),
+        Err(error) => Err(map_store_error(error)),
+    }
+}
+
+/// THE user-lifecycle read, the one place in this crate that asks the store whether a
+/// user-bound subject may still obtain tokens (issue #52, extended by issue #241).
+///
+/// Three callers need three DIFFERENT wire answers from the same question, so the read
+/// is separated from the mapping rather than copied: [`ensure_subject_can_authenticate`]
+/// renders it as `invalid_grant` for the refresh grant, the code exchange, and the
+/// device grant; [`crate::jwt_bearer`] renders it as that grant's uniform `invalid_grant`
+/// PLUS an out-of-band `principal_not_authenticatable` diagnostic. A copied read would be
+/// three places for a future edit to miss two of.
+///
+/// Returns `Ok(false)`, meaning FENCED, for every non-authenticatable outcome the store can
+/// report: a blocked, disabled, or pending-verification user, and equally an absent,
+/// soft-deleted, cross-scope, or corrupt-state row, all of which
+/// [`ironauth_store::UserRepo::state_for_subject`] collapses to [`None`]. Active and
+/// scheduled-offboarding are the two states that answer `Ok(true)`.
+///
+/// # Errors
+///
+/// [`ironauth_store::StoreError`] on a persistence failure. Every caller treats it as
+/// fail CLOSED; the error is returned rather than swallowed so each can pick its own
+/// closed answer (`server_error` for the grants that map store faults that way).
+pub(crate) async fn subject_can_authenticate(
+    state: &OidcState,
+    scope: Scope,
+    subject: &str,
+) -> Result<bool, StoreError> {
+    Ok(state
         .store()
         .scoped(scope)
         .users()
         .state_for_subject(subject)
-        .await
-    {
-        Ok(Some(user_state)) if user_state.can_authenticate() => Ok(()),
-        Ok(_) => Err(TokenError::InvalidGrant),
-        Err(error) => Err(map_store_error(error)),
-    }
+        .await?
+        .is_some_and(|user_state| user_state.can_authenticate()))
 }
 
 /// The `refresh_token` grant (RFC 6749 6, issue #21): exchange a rotating refresh

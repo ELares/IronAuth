@@ -36,6 +36,11 @@
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
+# `require_tracked`: the shared guard both registry rules below need before they trust a
+# `git diff --exit-code`. See that file for the hole and the measurement.
+# shellcheck source=scripts/lib/generated-artifact.sh
+. scripts/lib/generated-artifact.sh
+
 fail=0
 
 scan() {
@@ -108,6 +113,7 @@ header = (
 body = "".join(f"{count}\t{path}\n" for path, count in sorted(counts.items()))
 open(out, "w", encoding="utf-8").write(header + body)
 PY
+require_tracked "invariant-lints: rule 'session-mint-registry' violated" "$mint_inventory" || fail=1
 if ! git diff --exit-code "$mint_inventory" >/dev/null 2>&1; then
   echo "invariant-lints: rule 'session-mint-registry' violated: ${mint_inventory} is stale"
   echo "  (a call to interaction::establish_session was added, moved, or removed)."
@@ -115,14 +121,144 @@ if ! git diff --exit-code "$mint_inventory" >/dev/null 2>&1; then
   git --no-pager diff -- "$mint_inventory" || true
   fail=1
 fi
+# The doc check greps the FULL PATH, not the basename. A basename grep degrades this rule
+# to count-only for any new file whose basename is already listed: measured (issue #241) by
+# creating a second `token.rs` under a subdirectory, which fired the inventory diff and
+# then passed the doc check unexamined because `token.rs` was already named. The doc table
+# therefore carries full paths too.
 while IFS=$'\t' read -r _count path; do
   case "${_count}" in ''|'#'*) continue ;; esac
-  if ! grep -qF -- "$(basename "$path")" "$mint_doc"; then
+  if ! grep -qF -- "$path" "$mint_doc"; then
     echo "invariant-lints: rule 'session-mint-registry' violated: '${path}' mints a primary"
     echo "  session but is not named in ${mint_doc}."
     fail=1
   fi
 done < "$mint_inventory"
+
+# Rule user-token-mint-registry: every call site of the five `crate::tokens` functions that
+#   mint an OAuth/OIDC token artifact is pinned in docs/design/user-bound-mint-sites.txt and
+#   given a lifecycle verdict in docs/design/USER-BOUND-MINT-SITES.md.
+#
+#   The gap this closes: issue #52 established that a blocked, disabled, or deleted user
+#   obtains NO new tokens by ANY path, and then TWO user-bound mint paths (jwt-bearer's
+#   mapped principal, the legacy device grant) sat outside it for four milestones, written
+#   down in an issue rather than enforced. Issue #241 fenced them and found a THIRD nobody
+#   had written down at all (the legacy `session_ref IS NULL` code exchange). A count is
+#   what would have surfaced all three: none of them was hidden, each was simply never
+#   enumerated against the invariant.
+#
+#   Same shape as session-mint-registry, and deliberately so: generate from source, diff the
+#   committed copy, then require every path in the inventory to be named in the prose doc.
+#   Like that rule this is a COUNT, not a proof of correctness. What it guarantees is that a
+#   new token mint cannot ship without its author writing down whose lifecycle governs it.
+# Longest alternative first, so an engine that takes the FIRST matching alternative rather
+# than the longest one still reaches `mint_refresh_token` before it settles for `mint`.
+mint_names='mint_client_credentials_access_token|mint_refresh_token|mint_access_token|mint_id_token|mint'
+# The qualification is load-bearing: `mint(` unqualified matches prose ("the mint (issue
+# #279)") and unrelated methods (`pow_gate`'s token bucket, `recovery_proof`'s pure helper),
+# so the inventory counts `tokens::<name>(` only. That is exact TODAY because every mint
+# caller imports `crate::tokens::{self, ..}` and calls through the module, and this rule
+# keeps it exact by refusing the spellings that would evade the count: importing a mint
+# function by bare name, and ALIASING THE MODULE so the call no longer reads `tokens::`.
+#
+# Read the pattern as two arms over `use <path>tokens`:
+#
+#   `::` <anything ending in a non-word char>? <mint name> <non-word char or end of line>
+#     catches `use crate::tokens::mint_refresh_token;` (bare),
+#     `use crate::tokens::{mint_refresh_token};` (braced),
+#     `use crate::tokens::{self, mint};` (mixed), and
+#     `use crate::tokens::mint as m;` (renamed).
+#   <space> `as` <space>
+#     catches `use crate::tokens as t;`, after which `t::mint(..)` is a mint the
+#     `tokens::<name>(` inventory count cannot see.
+#
+# The leading `([A-Za-z0-9_]+::)*` accepts any module path ending in `tokens` rather than
+# `crate::` alone, because `use super::tokens::mint;` from a submodule is the same hole and
+# that spelling is idiomatic in this tree (flow/golden.rs already writes
+# `use super::consent::..`), and because `pub use tokens::mint;` in lib.rs would re-export
+# a mint under a crate-root name the count never sees.
+#
+# WHAT WAS WRONG BEFORE, measured: the previous spelling put the `(^|[^A-Za-z0-9_])`
+# separator AFTER the literal `crate::tokens::`, so it required a non-word character that
+# the BRACED form supplies and the BARE form does not.
+# `use crate::tokens::mint_refresh_token;` evaded it; `use crate::tokens::{mint_refresh_token};`
+# was caught. Worse, whether it evaded depended on the grep implementation, so a hand-run
+# grep and this gate could disagree about the same line.
+#
+# RESIDUAL, recorded because the doc states what this rule buys: grep is LINE based, so a
+# `use` statement rustfmt has split across lines (it does past 100 columns, which a list of
+# these five names exceeds) puts the imported names on continuation lines carrying no
+# `use ... tokens`, and this rule does not see them. docs/design/USER-BOUND-MINT-SITES.md
+# lists that limit beside the other two.
+scan user-token-mint-qualified "use[[:space:]]+([A-Za-z0-9_]+::)*tokens(::([^;]*[^A-Za-z0-9_])?(${mint_names})([^A-Za-z0-9_]|$)|[[:space:]]+as[[:space:]])"
+
+token_inventory="docs/design/user-bound-mint-sites.txt"
+token_doc="docs/design/USER-BOUND-MINT-SITES.md"
+python3 - "crates/ironauth-oidc/src" "$token_inventory" <<'PY'
+import pathlib, re, sys
+
+src, out = pathlib.Path(sys.argv[1]), sys.argv[2]
+names = [
+    "mint",
+    "mint_access_token",
+    "mint_id_token",
+    "mint_refresh_token",
+    "mint_client_credentials_access_token",
+]
+# A CALL through the module path. The definitions live in tokens.rs and are written
+# `pub fn <name>(`, which carries no `tokens::` qualifier and so cannot match.
+call = re.compile(r"\btokens::(" + "|".join(sorted(names, key=len, reverse=True)) + r")\s*\(")
+counts = {}
+for path in sorted(src.rglob("*.rs")):
+    n = 0
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if call.search(line):
+            n += 1
+    if n:
+        counts[path.as_posix()] = n
+
+header = (
+    "# User-bound token mint sites (generated)\n"
+    "#\n"
+    "# Generated by scripts/invariant-lints.sh (rule user-token-mint-registry) from every\n"
+    "# call to a crate::tokens mint function under crates/ironauth-oidc/src; do not edit by\n"
+    "# hand. Every path here MUST be named, with the principal it mints for and the\n"
+    "# lifecycle fence that governs it, in docs/design/USER-BOUND-MINT-SITES.md, so a new\n"
+    "# token mint cannot ship without an answer to 'whose account can revoke this token'.\n"
+    "#\n"
+    "# <count>\\t<path>\n"
+)
+body = "".join(f"{count}\t{path}\n" for path, count in sorted(counts.items()))
+open(out, "w", encoding="utf-8").write(header + body)
+PY
+# The diff below compares the regenerated inventory against the INDEX, so an inventory
+# git does not track produces an empty diff and the rule silently passes on every input.
+# Measured: with the file untracked, adding a second mint call to a file already listed
+# left the lint clean. The rule that catches an unexamined mint must not itself be
+# defeatable by forgetting to `git add`, so being untracked is a violation in its own
+# right rather than a quiet no-op. The guard is shared with every other freshness gate in
+# scripts/ (see scripts/lib/generated-artifact.sh), because the shape is identical at all
+# of them and a guard living in one script is one the next author will not know to copy.
+require_tracked "invariant-lints: rule 'user-token-mint-registry' violated" "$token_inventory" || fail=1
+if ! git diff --exit-code "$token_inventory" >/dev/null 2>&1; then
+  echo "invariant-lints: rule 'user-token-mint-registry' violated: ${token_inventory} is stale"
+  echo "  (a call to a crate::tokens mint function was added, moved, or removed)."
+  echo "  It has been regenerated; review it, name the file in ${token_doc}, and commit both."
+  git --no-pager diff -- "$token_inventory" || true
+  fail=1
+fi
+# FULL PATH, not basename, for the reason recorded on the session-mint rule above: a
+# basename grep lets a NEW mint file whose basename collides with one already named pass
+# the doc check unexamined, which degrades this rule to a bare count for exactly the file
+# an author is least likely to have thought about.
+while IFS=$'\t' read -r _count path; do
+  case "${_count}" in ''|'#'*) continue ;; esac
+  if ! grep -qF -- "$path" "$token_doc"; then
+    echo "invariant-lints: rule 'user-token-mint-registry' violated: '${path}' mints a token"
+    echo "  but is not named in ${token_doc}."
+    fail=1
+  fi
+done < "$token_inventory"
 
 if [ "$fail" -ne 0 ]; then
   exit 1

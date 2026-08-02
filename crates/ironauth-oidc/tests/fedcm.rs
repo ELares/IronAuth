@@ -1043,3 +1043,107 @@ async fn assertion_flag_off_is_404() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "flag off is a uniform 404");
 }
+
+/// A FedCM harness with the flag on and NO subject seeded yet, so a test can plant
+/// several accounts in it and drive them independently. `armed_assertion_harness` above
+/// seeds one user under a fixed identifier and so cannot be called twice.
+async fn fedcm_harness() -> (Harness, String) {
+    let mut harness = Harness::start().await;
+    let client_id = harness.client_id().to_string();
+    harness.enable_fedcm();
+    (harness, client_id)
+}
+
+/// Seed a consenting FedCM account and return `(subject, public_subject, cookie)`.
+async fn fedcm_account(
+    harness: &Harness,
+    client_id: &str,
+    identifier: &str,
+) -> (String, String, String) {
+    let subject = harness
+        .seed_user_with_claims(identifier, SEED_PASSWORD, CLAIMS_JSON)
+        .await;
+    harness.grant_consent(&subject, client_id).await;
+    let public_subject = harness.state().resolve_public_subject(&subject);
+    let cookie = harness.session_cookie(&subject).await;
+    (subject, public_subject, cookie)
+}
+
+#[tokio::test]
+async fn a_fenced_user_gets_no_fedcm_assertion() {
+    // The registry row for `crates/ironauth-oidc/src/fedcm.rs` says this mint is fenced by
+    // the session cascade twice over (`resolve_session` resolves a live `sessions` row
+    // before anything else, and `ensure_sid` fails closed on a dead one) and that there is
+    // no session-less branch. That was argued and never measured: no test here had ever put
+    // a blocked, disabled, or deleted user against the assertion endpoint. Issue #241 was
+    // filed because two mint paths sat outside the lifecycle fence for four milestones on
+    // exactly that footing, so this row is measured now rather than reasoned.
+    let (harness, client_id) = fedcm_harness().await;
+
+    // CONTROL FIRST. It proves the fixture reaches the SIGNING mint: without it, a refusal
+    // caused by a missing consent, a wrong Origin, or the flag being off would satisfy
+    // every assertion below and the test would pass having exercised nothing.
+    let (_active, active_public, active_cookie) =
+        fedcm_account(&harness, &client_id, "fedcm-fence-active@example.test").await;
+    let (status, _headers, body) = assertion_post(
+        &harness,
+        &assertion_form(&client_id, &active_public, "n-fence-active"),
+        Some(RP_ORIGIN),
+        Some("webidentity"),
+        Some(&active_cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "an ACTIVE account asserts: {body}");
+    let control = json(&body)["token"].as_str().expect("token").to_owned();
+    let policy = harness.id_token_policy(&client_id);
+    verify(&control, &policy, &common::verify_clock()).expect("the control token verifies");
+
+    // BLOCKED. The lifecycle write ends the subject's sessions in the same transaction, so
+    // the cookie the browser still holds names a session that is no longer live.
+    let (blocked, blocked_public, blocked_cookie) =
+        fedcm_account(&harness, &client_id, "fedcm-fence-blocked@example.test").await;
+    harness
+        .set_user_state(&blocked, ironauth_store::UserState::Blocked)
+        .await;
+    let (status, _headers, body) = assertion_post(
+        &harness,
+        &assertion_form(&client_id, &blocked_public, "n-fence-blocked"),
+        Some(RP_ORIGIN),
+        Some("webidentity"),
+        Some(&blocked_cookie),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "a BLOCKED account must not assert: {body}"
+    );
+    assert!(
+        json(&body).get("token").is_none(),
+        "and no token in the body: {body}"
+    );
+
+    // DELETED. The soft-delete tombstone is a different write from a state transition, and
+    // the invariant names all three of blocked, disabled, and deleted, so it gets its own
+    // arm rather than riding on the one above.
+    let (deleted, deleted_public, deleted_cookie) =
+        fedcm_account(&harness, &client_id, "fedcm-fence-deleted@example.test").await;
+    harness.delete_user(&deleted).await;
+    let (status, _headers, body) = assertion_post(
+        &harness,
+        &assertion_form(&client_id, &deleted_public, "n-fence-deleted"),
+        Some(RP_ORIGIN),
+        Some("webidentity"),
+        Some(&deleted_cookie),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "a DELETED account must not assert: {body}"
+    );
+    assert!(
+        json(&body).get("token").is_none(),
+        "and no token in the body: {body}"
+    );
+}
