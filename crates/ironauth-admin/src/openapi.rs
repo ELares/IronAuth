@@ -42,8 +42,10 @@ use crate::views::{
     SetClientAdminConsentRequest, SetLocaleRequest, SetSignupFormRequest, SetUserStateRequest,
     SignupFormFieldView, SignupFormView, SignupQuarantineCaseView, SignupQuarantineDecisionView,
     SignupQuarantineList, SignupQuarantineReasonView, SignupQuarantineStateView, TenantCreated,
-    TenantList, TenantStatusView, TenantView, UpdateUserRequest, UserConsentList, UserConsentView,
-    UserExternalIdView, UserList, UserRevocationView, UserStateChangeView, UserStateView, UserView,
+    TenantList, TenantStatusView, TenantView, TraitAnnotationsView, TraitSchemaVersionView,
+    UpdateUserRequest, UserConsentList, UserConsentView, UserExternalIdView, UserList,
+    UserRevocationView, UserStateChangeView, UserStateView, UserTraitsView, UserView,
+    VerificationAddressView,
 };
 
 /// The management API's OpenAPI document. The handlers listed in `paths(...)`
@@ -154,6 +156,11 @@ use crate::views::{
         (name = "users", description = "Admin user CRUD, lifecycle state transitions, and \
                                        external-id correlation, with a session cascade on the \
                                        session-ending transitions"),
+        (name = "trait-schemas", description = "Per-environment identity trait-schema versions: \
+                                               an append-only registry of immutable JSON Schema \
+                                               (draft 2020-12) versions with inline behavior \
+                                               annotations, the active-version introspection \
+                                               read, and the cutover-gated activation"),
         (name = "invitations", description = "Admin user-invitation CRUD: create (provisioning a \
                                              pending-verification user and a single-use, expiring, \
                                              hashed-at-rest token), list, get, revoke, and resend"),
@@ -303,6 +310,12 @@ use crate::views::{
         crate::users::set_user_state,
         crate::users::link_user_external_id,
         crate::users::unlink_user_external_id,
+        crate::users::get_user_traits,
+        crate::trait_schemas::create_trait_schema_version,
+        crate::trait_schemas::list_trait_schema_versions,
+        crate::trait_schemas::get_active_trait_schema,
+        crate::trait_schemas::get_trait_schema_version,
+        crate::trait_schemas::activate_trait_schema_version,
         crate::invitations::create_invitation,
         crate::invitations::list_invitations,
         crate::invitations::get_invitation,
@@ -419,6 +432,12 @@ use crate::views::{
         SignupFormView,
         CreateFlowVersionRequest,
         FlowVersionView,
+        crate::views::CreateTraitSchemaRequest,
+        TraitSchemaVersionView,
+        TraitAnnotationsView,
+        VerificationAddressView,
+        UserTraitsView,
+        crate::error::TraitErrorView,
         SetClientAdminConsentRequest,
         ClientAdminConsentView,
         BrandAssetView,

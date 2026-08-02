@@ -6,6 +6,65 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- The end-user-driven trait paths are held to the SELF-SERVICE class on BOTH the replace and
+  the CREATE seam (issue #53, PR 1, review fold), and two live bypasses that survived the
+  first cut are closed.
+
+  - **First federated login.** `provision_federated_user` passed the mapped document into
+    `NewAdminUser` and the raw INSERT, outside the classed seam entirely. MEASURED: a
+    connector whose claim mapping named an admin-only trait wrote it onto a brand-new local
+    identity on FIRST login, and was refused only on the SECOND, which made the returning
+    login fail for a fault the first login had caused. The create now carries
+    `NewUserTraits::visibility`, so the first login fails closed and provisions nothing.
+  - **Self-service signup.** A signup form configured on a trait under v1 survives a v2 that
+    marks the trait admin-only, because the cutover scan validates identity DATA and an
+    annotation is not a validation rule, and `signup_field_nodes` only drops a pointer that
+    no longer RESOLVES. MEASURED end to end: an end-user signup wrote an admin-only trait.
+    `load_active_signup_form` now re-validates the stored form against the NOW-active schema
+    and a stale form collects nothing, and the store's signup seam applies the class too, so
+    neither gate is the only one.
+  - **The returning federated login's refusal is reported as what it is.** A store refusal on
+    that path fell out as an undifferentiated store fault; it is now traced and answered as
+    the `ClaimMappingError::MappingInvalid` class, which is what it is (a mapping-definition
+    fault reached one step later, because only the store knows the annotations).
+  - **The lazy-migration hook no longer hand-rolls the check.** It called
+    `self_service_violations` at the caller, which was itself evidence that the seam was not
+    the only enforcement; the create now states `SelfService` and the seam refuses.
+  - `federation.rs`'s Apple profile-reuse read moved to `traits_user_visible`, the same
+    asymmetry already fixed in `flow/profiling.rs`. The journey-guard read (`flow/eval_ctx.rs`)
+    deliberately did NOT: a guard is operator-authored policy running inside the server, and
+    routing on an admin-only trait is what admin-only metadata is for, so redacting there
+    would leave such a guard compiling, activating and silently never matching.
+
+  The wiring is now COVERED, which it was not: MEASURED, mutating `federation.rs` back to the
+  base `set_traits` left all 22 shipped federation tests green (including the one that drives
+  exactly that path, because it asserts what the mapping WROTE and never what the write
+  DESTROYED), and reverting both progressive-profiling changes left `flow_progressive_profiling`
+  at 9 passed and `flow_signup_fields` at 3 passed.
+
+- End-user-driven trait writes are held to the SELF-SERVICE visibility class (issue #53,
+  PR 1), so admin-only identity metadata is immutable through them in BOTH directions.
+
+  - Progressive profiling (`flow/profiling.rs`) now builds its merge base from the
+    USER-VISIBLE projection rather than the full document, and writes with
+    `TraitWriteVisibility::SelfService`. The admin-only fields are not lost by being left
+    out: the write class carries them over from the stored document, and leaving them out
+    is what makes the write legal at all.
+  - The returning federated login (`federation.rs`) writes with the same class, which fixes
+    a MEASURED defect: a trait write replaces the WHOLE document, so a returning login whose
+    connector mapping produced only the upstream's fields DROPPED any admin-only metadata an
+    operator had set on the identity. Those fields are carried over now. The other half of
+    the class refuses a mapping that TARGETS an admin-only trait; that refusal is made at
+    CONFIG time by `ironauth-admin`'s connector create and update (see the entry above and
+    the `ironauth-admin` changelog), so an operator hears about it when they save the
+    connector rather than an end user hitting it at login.
+  - The lazy-migration hook (`login.rs`) refuses a legacy-store profile that names an
+    admin-only trait, refusing the whole migration rather than silently dropping the field.
+    This is the same argument that path already makes about claims ("a hostile or compromised
+    legacy store must not be able to inject an attacker-controlled claim an RP would trust"),
+    applied to the other channel it does accept. The refusal is the create's SELF-SERVICE
+    class on the store seam, not a check at that caller.
+
 - **A blocked, disabled, or deleted user now mints nothing on the three paths that were
   outside the fence** (issue #241, completing issue #52). #52 established the invariant and
   named three enforcing surfaces. A review then found two user bound mint paths outside all

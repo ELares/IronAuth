@@ -420,6 +420,17 @@ async fn verify_and_profile(
     // Verified: gather the exportable profile so the successor seeds the full
     // identity. A profile read failure never downgrades a valid verdict; the profile
     // is simply omitted.
+    //
+    // The traits below are the FULL document, admin-only fields included, and that is a
+    // decision rather than an oversight (issue #53). It looks like a self-service read (an
+    // end user's password is one of its two inputs) and it is not one: the request cannot be
+    // made at all without the OPERATOR's per-environment sealed bearer, which is what arms
+    // this endpoint. Its trust level is the operator's, and its purpose is the exit covenant
+    // (a successor seeds the WHOLE identity so a user base migrates off IronAuth with no
+    // forced reset). Redacting here would make the migration LOSSY in exactly the dimension
+    // an operator can least reconstruct, which is the failure the covenant exists to
+    // prevent. It is the same verdict, for the same reason, as `exportIdentities`, the other
+    // route that returns the decrypted document.
     let subject = user.id.to_string();
     let claims = state
         .store()

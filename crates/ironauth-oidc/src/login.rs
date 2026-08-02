@@ -17,7 +17,8 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use ironauth_import::ForeignHash;
 use ironauth_store::{
-    CorrelationId, NewAdminUser, Scope, TraitSchema, UserId, UserRecord, UserState,
+    CorrelationId, NewAdminUser, NewUserTraits, Scope, TraitSchema, TraitWriteVisibility, UserId,
+    UserRecord, UserState,
 };
 use serde::Deserialize;
 
@@ -994,6 +995,17 @@ async fn complete_lazy_migration(
                     if !schema.validate(traits).is_empty() {
                         return None;
                     }
+                    // The admin-only refusal is NOT re-spelled here. The SAME argument the
+                    // note above makes about claims applies to this channel (a legacy store
+                    // is exactly the "hostile or compromised" source it names, and an
+                    // admin-only trait is metadata the operator's own plane writes), but it
+                    // is enforced by the create's SELF-SERVICE visibility class on the store
+                    // seam below, not by a check at this caller. A hand-rolled copy here is
+                    // what "the class is the only enforcement" would be untrue about: it
+                    // would leave the rule enforced on the path someone remembered and
+                    // absent on the next one. The refusal still refuses the WHOLE migration
+                    // (the create errors and the caller falls through to the uniform
+                    // failure), so a misconfigured hook is loud, not half applied.
                     traits_json = serde_json::to_string(traits).ok();
                     traits_schema_version = Some(active.version);
                 }
@@ -1025,8 +1037,15 @@ async fn complete_lazy_migration(
         // the next login is a normal local login and never calls the hook.
         foreign_password_hash: None,
         foreign_password_algo: None,
-        traits_json: traits_json.as_deref(),
-        traits_schema_version,
+        // The SELF-SERVICE class (issue #53). A legacy store is exactly the "hostile or
+        // compromised" source the claims note above names, so the migration hook is held to
+        // the same class as any other end-user-driven write and the refusal lives on the
+        // store seam rather than in a hand-rolled check at this caller.
+        traits: traits_json.as_deref().map(|traits_json| NewUserTraits {
+            traits_json,
+            schema_version: traits_schema_version,
+            visibility: TraitWriteVisibility::SelfService,
+        }),
     };
     let create = state
         .store()

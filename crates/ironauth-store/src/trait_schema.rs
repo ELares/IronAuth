@@ -140,6 +140,75 @@ impl TraitAnnotations {
         }
         Value::Object(out)
     }
+
+    /// The INVISIBLE half's mirror image: every admin-only field a SELF-SERVICE
+    /// submission NAMES, reported as per-field failures carrying an RFC 6901 JSON
+    /// Pointer to the offending top-level field (issue #53).
+    ///
+    /// [`redact_for_user`](Self::redact_for_user) makes admin-only metadata invisible on
+    /// the way OUT; this makes it IMMUTABLE on the way IN. A self-service surface reads a
+    /// REDACTED document, so a well-behaved read-modify-write round trip never names an
+    /// admin-only field at all: naming one is always an attempt to write metadata the
+    /// surface was never shown, whether the value is new, identical, or `null` (an
+    /// explicit clear). All three are refused alike, so there is no shape of submission
+    /// that can probe an admin-only field's presence or value.
+    ///
+    /// An empty vector means the submission names none. A NON-OBJECT instance names no
+    /// top-level field and so violates nothing HERE. That is not the whole rule and this
+    /// function is not where the whole rule lives: a non-object submission also cannot be
+    /// PRESERVED into (there is no member to carry an admin-only field onto), so on its own
+    /// it would CLEAR admin-only metadata. Nothing in this crate requires a schema to assert
+    /// a root `type`, so the schema cannot be relied on to refuse it either (MEASURED: with a
+    /// root-`type`-free schema, submitting `[1, 2]` produced zero violations, survived
+    /// preservation unchanged, and the write proceeded). The refusal of that shape belongs
+    /// with the OTHER half of the class and lives on the write seam
+    /// (`TraitWriteVisibility::apply`), which is the one place that can see BOTH the
+    /// submission and the existing document.
+    #[must_use]
+    pub fn self_service_violations(&self, traits: &Value) -> Vec<ValidationFailure> {
+        let Value::Object(map) = traits else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for key in map.keys() {
+            if self.is_admin_only(key) {
+                out.push(ValidationFailure {
+                    pointer: format!("/{}", escape_token(key)),
+                    message: "admin-only trait cannot be written through a self-service surface"
+                        .to_string(),
+                });
+            }
+        }
+        out
+    }
+
+    /// Carry every admin-only field of `existing` onto `submitted`, so a self-service
+    /// write that OMITS admin-only metadata cannot DELETE it (issue #53).
+    ///
+    /// This is the second half of immutability and the half that is easy to miss.
+    /// [`self_service_violations`](Self::self_service_violations) stops a self-service
+    /// write from SETTING an admin-only field; without this, the same write would still
+    /// CLEAR one, because a trait write replaces the whole document and a self-service
+    /// caller (reading through [`redact_for_user`](Self::redact_for_user)) never had the
+    /// admin-only fields to send back.
+    ///
+    /// Call it AFTER the violation check, never before: reinstating the fields first
+    /// would make every submission look like it named them.
+    ///
+    /// A non-object on either side carries nothing (there is no top-level field to carry).
+    pub fn preserve_admin_only(&self, submitted: &mut Value, existing: &Value) {
+        let Some(existing_map) = existing.as_object() else {
+            return;
+        };
+        let Some(target) = submitted.as_object_mut() else {
+            return;
+        };
+        for (key, value) in existing_map {
+            if self.is_admin_only(key) {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+    }
 }
 
 /// The known primitive type keywords of the supported draft 2020-12 subset.
@@ -164,7 +233,7 @@ impl TraitSchema {
             pointer: String::new(),
             message: format!("schema is not valid JSON: {err}"),
         })?;
-        check_schema_wellformed(&root, &mut String::new(), 0)?;
+        check_schema_wellformed(&root, &mut String::new(), 0, true)?;
         Ok(Self { root })
     }
 
@@ -511,10 +580,17 @@ fn push_token(pointer: &mut String, token: &str) -> usize {
 
 /// Check that a schema document (or sub-schema) is well formed within the
 /// supported vocabulary and depth bound.
+///
+/// `annotatable` is true for the document ROOT and for the direct children of the ROOT
+/// `properties`, which are the sub-schemas [`TraitSchema::annotations`] actually reads plus
+/// the position a lone sub-schema occupies when it is compiled on its own. See the
+/// [`ANNOTATION_KEYWORD`] check below for why anywhere DEEPER is a hard refusal, and why the
+/// root is not.
 fn check_schema_wellformed(
     schema: &Value,
     pointer: &mut String,
     depth: usize,
+    annotatable: bool,
 ) -> Result<(), SchemaError> {
     if depth > MAX_DEPTH {
         return Err(SchemaError {
@@ -534,6 +610,40 @@ fn check_schema_wellformed(
         });
     };
 
+    // `x-ironauth` is read ONLY off the ROOT `properties` ([`TraitSchema::annotations`]), so
+    // the SAME keyword one level down is INERT: it compiles, it activates, and it enforces
+    // nothing. That is a tolerable shape for a purely documentary keyword and NOT a tolerable
+    // shape for `visibility`, which issue #53 turns into a security boundary. MEASURED on the
+    // pre-fix tree: with `address: {properties: {secret: {x-ironauth: {visibility: admin}}}}`,
+    // a self-service write OVERWROTE `address.secret` with an attacker string and a later
+    // omission CLEARED it, while the root-level `risk_score` control was correctly preserved by
+    // the same write. An operator reading that schema would believe the nested field was
+    // protected. Refuse it LOUDLY instead, naming the offending pointer, so the belief and the
+    // behavior cannot diverge.
+    //
+    // The document ROOT is annotatable, and that is not a loophole. A sub-schema of a compiled
+    // trait schema is legitimately COMPILED ON ITS OWN elsewhere in the tree (the signup-field
+    // path's `node_accepts` compiles the field's sub-schema to validate one submitted value
+    // against it), and a top-level trait's sub-schema is precisely a document whose ROOT
+    // carries the annotation. MEASURED: refusing the root too broke three signup-field unit
+    // tests, because the fail-closed `Err(_) => false` in that helper turned every annotated
+    // field's valid value into an invalid-format failure. Refusing the root would therefore
+    // trade a misleading annotation for a broken one, which is worse. It also costs nothing:
+    // the position this rule protects is BELOW a root `properties`, and a full trait schema is
+    // always compiled from its own root, so a nested annotation is still refused there.
+    if !annotatable && map.contains_key(ANNOTATION_KEYWORD) {
+        let restore = push_token(pointer, ANNOTATION_KEYWORD);
+        let err = SchemaError {
+            pointer: pointer.clone(),
+            message: format!(
+                "\"{ANNOTATION_KEYWORD}\" is only read on a TOP-LEVEL property of the schema \
+                 root, so it is refused here rather than accepted and ignored"
+            ),
+        };
+        pointer.truncate(restore);
+        return Err(err);
+    }
+
     if let Some(type_value) = map.get("type") {
         check_type_keyword(type_value, pointer)?;
     }
@@ -550,7 +660,8 @@ fn check_schema_wellformed(
         let restore = push_token(pointer, "properties");
         for (name, subschema) in props {
             let inner = push_token(pointer, name);
-            check_schema_wellformed(subschema, pointer, depth + 1)?;
+            // A ROOT property (and only a root property) is where an annotation is read.
+            check_schema_wellformed(subschema, pointer, depth + 1, depth == 0)?;
             pointer.truncate(inner);
         }
         pointer.truncate(restore);
@@ -564,14 +675,14 @@ fn check_schema_wellformed(
     match map.get("additionalProperties") {
         Some(additional) if !additional.is_boolean() => {
             let restore = push_token(pointer, "additionalProperties");
-            check_schema_wellformed(additional, pointer, depth + 1)?;
+            check_schema_wellformed(additional, pointer, depth + 1, false)?;
             pointer.truncate(restore);
         }
         _ => {}
     }
     if let Some(items) = map.get("items") {
         let restore = push_token(pointer, "items");
-        check_schema_wellformed(items, pointer, depth + 1)?;
+        check_schema_wellformed(items, pointer, depth + 1, false)?;
         pointer.truncate(restore);
     }
     if let Some(prefix) = map.get("prefixItems") {
@@ -587,7 +698,7 @@ fn check_schema_wellformed(
         let restore = push_token(pointer, "prefixItems");
         for (index, subschema) in prefix.iter().enumerate() {
             let inner = push_token(pointer, &index.to_string());
-            check_schema_wellformed(subschema, pointer, depth + 1)?;
+            check_schema_wellformed(subschema, pointer, depth + 1, false)?;
             pointer.truncate(inner);
         }
         pointer.truncate(restore);
@@ -1207,6 +1318,166 @@ mod tests {
         let redacted =
             a.redact_for_user(&json!({"email": "a@b.test", "risk_score": 90, "nickname": "z"}));
         assert_eq!(redacted, json!({"email": "a@b.test", "nickname": "z"}));
+    }
+
+    /// A schema whose `risk_score` is admin-only and whose `nickname` is not, plus an
+    /// admin-only field whose NAME needs RFC 6901 escaping, so the pointer the refusal
+    /// reports is exercised rather than assumed.
+    fn visibility_annotations() -> TraitAnnotations {
+        schema(&json!({
+            "type": "object",
+            "properties": {
+                "nickname": {"type": "string"},
+                "risk_score": {"type": "integer", "x-ironauth": {"visibility": "admin"}},
+                "ops/note~1": {"type": "string", "x-ironauth": {"visibility": "admin"}}
+            }
+        }))
+        .annotations()
+    }
+
+    #[test]
+    fn a_self_service_submission_naming_an_admin_only_trait_is_refused_per_field() {
+        let a = visibility_annotations();
+        // A submission touching only user-visible fields names no admin-only trait.
+        assert!(
+            a.self_service_violations(&json!({"nickname": "z"}))
+                .is_empty()
+        );
+        // SETTING an admin-only field is refused, with an RFC 6901 pointer at it.
+        let set = a.self_service_violations(&json!({"nickname": "z", "risk_score": 0}));
+        assert_eq!(set.len(), 1, "{set:?}");
+        assert_eq!(set[0].pointer, "/risk_score");
+        assert!(
+            set[0].message.contains("admin-only"),
+            "the reason names the class, not the value: {}",
+            set[0].message
+        );
+        // CLEARING it explicitly (an unconditional `null`) is the same refusal: the two
+        // shapes must not be distinguishable, or the refusal is a presence oracle.
+        let cleared = a.self_service_violations(&json!({"risk_score": null}));
+        assert_eq!(cleared.len(), 1, "{cleared:?}");
+        assert_eq!(cleared[0].pointer, "/risk_score");
+        assert_eq!(cleared[0], set[0], "set and clear are refused identically");
+        // The pointer is RFC 6901 ESCAPED: `~` is `~0` and `/` is `~1`, in that order.
+        let escaped = a.self_service_violations(&json!({"ops/note~1": "x"}));
+        assert_eq!(escaped.len(), 1, "{escaped:?}");
+        assert_eq!(escaped[0].pointer, "/ops~1note~01");
+        // Every offending field is reported, not merely the first.
+        let both = a.self_service_violations(&json!({"risk_score": 1, "ops/note~1": "x"}));
+        assert_eq!(both.len(), 2, "{both:?}");
+        // A non-object names no top-level field.
+        assert!(a.self_service_violations(&json!([1, 2])).is_empty());
+    }
+
+    #[test]
+    fn a_self_service_write_omitting_an_admin_only_trait_cannot_clear_it() {
+        let a = visibility_annotations();
+        let existing = json!({"nickname": "old", "risk_score": 90, "ops/note~1": "watch"});
+        // The self-service caller read a REDACTED document, so its write back omits every
+        // admin-only field. Preservation carries them over verbatim.
+        let mut submitted = json!({"nickname": "new"});
+        a.preserve_admin_only(&mut submitted, &existing);
+        assert_eq!(
+            submitted,
+            json!({"nickname": "new", "risk_score": 90, "ops/note~1": "watch"}),
+            "the user field is updated and both admin-only fields survive"
+        );
+        // Preservation never invents a field the identity did not already carry.
+        let mut fresh = json!({"nickname": "n"});
+        a.preserve_admin_only(&mut fresh, &json!({"nickname": "old"}));
+        assert_eq!(fresh, json!({"nickname": "n"}));
+        // It never carries a USER-visible field: the submission stays authoritative for
+        // everything it is allowed to write, so omitting `nickname` still clears it.
+        let mut dropped = json!({});
+        a.preserve_admin_only(&mut dropped, &existing);
+        assert_eq!(dropped, json!({"risk_score": 90, "ops/note~1": "watch"}));
+        // A non-object on either side carries nothing and does not panic.
+        let mut scalar = json!("x");
+        a.preserve_admin_only(&mut scalar, &existing);
+        assert_eq!(scalar, json!("x"));
+        let mut target = json!({"nickname": "n"});
+        a.preserve_admin_only(&mut target, &json!(7));
+        assert_eq!(target, json!({"nickname": "n"}));
+    }
+
+    #[test]
+    fn an_annotation_anywhere_but_a_top_level_property_is_refused_by_name() {
+        // The ONE position that is read, and therefore the one that compiles: a direct
+        // child of the root `properties`.
+        assert!(
+            TraitSchema::compile(
+                &json!({
+                    "type": "object",
+                    "properties": {
+                        "risk_score": {"type": "integer", "x-ironauth": {"visibility": "admin"}}
+                    }
+                })
+                .to_string()
+            )
+            .is_ok()
+        );
+
+        // A NESTED property. This is the shape that made the annotation a lie: it compiled,
+        // it activated, and it enforced NOTHING, because `annotations()` reads only the root
+        // `properties`. MEASURED on the pre-fix tree: a self-service write overwrote
+        // `address.secret` with an attacker string and a later omission CLEARED it, while
+        // the root-level control in the SAME write was correctly preserved.
+        let nested = TraitSchema::compile(
+            &json!({
+                "type": "object",
+                "properties": {
+                    "address": {
+                        "type": "object",
+                        "properties": {
+                            "secret": {"type": "string", "x-ironauth": {"visibility": "admin"}}
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect_err("a nested annotation must be refused, not silently ignored");
+        assert_eq!(
+            nested.pointer, "/properties/address/properties/secret/x-ironauth",
+            "the refusal names the offending LOCATION, so an operator can find it: {nested}"
+        );
+        assert!(
+            nested.message.contains("x-ironauth"),
+            "the reason names the keyword: {}",
+            nested.message
+        );
+
+        // Inside an ARRAY item: same verdict, different descent.
+        let in_items = TraitSchema::compile(
+            &json!({
+                "type": "object",
+                "properties": {
+                    "phones": {
+                        "type": "array",
+                        "items": {"type": "string", "x-ironauth": {"visibility": "admin"}}
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect_err("an annotation inside `items` must be refused");
+        assert_eq!(in_items.pointer, "/properties/phones/items/x-ironauth");
+
+        // At the ROOT itself: PERMITTED, deliberately. A sub-schema of a compiled trait
+        // schema is legitimately compiled on its own (the signup-field path does exactly
+        // that to validate one submitted value), and a top-level trait's sub-schema is a
+        // document whose ROOT carries the annotation. MEASURED: refusing the root broke
+        // three `flow::signup_fields` unit tests, because that helper is fail-closed and
+        // turned every annotated field's VALID value into an invalid-format failure. The
+        // position this rule protects is below a root `properties`, and a full trait schema
+        // is always compiled from its own root, so the nested case above is still refused.
+        assert!(
+            TraitSchema::compile(
+                &json!({"type": "string", "x-ironauth": {"visibility": "admin"}}).to_string()
+            )
+            .is_ok(),
+            "a lone sub-schema carrying its own annotation must still compile"
+        );
     }
 
     #[test]

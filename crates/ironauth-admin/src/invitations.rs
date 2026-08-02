@@ -298,8 +298,7 @@ pub async fn create_invitation(
                     // imported foreign hash enters.
                     foreign_password_hash: None,
                     foreign_password_algo: None,
-                    traits_json: None,
-                    traits_schema_version: None,
+                    traits: None,
                 },
                 invitation_id: &id,
                 token_digest: &digest,

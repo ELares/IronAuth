@@ -59,6 +59,10 @@ fn signup_form_path(tenant: &str, environment: &str, client: &str) -> String {
     format!("/v1/tenants/{tenant}/environments/{environment}/applications/{client}/signup-form")
 }
 
+fn trait_schemas_path(tenant: &str, environment: &str) -> String {
+    format!("/v1/tenants/{tenant}/environments/{environment}/trait-schemas")
+}
+
 fn brand_path(tenant: &str, environment: &str, slug: &str) -> String {
     format!("/v1/tenants/{tenant}/environments/{environment}/brands/{slug}")
 }
@@ -1485,5 +1489,90 @@ async fn a_brand_write_is_sudo_gated() {
         status,
         StatusCode::NO_CONTENT,
         "the re-elevated delete lands"
+    );
+}
+
+/// The two trait-schema MUTATIONS (issue #53) are sudo gated exactly like every other
+/// environment-scoped config write. Which schema an environment serves decides what every
+/// identity write is validated against and which of its fields are admin-only, so a stolen
+/// cookie that could append and activate a version could redefine the visibility split
+/// itself; that is at least as security-relevant as a journey artifact.
+///
+/// ONE test rather than two, and in this order on purpose: the create must be challenged
+/// FIRST and prove it stored nothing, because if it had stored a version the activate half
+/// would be testing a different tree than the one the create half left behind.
+#[tokio::test]
+async fn the_trait_schema_create_and_activate_are_sudo_gated() {
+    let (harness, clock) = Harness::start_with_sudo(600).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k1").await;
+    let path = trait_schemas_path(&tenant, &env);
+    let body = r#"{"schema":{"type":"object","properties":{"nickname":{"type":"string"}}}}"#;
+
+    // CREATE, with the elevation window lapsed: challenged, and the registry stays empty.
+    let (status, _, challenge) = harness.post(&path, "c1", body).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "the stale trait-schema create is challenged: {challenge}"
+    );
+    assert!(
+        challenge.contains("insufficient_user_authentication"),
+        "the challenge body carries the RFC 9470 error: {challenge}"
+    );
+    let (status, _, empty) = harness.get(&path).await;
+    assert_eq!(status, StatusCode::OK, "list: {empty}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&empty)
+            .expect("json")
+            .as_array()
+            .expect("array")
+            .len(),
+        0,
+        "the challenged create stored nothing: {empty}"
+    );
+
+    // Elevate once, and the SAME create succeeds.
+    let (status, _, elevated) = harness.post(&elevate_path(&tenant, &env), "e1", "{}").await;
+    assert_eq!(status, StatusCode::OK, "elevate: {elevated}");
+    let (status, _, created) = harness.post(&path, "c2", body).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the elevated create succeeds: {created}"
+    );
+    assert!(
+        created.contains("\"version\":1"),
+        "the write persisted: {created}"
+    );
+
+    // Let the elevation lapse again and prove the ACTIVATE carries its own gate rather
+    // than riding on the create's. Without this half, dropping
+    // `require_fresh_privilege` from the activate handler alone would stay green.
+    clock.advance(Duration::from_secs(601));
+    let activate = format!("{path}/1/activate");
+    let (status, _, challenge) = harness.post(&activate, "a1", "").await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "the stale trait-schema activate is challenged: {challenge}"
+    );
+    let (status, _, still) = harness.get(&format!("{path}/1")).await;
+    assert_eq!(status, StatusCode::OK, "{still}");
+    assert!(
+        still.contains("\"active\":false"),
+        "the challenged activate moved nothing: {still}"
+    );
+
+    let (status, _, elevated) = harness.post(&elevate_path(&tenant, &env), "e2", "{}").await;
+    assert_eq!(status, StatusCode::OK, "elevate: {elevated}");
+    let (status, _, activated) = harness.post(&activate, "a2", "").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the elevated activate succeeds: {activated}"
+    );
+    assert!(
+        activated.contains("\"active\":true"),
+        "the activation landed: {activated}"
     );
 }

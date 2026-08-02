@@ -13,6 +13,7 @@
 # Idempotency-Key is issue #247's defect: a failure between them leaves a partial
 # state the replay store cannot see.
 crates/ironauth-admin/src/connectors.rs:create_connector:1
+crates/ironauth-admin/src/connectors.rs:refuse_admin_only_claim_mapping:0
 crates/ironauth-admin/src/dcr.rs:create_dcr_policy:1
 crates/ironauth-admin/src/dcr.rs:create_initial_access_token:1
 crates/ironauth-admin/src/dcr.rs:resolve_policy_chain_snapshot:0
@@ -52,5 +53,8 @@ crates/ironauth-admin/src/sudo.rs:require_fresh_privilege:1
 crates/ironauth-admin/src/tenants.rs:create_tenant:1
 crates/ironauth-admin/src/tenants.rs:restore_tenant:1
 crates/ironauth-admin/src/tenants.rs:transition_tenant:1
+crates/ironauth-admin/src/trait_schemas.rs:activate_trait_schema_version:1
+crates/ironauth-admin/src/trait_schemas.rs:create_trait_schema_version:1
 crates/ironauth-admin/src/users.rs:create_user:1
 crates/ironauth-admin/src/users.rs:set_user_state:1
+crates/ironauth-admin/src/users.rs:validated_traits:0

@@ -1285,9 +1285,16 @@ pub(crate) struct FinalizeLogin<'a> {
 /// trace (issue #91). A closed set derived only from the error VARIANT, never its pointers
 /// or message (which are already operator safe, but the trace keeps to the variant so it is
 /// a metric like dimension). Never a claim value or a claim path.
+/// The bounded trace kind for a claim-mapping DEFINITION fault (issue #91). Spelled once
+/// because two sites report it: the evaluator's own
+/// [`ClaimMappingError::MappingInvalid`], and the store's refusal of a mapped document that
+/// targets an admin-only trait (issue #53), which is the same class of fault reached one
+/// step later.
+const MAPPING_INVALID_KIND: &str = "mapping_invalid";
+
 fn claim_mapping_failure_kind(error: &ClaimMappingError) -> &'static str {
     match error {
-        ClaimMappingError::MappingInvalid { .. } => "mapping_invalid",
+        ClaimMappingError::MappingInvalid { .. } => MAPPING_INVALID_KIND,
         ClaimMappingError::UpstreamClaim { .. } => "upstream_claim",
         // The error enum is non exhaustive: a future variant traces as a generic bounded
         // kind rather than failing to compile or leaking anything.
@@ -1339,14 +1346,20 @@ pub(crate) async fn finalize_federated_login(finalize: FinalizeLogin<'_>) -> Res
             .by_external_id(&external_id)
             .await
         {
+            // The USER-VISIBLE projection, not the full document (issue #53), for the same
+            // reason progressive profiling reads it: this feeds a SELF-SERVICE write, and a
+            // reuse source must be built out of what a self-service surface is allowed to
+            // see. With the config-time admin-only gate on claim mappings no mapped field
+            // can be admin-only anyway, so this changes no supported behavior; it removes
+            // the asymmetry rather than relying on the other gate holding.
             Ok(Some(existing)) => match state
                 .store()
                 .scoped(scope)
                 .users()
-                .traits(&existing.id)
+                .traits_user_visible(&existing.id)
                 .await
             {
-                Ok(traits) => traits.and_then(|(_, value)| match value {
+                Ok(traits) => traits.and_then(|value| match value {
                     serde_json::Value::Object(map) => Some(map),
                     _ => None,
                 }),
@@ -1454,7 +1467,7 @@ pub(crate) async fn finalize_federated_login(finalize: FinalizeLogin<'_>) -> Res
         // The safe default: provision the separate federated identity exactly as issue #77
         // does today, keyed on the verified, issuer-namespaced `(issuer, sub)` composite.
         LinkDispatch::Provision => {
-            let Ok(user_id) = provision_federated_user(
+            match provision_federated_user(
                 state,
                 scope,
                 connector_slug,
@@ -1465,10 +1478,32 @@ pub(crate) async fn finalize_federated_login(finalize: FinalizeLogin<'_>) -> Res
                 org_connection_id,
             )
             .await
-            else {
-                return interaction::server_error_page();
-            };
-            user_id
+            {
+                Ok(user_id) => user_id,
+                // The store's SELF-SERVICE visibility class refused the mapped document
+                // (issue #53): the connector's claim mapping targets an admin-only trait.
+                // That is a MAPPING DEFINITION fault, exactly the class the evaluator
+                // reports as `ClaimMappingError::MappingInvalid`, reached one step later
+                // because only the store knows the annotations. Reporting it as that class
+                // is what keeps it out of the undifferentiated store-fault bucket: an
+                // operator reading the flow inspector sees `mapping_invalid` and a pointer
+                // to fix, not an unexplained failure. `refuse_admin_only_claim_mapping`
+                // refuses such a mapping at CONFIG time, so this arm is only reachable for
+                // a mapping stored before that gate existed.
+                Err(StoreError::TraitsInvalid(_)) => {
+                    crate::policy_trace::record_claim_mapping_trace(
+                        state,
+                        scope,
+                        connector_slug,
+                        crate::policy_trace::ClaimMappingTraceOutcome::Failed {
+                            kind: MAPPING_INVALID_KIND,
+                        },
+                    )
+                    .await;
+                    return interaction::server_error_page();
+                }
+                Err(_) => return interaction::server_error_page(),
+            }
         }
     };
 
@@ -1979,8 +2014,24 @@ async fn provision_federated_user(
         .by_external_id(&external_id)
         .await?
     {
-        // Returning login: refresh the mapped traits (fully re-validated by set_traits against
-        // the active schema). A trait-free mapping leaves the existing identity untouched.
+        // Returning login: refresh the mapped traits (fully re-validated against the active
+        // schema). A trait-free mapping leaves the existing identity untouched.
+        //
+        // SELF-SERVICE, not admin (issue #53). A federated login is initiated by the END USER
+        // and its trait values come from an upstream the operator does not control, so it is
+        // held to the self-service class, and that fixes a MEASURED defect: a trait write
+        // replaces the WHOLE document, so a returning login whose mapping produced only the
+        // upstream's fields used to DROP any admin-only metadata an operator had set on the
+        // identity. The self-service class carries those fields over instead.
+        //
+        // The other half of the class REFUSES a mapping that targets an admin-only trait, and
+        // that refusal must not be the first time an operator hears about it: a login-time
+        // refusal breaks the END USER for a fault only the operator can fix. The gate is
+        // therefore at CONFIG time, in `connectors::refuse_admin_only_claim_mapping`, which is
+        // the same posture `validate_signup_form` already takes on the other configuration
+        // surface that can name a trait. This is the fallback for a mapping stored before that
+        // gate existed, and it is reported as the `MappingInvalid` class it is (a definition
+        // fault), never as an unexplained persistence failure.
         if let Some(traits_json) = traits_json.as_deref() {
             let actor = interaction::user_actor(&existing.id);
             let correlation = ironauth_store::CorrelationId::generate(state.env());
@@ -1989,7 +2040,12 @@ async fn provision_federated_user(
                 .scoped(scope)
                 .acting(actor, correlation)
                 .users()
-                .set_traits(state.env(), &existing.id, traits_json)
+                .set_traits_with_visibility(
+                    state.env(),
+                    &existing.id,
+                    traits_json,
+                    ironauth_store::TraitWriteVisibility::SelfService,
+                )
                 .await?;
         }
         // Refresh the org binding on the returning identity (issue #77): the identity
@@ -2021,10 +2077,20 @@ async fn provision_federated_user(
                 state: UserState::Active,
                 foreign_password_hash: None,
                 foreign_password_algo: None,
-                traits_json: traits_json.as_deref(),
-                // The schema version accompanies the traits; the two are set together, and a
-                // non-empty document only reaches here when an active schema was present.
-                traits_schema_version: traits_json.as_ref().and(schema_version),
+                // FIRST login, and the SAME class as the returning one (issue #53). This is
+                // the create seam, which seals verbatim; without the class it was a MEASURED
+                // bypass of the admin-only split, where an upstream IdP whose mapping named
+                // an admin-only trait wrote it into the identity on first login and was only
+                // refused on the SECOND. The schema version accompanies the traits; the two
+                // are set together, and a non-empty document only reaches here when an active
+                // schema was present.
+                traits: traits_json
+                    .as_deref()
+                    .map(|traits_json| ironauth_store::NewUserTraits {
+                        traits_json,
+                        schema_version,
+                        visibility: ironauth_store::TraitWriteVisibility::SelfService,
+                    }),
             },
             now_micros,
             None,

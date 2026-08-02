@@ -75,6 +75,23 @@ pub(super) async fn assemble_eval_context(
 
 /// The subject's sealed trait document, or JSON null when there is no subject yet or the read
 /// faults. The read happens at context assembly (the ONE I/O edge); the evaluator itself is pure.
+///
+/// The FULL document, admin-only fields included, and that is a decision rather than an
+/// oversight (issue #53). The two other end-user-facing readers moved to the redacted
+/// projection (`traits_user_visible`) in this change; this one deliberately did not.
+///
+/// A journey guard is OPERATOR-AUTHORED policy running inside the server, not a self-service
+/// surface: routing on an admin-only trait (`risk_score` is the canonical example, and the
+/// canonical routing signal) is precisely what admin-only metadata is FOR. Redacting here
+/// would leave such a guard compiling, activating, and silently never matching, which is the
+/// correct-but-inert failure this codebase has been bitten by before and is strictly worse
+/// than the alternative.
+///
+/// The value itself never reaches the end user. It is read only by predicates
+/// (`FieldSource::SubjectTraits` resolves an RFC 6901 pointer and compares), and the only
+/// place it is serialized is the journey REPLAY transcript, an operator and CI artifact. What
+/// an end user can observe is the ROUTING OUTCOME, which is a one-bit consequence of a
+/// predicate the operator wrote on purpose, exactly as for a risk decision.
 async fn subject_traits(state: &OidcState, scope: Scope, subject: Option<&str>) -> Value {
     let Some(subject) = subject else {
         return Value::Null;

@@ -134,6 +134,18 @@ fn cases(client: &str) -> Vec<Case> {
             expect: Expect::UniformNotFound,
         },
         Case {
+            // The traits read (issue #53) resolves the user through the SAME fence and then
+            // proves the row exists before it reads the sealed document, so an absent user
+            // is the uniform not-found rather than an honest-looking `{"traits":null}` (a
+            // 200 there would report an identity that is not present as one with no traits)
+            // and never the envelope fault a key-free environment would otherwise produce.
+            operation_id: "getUserTraits",
+            method: "GET",
+            suffix: "/traits".to_owned(),
+            body: None,
+            expect: Expect::UniformNotFound,
+        },
+        Case {
             operation_id: "deleteUser",
             method: "DELETE",
             suffix: String::new(),

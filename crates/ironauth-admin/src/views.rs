@@ -14,8 +14,9 @@ use ironauth_store::{
     EnvironmentRecord, GuardrailSet, InvitationAdminRecord, InvitationCredentialType,
     InvitationState, ManagementCredentialRecord, OperatorRecord, OrgMembershipRecord,
     OrganizationRecord, RecoveryApprovalState, RecoveryApprovalView, RefreshFamilySummary,
-    ResourceType, SessionSummary, SignupQuarantineReason, SignupQuarantineState,
-    SignupQuarantineView, TenantRecord, UserAdminRecord, UserState,
+    ResourceType, SchemaError, SessionSummary, SignupQuarantineReason, SignupQuarantineState,
+    SignupQuarantineView, TenantRecord, TraitSchema, TraitSchemaVersion, UserAdminRecord,
+    UserState,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -1050,11 +1051,21 @@ pub struct CreateUserRequest {
     /// state (not `scheduled_offboarding`, which needs a timestamp).
     #[serde(default)]
     pub state: Option<UserStateView>,
+    /// An OPTIONAL identity-traits document (issue #53), VALIDATED against the
+    /// environment's active trait schema. A document violating the schema is a 422
+    /// carrying a per-field RFC 6901 JSON Pointer for each failure and NOTHING is
+    /// created; a valid document is stored with the schema version it validated
+    /// against. Absent leaves the identity trait-free. Arrays and nested objects are
+    /// first-class and round-trip verbatim.
+    #[serde(default)]
+    #[schema(value_type = Object)]
+    pub traits: Option<serde_json::Value>,
 }
 
 /// The body to update a user (issue #52), applied as an RFC 7396 JSON Merge Patch
-/// over the mutable profile. Only the standard-claim document is updatable here;
-/// the lifecycle state and external id have their own explicit operations.
+/// over the mutable profile. The standard-claim document and the identity-traits
+/// document are updatable here; the lifecycle state and external id have their own
+/// explicit operations.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct UpdateUserRequest {
     /// The replacement standard-claim JSON document. Absent leaves the claims
@@ -1062,6 +1073,130 @@ pub struct UpdateUserRequest {
     #[serde(default)]
     #[schema(value_type = Object)]
     pub claims: Option<serde_json::Value>,
+    /// The REPLACEMENT identity-traits document (issue #53), VALIDATED against the
+    /// environment's active trait schema. Absent leaves the traits unchanged; present,
+    /// it REPLACES the whole document (traits are a schema-validated document, so a
+    /// per-key merge could not be validated as a whole), and the schema version it
+    /// validated against is recorded on the identity. A document violating the schema
+    /// is a 422 carrying a per-field RFC 6901 JSON Pointer for each failure and NOTHING
+    /// is written.
+    #[serde(default)]
+    #[schema(value_type = Object)]
+    pub traits: Option<serde_json::Value>,
+}
+
+/// One identity's trait document, as returned by the management API (issue #53).
+///
+/// A management read, so it is the FULL document: admin-only metadata included. The
+/// redacted, user-visible projection is what a self-service surface reads
+/// (`TraitAnnotations::redact_for_user`), and nothing on this plane serves it.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct UserTraitsView {
+    /// The user identifier (`usr_...`, embeds its scope).
+    pub id: String,
+    /// The identity-traits document, or null when the identity has none set.
+    #[schema(value_type = Object)]
+    pub traits: Option<serde_json::Value>,
+    /// The trait-schema version the document was last validated against, or null when
+    /// the identity has no traits.
+    pub schema_version: Option<i32>,
+}
+
+/// The body to create a new immutable trait-schema version (issue #53).
+///
+/// The `schema` is a JSON Schema (draft 2020-12, the supported profile vocabulary)
+/// carrying the inline `x-ironauth` behavior annotations. It is COMPILED before the
+/// write; a malformed schema is a 400 naming the offending RFC 6901 location in the
+/// schema document and nothing is stored. A schema document carries no secret and no
+/// PII (it declares field SHAPES, never values).
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct CreateTraitSchemaRequest {
+    /// The JSON Schema document (draft 2020-12).
+    #[schema(value_type = Object)]
+    pub schema: serde_json::Value,
+}
+
+/// The IronAuth behavior vocabulary a trait schema declares (issue #53), parsed off
+/// its top-level properties and served with every version so a form generator, a login
+/// surface, or a recovery surface reads the contract from one place.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct TraitAnnotationsView {
+    /// Top-level trait names declared as login identifiers.
+    pub login_identifiers: Vec<String>,
+    /// Top-level trait names declared as verification addresses, each with the kind
+    /// the annotation names (for example `email`).
+    pub verification_addresses: Vec<VerificationAddressView>,
+    /// Top-level trait names declared as recovery channels.
+    pub recovery_channels: Vec<String>,
+    /// Top-level trait names declared admin-only: invisible AND immutable through
+    /// self-service surfaces.
+    pub admin_only: Vec<String>,
+}
+
+/// One declared verification address (issue #53): the trait name and its kind.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct VerificationAddressView {
+    /// The top-level trait name.
+    pub field: String,
+    /// The verification kind the annotation names (for example `email`, `phone`).
+    pub kind: String,
+}
+
+/// One immutable trait-schema version, as returned by the management API (issue #53).
+///
+/// This is also the schema INTROSPECTION shape: the served schema document plus its
+/// parsed behavior annotations, so a form generator reads both from one response.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct TraitSchemaVersionView {
+    /// The `tsc_` version id (embeds its scope).
+    pub id: String,
+    /// The per-environment monotonic version number.
+    pub version: i32,
+    /// The JSON Schema document (draft 2020-12) this version serves.
+    #[schema(value_type = Object)]
+    pub schema: serde_json::Value,
+    /// The parsed IronAuth behavior annotations of this schema.
+    pub annotations: TraitAnnotationsView,
+    /// Whether this version is the environment's ACTIVE served default (the version
+    /// every trait write validates against).
+    pub active: bool,
+    /// Creation time, milliseconds since the Unix epoch.
+    pub created_at_unix_ms: i64,
+}
+
+impl TraitSchemaVersionView {
+    /// Build a view from a stored registry version, compiling it to derive the served
+    /// annotations.
+    ///
+    /// # Errors
+    ///
+    /// The compile fault, if the STORED schema does not compile. A stored schema is
+    /// proved well formed on write, so that is a persistence corruption and never a
+    /// caller fault; the caller renders it as an internal error.
+    pub fn from_version(record: &TraitSchemaVersion) -> Result<Self, SchemaError> {
+        let schema = TraitSchema::compile(&record.schema_json)?;
+        let annotations = schema.annotations();
+        Ok(Self {
+            id: record.id.to_string(),
+            version: record.version,
+            schema: schema.as_value().clone(),
+            annotations: TraitAnnotationsView {
+                login_identifiers: annotations.login_identifiers.clone(),
+                verification_addresses: annotations
+                    .verification_addresses
+                    .iter()
+                    .map(|(field, kind)| VerificationAddressView {
+                        field: field.clone(),
+                        kind: kind.clone(),
+                    })
+                    .collect(),
+                recovery_channels: annotations.recovery_channels.clone(),
+                admin_only: annotations.admin_only.clone(),
+            },
+            active: record.active,
+            created_at_unix_ms: ms(record.created_at_unix_micros),
+        })
+    }
 }
 
 /// The body to transition a user's lifecycle state (issue #52).

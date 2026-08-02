@@ -6,6 +6,17 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- An import into a scope that SERVES an active trait schema now VALIDATES the restored trait
+  documents (issue #53, PR 1, review fold). The exit covenant needs validation skipped when
+  the target scope has NO schema, so a full export re-imports losslessly into a fresh
+  instance; the first cut generalized that into skipping validation unconditionally, which
+  let a restore into a live scope write documents no live write could have produced, with the
+  next cutover scan as the first place an operator would find out. `import_stream` resolves
+  the active schema ONCE per run and a violating record is that record's failure through the
+  existing per-record report, carrying an RFC 6901 pointer and never the offending value. A
+  stored schema that does not compile is treated as no schema rather than failing every
+  record, so a corrupt registry cannot turn a restore into a total loss.
+
 - Second-factor restore on import (issue #58/#69, review): `ImportRecord` gains an
   optional `totp` list (`ImportTotp`: the Base32 seed, parameters, friendly name,
   status, and single-use step) and a `recovery_codes` list (`ImportRecoveryCode`: the

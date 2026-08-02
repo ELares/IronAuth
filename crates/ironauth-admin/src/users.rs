@@ -28,8 +28,8 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::Response;
 use ironauth_store::{
-    CorrelationId, IdempotencyWrite, NewAdminUser, Scope, StoreError, UserId, UserListFilter,
-    UserState,
+    CorrelationId, IdempotencyWrite, NewAdminUser, NewUserTraits, Scope, StoreError, TraitSchema,
+    TraitWriteVisibility, UserId, UserListFilter, UserState,
 };
 use serde::Deserialize;
 use utoipa::IntoParams;
@@ -44,7 +44,7 @@ use crate::response::{json, no_content};
 use crate::state::AdminState;
 use crate::views::{
     CreateUserRequest, LinkExternalIdRequest, SetUserStateRequest, UpdateUserRequest,
-    UserExternalIdView, UserList, UserStateChangeView, UserStateView, UserView,
+    UserExternalIdView, UserList, UserStateChangeView, UserStateView, UserTraitsView, UserView,
 };
 
 /// The user list search filters: by lifecycle state, by external id, and by login
@@ -92,6 +92,51 @@ fn resolve_scope(
         .parse_id(environment_id)?;
     let actor = principal.require_environment(tenant, environment)?;
     Ok((Scope::new(tenant, environment), actor))
+}
+
+/// Validate a submitted identity-traits document against the environment's ACTIVE trait
+/// schema (issue #53), returning the canonical JSON text to persist and the schema version
+/// it validated against.
+///
+/// This is the create-and-PATCH half of the acceptance criterion, and it lives in ONE
+/// function reached by BOTH writers on purpose: a validation rule enforced on the create and
+/// not on the PATCH would read as enforced while the PATCH walked around it. The store's
+/// `set_traits` seam enforces the same contract for the flow-driven writers, so there is no
+/// path into the `traits_sealed` column that skips the active schema except the deliberate
+/// import/restore one (`NewAdminUser::traits_json`, which is documented as verbatim because a
+/// fresh scope being restored into has not registered a schema yet).
+///
+/// Failures come back per FIELD, each with its RFC 6901 JSON Pointer, as
+/// [`ApiError::TraitsInvalid`] (a 422 carrying the structured `trait_errors` list), never a
+/// flattened string. An environment with NO active schema cannot validate anything, so a
+/// request carrying traits there is a legible 422 rather than an unvalidated write.
+async fn validated_traits(
+    state: &AdminState,
+    scope: Scope,
+    traits: &serde_json::Value,
+) -> Result<(String, i32), ApiError> {
+    let active = state
+        .store()
+        .scoped(scope)
+        .trait_schemas()
+        .active()
+        .await?
+        .ok_or_else(|| {
+            ApiError::Unprocessable(
+                "the environment has no active trait schema, so traits cannot be validated; \
+                 create and activate a trait-schema version first"
+                    .to_owned(),
+            )
+        })?;
+    // A STORED schema is proved well formed on write, so a compile fault is a persistence
+    // corruption and never a caller fault.
+    let schema = TraitSchema::compile(&active.schema_json).map_err(|_| ApiError::Internal)?;
+    let failures = schema.validate(traits);
+    if !failures.is_empty() {
+        return Err(ApiError::TraitsInvalid(failures));
+    }
+    let traits_json = serde_json::to_string(traits).map_err(|_| ApiError::Internal)?;
+    Ok((traits_json, active.version))
 }
 
 /// Parse a CALLER-SUPPLIED id for a user this request is about to MINT, mapping a
@@ -188,6 +233,14 @@ pub async fn create_user(
         Some(value) => Some(require_non_empty(value, "password_hash")?),
         None => None,
     };
+    // Traits are validated against the ACTIVE schema BEFORE anything is written, so a
+    // violating document creates NO user (issue #53). A valid one is persisted together with
+    // the schema version it validated against, which is what `traits_schema_version` is for
+    // and what lets a later migration job select the identities still on an older version.
+    let traits = match request.traits.as_ref() {
+        Some(value) => Some(validated_traits(&state, scope, value).await?),
+        None => None,
+    };
 
     let created_at_micros = state.now_unix_micros();
     let user_id = supplied_id.unwrap_or_else(|| UserId::generate(state.env(), &scope));
@@ -230,8 +283,16 @@ pub async fn create_user(
                 // imported foreign hash enters.
                 foreign_password_hash: None,
                 foreign_password_algo: None,
-                traits_json: None,
-                traits_schema_version: None,
+                // Already validated against the active schema above; `admin_create` seals
+                // the document verbatim, which is why the validation has to be here. The
+                // ADMIN visibility class (issue #53): this is the management plane, which
+                // is precisely where admin-only metadata is written, so the split does not
+                // apply and the submitted document is authoritative over every field.
+                traits: traits.as_ref().map(|(json, version)| NewUserTraits {
+                    traits_json: json.as_str(),
+                    schema_version: Some(*version),
+                    visibility: TraitWriteVisibility::Admin,
+                }),
             },
             created_at_micros,
             Some(write),
@@ -337,7 +398,67 @@ pub async fn get_user(
     Ok(json(StatusCode::OK, body))
 }
 
-/// Update a user's profile (RFC 7396 partial patch of the standard claims).
+/// Get one user's identity-traits document.
+///
+/// A MANAGEMENT read, so it is the FULL document, admin-only metadata included. There is no
+/// self-service counterpart of this route on this plane; a self-service surface reads the
+/// REDACTED projection (`UserRepo::traits_user_visible`), which strips every field the active
+/// schema annotates `visibility: admin`.
+//
+// WHY THIS READ WRITES NO AUDIT ROW, while `exportIdentities` does. A `//` comment rather
+// than a doc comment on purpose: utoipa renders the doc comment into the published spec,
+// and this is an internal verdict, not something an API consumer needs.
+//
+// The asymmetry is deliberate and it is not about which route decrypts PII: `getUser`
+// already returns the decrypted standard-claim document with no audit row, and so does
+// every other single-identity management read on this plane. The audited one is the BULK
+// EXTRACTION, and what it audits is not "PII was decrypted" but "a whole environment was
+// drained": `record_export_audit` targets the ENVIRONMENT and records the identity COUNT,
+// which is a fact about an egress event, not about a lookup. Auditing every single-identity
+// read would produce a row per console page view, which is how an audit log stops being
+// read at all. If per-read attribution is later wanted it belongs as one decision across
+// every management read, not as one route quietly holding a different rule.
+#[utoipa::path(
+    get,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/traits",
+    operation_id = "getUserTraits",
+    tag = "users",
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("user_id" = String, Path, description = "The user identifier (usr_...)")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "The user's traits and the schema version they validated against", body = UserTraitsView),
+        (status = 401, description = "Missing or invalid credential", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "Not found (absent or in another scope)", body = ErrorBody)
+    )
+)]
+pub async fn get_user_traits(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, user_id)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let id = resolve_user(&state, scope, &user_id, EnvironmentAccess::Read).await?;
+    // The user must exist, or a trait-free identity and an ABSENT one would answer alike and
+    // the route would be a silent existence oracle in the wrong direction (200 for a user
+    // that is not there).
+    state.store().scoped(scope).users().get(&id).await?;
+    let traits = state.store().scoped(scope).users().traits(&id).await?;
+    let view = UserTraitsView {
+        id: id.to_string(),
+        traits: traits.as_ref().map(|(_, value)| value.clone()),
+        schema_version: traits.as_ref().map(|(version, _)| *version),
+    };
+    let body = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
+    Ok(json(StatusCode::OK, body))
+}
+
+/// Update a user's profile (RFC 7396 partial patch of the standard claims and the
+/// identity-traits document).
 #[utoipa::path(
     patch,
     path = "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}",
@@ -368,6 +489,24 @@ pub async fn update_user(
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     let id = resolve_user(&state, scope, &user_id, EnvironmentAccess::Write).await?;
     let request: UpdateUserRequest = parse_json(&body)?;
+    // BOTH documents are validated before EITHER is written. A patch carrying valid claims
+    // and an invalid traits document must land nothing at all, or a caller retrying the whole
+    // patch after fixing the traits would be applying the claims twice; and a partial 422 is
+    // exactly the state an operator cannot reason about.
+    //
+    // The two writes below are two audited transactions, not one, and that is deliberate
+    // rather than the issue #247 split. That defect is specific to a handler behind an
+    // `Idempotency-Key`: the key's record commits with ONE of the writes, so a failure between
+    // them leaves a partial state the replay store cannot see and the retry replays a response
+    // for work that never finished. This PATCH carries no key (`scripts/idempotent-write-audit.sh`
+    // therefore does not list it), and BOTH writes are whole-document REPLACEMENTS, so a
+    // failure between them leaves a state a plain retry of the identical request converges out
+    // of. They also want separate audit rows: a claims change and a traits change are different
+    // facts about the identity and an operator reads them separately.
+    let traits = match request.traits.as_ref() {
+        Some(value) => Some(validated_traits(&state, scope, value).await?),
+        None => None,
+    };
     if let Some(claims) = request.claims.as_ref() {
         let claims_json = claims.to_string();
         state
@@ -377,7 +516,21 @@ pub async fn update_user(
             .users()
             .update_claims(state.env(), &id, &claims_json)
             .await?;
-    } else {
+    }
+    if let Some((traits_json, _)) = traits.as_ref() {
+        // The ADMIN visibility class: this is the management plane, which is precisely where
+        // admin-only metadata is written. `set_traits` re-validates against the active schema
+        // and records the version, so the write path is the same one every flow-driven writer
+        // uses and cannot drift from it.
+        state
+            .store()
+            .scoped(scope)
+            .acting(actor, CorrelationId::generate(state.env()))
+            .users()
+            .set_traits(state.env(), &id, traits_json)
+            .await?;
+    }
+    if request.claims.is_none() && request.traits.is_none() {
         // No mutable field supplied: still confirm the user exists (a not-found is
         // the uniform 404), so an empty patch of an absent user is not a silent 200.
         state.store().scoped(scope).users().get(&id).await?;
