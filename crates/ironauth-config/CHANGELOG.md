@@ -6,6 +6,38 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **BREAKING, and the four keys are removed rather than deprecated (issue #250).**
+  `admin.outbound_verification_enabled`, `admin.outbound_verification_token`,
+  `admin.outbound_verification_tenant`, and `admin.outbound_verification_environment` are
+  GONE. The outbound lazy-migration credential-verification endpoint's enablement and its
+  shared bearer now live in the addressed environment's own sealed per-environment secret
+  (issue #45), so each environment carries an independent, rotatable credential instead of
+  one deployment-global value with a single authorized scope. There is deliberately no
+  fallback to the old keys: keeping one would mean "environment-scoped config" was still not
+  literally true, which is the entire point of the issue.
+
+  **OPERATOR OBLIGATION.** If your config carries any of the four keys, IronAuth will REFUSE
+  TO START and name the key: `AdminConfig` is `deny_unknown_fields`, so their removal is a
+  loud load failure, not a silent one. That is the deliberate choice. All four defaulted to
+  `false` or unset, so a deployment that never enabled the feature is unaffected and has
+  nothing to do. Assume more of them did than you would guess, though: the SHIPPED exit guide
+  (`docs/exit-guide.md`) carried a worked example that set `outbound_verification_enabled =
+  true` along with the other three keys, so any deployment that followed the documentation to
+  turn the feature on is carrying all four. A deployment that DID enable it must, in this
+  order:
+
+    1. delete the four keys from its config, so the process starts;
+    2. re-arm each environment that was using the feature, through the management API:
+       `PUT /v1/tenants/{tenant}/environments/{environment}/migration/outbound-verification`
+       with `{"token": "<the same or a new token>"}`. The token must be at least 32 bytes.
+
+  Between those two steps the endpoint answers its uniform not-found, which is the same
+  answer it gives when disabled, so the failure direction is CLOSED: an in-flight outbound
+  migration pauses and resumes, and no request is ever verified against a token nobody
+  configured. Nothing is backfilled automatically, and it deliberately is not: the old value
+  is a deployment-wide secret and the new one is per environment, so a backfill would have to
+  guess which environments should receive a copy of a credential a third party holds.
+
 - `[outbox]` (issue #104): the tuning of the shared transactional outbox and job queue every
   async path dispatches through, as a top-level section rather than knobs rediscovered under
   each subsystem. `worker_concurrency`, `visibility_timeout_secs`, `poll_interval_secs`,

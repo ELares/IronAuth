@@ -12,6 +12,42 @@ use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{Migration, MigrationError, MigrationRunner, Phase};
 use sqlx::Row;
 
+/// What every shipped migration is ABOUT, in chain order, comma separated.
+///
+/// A `const` rather than a literal inside an assertion message, because
+/// [`production_chain_is_only_the_real_migrations_and_ships_no_demo_object`] asserts its
+/// length against the applied count. As a message it was decoration: nothing read it, so
+/// nothing noticed a subject that was never written down.
+const CHAIN_SUBJECTS: &str = "isolation, audit log, \
+     management API, OIDC authorization, signing keys, login/consent, authentication \
+     context, redirect registration, UserInfo claims, consent scope upsert, resource \
+     servers, opaque access \
+     tokens, client auth suite, dynamic client registration, pushed authorization requests, \
+     refresh tokens, client-credentials service accounts, DCR abuse controls, resource \
+     indicators, JWT bearer assertion grant, device authorization, session model, RP-initiated \
+     logout, session-ended events, back-channel logout, front-channel logout, resource-model \
+     APIs, envelope encryption, environment guardrails, tenant lifecycle, BYOK bindings, \
+     snapshot export, custom domains, environment secrets and variables, config promotion, \
+     self-service account, admin user lifecycle, identity traits, foreign password \
+     import, user invitations, flexible identifiers, exit-export credential grants, \
+     migration state machine, webauthn credentials, totp credentials, credential abuse \
+     defenses, step-up policies, email OTP and scanner-safe magic links, credential-class \
+     policies, guarded SMS OTP, passkey attestation, admin sudo elevations, trusted devices, \
+     risk engine, account recovery, federation connectors, registration abuse defenses, \
+     federation login state, enterprise inbound routing, upstream token vault, \
+     guarded account links, account linking wiring, FedCM assertion nonces, third-party \
+     risk signals, signup fraud review, advanced recovery modes, headless flows, branding, \
+     locale bundles, brand assets, diagnostic reason detail, diagnostics control read, \
+     policy decision traces, flows control read, signup forms, consent lockdown, client admin \
+     grants, consent control grants, flow version pin, flow versions, first-party challenge \
+     codes, DPoP binding, DPoP proof replay, organization membership, organization token \
+     context, organization roles, organization groups, organization group members, \
+     organization role assignments, organization authentication policies, permission \
+     vocabulary, role-to-permission mapping, organization default role, resource-server \
+     permission claims, token size event budget columns, client allowed scopes, \
+     email-factor downgrade configuration, control-plane dead-surface grants, generic \
+     transactional outbox, control-plane writes on environment secrets.";
+
 /// A throwaway migration with the given version, phase, and SQL text.
 fn step(version: i64, phase: Phase, sql: &'static str) -> Migration {
     Migration {
@@ -616,39 +652,32 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
     );
     assert_eq!(
         report.already_applied(),
-        99,
+        100,
         "a migration was added to or removed from the production chain; this count is a \
          deliberate checkpoint, not a bug, so read the new migration, satisfy yourself that it \
-         belongs in the shipped chain, then update this number and the subject list below and \
-         the version vector that follows. The chain this test pins is: isolation, audit log, \
-         management API, OIDC authorization, signing keys, login/consent, authentication \
-         context, redirect registration, UserInfo claims, consent scope upsert, resource \
-         servers, opaque access \
-         tokens, client auth suite, dynamic client registration, pushed authorization requests, \
-         refresh tokens, client-credentials service accounts, DCR abuse controls, resource \
-         indicators, JWT bearer assertion grant, device authorization, session model, RP-initiated \
-         logout, session-ended events, back-channel logout, front-channel logout, resource-model \
-         APIs, envelope encryption, environment guardrails, tenant lifecycle, BYOK bindings, \
-         snapshot export, custom domains, environment secrets and variables, config promotion, \
-         self-service account, admin user lifecycle, identity traits, foreign password \
-         import, user invitations, flexible identifiers, exit-export credential grants, \
-         migration state machine, webauthn credentials, totp credentials, credential abuse \
-         defenses, step-up policies, email OTP and scanner-safe magic links, credential-class \
-         policies, guarded SMS OTP, passkey attestation, admin sudo elevations, trusted devices, \
-         risk engine, account recovery, federation connectors, registration abuse defenses, \
-         federation login state, enterprise inbound routing, upstream token vault, \
-         guarded account links, account linking wiring, FedCM assertion nonces, third-party \
-         risk signals, signup fraud review, advanced recovery modes, headless flows, branding, \
-         locale bundles, brand assets, diagnostic reason detail, diagnostics control read, \
-         policy decision traces, flows control read, signup forms, consent lockdown, client admin \
-         grants, consent control grants, flow version pin, flow versions, first-party challenge \
-         codes, DPoP binding, DPoP proof replay, organization membership, organization token \
-         context, organization roles, organization groups, organization group members, \
-         organization role assignments, organization authentication policies, permission \
-         vocabulary, role-to-permission mapping, organization default role, resource-server \
-         permission claims, token size event budget columns, client allowed scopes, \
-         email-factor downgrade configuration, control-plane dead-surface grants, generic \
-         transactional outbox."
+         belongs in the shipped chain, then update this number and CHAIN_SUBJECTS and the \
+         version vector that follows. The chain this test pins is: {CHAIN_SUBJECTS}"
+    );
+    // The subject list is ASSERTED, not merely printed (issue #250). It used to live
+    // only inside the message above, which meant nothing checked it: a migration could
+    // be added with the count bumped and no subject written down, or a subject could be
+    // dropped while editing an adjacent one, and this test stayed green either way. A
+    // count is a weak check on a prose list and it is the strongest one available here,
+    // but it is the check that catches the ACTUAL failure mode, which is forgetting the
+    // list exists.
+    let subjects: Vec<&str> = CHAIN_SUBJECTS
+        .trim_end_matches('.')
+        .split(", ")
+        .map(str::trim)
+        .collect();
+    assert_eq!(
+        subjects.len(),
+        report.already_applied(),
+        "CHAIN_SUBJECTS names {} migrations and the chain applied {}; the list is the \
+         record of WHAT shipped, so a new migration writes a subject here as well as \
+         bumping the count. The list as parsed: {subjects:?}",
+        subjects.len(),
+        report.already_applied()
     );
 
     // The ledger holds exactly the shipped versions, contiguous and in order.
@@ -659,7 +688,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
             46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67,
             68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89,
-            90, 91, 92, 93, 94, 95, 96, 97, 98, 99
+            90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100
         ]
     );
     let phase_of = |version: i64| async move {
@@ -6121,6 +6150,237 @@ async fn the_data_plane_holds_no_column_scoped_write_grant_on_permissions() {
         role_has_any_column_privilege(pool, "ironauth_control", "permissions", "UPDATE").await,
         "the control plane holds the column-scoped UPDATE a relabel and a delete need"
     );
+}
+
+/// Migration 0100's control-plane write grants on `environment_secrets` (issue #250).
+///
+/// Its own test rather than more lines in the production-chain sweep, following the
+/// 0091/0092 precedent, so a failure names this grant rather than a line inside that
+/// long test. Both directions matter: the control plane must be ABLE to arm, rotate,
+/// and disable an environment's outbound-verification credential, and it must be able
+/// to do exactly that and no more.
+#[tokio::test]
+async fn the_control_plane_can_write_an_environment_secret_value_and_nothing_else() {
+    let db = TestDatabase::start().await;
+    let pool = db.owner_pool();
+
+    // The three table-wide privileges the management endpoints need. DELETE has no
+    // column form, so it is asserted table-wide by definition.
+    for privilege in ["SELECT", "INSERT", "DELETE"] {
+        assert!(
+            role_has_table_privilege(pool, "ironauth_control", "environment_secrets", privilege)
+                .await,
+            "the control plane needs {privilege} on environment_secrets to manage the \
+             outbound-verification credential"
+        );
+    }
+
+    // The UPDATE is COLUMN SCOPED, which is the whole point: a rotation rewrites the
+    // sealed value and its bookkeeping, and nothing else. `has_table_privilege` does
+    // not see a column-scoped grant, so the table-wide probe must read FALSE while the
+    // four named columns read true.
+    assert!(
+        !role_has_table_privilege(pool, "ironauth_control", "environment_secrets", "UPDATE").await,
+        "the control plane must hold NO table-wide UPDATE on environment_secrets (the #31 \
+         lesson): a future column would silently fall under it"
+    );
+    for column in ["ciphertext", "dek_version", "version", "updated_at"] {
+        assert!(
+            role_has_column_privilege(
+                pool,
+                "ironauth_control",
+                "environment_secrets",
+                column,
+                "UPDATE"
+            )
+            .await,
+            "a rotation rewrites {column}, so the control plane needs it"
+        );
+    }
+    // And the identity columns are NOT writable, so the control plane cannot rewrite a
+    // secret's name or scope THROUGH AN UPDATE. That is a narrower claim than it looks
+    // and the next test is the reason it has to be stated that narrowly.
+    for column in ["id", "tenant_id", "environment_id", "name", "created_at"] {
+        assert!(
+            !role_has_column_privilege(
+                pool,
+                "ironauth_control",
+                "environment_secrets",
+                column,
+                "UPDATE"
+            )
+            .await,
+            "the control plane must not be able to rewrite {column} on environment_secrets"
+        );
+    }
+}
+
+/// Migration 0100's RESTRICTIVE row-level-security policies on `environment_secrets`
+/// (issue #250): the control plane may write exactly the ONE reserved name.
+///
+/// # Why the column grants above are not the fence, measured rather than argued
+///
+/// `GRANT INSERT` is table wide and `GRANT DELETE` has no column form at all, so the
+/// column-scoped UPDATE says nothing about what the control plane can CREATE. INSERT
+/// plus DELETE is a rename, and a replace of any other secret in the bound scope, one
+/// statement pair at a time. An earlier draft of 0100's header claimed the grants alone
+/// meant the control plane "can neither rename one nor move one between scopes"; that
+/// was true of UPDATE and false of the pair, and this test is what would have caught it.
+///
+/// SELECT is deliberately left unrestricted, and that is asserted here too: 0035 granted
+/// the control role SELECT for the config-promotion plan's reference-PRESENCE check,
+/// which asks about secrets by whatever name a variable references.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one linear seed -> five-probe walk over one policy set
+async fn the_control_plane_can_write_only_the_one_reserved_environment_secret_name() {
+    use ironauth_env::Env;
+
+    const RESERVED: &str = "ironauth.outbound_verification_token";
+    const FOREIGN: &str = "connector.stripe.api_key";
+
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let tenant = scope.tenant().to_string();
+    let environment = scope.environment().to_string();
+
+    // A FOREIGN secret seeded as the OWNER, so the control plane's inability to touch it
+    // below is measured against a row that really exists.
+    sqlx::query(
+        "INSERT INTO environment_secrets \
+         (id, tenant_id, environment_id, name, dek_version, ciphertext) \
+         VALUES ($1, $2, $3, $4, 1, '\\x00'::bytea)",
+    )
+    .bind("esec_owner_seeded_foreign")
+    .bind(&tenant)
+    .bind(&environment)
+    .bind(FOREIGN)
+    .execute(db.owner_pool())
+    .await
+    .expect("the owner seeds a foreign secret");
+
+    // Everything below runs as `ironauth_control` inside the scope-bound transaction the
+    // repository layer always opens, which is exactly how the management API reaches
+    // this table.
+    let mut tx = db
+        .control_pool()
+        .begin()
+        .await
+        .expect("control transaction");
+    for (key, value) in [
+        ("ironauth.tenant_id", &tenant),
+        ("ironauth.environment_id", &environment),
+    ] {
+        sqlx::query("SELECT set_config($1, $2, true)")
+            .bind(key)
+            .bind(value)
+            .execute(&mut *tx)
+            .await
+            .expect("bind the scope");
+    }
+
+    // 1. The RESERVED name is writable: this is the anti-vacuity control. Without it a
+    //    policy that refused EVERYTHING would satisfy every negative below.
+    sqlx::query(
+        "INSERT INTO environment_secrets \
+         (id, tenant_id, environment_id, name, dek_version, ciphertext) \
+         VALUES ($1, $2, $3, $4, 1, '\\x01'::bytea)",
+    )
+    .bind("esec_control_reserved")
+    .bind(&tenant)
+    .bind(&environment)
+    .bind(RESERVED)
+    .execute(&mut *tx)
+    .await
+    .expect("the control plane arms the reserved name");
+
+    // 2. A DIFFERENT name is refused at the INSERT, which is the hole the grants left
+    //    wide open: this is how the control plane would have minted a secret under any
+    //    name at all.
+    let refused = sqlx::query(
+        "INSERT INTO environment_secrets \
+         (id, tenant_id, environment_id, name, dek_version, ciphertext) \
+         VALUES ($1, $2, $3, $4, 1, '\\x02'::bytea)",
+    )
+    .bind("esec_control_foreign")
+    .bind(&tenant)
+    .bind(&environment)
+    .bind("connector.acme.api_key")
+    .execute(&mut *tx)
+    .await;
+    let message = refused
+        .expect_err("the control plane must not create a secret under any other name")
+        .to_string();
+    assert!(
+        message.contains("row-level security"),
+        "the refusal must be the restrictive policy rather than an incidental \
+         constraint: {message}"
+    );
+
+    // A failed statement poisons the transaction, so the remaining probes get a fresh
+    // one, bound to the same scope.
+    tx.rollback().await.expect("roll back the poisoned probe");
+    let mut tx = db
+        .control_pool()
+        .begin()
+        .await
+        .expect("control transaction");
+    for (key, value) in [
+        ("ironauth.tenant_id", &tenant),
+        ("ironauth.environment_id", &environment),
+    ] {
+        sqlx::query("SELECT set_config($1, $2, true)")
+            .bind(key)
+            .bind(value)
+            .execute(&mut *tx)
+            .await
+            .expect("bind the scope");
+    }
+
+    // 3. The other half of the rename: DELETE. Without the restrictive DELETE policy the
+    //    control plane could destroy any secret in the scope, connector credentials
+    //    included, and then INSERT its own row under that name.
+    let deleted = sqlx::query("DELETE FROM environment_secrets WHERE name = $1")
+        .bind(FOREIGN)
+        .execute(&mut *tx)
+        .await
+        .expect("the delete runs")
+        .rows_affected();
+    assert_eq!(
+        deleted, 0,
+        "the control plane must not be able to delete another environment secret"
+    );
+
+    // 4. And an UPDATE of a foreign row's VALUE is refused by the policy as well, which
+    //    the column grants alone did not cover: they said WHICH columns, never WHICH ROWS.
+    let updated =
+        sqlx::query("UPDATE environment_secrets SET ciphertext = '\\x03'::bytea WHERE name = $1")
+            .bind(FOREIGN)
+            .execute(&mut *tx)
+            .await
+            .expect("the update runs")
+            .rows_affected();
+    assert_eq!(
+        updated, 0,
+        "the control plane must not be able to rewrite another environment secret's value"
+    );
+
+    // 5. SELECT is UNRESTRICTED, deliberately: 0035's reference-presence check reads
+    //    secrets by whatever name a promoted variable references. A policy that broke
+    //    that would break config promotion, so it is pinned here rather than discovered
+    //    there.
+    let (visible,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM environment_secrets WHERE name = $1")
+            .bind(FOREIGN)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("the presence read runs");
+    assert_eq!(
+        visible, 1,
+        "the control plane must still SEE a foreign secret's presence (migration 0035)"
+    );
+
+    tx.commit().await.expect("commit the probe transaction");
 }
 
 /// The `org_role_permissions` schema, policy, indexes, and grants (issue #98,

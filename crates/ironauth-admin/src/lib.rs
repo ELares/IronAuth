@@ -213,11 +213,23 @@ pub fn management_router(state: AdminState) -> Router {
         )
         // Outbound lazy-migration credential verification (issue #58): the mirror of
         // the inbound migration hook, so a successor system can migrate away. A static
-        // suffix; disabled by default and gated by an environment-scoped shared token
-        // (never a management key), so it does not take the management Principal.
+        // suffix; disabled by default and gated by the ADDRESSED ENVIRONMENT's own
+        // sealed shared token (issue #250, never a management key), so it does not take
+        // the management Principal. Every refusal is one uniform not-found.
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/migration/verify-credential",
             post(migration::verify_credential),
+        )
+        // The management half of that credential (issue #250): read whether this
+        // environment has outbound verification armed (metadata only, never the token),
+        // enable or rotate it, and disable it. Ordinary management endpoints on the
+        // environment prefix, taking the management Principal. A static suffix, matched
+        // before the parameterized keys/organizations routes.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/migration/outbound-verification",
+            get(migration::get_outbound_verification)
+                .put(migration::set_outbound_verification)
+                .delete(migration::delete_outbound_verification),
         )
         // Inbound lazy-migration progress (issue #56): the queryable JSON view of how far
         // an environment's lazy migration has come, plus this node's circuit-breaker

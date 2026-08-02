@@ -1263,51 +1263,20 @@ pub struct AdminConfig {
     #[serde(default = "default_offboarding_retention_secs")]
     pub offboarding_retention_secs: u64,
 
-    /// Enable the OUTBOUND lazy-migration credential-verification endpoint (issue
-    /// #58): the mirror of IronAuth's inbound migration hook, so a SUCCESSOR system
-    /// can migrate away from IronAuth exactly as easily as IronAuth migrates off an
-    /// incumbent. When enabled, `POST .../migration/verify-credential` lets a
-    /// successor present a user's identifier plus password during its OWN lazy
-    /// migration and receive a verdict (and, on success, an optional profile), so it
-    /// upgrades users to its native store on their next login without a password
-    /// reset. The SAFE default (`false`) leaves the endpoint returning a uniform
-    /// not-found: the exit-friendliness covenant makes the export SELF-SERVE, but
-    /// exposing a live credential-oracle to a third party is an explicit,
-    /// per-deployment opt-in. This is a promotable per-environment setting in spirit
-    /// (like the OIDC toggles); the process value is the deployment default until
-    /// per-environment overrides ride the M5 promotion pipeline.
-    pub outbound_verification_enabled: bool,
-
-    /// The shared bearer token a successor system presents to the OUTBOUND
-    /// lazy-migration verification endpoint (issue #58), as
-    /// `Authorization: Bearer <token>`. It is a DISTINCT credential from the
-    /// management operator token and any management key: it authorizes ONLY the
-    /// credential-verification endpoint, never any other management surface. Unset
-    /// (the default) leaves the endpoint unauthorized even when
-    /// `outbound_verification_enabled` is true (fail closed: no token, no access).
-    /// Use the `file`/`env` secret indirection, never a literal, outside dev mode.
-    pub outbound_verification_token: Option<Secret>,
-
-    /// The tenant id the OUTBOUND lazy-migration verification endpoint is authorized
-    /// for (issue #58). The endpoint is bound to exactly ONE `(tenant, environment)`:
-    /// a request whose path scope does not match this tenant AND
-    /// `outbound_verification_environment` is a uniform not-found, so the shared token
-    /// can only ever verify credentials in its one configured environment and never
-    /// leaks across tenants. Unset (the default) leaves the endpoint bound to no
-    /// scope, so it matches nothing and is a uniform not-found even when enabled and
-    /// credentialed (fail closed: no scope, no access). A larger per-environment
-    /// secret home rides the M5 promotion pipeline; this pins the authorized scope
-    /// today so the most sensitive new surface is never deployment-global.
-    #[serde(default)]
-    pub outbound_verification_tenant: Option<String>,
-
-    /// The environment id the OUTBOUND lazy-migration verification endpoint is
-    /// authorized for (issue #58), paired with `outbound_verification_tenant`. Both
-    /// must be set and must match the request's path scope, or the endpoint is a
-    /// uniform not-found. Unset (the default) is fail closed.
-    #[serde(default)]
-    pub outbound_verification_environment: Option<String>,
-
+    // The OUTBOUND lazy-migration credential-verification endpoint (issue #58) used
+    // to live here, as `outbound_verification_enabled`, `outbound_verification_token`,
+    // `outbound_verification_tenant`, and `outbound_verification_environment`. Issue
+    // #250 moved its enablement AND its credential into the per-environment secrets
+    // surface (issue #45), so every environment carries its own independent, sealed,
+    // rotatable token instead of one deployment-global value with a single authorized
+    // scope. There is deliberately NO fallback to a process value: "environment-scoped
+    // config" is now literally true.
+    //
+    // Removing the four keys is the loud path, not the quiet one. `AdminConfig` is
+    // `deny_unknown_fields`, so a config file that still carries any of them FAILS TO
+    // LOAD with an error naming the key, rather than starting up with a feature the
+    // operator believes is enabled and is not. See `docs/exit-guide.md` for the
+    // replacement management endpoints and the CHANGELOG for the operator obligation.
     /// Whether admin sudo mode (session privilege separation) is active on the
     /// management surface (issue #73). OFF by default: it is an exploratory bet, gated
     /// behind a per-environment flag and a graduation decision. When ON, admin READS are
@@ -1383,10 +1352,6 @@ impl Default for AdminConfig {
             default_page_size: 50,
             allowed_regions: Vec::new(),
             offboarding_retention_secs: default_offboarding_retention_secs(),
-            outbound_verification_enabled: false,
-            outbound_verification_token: None,
-            outbound_verification_tenant: None,
-            outbound_verification_environment: None,
             sudo_mode_enabled: false,
             sudo_mode_window_secs: default_sudo_mode_window_secs(),
             backfill_signing_algorithms_on_start: false,
@@ -2068,10 +2033,43 @@ pub struct OidcConfig {
     /// The INBOUND lazy-migration hook (issue #56): verify a first login against a
     /// legacy credential store over the SSRF-hardened outbound fetcher and, on success,
     /// create the user locally with a native Argon2id hash so subsequent logins never
-    /// call the hook. Disabled by default; the endpoint and its authentication secret
-    /// are environment-scoped config (see [`LazyMigrationConfig`]). This is a promotable
-    /// per-environment setting in spirit; the process value is the deployment default
-    /// until per-environment overrides ride the M5 promotion pipeline.
+    /// call the hook. Disabled by default.
+    ///
+    /// CORRECTING A CLAIM THIS COMMENT USED TO MAKE (issue #250 sweep): it said the
+    /// endpoint and its authentication secret "are environment-scoped config". They are
+    /// not, and were not when that was written. This whole section is DEPLOYMENT
+    /// GLOBAL: `OidcState::migration_hook` takes no `Scope` and hands back one
+    /// process-wide hook, so an armed hook fires on the first-login path of EVERY
+    /// environment in the deployment, and there is not even the single-`(tenant,
+    /// environment)` pin the OUTBOUND side had before issue #250 re-homed it.
+    ///
+    /// # What that costs a MULTI-TENANT deployment that turns this on, named exactly
+    ///
+    /// Calling it "a performance and blast-radius decision" understates it enough that a
+    /// future reader could deprioritise it, so the two primitives are named rather than
+    /// summarized. See issue #482, which carries the measurements and the reason the
+    /// structural fix is an owner-level decision rather than a mechanical port.
+    ///
+    /// 1. PLAINTEXT CREDENTIAL EGRESS ACROSS TENANTS. `login.rs` calls
+    ///    `hook.attempt(identifier, password)` on the absent-account branch, from
+    ///    `state.migration_hook()`, which takes no `Scope`. Every identifier and password
+    ///    typed at ANY environment's login page, for any account absent locally, is sent
+    ///    to the one configured third-party webhook.
+    /// 2. THIRD-PARTY-CONTROLLED ACCOUNT CREATION IN EVERY ENVIRONMENT. On a `Verified`
+    ///    verdict, `complete_lazy_migration` creates the user in the REQUESTING scope. The
+    ///    webhook can answer "verified" to any identifier and mint an account in any
+    ///    tenant.
+    ///
+    /// What bounds it is that it is OFF by default and harmless in a single-tenant
+    /// deployment, which is the only reason it is not a release blocker.
+    ///
+    /// It is the same defect shape issue #250 fixed on the outbound side, on the inbound
+    /// mirror of the same endpoint, and it is deliberately left standing here rather than
+    /// folded into that change: the fix puts a per-request per-scope read on the LOGIN hot
+    /// path and gives the circuit breaker per-scope state, which is a design change with
+    /// its own blast radius rather than a mechanical port, so it is an owner-level call
+    /// and gets its own issue. What is fixed here is the sentence, because a comment that
+    /// claims a property the code does not have is worse than no comment.
     pub lazy_migration: LazyMigrationConfig,
 
     /// Generic OIDC UPSTREAM federation (issue #75, PR B): turn a declarative connector

@@ -6795,6 +6795,253 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/migration/outbound-verification": {
+      "get": {
+        "tags": [
+          "exit"
+        ],
+        "summary": "Read one environment's outbound-verification state (never its token).",
+        "operationId": "getOutboundVerification",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Whether outbound verification is enabled for this environment, with the stored token's version and timestamps. The token itself is never returned.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OutboundVerificationView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found. The environment must EXIST; a soft-deleted one still answers, exactly as every other management read does, and exactly as the DELETE on this same path does",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "exit"
+        ],
+        "summary": "Enable, or rotate, one environment's outbound-verification token.",
+        "operationId": "setOutboundVerification",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetOutboundVerificationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The token was sealed for this environment. Outbound verification is now enabled here, and any previous token stopped working. The response carries the new version and timestamps, never the token.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OutboundVerificationView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request, or a token shorter than the 32-byte floor",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential, or a lapsed sudo elevation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found. The environment must be live: an absent or soft-deleted one answers this same not-found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "exit"
+        ],
+        "summary": "Disable one environment's outbound verification, destroying its token.",
+        "operationId": "deleteOutboundVerification",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Outbound verification is disabled for this environment and its token is gone. Idempotent: disabling an already-disabled environment is the same 204."
+          },
+          "401": {
+            "description": "Missing or invalid credential, or a lapsed sudo elevation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found: the environment was never created. A SOFT-DELETED environment is NOT refused here, deliberately, because destroying a credential is the closing direction and must never require its parent to be live",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A live environment variable in this scope still references the outbound-verification secret, so deleting it would leave a dangling reference. Remove the referring variable first. Documented because it is structurally reachable through the config-promotion apply, not because this surface creates such a reference",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/migration/progress": {
       "get": {
         "tags": [
@@ -6910,7 +7157,7 @@
         },
         "responses": {
           "200": {
-            "description": "The verification verdict. On success it carries the stable subject and the user's profile (claims and traits), so the successor migrates the full identity. A wrong password, unknown account, or fenced account returns verified=false with no distinguishing oracle. Enabled and credentialed through environment-scoped config; documented at docs/exit-guide.md.",
+            "description": "The verification verdict. On success it carries the stable subject and the user's profile (claims and traits), so the successor migrates the full identity. A wrong password, unknown account, or fenced account returns verified=false with no distinguishing oracle. Enabled and credentialed PER ENVIRONMENT through the outbound-verification management endpoints; documented at docs/exit-guide.md.",
             "content": {
               "application/json": {
                 "schema": {
@@ -6920,17 +7167,7 @@
             }
           },
           "400": {
-            "description": "Malformed request",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Missing or invalid outbound verification token",
+            "description": "Malformed request, from a caller that already presented this environment's outbound verification token",
             "content": {
               "application/json": {
                 "schema": {
@@ -6940,7 +7177,7 @@
             }
           },
           "404": {
-            "description": "The endpoint is disabled, or the environment was not found",
+            "description": "The uniform refusal. A missing bearer, a wrong bearer, an environment with outbound verification disabled, an absent environment, an absent tenant, and a malformed path id are ONE byte-identical answer, so no caller learns which of them applied",
             "content": {
               "application/json": {
                 "schema": {
@@ -17670,6 +17907,43 @@
           }
         }
       },
+      "OutboundVerificationView": {
+        "type": "object",
+        "description": "One environment's outbound-verification state, WITHOUT the token (issue #250).\n\nThis view is what makes the feature operable, and it is metadata only by\nconstruction: it is built from [`ironauth_store::EnvironmentSecretMetadata`],\nwhich the store reads with a `SELECT` that does not name the `ciphertext` column\nat all, so there is no code path from this response to a secret value. A token,\nonce written, is never readable back through any endpoint; it is rotated or it is\ndeleted.",
+        "required": [
+          "enabled"
+        ],
+        "properties": {
+          "created_at_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the token was first written, in milliseconds since the Unix epoch, or\nnull when disabled."
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether the outbound credential-verification endpoint is enabled for THIS\nenvironment. True exactly when this environment holds an outbound-verification\ntoken; the endpoint is a uniform not-found in every environment where this is\nfalse, which is every environment until an operator enables it."
+          },
+          "updated_at_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the token was last rotated, in milliseconds since the Unix epoch, or null\nwhen disabled."
+          },
+          "version": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The monotonic write version of the stored token, bumped by every rotation, or\nnull when disabled. An operator confirms a rotation landed by watching this\nadvance, which is the only reason it is published: the value itself never is."
+          }
+        }
+      },
       "PasswordHashingProbeReport": {
         "type": "object",
         "description": "A parameter recommendation produced from a host-measured probe (issue #62).",
@@ -18703,6 +18977,19 @@
             ],
             "description": "The new parent group, or null to promote this group to a root.",
             "example": "grp_..."
+          }
+        }
+      },
+      "SetOutboundVerificationRequest": {
+        "type": "object",
+        "description": "The body that enables or rotates an environment's outbound-verification token.\n\nNo `Debug` is derived, exactly as [`VerifyCredentialRequest`] derives none, so a\nstray struct dump cannot spill the token an operator is writing.",
+        "required": [
+          "token"
+        ],
+        "properties": {
+          "token": {
+            "type": "string",
+            "description": "The shared bearer a successor system will present to this environment's\ncredential-verification endpoint. Writing it enables the endpoint for this\nenvironment; writing it again rotates it, and the previous value stops working\nthe moment the write commits. It is sealed under this environment's envelope\nkey and is never readable back through any endpoint."
           }
         }
       },

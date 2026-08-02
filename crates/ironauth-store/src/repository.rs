@@ -35492,6 +35492,38 @@ impl EnvironmentRepo<'_> {
         environment_from_row(&row)
     }
 
+    /// Whether an environment row exists under this tenant AT ALL: live OR
+    /// soft-deleted (issue #250).
+    ///
+    /// [`EnvironmentRepo::get`] answers the LIVE question, which is the right one for
+    /// every write that ARMS or CREATES something. It is the wrong one for a write in
+    /// the CLOSING direction. Destroying a credential inside a decommissioned
+    /// environment is precisely what an operator needs to be able to do, and gating it
+    /// on the parent being live turns a soft delete into a one-way door: the credential
+    /// survives the deletion (soft-deleting an environment cascades to almost nothing)
+    /// and the only route that could destroy it starts refusing.
+    ///
+    /// So this is the weaker precondition a closing write takes: the environment must
+    /// be ADDRESSABLE, not live. An environment that was never created is still the
+    /// uniform not-found, which is what keeps the absent case from becoming a silent
+    /// success on a delete that violates no foreign key.
+    ///
+    /// It reads no columns and returns no record, so it cannot be mistaken at a call
+    /// site for the liveness check.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn exists_in_any_state(&self, id: &EnvironmentId) -> Result<bool, StoreError> {
+        let row =
+            sqlx::query("SELECT 1 AS present FROM environments WHERE id = $1 AND tenant_id = $2")
+                .bind(id.to_string())
+                .bind(self.tenant.to_string())
+                .fetch_optional(self.store.pool())
+                .await?;
+        Ok(row.is_some())
+    }
+
     /// One page of live environments under this tenant, ordered by `(created_at,
     /// id)`.
     ///
@@ -47239,6 +47271,136 @@ impl EnvironmentSecretRepo<'_> {
         tx.commit().await?;
         Ok(plaintext)
     }
+
+    /// [`EnvironmentSecretRepo::open_value`] under the store's OWN platform master
+    /// key, at the SAME cost whether the secret is there or not (issue #250).
+    ///
+    /// Two things are folded into one function here, and the second is the reason it
+    /// is not simply `open_value` with the key resolved:
+    ///
+    /// 1. The explicit-`master` form exists because the config-promotion apply threads
+    ///    one key handle through a plan; a request handler has no such thread and would
+    ///    otherwise need the key exposed on the public `Store` surface, which is exactly
+    ///    what [`Store::master`] being crate-private prevents.
+    /// 2. `open_value`'s zero-row branch returns after ONE round trip, while its hit
+    ///    branch spends THREE (`environment_secrets`, then `tenant_deks`, then
+    ///    `tenant_keks`) and three AEAD opens. That difference is a timing oracle for
+    ///    the ONE caller that is reachable without any credential at all
+    ///    (`ironauth_admin::migration::verify_credential`, whose whole posture is that
+    ///    an armed environment is indistinguishable from a disabled one). MEASURED
+    ///    before this branch existed: an unauthenticated prober driving a garbage
+    ///    bearer separated armed from disabled with a single-sample classifier.
+    ///
+    /// So the miss branch SPENDS the same work: the same two key lookups, and three
+    /// AEAD opens against a fixed decoy blob. Both branches then cost three round trips
+    /// and three AEAD opens. See [`spend_uniform_open_cost`].
+    ///
+    /// The name carries the covenant. A caller that wants the cheap read wants
+    /// [`EnvironmentSecretRepo::open_value`]; a caller reachable by an unauthenticated
+    /// prober wants this one, and pays for it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] if the store carries no platform master key (fail
+    /// closed: an unsealed read is never substituted), plus everything
+    /// [`EnvironmentSecretRepo::open_value`] reports.
+    pub async fn open_value_under_platform_key_at_uniform_cost(
+        &self,
+        name: &str,
+    ) -> Result<Vec<u8>, StoreError> {
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT dek_version, ciphertext FROM environment_secrets \
+             WHERE tenant_id = $1 AND environment_id = $2 AND name = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(name)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            spend_uniform_open_cost(&mut tx, self.scope, master).await?;
+            tx.commit().await?;
+            return Err(StoreError::NotFound);
+        };
+        let dek_version: i32 = row.get("dek_version");
+        let ciphertext: Vec<u8> = row.get("ciphertext");
+        let dek = fetch_dek_by_version(&mut tx, self.scope, master, dek_version).await?;
+        let plaintext = dek.open(
+            &secret_seal_aad(self.scope, &env_secret_seal_purpose(name), dek_version),
+            &Sealed::from_bytes(ciphertext)?,
+        )?;
+        tx.commit().await?;
+        Ok(plaintext)
+    }
+}
+
+/// The key version the uniform-cost read's DECOY lookups name (issue #250).
+///
+/// A provisioned scope's KEK and DEK versions start at 1, so version 0 names a row in
+/// no scope that has ever existed. The decoy `SELECT`s therefore cost exactly the round
+/// trip they exist to spend and can never touch a real key, and their answer is the
+/// same empty result in every scope, armed or not.
+const UNIFORM_COST_DECOY_KEY_VERSION: i32 = 0;
+
+/// The fixed blob the uniform-cost read's decoy AEAD opens are performed against
+/// (issue #250): long enough to be a well-formed [`Sealed`] (a nonce plus a tag plus a
+/// payload the size of a wrapped key) and, being a constant, openable by nothing.
+const UNIFORM_COST_DECOY_SEALED: [u8; 60] = [0x5A; 60];
+
+/// Spend, on a MISS, the work a HIT costs (issue #250): the two key `SELECT`s and the
+/// three AEAD opens, so the presence of a secret is not readable from the shape of the
+/// work done.
+///
+/// The two queries are the same two [`fetch_dek_by_version`] and [`fetch_kek_by_version`]
+/// issue, in the same order, against the same tables, differing only in the version they
+/// bind ([`UNIFORM_COST_DECOY_KEY_VERSION`], which matches nothing). They are issued
+/// UNCONDITIONALLY rather than through those functions, because those functions
+/// short-circuit: the DEK lookup returning no row would skip the KEK lookup, and a scope
+/// with no key hierarchy at all would then still be one round trip cheaper than a scope
+/// that has one.
+///
+/// The three opens are three failing unwraps under the real master key rather than one
+/// unwrap and two synthesized keys, because a failing open runs the same AEAD primitive
+/// over the same key schedule as a succeeding one, and the alternative would need a Kek
+/// and a Dek conjured from entropy this layer does not hold at read time.
+///
+/// Every result is discarded. Nothing here can succeed, and nothing here writes.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] if a decoy lookup fails, which is the same answer the real
+/// lookup would give.
+async fn spend_uniform_open_cost(
+    conn: &mut PgConnection,
+    scope: Scope,
+    master: &MasterKey,
+) -> Result<(), StoreError> {
+    let _dek_row = sqlx::query(
+        "SELECT kek_version, wrapped_dek FROM tenant_deks \
+         WHERE tenant_id = $1 AND environment_id = $2 AND version = $3",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(UNIFORM_COST_DECOY_KEY_VERSION)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let _kek_row = sqlx::query(
+        "SELECT master_key_id, wrapped_kek FROM tenant_keks \
+         WHERE tenant_id = $1 AND environment_id = $2 AND version = $3",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(UNIFORM_COST_DECOY_KEY_VERSION)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let decoy = Sealed::from_bytes(UNIFORM_COST_DECOY_SEALED.to_vec())?;
+    let aad = kek_wrap_aad(scope, UNIFORM_COST_DECOY_KEY_VERSION, master.id());
+    for _ in 0..3 {
+        let _ = master.unwrap_kek(&aad, &decoy);
+    }
+    Ok(())
 }
 
 /// The mutating environment-variable repository for one scope and actor (issue #45).
@@ -47494,6 +47656,28 @@ impl ActingEnvironmentSecretRepo<'_> {
         )
         .await?;
         Ok(id)
+    }
+
+    /// [`ActingEnvironmentSecretRepo::put`] under the store's OWN platform master
+    /// key, the write-side twin of
+    /// [`EnvironmentSecretRepo::open_value_under_platform_key`] (issue #250) and for
+    /// the same reason: a request handler holds a [`Store`], not a key handle, and
+    /// [`Store::master`] is crate-private so that stays true.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] if the store carries no platform master key (fail
+    /// closed: a plaintext write is never substituted for a sealed one), plus
+    /// everything [`ActingEnvironmentSecretRepo::put`] reports.
+    pub async fn put_under_platform_key(
+        &self,
+        env: &Env,
+        name: &str,
+        plaintext: &[u8],
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<EnvironmentSecretId, StoreError> {
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        self.put(env, master, name, plaintext, idempotency).await
     }
 
     /// Delete a secret and audit `environment_secret.delete` in the same

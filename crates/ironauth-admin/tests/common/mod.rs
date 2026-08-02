@@ -233,36 +233,60 @@ impl Harness {
     }
 
     /// Start a fresh database and router with the OUTBOUND lazy-migration
-    /// credential-verification endpoint enabled, its shared token set, and BOUND to a
-    /// freshly seeded `(tenant, environment)` scope (issue #58). `token` is the bearer
-    /// a successor system presents; `None` leaves the endpoint enabled but
-    /// unauthorized (fail-closed testing). The endpoint is authorized for exactly the
-    /// returned [`Harness::outbound_scope`]; a request to any other scope is a uniform
-    /// 404. Callers seed users into `outbound_scope`.
-    pub async fn start_with_outbound_verification(token: Option<&str>) -> Self {
+    /// credential-verification endpoint ARMED in a freshly seeded
+    /// `(tenant, environment)` scope (issue #58, re-homed by issue #250).
+    ///
+    /// There is no config knob any more: `token` is written into THAT ENVIRONMENT's
+    /// own sealed secret through the real management endpoint, which is the only way
+    /// the feature can be enabled at all. Every other scope in this database is
+    /// therefore disabled, which is what makes the cross-environment test meaningful.
+    /// Callers seed users into [`Harness::outbound_scope`].
+    pub async fn start_with_outbound_verification(token: &str) -> Self {
         let db = TestDatabase::start().await;
-        // Seed the authorized scope BEFORE building the state, so the outbound
-        // verification can be pinned to it (the endpoint is scope-bound, not global).
-        let scope = db.seed_scope(&Env::system()).await;
         let config = AdminConfig {
             bootstrap_operator_token: Some(Secret::Literal(SecretString::new(OPERATOR_TOKEN))),
             max_page_size: 200,
             default_page_size: 50,
-            outbound_verification_enabled: true,
-            outbound_verification_token: token
-                .map(|value| Secret::Literal(SecretString::new(value))),
-            outbound_verification_tenant: Some(scope.tenant().to_string()),
-            outbound_verification_environment: Some(scope.environment().to_string()),
             ..AdminConfig::default()
         };
         let state = AdminState::new(db.control_store().clone(), Env::system(), &config)
             .expect("admin state builds");
         let router = management_router(state);
-        Self {
+        let harness = Self {
             db,
             router,
+            outbound_scope: None,
+        };
+        let scope = harness.seed_scope().await;
+        harness.arm_outbound_verification(scope, token).await;
+        Self {
             outbound_scope: Some(scope),
+            ..harness
         }
+    }
+
+    /// Arm outbound verification in `scope` with `token`, through the REAL management
+    /// endpoint (issue #250), so the harness exercises the same seal an operator does
+    /// rather than a second write path that could drift from it.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless the write answers 200 with `enabled: true`.
+    pub async fn arm_outbound_verification(&self, scope: Scope, token: &str) {
+        let path = format!(
+            "/v1/tenants/{}/environments/{}/migration/outbound-verification",
+            scope.tenant(),
+            scope.environment()
+        );
+        let body = serde_json::json!({ "token": token }).to_string();
+        let (status, _headers, body) = self.put(&path, &body).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "arming outbound verification must succeed: {body}"
+        );
+        let view: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(view["enabled"], true, "armed: {body}");
     }
 
     /// Start a fresh database and router with a store-backed data-plane issuer registry
@@ -341,10 +365,6 @@ impl Harness {
             bootstrap_operator_token: Some(Secret::Literal(SecretString::new(OPERATOR_TOKEN))),
             max_page_size: 200,
             default_page_size,
-            outbound_verification_enabled: true,
-            outbound_verification_token: Some(Secret::Literal(SecretString::new(outbound_token))),
-            outbound_verification_tenant: Some(scope.tenant().to_string()),
-            outbound_verification_environment: Some(scope.environment().to_string()),
             ..AdminConfig::default()
         };
         let registry = std::sync::Arc::new(ironauth_oidc::IssuerRegistry::store_backed(
@@ -372,10 +392,20 @@ impl Harness {
             .with_signup_quarantine_enabled(true)
             .with_advanced_recovery_enabled(true);
         let router = management_router(state);
-        Self {
+        let harness = Self {
             db,
             router,
+            outbound_scope: None,
+        };
+        // Outbound verification is armed in THAT environment's own sealed secret
+        // (issue #250), not in config, so the whole-surface sweeps drive the endpoint
+        // through the same door an operator uses.
+        harness
+            .arm_outbound_verification(scope, outbound_token)
+            .await;
+        Self {
             outbound_scope: Some(scope),
+            ..harness
         }
     }
 

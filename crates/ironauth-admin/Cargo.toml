@@ -495,3 +495,25 @@ workspace = true
 name = "unsealed_environment"
 path = "tests/unsealed_environment.rs"
 required-features = ["testing"]
+
+# The PER-ENVIRONMENT outbound migration verification credential (issue #250): an
+# armed environment verifies with its own sealed token and refuses a wrong one, one
+# environment's token verifies nothing in another, rotation takes effect immediately,
+# disabling destroys the token, the token is sealed at rest and never read back, and
+# the six refusal states are ONE byte-identical not-found (the enumeration oracle
+# per-environment enablement would otherwise create). Needs a real database.
+[[test]]
+name = "outbound_verification"
+path = "tests/outbound_verification.rs"
+required-features = ["testing"]
+
+# The TIMING harness behind the issue #250 uniform-not-found claim: the armed and the
+# disabled branches must cost the same to an UNAUTHENTICATED prober, because the delta
+# used to be two database round trips and a single-sample classifier separated them.
+# Every test in it is `#[ignore]`d (a wall-clock assertion in CI is a flake generator),
+# so it is registered here to be BUILT and to be runnable by hand; the numbers it
+# printed are quoted in the crate CHANGELOG with the command. Needs a real database.
+[[test]]
+name = "outbound_timing_probe"
+path = "tests/outbound_timing_probe.rs"
+required-features = ["testing"]

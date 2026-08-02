@@ -120,6 +120,7 @@ fn operation_ids_are_the_stable_set() {
             "deleteOrgGroup",
             "deleteOrgRole",
             "deleteOrganization",
+            "deleteOutboundVerification",
             "deletePermission",
             "deleteSignupForm",
             "deleteTenant",
@@ -153,6 +154,7 @@ fn operation_ids_are_the_stable_set() {
             "getOrgMembershipEffectiveRoles",
             "getOrgRole",
             "getOrganization",
+            "getOutboundVerification",
             "getPermission",
             "getPolicyDecisionTraces",
             "getRefreshFamily",
@@ -216,6 +218,7 @@ fn operation_ids_are_the_stable_set() {
             "setLocale",
             "setOrgDefaultRole",
             "setOrgGroupParent",
+            "setOutboundVerification",
             "setSignupForm",
             "setUserState",
             "suspendTenant",
@@ -377,6 +380,7 @@ fn documented_paths_are_the_expected_set() {
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/connectors/{connector_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/keys/{key_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/locales/{locale}",
+            "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/migration/outbound-verification",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/default-role",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}",
@@ -425,6 +429,7 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/migration-runs",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/migration-runs/{run_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/migration-runs/{run_id}/violations",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/migration/outbound-verification",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/migration/progress",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}",
@@ -511,6 +516,7 @@ fn documented_paths_are_the_expected_set() {
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/signing-algorithm",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/connectors/{connector_id}",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/locales/{locale}",
+            "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/migration/outbound-verification",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/default-role",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/parent",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/external-id",
@@ -605,17 +611,24 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        147,
+        150,
         "the documented route count is pinned"
     );
 
-    // The OUTBOUND lazy-migration endpoint (issue #58) is the one documented route
-    // that is NOT gated by the management `Principal` at 401. It is DISABLED BY
-    // DEFAULT and scope-bound: its enablement gate is evaluated BEFORE the bearer
-    // check, so an unauthenticated probe against the default (disabled) config is a
-    // uniform 404, indistinguishable from an absent route. That is the intended
-    // posture (a disabled credential oracle reveals nothing), so it is asserted as a
-    // 404 here rather than a 401.
+    // The OUTBOUND lazy-migration endpoint (issue #58, re-homed by #250) is the one
+    // documented route that is NOT gated by the management `Principal` at 401: every
+    // refusal on it is the uniform 404, indistinguishable from an absent route, because
+    // a 401 would tell an unauthenticated prober which environments have an outbound
+    // migration armed. So it is asserted as a 404 here rather than a 401.
+    //
+    // What this sweep does NOT say, stated because it used to be cited as if it did:
+    // it says NOTHING about the ORDER in which that 404 is reached. This router carries
+    // no master key, so the secret read short-circuits before it issues a query and a
+    // handler that read the secret BEFORE the bearer answers the same 404 over the same
+    // never-connected pool. MEASURED: exactly that mutant survives this file and the
+    // whole crate suite. The order is pinned by
+    // `the_outbound_bearer_check_runs_before_any_database_access` below, which counts
+    // connections rather than statuses.
     let outbound =
         "/v1/tenants/{tenant_id}/environments/{environment_id}/migration/verify-credential";
 
@@ -663,6 +676,148 @@ async fn served_routes_match_documented_routes() {
         documented.len() - outbound_pairs,
         "served (method, path) pairs over the documented paths (excluding the disabled-by-default \
          outbound endpoint) must equal the documented count"
+    );
+}
+
+/// The outbound verify endpoint reads the BEARER before it touches the database, pinned
+/// by COUNTING CONNECTIONS rather than by reading a status (issue #250).
+///
+/// # Why a status assertion cannot pin this, measured rather than argued
+///
+/// The order is the whole anti-enumeration property: a request with no credential must
+/// be refused before it can make the endpoint issue a query, so an unauthenticated
+/// prober cannot make the server work on its behalf and cannot learn anything from how
+/// long that work took. Every existing witness for it was a 404, and a 404 is exactly
+/// what a REORDERED handler answers too. Mutating `verify_credential` to read the secret
+/// first compiled and survived the entire `ironauth-admin` suite (392 tests over 46
+/// binaries), because `db_free_router` builds a store with no master key, so
+/// `open_value_under_platform_key_at_uniform_cost` returns at `Store::master` before any
+/// query and `stored_outbound_token` collapses the error to `None`.
+///
+/// So this drives a router whose store DOES carry a master key, over a lazy pool aimed
+/// at a socket that accepts connections and counts them, and asserts the two halves
+/// together:
+///
+/// * a request with NO bearer answers the uniform not-found having opened ZERO
+///   connections. That is the property.
+/// * a request WITH a (garbage) bearer opens at least one. That is the ANTI-VACUITY
+///   CONTROL, and it is not optional: without it the first assertion is satisfied by any
+///   route that never reaches the store for any reason at all, including a route that
+///   does not exist.
+///
+/// The socket accepts and then says nothing, so the second probe ends at the pool's
+/// acquire timeout and the endpoint answers its uniform not-found there too, which is
+/// the fail-closed behaviour `stored_outbound_token` documents.
+#[tokio::test]
+async fn the_outbound_bearer_check_runs_before_any_database_access() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a probe socket");
+    let port = listener.local_addr().expect("probe socket address").port();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&accepted);
+    // Accept and HOLD: a client that completes a TCP handshake and then waits is what
+    // makes "a connection was attempted" observable without a database anywhere.
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    held.push(stream);
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_millis(750))
+        .connect_lazy(&format!("postgres://ironauth@127.0.0.1:{port}/ironauth"))
+        .expect("lazy pool parses the URL");
+    let config = AdminConfig {
+        bootstrap_operator_token: Some(Secret::Literal(SecretString::new("t"))),
+        ..AdminConfig::default()
+    };
+    // WITH a master key, which is the difference from `db_free_router` and the reason
+    // this test can see the order at all.
+    let master = Arc::new(ironauth_jose::MasterKey::generate(
+        "master-order-probe",
+        &ironauth_env::FixedEntropy::new(0x4f52_4452),
+    ));
+    let state = AdminState::new(
+        Store::from_pool(pool).with_master_key(master),
+        Env::system(),
+        &config,
+    )
+    .expect("state builds");
+    let router = management_router(state);
+
+    // WELL-FORMED ids, which is load bearing rather than cosmetic: a malformed path id
+    // is itself the uniform not-found, refused by pure parsing before the store is
+    // reached, so a placeholder like `ten_x` would make BOTH probes answer 404 with zero
+    // connections and the control below would go red for a reason that has nothing to do
+    // with the order. They name no rows, and cannot: this pool reaches no database.
+    let tenant = ironauth_store::TenantId::generate(&Env::system());
+    let environment = ironauth_store::EnvironmentId::generate(&Env::system());
+    let path =
+        format!("/v1/tenants/{tenant}/environments/{environment}/migration/verify-credential");
+    let path = path.as_str();
+    let body = r#"{"identifier":"probe@example.test","password":"probe"}"#;
+
+    // 1. No bearer: refused before anything, so the pool was never asked for a
+    //    connection.
+    let request = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .expect("request builds");
+    let response = router
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("the router answers");
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "an unauthenticated probe is the uniform not-found"
+    );
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        0,
+        "a request with no bearer must be refused BEFORE any database access: the pool \
+         opened a connection, so the secret read now runs before the bearer check"
+    );
+
+    // 2. A garbage bearer: the control. It gets past the bearer check, so it DOES reach
+    //    the store, which is what makes the zero above attributable to the order.
+    let request = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .header(
+            axum::http::header::AUTHORIZATION,
+            "Bearer garbage-bearer-not-a-real-token-x",
+        )
+        .body(Body::from(body))
+        .expect("request builds");
+    let response = router
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("the router answers");
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "an unreachable store fails CLOSED to the same uniform not-found"
+    );
+    assert!(
+        accepted.load(Ordering::SeqCst) >= 1,
+        "the control probe must actually reach the store, or the assertion above measures \
+         nothing: no connection was ever attempted"
     );
 }
 

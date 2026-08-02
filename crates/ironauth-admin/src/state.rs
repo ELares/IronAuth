@@ -134,24 +134,11 @@ struct Inner {
     // The tenant-offboarding retention window in seconds (issue #46): the grace
     // period a soft-deleted tenant can be restored within.
     offboarding_retention_secs: u64,
-    // Whether the outbound lazy-migration credential-verification endpoint is
-    // enabled (issue #58). Off by default; the endpoint is a uniform not-found when
-    // this is false.
-    outbound_verification_enabled: bool,
-    // The resolved shared bearer token a successor system presents to the outbound
-    // verification endpoint (issue #58), or None when unset. Wrapped in SecretString
-    // so it cannot leak through Debug/logs; reachable only via `.expose()` at the
-    // constant-time comparison site. A distinct credential from the operator token
-    // and management keys: it authorizes ONLY that one endpoint.
-    outbound_verification_token: Option<SecretString>,
-    // The single (tenant, environment) the outbound verification endpoint is
-    // authorized for (issue #58), as the scoped-id strings that appear in the request
-    // path. Both must be set and must match the request's path scope, or the endpoint
-    // is a uniform not-found: the shared token can only ever verify credentials in its
-    // one configured environment, never across tenants. None (either unset) fails
-    // closed (matches nothing).
-    outbound_verification_tenant: Option<String>,
-    outbound_verification_environment: Option<String>,
+    // The outbound lazy-migration credential-verification endpoint (issue #58) used
+    // to carry four fields here, mirroring four `AdminConfig` keys. Issue #250 moved
+    // its enablement AND its credential into the addressed environment's own sealed
+    // per-environment secret (issue #45), so nothing about it is process state any
+    // more: `crate::migration` reads it per request, per scope, with no fallback.
     // The inbound lazy-migration hook (issue #56), shared with the OIDC data plane in the
     // same process when one is configured. Held so the management-plane migration-progress
     // endpoint can report THIS node's circuit-breaker state alongside the DB progress
@@ -256,20 +243,6 @@ impl AdminState {
         let hard_cap = u32::try_from(MANAGEMENT_LIST_HARD_CAP).unwrap_or(u32::MAX);
         let max_page_size = config.max_page_size.max(1).min(hard_cap);
         let default_page_size = config.default_page_size.max(1).min(max_page_size);
-        // The outbound verification token (issue #58) is resolved once here and, like
-        // the operator token, trimmed and refused when empty so an empty configured
-        // token can never match an empty presented bearer.
-        let outbound_verification_token = match &config.outbound_verification_token {
-            Some(secret) => {
-                let resolved = secret.resolve().map_err(StateError::Secret)?;
-                let trimmed = resolved.expose().trim();
-                if trimmed.is_empty() {
-                    return Err(StateError::EmptyToken);
-                }
-                Some(SecretString::new(trimmed))
-            }
-            None => None,
-        };
         Ok(Self {
             inner: Arc::new(Inner {
                 store,
@@ -283,16 +256,6 @@ impl AdminState {
                 max_page_size,
                 allowed_regions: config.allowed_regions.clone(),
                 offboarding_retention_secs: config.offboarding_retention_secs,
-                outbound_verification_enabled: config.outbound_verification_enabled,
-                outbound_verification_token,
-                outbound_verification_tenant: config
-                    .outbound_verification_tenant
-                    .clone()
-                    .filter(|value| !value.trim().is_empty()),
-                outbound_verification_environment: config
-                    .outbound_verification_environment
-                    .clone()
-                    .filter(|value| !value.trim().is_empty()),
                 migration_hook: None,
                 federation: None,
                 max_group_depth: ironauth_config::ORGANIZATIONS_DEFAULT_MAX_GROUP_DEPTH,
@@ -727,49 +690,6 @@ impl AdminState {
             .as_ref()?
             .health()
             .snapshot(now, connector_id, fingerprint)
-    }
-
-    /// Whether the outbound lazy-migration credential-verification endpoint is
-    /// enabled (issue #58). Off by default; the endpoint is a uniform not-found when
-    /// this is false, so exposing a credential oracle to a successor system is an
-    /// explicit per-deployment opt-in.
-    #[must_use]
-    pub fn outbound_verification_enabled(&self) -> bool {
-        self.inner.outbound_verification_enabled
-    }
-
-    /// Match a presented token against the configured outbound verification token
-    /// (issue #58), in constant time. Returns `false` when no token is configured
-    /// (fail closed: no token, no access), so enabling the endpoint without a token
-    /// authorizes nobody.
-    #[must_use]
-    pub fn match_outbound_verification_token(&self, token: &str) -> bool {
-        let Some(configured) = self.inner.outbound_verification_token.as_ref() else {
-            return false;
-        };
-        let configured = configured.expose();
-        if configured.is_empty() {
-            return false;
-        }
-        constant_time_eq(token.as_bytes(), configured.as_bytes())
-    }
-
-    /// Whether the outbound verification endpoint is authorized for `scope` (issue
-    /// #58): the request's path scope must equal the ONE configured
-    /// `(tenant, environment)`. Returns `false` when either half is unset (fail
-    /// closed: no configured scope, no access), so the shared token can only ever
-    /// verify credentials in its one configured environment and a request to any
-    /// other tenant or environment is a uniform not-found, never a cross-tenant
-    /// oracle.
-    #[must_use]
-    pub fn outbound_verification_scope_allows(&self, scope: Scope) -> bool {
-        let (Some(tenant), Some(environment)) = (
-            self.inner.outbound_verification_tenant.as_deref(),
-            self.inner.outbound_verification_environment.as_deref(),
-        ) else {
-            return false;
-        };
-        tenant == scope.tenant().to_string() && environment == scope.environment().to_string()
     }
 
     /// Whether `region` is in the operator's configured data-residency region set

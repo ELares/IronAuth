@@ -112,8 +112,10 @@ use ironauth_store::{
 /// same idiom `absent_environment.rs` and `openapi_contract.rs` use.
 const COMMITTED_SPEC: &str = include_str!("../../../docs/openapi/management.json");
 
-/// The shared bearer the outbound verification endpoint is configured with.
-const OUTBOUND_TOKEN: &str = "outbound-sweep-token";
+/// The shared bearer the fixture ARMS the outbound verification endpoint with, in the
+/// sweep environment's own sealed secret (issue #250). It is not configuration: there is
+/// no configuration key for it any more.
+const OUTBOUND_TOKEN: &str = "outbound-sweep-token-of-at-least-32-bytes";
 
 /// The smallest byte string the brand-asset upload's MAGIC-BYTE sniff accepts: a RIFF
 /// container tagged WEBP. The sniff reads the BYTES and never the declared header.
@@ -1286,6 +1288,22 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             &serde_json::json!({ "identifier": "sweep@example.test", "password": "hunter2hunter2" }),
         )
         .with_bearer(OUTBOUND_TOKEN),
+        Case::empty(
+            "migration.getOutboundVerification",
+            "GET",
+            format!("{base}/migration/outbound-verification"),
+        ),
+        Case::json(
+            "migration.setOutboundVerification",
+            "PUT",
+            format!("{base}/migration/outbound-verification"),
+            &serde_json::json!({ "token": "a-rotated-outbound-token-of-32-plus-bytes" }),
+        ),
+        Case::empty(
+            "migration.deleteOutboundVerification",
+            "DELETE",
+            format!("{base}/migration/outbound-verification"),
+        ),
         // ---- organizations ----
         Case::empty(
             "organizations.listOrganizations",
@@ -2076,6 +2094,26 @@ async fn placing_a_ban_writes_exactly_one_audit_row_and_lifting_writes_another()
         before.iter().all(|action| !action.starts_with("abuse.")),
         "nothing has audited an abuse action yet: {before:?}"
     );
+    // WHERE the scope's envelope key pair was provisioned is pinned rather than
+    // tolerated (issue #250). The FIRST seal in a scope lazily provisions it and each
+    // provision audits, and since #250 the first seal is the arming of this
+    // environment's outbound verification token, which `start_fully_armed` performs
+    // before this test runs. So the pair is already in `before`, in order, and the
+    // create's delta below is its own row alone. If provisioning ever moved back to
+    // the ban path, or stopped happening at all, one of these two halves goes red.
+    assert_eq!(
+        before
+            .iter()
+            .filter(|action| action.starts_with("envelope."))
+            .cloned()
+            .collect::<Vec<String>>(),
+        [
+            "envelope.kek.provision".to_owned(),
+            "envelope.dek.provision".to_owned()
+        ],
+        "the scope's envelope pair is provisioned exactly once, by the first seal in \
+         it (the outbound-verification arming): {before:?}"
+    );
 
     let (status, _, body) = h.post(&bans, "k-audited", &request).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
@@ -2085,19 +2123,14 @@ async fn placing_a_ban_writes_exactly_one_audit_row_and_lifting_writes_another()
         vec!["abuse.ban.create".to_owned()],
         "placing a ban writes exactly one abuse audit row"
     );
-    // The FIRST seal in a scope lazily provisions its envelope key pair, and each
-    // provision audits, so the create's total delta is three rather than one. That is
-    // measured rather than tolerated: pinning the exact sequence is what would notice the
-    // ban path starting to write a fourth row, and what would notice the envelope
-    // provisioning moving somewhere a ban no longer triggers it.
+    // The scope's envelope pair was already provisioned (asserted above), so the
+    // create's TOTAL delta is exactly its own row. Pinning the exact sequence rather
+    // than the abuse-family filter alone is what would notice the ban path starting to
+    // write a second row of some other family.
     assert_eq!(
         &after_create[before.len()..],
-        [
-            "envelope.kek.provision".to_owned(),
-            "envelope.dek.provision".to_owned(),
-            "abuse.ban.create".to_owned()
-        ],
-        "the create audits its envelope provisioning and then the ban, and nothing else"
+        ["abuse.ban.create".to_owned()],
+        "the create audits the ban and nothing else"
     );
 
     let (status, _, body) = h
@@ -2544,9 +2577,9 @@ fn documented_write_exceptions() -> BTreeMap<&'static str, StatusCode> {
         // profile so it can migrate the identity out; it writes nothing. Decommissioning
         // an environment is exactly WHEN a successor is draining it, so refusing here
         // would break the migration path at the moment it is needed, and it would do so
-        // for a request that changes nothing. It is scope-bound at configuration time and
-        // authorized by its own shared token, so it is not reachable as a general
-        // management route at all.
+        // for a request that changes nothing. It is scope-bound by construction since
+        // issue #250 (the token IS that environment's own sealed secret) and authorized
+        // by that token, so it is not reachable as a general management route at all.
         //
         // Its 200 is not the whole exemption, and pinning only the 200 left the branch
         // the exemption is FOR undriven: with the fixture user seeded without a password
@@ -2556,6 +2589,52 @@ fn documented_write_exceptions() -> BTreeMap<&'static str, StatusCode> {
         // [`documented_body_contents`] requires the answer to carry the positive verdict,
         // the subject, and the claim.
         ("migration.verifyMigrationCredential", StatusCode::OK),
+        // The OFF SWITCH for the entry above, and the reason it is exempt is the entry
+        // above (issue #250). The verify endpoint keeps answering 200 with a live
+        // credential oracle inside a soft-deleted environment, deliberately. Fencing the
+        // route that DESTROYS that credential therefore turns the soft delete into a one
+        // way door: there is no environment-restore route and no generic
+        // environment-secrets route, so a decommissioned environment would keep serving a
+        // password oracle plus PII with no remedy short of a direct database write.
+        //
+        // Destroying something is the CLOSING direction, and a closing write never
+        // requires its parent to be live. It still requires the parent to EXIST, which is
+        // why `tests/absent_environment.rs` drives the same route and requires the uniform
+        // not-found there; the store alone would not give that, because deleting a row
+        // that was never there violates no foreign key.
+        //
+        // This is the one exempted write in this file that LANDS A ROW CHANGE, which is
+        // the whole point of it, so it is also the one entry in
+        // [`documented_write_row_effects`].
+        (
+            "migration.deleteOutboundVerification",
+            StatusCode::NO_CONTENT,
+        ),
+    ])
+}
+
+/// The row-count deltas the documented write exceptions are permitted to leave behind,
+/// per table, and nothing else may move (issue #250).
+///
+/// The sweep's closing claim is that no write into a soft-deleted environment landed a
+/// row anywhere, audit log included, read as the database owner so row-level security
+/// cannot hide one. Until issue #250 that claim was literally "nothing moved", because
+/// both documented exceptions were reads in write clothing.
+///
+/// `deleteOutboundVerification` is the first exception that is a REAL write, and it has
+/// to be: it is the off switch for the credential oracle the exception above it keeps
+/// answering with. Tolerating "some rows moved" would delete the whole instrument, so
+/// the movement is RECORDED instead, exactly, per table. That turns the assertion from a
+/// weaker one into a STRONGER one: it now also pins that the disarm at a soft-deleted
+/// environment really did destroy the secret (`environment_secrets` falls by exactly
+/// one) and really did audit it (`audit_log` rises by exactly one). A fence quietly
+/// reintroduced on that route would leave both at zero and fail here.
+fn documented_write_row_effects() -> BTreeMap<String, i64> {
+    BTreeMap::from([
+        // The disarm destroys THIS environment's outbound-verification secret.
+        ("environment_secrets".to_owned(), -1),
+        // And audits `environment_secret.delete` in the same transaction.
+        ("audit_log".to_owned(), 1),
     ])
 }
 
@@ -2856,7 +2935,7 @@ fn assert_every_refusal_is_the_same_refusal(
     }
 }
 
-/// The tables whose row count MOVED between two snapshots, one line each.
+/// The tables whose row count MOVED between two snapshots, and by how much.
 ///
 /// `assert_eq!(before, after)` over the whole map already FAILS when a write lands, so
 /// this changes nothing about the verdict; it changes what the failure says. The map
@@ -2867,19 +2946,26 @@ fn assert_every_refusal_is_the_same_refusal(
 /// table beside it names the resource outright.
 ///
 /// MEASURED against exactly the mutant [`snapshot`] describes: the failure reads
-/// `audit_log: 42 -> 43` and nothing else, where the equality failure it replaced named
-/// no table at all.
-fn moved_tables(before: &BTreeMap<String, i64>, after: &BTreeMap<String, i64>) -> Vec<String> {
-    let mut moved = Vec::new();
+/// `audit_log: 1` and nothing else, where the equality failure it replaced named no
+/// table at all.
+///
+/// It returns the DELTA rather than a rendered line so the caller can compare it against
+/// [`documented_write_row_effects`], which is what lets one documented exception be a
+/// real write without the instrument degrading to "some rows moved, fine".
+fn moved_deltas(
+    before: &BTreeMap<String, i64>,
+    after: &BTreeMap<String, i64>,
+) -> BTreeMap<String, i64> {
+    let mut moved = BTreeMap::new();
     for (table, before_count) in before {
         let after_count = after.get(table).copied().unwrap_or_default();
         if after_count != *before_count {
-            moved.push(format!("{table}: {before_count} -> {after_count}"));
+            moved.insert(table.clone(), after_count - before_count);
         }
     }
-    for table in after.keys() {
+    for (table, after_count) in after {
         if !before.contains_key(table) {
-            moved.push(format!("{table}: absent -> present"));
+            moved.insert(table.clone(), *after_count);
         }
     }
     moved
@@ -3222,16 +3308,22 @@ async fn every_environment_scoped_write_refuses_a_soft_deleted_environment() {
     assert_sweep_reaches_the_whole_prefix(&driven, &driven_reads);
     assert_every_refusal_is_the_same_refusal(&refusals, &not_found_headers);
 
-    // And no WRITE landed a row anywhere, audit log included. Read as the database owner,
-    // so row-level security cannot hide one, and it covers the two documented exceptions
-    // as well as the refusals: the claim that the flow dry run and the credential
-    // verification write nothing is measured here rather than asserted in their comments.
+    // And the ONLY rows that moved anywhere, audit log included, are the ones the
+    // documented exceptions are documented to move. Read as the database owner, so
+    // row-level security cannot hide one. It covers the refusals and the exceptions
+    // alike: the claim that the flow dry run and the credential verification write
+    // nothing is measured here rather than asserted in their comments, and so is the
+    // claim that the disarm really does destroy the credential and audit it.
     let after = snapshot(doomed.db().owner_pool()).await;
-    let moved = moved_tables(&before, &after);
-    assert!(
-        moved.is_empty(),
-        "a write into a soft-deleted environment landed a row:\n{}\n\nthe whole table:\n{}",
-        moved.join("\n"),
+    let moved = moved_deltas(&before, &after);
+    assert_eq!(
+        moved,
+        documented_write_row_effects(),
+        "the rows a soft-deleted environment's writes moved are not exactly the documented \
+         effects of the documented exceptions. Anything unexpected here is a write that \
+         LANDED; a documented effect that is MISSING is an exception whose branch never \
+         ran (a fence quietly reintroduced on the disarm reads exactly that way).\n\nthe \
+         whole table:\n{}",
         observed.join("\n")
     );
 }

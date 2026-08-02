@@ -50,6 +50,36 @@ fn unknown_key_in_a_real_file_names_the_file_line_and_key() {
     assert!(msg.contains("bind"), "expected-fields list missing: {msg}");
 }
 
+/// The issue #250 UPGRADE PATH, pinned rather than asserted in prose.
+///
+/// The four `admin.outbound_verification_*` keys moved to a per-environment sealed
+/// secret and were REMOVED rather than deprecated, deliberately: with
+/// `deny_unknown_fields` on `AdminConfig`, a config file that still carries one
+/// fails to LOAD and names the key, so an operator who had the feature enabled is
+/// told, loudly, at startup, instead of silently losing an armed credential oracle.
+/// This is the assertion that goes RED if someone ever restores one of them as a
+/// tolerated-and-ignored key, which would turn the loud failure back into a quiet
+/// one.
+#[test]
+fn the_removed_outbound_verification_keys_fail_the_load_and_name_themselves() {
+    for key in [
+        "outbound_verification_enabled = true",
+        "outbound_verification_token = \"a-token\"",
+        "outbound_verification_tenant = \"ten_x\"",
+        "outbound_verification_environment = \"env_x\"",
+    ] {
+        let file =
+            TempFile::with_contents("removed-outbound-key.toml", &format!("[admin]\n{key}\n"));
+        let err = Config::load(&file.0).expect_err("a removed key must abort the load");
+        let msg = err.to_string();
+        let name = key.split_whitespace().next().expect("key name");
+        assert!(
+            msg.contains(name),
+            "the load failure must NAME the removed key `{name}`: {msg}"
+        );
+    }
+}
+
 #[test]
 fn missing_file_names_the_path() {
     let path = scratch_path("does-not-exist.toml");

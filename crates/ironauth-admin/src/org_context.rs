@@ -71,6 +71,17 @@
 //! plainly here rather than glossed: those call sites are constrained by the sweep and
 //! not by the type system.
 //!
+//! # The fence has a CLOSING-direction sibling, and it is not the same question
+//!
+//! [`require_live_environment`] is the fence for a write that CREATES or ARMS something.
+//! A write that DESTROYS something takes [`require_present_environment`] instead, which
+//! refuses only an environment that was never created. Requiring liveness to DISARM
+//! turns a soft delete into a one-way door: the thing armed there survives the deletion
+//! (that is the whole mechanism above) and the only route that could destroy it starts
+//! refusing. Issue #250 measured that exact state on the outbound-verification
+//! credential. The two are separate functions rather than a flag so a call site has to
+//! name which direction it is writing in.
+//!
 //! A READ keeps working, which is the same line issue #409 drew when it made an ABSENT
 //! environment the uniform not-found for every NON-GET operation under the environment
 //! prefix and left every GET alone. An operator who decommissions an environment still
@@ -384,6 +395,50 @@ pub async fn require_live_environment(state: &AdminState, scope: &Scope) -> Resu
         .get(&scope.environment())
         .await?;
     Ok(())
+}
+
+/// Verify the scope's ENVIRONMENT exists, live or SOFT-DELETED, for a write in the
+/// CLOSING direction (issue #250).
+///
+/// This is the deliberately weaker sibling of [`require_live_environment`], and the
+/// distinction is not a convenience. [`require_live_environment`] is the right fence
+/// for a write that CREATES or ARMS something, because landing a row inside an
+/// environment an operator believes is decommissioned is the defect issues #411 and
+/// #451 are about. It is the WRONG fence for a write that DESTROYS something: soft
+/// deleting an environment cascades to almost nothing, so whatever was armed there
+/// survives the deletion, and fencing the only route that could destroy it makes the
+/// soft delete a ONE WAY DOOR. There is no environment-restore route, so the state is
+/// then remediable only by a direct database write.
+///
+/// MEASURED, on the surface this was written for: with the live fence on the disable
+/// endpoint, an environment DELETE followed by `POST .../migration/verify-credential`
+/// answered 200 with a verified credential and the user's profile, while `DELETE
+/// .../migration/outbound-verification` answered 404 and could not turn it off.
+///
+/// The ABSENT case still refuses, and that half is load bearing for a different
+/// reason: deleting a row that was never there violates no foreign key, so the store
+/// answers its own not-found and an idempotent delete arm turns that into a success.
+/// Without this check the absent-environment contract (`tests/absent_environment.rs`)
+/// would be satisfied by nothing at all.
+///
+/// # Errors
+///
+/// [`ApiError::NotFound`] if the environment was never created.
+pub async fn require_present_environment(
+    state: &AdminState,
+    scope: &Scope,
+) -> Result<(), ApiError> {
+    let present = state
+        .store()
+        .management()
+        .environments(scope.tenant())
+        .exists_in_any_state(&scope.environment())
+        .await?;
+    if present {
+        Ok(())
+    } else {
+        Err(ApiError::NotFound)
+    }
 }
 
 /// Resolve an untrusted user id in scope and, for a WRITE, verify that the environment

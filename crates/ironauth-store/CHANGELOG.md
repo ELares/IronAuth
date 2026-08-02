@@ -6,6 +6,59 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Control-plane writes on `environment_secrets` (issue #250, migration 0100, an expand).
+  `ironauth_control` gains INSERT and DELETE plus a COLUMN-SCOPED UPDATE over exactly the
+  four columns an overwrite rewrites (`ciphertext`, `dek_version`, `version`, `updated_at`),
+  which is what lets the management API enable, rotate, and disable an environment's
+  outbound-verification credential. Never a table-wide UPDATE (the #31 lesson), and no grant
+  on `name`, `id`, `tenant_id`, `environment_id`, or `created_at`. Row-level security is
+  unchanged and still forced.
+
+  **The grants alone are NOT the fence, and an earlier draft of this entry said they were.**
+  It claimed the control plane "can rotate a secret's VALUE in place but can neither rename
+  one nor move one between scopes". That is true of UPDATE and false of the pair the same
+  migration hands out: `GRANT INSERT` is table wide and `GRANT DELETE` has no column form, so
+  INSERT plus DELETE is a rename, and a replace of any other secret in the bound scope, one
+  statement pair at a time. Connector credentials live in that table. So 0100 also adds three
+  RESTRICTIVE row-level-security policies binding `ironauth_control` to the ONE reserved name
+  `ironauth.outbound_verification_token` on INSERT, UPDATE, and DELETE, which makes the grant
+  match the property the handler already honours. SELECT is deliberately left unrestricted:
+  0035 granted it for the config-promotion plan's reference-PRESENCE check, which asks about
+  secrets by whatever name a variable references. `tests/migration.rs
+  ::the_control_plane_can_write_only_the_one_reserved_environment_secret_name` drives all
+  five directions as `ironauth_control` in a scope-bound transaction.
+
+  **The record 0035 left is corrected in the new migration's header.** 0035 says the control
+  role "holds no envelope master key so a secret VALUE stays unreachable through the control
+  plane". That stopped being true at 0037: issue #52 gave the control plane end-to-end user
+  management, so 0037 granted it SELECT and INSERT on `tenant_keks` and `tenant_deks`, and
+  the boot path attaches the platform master key to the control-plane store. A secret value
+  has been openable through the control plane since then. What DOES still hold, and is the
+  property that matters, is that the config-promotion SNAPSHOT EXPORT never reads one: that
+  is a property of the export code path, pinned by its own tests, not of the grant table.
+
+- `EnvironmentSecretRepo::open_value_under_platform_key_at_uniform_cost` and
+  `ActingEnvironmentSecretRepo::put_under_platform_key` (issue #250): the explicit-`master`
+  forms exist because the config-promotion apply threads one key handle through a plan, and a
+  request handler has no such thread. These resolve the key from the store's own handle, the
+  way every other sealed surface in the repository layer does, so `Store::master` can stay
+  crate-private. Each fails closed with `StoreError::Encryption` when no platform master key
+  is installed; neither substitutes an unsealed read or a plaintext write.
+
+  The read carries a second property in its NAME because a caller has to opt into paying for
+  it. `open_value` returns after one round trip on a miss and spends three plus three AEAD
+  opens on a hit, which is a timing oracle for the one caller reachable with no credential at
+  all. The uniform-cost form spends the same two key lookups (bound to a key version that
+  exists in no scope, so they can never touch real key material) and three decoy AEAD opens
+  on the miss branch. A caller that wants the cheap read still calls `open_value`.
+
+- `EnvironmentRepo::exists_in_any_state` (issue #250): whether an environment row exists at
+  all, live or soft-deleted. It is the precondition a CLOSING write takes, where
+  `EnvironmentRepo::get` is the one an arming write takes. Gating a destroy on the parent
+  being live turns a soft delete into a one-way door, because soft-deleting an environment
+  cascades to almost nothing and there is no environment-restore route. It reads no columns
+  and returns no record, so it cannot be mistaken for the liveness check at a call site.
+
 - **An invitation create is now ONE transaction, so a partial one leaves nothing** (issue
   #247). `ActingInvitationRepo::create_with_user` provisions the `pending_verification`
   user, writes its `user.create` audit row, writes the invitation, writes its

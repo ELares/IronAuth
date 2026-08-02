@@ -632,8 +632,8 @@ async fn outbound_verification_is_disabled_by_default() {
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // one linear seed -> verify-each-case walk
 async fn outbound_verification_verifies_native_and_foreign_when_enabled() {
-    const OUTBOUND_TOKEN: &str = "successor-shared-secret";
-    let harness = Harness::start_with_outbound_verification(Some(OUTBOUND_TOKEN)).await;
+    const OUTBOUND_TOKEN: &str = "successor-shared-secret-at-least-32-bytes";
+    let harness = Harness::start_with_outbound_verification(OUTBOUND_TOKEN).await;
     let env = Env::system();
     let store = harness.control_store();
     // The outbound endpoint is bound to this scope; seed the users into it.
@@ -686,16 +686,18 @@ async fn outbound_verification_verifies_native_and_foreign_when_enabled() {
         scope.environment()
     );
 
-    // A wrong outbound token is unauthorized (even though the endpoint is enabled).
+    // A wrong outbound token is the UNIFORM NOT-FOUND, not a 401 (issue #250): with
+    // enablement now per environment, a 401 here would tell an unauthorized caller
+    // which environments have an outbound migration armed.
     let (status, _h, _b) = harness
         .post_as(
             &path,
-            "wrong-token",
+            "wrong-token-of-a-generous-length-32-plus",
             "k0",
             r#"{"identifier":"erin@exit.test","password":"s3cret"}"#,
         )
         .await;
-    assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+    assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
 
     // Native credential verifies, and returns the profile.
     let (status, _h, body) = harness
@@ -1129,14 +1131,15 @@ async fn totp_and_recovery_codes_round_trip_and_still_verify_after_reimport() {
     );
 }
 
-/// The outbound endpoint is SCOPE-BOUND (issue #58, MEDIUM): configured and enabled
-/// for one (tenant, environment), a request to a DIFFERENT scope with the CORRECT
-/// token is the uniform 404 and verifies nothing, so the shared token can never
-/// verify credentials across tenants.
+/// The outbound endpoint is SCOPE-BOUND (issue #58, MEDIUM), and issue #250 made the
+/// binding structural rather than configured: the token lives in ONE environment's
+/// own sealed secret, so a request to a DIFFERENT environment carrying that same
+/// token is the uniform 404 and verifies nothing. There is no longer any deployment
+/// value for a token to be compared against outside the environment that owns it.
 #[tokio::test]
 async fn outbound_verification_is_bound_to_its_configured_scope() {
-    const OUTBOUND_TOKEN: &str = "successor-shared-secret";
-    let harness = Harness::start_with_outbound_verification(Some(OUTBOUND_TOKEN)).await;
+    const OUTBOUND_TOKEN: &str = "successor-shared-secret-at-least-32-bytes";
+    let harness = Harness::start_with_outbound_verification(OUTBOUND_TOKEN).await;
     let env = Env::system();
     let store = harness.control_store();
     let configured = harness.outbound_scope();
@@ -1185,8 +1188,8 @@ async fn outbound_verification_is_bound_to_its_configured_scope() {
     let verdict: serde_json::Value = serde_json::from_str(&body).expect("json");
     assert_eq!(verdict["verified"], true, "the configured scope verifies");
 
-    // A DIFFERENT scope, with the CORRECT token, is the uniform 404: the token cannot
-    // verify credentials outside its one configured environment.
+    // A DIFFERENT scope, with a token that is CORRECT in the armed environment, is the
+    // uniform 404: that token is that environment's secret and nothing else's.
     let other = harness.seed_scope().await;
     let other_path = format!(
         "/v1/tenants/{}/environments/{}/migration/verify-credential",
@@ -1210,8 +1213,16 @@ async fn outbound_verification_is_bound_to_its_configured_scope() {
 
 /// The disabled endpoint is indistinguishable from an absent route to an
 /// unauthenticated probe (issue #58, LOW): a request carrying no `Authorization`
-/// header against a disabled endpoint returns 404, not 401, so the enablement gate is
-/// evaluated before the bearer check and the route's existence is not revealed.
+/// header against a disabled environment returns 404, not 401, so the route's
+/// existence is not revealed.
+///
+/// It says nothing about ORDER, and the sentence it used to carry ("so the enablement
+/// gate is evaluated before the bearer check") was inference from a status rather than
+/// a measurement, and after issue #250 it is not even the right order: the BEARER is
+/// read first and the enablement is not a gate at all, it is the presence of this
+/// environment's sealed secret. What pins the order is
+/// `openapi_contract::the_outbound_bearer_check_runs_before_any_database_access`, which
+/// counts connections opened rather than statuses returned.
 #[tokio::test]
 async fn disabled_outbound_endpoint_is_404_to_an_unauthenticated_probe() {
     let harness = Harness::start(100).await;

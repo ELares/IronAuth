@@ -6,6 +6,119 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Per-environment outbound migration verification (issue #250), the follow-up the #58
+  adversarial review asked for. `POST .../migration/verify-credential` now reads its
+  enablement AND its shared bearer from the ADDRESSED environment's own sealed
+  `environment_secrets` row (the reserved name `ironauth.outbound_verification_token`),
+  never from `AdminConfig`. Several concurrent outbound migrations can run in one
+  deployment, each with an independent token, each rotatable on its own schedule, each
+  sealed under its own environment's envelope key and invisible to every other environment
+  by forced row-level security. Enablement and the credential are ONE fact (the secret's
+  existence IS the enablement), so there is no "enabled but uncredentialed" state, and
+  disabling destroys the credential rather than leaving it sealed and dormant.
+
+  **The uniform not-found got STRICTER, and it had to.** The endpoint used to answer `401`
+  for a missing or wrong bearer inside its one configured scope. With enablement per
+  environment that `401` is an ENUMERATION ORACLE: anyone who can reach the management port
+  could walk the `(tenant, environment)` space and read off which environments have an
+  outbound migration armed, one unauthenticated request each. So there is no `401` on this
+  endpoint any more. A missing bearer, a wrong bearer, a disabled environment, an absent
+  environment, an absent tenant, and a malformed path id are ONE byte-identical `404`, and
+  the missing-bearer refusal is answered BEFORE ANY DATABASE ACCESS, which is also what
+  keeps the route answerable over a never-connected pool. `tests/outbound_verification.rs`
+  drives all six states and asserts the status, the response headers, and the body bytes are
+  identical. The `Bearer` scheme is matched case insensitively (RFC 7235 section 2.1): a
+  case-sensitive match fails closed, but with a uniform `404` everywhere a successor whose
+  client uppercases the scheme would present a correct token and get an answer identical to
+  "not enabled", with nothing to debug.
+
+  **The check ORDER is pinned by counting connections, not by reading a status.** The
+  bearer-first order is what makes the refusal free of any database access, and a status
+  assertion cannot see it: a handler mutated to read the secret FIRST answers the same `404`
+  over the same pool and survives the whole crate suite (MEASURED: 392 tests over 46
+  binaries, green). `openapi_contract::the_outbound_bearer_check_runs_before_any_database_access`
+  drives a router whose store carries a master key over a lazy pool aimed at a socket that
+  counts connections, and requires the no-bearer probe to answer `404` having opened NONE
+  while a garbage-bearer control opens one.
+
+  **The timing residual was flattened rather than conceded, because the concession was
+  measured wrong twice.** It is reachable with NO credential (any garbage bearer reaches the
+  envelope open, and nothing rate limits it), and the delta was not the AEAD but TWO DATABASE
+  ROUND TRIPS: the plain sealed read costs one `SELECT` on a miss and three on a hit. The read
+  now goes through `EnvironmentSecretRepo::open_value_under_platform_key_at_uniform_cost`,
+  whose miss branch spends the same two key lookups and the same three AEAD opens.
+  `tests/outbound_timing_probe.rs` is the harness (`#[ignore]`d: a wall-clock assertion in CI
+  is a flake generator), run with
+
+  ```
+  scripts/with-test-db.sh cargo test -p ironauth-admin --features testing \
+      --test outbound_timing_probe -- --ignored --nocapture
+  ```
+
+  600 interleaved unauthenticated samples per branch, on one throwaway local Postgres.
+  BEFORE, the armed median was 1.437x the disabled median, the armed 1st percentile sat
+  ABOVE the disabled median, and a single-sample classifier at the midpoint of the medians
+  got 0.977 recall at 0.022 false positives: one request per `(tenant, environment)` pair.
+  AFTER, over three runs, the ratio is 1.041 to 1.045, the armed 1st percentile is BELOW the
+  disabled median in every run, and the same classifier gets 0.69 to 0.81 recall at 0.21 to
+  0.36 false positives, which is close enough to a coin toss that a prober needs many
+  separated windows rather than ten requests. The residual is real and is stated as a number
+  rather than as an adjective: about 14 microseconds on a 318 microsecond baseline, from the
+  hit branch decoding two key rows and unwrapping two real keys where the miss branch's decoy
+  lookups return none.
+
+  Token comparison is `hash::constant_time_eq`, which SHA-256s both sides before an
+  XOR-accumulating compare, so neither the length nor the position of the first differing
+  byte leaks. The opened value is wrapped in `SecretString` (redacted `Debug` and `Display`)
+  and reaches nothing but that one comparison: no log, no tracing field, no error body. The
+  plaintext is NOT zeroized, and this change makes that residue larger rather than smaller,
+  because it moves the credential from a once-at-boot read to a once-per-request read.
+  `SecretString` has never zeroized on drop, on this or any other secret in the tree, so this
+  is a pre-existing design point recorded here rather than a regression introduced here.
+
+- Three management endpoints for that credential (issue #250), under
+  `.../migration/outbound-verification`: `GET` reads whether the environment is armed plus
+  the stored version and timestamps (metadata only, built from a `SELECT` that does not name
+  the ciphertext column, so there is no code path from the response to a value), `PUT`
+  enables or rotates it, and `DELETE` disables it and destroys the token. They take the
+  ordinary management credential and resolve through `resolve_scope`, so a management key
+  scoped elsewhere gets the loud wrong-scope refusal, and both writes pass the sudo guard.
+  They are deliberately NOT a generic environment-secrets API: they address exactly the one
+  reserved name, so this surface cannot read or write any other environment secret, and
+  migration 0100 enforces that at the DATABASE as well as in the handler. A token under 32
+  bytes is refused and nothing is stored; the refusal names the floor, never the token.
+  `DELETE` is idempotent, because a `404` for an already-disabled environment would rebuild
+  the enablement oracle on the management side.
+
+  **The environment precondition differs by DIRECTION, and that asymmetry is the point.**
+  `PUT` requires a LIVE environment, because arming a credential oracle inside something an
+  operator believes is decommissioned is the defect issues #411 and #451 are about. `GET` and
+  `DELETE` require only that the environment EXIST. Requiring liveness to DISARM turned the
+  soft delete into a ONE WAY DOOR, and it was measured end to end: environment `DELETE` 204,
+  then `POST .../verify-credential` 200 with `{"verified":true}` plus the subject and profile,
+  then `DELETE .../outbound-verification` 404 and `PUT` 404, with `GET` still reporting
+  `{"enabled":true}`. Soft-deleting an environment cascades to almost nothing, so the sealed
+  credential survives it, and with no environment-restore route and no generic
+  environment-secrets route the only remedies left were a direct database write or a full
+  tenant crypto shred. The verify endpoint answering inside a soft-deleted environment is
+  deliberate and older than this change (a successor draining an environment is exactly who
+  is still reading it); what was new was deleting the off switch, since before this change an
+  operator always had `admin.outbound_verification_enabled = false` plus a restart.
+  `outbound_verification::a_soft_deleted_environments_credential_can_still_be_destroyed`
+  drives the whole sequence, and `live_surface` records the disarm as the one documented
+  write exception that lands a row change, pinning the exact per-table delta rather than
+  tolerating one.
+
+  The absent case still refuses on all three, and that half is carried by
+  `org_context::require_present_environment` rather than by the database: deleting a row that
+  was never there violates no foreign key, so the store answers its own not-found and the
+  idempotency arm would turn it into a `204`. The claim that "absent is already refused by
+  the store's own foreign keys" is true of insert-shaped writes and false of this delete.
+
+  No `Idempotency-Key` arm, following `client_scopes` and `resource_servers`: the key exists
+  so a retried CREATE cannot mint two rows, and a `PUT` of an absolute value onto a per-scope
+  singleton is naturally idempotent.
+
 - **BEHAVIOR FIX. A failed invitation create no longer wedges the identifier it named**
   (issue #247). `POST /v1/tenants/{tenant_id}/environments/{environment_id}/invitations`
   provisioned the `pending_verification` user in one store transaction and wrote the
