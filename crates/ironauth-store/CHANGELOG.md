@@ -6,6 +6,91 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **An invitation create is now ONE transaction, so a partial one leaves nothing** (issue
+  #247). `ActingInvitationRepo::create_with_user` provisions the `pending_verification`
+  user, writes its `user.create` audit row, writes the invitation, writes its
+  `invitation.create` audit row and commits the caller's Idempotency-Key record in a single
+  bespoke committing transaction, the shape the refresh redeem and the grant revoke already
+  use. Before it, the management surface ran the #52 audited user create and the invitation
+  create (which carried the Idempotency-Key record) as two UN-JOINED transactions: a failure
+  of the second after the first committed left an orphaned pending user with no invitation
+  and no stored key, so a retry under the SAME key missed the replay store, re-ran the user
+  create, hit the identifier unique violation and answered a conflict, and the identifier
+  stayed wedged behind a ghost account until an operator deleted it. The at-most-once
+  provisioning invariant always held (the identifier unique constraint is untouched, and is
+  the thing that made this a degraded replay rather than a duplicate account); what was
+  broken was the replay. The two INSERTs each have ONE expression now
+  (`insert_admin_user_row`, `insert_invitation_row`), reached by both the single-write path
+  and the joined one, so an invited account is byte-for-byte the account the admin create
+  writes. `NewInvitedUser` carries no `target_identifier`: the invitation targets the
+  identifier of the user it provisions, read from the user spec rather than supplied twice,
+  so the two cannot disagree. The old single-write `ActingInvitationRepo::create` (an
+  invitation for a user that already exists) is now `#[cfg(feature = "testing")]`: a
+  PRODUCTION build has no `create` on that repository at all, so a future handler cannot
+  provision a user in one transaction and reach for it in a second. It survives for the
+  fixtures that legitimately bind a user into an organization BEFORE inviting it, which
+  the joined create cannot express; the fixtures that do not need that call the joined one
+  and so exercise the production path.
+- **The Idempotency-Key record is written FIRST inside that transaction**, where
+  `ActingRecoveryApprovalRepo::approve` already put its own, and this is a SEPARATE fix
+  from joining (issue #247). Order inside one transaction changes nothing about what
+  commits, but it decides which unique index a CONCURRENT same-key request blocks on and
+  therefore which error it surfaces. Written last, the loser blocked on the login-handle
+  blind index and still returned `StoreError::Conflict`, so the management surface answered
+  a 409 naming the caller's own identifier as taken (MEASURED against a live cluster, and
+  the joined-but-last-ordered code is killed by
+  `two_concurrent_same_key_creates_land_once_and_the_loser_replays_the_winner`). Written
+  first, the loser blocks on `idempotency_keys` and reaches
+  `StoreError::IdempotencyConflict`, which the caller resolves by replaying the winner's
+  committed response.
+- **NEW ERROR. `StoreError::InvitationMintCollision`**, so the joined create can report a
+  collision on any of the THREE values it mints from 256 bits of entropy as its own fault
+  class: the `usr_` id of the account it provisions, the `inv_` handle, and the token
+  digest. The path folds writes whose unique violations used to be reported identically and
+  mean opposite things: the invited LOGIN HANDLE is taken (the caller's 409, and the thing
+  they can act on) versus the mint collided (not a caller fault, and nothing about their
+  request would change it). The `usr_` id is the sharp one, because it rides the SAME insert
+  as the login handle, so telling them apart needs the CONSTRAINT the violation names rather
+  than the SQLSTATE alone: `insert_admin_user_row` takes the verdict for a duplicate id from
+  its caller, because the two callers judge it differently. The #52 admin create may be
+  handed an id preserved from an exported record (a re-import is a genuine conflict, and the
+  import engine's idempotent skip depends on seeing one), while the invitation create mints
+  the id inside the request that uses it. `InvitationMintCollision` classifies `Internal` on
+  the wire, which the exhaustive `into_wire` match forced a decision on.
+- **An admin recovery approval now decides AND completes in ONE transaction** (issue #247,
+  the same defect shape as the invitation create).
+  `ActingRecoveryApprovalRepo::approve` folds the approval flip, its `recovery.approved`
+  audit row, the #81-gated completion, its `recovery.complete` audit row and the
+  Idempotency-Key record into one transaction, and returns whether the flow COMPLETED. The
+  admin surface used to decide in one transaction and complete in a second whose result it
+  discarded; because the Idempotency-Key record committed with the decision, a failed
+  completion left an approved-but-unfinished flow the replay store could not see, and a
+  retry under the same key replayed the stored response without ever re-attempting the
+  completion, so only a FRESH key could finish that flow. The #81 delay gate is unchanged
+  and still refuses to complete inside the hold window; the completion's `recover_acr` is
+  now read from the write's own `RETURNING`, so the strength on the audit row is the one the
+  completed row holds. The guarded UPDATE has ONE expression (`complete_recovery_flow`),
+  shared with `ActingRecoveryFlowRepo::complete`, so neither path can be given a weaker gate.
+  ONE BEHAVIOR CHANGE comes with the join: the old split path went through
+  `write_audited_detailed`, which writes its audit row whether or not the guarded UPDATE
+  matched, so a HELD approve recorded a `recovery.complete` row for a completion that did
+  not happen. The joined path writes that row only when the flow flipped.
+- **`ActingRecoveryFlowRepo::complete` audits the strength the COMMITTED ROW holds** (issue
+  #247, the #395 / #438 shape). It discarded its `RETURNING` with `.is_some()` and audited
+  the `recover_acr` string its CALLER passed in, and the live caller (the hosted
+  advanced-recovery finish) passes a value it read from the flow earlier in the request. The
+  authoritative value is in the write's own `RETURNING`, so that is what the row records
+  now. When nothing flipped there is no committed row to describe and the row falls back to
+  the strength the caller asked to complete at; the row is still written either way, so the
+  recovery log gains and loses nothing here.
+- **A concurrent pair of FIRST writes into a fresh scope no longer fails.**
+  `ActingEnvelopeRepo::provision_kek` and `provision_dek` are check-then-insert, so two
+  concurrent first writes both see no key and both insert; the unique index decides it, and
+  the loser's violation was reported as `StoreError::Database` rather than as the
+  `StoreError::Conflict` its own doc promises and `ensure_scope_keys` already tolerates. The
+  documented tolerance was therefore unreachable under an actual race and the loser surfaced
+  a persistence fault (MEASURED, by issue #247's concurrent same-key create test). Losing
+  the race means the day-one key already exists, which is what the read arm reports.
 - **The user surface IDOR claim is now measured rather than nearly true** (issue #241).
   `IdorHarness::register_user_admin_probes` claimed to cover EVERY scope embedding user
   surface while stopping at the eight management ones. The three BY SUBJECT data plane reads

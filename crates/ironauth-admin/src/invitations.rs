@@ -39,8 +39,8 @@ use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::Response;
 use ironauth_store::{
     CorrelationId, IdempotencyWrite, InvitationCredentialType, InvitationId, InvitationListFilter,
-    InvitationState, MintedInvitationToken, NewAdminUser, NewInvitation, Scope, StoreError,
-    UserState, mint_invitation_token, mint_invitation_token_for,
+    InvitationState, MintedInvitationToken, NewAdminUser, NewInvitedUser, Scope, StoreError,
+    UserId, UserState, mint_invitation_token, mint_invitation_token_for,
 };
 use serde::Deserialize;
 use utoipa::IntoParams;
@@ -228,45 +228,12 @@ pub async fn create_invitation(
     // creation into one traceable operation across their two audit rows.
     let correlation = CorrelationId::generate(state.env());
 
-    // Provision the pending_verification user this invitation activates on accept,
-    // through the #52 audited management repo. No credential is set now; the accept
-    // sets it. An identifier already in use is a 409.
-    let user_id = match state
-        .store()
-        .scoped(scope)
-        .acting(actor, correlation)
-        .users()
-        .admin_create(
-            state.env(),
-            NewAdminUser {
-                id: None,
-                identifier: &identifier,
-                password_hash: None,
-                claims_json: None,
-                external_id: None,
-                state: UserState::PendingVerification,
-                // The invitation create surface (issue #60) sets no foreign
-                // credential; the streaming bulk import path (issue #55) is where an
-                // imported foreign hash enters.
-                foreign_password_hash: None,
-                foreign_password_algo: None,
-                traits_json: None,
-                traits_schema_version: None,
-            },
-            created_at_micros,
-            None,
-        )
-        .await
-    {
-        Ok(user_id) => user_id,
-        Err(StoreError::Conflict) => {
-            return Err(ApiError::Conflict(
-                "a user or invitation with this identifier already exists in this environment"
-                    .to_owned(),
-            ));
-        }
-        Err(error) => return Err(error.into()),
-    };
+    // Mint the pending user's id HERE rather than letting the store mint it (issue
+    // #247). The response body and the body stored under the Idempotency-Key both name
+    // the user, so both must be knowable BEFORE the write; the store validates the id
+    // against this scope exactly as it does a caller-supplied id on the #52 admin
+    // create.
+    let user_id = UserId::generate(state.env(), &scope);
 
     // The durable invitation view (NO token): both the LIVE 201 body (with the token
     // added) and the stored Idempotency-Key body (without it) derive from this one
@@ -299,17 +266,42 @@ pub async fn create_invitation(
     };
     let live_body = serde_json::to_string(&live_view).map_err(|_| ApiError::Internal)?;
 
+    // ONE transaction for the whole create (issue #247): the pending_verification user
+    // this invitation activates on accept, its `user.create` audit row, the invitation,
+    // its `invitation.create` audit row, and the Idempotency-Key record. No credential
+    // is set now; the accept sets it.
+    //
+    // This used to be TWO un-joined store calls, the #52 audited admin create followed
+    // by the invitation create that also committed the Idempotency-Key record. A failure
+    // of the second after the first committed left an orphaned pending user with no
+    // invitation and no stored key, so a retry under the SAME key missed the replay
+    // store, re-ran the user create, hit the identifier unique violation and answered
+    // 409; the identifier stayed wedged behind the ghost until an operator deleted it.
+    // Joined, a partial create leaves NOTHING and the retry re-executes cleanly.
     let result = state
         .store()
         .scoped(scope)
         .acting(actor, correlation)
         .invitations()
-        .create(
+        .create_with_user(
             state.env(),
-            NewInvitation {
-                id: &id,
-                user_id: &user_id,
-                target_identifier: &identifier,
+            NewInvitedUser {
+                user: NewAdminUser {
+                    id: Some(&user_id),
+                    identifier: &identifier,
+                    password_hash: None,
+                    claims_json: None,
+                    external_id: None,
+                    state: UserState::PendingVerification,
+                    // The invitation create surface (issue #60) sets no foreign
+                    // credential; the streaming bulk import path (issue #55) is where an
+                    // imported foreign hash enters.
+                    foreign_password_hash: None,
+                    foreign_password_algo: None,
+                    traits_json: None,
+                    traits_schema_version: None,
+                },
+                invitation_id: &id,
                 token_digest: &digest,
                 credential_type,
                 org_context: org_context.as_deref(),
@@ -331,9 +323,15 @@ pub async fn create_invitation(
         Err(StoreError::IdempotencyConflict) => {
             idempotency::replay_after_conflict(&state, &credential_ref, &key, &fingerprint).await
         }
-        // A 256-bit-entropy digest collision is astronomically unlikely and is not a
-        // caller fault: surface it as an opaque server error, not a 409.
-        Err(StoreError::Conflict) => Err(ApiError::Internal),
+        // The invited identifier (or the minted user id) is already taken: a 409 the
+        // caller can act on.
+        Err(StoreError::Conflict) => Err(ApiError::Conflict(
+            "a user or invitation with this identifier already exists in this environment"
+                .to_owned(),
+        )),
+        // A 256-bit-entropy handle or digest collision is astronomically unlikely and is
+        // not a caller fault: it arrives as its OWN store error and renders as an opaque
+        // server error, never as a 409 about an identifier that did not collide.
         Err(error) => Err(error.into()),
     }
 }

@@ -292,6 +292,80 @@ async fn concurrent_same_key_same_body_puts_write_exactly_one_audit_row() {
 }
 
 #[tokio::test]
+async fn a_retry_after_a_lost_idempotency_record_reverts_a_later_pin_and_audits_again() {
+    // The BOUND on `signing_algorithm.rs:set_client_signing_algorithm`'s verdict in
+    // docs/design/IDEMPOTENT-WRITE-SITES.md (issue #247). That handler is the one live
+    // site the registry judges STRUCTURALLY SPLIT and does not join: its two writes are
+    // on two database roles, so no single transaction can span them. The verdict used to
+    // say the residue of a failure between them was VOID. It is not void, it is bounded,
+    // and this is the interleaving that shows the difference.
+    //
+    // The lost record is simulated exactly: the column write commits and the
+    // Idempotency-Key record does not, which is the only failure mode the split has. A
+    // second operator then pins something else. The first caller's retry under the same
+    // key finds no stored response, so it RE-EXECUTES, and because the write is
+    // change-only against a column that has since moved, it writes a second audit row and
+    // silently reverts the later pin.
+    //
+    // Neither half is a security hole and no state is lost that an operator cannot see in
+    // the audit log, which is why the verdict stays "do not join". But "no residue at
+    // all" was false, so the verdict says bounded and names this.
+    let h = Harness::start_with_signing_registry(50).await;
+    let (scope, client) = provisioned_client(&h).await;
+    let uri = path(scope, &client);
+
+    let (status, _, _) = h
+        .put_with_key(&uri, "k-lost", r#"{"algorithm":"RS256"}"#)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        h.client_signing_alg(scope, &client).await.as_deref(),
+        Some("RS256")
+    );
+    assert_eq!(alg_set_audit_rows(&h, scope, &client).await, 1);
+
+    // The split failing: the data write committed on the data plane, the record did not
+    // commit on the control plane.
+    sqlx::query("DELETE FROM idempotency_keys WHERE idempotency_key = $1")
+        .bind("k-lost")
+        .execute(h.db().owner_pool())
+        .await
+        .expect("drop the stored response the second write would have committed");
+
+    // A DIFFERENT operator pins something else, under their own key.
+    let (status, _, _) = h
+        .put_with_key(&uri, "k-later", r#"{"algorithm":"ES256"}"#)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        h.client_signing_alg(scope, &client).await.as_deref(),
+        Some("ES256")
+    );
+    assert_eq!(alg_set_audit_rows(&h, scope, &client).await, 2);
+
+    // The first caller retries under their original key. There is no stored response, so
+    // this is a re-execution, not a replay.
+    let (status, _, body) = h
+        .put_with_key(&uri, "k-lost", r#"{"algorithm":"RS256"}"#)
+        .await;
+    assert_eq!(status, StatusCode::OK, "the retry re-executes: {body}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(value["id_token_signed_response_alg"], "RS256");
+
+    assert_eq!(
+        h.client_signing_alg(scope, &client).await.as_deref(),
+        Some("RS256"),
+        "THE BOUND, half one: the retry reverted the later operator's pin"
+    );
+    assert_eq!(
+        alg_set_audit_rows(&h, scope, &client).await,
+        3,
+        "THE BOUND, half two: the retry writes a THIRD audit row, so the revert is \
+         reconstructable from the log rather than silent to an investigator"
+    );
+}
+
+#[tokio::test]
 async fn a_no_op_re_pin_of_the_same_value_writes_no_second_audit_row() {
     // The change-only write also means a sequential re-pin of the SAME value (under a
     // fresh Idempotency-Key, so it is not an idempotency replay) is a no-op: it succeeds

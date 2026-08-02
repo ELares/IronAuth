@@ -266,13 +266,22 @@ async fn decide(
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()));
+    // An APPROVE decides the case AND completes the recovery it unblocks in ONE store
+    // transaction (issue #247), through the #81 delay gate, which is unchanged: a held
+    // recovery whose window has not elapsed stays held and the admin re-approves after
+    // the window to finalize. Completion is a side effect, not in the body.
+    //
+    // The completion used to run as a SECOND, un-joined transaction after this one, with
+    // its result discarded. Because the Idempotency-Key record committed with the
+    // decision, a failed completion left an approved-but-unfinished flow the replay store
+    // could not see: a retry under the same key replayed the stored 200 and never
+    // re-attempted the completion, so only a FRESH key could ever finish that flow.
     let result = match decision {
-        RecoveryApprovalStateView::Approved => {
-            acting
-                .recovery_approvals()
-                .approve(state.env(), &flow, Some(write))
-                .await
-        }
+        RecoveryApprovalStateView::Approved => acting
+            .recovery_approvals()
+            .approve(state.env(), &flow, Some(write))
+            .await
+            .map(|_completed| ()),
         _ => {
             acting
                 .recovery_approvals()
@@ -281,30 +290,7 @@ async fn decide(
         }
     };
     match result {
-        Ok(()) => {
-            // On an approve, complete THROUGH the #81 gate: read the flow for its
-            // recover_acr and call complete(), whose hold_until guard enforces the delay. A
-            // held recovery whose window has not elapsed stays held (best effort; a re-approve
-            // after the window finalizes it). Completion is a side effect, not in the body.
-            if matches!(decision, RecoveryApprovalStateView::Approved) {
-                if let Ok(Some(record)) = state
-                    .store()
-                    .scoped(scope)
-                    .recovery_flows()
-                    .get(&flow)
-                    .await
-                {
-                    let _completed = state
-                        .store()
-                        .scoped(scope)
-                        .acting(actor, CorrelationId::generate(state.env()))
-                        .recovery_flows()
-                        .complete(state.env(), &flow, &record.recover_acr)
-                        .await;
-                }
-            }
-            Ok(json(StatusCode::OK, body_string))
-        }
+        Ok(()) => Ok(json(StatusCode::OK, body_string)),
         Err(StoreError::IdempotencyConflict) => {
             idempotency::replay_after_conflict(state, &credential_ref, &key, &fingerprint).await
         }

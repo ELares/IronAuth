@@ -3,16 +3,20 @@
 //! The advanced-recovery mode repositories (issue #82, PR 3) against a real Postgres: the
 //! admin-approval queue, trusted-contact enrollment and single-use confirmations, and the
 //! IDV-gated single-use case-bound session, plus cross-scope isolation (a row minted in one
-//! scope is a uniform not-found under another).
+//! scope is a uniform not-found under another). The admin APPROVE decides the case and
+//! completes the recovery in ONE transaction (issue #247), so a failed completion decides
+//! nothing and the same Idempotency-Key retries, while the #81 delay gate still holds a
+//! flow whose window has not elapsed.
 
 use std::time::SystemTime;
 
 use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
-    CorrelationId, NewRecoveryFlow, RecoveryApprovalId, RecoveryEntryPoint, RecoveryFlowId,
-    RecoveryMethod, Scope, StoreError, UserId,
+    CorrelationId, NewRecoveryFlow, RecoveryApprovalId, RecoveryApproveFailurePoint,
+    RecoveryEntryPoint, RecoveryFlowId, RecoveryMethod, RecoveryState, Scope, StoreError, UserId,
 };
+use sqlx::Row;
 
 /// The current instant in microseconds since the Unix epoch, read through the env clock seam
 /// (the store uses the real system clock under `Env::system()`, so the confirmation / session
@@ -58,6 +62,291 @@ async fn seed_flow(
         .await
         .expect("seed the recovery flow");
     (flow_id, subject)
+}
+
+/// Seed an admin-approved recovery flow with NO hold, so the completion the approve
+/// runs is not fenced by the #81 delay, and open its pending approval.
+async fn seed_completable_flow(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    seed_byte: u8,
+) -> RecoveryFlowId {
+    let subject = UserId::generate(env, &scope);
+    let flow_id = RecoveryFlowId::generate(env, &scope);
+    let digest = vec![seed_byte; 32];
+    let spec = NewRecoveryFlow {
+        id: &flow_id,
+        subject: &subject,
+        entry_point: RecoveryEntryPoint::LostAllFactors,
+        recover_acr: "urn:ironauth:acr:pwd",
+        cancel_token_digest: &digest,
+        recipient: "recover@example.test",
+        hold_until_unix_micros: None,
+        method: RecoveryMethod::AdminApproved,
+    };
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .recovery_flows()
+        .initiate(env, spec, 0)
+        .await
+        .expect("seed the recovery flow");
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .recovery_approvals()
+        .open(env, &flow_id, &subject)
+        .await
+        .expect("open the approval");
+    flow_id
+}
+
+/// The audit actions recorded in `scope`.
+async fn audit_actions(db: &TestDatabase, scope: Scope) -> Vec<String> {
+    db.store()
+        .scoped(scope)
+        .audit()
+        .list()
+        .await
+        .expect("audit list")
+        .into_iter()
+        .map(|row| row.action)
+        .collect()
+}
+
+// One linear failure-then-retry narrative: injecting the failure, asserting the four
+// post-conditions, retrying, and asserting what the commit owes. Splitting it would hide
+// which assertions belong to which half.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn an_approve_whose_completion_fails_decides_nothing_and_the_same_key_then_lands() {
+    // Issue #247, the second site with the same shape. The admin surface used to decide
+    // the case (committing the Idempotency-Key record with it) in ONE transaction and
+    // complete the recovery in a SECOND, discarding that second result. A failed
+    // completion therefore left an approved-but-unfinished flow the replay store could
+    // not see: a retry under the SAME key replayed the stored response and never
+    // re-attempted the completion, so ONLY a fresh key could ever finish that flow.
+    //
+    // Joined, the decision, both audit rows, the completion and the idempotency record
+    // share one transaction.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let flow = seed_completable_flow(&db, &env, scope, 9).await;
+    let key = "recovery-atomic-key";
+
+    // The failing attempts, one at EACH of the three seams a split approve could be
+    // reintroduced at, exactly as the invitation site loops over its three. Probing only
+    // the seam BEFORE the completion (the old split) leaves the other end unmeasured:
+    // MEASURED, a mutation that committed the decision and completed in a SECOND
+    // transaction, which is the whole defect, survived eleven green tests when this was
+    // the only point offered.
+    for at in [
+        RecoveryApproveFailurePoint::AfterIdempotency,
+        RecoveryApproveFailurePoint::AfterDecision,
+        RecoveryApproveFailurePoint::BeforeCommit,
+    ] {
+        let failed = db
+            .control_store()
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .recovery_approvals()
+            .approve_injecting_failure(
+                &env,
+                &flow,
+                Some(ironauth_store::IdempotencyWrite {
+                    credential_ref: "cred-247",
+                    key,
+                    request_fingerprint: "fp-247",
+                    response_status: 200,
+                    response_body: "{}",
+                }),
+                at,
+            )
+            .await;
+        assert!(
+            failed.is_err(),
+            "the failure injected at {at:?} must fail: {failed:?}"
+        );
+
+        // NOTHING was decided: the case is still open, the flow is not completed,
+        // neither audit row landed, and no idempotency record survives to turn the retry
+        // into a permanent no-op.
+        assert!(
+            !db.store()
+                .scoped(scope)
+                .recovery_approvals()
+                .is_approved(&flow)
+                .await
+                .expect("is_approved"),
+            "an approve rolled back at {at:?} leaves the case undecided"
+        );
+        let record = db
+            .store()
+            .scoped(scope)
+            .recovery_flows()
+            .get(&flow)
+            .await
+            .expect("read the flow")
+            .expect("the flow exists");
+        assert_ne!(
+            record.state,
+            RecoveryState::Completed,
+            "an approve rolled back at {at:?} completes nothing"
+        );
+        let after_failure = audit_actions(&db, scope).await;
+        for absent in ["recovery.approved", "recovery.complete"] {
+            assert!(
+                !after_failure.iter().any(|a| a == absent),
+                "an approve rolled back at {at:?} leaves no {absent} audit row; \
+                 saw {after_failure:?}"
+            );
+        }
+        let stored: i64 =
+            sqlx::query("SELECT COUNT(*) AS n FROM idempotency_keys WHERE idempotency_key = $1")
+                .bind(key)
+                .fetch_one(db.owner_pool())
+                .await
+                .expect("count idempotency rows")
+                .get("n");
+        assert_eq!(
+            stored, 0,
+            "an approve rolled back at {at:?} stores no Idempotency-Key record"
+        );
+    }
+
+    // The retry under the SAME key decides AND completes, in one transaction.
+    let completed = db
+        .control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .recovery_approvals()
+        .approve(
+            &env,
+            &flow,
+            Some(ironauth_store::IdempotencyWrite {
+                credential_ref: "cred-247",
+                key,
+                request_fingerprint: "fp-247",
+                response_status: 200,
+                response_body: "{}",
+            }),
+        )
+        .await
+        .expect("the same key retries cleanly after a failed approve");
+    assert!(completed, "the approve completed the recovery it unblocked");
+    assert!(
+        db.store()
+            .scoped(scope)
+            .recovery_approvals()
+            .is_approved(&flow)
+            .await
+            .expect("is_approved")
+    );
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .recovery_flows()
+            .get(&flow)
+            .await
+            .expect("read the flow")
+            .expect("the flow exists")
+            .state,
+        RecoveryState::Completed,
+        "the joined approve completed the flow"
+    );
+
+    // Both audit rows landed, under ONE correlation id: they are one operation now, not
+    // two requests that happened to follow each other.
+    let rows = db
+        .store()
+        .scoped(scope)
+        .audit()
+        .list()
+        .await
+        .expect("audit list");
+    let decision = rows
+        .iter()
+        .find(|row| row.action == "recovery.approved")
+        .expect("the decision is audited");
+    let completion = rows
+        .iter()
+        .find(|row| row.action == "recovery.complete")
+        .expect("the completion is audited");
+    assert_eq!(
+        decision.correlation_id.to_string(),
+        completion.correlation_id.to_string(),
+        "the decision and the completion share one correlation id, because they are one transaction"
+    );
+    assert_eq!(
+        completion.detail.as_deref(),
+        Some("urn:ironauth:acr:pwd"),
+        "the completion audit records the strength the completed row holds"
+    );
+}
+
+#[tokio::test]
+async fn a_held_approve_decides_the_case_without_completing_the_flow() {
+    // The #81 delay gate is UNCHANGED by the join: an approve inside the hold window
+    // still decides the case and still refuses to complete, so the admin re-approves
+    // after the window to finalize. Without this the join could silently have erased the
+    // delay, which is the one thing the completion guard exists to prevent.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    // `seed_flow` holds until the year 2255, so the window has not elapsed.
+    let (flow, subject) = seed_flow(&db, &env, scope, RecoveryMethod::AdminApproved, 8).await;
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .recovery_approvals()
+        .open(&env, &flow, &subject)
+        .await
+        .expect("open");
+
+    let completed = db
+        .control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .recovery_approvals()
+        .approve(&env, &flow, None)
+        .await
+        .expect("approve");
+    assert!(
+        !completed,
+        "a held flow is NOT completed: the delay window has not elapsed"
+    );
+    assert!(
+        db.store()
+            .scoped(scope)
+            .recovery_approvals()
+            .is_approved(&flow)
+            .await
+            .expect("is_approved"),
+        "the decision still stands: only the completion is held"
+    );
+    assert_ne!(
+        db.store()
+            .scoped(scope)
+            .recovery_flows()
+            .get(&flow)
+            .await
+            .expect("read the flow")
+            .expect("the flow exists")
+            .state,
+        RecoveryState::Completed,
+        "the held flow is not completed"
+    );
+    let actions = audit_actions(&db, scope).await;
+    assert!(
+        actions.iter().any(|a| a == "recovery.approved"),
+        "the decision is audited; saw {actions:?}"
+    );
+    assert!(
+        !actions.iter().any(|a| a == "recovery.complete"),
+        "a completion that did not happen writes no audit row; saw {actions:?}"
+    );
 }
 
 #[tokio::test]
