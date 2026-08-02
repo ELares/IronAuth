@@ -261,33 +261,89 @@ account, and a fenced account (blocked, disabled, pending verification) all retu
 covers both the native Argon2id verifier and any foreign hash, through the same
 dispatch as login; it never mutates IronAuth state.
 
-### Enablement (disabled by default)
+### Enablement (per environment, disabled by default)
 
-Exposing a live credential oracle to a third party is an explicit, per-deployment
-opt-in, so this endpoint is **disabled by default**. It is enabled through
-environment-scoped configuration in `ironauth-config`:
+Exposing a live credential oracle to a third party is an explicit opt-in, so this
+endpoint is **disabled by default in every environment**. Enablement and the shared
+token are **per environment**: each environment carries its own token, sealed at rest
+under that environment's envelope key, rotatable on its own schedule and independent
+of every other environment. A deployment can therefore run several concurrent
+outbound migrations without any of them being able to verify credentials in another.
 
-```toml
-[admin]
-outbound_verification_enabled = true
-# The shared bearer token a successor system presents. A distinct credential from
-# the operator token and every management key; it authorizes ONLY this endpoint.
-outbound_verification_token = { env = "IRONAUTH_OUTBOUND_VERIFICATION_TOKEN" }
-# The ONE (tenant, environment) this endpoint is authorized for. The shared token
-# can only ever verify credentials in this one environment; a request to any other
-# tenant or environment is a uniform not-found, so the token never crosses tenants.
-outbound_verification_tenant = "ten_..."
-outbound_verification_environment = "env_..."
+There is no configuration key for this. It is driven entirely through the management
+API, with the ordinary management credential:
+
+```
+PUT /v1/tenants/{tenant_id}/environments/{environment_id}/migration/outbound-verification
+Authorization: Bearer <management credential>
+Content-Type: application/json
+
+{ "token": "<the shared bearer the successor will present>" }
 ```
 
-When disabled, the endpoint is a uniform not-found. When enabled without a token, it
-authorizes nobody (fail closed). When enabled without a configured
-`(tenant, environment)` scope, it matches no request (fail closed). A request whose
-path scope does not match the configured scope is a uniform not-found REGARDLESS of
-the token, so the endpoint is invisible and inert outside its one authorized
-environment. A request missing a bearer against a DISABLED endpoint is itself a
-uniform not-found (the enablement gate is evaluated before the bearer check), so a
-disabled endpoint is indistinguishable from an absent route.
+The token must be at least 32 bytes. Writing it enables the endpoint for that
+environment; writing it again ROTATES it, and the previous token stops working the
+moment the write commits, with no restart. The response carries the stored version
+and timestamps so a rotation is confirmable:
+
+```json
+{ "enabled": true, "version": 2, "created_at_unix_ms": 0, "updated_at_unix_ms": 0 }
+```
+
+`GET` on the same path reads that view back. It NEVER returns the token: once
+written, a token is rotated or deleted, never read. `DELETE` disables the endpoint
+for that environment and destroys the token; it is idempotent (disabling an
+already-disabled environment is the same `204`).
+
+**Decommissioning an environment does NOT disable this.** Soft-deleting an
+environment leaves its sealed credential in place and the verify endpoint keeps
+answering, deliberately: a successor draining an environment is exactly who is still
+reading it. So `DELETE` on the path above keeps working at a soft-deleted
+environment, and it is the only way to turn the credential off. `PUT` does not: a
+decommissioned environment cannot be given a NEW credential, and a rotation is a new
+credential. If you are decommissioning an environment and do not want it answering a
+successor any more, `DELETE` the outbound verification first, or at any time after.
+
+The token is a DISTINCT credential from the operator token and every management key,
+in both directions: it authorizes ONLY the verify endpoint, and it is not accepted at
+the management endpoints above, so a successor system holding it cannot read or
+rotate its own enablement, let alone anyone else's.
+
+### Every refusal is the same answer
+
+For a caller who has not presented this environment's token, the verify endpoint has
+exactly ONE outcome: a uniform `404`. (A caller who HAS presented it can also see a
+`400` for a malformed body, and the `200` carrying the verdict.) All of these are
+that one byte-identical `404`:
+
+* an absent tenant;
+* an absent environment;
+* a live environment with outbound verification disabled;
+* an armed environment with **no** `Authorization` header;
+* an armed environment with the **wrong** token, including a token that is correct in
+  a different environment;
+* a malformed tenant or environment id.
+
+That is stricter than it needs to be for a plain credential check, deliberately.
+Enablement is now per environment, so a `401` for a missing or wrong bearer would let
+anyone who can reach the management port walk the `(tenant, environment)` space and
+read off which environments have an outbound migration armed, one request each. The
+missing-bearer refusal is answered before any database access at all.
+
+The `Bearer` scheme is matched case insensitively, per RFC 7235 section 2.1, so a
+client that sends `BEARER` is not silently told the environment is not armed.
+
+The residual signal, stated with a number because it is real: an armed environment and
+a disabled one no longer differ in the number of database round trips or AEAD
+operations a request costs, but they still differ by about 4 percent at the median (on
+the order of 14 microseconds), because the armed branch decodes two key rows the
+disabled branch's lookups do not return. Measured over 600 interleaved unauthenticated
+samples per branch, a single-sample classifier at the midpoint of the two medians gets
+roughly 0.8 recall at roughly 0.2 false positives, which is far from the 0.98 recall at
+0.02 false positives the unflattened shape gave. Reading it takes many samples over
+separated windows rather than a handful of requests. Both cases answer the same `404`,
+and the token itself is compared in constant time, so neither its length nor the
+position of its first wrong byte leaks.
 
 ## The round-trip guarantee
 

@@ -520,6 +520,20 @@ fn environment_child_cases(base: &str, ids: &Ids) -> Vec<Case> {
             }))),
         },
         Case {
+            label: "migration.setOutboundVerification",
+            method: "PUT",
+            path: format!("{base}/migration/outbound-verification"),
+            body: Some(body_of(&serde_json::json!({
+                "token": "an-outbound-token-of-at-least-32-bytes"
+            }))),
+        },
+        Case {
+            label: "migration.deleteOutboundVerification",
+            method: "DELETE",
+            path: format!("{base}/migration/outbound-verification"),
+            body: None,
+        },
+        Case {
             label: "password_hashing.probePasswordHashing",
             method: "POST",
             path: format!("{base}/password-hashing/probe"),

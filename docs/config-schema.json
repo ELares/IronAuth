@@ -78,39 +78,6 @@
           "minimum": 0,
           "type": "integer"
         },
-        "outbound_verification_enabled": {
-          "default": false,
-          "description": "Enable the OUTBOUND lazy-migration credential-verification endpoint (issue\n#58): the mirror of IronAuth's inbound migration hook, so a SUCCESSOR system\ncan migrate away from IronAuth exactly as easily as IronAuth migrates off an\nincumbent. When enabled, `POST .../migration/verify-credential` lets a\nsuccessor present a user's identifier plus password during its OWN lazy\nmigration and receive a verdict (and, on success, an optional profile), so it\nupgrades users to its native store on their next login without a password\nreset. The SAFE default (`false`) leaves the endpoint returning a uniform\nnot-found: the exit-friendliness covenant makes the export SELF-SERVE, but\nexposing a live credential-oracle to a third party is an explicit,\nper-deployment opt-in. This is a promotable per-environment setting in spirit\n(like the OIDC toggles); the process value is the deployment default until\nper-environment overrides ride the M5 promotion pipeline.",
-          "type": "boolean"
-        },
-        "outbound_verification_environment": {
-          "default": null,
-          "description": "The environment id the OUTBOUND lazy-migration verification endpoint is\nauthorized for (issue #58), paired with `outbound_verification_tenant`. Both\nmust be set and must match the request's path scope, or the endpoint is a\nuniform not-found. Unset (the default) is fail closed.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "outbound_verification_tenant": {
-          "default": null,
-          "description": "The tenant id the OUTBOUND lazy-migration verification endpoint is authorized\nfor (issue #58). The endpoint is bound to exactly ONE `(tenant, environment)`:\na request whose path scope does not match this tenant AND\n`outbound_verification_environment` is a uniform not-found, so the shared token\ncan only ever verify credentials in its one configured environment and never\nleaks across tenants. Unset (the default) leaves the endpoint bound to no\nscope, so it matches nothing and is a uniform not-found even when enabled and\ncredentialed (fail closed: no scope, no access). A larger per-environment\nsecret home rides the M5 promotion pipeline; this pins the authorized scope\ntoday so the most sensitive new surface is never deployment-global.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "outbound_verification_token": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Secret"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "description": "The shared bearer token a successor system presents to the OUTBOUND\nlazy-migration verification endpoint (issue #58), as\n`Authorization: Bearer <token>`. It is a DISTINCT credential from the\nmanagement operator token and any management key: it authorizes ONLY the\ncredential-verification endpoint, never any other management surface. Unset\n(the default) leaves the endpoint unauthorized even when\n`outbound_verification_enabled` is true (fail closed: no token, no access).\nUse the `file`/`env` secret indirection, never a literal, outside dev mode."
-        },
         "sudo_mode_enabled": {
           "default": false,
           "description": "Whether admin sudo mode (session privilege separation) is active on the\nmanagement surface (issue #73). OFF by default: it is an exploratory bet, gated\nbehind a per-environment flag and a graduation decision. When ON, admin READS are\nunaffected but a MUTATION requires a RECENT re-authentication: the acting\ncredential must have a recorded elevation whose freshness window has not lapsed,\nevaluated the same way step-up (issue #72) evaluates a max-auth-age window. A\nmutation without a fresh elevation returns a structured RFC 9470 challenge\n(`insufficient_user_authentication`) and executes nothing. The enforced guarantee\nis that the elevation is SERVER-RECORDED and never CLIENT-ASSERTED: it derives only\nfrom a server-written re-auth event, never from a client-supplied header or flag, so\na forged header cannot elevate. CAVEAT: because the admin plane authenticates via a\nsingle non-interactive bearer credential with NO second factor, sudo mode does NOT\nyet defeat a fully-stolen admin bearer, which can call the elevate endpoint itself\nand then mutate. It bounds a header-forgery or replay path, not a stolen bearer.\nBinding elevation to a distinct interactive re-auth factor (an operator passkey) is\na documented graduation step; the freshness seam is factored so end-user\napplication sessions, which have that factor split, get the full guarantee. When\nOFF, the admin surface behaves exactly as before (no freshness gate). Independent of\nevery other flag.",
@@ -1010,7 +977,7 @@
             "secret": null,
             "timeout_secs": 5
           },
-          "description": "The INBOUND lazy-migration hook (issue #56): verify a first login against a\nlegacy credential store over the SSRF-hardened outbound fetcher and, on success,\ncreate the user locally with a native Argon2id hash so subsequent logins never\ncall the hook. Disabled by default; the endpoint and its authentication secret\nare environment-scoped config (see [`LazyMigrationConfig`]). This is a promotable\nper-environment setting in spirit; the process value is the deployment default\nuntil per-environment overrides ride the M5 promotion pipeline."
+          "description": "The INBOUND lazy-migration hook (issue #56): verify a first login against a\nlegacy credential store over the SSRF-hardened outbound fetcher and, on success,\ncreate the user locally with a native Argon2id hash so subsequent logins never\ncall the hook. Disabled by default.\n\nCORRECTING A CLAIM THIS COMMENT USED TO MAKE (issue #250 sweep): it said the\nendpoint and its authentication secret \"are environment-scoped config\". They are\nnot, and were not when that was written. This whole section is DEPLOYMENT\nGLOBAL: `OidcState::migration_hook` takes no `Scope` and hands back one\nprocess-wide hook, so an armed hook fires on the first-login path of EVERY\nenvironment in the deployment, and there is not even the single-`(tenant,\nenvironment)` pin the OUTBOUND side had before issue #250 re-homed it.\n\n# What that costs a MULTI-TENANT deployment that turns this on, named exactly\n\nCalling it \"a performance and blast-radius decision\" understates it enough that a\nfuture reader could deprioritise it, so the two primitives are named rather than\nsummarized. See issue #482, which carries the measurements and the reason the\nstructural fix is an owner-level decision rather than a mechanical port.\n\n1. PLAINTEXT CREDENTIAL EGRESS ACROSS TENANTS. `login.rs` calls\n   `hook.attempt(identifier, password)` on the absent-account branch, from\n   `state.migration_hook()`, which takes no `Scope`. Every identifier and password\n   typed at ANY environment's login page, for any account absent locally, is sent\n   to the one configured third-party webhook.\n2. THIRD-PARTY-CONTROLLED ACCOUNT CREATION IN EVERY ENVIRONMENT. On a `Verified`\n   verdict, `complete_lazy_migration` creates the user in the REQUESTING scope. The\n   webhook can answer \"verified\" to any identifier and mint an account in any\n   tenant.\n\nWhat bounds it is that it is OFF by default and harmless in a single-tenant\ndeployment, which is the only reason it is not a release blocker.\n\nIt is the same defect shape issue #250 fixed on the outbound side, on the inbound\nmirror of the same endpoint, and it is deliberately left standing here rather than\nfolded into that change: the fix puts a per-request per-scope read on the LOGIN hot\npath and gives the circuit breaker per-scope state, which is a design change with\nits own blast radius rather than a mechanical port, so it is an owner-level call\nand gets its own issue. What is fixed here is the sentence, because a comment that\nclaims a property the code does not have is worse than no comment."
         },
         "magic_link_enabled": {
           "default": true,
@@ -2494,10 +2461,6 @@
         "default_page_size": 50,
         "max_page_size": 200,
         "offboarding_retention_secs": 2592000,
-        "outbound_verification_enabled": false,
-        "outbound_verification_environment": null,
-        "outbound_verification_tenant": null,
-        "outbound_verification_token": null,
         "sudo_mode_enabled": false,
         "sudo_mode_window_secs": 600
       },
