@@ -4778,10 +4778,20 @@ export interface components {
             next_cursor?: string | null;
         };
         /**
-         * @description The result of a tenant lifecycle transition (issue #46): the tenant id and its
-         *     new status. It states the POST-CONDITION (what is true after the call), so the
-         *     body is known before the write and stored verbatim for an Idempotency-Key
-         *     replay, exactly like the session-revocation views.
+         * @description The result of a tenant lifecycle call (issue #46): the tenant id and the status
+         *     it now has.
+         *
+         *     For `suspend` and `resume` the status is a POST-CONDITION the call chooses: the
+         *     store refuses any transition whose source state is wrong, so a 200 means the
+         *     tenant now holds the requested status, and the body can be serialized before the
+         *     write and stored verbatim for an Idempotency-Key replay, exactly like the
+         *     session-revocation views.
+         *
+         *     `restore` is NOT a transition and its status is NOT predictable that way (issue
+         *     #438): it undoes the DELETE and leaves the lifecycle status untouched, so a tenant
+         *     suspended before its grace deletion comes back suspended. That endpoint therefore
+         *     renders this view from the status the store COMMITTED, inside the write's own
+         *     transaction, so the 200, its replays and a subsequent read agree.
          */
         TenantStatusView: {
             /** @description The tenant identifier (`ten_...`). */
@@ -14484,7 +14494,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Restored (post-condition) */
+            /** @description Restored; reports the lifecycle status the restore committed, which is the status the tenant had before it was deleted (a restore does not resume a suspended tenant) */
             200: {
                 headers: {
                     [name: string]: unknown;

@@ -33283,14 +33283,21 @@ struct AuditedWrite<'a, T: AuditTarget> {
 /// `poison_after_audit` is `false` on every production path; the testing
 /// atomicity probe sets it to force a guaranteed in-transaction failure after
 /// both inserts, to demonstrate they roll back together.
-async fn write_audited<T, M>(
+///
+/// The mutation's own return value `R` is handed back to the caller (`()` for the
+/// overwhelming majority, which report nothing). A write that must report what it
+/// COMMITTED, rather than what its caller predicted, returns it from inside the
+/// transaction through this channel: the value and the row it describes are read in
+/// the same transaction that writes them, so they cannot disagree (issues #395,
+/// #438).
+async fn write_audited<T, M, R>(
     spec: AuditedWrite<'_, T>,
     mutate: M,
     poison_after_audit: bool,
-) -> Result<(), StoreError>
+) -> Result<R, StoreError>
 where
     T: AuditTarget,
-    M: AsyncFnOnce(&mut Transaction<'_, Postgres>) -> Result<(), StoreError>,
+    M: AsyncFnOnce(&mut Transaction<'_, Postgres>) -> Result<R, StoreError>,
 {
     // The overwhelming majority of audited writes carry no detail dimension.
     write_audited_detailed(spec, mutate, poison_after_audit, None).await
@@ -33301,19 +33308,19 @@ where
 /// operator working from the audit table alone gets the actionable reason. `detail`
 /// is never attacker-controlled free text. Every other audited write goes through
 /// [`write_audited`] with no detail, so this is the only path that sets it.
-async fn write_audited_detailed<T, M>(
+async fn write_audited_detailed<T, M, R>(
     spec: AuditedWrite<'_, T>,
     mutate: M,
     poison_after_audit: bool,
     detail: Option<&str>,
-) -> Result<(), StoreError>
+) -> Result<R, StoreError>
 where
     T: AuditTarget,
-    M: AsyncFnOnce(&mut Transaction<'_, Postgres>) -> Result<(), StoreError>,
+    M: AsyncFnOnce(&mut Transaction<'_, Postgres>) -> Result<R, StoreError>,
 {
     let mut tx = begin_scoped(spec.store, spec.scope).await?;
     // The data change and the audit row share this one transaction.
-    mutate(&mut tx).await?;
+    let reported = mutate(&mut tx).await?;
     insert_audit_row(&mut tx, &spec, detail).await?;
     if poison_after_audit {
         // Testing seam only (production callers pass false): force a guaranteed
@@ -33322,7 +33329,9 @@ where
         sqlx::query("SELECT 1 / 0").execute(&mut *tx).await?;
     }
     tx.commit().await?;
-    Ok(())
+    // Reached only on a COMMITTED transaction: a mutation that reports what it wrote
+    // never reports it for a write that rolled back.
+    Ok(reported)
 }
 
 /// Insert exactly one audit row into the current transaction, after the data change
@@ -33454,23 +33463,31 @@ pub struct IdempotencyWrite<'a> {
 }
 
 /// A pending Idempotency-Key record whose stored body is only KNOWABLE once the write
-/// has run, because the write RESOLVES which row it lands on (issue #395).
+/// has run, because the write RESOLVES what it lands on (issue #395).
 ///
 /// [`IdempotencyWrite`] carries a body the caller already serialized, which is correct
-/// whenever the caller knows the resulting resource before the write executes. A
-/// revive-or-insert does not have that property: it can land on an EXISTING
-/// soft-deleted row, keeping that row's ORIGINAL id and creation time and, when the
-/// re-add supplied none, its existing metadata. A body serialized up front from
-/// REQUEST state therefore describes a resource that was never persisted: a phantom
-/// id no endpoint resolves, and two fields that disagree with every read of the row.
-/// It is a phantom twice over, because it is both what the create returns and what
-/// every replay of that Idempotency-Key returns forever after.
+/// whenever the caller knows the outcome before the write executes. Two shapes of
+/// write do NOT have that property, and both are wrong in the same way:
 ///
-/// The body is therefore a BUILDER the store calls with the ROW the write actually
-/// resolved, inside the same transaction as the write, so the stored response and the
-/// row it describes commit together and agree. The caller renders its own response
-/// from the same returned row, so the 201 and its replays are the same bytes.
-pub struct ResolvedIdempotencyWrite<'a> {
+/// - a revive-or-insert can land on an EXISTING soft-deleted row, keeping that row's
+///   ORIGINAL id and creation time and, when the re-add supplied none, its existing
+///   metadata (issue #395);
+/// - a write whose post-condition is only PARTLY determined by the call can commit a
+///   state the caller did not choose. A tenant restore undoes a DELETE without
+///   touching the tenant's lifecycle status, so a tenant suspended before its grace
+///   deletion comes back SUSPENDED (issue #438).
+///
+/// A body serialized up front from REQUEST state therefore describes something that
+/// was never persisted: a phantom id no endpoint resolves, or a status that
+/// contradicts the row. It is a phantom twice over, because it is both what the call
+/// returns and what every replay of that Idempotency-Key returns forever after.
+///
+/// The body is therefore a BUILDER the store calls with what the write actually
+/// resolved (`R`), inside the same transaction as the write, so the stored response
+/// and the state it describes commit together and agree. The caller renders its own
+/// response from the same returned value, so the response and its replays are the
+/// same bytes.
+pub struct ResolvedIdempotencyWrite<'a, R> {
     /// The acting credential's audit-actor id (the isolation key here).
     pub credential_ref: &'a str,
     /// The client-supplied Idempotency-Key header value.
@@ -33479,15 +33496,15 @@ pub struct ResolvedIdempotencyWrite<'a> {
     pub request_fingerprint: &'a str,
     /// The status the caller is about to return.
     pub response_status: u16,
-    /// Renders the body to store from the membership the write RESOLVED, as persisted
-    /// (the revived row, or the freshly inserted one). A serialization failure
-    /// surfaces as a decode error and rolls the whole transaction back, so a body
-    /// that cannot be rendered never commits a half-written membership.
+    /// Renders the body to store from what the write RESOLVED, as persisted (the
+    /// revived row rather than the freshly inserted one, the surviving lifecycle
+    /// status rather than the predicted one). A serialization failure surfaces as a
+    /// decode error and rolls the whole transaction back, so a body that cannot be
+    /// rendered never commits a half-written mutation.
     /// `Sync` because the write it feeds is held across an await inside an axum
     /// handler whose future must be `Send`, and a shared reference is `Send` only
     /// when its referent is `Sync`.
-    pub response_body:
-        &'a (dyn Fn(&OrgMembershipRecord) -> Result<String, serde_json::Error> + Sync),
+    pub response_body: &'a (dyn Fn(&R) -> Result<String, serde_json::Error> + Sync),
 }
 
 /// A tenant row (management plane).
@@ -38287,8 +38304,11 @@ impl ActingTenantRepo<'_> {
     /// The shared body of [`ActingTenantRepo::suspend`] and
     /// [`ActingTenantRepo::resume`]: validate the state-machine transition
     /// `from -> to`, flip the tenant status, and cascade the data-plane serving
-    /// state to every environment, in one audited transaction.
-    #[allow(clippy::too_many_arguments)]
+    /// state to every LIVE environment, in one audited transaction. A deleted
+    /// environment is fenced by its own deletion and a tenant transition does not lift
+    /// that (the sibling of issue #439 on this path); it is still written, always
+    /// fenced, so the cascade leaves no environment on the absent-row default.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn transition(
         &self,
         env: &Env,
@@ -38375,12 +38395,32 @@ impl ActingTenantRepo<'_> {
                 //    has no row yet; the upsert creates it). This is what a
                 //    suspended tenant's data plane reads to fence, and a resumed
                 //    tenant's to serve again.
-                let env_rows = sqlx::query("SELECT id FROM environments WHERE tenant_id = $1")
-                    .bind(id.to_string())
-                    .fetch_all(&mut **tx)
-                    .await?;
+                //
+                //    A DELETED environment is fenced by its own deletion and stays
+                //    fenced whatever the tenant does (the sibling of issue #439 on
+                //    this path). The tenant's derived serving state is written only
+                //    over its LIVE environments: writing it over every one meant a
+                //    tenant resume SERVED an environment an operator had
+                //    decommissioned, because `environment_state` reads this row and
+                //    nothing else. Deleted environments are still visited, and still
+                //    written, so an environment old enough to have no row yet gets one
+                //    that fences it rather than being left to the absent-row default,
+                //    which serves.
+                let env_rows = sqlx::query(
+                    "SELECT id, (deleted_at IS NOT NULL) AS deleted \
+                     FROM environments WHERE tenant_id = $1",
+                )
+                .bind(id.to_string())
+                .fetch_all(&mut **tx)
+                .await?;
                 for env_row in &env_rows {
                     let env_id: String = env_row.get("id");
+                    let env_deleted: bool = env_row.get("deleted");
+                    let env_serving = if env_deleted {
+                        serving_status_str(EnvironmentServingState::Suspended)
+                    } else {
+                        serving_status
+                    };
                     sqlx::query("SELECT set_config('ironauth.environment_id', $1, true)")
                         .bind(&env_id)
                         .execute(&mut **tx)
@@ -38396,7 +38436,7 @@ impl ActingTenantRepo<'_> {
                     )
                     .bind(id.to_string())
                     .bind(&env_id)
-                    .bind(serving_status)
+                    .bind(env_serving)
                     .bind(now_micros)
                     .execute(&mut **tx)
                     .await?;
@@ -38442,6 +38482,16 @@ impl ActingTenantRepo<'_> {
     /// data plane serving the offboarded tenant. Nothing is crypto-shredded here: the
     /// keys survive so a restore loses no data; erasure is the terminal purge's job.
     ///
+    /// The one instant this stamps across all three tables is also the DISCRIMINATOR
+    /// [`ActingTenantRepo::restore`] undoes itself by (issue #439), so it is chosen to
+    /// be STRICTLY LATER than every tombstone that already exists under the tenant,
+    /// not merely read off the clock: the environment rows are locked and their
+    /// tombstones (and their credentials') read first, and the stamp is the later of
+    /// the clock and one microsecond past the latest of them. An environment or a
+    /// management key an operator decommissioned on its own therefore carries a
+    /// provably earlier instant, whatever the platform clock's resolution and however
+    /// close together the two deletions were issued, and the restore leaves it alone.
+    ///
     /// # Errors
     ///
     /// [`StoreError::NotFound`] if no live tenant matched under this operator.
@@ -38474,32 +38524,146 @@ impl ActingTenantRepo<'_> {
                 target: id,
             },
             async move |tx| {
-                let deleted_micros = epoch_micros(env.clock().now_utc());
-                // 1. Soft-delete the tenant itself (a level table, no row-level
-                //    security).
-                let result = sqlx::query(
+                // 1. LOCK the tenant row, in the same mode the tombstone UPDATE in
+                //    step 3 takes, before touching anything else. Two reasons.
+                //
+                //    It is this transaction's live-tenant GUARD: a tenant that is
+                //    absent, owned by another operator, or already tombstoned matches
+                //    nothing and is the uniform NotFound. Because the lock is held to
+                //    commit, that decision cannot then be raced, which is why step 3
+                //    no longer re-checks it.
+                //
+                //    And it keeps the transaction's lock ORDER (tenant, then
+                //    environments, then credentials) the one every tenant-level write
+                //    already uses, so a concurrent restore or transition of the same
+                //    tenant SERIALIZES behind this rather than deadlocking with the
+                //    environment lock taken next.
+                let live = sqlx::query(
+                    "SELECT id FROM tenants \
+                     WHERE id = $1 AND operator_id = $2 AND deleted_at IS NULL \
+                     FOR NO KEY UPDATE",
+                )
+                .bind(id.to_string())
+                .bind(operator.to_string())
+                .fetch_optional(&mut **tx)
+                .await?;
+                if live.is_none() {
+                    return Err(StoreError::NotFound);
+                }
+                // 2. LOCK every environment row of the tenant and read the tombstones
+                //    that ALREADY exist, before choosing this delete's instant. The
+                //    restore matches on that instant to undo exactly the tombstones
+                //    this delete writes (issue #439), so the instant has to be a
+                //    DISCRIMINATOR, and this read is what makes it one.
+                //
+                //    `FOR UPDATE` re-reads the latest committed version once the lock
+                //    is granted, so a concurrent individual environment delete is
+                //    either already visible here or blocked until this transaction
+                //    commits, after which its own `deleted_at IS NULL` guard refuses
+                //    it: no environment tombstone can appear behind this read. The
+                //    rows stay locked to commit, and an INSERT whose foreign key names
+                //    one of them takes a conflicting KEY SHARE lock on it, so no
+                //    management credential can be minted into this tenant mid delete
+                //    either.
+                //
+                //    `FOR UPDATE` itself is REASONED, not measured: dropping it kills
+                //    no test, because its effect needs a genuinely concurrent
+                //    individual environment delete committing between this read and
+                //    this transaction's commit, which no test stages. The stamping
+                //    rule the lock protects IS measured, by
+                //    `a_restore_leaves_an_individually_deleted_environment_deleted`.
+                //    Do not read the surviving mutant as dead code.
+                //
+                //    REQUIRES POSTGRESQL 14 OR LATER, and this is the one place in the
+                //    schema where that stops being a portability nicety and becomes a
+                //    security property. `EXTRACT(EPOCH ...)` returns `numeric` on 14 and
+                //    later, so the microsecond round trip is EXACT (measured: 200,000
+                //    random instants across 1938 to 2039 AD, zero mismatches). On 13 and
+                //    earlier it returns `double precision`, whose ULP near present day
+                //    epochs is about half a microsecond, so a tombstone could read back
+                //    off by one and stop matching the stamp this delete wrote. The
+                //    failure mode is not a rounding artifact: a stamp that fails to match
+                //    is a stamp that fails OPEN, reviving an environment and re-enabling a
+                //    management credential an operator decommissioned on their own. CI
+                //    pins `postgres:16` (`.github/workflows/ci.yml`), and no repository
+                //    wide minimum is documented elsewhere, which is why it is stated here
+                //    rather than assumed. The `(EXTRACT * 1000000)::bigint` idiom is used
+                //    widely in this file; this is the only site where an inexact result
+                //    would be a security regression rather than a wrong display value.
+                let env_rows = sqlx::query(
+                    "SELECT id, (EXTRACT(EPOCH FROM deleted_at) * 1000000)::bigint AS deleted_us \
+                     FROM environments WHERE tenant_id = $1 ORDER BY id FOR UPDATE",
+                )
+                .bind(id.to_string())
+                .fetch_all(&mut **tx)
+                .await?;
+                let mut latest_tombstone: Option<i64> = None;
+                for env_row in &env_rows {
+                    latest_tombstone =
+                        latest_tombstone.max(env_row.get::<Option<i64>, _>("deleted_us"));
+                }
+                // The same question one level down, and it is a SEPARATE one: a
+                // management key an operator REVOKED on its own carries an instant no
+                // environment tombstone need match. `management_credentials` carries
+                // forced row-level security keyed on (tenant, environment), so this
+                // re-scopes per environment exactly as the write loop below does, and
+                // locks the rows for the same reason the environment rows are locked.
+                for env_row in &env_rows {
+                    let env_id: String = env_row.get("id");
+                    sqlx::query("SELECT set_config('ironauth.environment_id', $1, true)")
+                        .bind(&env_id)
+                        .execute(&mut **tx)
+                        .await?;
+                    let cred_rows = sqlx::query(
+                        "SELECT (EXTRACT(EPOCH FROM deleted_at) * 1000000)::bigint AS deleted_us \
+                         FROM management_credentials \
+                         WHERE tenant_id = $1 AND environment_id = $2 \
+                         ORDER BY id FOR UPDATE",
+                    )
+                    .bind(id.to_string())
+                    .bind(&env_id)
+                    .fetch_all(&mut **tx)
+                    .await?;
+                    for cred_row in &cred_rows {
+                        latest_tombstone =
+                            latest_tombstone.max(cred_row.get::<Option<i64>, _>("deleted_us"));
+                    }
+                }
+                // This delete's instant is the clock's, forced STRICTLY LATER than
+                // every tombstone found above. That is the whole of the #439
+                // discriminator: every pre-existing tombstone under this tenant is now
+                // provably earlier than the one this delete writes, so the restore's
+                // equality predicates select exactly this delete's set, whatever the
+                // platform clock's resolution and however close together the two
+                // deletions were issued. Left as the raw clock reading it would be a
+                // TIE whenever an individual deletion and this one read the wall clock
+                // in the same microsecond, and the tie fails OPEN: the restore would
+                // revive the environment and re-enable the management credential an
+                // operator had decommissioned on their own.
+                let deleted_micros = match latest_tombstone {
+                    Some(latest) => {
+                        epoch_micros(env.clock().now_utc()).max(latest.saturating_add(1))
+                    }
+                    None => epoch_micros(env.clock().now_utc()),
+                };
+                // 3. Soft-delete the tenant itself (a level table, no row-level
+                //    security). Guarded and locked by step 1, so this cannot miss.
+                sqlx::query(
                     "UPDATE tenants SET deleted_at = \
                      TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
-                     WHERE id = $2 AND operator_id = $3 AND deleted_at IS NULL",
+                     WHERE id = $2 AND operator_id = $3",
                 )
                 .bind(deleted_micros)
                 .bind(id.to_string())
                 .bind(operator.to_string())
                 .execute(&mut **tx)
                 .await?;
-                if result.rows_affected() == 0 {
-                    return Err(StoreError::NotFound);
-                }
-                // 2. Cascade to the tenant's management credentials. They carry
+                // 4. Cascade to the tenant's management credentials. They carry
                 //    forced row-level security keyed on (tenant, environment), so
                 //    each environment's rows are visible (and updatable) only under
                 //    that environment's scope; a single tenant-wide UPDATE would
                 //    reach only the audit scope's environment. Re-scope per
                 //    environment to mark them all.
-                let env_rows = sqlx::query("SELECT id FROM environments WHERE tenant_id = $1")
-                    .bind(id.to_string())
-                    .fetch_all(&mut **tx)
-                    .await?;
                 for env_row in &env_rows {
                     let env_id: String = env_row.get("id");
                     sqlx::query("SELECT set_config('ironauth.environment_id', $1, true)")
@@ -38538,9 +38702,12 @@ impl ActingTenantRepo<'_> {
                     // which crypto-shreds through the same #48 envelope path once the
                     // window elapses.
                 }
-                // 3. Cascade to the tenant's environments (a level table, no
+                // 5. Cascade to the tenant's environments (a level table, no
                 //    row-level security), so reads stop returning them and the
-                //    authenticate join rejects the child keys.
+                //    authenticate join rejects the child keys. `deleted_at IS NULL`
+                //    LEAVES an environment an operator decommissioned earlier on its
+                //    OWN, earlier, instant: that is the partition the restore relies
+                //    on, and step 2 is what guarantees the two instants differ.
                 sqlx::query(
                     "UPDATE environments SET deleted_at = \
                      TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
@@ -38550,7 +38717,7 @@ impl ActingTenantRepo<'_> {
                 .bind(id.to_string())
                 .execute(&mut **tx)
                 .await?;
-                // 4. Restore the audit scope's row-level-security variables so the
+                // 6. Restore the audit scope's row-level-security variables so the
                 //    audited-write's audit row inserts under (tenant, oldest
                 //    environment), exactly as it did before the per-environment
                 //    re-scoping above.
@@ -38571,10 +38738,12 @@ impl ActingTenantRepo<'_> {
 
     /// Restore a tenant from the GRACE stage of offboarding (issue #46): reverse the
     /// grace delete while it is still INSIDE the configured `retention` window. Clears
-    /// the tenant's, its environments', and its management credentials' soft-delete
-    /// tombstones and returns every environment's data plane to the serving state the
-    /// tenant's OWN lifecycle status entails, in one audited transaction, so the tenant
-    /// serves again with NO data loss (the grace delete never shredded a key).
+    /// the soft-delete tombstones THIS DELETE wrote, on the tenant, on the environments
+    /// it took down and on their management credentials, and returns THOSE
+    /// environments' data plane to the serving state the tenant's OWN lifecycle status
+    /// entails, in one audited transaction, so what the offboarding took away comes
+    /// back with NO data loss (the grace delete never shredded a key). Anything that
+    /// was already deleted when the tenant was offboarded stays deleted: see below.
     ///
     /// A restore undoes the DELETE without touching the tenant's LIFECYCLE STATUS
     /// (issue #432): a tenant that was [`TenantStatus::Suspended`] before the grace
@@ -38583,20 +38752,56 @@ impl ActingTenantRepo<'_> {
     /// `active`. Lifting a suspension is [`ActingTenantRepo::resume`]'s job, and it
     /// still works on a restored tenant.
     ///
-    /// That narrowness is claimed for the tenant's own status and for NOTHING else.
-    /// It is NOT claimed for an environment's own deletion: step 3 below clears
-    /// `deleted_at` on EVERY environment of this tenant unconditionally, and step 2
-    /// writes the serving state the TENANT status entails over every one of them, so
-    /// an environment that had been deleted individually before the tenant was ever
-    /// offboarded comes back with the rest. Issue #439 records that case with the
-    /// measurement; it is not introduced here, and
-    /// [`ActingTenantRepo::transition`]'s cascade selects environments the same way.
+    /// A restore also undoes THIS DELETION and no other (issue #439). Every write
+    /// below is keyed on the tenant's own `deleted_at`, the single instant
+    /// [`ActingTenantRepo::delete`] stamps across the tenant, its environments and
+    /// their management credentials in one transaction. An environment (or a
+    /// management key) an operator deleted on its OWN, before the tenant was ever
+    /// offboarded, carries an EARLIER `deleted_at` (the grace delete skips what is
+    /// already tombstoned), matches none of these predicates, and stays deleted and
+    /// stays fenced. Restoring it is [`ActingEnvironmentRepo`]'s business, and there
+    /// is deliberately no such operation today.
+    ///
+    /// Matching on the instant needs NO marker column and NO migration, and it does
+    /// not depend on the clock's resolution, because [`ActingTenantRepo::delete`] does
+    /// not merely read the clock: it locks the tenant's environment rows, reads every
+    /// tombstone already under the tenant, and stamps an instant STRICTLY LATER than
+    /// all of them. Two deletions that read the wall clock in the same microsecond
+    /// therefore still carry different instants, and a frozen clock is an ordinary
+    /// configuration rather than a caveat, which is what
+    /// `a_restore_leaves_an_individually_deleted_environment_deleted` runs under.
+    ///
+    /// It also NARROWS what a restore brings back, and the narrowing is worth stating
+    /// because it is not what an operator would guess: a tenant whose environments had
+    /// ALL been decommissioned individually before it was offboarded comes back LIVE
+    /// with ZERO live environments, where before it came back with all of them. That
+    /// follows from the rule (none of those tombstones is this delete's) and it is
+    /// recoverable by creating a fresh environment, but nothing here undoes a
+    /// decommissioning. `a_restore_of_a_tenant_whose_environments_were_all_decommissioned`
+    /// pins it.
+    ///
+    /// The instant round trips through `EXTRACT(EPOCH FROM deleted_at)`, which is
+    /// EXACT on PostgreSQL 14 and later (the extract returns `numeric`). On 13 and
+    /// earlier it returns `double precision`, whose half-microsecond error would break
+    /// every equality above, so 14 is this store's floor. Nothing else in the tree
+    /// states a minimum server version; continuous integration runs 16.
     ///
     /// State machine: valid only for a tenant in GRACE (soft-deleted, not yet purged)
     /// whose retention window has NOT elapsed. A tenant that was never deleted, was
     /// already restored, or was terminally purged is [`StoreError::NotFound`]; a
     /// tenant whose retention window has already elapsed is [`StoreError::Conflict`]
     /// (restore is no longer offered; the terminal hard delete is due).
+    ///
+    /// # What it reports
+    ///
+    /// The lifecycle status the restore COMMITTED, read back from the write's own
+    /// `RETURNING` inside the transaction (issue #438). The caller's 200 body is
+    /// rendered from this value and, through [`ResolvedIdempotencyWrite`], the
+    /// Idempotency-Key record is rendered from the SAME value in the SAME transaction,
+    /// so the response, its replays and a subsequent tenant READ cannot disagree. A
+    /// body asserted before the call could: this endpoint's used to say `active`
+    /// unconditionally, and a suspended tenant's restore reported a status the row
+    /// never held.
     ///
     /// # Errors
     ///
@@ -38608,8 +38813,8 @@ impl ActingTenantRepo<'_> {
         env: &Env,
         id: &TenantId,
         retention: Duration,
-        idempotency: Option<IdempotencyWrite<'_>>,
-    ) -> Result<(), StoreError> {
+        idempotency: Option<ResolvedIdempotencyWrite<'_, TenantStatus>>,
+    ) -> Result<TenantStatus, StoreError> {
         let operator = self.operator;
         // Pre-read the grace tenant's deletion instant for the window decision. A row
         // that is not in grace (never deleted, already restored, or purged) is a clean
@@ -38668,14 +38873,42 @@ impl ActingTenantRepo<'_> {
                 //    concurrent writer can change it under us); RETURNING is simply
                 //    one round trip and one place to get the predicate right instead
                 //    of two.
+                //
+                //    The guard also PINS the deletion instant to the one pre-read
+                //    above, which is the value every cascade below matches on (issue
+                //    #439). Pinning it here is what makes that value safe to use: the
+                //    pre-read ran outside this transaction, so without it a concurrent
+                //    restore-then-delete could re-stamp `deleted_at` in between and
+                //    the cascades would silently match nothing, leaving the
+                //    environments tombstoned under a live tenant. With it, a re-stamp
+                //    matches no row and the whole restore is the uniform NotFound.
+                //    That is MEASURED, not merely reasoned:
+                //    `a_restore_whose_deletion_instant_was_re_stamped_underneath_it_is_refused`
+                //    holds this row's lock while it re-stamps, so the restore pre-reads
+                //    the old instant and meets the new one here, and it fails if this
+                //    predicate is relaxed back to `deleted_at IS NOT NULL`.
+                //    The instant round-trips exactly (a `timestamptz` is microseconds
+                //    since the epoch, and both directions go through the same
+                //    construction), and because it is now load-bearing on EVERY
+                //    restore, an inexact round trip could not pass silently: it would
+                //    fail every restore in the suite rather than only the case this
+                //    predicate is for.
+                //
+                //    `purged_at IS NULL` is the same kind of backstop for the same
+                //    pre-read and is deliberately unpinned: it is only reachable when a
+                //    terminal purge COMMITS between the pre-read and this statement, an
+                //    interleaving no test can stage, so no mutant of it dies. It is not
+                //    dead code, and removing it would let a restore undo a purge.
                 let restored = sqlx::query(
                     "UPDATE tenants SET deleted_at = NULL \
                      WHERE id = $1 AND operator_id = $2 \
-                     AND deleted_at IS NOT NULL AND purged_at IS NULL \
+                     AND deleted_at = TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval \
+                     AND purged_at IS NULL \
                      RETURNING status",
                 )
                 .bind(id.to_string())
                 .bind(operator.to_string())
+                .bind(deleted_micros)
                 .fetch_optional(&mut **tx)
                 .await?;
                 let Some(restored) = restored else {
@@ -38707,33 +38940,77 @@ impl ActingTenantRepo<'_> {
                 //    delete's credential tombstones, re-scoping to each environment
                 //    for the forced row-level security on management_credentials and
                 //    environment_states.
-                let env_rows = sqlx::query("SELECT id FROM environments WHERE tenant_id = $1")
-                    .bind(id.to_string())
-                    .fetch_all(&mut **tx)
-                    .await?;
+                //
+                //    EVERY environment is visited, exactly as
+                //    [`ActingTenantRepo::transition`]'s cascade does and for the same
+                //    reason: an environment left with no `environment_states` row at
+                //    all falls to the absent-row default, which SERVES. Only the ones
+                //    THIS delete tombstoned get the tenant's derived serving state
+                //    (issue #439); every other one is written FENCED whatever the
+                //    tenant's status.
+                //
+                //    The partition is the deletion instant. The delete stamps one
+                //    instant, strictly later than every tombstone that already existed
+                //    under the tenant, so `matched` means "the tenant delete took this
+                //    one down" and anything else means "it was already down, or it
+                //    arrived after the delete had scanned". An already-down environment
+                //    keeps its fence and its credential tombstones, because a restore
+                //    undoes its own deletion and not every deletion that ever happened
+                //    under the tenant. An environment that ARRIVED after the scan is
+                //    the create/delete window: `ActingEnvironmentRepo::create` checks
+                //    the parent tenant's liveness with a non-locking read, so under
+                //    READ COMMITTED a create can commit just after a tenant delete
+                //    listed the environments and just before it committed. Such an
+                //    environment is live and unfenced, under a tenant that is not; it
+                //    is fenced here rather than left serving under a tenant the
+                //    operator restored into `suspended`.
+                let env_rows = sqlx::query(
+                    "SELECT id, \
+                            (deleted_at = TIMESTAMPTZ 'epoch' \
+                             + ($2::text || ' microseconds')::interval) IS TRUE AS matched \
+                     FROM environments WHERE tenant_id = $1",
+                )
+                .bind(id.to_string())
+                .bind(deleted_micros)
+                .fetch_all(&mut **tx)
+                .await?;
                 for env_row in &env_rows {
                     let env_id: String = env_row.get("id");
+                    let matched: bool = env_row.get("matched");
+                    let env_serving = if matched {
+                        serving_status
+                    } else {
+                        serving_status_str(EnvironmentServingState::Suspended)
+                    };
                     sqlx::query("SELECT set_config('ironauth.environment_id', $1, true)")
                         .bind(&env_id)
                         .execute(&mut **tx)
                         .await?;
+                    // Again only what THIS delete tombstoned (issue #439). A
+                    // management key an operator REVOKED on its own beforehand carries
+                    // its own earlier instant and stays revoked; reviving it would
+                    // hand a decommissioned credential back its access as a side
+                    // effect of an unrelated tenant restore.
                     sqlx::query(
                         "UPDATE management_credentials SET deleted_at = NULL \
-                         WHERE tenant_id = $1 AND environment_id = $2 AND deleted_at IS NOT NULL",
+                         WHERE tenant_id = $1 AND environment_id = $2 \
+                         AND deleted_at = \
+                             TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval",
                     )
                     .bind(id.to_string())
                     .bind(&env_id)
+                    .bind(deleted_micros)
                     .execute(&mut **tx)
                     .await?;
-                    // Only the ON CONFLICT arm ever runs on THIS path: a grace delete
-                    // is a precondition of a restore (the guarded UPDATE above
-                    // requires `deleted_at IS NOT NULL`), and `ActingTenantRepo::delete`
-                    // upserts a fence row for every environment this same query
-                    // returns, so the row is always already there. The upsert form is
-                    // kept because it is the honest shape and because
-                    // `EXCLUDED.serving_status` reads the bound parameter out of the
-                    // VALUES clause. For the same reason a mutant on that clause is NO
-                    // evidence the INSERT arm runs: the conflict arm reads it too.
+                    // The ON CONFLICT arm runs for every environment the delete
+                    // fenced, which is every one it could see; the INSERT arm is
+                    // reached only by an environment that arrived through the
+                    // create/delete window described above and so has no row yet.
+                    // That is precisely the case the absent-row default would serve,
+                    // which is why the upsert is the right shape here rather than an
+                    // UPDATE. A mutant on `EXCLUDED.serving_status` is NO evidence the
+                    // INSERT arm runs: the conflict arm reads the same bound parameter
+                    // out of the VALUES clause.
                     sqlx::query(
                         "INSERT INTO environment_states \
                          (tenant_id, environment_id, serving_status, updated_at) \
@@ -38745,17 +39022,20 @@ impl ActingTenantRepo<'_> {
                     )
                     .bind(id.to_string())
                     .bind(&env_id)
-                    .bind(serving_status)
+                    .bind(env_serving)
                     .bind(now_micros)
                     .execute(&mut **tx)
                     .await?;
                 }
-                // 3. Clear the environments' tombstones (a level table).
+                // 3. Clear the tombstones this delete wrote on the environments (a
+                //    level table), matched on its instant for the reason step 2 gives.
                 sqlx::query(
                     "UPDATE environments SET deleted_at = NULL \
-                     WHERE tenant_id = $1 AND deleted_at IS NOT NULL",
+                     WHERE tenant_id = $1 \
+                     AND deleted_at = TIMESTAMPTZ 'epoch' + ($2::text || ' microseconds')::interval",
                 )
                 .bind(id.to_string())
+                .bind(deleted_micros)
                 .execute(&mut **tx)
                 .await?;
                 // 4. Restore the audit scope's row-level-security variables.
@@ -38767,8 +39047,13 @@ impl ActingTenantRepo<'_> {
                     .bind(scope.environment().to_string())
                     .execute(&mut **tx)
                     .await?;
-                insert_idempotency(tx, idempotency).await?;
-                Ok(())
+                // The stored response is rendered from the status this restore
+                // COMMITTED, not from a post-condition the caller predicted (issue
+                // #438), in the same transaction as the write, so the 200, every
+                // replay of that Idempotency-Key and a subsequent tenant READ all
+                // report the one value that was persisted.
+                insert_resolved_idempotency(tx, idempotency, &status).await?;
+                Ok(status)
             },
             false,
         )
@@ -39509,7 +39794,7 @@ impl ActingOrgMembershipRepo<'_> {
         env: &Env,
         spec: NewMembership<'_>,
         created_at_micros: i64,
-        idempotency: Option<ResolvedIdempotencyWrite<'_>>,
+        idempotency: Option<ResolvedIdempotencyWrite<'_, OrgMembershipRecord>>,
     ) -> Result<OrgMembershipRecord, StoreError> {
         if spec.id.scope() != self.scope
             || spec.organization_id.scope() != self.scope
@@ -43516,13 +43801,13 @@ struct LiveMembership {
 /// be inserted, so the two cannot come apart.
 ///
 /// A body that fails to render surfaces as a decode error, which propagates out of
-/// the caller's transaction and rolls it back: the membership row, any attachment
-/// revocations and the audit row written before this point all go with it, so
-/// nothing half-written and no unbacked idempotency record ever commits.
-async fn insert_resolved_idempotency(
+/// the caller's transaction and rolls it back: the data rows, any cascade and the
+/// audit row written before this point all go with it, so nothing half-written and
+/// no unbacked idempotency record ever commits.
+async fn insert_resolved_idempotency<R>(
     tx: &mut Transaction<'_, Postgres>,
-    idempotency: Option<ResolvedIdempotencyWrite<'_>>,
-    resolved: &OrgMembershipRecord,
+    idempotency: Option<ResolvedIdempotencyWrite<'_, R>>,
+    resolved: &R,
 ) -> Result<(), StoreError> {
     let Some(idem) = idempotency else {
         return Ok(());
@@ -43602,10 +43887,13 @@ fn retention_micros(retention: Duration) -> i64 {
 /// [`ActingTenantRepo::delete`] writing the fence directly, and stays fenced until a
 /// restore, which asks this function what the surviving status entails.
 ///
-/// An ENVIRONMENT's own deletion does not compose that way, and this function does not
-/// claim it does: the only input is the TENANT status, so whatever it returns is
-/// written over every environment of that tenant, including one that was deleted
-/// individually beforehand. Issue #439 records that case with the measurement.
+/// An ENVIRONMENT's own deletion is not expressible here either, and this mapping is
+/// deliberately TENANT ONLY: its single input is the tenant status, so it cannot know
+/// which environment it is being asked about. Composing the two dimensions is each
+/// CALLER's job, and both callers do it the same way (issue #439): they visit every
+/// environment of the tenant, ask this function what the tenant status entails, and
+/// write that only over the environments whose own deletion this call is entitled to
+/// lift. Every other environment is written FENCED regardless of what this returns.
 fn serving_state_for(status: TenantStatus) -> EnvironmentServingState {
     match status {
         TenantStatus::Active => EnvironmentServingState::Active,

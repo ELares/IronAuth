@@ -6,6 +6,58 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **A tenant restore undoes the deletion it is undoing, and no other** (issue #439).
+  `ActingTenantRepo::restore` cleared `deleted_at` on EVERY environment of the tenant and on
+  EVERY management credential under it, so an environment an operator had decommissioned on
+  its own, weeks before the tenant was ever offboarded, came back LIVE and SERVING as a side
+  effect of the tenant restore, and a management key revoked on its own came back able to
+  authenticate. Both are now matched on the tenant's own deletion instant, the single value
+  `delete` stamps across the tenant, its environments and their credentials in one
+  transaction. Anything tombstoned EARLIER carries an earlier instant (the delete skips what
+  is already tombstoned), matches nothing, and stays deleted, stays fenced and stays
+  unusable. No marker column and no migration: the delete already partitions the two sets
+  exactly. To make that partition exact rather than clock-dependent, the delete now LOCKS
+  the tenant's environment rows, reads every tombstone already under the tenant (their own
+  and their credentials'), and stamps an instant STRICTLY LATER than all of them instead of
+  taking the clock reading raw. Two deletions issued close enough to read the wall clock in
+  the same microsecond would otherwise share one instant, and that tie failed OPEN: the
+  restore revived the decommissioned environment AND re-enabled a management key the
+  operator had revoked. A frozen clock is now an ordinary configuration, which is what the
+  regression test runs under.
+- **A tenant restore FENCES an environment it is not entitled to revive**, rather than
+  leaving it with no serving-state row at all. `restore` now visits EVERY environment of the
+  tenant, exactly as the suspend/resume cascade does, writing the tenant's derived serving
+  state only over the ones this delete tombstoned and `suspended` over the rest. An
+  environment with no `environment_states` row falls to the absent-row default, which
+  SERVES; one can exist because `ActingEnvironmentRepo::create` checks the parent tenant's
+  liveness with a non-locking read, so under READ COMMITTED a create can land between a
+  tenant delete's environment scan and its commit.
+- **A tenant whose environments were ALL decommissioned individually comes back with NONE
+  of them** (the narrowing #439's rule implies, recorded because it is not what an operator
+  would guess). The tenant itself is restored and live; every environment keeps the
+  tombstone its own decommissioning wrote. Recoverable by creating a fresh environment.
+- **A grace delete by the WRONG operator is now pinned** (coverage, found while moving that
+  predicate). The operator check rode on the tombstone UPDATE and nothing asserted it: no
+  test in the tree ever constructed a second operator, so removing it survived the whole
+  suite. It now rides on the row lock that opens the transaction, and a test offboards a
+  tenant as a stranger and requires the uniform not-found with the tenant left untouched.
+- **A tenant RESUME no longer serves an environment that was deleted on its own** (the
+  sibling of #439 on the transition path, found by sweeping for the same shape). The
+  suspend/resume cascade wrote the tenant's derived serving state over every environment,
+  and a deleted environment's whole data-plane fence IS that row, so a resume lifted a
+  decommissioning. The cascade still visits every environment (so none is left on the
+  absent-row default, which serves) but writes `suspended` for a deleted one whatever the
+  tenant's status.
+- **A tenant restore REPORTS the lifecycle status it committed** (issue #438), read back
+  from the write's own `RETURNING` inside the transaction, instead of returning `()` and
+  leaving its caller to predict. A restore is not a status transition: it undoes the DELETE
+  and leaves the status alone, so a tenant suspended beforehand comes back suspended, and
+  the caller's response body must say so. `ResolvedIdempotencyWrite` (the #395 mechanism,
+  which renders the Idempotency-Key body from what the write RESOLVED rather than from what
+  the request asked for) is now generic over that resolved value, so it serves both the
+  membership re-add it was built for and this. `restore` takes one, and its stored replay
+  body and the value it hands back are rendered from the same committed status in the same
+  transaction.
 - **One transactional outbox and lease based job queue, and the session-ended fan-out moved
   onto it** (issue #104, PR 1 of the sequence). Every outbound subsystem this milestone adds
   needs the same three things: a row that commits with the domain write that caused it, a
@@ -504,16 +556,15 @@ range per docs/RELEASING.md.
   fence exists for, by `a_restored_tenant_that_is_still_suspended_serves_nothing` (JWKS and
   discovery, over the store-backed harness, driving the real control-plane suspend, delete,
   and restore).
-  - Scope, stated because two nearby surfaces are NOT covered. The restore ENDPOINT still
-    answers `{"status":"active"}` from a literal built before the store call, so its 200 (and
-    the Idempotency-Key replay body stored with it) already disagreed with `tenants.status`
-    for a restored suspended tenant, and after this entry it disagrees with the data plane
-    too. The response bytes are unchanged here, and #438 records them with the measurement,
-    alongside why the fix is a signature change rather than a one-liner. A restore also
-    still revives environments that had been deleted individually before the tenant was
-    offboarded, because it clears every environment tombstone unconditionally and derives one
-    serving state from the tenant status alone; that too is pre-existing and unchanged here,
-    and #439 records it.
+  - Scope, as this entry shipped: two nearby surfaces were NOT covered by it. The restore
+    ENDPOINT answered `{"status":"active"}` from a literal built before the store call, so
+    its 200 (and the Idempotency-Key replay body stored with it) disagreed with
+    `tenants.status` for a restored suspended tenant, and after this entry it disagreed with
+    the data plane too. A restore also revived environments that had been deleted
+    individually before the tenant was offboarded, because it cleared every environment
+    tombstone unconditionally and derived one serving state from the tenant status alone.
+    BOTH are fixed by the #438 and #439 entries above, in this same release; the two
+    sentences remain here to record what this entry did and did not claim when it landed.
 - **`transition`'s upsert conflict arm is now pinned** (issue #432, coverage). Nothing
   asserted on it: forcing the `ON CONFLICT ... DO UPDATE` arm to a literal `'active'`
   survived the whole store suite, because the fence tests stop after ONE resume, whose
