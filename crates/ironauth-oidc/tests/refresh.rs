@@ -1106,3 +1106,127 @@ async fn a_fenced_user_cannot_exchange_an_offline_access_authorization_code() {
         "another user's fence does not affect this offline family"
     );
 }
+
+/// Rewrite the subject's grants to the LEGACY shape: `session_ref` NULL, as a build from
+/// before issue #32 recorded it persisted every grant. Returns the rows changed so a
+/// caller can prove the fixture did something.
+///
+/// SQL against the owner pool, because there is deliberately no application path that
+/// produces this row any more: `issue_code_core` passes `session_ref: Some(..)` and
+/// `Resolved::session_ref` is a non-optional `&str`. The shape exists only in a database
+/// written by an older binary, which is exactly the population the fence must cover.
+async fn strip_grant_session_ref(harness: &Harness, subject: &str) -> u64 {
+    sqlx::query("UPDATE grants SET session_ref = NULL WHERE subject = $1")
+        .bind(subject)
+        .execute(harness.db().owner_pool())
+        .await
+        .expect("strip the grant's session_ref")
+        .rows_affected()
+}
+
+#[tokio::test]
+async fn a_fenced_user_cannot_exchange_a_session_less_authorization_code() {
+    // The THIRD hole (issue #241), and the one nobody had written down. Its two siblings
+    // above enumerate the code exchange's fence as a ladder of four session-cascade reads
+    // whose height varies by scope. Every rung of that ladder is conditioned on the grant
+    // HAVING a session, and the three conditions are in three different files, which is
+    // why counting the rungs did not surface it:
+    //
+    //   1+2. `resolve_code_exchange_sid`'s `let Some(session_ref) = .. else`, which
+    //        returned `Ok(None)` and skipped both reads.
+    //   3.   `lock_bound_session_live` returns `Ok(true)` outright for a NULL
+    //        `session_ref` ("not session-bound: open unconditionally").
+    //   4.   The refresh-family `INSERT ... SELECT` predicate is
+    //        `AND ($9 OR g.session_ref IS NULL OR EXISTS(..))`; the middle disjunct
+    //        satisfies it.
+    //
+    // So for a session-less grant the ladder was not shorter, it was ABSENT, and unlike
+    // the `offline_access` case the sibling covers, this was true on an ordinary `openid`
+    // scope too. A blocked or deleted subject's code minted an access token, an ID token,
+    // and a refresh family.
+    //
+    // Reachable only for a code row an older build persisted and a rolling upgrade
+    // redeems inside the code TTL. That is narrow. It is also the widest of the three
+    // holes issue #241 closed, and it was never in an issue, a comment, or a review.
+    let harness = Harness::start().await;
+
+    // The control, and it is load bearing twice over: it proves a legacy-shaped code
+    // still exchanges for a healthy user (the fence must not break rolling upgrades,
+    // which would be its own outage), and it proves the fixture produces a code that
+    // reaches the mint at all.
+    let (healthy, client_id, secret, code) =
+        outstanding_code_for_new_user(&harness, "openid").await;
+    assert_eq!(
+        strip_grant_session_ref(&harness, &healthy).await,
+        1,
+        "the fixture rewrote exactly one grant to the legacy shape"
+    );
+    let (status, _, body) = harness
+        .token_with_auth(
+            &code_exchange_form(&code),
+            Some(&basic_header(&client_id, &secret)),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an active user's legacy code still exchanges: {body}"
+    );
+    assert!(
+        json(&body)["access_token"].is_string() && json(&body)["id_token"].is_string(),
+        "and it mints the full token set, with no sid to carry: {body}"
+    );
+
+    // BLOCKED, on a legacy-shaped code of its own, on the ORDINARY `openid` scope: the
+    // scope on which the sibling test's four rungs are all supposed to be present.
+    let (subject, client_id, secret, code) =
+        outstanding_code_for_new_user(&harness, "openid").await;
+    assert_eq!(strip_grant_session_ref(&harness, &subject).await, 1);
+    harness
+        .set_user_state(&subject, ironauth_store::UserState::Blocked)
+        .await;
+    let (status, _, body) = harness
+        .token_with_auth(
+            &code_exchange_form(&code),
+            Some(&basic_header(&client_id, &secret)),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a blocked user's legacy code exchange: {body}"
+    );
+    assert_eq!(json(&body)["error"], "invalid_grant");
+    assert!(
+        json(&body).get("access_token").is_none(),
+        "no access token: {body}"
+    );
+    assert!(json(&body).get("id_token").is_none(), "no id token: {body}");
+    assert!(
+        json(&body).get("refresh_token").is_none(),
+        "and no refresh family, which would outlive the code by far: {body}"
+    );
+
+    // DELETED, on the `offline_access` scope, where a minted family would deliberately
+    // SURVIVE the session cascade and so could not be cleaned up after the fact.
+    let (subject, client_id, secret, code) =
+        outstanding_code_for_new_user(&harness, "openid offline_access").await;
+    assert_eq!(strip_grant_session_ref(&harness, &subject).await, 1);
+    harness.delete_user(&subject).await;
+    let (status, _, body) = harness
+        .token_with_auth(
+            &code_exchange_form(&code),
+            Some(&basic_header(&client_id, &secret)),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a deleted user's legacy offline code exchange: {body}"
+    );
+    assert_eq!(json(&body)["error"], "invalid_grant");
+    assert!(
+        json(&body).get("refresh_token").is_none(),
+        "an offline family that survives the cascade is never opened for a deleted user: {body}"
+    );
+}

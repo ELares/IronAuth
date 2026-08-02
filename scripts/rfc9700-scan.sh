@@ -25,6 +25,9 @@
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
+# shellcheck source=scripts/lib/generated-artifact.sh
+. scripts/lib/generated-artifact.sh
+
 src="crates/ironauth-oidc/src"
 doc="docs/conformance/rfc9700-checklist.md"
 cargo="crates/ironauth-oidc/Cargo.toml"
@@ -117,6 +120,7 @@ header = (
 )
 open(out, "w", encoding="utf-8").write(header + "\n".join(sorted(routes)) + "\n")
 PY
+require_tracked "rfc9700-scan" "$inventory" || fail=1
 if ! git diff --exit-code "$inventory" >/dev/null 2>&1; then
   echo "rfc9700-scan: $inventory is stale (a route changed). Regenerated; review and commit it,"
   echo "              and map any new endpoint in $doc."

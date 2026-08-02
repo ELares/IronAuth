@@ -518,7 +518,24 @@ async fn issue_device_tokens(
 ///
 /// Returns [`None`] only for a grant approved BEFORE the approving session was recorded
 /// (there is genuinely no session to resolve), so an in-flight upgrade keeps working:
-/// such a flow simply mints without a `sid`, exactly as it did before.
+/// such a flow mints without a `sid`, exactly as it did before.
+///
+/// It does NOT mint without a lifecycle check (issue #241). A session-carrying grant is
+/// fenced by the live-session read below, and the block/disable/delete cascade ends the
+/// approving human's sessions in the same transaction as the lifecycle write, so a
+/// fenced user's device flow stops redeeming. A grant with no `session_ref` reaches
+/// neither of those, and it is a full ID + access + refresh mint, so that branch asks
+/// the user directly: [`crate::token::ensure_subject_can_authenticate`], the SAME read
+/// the refresh grant is fenced by, failing closed on a blocked, disabled, deleted, or
+/// absent subject and on a store fault.
+///
+/// The check is unconditional on that branch rather than gated on the subject's SHAPE,
+/// and it can be, because a device grant's `subject` is a `usr_` id by construction: it
+/// is copied from the approving human's session, and a session exists only where
+/// `interaction::establish_session` already resolved a live `users` row for it. The
+/// jwt-bearer grant needs the shape test (`jwt_bearer::MappedPrincipal`) precisely
+/// because its principal is operator-authored and may be a workload identity; nothing
+/// operator-authored reaches here.
 ///
 /// If the approving human's session is no longer LIVE (they logged out, or an operator
 /// revoked it, between approving the device and the device polling for its tokens), the
@@ -534,6 +551,7 @@ async fn resolve_device_sid(
     grant: &ApprovedDeviceGrant,
 ) -> Result<Option<String>, TokenError> {
     let Some(session_ref) = grant.session_ref.as_deref() else {
+        crate::token::ensure_subject_can_authenticate(state, scope, &grant.subject).await?;
         return Ok(None);
     };
     let session_id =

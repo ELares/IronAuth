@@ -6,6 +6,90 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **A blocked, disabled, or deleted user now mints nothing on the three paths that were
+  outside the fence** (issue #241, completing issue #52). #52 established the invariant and
+  named three enforcing surfaces. A review then found two user bound mint paths outside all
+  three, judged both narrow, and recorded them as accepted deferred defense in depth, where
+  they sat. Implementing them turned up a THIRD that no issue, comment, or review had ever
+  mentioned.
+  - **jwt-bearer mapped principals (the path with no fence of any kind).** The RFC 7523
+    grant mints under a principal an operator wrote onto a subject mapping rule. There is no
+    session to cascade and the user holds no credential, so nothing reached it: a TRUSTED
+    EXTERNAL ISSUER could keep minting for a terminated employee's account indefinitely, and
+    the only thing that stopped it was an operator remembering to delete the mapping too.
+    `fence_mapped_principal` now applies the same `state_for_subject` read the refresh grant
+    uses and fails closed, uniform `invalid_grant` on the wire with the new
+    `principal_not_authenticatable` recorded out of band (distinct from
+    `assertion_subject_unmapped`, because telling an operator to add a rule that already
+    exists sends them to debug the wrong system).
+  - **The fence applies to lifecycle bearing principals ONLY, and that is the load bearing
+    half.** The same grant is the substrate under workload identity federation (SPIRE,
+    Kubernetes, GitHub Actions, issue #26), where the principal is a workload id with no
+    `users` row anywhere. `state_for_subject` queries the `users` table, so an unconditional
+    re-check fails closed on EVERY legitimate workload assertion: an outage wearing a
+    hardening's clothes. `MappedPrincipal` discriminates STRUCTURALLY, by parsing the
+    principal through `UserId`'s own constructors rather than comparing it against a spelled
+    out `usr_`, so a future identifier kind cannot acquire or lose the fence through how
+    somebody spells a prefix. It has THREE cases, not two: a user id from ANOTHER scope
+    fails an in scope parse for exactly the reason an opaque workload string does, and a
+    boolean test would wave it through the workload branch as a user bound token minted with
+    no lifecycle check for a subject this scope cannot read. That case is refused.
+  - **The two session-less legacy edges.** `resolve_device_sid` and
+    `resolve_code_exchange_sid` each returned `Ok(None)` for a grant carrying no
+    `session_ref`, the shape an older build persists and a rolling upgrade redeems. Those two
+    paths are fenced only by the session cascade, which works by reading live session state,
+    so a row with no session reached a full ID + access + refresh mint having been checked by
+    nothing. The code exchange one is the third hole and the widest: its fence was understood
+    as a ladder of four reads whose height varied by scope, and all four are separately
+    conditioned on the grant having a session (rung 3's `lock_bound_session_live` returns
+    `Ok(true)` outright for NULL; rung 4's predicate carries `OR g.session_ref IS NULL`), so
+    the ladder was not shorter for such a grant, it was absent, on an ordinary `openid` scope
+    as much as on `offline_access`. Both branches now call
+    `token::ensure_subject_can_authenticate` directly.
+  - **`docs/design/USER-BOUND-MINT-SITES.md` plus the `user-token-mint-registry` invariant
+    lint**, mirroring the issue #295 session mint registry. Ten call sites across six files,
+    generated from source and diffed, with a per file verdict on whose lifecycle governs the
+    mint. None of the three holes was hidden; what was missing was any one place where the
+    mints were listed against the invariant at once, so "is that everything?" could not be
+    answered without redoing the sweep. A companion rule refuses the `use` spellings that
+    would let a mint be called without the `tokens::` prefix the count matches: importing a
+    mint function by bare name in any of its four forms, from a `super::`/`self::` path or a
+    crate root re-export as much as from `crate::`, and aliasing the module itself
+    (`use crate::tokens as t;`). The registry doc states the three residual limits rather
+    than claiming completeness: the count is per LINE rather than per call, the companion
+    rule is a line based grep and so cannot see a `use` rustfmt has split across lines, and
+    two files sign a JWS directly without passing through `crate::tokens` (the back channel
+    logout token and the upstream `private_key_jwt` client assertion, neither of which
+    authenticates a user to IronAuth).
+  - **Two defects in the registry MECHANISM itself, one of them shipped in PR #479.** Both
+    registry rules checked that a mint file was documented by grepping its BASENAME, so a
+    NEW mint file whose basename collided with one already named passed the doc check
+    unexamined and the rule degraded to a bare count for exactly the file an author is
+    least likely to have thought about. Measured by adding a second `token.rs` under a
+    subdirectory: the inventory diff fired, and after regenerating, the doc check passed.
+    Both rules now grep the FULL PATH and both doc tables carry full paths. Separately, the
+    guard that refuses a generated artifact git does not TRACK (without which
+    `git diff --exit-code` compares against nothing and reports clean for any content) had
+    been written at the one site where it was measured; it now lives in
+    `scripts/lib/generated-artifact.sh` and is applied by all six freshness gates that end
+    in such a diff (`invariant-lints` twice, `rfc9700-scan`, `openapi-check`,
+    `admin-spa-bindings`, `reference-app-bindings`). Latent at five of the six today, since
+    every artifact they guard is tracked, and lifted anyway because the failure is silent
+    and a guard living in one script is one the next author will not know to copy.
+  - **Both cascade fenced front channel verdicts are now measured rather than argued.** The
+    registry gave `authorize.rs` (the implicit and hybrid front channel ID token) and
+    `fedcm.rs` (the id assertion) lifecycle verdicts on prose alone: no test anywhere had put
+    a blocked, disabled, or deleted user against either endpoint. On the milestone whose
+    whole finding was that three mint paths sat unfenced because nobody enumerated them, a
+    verdict resting on an argument is the shape the next defect takes.
+    `a_fenced_user_mints_no_front_channel_id_token` drives blocked and disabled on the pure
+    implicit flow and deleted on the hybrid (where the authorization code matters as much as
+    the token, since a code issued there would redeem later), and
+    `a_fenced_user_gets_no_fedcm_assertion` drives blocked and deleted against the assertion
+    endpoint. Each opens with an ACTIVE control that reaches the signing mint and verifies
+    the token it gets, so a refusal caused by an unrelated precondition cannot score as a
+    pass. Both verdicts held; this is a measurement gap closed, not a hole.
+
 - **Two of the three advanced recovery modes get a MOUNTED initiation, and the recover factor
   stopped being something a caller could say** (issue #295, following issue #82 PR 3; issue #295
   stays OPEN for the trusted contact half). PR 3 shipped the three modes' completion machinery

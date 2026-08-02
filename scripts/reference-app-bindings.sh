@@ -11,6 +11,15 @@
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
+# shellcheck source=scripts/lib/generated-artifact.sh
+. scripts/lib/generated-artifact.sh
+
+# The drift check below is a `git diff --exit-code`, which reports NOTHING for a path git
+# does not track and so would pass on any content at all. Refuse that first.
+require_tracked "reference-app-bindings" \
+  packages/reference-app/src/contract/flow.gen.ts \
+  packages/reference-app/src/contract/messages.gen.ts
+
 python3 scripts/gen-reference-app-bindings.py
 git diff --exit-code \
   packages/reference-app/src/contract/flow.gen.ts \

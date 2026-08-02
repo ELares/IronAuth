@@ -28,7 +28,13 @@
 //!    assertion carries one) spend a single-use `jti`.
 //! 4. Map the verified `(external issuer + sub, plus an optional claim gate)` to a
 //!    REGISTERED IronAuth principal. An unmapped subject is REJECTED, never
-//!    auto-provisioned.
+//!    auto-provisioned. When (and ONLY when) that principal is a lifecycle-bearing
+//!    `usr_` user, apply the account-lifecycle fence (issue #52's invariant, extended
+//!    here by issue #241): a blocked, disabled, or deleted user obtains no new tokens by
+//!    ANY path, and a trusted external issuer holding a valid assertion is a path. A
+//!    WORKLOAD principal carries no lifecycle and is deliberately not checked, because a
+//!    `users`-table read would fail closed on every legitimate workload assertion. See
+//!    [`MappedPrincipal`] for what the two are told apart by.
 //! 5. Mint a SHORT-LIVED access token under the mapped principal (its `sub`),
 //!    audienced to the presenting client (the #29 `resolve_access_token_target`
 //!    seam with no resource, an empty resource set), through the SAME signing core
@@ -90,7 +96,7 @@ use ironauth_jose::{
 use ironauth_store::{
     ClientAuthDiagnosticReason, ClientCredentialsAccess, ClientId, CorrelationId,
     ExternalAssertionIssuerRecord, GrantId, IssueClientCredentials, JtiOutcome,
-    NewClientAuthDiagnostic, NewOpaqueAccessToken, Scope,
+    NewClientAuthDiagnostic, NewOpaqueAccessToken, Scope, UserId,
 };
 use serde_json::Value;
 
@@ -470,13 +476,126 @@ async fn resolve_mapped_principal(
             ));
         }
     }
-    // BY DESIGN (accepted residual): the mapped `principal` is OPERATOR-AUTHORED (a
-    // registered mapping rule) and is NOT liveness-checked at mint. Cross-tenant
-    // misuse is contained by RLS plus the assertion's own verified `iss`/signature;
-    // intra-tenant correctness relies on the privileged authorship of the mapping
-    // rule. A mint-time in-scope principal-liveness check (rejecting a mapping to a
-    // deactivated principal) is deferred defense-in-depth, not a correctness gap here.
+    // The user-lifecycle fence (issue #52's invariant, extended here by issue #241).
+    // Applies to a lifecycle-bearing principal ONLY; see `MappedPrincipal`.
+    fence_mapped_principal(state, scope, &mapping.principal).await?;
     Ok(mapping.principal)
+}
+
+/// What KIND of thing an operator's subject-mapping rule points at, which decides
+/// whether the user-lifecycle fence applies to it (issue #241).
+///
+/// # Why this is a type and not an `if`
+///
+/// This grant carries two populations through one code path. One is WORKLOAD federation
+/// (SPIRE JWT-SVIDs, Kubernetes projected tokens, GitHub Actions OIDC, issue #26), where
+/// the mapped principal names a service account or a workload and there is no `users` row
+/// anywhere. The other is a mapping an operator wrote onto a real end-user account, which
+/// is the hole issue #241 closes: a trusted external issuer could keep minting for that
+/// account after it was blocked, disabled, or deleted.
+///
+/// A fence that ran on both would not be hardening, it would be an outage:
+/// `UserRepo::state_for_subject` queries the `users` table, finds nothing for a workload
+/// id, and fails CLOSED, refusing EVERY legitimate workload assertion in the deployment.
+/// So the two populations must be told apart, and the only question is by what.
+///
+/// # What it is keyed on, and why that cannot drift
+///
+/// By PARSING, through [`ironauth_store::UserId`]'s own constructors, never by comparing
+/// the principal against a spelled-out `"usr_"`. The prefix these constructors enforce is
+/// `<UserKind as ScopedKind>::PREFIX`, a single associated constant on the marker type
+/// that also defines what a `UserId` IS everywhere else in the product. There is no
+/// second copy of it in this file to fall out of step with the first.
+///
+/// The difference is not stylistic. A literal comparison is a fact about SPELLING, and it
+/// silently answers for identifier kinds that do not exist yet: introduce a `usrv_`
+/// verified-user prefix and `starts_with("usr_")` sweeps it into the fence with no
+/// compile error and no test change; introduce a lifecycle-bearing kind spelled anything
+/// else and it silently escapes. Parsing is a fact about the TYPE: a future kind is a
+/// different `ScopedKind` with a different `PREFIX`, so `UserId::parse_in_scope` rejects
+/// it, and it acquires this fence only when somebody deliberately gives it one.
+///
+/// # Three outcomes, because two would leak
+///
+/// The obvious shape is "parses in scope, or does not". It is wrong at one edge. A
+/// principal that is a well-formed user id belonging to ANOTHER tenant or environment
+/// fails `parse_in_scope` exactly as an opaque workload string does, so a two-valued test
+/// waves it through UNFENCED under the workload branch: a user-bound token, minted with
+/// no lifecycle check, for a subject this scope cannot even read the state of.
+/// [`MappedPrincipal::ForeignUser`] separates it and REFUSES, which is the only
+/// answer available. This scope cannot resolve a foreign user's state (RLS and the
+/// tenant/environment SQL filter both stop it), so the fence cannot be applied to it, and
+/// an unfenceable user-bound mint is exactly what this issue exists to prevent.
+enum MappedPrincipal {
+    /// A [`ironauth_store::UserId`] minted in THIS scope: lifecycle bearing and
+    /// readable here, so the fence applies.
+    User,
+    /// A user-kind id minted in ANOTHER tenant or environment: lifecycle bearing but
+    /// unfenceable from here. Refused.
+    ForeignUser,
+    /// Not a user id at all: a workload or service-account principal, which carries no
+    /// lifecycle. The fence does not apply and MUST not, or workload federation breaks.
+    Workload,
+}
+
+impl MappedPrincipal {
+    /// Classify `principal` against `scope`, structurally.
+    ///
+    /// [`ScopedId::parse_declared_scope`] is used here to ask a question its usual
+    /// caveat does not cover. That caveat forbids using it to decide whether untrusted
+    /// input names an IN-SCOPE resource, because it performs no scope check and would be
+    /// a cross-scope existence oracle. Nothing like that happens here: the input is
+    /// OPERATOR-AUTHORED configuration rather than caller-supplied, it is asked only
+    /// what KIND of identifier it is, no row is looked up, and the answer is a REFUSAL
+    /// whose wire form is this grant's uniform `invalid_grant`, byte-identical to every
+    /// other mapping failure. A caller cannot vary the principal and so cannot read
+    /// anything out of the distinction.
+    fn classify(principal: &str, scope: &Scope) -> Self {
+        if UserId::parse_in_scope(principal, scope).is_ok() {
+            return MappedPrincipal::User;
+        }
+        if UserId::parse_declared_scope(principal).is_ok() {
+            return MappedPrincipal::ForeignUser;
+        }
+        MappedPrincipal::Workload
+    }
+}
+
+/// Apply the user-lifecycle fence to a mapped principal before it is minted for
+/// (issue #241): a blocked, disabled, or deleted user obtains no new tokens by ANY path,
+/// and a trusted external issuer holding a valid assertion is a path.
+///
+/// A [`MappedPrincipal::Workload`] principal is returned to unchanged: it carries no
+/// lifecycle, and checking it would fail closed on every legitimate workload assertion.
+/// A [`MappedPrincipal::User`] is fenced against the SAME
+/// [`crate::token::subject_can_authenticate`] read the refresh grant is fenced by, and a
+/// [`MappedPrincipal::ForeignUser`] is refused unread.
+///
+/// A refusal is [`JwtBearerError::Reject`] carrying
+/// [`ClientAuthDiagnosticReason::PrincipalNotAuthenticatable`], so the wire stays the
+/// uniform `invalid_grant` while an operator gets the specific reason out of band and can
+/// tell "this account is fenced" apart from "you never wrote this mapping". A store fault
+/// is [`JwtBearerError::Server`]: fail CLOSED, never mint on an unread lifecycle.
+async fn fence_mapped_principal(
+    state: &OidcState,
+    scope: Scope,
+    principal: &str,
+) -> Result<(), JwtBearerError> {
+    match MappedPrincipal::classify(principal, &scope) {
+        MappedPrincipal::Workload => Ok(()),
+        MappedPrincipal::ForeignUser => Err(JwtBearerError::Reject(
+            ClientAuthDiagnosticReason::PrincipalNotAuthenticatable,
+        )),
+        MappedPrincipal::User => {
+            match crate::token::subject_can_authenticate(state, scope, principal).await {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(JwtBearerError::Reject(
+                    ClientAuthDiagnosticReason::PrincipalNotAuthenticatable,
+                )),
+                Err(_) => Err(JwtBearerError::Server),
+            }
+        }
+    }
 }
 
 /// Verify an external assertion's signature and RFC 7523 claim rules through the ONE
@@ -820,6 +939,70 @@ mod tests {
             )
             .is_none(),
             "an empty key set fails closed"
+        );
+    }
+
+    #[test]
+    fn the_lifecycle_discriminator_separates_users_foreign_users_and_workloads() {
+        use ironauth_env::Env;
+        use ironauth_store::{EnvironmentId, TenantId};
+
+        let (env, _) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 11);
+        let scope = Scope::new(TenantId::generate(&env), EnvironmentId::generate(&env));
+        let other = Scope::new(TenantId::generate(&env), EnvironmentId::generate(&env));
+
+        // A real user id minted in THIS scope is lifecycle bearing: the fence applies.
+        let mine = UserId::generate(&env, &scope).to_string();
+        assert!(
+            matches!(
+                MappedPrincipal::classify(&mine, &scope),
+                MappedPrincipal::User
+            ),
+            "an in-scope usr_ id is lifecycle bearing"
+        );
+
+        // The same KIND of id from another tenant is still lifecycle bearing, but this
+        // scope cannot read its state, so it is refused rather than waved through. This
+        // is the case a two-valued `parses in scope or not` test would misclassify as a
+        // workload and mint for unfenced.
+        let foreign = UserId::generate(&env, &other).to_string();
+        assert!(
+            matches!(
+                MappedPrincipal::classify(&foreign, &scope),
+                MappedPrincipal::ForeignUser
+            ),
+            "a usr_ id from another scope is unfenceable here, not a workload"
+        );
+
+        // Workload principals: the population that MUST skip the fence, or every SPIRE /
+        // Kubernetes / GitHub Actions assertion in the deployment fails closed. Note the
+        // second one: an operator-authored label may legitimately begin with the four
+        // characters `usr_` without being an identifier at all, so a `starts_with` test
+        // would fence it and take the deployment down.
+        for workload in [
+            "spiffe://cluster.test/ns/prod/sa/alpha",
+            "usr_workload_alpha",
+            "sva_not-a-user",
+            "",
+        ] {
+            assert!(
+                matches!(
+                    MappedPrincipal::classify(workload, &scope),
+                    MappedPrincipal::Workload
+                ),
+                "{workload:?} carries no lifecycle and must skip the fence"
+            );
+        }
+
+        // The discriminator is keyed on the KIND, not the spelling: another scoped id
+        // type minted in the caller's OWN scope still is not a user.
+        let client = ironauth_store::ClientId::generate(&env, &scope).to_string();
+        assert!(
+            matches!(
+                MappedPrincipal::classify(&client, &scope),
+                MappedPrincipal::Workload
+            ),
+            "an in-scope id of a DIFFERENT kind is not lifecycle bearing"
         );
     }
 

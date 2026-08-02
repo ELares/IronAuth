@@ -252,13 +252,32 @@ impl IdorHarness {
         self
     }
 
-    /// Register the admin user-management probes (issue #52): every management-plane
-    /// user surface that resolves a user by identifier. The set is the read surfaces
-    /// (`users.get`, `users.list`) and the mutating surfaces (`users.delete`,
-    /// `users.set_state`, `users.external_id.link`). A foreign user must be the
-    /// uniform not-found on every one, and the list surface must never leak a foreign
-    /// tenant's users. Run these with a store that carries the platform master key
-    /// (the user PII paths fail closed without it).
+    /// Register the user-surface probes (issue #52, completed by issue #241): every
+    /// surface that resolves a user, on the management plane and the DATA plane alike. A
+    /// foreign user must be the uniform not-found on every one, and the list surface must
+    /// never leak a foreign tenant's users. Run these with a store that carries the
+    /// platform master key (the user PII paths fail closed without it).
+    ///
+    /// Three groups:
+    ///
+    /// - the management READS (`users.get`, `users.list`, `users.by_external_id`);
+    /// - the management MUTATIONS (`users.delete`, `users.set_state`,
+    ///   `users.update_claims`, `users.external_id.link`, `users.external_id.unlink`);
+    /// - the BY-SUBJECT data-plane reads (`users.state_for_subject`,
+    ///   `users.claims_for_subject`, `users.by_identifier`), added by issue #241.
+    ///
+    /// That third group is why this doc no longer says "admin". It was left out
+    /// originally with a written argument that it could not leak, and the argument was
+    /// correct: those three hard filter `tenant_id`/`environment_id` in SQL and open
+    /// their PII under a scope-bound AAD. What was wrong was claiming COMPLETE coverage
+    /// on top of an unmeasured argument. These reads are the ones the login path and the
+    /// token-mint lifecycle fences are built on, so if any user surface deserved a
+    /// measurement rather than a paragraph it was these. They are measured now, and the
+    /// claim is true rather than nearly true.
+    ///
+    /// `users.by_identifier` keys on a login HANDLE, not an id, so the caller must
+    /// include a victim's real identifier among the foreign references or that probe is
+    /// vacuous. `users.by_external_id` already carried the same requirement.
     pub fn register_user_admin_probes(&mut self) -> &mut Self {
         self.register(Box::new(UserAdminGetProbe));
         self.register(Box::new(UserAdminListProbe));
@@ -268,6 +287,9 @@ impl IdorHarness {
         self.register(Box::new(UserAdminUpdateClaimsProbe));
         self.register(Box::new(UserAdminExternalIdLinkProbe));
         self.register(Box::new(UserAdminExternalIdUnlinkProbe));
+        self.register(Box::new(UserStateForSubjectProbe));
+        self.register(Box::new(UserClaimsForSubjectProbe));
+        self.register(Box::new(UserByIdentifierProbe));
         self
     }
 
@@ -2276,6 +2298,110 @@ impl IsolationProbe for UserAdminExternalIdUnlinkProbe {
             {
                 Ok(()) => ProbeOutcome::Leaked,
                 Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `UserRepo::state_for_subject` (issue #241): the LIFECYCLE READ
+/// the token-minting fences are built on. A foreign subject must read as absent here, or
+/// a fence would be evaluating another tenant's account state, and the answer to "may
+/// this subject still obtain tokens" would come from the wrong tenant's `users` row.
+///
+/// Registered because "complete coverage" had been claimed for a set that stopped at the
+/// admin surfaces. There was no gap to close (the SQL hard filters `tenant_id` and
+/// `environment_id`), and that is precisely why the claim needed a probe rather than a
+/// paragraph: an unmeasured guarantee is indistinguishable from a broken one.
+struct UserStateForSubjectProbe;
+
+impl IsolationProbe for UserStateForSubjectProbe {
+    fn name(&self) -> &'static str {
+        "users.state_for_subject"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            match store
+                .scoped(caller)
+                .users()
+                .state_for_subject(foreign_id)
+                .await
+            {
+                Ok(Some(_)) => ProbeOutcome::Leaked,
+                Ok(None) | Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `UserRepo::claims_for_subject` (issue #241): the standard-claim
+/// document `UserInfo` releases. A foreign subject resolving here would be a cross-tenant
+/// PII read, the highest-value one on the user surface.
+///
+/// Isolated TWICE over, and the probe proves both hold at once: the SQL filters
+/// `tenant_id`/`environment_id`, and the sealed claims are opened under a scope-bound AAD
+/// (`user_pii_seal_aad(self.scope, ..)`), so even a row reached past the filter would fail
+/// to decrypt rather than yield plaintext.
+struct UserClaimsForSubjectProbe;
+
+impl IsolationProbe for UserClaimsForSubjectProbe {
+    fn name(&self) -> &'static str {
+        "users.claims_for_subject"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            match store
+                .scoped(caller)
+                .users()
+                .claims_for_subject(foreign_id)
+                .await
+            {
+                Ok(Some(_)) => ProbeOutcome::Leaked,
+                Ok(None) | Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `UserRepo::by_identifier` (issue #241): the LOGIN lookup. A foreign
+/// user resolving by its login handle would let one tenant authenticate against another
+/// tenant's account, so this is the read with the most direct authentication consequence
+/// of the three.
+///
+/// Its key is a login handle rather than an id, so the harness must be given a victim's
+/// real identifier as a `foreign_id` for the probe to hunt a foreign row of its own key
+/// type; `users.by_external_id` has the same requirement and the same fixture answers
+/// both. Isolated twice over here too: the blind index is a per-scope keyed HMAC, so the
+/// caller's scope computes a DIFFERENT index for the same handle, and the SQL filter
+/// stands behind that.
+struct UserByIdentifierProbe;
+
+impl IsolationProbe for UserByIdentifierProbe {
+    fn name(&self) -> &'static str {
+        "users.by_identifier"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            match store.scoped(caller).users().by_identifier(foreign_id).await {
+                Ok(Some(_)) => ProbeOutcome::Leaked,
+                Ok(None) | Err(_) => ProbeOutcome::Denied,
             }
         })
     }

@@ -1291,3 +1291,128 @@ async fn device_authorization_blocks_a_third_party_client_without_admin_consent(
     let carved = start_flow(&harness, &client_str, Some("openid profile")).await;
     assert!(carved["device_code"].is_string());
 }
+
+/// Rewrite the approving grant to the LEGACY shape: `session_ref` NULL, as a build from
+/// before issue #32 recorded it persisted every device grant. Returns how many rows were
+/// changed, so a caller can prove the fixture actually did something.
+///
+/// Done in SQL against the owner pool because there is deliberately no application path
+/// that produces this row any more; the shape exists only in a database written by an
+/// older binary, which is exactly the population the fence has to cover.
+async fn strip_session_ref(harness: &Harness, subject: &str) -> u64 {
+    sqlx::query("UPDATE grants SET session_ref = NULL WHERE subject = $1")
+        .bind(subject)
+        .execute(harness.db().owner_pool())
+        .await
+        .expect("strip the grant's session_ref")
+        .rows_affected()
+}
+
+#[tokio::test]
+async fn a_fenced_user_redeems_no_legacy_session_less_device_grant() {
+    // Issue #241. `resolve_device_sid` returns `Ok(None)` for a grant approved before the
+    // approving session was recorded, so an in-flight upgrade keeps working. What that
+    // also meant was that such a grant reached a FULL ID + access + refresh mint having
+    // been checked by nothing: the device path's only lifecycle fence is the block /
+    // disable / delete session cascade, and it works by reading live-session state, so a
+    // grant with no session skipped it entirely.
+    //
+    // Narrow, and narrowness is precisely how it stayed open across four milestones after
+    // a review named it. It is reachable for the width of a rolling upgrade, on a flow
+    // approved by the old binary and polled by the new one, which is a window an operator
+    // does not choose and cannot see.
+    let harness = Harness::start().await;
+    let client = *harness.client_id();
+    harness
+        .enable_device_grant(&client, DEVICE_GRANTS, Some(TEST_LOGO))
+        .await;
+    let client_str = client.to_string();
+
+    // The control, first, and it is doing real work: it proves a legacy-shaped grant
+    // still REDEEMS for a healthy user. Without it, the refusal below would be equally
+    // consistent with the fence having simply broken every session-less grant, which
+    // would be its own upgrade outage rather than a fix.
+    let start = start_flow(&harness, &client_str, Some("openid")).await;
+    let device_code = start["device_code"].as_str().unwrap().to_owned();
+    let user_code = start["user_code"].as_str().unwrap().to_owned();
+    let healthy = harness.seed_unique_user().await;
+    harness.grant_consent(&healthy, &client_str).await;
+    let (_id, cookie) = harness.session_with_id(&healthy, "pwd", 0).await;
+    approve_as(&harness, &user_code, &cookie).await;
+    assert_eq!(
+        strip_session_ref(&harness, &healthy).await,
+        1,
+        "the fixture rewrote exactly one grant to the legacy shape"
+    );
+    harness
+        .clock()
+        .advance(Duration::from_secs(INTERVAL_SECS + 1));
+    let (status, body) = poll(&harness, &device_code, &client_str).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an active user's legacy device grant still redeems: {body:?}"
+    );
+    assert!(
+        body["access_token"].is_string() && body["id_token"].is_string(),
+        "and it mints the full token set, with no sid to carry: {body:?}"
+    );
+
+    // BLOCKED between approval and the poll, on a legacy-shaped grant of its own.
+    let start = start_flow(&harness, &client_str, Some("openid")).await;
+    let device_code = start["device_code"].as_str().unwrap().to_owned();
+    let user_code = start["user_code"].as_str().unwrap().to_owned();
+    let fenced = harness.seed_unique_user().await;
+    harness.grant_consent(&fenced, &client_str).await;
+    let (_id, cookie) = harness.session_with_id(&fenced, "pwd", 0).await;
+    approve_as(&harness, &user_code, &cookie).await;
+    assert_eq!(
+        strip_session_ref(&harness, &fenced).await,
+        1,
+        "the fixture rewrote exactly one grant to the legacy shape"
+    );
+    harness
+        .set_user_state(&fenced, ironauth_store::UserState::Blocked)
+        .await;
+    harness
+        .clock()
+        .advance(Duration::from_secs(INTERVAL_SECS + 1));
+    let (status, body) = poll(&harness, &device_code, &client_str).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a blocked user's legacy device grant mints nothing: {body:?}"
+    );
+    assert_eq!(body["error"], "invalid_grant");
+    assert!(
+        body.get("access_token").is_none(),
+        "no access token: {body:?}"
+    );
+    assert!(body.get("id_token").is_none(), "no id token: {body:?}");
+    assert!(
+        body.get("refresh_token").is_none(),
+        "and no refresh token, which would outlive the poll by far: {body:?}"
+    );
+
+    // DELETED, on its own legacy-shaped grant. A soft-delete tombstone reads as absent,
+    // and absent must be fail CLOSED rather than "no state to check".
+    let start = start_flow(&harness, &client_str, Some("openid")).await;
+    let device_code = start["device_code"].as_str().unwrap().to_owned();
+    let user_code = start["user_code"].as_str().unwrap().to_owned();
+    let removed = harness.seed_unique_user().await;
+    harness.grant_consent(&removed, &client_str).await;
+    let (_id, cookie) = harness.session_with_id(&removed, "pwd", 0).await;
+    approve_as(&harness, &user_code, &cookie).await;
+    assert_eq!(strip_session_ref(&harness, &removed).await, 1);
+    harness.delete_user(&removed).await;
+    harness
+        .clock()
+        .advance(Duration::from_secs(INTERVAL_SECS + 1));
+    let (status, body) = poll(&harness, &device_code, &client_str).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a deleted user's legacy device grant mints nothing: {body:?}"
+    );
+    assert_eq!(body["error"], "invalid_grant");
+}

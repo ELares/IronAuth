@@ -1254,3 +1254,296 @@ async fn start_jwks_server(body: String) -> SocketAddr {
     });
     addr
 }
+
+/// The external `sub` a mapping to a LIFECYCLE-BEARING user principal is keyed on, kept
+/// distinct from [`EXTERNAL_SUBJECT`] so a single harness can carry a user mapping and a
+/// workload mapping from the SAME trusted issuer at once.
+const EXTERNAL_HUMAN_SUBJECT: &str = "https://idp.partner.test/employees/e-4471";
+
+/// Register the standard trusted issuer with TWO mappings from the same issuer: the
+/// workload subject onto the opaque [`MAPPED_PRINCIPAL`], and `EXTERNAL_HUMAN_SUBJECT`
+/// onto a freshly seeded real `usr_` account. Returns `(client_id, user_subject)`.
+///
+/// Both populations in ONE deployment is the point. The lifecycle fence has to refuse one
+/// and pass the other on the same request path, against the same issuer trust, so a test
+/// that seeded only the population it was interested in could not tell a working
+/// discriminator from a fence that was simply off (or simply on).
+async fn seed_user_and_workload_trust(h: &Harness, identifier: &str) -> (String, String) {
+    let jwks = jwks_json(&issuer_key());
+    h.register_external_issuer(EXTERNAL_ISSUER, Some(&jwks), None, None, true)
+        .await;
+    h.create_subject_mapping(
+        EXTERNAL_ISSUER,
+        EXTERNAL_SUBJECT,
+        None,
+        None,
+        MAPPED_PRINCIPAL,
+    )
+    .await;
+    let user_subject = h
+        .seed_user(identifier, "correct-horse-battery-staple")
+        .await;
+    h.create_subject_mapping(
+        EXTERNAL_ISSUER,
+        EXTERNAL_HUMAN_SUBJECT,
+        None,
+        None,
+        &user_subject,
+    )
+    .await;
+    (h.client_id().to_string(), user_subject)
+}
+
+#[tokio::test]
+async fn a_fenced_mapped_user_principal_mints_no_jwt_bearer_token() {
+    // The issue #52 invariant on the path that had NO fence of any kind (issue #241): a
+    // blocked, disabled, or deleted user obtains no new tokens by ANY path, and a
+    // TRUSTED EXTERNAL ISSUER holding a valid assertion is a path.
+    //
+    // It is a different threat model from the refresh grant's and narrower, which is why
+    // it was deferred rather than shipped with #52. The fenced user holds no credential
+    // here; a federated issuer the operator chose to trust does, and it keeps signing
+    // fresh assertions on its own schedule. Nothing else in the request stops it. There
+    // is no session to cascade (this grant never authenticates a human) and no refresh
+    // family to re-check, so before this the ONLY thing standing between a terminated
+    // employee's account and an indefinite stream of access tokens was an operator
+    // remembering to also delete the mapping rule.
+    let h = Harness::start().await;
+    let (client_id, subject) = seed_user_and_workload_trust(&h, "fenced-human@example.test").await;
+
+    // The control. While the account is ACTIVE the mapped assertion mints, and the token
+    // carries the user's own subject. Without this the refusals below would be consistent
+    // with the mapping never having worked at all.
+    let asrt = assertion(
+        &issuer_key(),
+        EXTERNAL_ISSUER,
+        EXTERNAL_HUMAN_SUBJECT,
+        h.issuer(),
+        3600,
+        "jti-human-active",
+    );
+    let (status, _h, body) = present(&h, &client_id, &asrt).await;
+    assert_eq!(status, StatusCode::OK, "active mapped user: {body}");
+    let token = json(&body)["access_token"]
+        .as_str()
+        .expect("an active mapped user mints an access token")
+        .to_owned();
+    assert_eq!(
+        jwt_payload(&token)["sub"],
+        subject,
+        "the token is minted under the mapped user's own subject"
+    );
+
+    // BLOCKED, the reversible fence. Fresh `jti`: the assertion is otherwise identical,
+    // so the only thing that changed between a 200 and this refusal is the account state.
+    h.set_user_state(&subject, ironauth_store::UserState::Blocked)
+        .await;
+    let asrt = assertion(
+        &issuer_key(),
+        EXTERNAL_ISSUER,
+        EXTERNAL_HUMAN_SUBJECT,
+        h.issuer(),
+        3600,
+        "jti-human-blocked",
+    );
+    let (status, _h, body) = present(&h, &client_id, &asrt).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "blocked principal: {body}");
+    assert_eq!(json(&body)["error"], "invalid_grant");
+    assert!(
+        json(&body).get("access_token").is_none(),
+        "a blocked mapped user mints no access token"
+    );
+    // The wire is the uniform invalid_grant every other mapping failure answers, so the
+    // operator's only channel is the out-of-band diagnostic, and it must distinguish a
+    // FENCED account from a MISSING mapping. Told to go add a rule that already exists,
+    // an operator would be debugging the wrong system.
+    assert!(
+        h.client_auth_diagnostics(&client_id)
+            .await
+            .iter()
+            .any(|d| d.failure_reason == "principal_not_authenticatable"),
+        "a fenced principal is diagnosed as fenced, not as unmapped"
+    );
+
+    // UNBLOCKED: the fence is a live read of current state rather than a latch, so
+    // restoring the account restores the grant. This is also what makes the refusal above
+    // attributable to `state_for_subject` and not to the spent `jti` or a poisoned
+    // mapping.
+    h.set_user_state(&subject, ironauth_store::UserState::Active)
+        .await;
+    let asrt = assertion(
+        &issuer_key(),
+        EXTERNAL_ISSUER,
+        EXTERNAL_HUMAN_SUBJECT,
+        h.issuer(),
+        3600,
+        "jti-human-unblocked",
+    );
+    let (status, _h, body) = present(&h, &client_id, &asrt).await;
+    assert_eq!(status, StatusCode::OK, "unblocked principal: {body}");
+    assert!(json(&body)["access_token"].is_string());
+
+    // DELETED, the irreversible one. A soft-delete tombstone reads as absent, and absent
+    // is fail CLOSED rather than "no state to check".
+    h.delete_user(&subject).await;
+    let asrt = assertion(
+        &issuer_key(),
+        EXTERNAL_ISSUER,
+        EXTERNAL_HUMAN_SUBJECT,
+        h.issuer(),
+        3600,
+        "jti-human-deleted",
+    );
+    let (status, _h, body) = present(&h, &client_id, &asrt).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "deleted principal: {body}");
+    assert_eq!(json(&body)["error"], "invalid_grant");
+    assert!(
+        json(&body).get("access_token").is_none(),
+        "a deleted mapped user mints no access token"
+    );
+}
+
+#[tokio::test]
+async fn a_workload_principal_still_mints_while_a_user_principal_is_fenced() {
+    // THE OUTAGE GUARD. This grant is the substrate under workload identity federation
+    // (SPIRE JWT-SVIDs, Kubernetes projected tokens, GitHub Actions OIDC, issue #26),
+    // where the mapped principal is a service account or a workload id and there is no
+    // `users` row for it anywhere. `UserRepo::state_for_subject` queries the `users`
+    // table, so a lifecycle re-check applied to a workload principal finds nothing and
+    // FAILS CLOSED, refusing every legitimate workload assertion in the deployment. That
+    // is a production outage in the shape of a hardening, and it is the failure this test
+    // exists to make loud rather than the one the sibling test covers.
+    //
+    // The two mappings are deliberately in ONE harness, from ONE trusted issuer, on ONE
+    // request path. So this is not "a workload mints" (which would stay green with the
+    // fence deleted entirely, and would prove nothing); it is "a workload mints AT THE
+    // SAME MOMENT a user principal is being refused", which is only true if the
+    // discriminator is doing real work.
+    let h = Harness::start().await;
+    let (client_id, subject) = seed_user_and_workload_trust(&h, "fenced-peer@example.test").await;
+
+    // Fence the human. The workload's mapping, issuer trust, and client are untouched.
+    h.set_user_state(&subject, ironauth_store::UserState::Disabled)
+        .await;
+    let human = assertion(
+        &issuer_key(),
+        EXTERNAL_ISSUER,
+        EXTERNAL_HUMAN_SUBJECT,
+        h.issuer(),
+        3600,
+        "jti-both-human",
+    );
+    let (status, _h, body) = present(&h, &client_id, &human).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the disabled user principal is refused: {body}"
+    );
+    assert_eq!(json(&body)["error"], "invalid_grant");
+    let fenced_before = fence_diagnostics(&h, &client_id).await;
+    assert_eq!(
+        fenced_before, 1,
+        "the human refusal recorded exactly one fence diagnostic"
+    );
+
+    // The workload, in the same deployment, at the same instant, through the same code.
+    let workload = assertion(
+        &issuer_key(),
+        EXTERNAL_ISSUER,
+        EXTERNAL_SUBJECT,
+        h.issuer(),
+        3600,
+        "jti-both-workload",
+    );
+    let (status, _h, body) = present(&h, &client_id, &workload).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a workload principal carries no lifecycle and must still mint: {body}"
+    );
+    let token = json(&body)["access_token"]
+        .as_str()
+        .expect("a workload assertion mints an access token")
+        .to_owned();
+    assert_eq!(
+        jwt_payload(&token)["sub"],
+        MAPPED_PRINCIPAL,
+        "the workload token is minted under the workload principal"
+    );
+    // The workload exchange recorded NO new fence diagnostic. It did not merely survive
+    // the lifecycle read, it never performed one: a `users` lookup that happened to
+    // succeed would be a latent outage waiting on the first deployment whose workload
+    // principal is not also a user id.
+    assert_eq!(
+        fence_diagnostics(&h, &client_id).await,
+        fenced_before,
+        "the workload exchange performed no lifecycle read and recorded no fence"
+    );
+}
+
+/// How many `principal_not_authenticatable` diagnostics this client has accumulated.
+async fn fence_diagnostics(h: &Harness, client_id: &str) -> usize {
+    h.client_auth_diagnostics(client_id)
+        .await
+        .iter()
+        .filter(|d| d.failure_reason == "principal_not_authenticatable")
+        .count()
+}
+
+#[tokio::test]
+async fn a_mapped_user_principal_from_another_scope_is_refused_rather_than_treated_as_a_workload() {
+    // The edge a two-valued discriminator gets wrong. "Does the principal parse as a
+    // UserId in THIS scope" has three answers, not two: a well-formed user id belonging
+    // to ANOTHER tenant or environment fails that parse for exactly the same reason an
+    // opaque workload string does. Told apart by a single boolean, it lands in the
+    // workload branch and mints a USER-BOUND token with no lifecycle check at all, for a
+    // subject whose state this scope cannot even read (RLS and the tenant/environment SQL
+    // filter both stop it). Unfenceable and unfenced is the exact combination issue #241
+    // exists to prevent, so `MappedPrincipal::ForeignUser` refuses it.
+    let h = Harness::start().await;
+    let jwks = jwks_json(&issuer_key());
+    h.register_external_issuer(EXTERNAL_ISSUER, Some(&jwks), None, None, true)
+        .await;
+
+    // A real, ACTIVE user id minted in another scope. Active on purpose: the refusal must
+    // come from the principal being unreachable here, never from it happening to be
+    // fenced over there.
+    let foreign_scope = h.provision_foreign_scope().await;
+    let foreign_subject = ironauth_store::UserId::generate(h.env(), &foreign_scope).to_string();
+    h.create_subject_mapping(
+        EXTERNAL_ISSUER,
+        EXTERNAL_HUMAN_SUBJECT,
+        None,
+        None,
+        &foreign_subject,
+    )
+    .await;
+
+    let client_id = h.client_id().to_string();
+    let asrt = assertion(
+        &issuer_key(),
+        EXTERNAL_ISSUER,
+        EXTERNAL_HUMAN_SUBJECT,
+        h.issuer(),
+        3600,
+        "jti-foreign-principal",
+    );
+    let (status, _h, body) = present(&h, &client_id, &asrt).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a cross-scope user principal is refused: {body}"
+    );
+    assert_eq!(json(&body)["error"], "invalid_grant");
+    assert!(
+        json(&body).get("access_token").is_none(),
+        "an unfenceable user-bound principal mints nothing"
+    );
+    assert!(
+        h.client_auth_diagnostics(&client_id)
+            .await
+            .iter()
+            .any(|d| d.failure_reason == "principal_not_authenticatable"),
+        "a cross-scope user principal is diagnosed as not authenticatable"
+    );
+}

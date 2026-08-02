@@ -15,6 +15,13 @@
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
+# shellcheck source=scripts/lib/generated-artifact.sh
+. scripts/lib/generated-artifact.sh
+
+# The drift check below is a `git diff --exit-code`, which reports NOTHING for a path git
+# does not track and so would pass on any content at all. Refuse that first.
+require_tracked "admin-spa-bindings" packages/admin-spa/src/api/management.gen.ts
+
 # Regenerate through the package script so the exact codegen invocation is the
 # one source of truth (package.json "codegen"). npm ci must have been run first.
 npm --prefix packages/admin-spa run codegen

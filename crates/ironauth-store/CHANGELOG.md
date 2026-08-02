@@ -6,6 +6,55 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The user surface IDOR claim is now measured rather than nearly true** (issue #241).
+  `IdorHarness::register_user_admin_probes` claimed to cover EVERY scope embedding user
+  surface while stopping at the eight management ones. The three BY SUBJECT data plane reads
+  were left out with a written argument that they could not leak, and the argument was
+  correct: `state_for_subject`, `claims_for_subject`, and `by_identifier` hard filter
+  `tenant_id`/`environment_id` in SQL, and the last two are isolated a second time over (a
+  scope bound PII seal AAD, and a per scope keyed blind index respectively). What was wrong
+  was claiming completeness on top of an argument nobody had run. These three are the reads
+  the login path and the token mint lifecycle fences are built on, so if any user surface
+  deserved a measurement it was these. Three new probes (`users.state_for_subject`,
+  `users.claims_for_subject`, `users.by_identifier`), each with a positive control in
+  `tests/user_admin.rs` proving the victim's own scope RESOLVES the identical argument that
+  read nothing cross scope, so a clean pass cannot come from a user that was never planted.
+  `by_identifier` keys on a login handle, so the fixture now carries the victim's real
+  identifier among the foreign references, as `by_external_id` already required. The
+  control helper covers all FIVE keyed READS, `users.get` included: it had none, which is
+  how a claim of "every keyed probe gets a positive control" came to be written beside four
+  of five, with the plainest probe in the set (read a user BY ITS ID) the one nobody had
+  proved was hunting a planted row. The five keyed MUTATIONS cannot take a control of this
+  shape (driving one under the victim's own scope would delete, block, or rewrite the row
+  the read controls assert they can still see), and the helper now says so rather than
+  leaving the gap implied.
+- **`UserState::ALL`, and the three-way lifecycle relation it exists to check** (issue #241).
+  Four user bound token mints are fenced by the SESSION CASCADE rather than by a direct
+  lifecycle read: the session carrying code exchange, the device grant, the implicit and
+  hybrid front channel ID token, and the FedCM assertion. That cascade is equivalent to a
+  direct read only because of a relation held jointly by three predicates that live apart
+  and know nothing of each other. `can_authenticate` is {active, scheduled offboarding},
+  `ends_sessions` is {blocked, disabled}, and the apparent gap (pending verification,
+  waitlisted) is closed not by the second predicate but by the THIRD: `can_transition_to`
+  refuses both as transition TARGETS, so such a user was created that way and holds no
+  session and no authorization code. Nothing tied the three together, there was no `ALL`,
+  and there was no test. Add a state that is non-authenticatable, a valid transition target,
+  and not session ending, and all four mint paths silently reopen with no compile error
+  anywhere. `every_reachable_non_authenticatable_state_ends_sessions` drives the relation
+  over `ALL` from both directions and carries an explicit non-vacuity guard, and
+  `user_state_all_holds_every_declared_variant` pins `ALL` against the enum's own
+  DECLARATION parsed out of the source, the same witness the three
+  `ClientAuthDiagnosticReason` style arrays use, because a total `match` cannot observe a
+  list that omits a variant it names. `ends_sessions` and `can_transition_to` now say in
+  their own docs that narrowing one or widening the other is a token mint change.
+- New `ClientAuthDiagnosticReason::PrincipalNotAuthenticatable` (`principal_not_authenticatable`,
+  issue #241). The jwt-bearer grant's uniform `invalid_grant` hides the difference between a
+  subject nobody wrote a mapping for and a mapped principal whose ACCOUNT was blocked,
+  disabled, or deleted; the out of band diagnostic is the operator's only channel, and folding
+  the second into `assertion_subject_unmapped` would tell them to go add a rule that already
+  exists. Recorded only for a principal that parses as a `usr_` id, so a workload principal
+  can never land here. The reason column is free text, so no migration.
+
 - **A tenant restore undoes the deletion it is undoing, and no other** (issue #439).
   `ActingTenantRepo::restore` cleared `deleted_at` on EVERY environment of the tenant and on
   EVERY management credential under it, so an environment an operator had decommissioned on

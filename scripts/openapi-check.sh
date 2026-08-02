@@ -12,6 +12,13 @@
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
+# shellcheck source=scripts/lib/generated-artifact.sh
+. scripts/lib/generated-artifact.sh
+
+# The drift check below is a `git diff --exit-code`, which reports NOTHING for a path git
+# does not track and so would pass on any content at all. Refuse that first.
+require_tracked "openapi-check" docs/openapi/management.json
+
 # Generate deterministically (database-free; the spec comes from the handler
 # annotations, not a running server). The example prints the exact byte content
 # committed to the artifact, including the trailing newline.
