@@ -17,7 +17,8 @@ use ironauth_import::{ForeignHash, ImportContext, import_stream};
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
     ActorRef, CorrelationId, CredentialType, HumanId, NewAdminUser, NewRecoveryCode,
-    NewTotpEnrollment, RecoveryRedeemOutcome, Scope, Store, UserId, UserRecord, UserState,
+    NewTotpEnrollment, NewUserTraits, RecoveryRedeemOutcome, Scope, Store, TraitWriteVisibility,
+    UserId, UserRecord, UserState,
 };
 
 /// A native Argon2id PHC verifier for `password`, exactly what the login path
@@ -90,8 +91,7 @@ async fn full_export_reimports_into_a_fresh_instance_with_logins_working() {
             state: UserState::Active,
             foreign_password_hash: None,
             foreign_password_algo: None,
-            traits_json: None,
-            traits_schema_version: None,
+            traits: None,
         },
         1_000_000,
     )
@@ -113,8 +113,11 @@ async fn full_export_reimports_into_a_fresh_instance_with_logins_working() {
             state: UserState::Active,
             foreign_password_hash: Some(&bcrypt_hash),
             foreign_password_algo: Some("bcrypt"),
-            traits_json: Some(r#"{"department":"engineering"}"#),
-            traits_schema_version: Some(3),
+            traits: Some(NewUserTraits {
+                traits_json: r#"{"department":"engineering"}"#,
+                schema_version: Some(3),
+                visibility: TraitWriteVisibility::Admin,
+            }),
         },
         2_000_000,
     )
@@ -134,8 +137,7 @@ async fn full_export_reimports_into_a_fresh_instance_with_logins_working() {
             state: UserState::PendingVerification,
             foreign_password_hash: None,
             foreign_password_algo: None,
-            traits_json: None,
-            traits_schema_version: None,
+            traits: None,
         },
         3_000_000,
     )
@@ -283,8 +285,7 @@ async fn re_importing_into_the_same_scope_is_idempotent() {
             state: UserState::Active,
             foreign_password_hash: None,
             foreign_password_algo: None,
-            traits_json: None,
-            traits_schema_version: None,
+            traits: None,
         },
         1_000_000,
     )
@@ -653,8 +654,7 @@ async fn outbound_verification_verifies_native_and_foreign_when_enabled() {
             state: UserState::Active,
             foreign_password_hash: None,
             foreign_password_algo: None,
-            traits_json: None,
-            traits_schema_version: None,
+            traits: None,
         },
         1_000_000,
     )
@@ -673,8 +673,7 @@ async fn outbound_verification_verifies_native_and_foreign_when_enabled() {
             state: UserState::Active,
             foreign_password_hash: Some(&bcrypt_hash),
             foreign_password_algo: Some("bcrypt"),
-            traits_json: None,
-            traits_schema_version: None,
+            traits: None,
         },
         2_000_000,
     )
@@ -827,8 +826,7 @@ async fn enrolled_credentials_round_trip_through_the_export() {
             state: UserState::Active,
             foreign_password_hash: None,
             foreign_password_algo: None,
-            traits_json: None,
-            traits_schema_version: None,
+            traits: None,
         },
         1_000_000,
     )
@@ -963,8 +961,7 @@ async fn totp_and_recovery_codes_round_trip_and_still_verify_after_reimport() {
             state: UserState::Active,
             foreign_password_hash: None,
             foreign_password_algo: None,
-            traits_json: None,
-            traits_schema_version: None,
+            traits: None,
         },
         1_000_000,
     )
@@ -1159,8 +1156,7 @@ async fn outbound_verification_is_bound_to_its_configured_scope() {
             state: UserState::Active,
             foreign_password_hash: None,
             foreign_password_algo: None,
-            traits_json: None,
-            traits_schema_version: None,
+            traits: None,
         },
         1_000_000,
     )
@@ -1240,5 +1236,136 @@ async fn disabled_outbound_endpoint_is_404_to_an_unauthenticated_probe() {
         status,
         axum::http::StatusCode::NOT_FOUND,
         "a disabled endpoint is a uniform 404 to an unauthenticated probe, not a 401: {body}"
+    );
+}
+
+/// An import into a scope that SERVES a trait schema validates the restored documents, and
+/// reports the offenders per record through the report the path already has.
+///
+/// The covenant is that a lossless restore must not need a schema: a full export re-imports
+/// into a FRESH scope that has registered nothing. The first cut generalized that into
+/// skipping validation UNCONDITIONALLY, which is strictly more than the covenant asks for
+/// and left a real gap: importing into a scope that DOES serve a schema wrote documents no
+/// live write could have produced, and the next cutover scan is where an operator would find
+/// out. Both halves are pinned here, in ONE test, because "validates when there is a schema"
+/// and "does not need one" only mean something together.
+// One test rather than two: "validates when there is a schema" and "does not need one" only
+// mean something together, and they have to run against the SAME input lines.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn an_import_validates_against_an_active_schema_and_needs_none_without_one() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let store = db.store();
+    let actor = db.test_actor(&env);
+
+    // Two records, one of which violates the schema installed below (`age` must be an
+    // integer). The line format is the documented export shape.
+    let lines: Vec<String> = vec![
+        serde_json::json!({
+            "identifier": "good@exit.test",
+            "state": "active",
+            "traits": {"age": 41}
+        })
+        .to_string(),
+        serde_json::json!({
+            "identifier": "bad@exit.test",
+            "state": "active",
+            "traits": {"age": "forty-one"}
+        })
+        .to_string(),
+    ];
+
+    // HALF ONE, the covenant: a scope with NO active schema imports BOTH records verbatim.
+    let fresh = db.seed_scope(&env).await;
+    let report = import_stream(
+        &ImportContext {
+            store,
+            scope: fresh,
+            env: &env,
+            actor,
+        },
+        lines.clone(),
+        |_| {},
+    )
+    .await;
+    assert_eq!(
+        (report.succeeded, report.failed),
+        (2, 0),
+        "a restore into a schema-free scope validates nothing: {report:?}"
+    );
+
+    // HALF TWO: install and activate a schema on a DIFFERENT target, and the same input now
+    // reports the violating record as a failure while the valid one still lands.
+    let target = db.seed_scope(&env).await;
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {"age": {"type": "integer"}}
+    })
+    .to_string();
+    let (_, version) = store
+        .scoped(target)
+        .acting(actor, CorrelationId::generate(&env))
+        .trait_schemas()
+        .create_version(&env, &schema, 1_000_000)
+        .await
+        .expect("create schema version");
+    store
+        .scoped(target)
+        .acting(actor, CorrelationId::generate(&env))
+        .trait_schemas()
+        .activate_version(&env, version)
+        .await
+        .expect("activate schema version");
+
+    let mut failures: Vec<String> = Vec::new();
+    let report = import_stream(
+        &ImportContext {
+            store,
+            scope: target,
+            env: &env,
+            actor,
+        },
+        lines,
+        |outcome| {
+            if let ironauth_import::RecordOutcome::Failed(error) = outcome {
+                failures.push(format!("{}: {}", error.key, error.reason));
+            }
+        },
+    )
+    .await;
+    assert_eq!(
+        (report.succeeded, report.failed),
+        (1, 1),
+        "the violating record fails and the valid one still lands: {report:?}"
+    );
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(
+        failures[0].contains("bad@exit.test") && failures[0].contains("/age"),
+        "the failure names the record and the offending FIELD: {failures:?}"
+    );
+    assert!(
+        !failures[0].contains("forty-one"),
+        "the reason names a dimension, never the offending value: {failures:?}"
+    );
+    // The scope holds exactly the one identity that validated.
+    assert!(
+        store
+            .scoped(target)
+            .users()
+            .by_identifier("good@exit.test")
+            .await
+            .expect("lookup")
+            .is_some()
+    );
+    assert!(
+        store
+            .scoped(target)
+            .users()
+            .by_identifier("bad@exit.test")
+            .await
+            .expect("lookup")
+            .is_none(),
+        "a record whose traits fail the target schema is not created at all"
     );
 }

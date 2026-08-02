@@ -444,8 +444,14 @@ fn config_and_connector_cases(base: &str, ids: &Ids) -> Vec<Case> {
     ]
 }
 
-/// The environment-scoped writes over invitations, journeys, keys, locales, and the
-/// two operator probes.
+/// The environment-scoped writes over invitations, journeys, trait schemas, keys,
+/// locales, and the two operator probes.
+///
+/// A flat case LIST, so its length is the number of routes it drives and nothing else.
+/// Splitting it to satisfy the line lint would put the sweep's coverage in two places,
+/// which is the property `every_documented_environment_scoped_write_is_driven_by_a_case`
+/// exists to keep in one.
+#[allow(clippy::too_many_lines)]
 fn environment_child_cases(base: &str, ids: &Ids) -> Vec<Case> {
     let Ids {
         management_key,
@@ -483,6 +489,20 @@ fn environment_child_cases(base: &str, ids: &Ids) -> Vec<Case> {
             label: "flow_versions.pinFlowVersion",
             method: "POST",
             path: format!("{base}/journeys/login/versions/1/pin"),
+            body: None,
+        },
+        Case {
+            label: "trait_schemas.createTraitSchemaVersion",
+            method: "POST",
+            path: format!("{base}/trait-schemas"),
+            body: Some(body_of(
+                &serde_json::json!({ "schema": {"type": "object"} }),
+            )),
+        },
+        Case {
+            label: "trait_schemas.activateTraitSchemaVersion",
+            method: "POST",
+            path: format!("{base}/trait-schemas/1/activate"),
             body: None,
         },
         Case {

@@ -106,3 +106,133 @@ async fn update_preserving_the_slug_succeeds_and_the_enabled_toggle_round_trips(
     let view: serde_json::Value = serde_json::from_str(&response).expect("json");
     assert_eq!(view["enabled"], true, "the toggle re-enables");
 }
+
+/// A connector body whose claim mapping targets `traits`.
+fn connector_body_mapping(slug: &str, traits: &serde_json::Value) -> String {
+    serde_json::json!({
+        "connector_id": slug,
+        "display_name": "Mapped",
+        "protocol": "oidc",
+        "endpoints": { "issuer": "https://issuer.example.com" },
+        "scopes": ["openid", "email"],
+        "client_id": "ironauth-at-acme",
+        "client_secret": "upstream-secret-value",
+        "claim_mapping": { "traits": traits }
+    })
+    .to_string()
+}
+
+/// Register and activate a trait schema with an ADMIN-ONLY `risk_score`, through the
+/// management surface.
+async fn seed_admin_only_schema(harness: &Harness, tenant: &str, environment: &str) {
+    let path = format!("/v1/tenants/{tenant}/environments/{environment}/trait-schemas");
+    let schema = serde_json::json!({
+        "schema": {
+            "type": "object",
+            "properties": {
+                "email": {"type": "string"},
+                "risk_score": {"type": "integer", "x-ironauth": {"visibility": "admin"}}
+            }
+        }
+    })
+    .to_string();
+    let (status, _, created) = harness.post(&path, "schema-create", &schema).await;
+    assert_eq!(status, StatusCode::OK, "create schema: {created}");
+    let (status, _, activated) = harness
+        .post(&format!("{path}/1/activate"), "schema-activate", "")
+        .await;
+    assert_eq!(status, StatusCode::OK, "activate schema: {activated}");
+}
+
+/// A claim mapping that targets an ADMIN-ONLY trait is refused at CONFIG time, on BOTH the
+/// create and the update, and stores nothing.
+///
+/// The connector claim mapping is the other configuration surface that can name a trait, and
+/// it had no admin-only gate at ALL:
+/// `grep -rn "is_admin_only|admin_only|visibility" crates/ironauth-connector/src/
+/// crates/ironauth-admin/src/connectors.rs` returned nothing. MEASURED, an upstream IdP
+/// whose mapping named an admin-only trait wrote it onto a local identity on first login.
+///
+/// The refusal belongs HERE and not only at login: the store's self-service class refuses the
+/// write, but a login-time refusal breaks the END USER for a fault only the operator can fix.
+/// This is the same posture `validate_signup_form` already takes on the signup-form surface.
+#[tokio::test]
+async fn a_claim_mapping_targeting_an_admin_only_trait_is_refused_at_config_time() {
+    let harness = Harness::start(50).await;
+    let (tenant, environment) = harness.create_tenant("Acme", "tenant-key").await;
+    seed_admin_only_schema(&harness, &tenant, &environment).await;
+    let path = format!("/v1/tenants/{tenant}/environments/{environment}/connectors");
+
+    // A mapping on a USER-visible trait is accepted, so the gate refuses the field and not
+    // the feature.
+    let ok = connector_body_mapping(
+        "acme-ok",
+        &serde_json::json!({"email": {"source": ["email"]}}),
+    );
+    let (status, _, body) = harness.post(&path, "ok-key", &ok).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "a mapping on a user-visible trait is accepted: {body}"
+    );
+
+    // A mapping that TARGETS the admin-only trait is a 400 naming the offending location in
+    // the DEFINITION, and nothing is stored.
+    let hostile = connector_body_mapping(
+        "acme-hostile",
+        &serde_json::json!({
+            "email": {"source": ["email"]},
+            "risk_score": {"source": ["risk_score"], "required": false}
+        }),
+    );
+    let (status, _, body) = harness.post(&path, "hostile-key", &hostile).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an admin-only mapping target is refused at config time: {body}"
+    );
+    assert!(
+        body.contains("/claim_mapping/traits/risk_score"),
+        "the refusal names the offending location in the definition the operator edits: \
+         {body}"
+    );
+    assert!(
+        !body.contains("upstream-secret-value"),
+        "the refusal must not leak the secret: {body}"
+    );
+    let (status, _, list) = harness.get(&path).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert!(
+        !list.contains("acme-hostile"),
+        "the refused create stored nothing: {list}"
+    );
+
+    // The UPDATE carries the SAME gate. Without this half, an operator could create a clean
+    // connector and then edit an admin-only target into it, and the gate would read as
+    // enforced while the update walked around it.
+    let view: serde_json::Value = serde_json::from_str(&{
+        let (_, _, one) = harness.get(&path).await;
+        one
+    })
+    .expect("json");
+    let id = view["items"][0]["id"].as_str().expect("id").to_owned();
+    let edit = connector_body_mapping(
+        "acme-ok",
+        &serde_json::json!({
+            "email": {"source": ["email"]},
+            "risk_score": {"source": ["risk_score"], "required": false}
+        }),
+    );
+    let (status, _, body) = harness.put(&format!("{path}/{id}"), &edit).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the update carries the same config-time gate: {body}"
+    );
+    let (status, _, after) = harness.get(&format!("{path}/{id}")).await;
+    assert_eq!(status, StatusCode::OK, "{after}");
+    assert!(
+        !after.contains("risk_score"),
+        "the refused update mutated nothing: {after}"
+    );
+}

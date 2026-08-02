@@ -49,6 +49,55 @@ pub struct ErrorBody {
     /// retrying.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_age: Option<u64>,
+    /// Present only on an identity-traits validation refusal (issue #53): one entry per
+    /// FAILING FIELD, each carrying an RFC 6901 JSON Pointer to the exact location in
+    /// the submitted document and a stable reason.
+    ///
+    /// It is a LIST and not a flattened string on purpose. A trait document fails field
+    /// by field, and a form that renders the failures has to attach each one to its own
+    /// input; a joined sentence forces every consumer to re-parse what the validator
+    /// already knew. The `message` field still carries the joined summary, so a client
+    /// that reads only that is not left with nothing.
+    ///
+    /// No entry ever echoes the offending VALUE (the validator's reasons name a
+    /// dimension, never data), so a refusal carries no trait PII.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trait_errors: Option<Vec<TraitErrorView>>,
+}
+
+impl ErrorBody {
+    /// The body every error shape starts from: the stable `error` code, the human message,
+    /// and NO optional field set. Each variant that carries an extra sets exactly that one
+    /// with functional-update syntax.
+    ///
+    /// This exists so that adding an optional field to [`ErrorBody`] touches ONE place
+    /// rather than every arm of the render. It used to be every arm, and the arms
+    /// re-spelled `expected_scope: None, actual_scope: None, failed_guardrails: None,
+    /// max_age: None` ten times over: a shape where the ONLY thing keeping a new field
+    /// off an unrelated error was ten identical hand edits.
+    fn plain(error: &str, message: String) -> Self {
+        Self {
+            error: error.to_owned(),
+            message,
+            expected_scope: None,
+            actual_scope: None,
+            failed_guardrails: None,
+            max_age: None,
+            trait_errors: None,
+        }
+    }
+}
+
+/// One per-field identity-traits validation failure on the wire (issue #53).
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct TraitErrorView {
+    /// An RFC 6901 JSON Pointer to the failing location in the submitted document (the
+    /// empty string points at the document root).
+    #[schema(example = "/address/zip")]
+    pub pointer: String,
+    /// A stable, operator-safe reason. Never echoes the offending value.
+    #[schema(example = "expected type string")]
+    pub message: String,
 }
 
 /// A management API error.
@@ -94,6 +143,16 @@ pub enum ApiError {
     /// bad request because the request is well-formed but violates the environment's
     /// enforced guardrail class.
     GuardrailViolation(Vec<GuardrailViolation>),
+    /// A submitted identity-traits document failed the environment's ACTIVE trait
+    /// schema (issue #53). Renders 422 with one `trait_errors` entry PER FAILING FIELD,
+    /// each carrying an RFC 6901 JSON Pointer, and NOTHING is written.
+    ///
+    /// It is its own variant rather than an `Unprocessable(String)` because the central
+    /// [`StoreError`] conversion renders through `Display`, which JOINS the failures
+    /// into one sentence. That join is exactly the information a form needs and cannot
+    /// reconstruct: which INPUT failed. Collapsing it would have made the structured
+    /// per-field contract unreachable from the one place every route converts through.
+    TraitsInvalid(Vec<ironauth_store::ValidationFailure>),
     /// Admin sudo mode is on and this mutation needs a RECENT re-authentication that
     /// the acting credential does not have (issue #73): the recorded elevation is
     /// absent or its freshness window has lapsed. Renders a 401 RFC 9470
@@ -122,6 +181,7 @@ impl ApiError {
             ApiError::Conflict(_) => StatusCode::CONFLICT,
             ApiError::IdempotencyKeyConflict
             | ApiError::GuardrailViolation(_)
+            | ApiError::TraitsInvalid(_)
             | ApiError::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
             ApiError::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -130,92 +190,67 @@ impl ApiError {
     /// The structured body this error renders to.
     fn body(&self) -> ErrorBody {
         match self {
-            ApiError::BadRequest(message) => ErrorBody {
-                error: "bad_request".to_owned(),
-                message: message.clone(),
-                expected_scope: None,
-                actual_scope: None,
-                failed_guardrails: None,
-                max_age: None,
-            },
-            ApiError::Unauthorized(message) => ErrorBody {
-                error: "unauthorized".to_owned(),
-                message: message.clone(),
-                expected_scope: None,
-                actual_scope: None,
-                failed_guardrails: None,
-                max_age: None,
-            },
+            ApiError::BadRequest(message) => ErrorBody::plain("bad_request", message.clone()),
+            ApiError::Unauthorized(message) => ErrorBody::plain("unauthorized", message.clone()),
             ApiError::WrongScope {
                 expected,
                 actual,
                 message,
             } => ErrorBody {
-                error: "wrong_scope".to_owned(),
-                message: message.clone(),
                 expected_scope: Some(expected.clone()),
                 actual_scope: Some(actual.clone()),
-                failed_guardrails: None,
-                max_age: None,
+                ..ErrorBody::plain("wrong_scope", message.clone())
             },
-            ApiError::NotFound => ErrorBody {
-                error: "not_found".to_owned(),
-                message: "resource not found".to_owned(),
-                expected_scope: None,
-                actual_scope: None,
-                failed_guardrails: None,
-                max_age: None,
-            },
-            ApiError::Conflict(message) => ErrorBody {
-                error: "conflict".to_owned(),
-                message: message.clone(),
-                expected_scope: None,
-                actual_scope: None,
-                failed_guardrails: None,
-                max_age: None,
-            },
-            ApiError::IdempotencyKeyConflict => ErrorBody {
-                error: "idempotency_key_conflict".to_owned(),
-                message: "the Idempotency-Key was reused with a different request".to_owned(),
-                expected_scope: None,
-                actual_scope: None,
-                failed_guardrails: None,
-                max_age: None,
-            },
+            ApiError::NotFound => ErrorBody::plain("not_found", "resource not found".to_owned()),
+            ApiError::Conflict(message) => ErrorBody::plain("conflict", message.clone()),
+            ApiError::IdempotencyKeyConflict => ErrorBody::plain(
+                "idempotency_key_conflict",
+                "the Idempotency-Key was reused with a different request".to_owned(),
+            ),
             ApiError::GuardrailViolation(violations) => ErrorBody {
-                error: "guardrail_violation".to_owned(),
-                message: guardrail_message(violations),
-                expected_scope: None,
-                actual_scope: None,
                 failed_guardrails: Some(violations.iter().map(|v| v.code().to_owned()).collect()),
-                max_age: None,
+                ..ErrorBody::plain("guardrail_violation", guardrail_message(violations))
             },
-            ApiError::Unprocessable(message) => ErrorBody {
-                error: "unprocessable_entity".to_owned(),
-                message: message.clone(),
-                expected_scope: None,
-                actual_scope: None,
-                failed_guardrails: None,
-                max_age: None,
+            ApiError::Unprocessable(message) => {
+                ErrorBody::plain("unprocessable_entity", message.clone())
+            }
+            ApiError::TraitsInvalid(failures) => ErrorBody {
+                trait_errors: Some(
+                    failures
+                        .iter()
+                        .map(|failure| TraitErrorView {
+                            pointer: failure.pointer.clone(),
+                            message: failure.message.clone(),
+                        })
+                        .collect(),
+                ),
+                ..ErrorBody::plain("traits_invalid", traits_invalid_message(failures))
             },
             ApiError::ReauthRequired { max_age } => ErrorBody {
-                error: "insufficient_user_authentication".to_owned(),
-                message: "a fresh re-authentication is required for this operation".to_owned(),
-                expected_scope: None,
-                actual_scope: None,
-                failed_guardrails: None,
                 max_age: Some(*max_age),
+                ..ErrorBody::plain(
+                    "insufficient_user_authentication",
+                    "a fresh re-authentication is required for this operation".to_owned(),
+                )
             },
-            ApiError::Internal => ErrorBody {
-                error: "internal".to_owned(),
-                message: "internal server error".to_owned(),
-                expected_scope: None,
-                actual_scope: None,
-                failed_guardrails: None,
-                max_age: None,
-            },
+            ApiError::Internal => ErrorBody::plain("internal", "internal server error".to_owned()),
         }
     }
+}
+
+/// A single-line summary of the per-field trait failures, so a caller reading only
+/// `message` still learns every failure and its location. The structured
+/// `trait_errors` list is what a form attaches to its inputs.
+fn traits_invalid_message(failures: &[ironauth_store::ValidationFailure]) -> String {
+    if failures.is_empty() {
+        return "the traits document failed the active trait schema".to_owned();
+    }
+    let joined = failures
+        .iter()
+        .map(|failure| format!("{}: {}", failure.pointer, failure.message))
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!("the traits document failed the active trait schema: {joined}")
 }
 
 /// A single-line summary of the failed guardrails, listing each one's message so
@@ -313,6 +348,20 @@ impl From<StoreError> for ApiError {
         // resource id), so nothing here can report anything the caller did not already
         // send. Reading it from there rather than restating it means the log line and
         // the caller's message cannot drift apart.
+        // The ONE interception ahead of the wire conversion, and it exists for exactly
+        // the reason the note above gives about silencers. `into_wire` maps this variant
+        // to `Unprocessable`, whose body is the `Display` string: correct status, right
+        // message, and the per-field list GONE. That is not a silenced error, it is a
+        // silenced STRUCTURE, and the acceptance criterion is about the structure ("per
+        // field JSON Pointer errors"). Lifting the failures out here keeps every route
+        // that converts through this impl on the structured contract without any of them
+        // having to carry an arm of its own.
+        //
+        // Nothing else may join it without the same argument: a variant whose typed
+        // payload the wire class DISCARDS, and a caller that needs the payload.
+        if let StoreError::TraitsInvalid(failures) = error {
+            return ApiError::TraitsInvalid(failures);
+        }
         let message = error.to_string();
         match error.into_wire() {
             // The uniform not-found is preserved across the boundary.

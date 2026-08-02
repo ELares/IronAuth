@@ -31,8 +31,8 @@ use std::time::SystemTime;
 
 use ironauth_env::Env;
 use ironauth_store::{
-    ActorRef, CorrelationId, CredentialType, NewAdminUser, RestoredRecoveryCode, RestoredTotp,
-    Scope, Store, StoreError, UserId, UserState,
+    ActorRef, CorrelationId, CredentialType, NewAdminUser, NewUserTraits, RestoredRecoveryCode,
+    RestoredTotp, Scope, Store, StoreError, TraitSchema, TraitWriteVisibility, UserId, UserState,
 };
 
 use crate::record::{ImportRecord, parse_record_line};
@@ -201,21 +201,76 @@ pub async fn import_stream<I>(
 where
     I: IntoIterator<Item = String>,
 {
+    // The target scope's ACTIVE trait schema, resolved ONCE for the whole run rather than
+    // per record (a scope has one active version for the duration of an import, and the
+    // read is a round trip).
+    //
+    // A restore SEALS traits verbatim, and it must: the exit covenant is that a full export
+    // re-imports losslessly even into a FRESH scope that has registered no schema at all,
+    // so validation cannot be a precondition of the path. That is the whole of what the
+    // covenant needs, and the first cut generalized it into skipping validation
+    // UNCONDITIONALLY, which is strictly more: importing into a scope that DOES serve a
+    // schema then wrote documents no live write could have written, and the next cutover
+    // scan is where an operator would find out. So: no active schema, no validation (the
+    // covenant); an active schema, validate and report the offenders per record through the
+    // report the path already has.
+    //
+    // A stored schema that does not COMPILE is a persistence corruption, not a record
+    // fault; it is treated as no schema rather than failing every record, so a corrupt
+    // registry cannot turn a restore into a total loss.
+    let schema = match ctx.store.scoped(ctx.scope).trait_schemas().active().await {
+        Ok(Some(version)) => TraitSchema::compile(&version.schema_json).ok(),
+        Ok(None) | Err(_) => None,
+    };
     drive_import(
         ctx.scope,
         lines,
-        async |prepared: PreparedCreate| create_user(ctx, prepared).await,
+        async |prepared: PreparedCreate| create_user(ctx, schema.as_ref(), prepared).await,
         on_record,
     )
     .await
+}
+
+/// Validate an imported traits document against the target scope's active schema, or
+/// report the per-field offenders as this record's operator-safe failure reason.
+///
+/// Value-free by construction: a [`ValidationFailure`] carries an RFC 6901 pointer and a
+/// stable reason and never echoes the offending value, so a failure report from an import
+/// carries no trait PII into an operator's console or log.
+fn check_imported_traits(
+    schema: Option<&TraitSchema>,
+    traits_json: Option<&str>,
+) -> Result<(), CreateError> {
+    let (Some(schema), Some(traits_json)) = (schema, traits_json) else {
+        return Ok(());
+    };
+    let value: serde_json::Value = serde_json::from_str(traits_json)
+        .map_err(|_| CreateError::Failed("traits are not valid JSON".to_owned()))?;
+    let failures = schema.validate(&value);
+    if failures.is_empty() {
+        return Ok(());
+    }
+    let detail = failures
+        .iter()
+        .map(|failure| format!("{}: {}", failure.pointer, failure.message))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(CreateError::Failed(format!(
+        "traits fail the target scope's active schema: {detail}"
+    )))
 }
 
 /// Create one prepared record through the audited admin-create path, mapping a
 /// duplicate to the idempotent [`CreateError::Conflict`].
 async fn create_user(
     ctx: &ImportContext<'_>,
+    schema: Option<&TraitSchema>,
     prepared: PreparedCreate,
 ) -> Result<String, CreateError> {
+    // Validate against the target scope's active schema when it HAS one (see
+    // `import_stream`). A violating record is this record's failure and nothing else's:
+    // the rest of the import proceeds, which is what a bulk restore needs.
+    check_imported_traits(schema, prepared.traits_json.as_deref())?;
     let created_at = epoch_micros(ctx.env.clock().now_utc());
     let result = ctx
         .store
@@ -238,9 +293,18 @@ async fn create_user(
                 foreign_password_algo: prepared.foreign_algo,
                 // Traits are restored VERBATIM (issue #58): sealed as-is without
                 // re-validating against the target scope's active schema, so a full
-                // export imports losslessly even into a fresh scope with no schema.
-                traits_json: prepared.traits_json.as_deref(),
-                traits_schema_version: prepared.traits_schema_version,
+                // export imports losslessly even into a fresh scope with no schema. The
+                // ADMIN class, because a restore is an operator action carrying the SOURCE
+                // instance's own admin-only metadata: refusing the fields the operator is
+                // restoring would make the round trip lossy by construction.
+                traits: prepared
+                    .traits_json
+                    .as_deref()
+                    .map(|traits_json| NewUserTraits {
+                        traits_json,
+                        schema_version: prepared.traits_schema_version,
+                        visibility: TraitWriteVisibility::Admin,
+                    }),
             },
             created_at,
             None,

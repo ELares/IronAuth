@@ -41,7 +41,7 @@ use serde_json::{Map, Value};
 
 use ironauth_store::{
     CorrelationId, FlowRecord, Scope, SignupFormConfig, SignupFormField, SignupStep, StoreError,
-    TraitSchema, UserId,
+    TraitSchema, TraitWriteVisibility, UserId,
 };
 
 use super::message::{self, Message};
@@ -248,8 +248,21 @@ pub(super) async fn advance(
     // Deep-merge the collected fields into the subject's existing traits and persist the WHOLE
     // document. Removing a field from the form never deletes an existing trait: the merge only
     // ever adds or overwrites the collected pointers.
-    let mut merged = match state.store().scoped(scope).users().traits(subject).await {
-        Ok(Some((_, existing))) => existing,
+    //
+    // The merge base is the USER-VISIBLE projection, not the full document (issue #53). This is
+    // an end-user-driven write, so it must be built out of what a self-service surface is
+    // allowed to see: reading the full document here would put admin-only metadata into the
+    // submitted payload, which the SelfService write class below refuses by design. The
+    // admin-only fields are not lost by being left out, because that write class carries them
+    // over from the stored document; leaving them out is what makes the write legal at all.
+    let mut merged = match state
+        .store()
+        .scoped(scope)
+        .users()
+        .traits_user_visible(subject)
+        .await
+    {
+        Ok(Some(existing)) => existing,
         Ok(None) => Value::Object(Map::new()),
         Err(_) => return Err(FlowError::Store),
     };
@@ -258,12 +271,23 @@ pub(super) async fn advance(
         return Err(FlowError::Store);
     };
     let actor = interaction::user_actor(subject);
+    // SELF-SERVICE: the end user is acting on their own profile. The store seam refuses any
+    // admin-only field this payload names and carries the stored ones over, so admin-only
+    // metadata is immutable here in BOTH directions (it cannot be set, and it cannot be
+    // cleared by omission). The form-config gate that refuses an admin-only trait POINTER is
+    // upstream of this and still holds; this is the seam that holds when a future writer does
+    // not go through a form at all.
     let write = state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .users()
-        .set_traits(state.env(), subject, &traits_json)
+        .set_traits_with_visibility(
+            state.env(),
+            subject,
+            &traits_json,
+            TraitWriteVisibility::SelfService,
+        )
         .await;
     match write {
         Ok(_) => Ok(ProfilingStep::Complete),

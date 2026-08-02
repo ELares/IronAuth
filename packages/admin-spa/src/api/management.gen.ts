@@ -1693,6 +1693,101 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List every trait-schema version of an environment (ascending by version). */
+        get: operations["listTraitSchemaVersions"];
+        put?: never;
+        /**
+         * Create a new immutable trait-schema version.
+         * @description This is a POST, not a PUT: it APPENDS a new immutable version with a server-assigned monotonic
+         *     version number. Per the codebase convention it REQUIRES an `Idempotency-Key`, wired through the
+         *     shared idempotency path: a retry with the same key REPLAYS the stored response (the SAME version
+         *     number), so a client or network retry never silently appends a duplicate version. A key reused
+         *     with a different body is a 422.
+         *
+         *     A new version is created as a CANDIDATE. It changes nothing about what identity writes are
+         *     validated against until it is activated, which is a separate, cutover-guarded call.
+         */
+        post: operations["createTraitSchemaVersion"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas/active": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get the environment's ACTIVE trait schema (the schema introspection endpoint).
+         * @description This is the version every identity write is validated against, served with its parsed behavior
+         *     annotations (login identifiers, verification addresses, recovery channels, and the admin-only
+         *     set), so a form generator reads the schema and its contract from one response.
+         */
+        get: operations["getActiveTraitSchema"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas/{version}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get one trait-schema version by its version number. */
+        get: operations["getTraitSchemaVersion"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas/{version}/activate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Activate a trait-schema version as the environment's served default (the cutover).
+         * @description GATED. The activation is REFUSED, and nothing moves, while any existing identity's traits fail
+         *     the target schema: the store counts them on a live scan INSIDE the activation transaction, and a
+         *     non-zero count answers 422 naming the count. See this module's header for why the live scan
+         *     rather than a job report is the gate that ships, and why the later dry-run and migration jobs
+         *     tighten it rather than replace it.
+         *
+         *     A mutating POST, so per the codebase convention it REQUIRES an `Idempotency-Key`: a retry with
+         *     the same key REPLAYS the stored response without re-running the scan (and activation is
+         *     naturally idempotent on the target version anyway).
+         */
+        post: operations["activateTraitSchemaVersion"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/users": {
         parameters: {
             query?: never;
@@ -1729,7 +1824,10 @@ export interface paths {
         delete: operations["deleteUser"];
         options?: never;
         head?: never;
-        /** Update a user's profile (RFC 7396 partial patch of the standard claims). */
+        /**
+         * Update a user's profile (RFC 7396 partial patch of the standard claims and the
+         *     identity-traits document).
+         */
         patch: operations["updateUser"];
         trace?: never;
     };
@@ -1830,6 +1928,29 @@ export interface paths {
         put?: never;
         /** Transition a user's lifecycle state. */
         post: operations["setUserState"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/traits": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get one user's identity-traits document.
+         * @description A MANAGEMENT read, so it is the FULL document, admin-only metadata included. There is no
+         *     self-service counterpart of this route on this plane; a self-service surface reads the
+         *     REDACTED projection (`UserRepo::traits_user_visible`), which strips every field the active
+         *     schema annotates `visibility: admin`.
+         */
+        get: operations["getUserTraits"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -2632,6 +2753,19 @@ export interface components {
              */
             home_region?: string | null;
         };
+        /**
+         * @description The body to create a new immutable trait-schema version (issue #53).
+         *
+         *     The `schema` is a JSON Schema (draft 2020-12, the supported profile vocabulary)
+         *     carrying the inline `x-ironauth` behavior annotations. It is COMPILED before the
+         *     write; a malformed schema is a 400 naming the offending RFC 6901 location in the
+         *     schema document and nothing is stored. A schema document carries no secret and no
+         *     PII (it declares field SHAPES, never values).
+         */
+        CreateTraitSchemaRequest: {
+            /** @description The JSON Schema document (draft 2020-12). */
+            schema: Record<string, never>;
+        };
         /** @description The body to create a user (issue #52). Every field but `identifier` is optional. */
         CreateUserRequest: {
             /** @description An OPTIONAL standard-claim JSON document (issue #15), stored verbatim. */
@@ -2654,6 +2788,15 @@ export interface components {
              */
             password_hash?: string | null;
             state?: null | components["schemas"]["UserStateView"];
+            /**
+             * @description An OPTIONAL identity-traits document (issue #53), VALIDATED against the
+             *     environment's active trait schema. A document violating the schema is a 422
+             *     carrying a per-field RFC 6901 JSON Pointer for each failure and NOTHING is
+             *     created; a valid document is stored with the schema version it validated
+             *     against. Absent leaves the identity trait-free. Arrays and nested objects are
+             *     first-class and round-trip verbatim.
+             */
+            traits?: Record<string, never>;
         };
         /** @description A page of DCR policies. */
         DcrPolicyList: {
@@ -2852,6 +2995,21 @@ export interface components {
              * @example resource not found
              */
             message: string;
+            /**
+             * @description Present only on an identity-traits validation refusal (issue #53): one entry per
+             *     FAILING FIELD, each carrying an RFC 6901 JSON Pointer to the exact location in
+             *     the submitted document and a stable reason.
+             *
+             *     It is a LIST and not a flattened string on purpose. A trait document fails field
+             *     by field, and a form that renders the failures has to attach each one to its own
+             *     input; a joined sentence forces every consumer to re-parse what the validator
+             *     already knew. The `message` field still carries the joined summary, so a client
+             *     that reads only that is not left with nothing.
+             *
+             *     No entry ever echoes the offending VALUE (the validator's reasons name a
+             *     dimension, never data), so a refusal carries no trait PII.
+             */
+            trait_errors?: components["schemas"]["TraitErrorView"][] | null;
         };
         /**
          * @description The body to EXTEND a signup-quarantine review window (issue #82, PR 2). The window is
@@ -4896,6 +5054,70 @@ export interface components {
             status: string;
         };
         /**
+         * @description The IronAuth behavior vocabulary a trait schema declares (issue #53), parsed off
+         *     its top-level properties and served with every version so a form generator, a login
+         *     surface, or a recovery surface reads the contract from one place.
+         */
+        TraitAnnotationsView: {
+            /**
+             * @description Top-level trait names declared admin-only: invisible AND immutable through
+             *     self-service surfaces.
+             */
+            admin_only: string[];
+            /** @description Top-level trait names declared as login identifiers. */
+            login_identifiers: string[];
+            /** @description Top-level trait names declared as recovery channels. */
+            recovery_channels: string[];
+            /**
+             * @description Top-level trait names declared as verification addresses, each with the kind
+             *     the annotation names (for example `email`).
+             */
+            verification_addresses: components["schemas"]["VerificationAddressView"][];
+        };
+        /** @description One per-field identity-traits validation failure on the wire (issue #53). */
+        TraitErrorView: {
+            /**
+             * @description A stable, operator-safe reason. Never echoes the offending value.
+             * @example expected type string
+             */
+            message: string;
+            /**
+             * @description An RFC 6901 JSON Pointer to the failing location in the submitted document (the
+             *     empty string points at the document root).
+             * @example /address/zip
+             */
+            pointer: string;
+        };
+        /**
+         * @description One immutable trait-schema version, as returned by the management API (issue #53).
+         *
+         *     This is also the schema INTROSPECTION shape: the served schema document plus its
+         *     parsed behavior annotations, so a form generator reads both from one response.
+         */
+        TraitSchemaVersionView: {
+            /**
+             * @description Whether this version is the environment's ACTIVE served default (the version
+             *     every trait write validates against).
+             */
+            active: boolean;
+            /** @description The parsed IronAuth behavior annotations of this schema. */
+            annotations: components["schemas"]["TraitAnnotationsView"];
+            /**
+             * Format: int64
+             * @description Creation time, milliseconds since the Unix epoch.
+             */
+            created_at_unix_ms: number;
+            /** @description The `tsc_` version id (embeds its scope). */
+            id: string;
+            /** @description The JSON Schema document (draft 2020-12) this version serves. */
+            schema: Record<string, never>;
+            /**
+             * Format: int32
+             * @description The per-environment monotonic version number.
+             */
+            version: number;
+        };
+        /**
          * @description The body to rename a group (RFC 7396 style partial edit: an omitted field is
          *     left unchanged).
          *
@@ -5018,8 +5240,9 @@ export interface components {
         };
         /**
          * @description The body to update a user (issue #52), applied as an RFC 7396 JSON Merge Patch
-         *     over the mutable profile. Only the standard-claim document is updatable here;
-         *     the lifecycle state and external id have their own explicit operations.
+         *     over the mutable profile. The standard-claim document and the identity-traits
+         *     document are updatable here; the lifecycle state and external id have their own
+         *     explicit operations.
          */
         UpdateUserRequest: {
             /**
@@ -5027,6 +5250,16 @@ export interface components {
              *     unchanged.
              */
             claims?: Record<string, never>;
+            /**
+             * @description The REPLACEMENT identity-traits document (issue #53), VALIDATED against the
+             *     environment's active trait schema. Absent leaves the traits unchanged; present,
+             *     it REPLACES the whole document (traits are a schema-validated document, so a
+             *     per-key merge could not be validated as a whole), and the schema version it
+             *     validated against is recorded on the identity. A document violating the schema
+             *     is a 422 carrying a per-field RFC 6901 JSON Pointer for each failure and NOTHING
+             *     is written.
+             */
+            traits?: Record<string, never>;
         };
         /**
          * @description A user's connected apps (issue #88): the remembered consents they hold, oldest
@@ -5124,6 +5357,25 @@ export interface components {
          */
         UserStateView: "active" | "blocked" | "disabled" | "pending_verification" | "scheduled_offboarding" | "waitlisted";
         /**
+         * @description One identity's trait document, as returned by the management API (issue #53).
+         *
+         *     A management read, so it is the FULL document: admin-only metadata included. The
+         *     redacted, user-visible projection is what a self-service surface reads
+         *     (`TraitAnnotations::redact_for_user`), and nothing on this plane serves it.
+         */
+        UserTraitsView: {
+            /** @description The user identifier (`usr_...`, embeds its scope). */
+            id: string;
+            /**
+             * Format: int32
+             * @description The trait-schema version the document was last validated against, or null when
+             *     the identity has no traits.
+             */
+            schema_version?: number | null;
+            /** @description The identity-traits document, or null when the identity has none set. */
+            traits: Record<string, never>;
+        };
+        /**
          * @description A user, as returned by the management API (issue #52). The identifier embeds its
          *     tenant and environment. NEVER carries the password hash (a management response
          *     must not return a stored credential, the #11 secret lesson).
@@ -5160,6 +5412,13 @@ export interface components {
              * @description Last-mutation time, milliseconds since the Unix epoch.
              */
             updated_at_unix_ms: number;
+        };
+        /** @description One declared verification address (issue #53): the trait name and its kind. */
+        VerificationAddressView: {
+            /** @description The top-level trait name. */
+            field: string;
+            /** @description The verification kind the annotation names (for example `email`, `phone`). */
+            kind: string;
         };
         /**
          * @description A successor system's credential-verification request (issue #58): a user's login
@@ -7587,7 +7846,7 @@ export interface operations {
                     "application/json": components["schemas"]["ConnectorView"];
                 };
             };
-            /** @description Malformed or invalid definition (JSON-pointer error) */
+            /** @description Malformed or invalid definition (JSON-pointer error), including a claim mapping that targets an admin-only trait */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -7726,7 +7985,7 @@ export interface operations {
                     "application/json": components["schemas"]["ConnectorView"];
                 };
             };
-            /** @description Malformed or invalid definition (JSON-pointer error) */
+            /** @description Malformed or invalid definition (JSON-pointer error), including a claim mapping that targets an admin-only trait */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -13929,6 +14188,307 @@ export interface operations {
             };
         };
     };
+    listTraitSchemaVersions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The environment's trait-schema versions */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TraitSchemaVersionView"][];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    createTraitSchemaVersion: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Required. Replaying a POST with the same key returns the original response (the same version) without appending a duplicate. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateTraitSchemaRequest"];
+            };
+        };
+        responses: {
+            /** @description The created candidate version */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TraitSchemaVersionView"];
+                };
+            };
+            /** @description A malformed schema document, naming the offending location */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Environment not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description A concurrent create took the next version; retry */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Idempotency-Key reused with a different request */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    getActiveTraitSchema: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The active version and its behavior annotations */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TraitSchemaVersionView"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment has no active trait schema */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    getTraitSchemaVersion: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The version number */
+                version: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The version */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TraitSchemaVersionView"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found (absent or in another scope) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    activateTraitSchemaVersion: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Required. Replaying a POST with the same key returns the original response without re-executing. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The version number to activate */
+                version: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The now-active version */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TraitSchemaVersionView"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The version does not exist in this scope. The environment must be live too: an absent or soft-deleted one answers this same not-found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The cutover is BLOCKED (identities fail the target schema), or the Idempotency-Key was reused with a different request */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     listUsers: {
         parameters: {
             query?: {
@@ -14658,6 +15218,60 @@ export interface operations {
             };
             /** @description Idempotency-Key reused with a different request */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    getUserTraits: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The user identifier (usr_...) */
+                user_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The user's traits and the schema version they validated against */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UserTraitsView"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found (absent or in another scope) */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

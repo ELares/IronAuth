@@ -671,3 +671,111 @@ fn extract_flow_id(html: &str) -> String {
     let end = rest.find('"').expect("flow value end");
     rest[..end].to_owned()
 }
+
+/// A schema like [`install_schema`]'s, plus an ADMIN-ONLY `risk_score` the operator's plane
+/// owns and no self-service surface may read or write.
+async fn install_schema_with_admin_only(harness: &Harness) {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "email": {"type": "string", "x-ironauth": {"identifier": true, "verification": "email"}},
+            "nickname": {"type": "string", "minLength": 3, "maxLength": 20},
+            "age": {"type": "integer", "minimum": 0, "maximum": 130},
+            "risk_score": {"type": "integer", "x-ironauth": {"visibility": "admin"}}
+        }
+    })
+    .to_string();
+    let env = harness.env().clone();
+    let scope = harness.scope();
+    let (_, version) = harness
+        .db()
+        .control_store()
+        .scoped(scope)
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+        .trait_schemas()
+        .create_version(&env, &schema, 1_000_000)
+        .await
+        .expect("create schema version");
+    harness
+        .db()
+        .control_store()
+        .scoped(scope)
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+        .trait_schemas()
+        .activate_version(&env, version)
+        .await
+        .expect("activate schema version");
+}
+
+/// A progressive-profiling write KEEPS the identity's admin-only metadata.
+///
+/// The wiring probe for the two halves this PR changed on `flow/profiling.rs` (the
+/// `SelfService` write class, and building the merge base from `traits_user_visible` instead
+/// of the full document). Both were covered by NOTHING: MEASURED, reverting BOTH left
+/// `flow_progressive_profiling` at 9 passed and `flow_signup_fields` at 3 passed. The shipped
+/// coverage for the split drives the STORE seam directly and never this wiring, so the two
+/// changes could have been deleted with CI green.
+///
+/// The two halves fail DIFFERENTLY, and both failures are asserted here:
+///
+/// - without the redacted merge base, the payload this path submits CONTAINS `risk_score`
+///   (it read the full document and merges into it), which the self-service class refuses,
+///   so the profiling submit does not mint at all;
+/// - without the self-service class, the write is an admin write of a document that does not
+///   carry `risk_score`, so the field is silently DELETED while the login mints happily.
+#[tokio::test]
+async fn a_progressive_profiling_write_keeps_admin_only_metadata() {
+    let harness = setup().await;
+    install_schema_with_admin_only(&harness).await;
+    install_form(&harness, NICKNAME_LATER_LOGIN_REQUIRED).await;
+    let subject = harness.seed_user("member@example.test", PASSWORD).await;
+    // The operator's plane stages the admin-only metadata (and a user-visible `age`, so the
+    // merge base is provably non-empty and the deep merge is still exercised).
+    seed_traits(
+        &harness,
+        &subject,
+        r#"{"email":"member@example.test","age":41,"risk_score":90}"#,
+    )
+    .await;
+
+    let (flow_id, token) = api_login_create(&harness).await;
+    let (_s, held) = submit_primary(&harness, &flow_id, &token, "member@example.test").await;
+    let token = held["submit_token"].as_str().expect("token").to_owned();
+    // The held profiling step must NOT render the admin-only field: it is invisible to a
+    // self-service surface, so it is not something the user could ever be asked for.
+    assert!(
+        node_named(&held["flow"], "risk_score").is_none(),
+        "the profiling step must not render an admin-only trait: {held}"
+    );
+
+    let (status, _h, done) = post_json(
+        &harness,
+        &submit_path(&harness, "login"),
+        &json!({"id": flow_id, "submit_token": token, "nodes": {"nickname": "zeke"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "profiling submit: {done}");
+    assert_eq!(
+        done["state"], "completed",
+        "the profiling write succeeds: a self-service write that names no admin-only trait \
+         is legal, and it is the REDACTED merge base that keeps it from naming one: {done}"
+    );
+
+    let traits = read_traits(&harness, &subject)
+        .await
+        .expect("traits sealed");
+    assert_eq!(
+        traits["nickname"], "zeke",
+        "the collected value landed: {traits}"
+    );
+    assert_eq!(
+        traits["age"], 41,
+        "the pre-existing USER-VISIBLE trait is still merged, so the redacted merge base did \
+         not become an empty one: {traits}"
+    );
+    assert_eq!(
+        traits["risk_score"], 90,
+        "the admin-only trait the self-service surface never saw was carried over by the \
+         write class rather than deleted by the whole-document replace: {traits}"
+    );
+}

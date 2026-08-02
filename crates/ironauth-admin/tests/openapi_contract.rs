@@ -84,6 +84,7 @@ fn operation_ids_are_the_stable_set() {
     assert_eq!(
         ids,
         vec![
+            "activateTraitSchemaVersion",
             "addOrgGroupMember",
             "applyConfigPromotion",
             "approveRecoveryApproval",
@@ -107,6 +108,7 @@ fn operation_ids_are_the_stable_set() {
             "createOrganization",
             "createPermission",
             "createTenant",
+            "createTraitSchemaVersion",
             "createUser",
             "deleteBrand",
             "deleteBrandFavicon",
@@ -131,6 +133,7 @@ fn operation_ids_are_the_stable_set() {
             "exportConfigSnapshot",
             "exportIdentities",
             "extendSignupQuarantine",
+            "getActiveTraitSchema",
             "getBrand",
             "getClientAdminConsent",
             "getClientAllowedScopes",
@@ -163,7 +166,9 @@ fn operation_ids_are_the_stable_set() {
             "getSigningRecommendations",
             "getSignupForm",
             "getTenant",
+            "getTraitSchemaVersion",
             "getUser",
+            "getUserTraits",
             "liftBan",
             "linkUserExternalId",
             "listBans",
@@ -193,6 +198,7 @@ fn operation_ids_are_the_stable_set() {
             "listSessions",
             "listSignupQuarantines",
             "listTenants",
+            "listTraitSchemaVersions",
             "listUserConsents",
             "listUsers",
             "pinFlowVersion",
@@ -307,6 +313,8 @@ fn every_post_documents_the_idempotency_key_header() {
         "createConnector",
         "createFlowVersion",
         "pinFlowVersion",
+        "createTraitSchemaVersion",
+        "activateTraitSchemaVersion",
         "verifyDcrClient",
         "revokeSession",
         "bulkRevokeSessions",
@@ -453,9 +461,13 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/sessions",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/sessions/{session_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/signup-quarantine",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas/active",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas/{version}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/users",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/consents",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/traits",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/webauthn/mds3/health",
             "PATCH /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}",
             "PATCH /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}",
@@ -500,6 +512,8 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/signup-quarantine/{user_id}/approve",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/signup-quarantine/{user_id}/extend",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/signup-quarantine/{user_id}/reject",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas/{version}/activate",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/users",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/consents/{client_id}/revoke",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/sessions/revoke",
@@ -611,7 +625,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        150,
+        156,
         "the documented route count is pinned"
     );
 

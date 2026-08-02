@@ -96,6 +96,7 @@ mod signup_quarantine;
 mod state;
 mod sudo;
 mod tenants;
+mod trait_schemas;
 mod users;
 mod views;
 
@@ -677,6 +678,37 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/external-id",
             put(users::link_user_external_id).delete(users::unlink_user_external_id),
+        )
+        // The user's identity-traits document (issue #53). A static suffix under
+        // `{user_id}`, a sibling of `/state` and `/external-id`, so it is safe wherever it
+        // is registered. Read only on this plane: traits are WRITTEN through the create body
+        // and the PATCH body, which is where they are validated against the active schema.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/traits",
+            get(users::get_user_traits),
+        )
+        // Per-environment identity trait-schema versions (issue #53): the append-only registry
+        // (create / list / get) plus the two pointers, the ACTIVE read that is also the schema
+        // introspection endpoint, and the cutover-gated activate. `/active` is a STATIC segment
+        // sibling of the parameterized `/{version}`; the router ranks a static segment above a
+        // parameter, and `parse_version` answers the uniform not-found for the literal anyway,
+        // so the pair cannot silently mis-route in either direction.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas",
+            post(trait_schemas::create_trait_schema_version)
+                .get(trait_schemas::list_trait_schema_versions),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas/active",
+            get(trait_schemas::get_active_trait_schema),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas/{version}",
+            get(trait_schemas::get_trait_schema_version),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas/{version}/activate",
+            post(trait_schemas::activate_trait_schema_version),
         )
         // Admin user-invitation CRUD (issue #60): create (provisioning a
         // pending_verification user and a single-use, expiring, unguessable token),

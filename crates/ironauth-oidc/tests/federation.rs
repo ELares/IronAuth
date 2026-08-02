@@ -2029,3 +2029,171 @@ async fn a_connector_disabled_between_authorize_and_callback_fails_closed_at_the
         "no user is provisioned once the connector is disabled"
     );
 }
+
+/// The mapping schema plus an ADMIN-ONLY `risk_score` the operator's plane owns. Declared in
+/// the schema (the fixture sets `additionalProperties: false`), never mapped by the
+/// connector below.
+fn mapping_trait_schema_with_admin_only() -> String {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "email": {"type": "string", "minLength": 3},
+            "name": {"type": "string"},
+            "risk_score": {"type": "integer", "x-ironauth": {"visibility": "admin"}}
+        },
+        "additionalProperties": false
+    })
+    .to_string()
+}
+
+/// A connector whose claim mapping TARGETS the admin-only trait: the shape the config-time
+/// gate refuses, seeded straight into the store here so the store seam's own refusal is what
+/// is under test (this is a mapping stored before that gate existed).
+fn admin_only_mapping_definition(slug: &str) -> String {
+    format!(
+        r#"{{"connector_id":"{slug}","display_name":"Hostile","protocol":"oidc","endpoints":{{"issuer":"{UPSTREAM_ISSUER}"}},"scopes":["openid","email"],"client_id":"{UPSTREAM_CLIENT_ID}","claim_mapping":{{"traits":{{"email":{{"source":["email"]}},"risk_score":{{"source":["risk_score"],"required":false}}}}}}}}"#
+    )
+}
+
+/// A RETURNING federated login refreshes the mapped traits WITHOUT dropping the admin-only
+/// metadata an operator set on the identity.
+///
+/// This is the wiring probe for the `SelfService` class on `federation.rs`, and it exists
+/// because that wiring was covered by NOTHING: MEASURED, mutating the returning-login write
+/// back to the base `set_traits` left all 22 shipped federation tests green, including
+/// `a_returning_login_refreshes_the_mapped_traits`, which drives exactly this path. That
+/// test asserts what the mapping WROTE; the defect is in what the write DESTROYED, and no
+/// assertion looked at it. A trait write replaces the WHOLE document, so a returning login
+/// whose mapping produces only the upstream's fields silently deleted every admin-only field
+/// on the identity.
+#[tokio::test]
+async fn a_returning_login_keeps_the_admin_only_metadata_it_does_not_map() {
+    let harness = Harness::start().await;
+    seed_trait_schema(&harness, &mapping_trait_schema_with_admin_only()).await;
+    seed_connector_json(
+        &harness,
+        CONNECTOR_SLUG,
+        &mapped_connector_definition(CONNECTOR_SLUG),
+    )
+    .await;
+    let upstream = start_upstream().await;
+    let runtime = build_runtime(upstream.addr, vec![IpAddr::from([93, 184, 216, 34])]);
+
+    let first = login_with_overrides(
+        &harness,
+        &runtime,
+        &upstream,
+        CONNECTOR_SLUG,
+        "keeper-sub",
+        serde_json::json!({ "email": "old@upstream.example", "name": "Old Name" }),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::SEE_OTHER);
+    let external_id = federated_external_id(UPSTREAM_ISSUER, "keeper-sub");
+    let user_id = provisioned_user_id(&harness, &external_id)
+        .await
+        .expect("first login");
+
+    // The OPERATOR sets admin-only metadata the upstream never sees and never maps.
+    let env = harness.env().clone();
+    harness
+        .db()
+        .control_store()
+        .scoped(harness.scope())
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+        .users()
+        .set_traits(
+            &env,
+            &user_id,
+            r#"{"email":"old@upstream.example","name":"Old Name","risk_score":90}"#,
+        )
+        .await
+        .expect("the management plane may write admin-only metadata");
+
+    // A returning login, with the upstream asserting drifted values.
+    let second = login_with_overrides(
+        &harness,
+        &runtime,
+        &upstream,
+        CONNECTOR_SLUG,
+        "keeper-sub",
+        serde_json::json!({ "email": "new@upstream.example", "name": "New Name" }),
+    )
+    .await;
+    assert_eq!(
+        second.status(),
+        StatusCode::SEE_OTHER,
+        "the returning login still succeeds"
+    );
+    let (_, traits) = harness
+        .store()
+        .scoped(harness.scope())
+        .users()
+        .traits(&user_id)
+        .await
+        .expect("traits read")
+        .expect("traits present");
+    // The mapped fields DID refresh, so the write really happened and this is not passing
+    // by virtue of nothing being written at all.
+    assert_eq!(
+        traits.get("name"),
+        Some(&serde_json::json!("New Name")),
+        "the mapped traits refreshed: {traits}"
+    );
+    assert_eq!(
+        traits.get("email"),
+        Some(&serde_json::json!("new@upstream.example")),
+        "{traits}"
+    );
+    // And the admin-only field the mapping never named survived the whole-document replace.
+    assert_eq!(
+        traits.get("risk_score"),
+        Some(&serde_json::json!(90)),
+        "a returning federated login must not delete admin-only metadata it does not map: \
+         {traits}"
+    );
+}
+
+/// A FIRST federated login through a connector whose mapping TARGETS an admin-only trait
+/// provisions NOTHING.
+///
+/// The create path is a second SQL site persisting `traits_sealed`, and it seals VERBATIM,
+/// so before the visibility class reached it an upstream identity provider wrote admin-only
+/// metadata onto a brand-new local identity and was refused only on the SECOND login, which
+/// is both the bypass and a self-inflicted failure on a login that used to work. Fail-closed
+/// is the right answer here: a mapping the operator must fix cannot be papered over by
+/// silently dropping the field, which would leave the operator believing it was applied.
+#[tokio::test]
+async fn a_first_federated_login_cannot_write_an_admin_only_trait() {
+    let harness = Harness::start().await;
+    seed_trait_schema(&harness, &mapping_trait_schema_with_admin_only()).await;
+    seed_connector_json(
+        &harness,
+        CONNECTOR_SLUG,
+        &admin_only_mapping_definition(CONNECTOR_SLUG),
+    )
+    .await;
+    let upstream = start_upstream().await;
+    let runtime = build_runtime(upstream.addr, vec![IpAddr::from([93, 184, 216, 34])]);
+
+    let response = login_with_overrides(
+        &harness,
+        &runtime,
+        &upstream,
+        CONNECTOR_SLUG,
+        "hostile-sub",
+        serde_json::json!({ "email": "mallory@upstream.example", "risk_score": 0 }),
+    )
+    .await;
+    assert_ne!(
+        response.status(),
+        StatusCode::SEE_OTHER,
+        "a login that would write admin-only metadata does not establish a session"
+    );
+    let external_id = federated_external_id(UPSTREAM_ISSUER, "hostile-sub");
+    assert!(
+        provisioned_user_id(&harness, &external_id).await.is_none(),
+        "NO user is provisioned when the mapping targets an admin-only trait: the create \
+         path carries the visibility class too"
+    );
+}

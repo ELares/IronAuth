@@ -353,3 +353,19 @@ in with their original password, including a user still on an imported foreign h
 Because the export serializes the same record format the import consumes and both
 sides share one algorithm-tagged hash layer, the round-trip is lossless by
 construction. You can always leave.
+
+### Identity traits on import (issue #53)
+
+Importing into a scope that has NO active trait schema restores the traits document
+VERBATIM and validates nothing. That is the covenant, and it is what makes a restore
+into a brand new instance lossless: the target has registered no schema yet, so there
+is nothing to validate against and the source's own already-valid document is the
+authority.
+
+Importing into a scope that DOES serve an active schema validates each restored
+document against it. A record whose traits violate the schema is reported as that
+RECORD's failure, with the RFC 6901 pointer of each offending field and never the
+offending value, and the rest of the import proceeds. This is not a narrowing of the
+covenant: it applies only where the target has already declared a contract, and it
+replaces the alternative of writing documents no live trait write could have produced
+and finding out at the next schema cutover.

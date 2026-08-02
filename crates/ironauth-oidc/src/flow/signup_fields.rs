@@ -29,7 +29,9 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map, Number, Value};
 
-use ironauth_store::{Scope, SignupFormConfig, SignupFormField, SignupStep, TraitSchema};
+use ironauth_store::{
+    Scope, SignupFormConfig, SignupFormField, SignupStep, TraitSchema, validate_signup_form,
+};
 
 use super::message::{self, Message, MessageContext, MessageId};
 use super::model::{FieldConstraints, InputType, Node, NodeAttributes, NodeGroup};
@@ -40,12 +42,32 @@ use crate::state::OidcState;
 /// client from the flow's `/authorize` resume target, read that client's active signup form,
 /// and compile the scope's active trait schema. Returns the config, the compiled schema, and
 /// the schema version, or [`None`] when the flow has no client, the client has no form, there
-/// is no active schema, or any read faults (a form is a pure additive collection, never a hard
-/// block, so any absence degrades to collecting nothing).
+/// is no active schema, the STORED form no longer validates against the NOW-active schema, or
+/// any read faults (a form is a pure additive collection, never a hard block, so any absence
+/// degrades to collecting nothing).
 ///
 /// This is the ONE loader both the registration path (the Signup-step fields) and the
 /// progressive profiling path (the LaterLogin-step fields) read the live form through, so a
 /// management write reflects on the very next flow transition on either path.
+///
+/// ## Why the stored form is RE-VALIDATED here (issue #53)
+///
+/// `validate_signup_form` runs at form-WRITE time, against the schema active THEN. The trait
+/// schema is a versioned, independently activated artifact, so the pair can drift, and the
+/// cutover scan does NOT catch the drift: it validates identity DATA against the target
+/// schema, and an `x-ironauth` annotation is not a validation rule, so a version that newly
+/// marks a trait admin-only activates cleanly with the form still pointing at it. MEASURED:
+/// a form field on `/risk_score` configured under v1 survived a v2 marking `risk_score`
+/// admin-only, and an end-user signup then wrote an admin-only trait.
+/// [`signup_field_nodes`] did not stop it either, because it only drops a pointer that no
+/// longer RESOLVES, and an admin-only field resolves perfectly well.
+///
+/// Re-validating here makes the config gate and the flow agree at every transition. A stale
+/// form degrades to collecting NOTHING rather than to collecting a subset: the existing
+/// posture of this loader is that any absence collects nothing, and a form the operator can
+/// no longer legally write is exactly such an absence. It fails CLOSED, which a per-field
+/// filter would not: a filter has to decide what a partially applied form means for a
+/// `required` field, and every answer to that is worse than not collecting.
 pub(super) async fn load_active_signup_form(
     state: &OidcState,
     scope: Scope,
@@ -68,6 +90,7 @@ pub(super) async fn load_active_signup_form(
         .await
         .ok()??;
     let schema = TraitSchema::compile(&active.schema_json).ok()?;
+    validate_signup_form(&config, &schema).ok()?;
     Some((config, schema, active.version))
 }
 

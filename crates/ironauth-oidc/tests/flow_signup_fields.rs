@@ -381,3 +381,115 @@ fn extract_flow_id(html: &str) -> String {
     let vend = rest.find('"').expect("flow value end");
     rest[..vend].to_owned()
 }
+
+/// Append and activate a SECOND schema version that marks `nickname` admin-only, WITHOUT
+/// touching the stored signup form. The cutover scan passes: it validates identity DATA
+/// against the target schema, and an `x-ironauth` annotation is not a validation rule.
+async fn activate_schema_marking_nickname_admin_only(harness: &Harness) {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "email": {"type": "string", "x-ironauth": {"identifier": true, "verification": "email"}},
+            "nickname": {
+                "type": "string",
+                "minLength": 3,
+                "maxLength": 20,
+                "x-ironauth": {"visibility": "admin"}
+            }
+        }
+    })
+    .to_string();
+    let env = harness.env().clone();
+    let scope = harness.scope();
+    let (_, version) = harness
+        .db()
+        .control_store()
+        .scoped(scope)
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+        .trait_schemas()
+        .create_version(&env, &schema, 2_000_000)
+        .await
+        .expect("create schema version 2");
+    harness
+        .db()
+        .control_store()
+        .scoped(scope)
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+        .trait_schemas()
+        .activate_version(&env, version)
+        .await
+        .expect("activate schema version 2: an annotation change blocks no cutover");
+}
+
+/// A signup form that has gone STALE against a newer schema collects NOTHING, and a
+/// self-service signup therefore cannot write a trait the new version made admin-only.
+///
+/// This was a live attack, MEASURED end to end: configure a signup field on a trait under v1,
+/// activate a v2 marking that trait admin-only (which the cutover scan passes, because
+/// annotations do not affect validation), and an end-user signup wrote admin-only metadata.
+/// Nothing stopped it. `validate_signup_form` runs only at form-WRITE time; the flow's own
+/// `signup_field_nodes` only drops a pointer that no longer RESOLVES, and an admin-only field
+/// resolves perfectly well.
+///
+/// Two independent gates now close it and BOTH are asserted, because either alone would leave
+/// the property depending on a single call site:
+///
+/// - `load_active_signup_form` re-validates the stored form against the NOW-active schema, so
+///   the field is not rendered and not collected;
+/// - the store's `register_inner` seam applies the SELF-SERVICE class, so even a submission
+///   that somehow named the trait could not seal it.
+#[tokio::test]
+async fn a_signup_form_gone_stale_against_a_newer_schema_collects_nothing() {
+    let harness = setup().await;
+    install_schema(&harness).await;
+    install_form(&harness).await;
+
+    // The control: under v1 the field IS rendered, so the assertion below measures the
+    // schema change and not a broken fixture.
+    let (_flow_id, _token, create) = api_create(&harness).await;
+    assert!(
+        node_named(&create["flow"], "nickname").is_some(),
+        "under v1 the configured field renders: {create}"
+    );
+
+    activate_schema_marking_nickname_admin_only(&harness).await;
+
+    // The field is GONE from the very next created flow (immediacy, the same property the
+    // form's own management write has).
+    let (flow_id, token, create) = api_create(&harness).await;
+    assert!(
+        node_named(&create["flow"], "nickname").is_none(),
+        "a form field the operator could no longer legally configure must not render: \
+         {create}"
+    );
+
+    // And a submission that sends the value anyway completes the registration WITHOUT
+    // sealing it: the value is not a collected field, so nothing carries it into the
+    // account's trait document.
+    let (status, done) = post_json(
+        &harness,
+        &submit_path(&harness),
+        &json!({
+            "id": flow_id,
+            "submit_token": token,
+            "nodes": {"identifier": "member@example.test", "password": PASSWORD, "nickname": "zeke"},
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "submit: {done}");
+    assert_eq!(
+        done["state"], "completed",
+        "the signup itself is not blocked: a form is an additive collection, so a stale one \
+         degrades to collecting nothing: {done}"
+    );
+    let pool = harness.db().owner_pool();
+    let row = sqlx::query("SELECT traits_sealed IS NOT NULL AS has_traits FROM users")
+        .fetch_one(pool)
+        .await
+        .expect("one user row");
+    let has_traits: bool = row.get("has_traits");
+    assert!(
+        !has_traits,
+        "an end-user signup must not seal a trait the active schema marks admin-only"
+    );
+}

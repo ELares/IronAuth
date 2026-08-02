@@ -6,6 +6,103 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Review fold on the identity trait-schema surface (issue #53, PR 1).
+
+  - **A connector claim mapping that targets an admin-only trait is refused at CONFIG time**,
+    on both the create and the update, naming `/claim_mapping/traits/<field>`. The claim
+    mapping is the other configuration surface that can name a trait and it had NO admin-only
+    gate at all (`grep -rn "is_admin_only|admin_only|visibility"` over `ironauth-connector`
+    and `connectors.rs` returned nothing), so an upstream identity provider could write
+    admin-only metadata onto a local identity. The store's write class refuses it too, but a
+    LOGIN-time refusal breaks the end user for a fault only the operator can fix; this is the
+    same posture `validate_signup_form` already takes on the signup-form surface.
+  - **The import path validates when the target scope HAS an active schema.** It skipped
+    validation unconditionally; the exit covenant only needs that when the target has NO
+    schema (a lossless restore into a fresh scope). A violating record is now that record's
+    failure through the existing `ImportReport`, with an RFC 6901 pointer and no trait value
+    in the reason, and the rest of the import proceeds.
+  - `scripts/idempotent-write-audit.sh`'s `MINIMUM_ROWS` floor moves 42 to 45, matching the
+    inventory this surface grew; at 42 the floor permitted a silent shrink of three sites.
+  - `tests/sudo.rs` drives the trait-schema CREATE and ACTIVATE gates, the activate half
+    separately so it cannot ride on the create's elevation.
+  - Verdicts written down where a reader returns the FULL document on purpose: the outbound
+    migration verify-credential endpoint (armed by the operator's per-environment sealed
+    bearer, and lossy for the successor if redacted, exactly like `exportIdentities`), and
+    why `getUserTraits` writes no audit row while `exportIdentities` does (the audited event
+    is a whole-environment EGRESS, not a decryption; no single-identity management read on
+    this plane audits).
+  - The module doc records that a traits LIST was deliberately omitted (the bulk read is
+    `exportIdentities`, which is paginated and audited; a trait-valued filter would need a
+    queryable projection of a column that is sealed at rest).
+
+  Test vacuities the review found, all fixed and all re-measured: the export round trip
+  asserted a `traits_schema_version` of 1 that was the only value its fixture could produce
+  (it now activates a second version and asserts 2, and the constant mutation is killed by
+  this file rather than only by `tests/export.rs`); the cutover refusal asserted a count of 1
+  that a hardcoded 1 satisfied (it now plants two failing identities, asserts 2, fixes one,
+  and asserts the count FOLLOWS the population down to 1); the round-trip PATCH payload now
+  actually does the three things its comment claims (removes an array element, reverses the
+  survivors, adds a nested member), asserted against the created document; and the
+  "no failure echoes a value" loop now submits a `zip` that FAILS, so it is not ranging over
+  failures that could never have mentioned it.
+
+- Identity trait schemas as a management surface (issue #53, PR 1). The versioned
+  trait-schema registry, the validator, and the visibility split all existed in the store
+  and had ZERO production callers: `docs/openapi/management.json` contained no path matching
+  `trait` or `schema`, `createUser` passed `traits_json: None`, and `activate_version` and
+  `list_versions` were reachable only from tests. This PR is the surface that makes them
+  live, targeting acceptance criteria 1, 3 and 4.
+
+  **The registry.** Five endpoints under
+  `/v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas`, mirroring the
+  journey-version registry (issue #92) because it is the same shape of thing: an append-only
+  set of IMMUTABLE versions with one active pointer. `POST` appends a candidate version
+  (Idempotency-Key required, replayed on retry, sudo gated, `require_live_environment`);
+  `GET` lists them; `GET /{version}` reads one; `GET /active` is the schema INTROSPECTION
+  endpoint, serving the active document together with its parsed behavior annotations, so a
+  form generator reads both from one response; `POST /{version}/activate` is the cutover.
+  There is no PUT and no DELETE: a version is immutable, and a change is a new version.
+
+  **Traits on the user surface.** `createUser` and `updateUser` now take a `traits`
+  document. It is VALIDATED against the environment's ACTIVE schema before anything is
+  written, and a violating document is a `422` carrying one `trait_errors` entry PER FAILING
+  FIELD, each with its RFC 6901 JSON Pointer, with nothing written. A valid document is
+  persisted together with the schema version it validated against, and a later activation
+  does NOT restamp it (that stamp is what lets a migration job select the identities still on
+  an older version). `GET .../users/{user_id}/traits` reads the document back. An environment
+  with no active schema refuses a traits-carrying write with a legible `422` rather than
+  performing an unvalidated one.
+
+  **The per-field errors are STRUCTURED, and that needed one deliberate interception.** The
+  central `From<StoreError>` renders through `Display`, which JOINS the failures into a
+  sentence; that is exactly the information a form cannot reconstruct (which INPUT failed).
+  `StoreError::TraitsInvalid` is therefore lifted out ahead of the wire conversion into
+  `ApiError::TraitsInvalid`, so every route that converts through the one impl gets the
+  structured contract without carrying an arm of its own. `ErrorBody` grew a `trait_errors`
+  list and a private `plain` constructor; the ten arms of the render used to re-spell every
+  optional field as `None`, which meant the only thing keeping a new field off an unrelated
+  error was ten identical hand edits.
+
+  **The cutover rule ships GATED, and by the stronger of the two available gates.**
+  `activateTraitSchemaVersion` refuses while ANY identity fails the target schema: the store
+  counts them on a live scan INSIDE the activation transaction, and a non-zero count is a
+  `422` naming the count with nothing moved. That is deliberately not a gate on dry-run or
+  migration job state, which is a claim about a moment that has passed (an identity written
+  after the report finished would satisfy it while still failing the schema). The later jobs
+  PR adds the operator ergonomics and can add a second precondition; it cannot loosen this
+  one.
+
+  MEASURED and fixed during the work: the first cut built the response view off the SUBMITTED
+  schema document, so a malformed schema answered `500` instead of the `400` the store's typed
+  `SchemaMalformed` already carried. A submitted schema now compiles through `validated_schema`
+  (a loud 400 naming the offending location in the schema), and only a STORED schema reaches
+  the view builder, where a compile fault genuinely is an internal fault.
+
+  `tests/trait_schemas.rs` pins the four decisive properties (a per-field-pointered refusal
+  that writes nothing, the persisted-and-not-restamped version, the visibility split in both
+  directions, and the arrays-and-nested-objects round trip through create, PATCH and export)
+  plus the registry's own contract.
+
 - Per-environment outbound migration verification (issue #250), the follow-up the #58
   adversarial review asked for. `POST .../migration/verify-credential` now reads its
   enablement AND its shared bearer from the ADDRESSED environment's own sealed

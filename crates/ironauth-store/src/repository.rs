@@ -45,7 +45,7 @@
 //! audit. This is enforcement by construction at the module boundary, not
 //! handler discipline spread across the codebase.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::time::{Duration, SystemTime};
 
@@ -14265,21 +14265,39 @@ pub struct NewAdminUser<'a> {
     /// `bcrypt`, `scrypt`, `pbkdf2`, `argon2`, `firebase-scrypt`), or [`None`] when
     /// there is no foreign hash. Set together with the hash.
     pub foreign_password_algo: Option<&'a str>,
-    /// The user's identity-traits document (issue #53) as JSON text, or [`None`] for
-    /// a user with no traits set (the three trait columns stay NULL). Sealed at rest
-    /// under the scope's active DEK exactly like the claim document. Unlike the
-    /// self-service and admin trait-write paths ([`ActingUserRepo::set_traits`]),
-    /// this seals the document VERBATIM without re-validating it against the scope's
-    /// active trait schema: it is the streaming-import / exit-restore path (issue
-    /// #58), where the traits already validated in the SOURCE instance are restored
-    /// as-is so a round-trip is lossless even into a fresh scope that has not yet
-    /// registered a schema. Set together with [`NewAdminUser::traits_schema_version`].
-    pub traits_json: Option<&'a str>,
-    /// The trait-schema version the imported `traits_json` was last validated against
-    /// in the source instance (issue #58), preserved verbatim so a later migration
-    /// job can select identities still on an older version. [`None`] when there are
-    /// no traits.
-    pub traits_schema_version: Option<i32>,
+    /// The identity-traits document to seal at INSERT (issue #53), or [`None`] for a
+    /// user created with no traits (the three trait columns stay NULL).
+    pub traits: Option<NewUserTraits<'a>>,
+}
+
+/// The identity-traits document a CREATE seals, and the surface class it comes from
+/// (issue #53).
+///
+/// The class rides WITH the document rather than beside it, so a create cannot supply
+/// traits without stating where they came from. That is not a stylistic preference: the
+/// create path was MEASURED to be a live bypass of the admin-only split (a first federated
+/// login wrote a mapped `risk_score` straight into the column), and the whole argument for
+/// putting the split on the write seam is that a caller cannot forget it. A field that can
+/// be left at a default can be forgotten; a field inside a struct you cannot construct
+/// without it cannot.
+///
+/// The document is sealed VERBATIM and is NOT re-validated against the scope's active trait
+/// schema. That is deliberate and is what the streaming-import / exit-restore path (issue
+/// #58) needs: traits that already validated in the SOURCE instance are restored as-is,
+/// even into a fresh scope that has not registered a schema yet. The validating spellings
+/// are [`ActingUserRepo::set_traits`] and the management create's own pre-write check.
+#[derive(Debug, Clone, Copy)]
+pub struct NewUserTraits<'a> {
+    /// The traits document as JSON text.
+    pub traits_json: &'a str,
+    /// The trait-schema version the document was last validated against, preserved
+    /// verbatim so a later migration job can select identities still on an older version.
+    /// [`None`] when the source recorded none.
+    pub schema_version: Option<i32>,
+    /// The surface class this document came from. Under
+    /// [`TraitWriteVisibility::SelfService`] a document NAMING an admin-only trait is
+    /// refused before the create transaction opens, so no user row is written.
+    pub visibility: TraitWriteVisibility,
 }
 
 /// The user id an admin create lands on: the caller's supplied one (which must be in
@@ -14303,6 +14321,59 @@ fn resolve_admin_user_id(
         }
         None => Ok(UserId::generate(env, &scope)),
     }
+}
+
+/// Apply a CREATE's visibility class to the traits it carries, BEFORE the create
+/// transaction opens (issue #53), so a refused create writes neither a user row nor an
+/// audit row.
+///
+/// This is the CREATE seam's half of [`TraitWriteVisibility`], and it is deliberately a
+/// call to the SAME [`TraitWriteVisibility::apply`] the replace seam uses rather than a
+/// second hand-rolled check: the reason the split lives on a seam at all is that a rule
+/// spelled twice drifts. Only the "cannot set" half can apply here, because a create has
+/// no existing document to preserve from or clear.
+///
+/// It runs OUTSIDE the create transaction and therefore outside the cutover lock, unlike
+/// [`ActingUserRepo::set_traits_with_visibility`]. That is sound rather than an oversight:
+/// a create seals VERBATIM and makes no claim to have validated against the active schema
+/// (that is exactly the import/restore contract [`NewUserTraits`] documents), so the state
+/// a race could produce, an identity carrying a field that a version activated moments
+/// later declares admin-only, is indistinguishable from the state the design already
+/// accepts everywhere, since annotations are never retroactive. Taking the lock here would
+/// buy nothing and would introduce a lock-ordering hazard with the joined invitation
+/// create, which writes its idempotency record first on purpose.
+///
+/// A scope with NO active schema declares no annotations at all, so no field can be
+/// admin-only and there is nothing to refuse.
+///
+/// # Errors
+///
+/// [`StoreError::TraitsInvalid`] if the class refuses the document;
+/// [`StoreError::SchemaMalformed`] if the STORED active schema does not compile;
+/// [`StoreError::Database`] on a persistence failure.
+async fn refuse_classed_create_traits(
+    store: &Store,
+    scope: Scope,
+    traits: Option<NewUserTraits<'_>>,
+) -> Result<(), StoreError> {
+    let Some(traits) = traits else {
+        return Ok(());
+    };
+    if traits.visibility == TraitWriteVisibility::Admin {
+        return Ok(());
+    }
+    let read = TraitSchemaRepo { store, scope };
+    let Some(active) = read.active().await? else {
+        return Ok(());
+    };
+    let schema = TraitSchema::compile(&active.schema_json)?;
+    let mut value: serde_json::Value = serde_json::from_str(traits.traits_json).map_err(|err| {
+        StoreError::TraitsInvalid(vec![ValidationFailure {
+            pointer: String::new(),
+            message: format!("traits are not valid JSON: {err}"),
+        }])
+    })?;
+    traits.visibility.apply(&schema, &mut value, None)
 }
 
 /// INSERT one admin-created user row into the caller's OPEN transaction (issue #52):
@@ -14372,7 +14443,12 @@ async fn insert_admin_user_row(
     // traits that already validated in the SOURCE instance as-is, even into a fresh
     // scope with no active schema. A create without traits leaves the three columns
     // NULL, and its recorded schema version is preserved verbatim.
-    let traits_json = spec.traits_json;
+    //
+    // The VISIBILITY CLASS is not applied here: it needs the scope's active schema, which
+    // is a read, and this function runs inside the caller's transaction. Both callers
+    // apply it through `refuse_classed_create_traits` BEFORE opening that transaction, so
+    // a refused create writes nothing at all.
+    let traits_json = spec.traits.map(|traits| traits.traits_json);
     // `spec.foreign_password_hash` and `spec.foreign_password_algo` (issue #55) are bound
     // straight through, AS-IS, with the non-secret algorithm tag. An imported foreign
     // hash is credential material, not PII, so it is not sealed (exactly like the native
@@ -14435,7 +14511,7 @@ async fn insert_admin_user_row(
     .bind(spec.foreign_password_algo)
     .bind(traits_sealed)
     .bind(traits_dek_version)
-    .bind(spec.traits_schema_version)
+    .bind(spec.traits.and_then(|traits| traits.schema_version))
     .execute(&mut **tx)
     .await;
     match result {
@@ -15301,8 +15377,11 @@ impl ActingUserRepo<'_> {
     // The shared registration body threads the small set of per-variant inputs (a
     // pre-allocated id, the sealed claim document, the passwordless flag, and the initial
     // lifecycle state) through one insert; grouping them into a struct would only obscure a
-    // linear seal-and-insert, so the argument-count lint is allowed here.
-    #[allow(clippy::too_many_arguments)]
+    // linear seal-and-insert, so the argument-count lint is allowed here. The LENGTH lint is
+    // allowed for the same reason: the body is one linear seal-and-insert plus the
+    // visibility class the seam states for itself, and extracting a fragment of it would
+    // scatter the one transaction a reader has to see whole.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn register_inner(
         &self,
         env: &Env,
@@ -15326,6 +15405,27 @@ impl ActingUserRepo<'_> {
         traits: Option<RegisteredTraits<'_>>,
     ) -> Result<UserId, StoreError> {
         let master = self.store.master().ok_or(StoreError::Encryption)?;
+        // The SELF-SERVICE class (issue #53), applied here and stated here rather than
+        // taken from a caller. Every path into this function is a SELF-SERVICE SIGNUP (the
+        // registration flow's active, waitlisted and quarantined creates), so the class is
+        // a property of the seam and not a decision any caller gets to make differently.
+        //
+        // This closed a MEASURED bypass: a signup form configured on `/risk_score` under v1
+        // survives a v2 that marks that trait admin-only, because the cutover scan validates
+        // DATA against the schema and an annotation is not a validation rule. The form-config
+        // gate (`validate_signup_form`) therefore refuses the field only at the moment the
+        // form is written, and the flow-side re-check added alongside this drops it from the
+        // rendered form; this is the seam that holds when neither has run.
+        refuse_classed_create_traits(
+            self.store,
+            self.scope,
+            traits.map(|carried| NewUserTraits {
+                traits_json: carried.traits_json,
+                schema_version: Some(carried.schema_version),
+                visibility: TraitWriteVisibility::SelfService,
+            }),
+        )
+        .await?;
         // The scope needs a live KEK/DEK before the first PII seal; provision them
         // lazily (idempotent) outside the register transaction.
         self.ensure_scope_keys(env, master).await?;
@@ -15467,6 +15567,11 @@ impl ActingUserRepo<'_> {
         self.ensure_scope_keys(env, master).await?;
         let scope = self.scope;
         let id = resolve_admin_user_id(env, scope, spec.id)?;
+        // The create's visibility class (issue #53), applied before anything is written. A
+        // SELF-SERVICE create (the FIRST federated login is one) naming an admin-only trait
+        // is refused here, so an upstream identity provider cannot be a channel into
+        // admin-only metadata by way of a create.
+        refuse_classed_create_traits(self.store, scope, spec.traits).await?;
         write_audited(
             AuditedWrite {
                 store: self.store,
@@ -32281,6 +32386,10 @@ impl ActingInvitationRepo<'_> {
         self.ensure_scope_keys(env, master).await?;
         let scope = self.scope;
         let user_id = resolve_admin_user_id(env, scope, spec.user.id)?;
+        // The create's visibility class (issue #53), through the SAME seam
+        // `admin_create` uses, applied before this transaction opens so a refused create
+        // leaves neither the user, the invitation, nor an audit row.
+        refuse_classed_create_traits(self.store, scope, spec.user.traits).await?;
         let invitation_id = *spec.invitation_id;
         // The invitation targets the identifier of the user it provisions, read from
         // the user spec rather than supplied a second time.
@@ -50120,6 +50229,135 @@ impl TraitSchemaRepo<'_> {
             .map(|row| trait_schema_version_from_row(self.scope, row))
             .collect()
     }
+
+    /// The next per-scope version number the registry would mint (issue #53). The
+    /// management create resolves it BEFORE the write so it can store the response it
+    /// will return under the Idempotency-Key in the SAME transaction as the version,
+    /// exactly like the journey-version registry.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn next_version(&self) -> Result<i32, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let next: i32 = sqlx::query(
+            "SELECT COALESCE(MAX(version), 0) + 1 AS next FROM trait_schemas \
+             WHERE tenant_id = $1 AND environment_id = $2",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_one(&mut *tx)
+        .await?
+        .get("next");
+        tx.commit().await?;
+        Ok(next)
+    }
+}
+
+/// TRANSACTION-scoped Postgres advisory lock serializing a scope's trait-schema CUTOVER
+/// against the scope's trait WRITES (issue #53).
+///
+/// Without it the cutover gate is a TOCTOU, and this was MEASURED rather than reasoned
+/// about. `begin_scoped` pins READ COMMITTED, `count_identities_failing_schema` is a plain
+/// `SELECT` with no `FOR SHARE`, and a trait write takes no lock covering the scope's
+/// schema pointer, so a write that validated against the STILL-ACTIVE OLD schema commits
+/// INSIDE the activation's window: at population 300 with zero delay between the two,
+/// `write_ok=true activate_ok=true` and version 2 was active while an identity held a value
+/// that fails it. A 150 ms delay does not race, which is exactly why a sequential test
+/// cannot see it.
+///
+/// The two sides take DIFFERENT MODES on purpose, which is stronger than locking both
+/// exclusively:
+///
+/// - a trait WRITE takes the lock SHARED, so concurrent writes to different identities in
+///   one environment do not serialize against each other (they never could corrupt each
+///   other: each is a single-row replace);
+/// - an ACTIVATION takes it EXCLUSIVE, so it cannot begin while any write that already read
+///   the active pointer is still in flight, and no write can read the pointer while the
+///   activation's scan and pointer move are in flight.
+///
+/// That is precisely the invariant the cutover claims: at the instant the pointer moves,
+/// every committed identity satisfies the target schema, and every write that has read the
+/// old pointer has already committed and been scanned.
+///
+/// `pg_advisory_xact_lock` auto-releases at commit or rollback, so no unlock path exists to
+/// be forgotten on an error return, and it is executable by PUBLIC so it needs no grant on
+/// either plane (a `SELECT ... FOR SHARE` would need a privilege the data-plane role does
+/// not hold on `trait_schemas`).
+///
+/// LOCK-SPACE DISJOINTNESS. This is the THIRD user of the single-argument transaction-scoped
+/// space, after the config-promotion apply and the group-hierarchy reparent; the
+/// namespace prefix inside the hashed string is what keeps the three keys apart, and a
+/// `hashtext` collision between two namespaces costs only needless serialization of two
+/// operations that are both safe under extra mutual exclusion, never a correctness failure.
+/// The migration runner's SESSION-level key is a full 64-bit constant outside `int4` range,
+/// so no `hashtext`-derived key can equal it.
+async fn lock_trait_schema_scope(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    exclusive: bool,
+) -> Result<(), StoreError> {
+    let sql = if exclusive {
+        "SELECT pg_advisory_xact_lock(hashtext($1))"
+    } else {
+        "SELECT pg_advisory_xact_lock_shared(hashtext($1))"
+    };
+    sqlx::query(sql)
+        .bind(format!(
+            "trait-schema-cutover:{}:{}",
+            scope.tenant(),
+            scope.environment()
+        ))
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// The scope's ACTIVE trait-schema version read INSIDE a caller's transaction (issue #53),
+/// so the read and the write it authorizes are one atomic unit under
+/// [`lock_trait_schema_scope`]. [`TraitSchemaRepo::active`] is the same read in a
+/// transaction of its own, for callers that only want to look.
+async fn active_trait_schema_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+) -> Result<Option<TraitSchemaVersion>, StoreError> {
+    let row = sqlx::query(&format!(
+        "SELECT {TRAIT_SCHEMA_COLUMNS} FROM trait_schemas \
+         WHERE tenant_id = $1 AND environment_id = $2 AND status = 'active'"
+    ))
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_optional(&mut **tx)
+    .await?;
+    row.map(|row| trait_schema_version_from_row(scope, &row))
+        .transpose()
+}
+
+/// One identity's decrypted trait document read INSIDE a caller's transaction (issue #53),
+/// the in-transaction twin of [`UserRepo::traits`]. The self-service write class needs the
+/// EXISTING document to preserve admin-only metadata from, and it must read it in the same
+/// transaction that writes the replacement, or a concurrent admin write of admin-only
+/// metadata could land between the read and the replace and be silently dropped.
+async fn user_traits_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    master: &MasterKey,
+    id: &UserId,
+) -> Result<Option<serde_json::Value>, StoreError> {
+    let row = sqlx::query(
+        "SELECT traits_sealed, traits_dek_version FROM users \
+         WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
+         AND deleted_at IS NULL AND traits_sealed IS NOT NULL",
+    )
+    .bind(id.to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    Ok(Some(open_user_traits(tx, scope, master, &row).await?))
 }
 
 /// The mutating trait-schema registry for a scope and actor (issue #53).
@@ -50145,11 +50383,61 @@ impl ActingTraitSchemaRepo<'_> {
         schema_json: &str,
         created_at_micros: i64,
     ) -> Result<(TraitSchemaId, i32), StoreError> {
+        let scope = self.scope;
+        let version = self
+            .store
+            .scoped(scope)
+            .trait_schemas()
+            .next_version()
+            .await?;
+        let id = TraitSchemaId::generate(env, &scope);
+        self.create_version_at(env, &id, schema_json, version, created_at_micros, None)
+            .await?;
+        Ok((id, version))
+    }
+
+    /// Create the immutable version `version` under the caller-minted `id`, storing the
+    /// version, its `trait_schema.create` audit row, and the optional idempotency record
+    /// in ONE transaction (issue #53). The schema is proved well formed BEFORE the
+    /// transaction, so a malformed schema never reaches the registry; the new version
+    /// starts as a `candidate` (activation is a separate, cutover-guarded step).
+    ///
+    /// The caller resolves `version` from [`TraitSchemaRepo::next_version`] and builds
+    /// the response it stores under the Idempotency-Key, exactly like the journey-version
+    /// registry: the management surface needs the id and version BEFORE the write, so a
+    /// retry under the same key REPLAYS the stored response rather than appending a
+    /// duplicate version.
+    ///
+    /// Append-only is enforced by the per-scope `UNIQUE (tenant, environment, version)`
+    /// index, not a row lock: two concurrent creates compute the same next version, the
+    /// first commits, and the second fails the constraint. That collision is surfaced as
+    /// [`StoreError::Conflict`] (the caller re-plans against the now-higher next
+    /// version), never a silent duplicate or overwrite.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::SchemaMalformed`] if the schema is not a well-formed JSON Schema
+    /// of the supported vocabulary; [`StoreError::NotFound`] if `id` belongs to another
+    /// scope; [`StoreError::Conflict`] if `version` was concurrently taken;
+    /// [`StoreError::IdempotencyConflict`] if the idempotency key is already stored;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn create_version_at(
+        &self,
+        env: &Env,
+        id: &TraitSchemaId,
+        schema_json: &str,
+        version: i32,
+        created_at_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
         // Prove the schema is well formed BEFORE the transaction: a malformed schema
         // never reaches the registry.
         TraitSchema::compile(schema_json)?;
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
         let scope = self.scope;
-        let id = TraitSchemaId::generate(env, &scope);
+        let id_string = id.to_string();
         let schema_owned = schema_json.to_string();
         write_audited(
             AuditedWrite {
@@ -50158,55 +50446,39 @@ impl ActingTraitSchemaRepo<'_> {
                 acting: &self.acting,
                 env,
                 action: Action::TraitSchemaCreate,
-                target: &id,
+                target: id,
             },
             async move |tx| {
-                // The next per-scope version number, computed under the row lock the
-                // audited transaction holds, so two concurrent creates cannot mint the
-                // same version (the unique index would also refuse it).
-                let next: i32 = sqlx::query(
-                    "SELECT COALESCE(MAX(version), 0) + 1 AS next FROM trait_schemas \
-                     WHERE tenant_id = $1 AND environment_id = $2",
-                )
-                .bind(scope.tenant().to_string())
-                .bind(scope.environment().to_string())
-                .fetch_one(&mut **tx)
-                .await?
-                .get("next");
-                sqlx::query(
+                // The idempotency record goes in FIRST, so a concurrent retry under the
+                // SAME key is caught HERE (the caller replays the stored response) rather
+                // than being masked by the version unique-violation below. Either failure
+                // rolls the whole transaction back, so the idempotency row never outlives
+                // a failed create.
+                insert_idempotency(tx, idempotency).await?;
+                let result = sqlx::query(
                     "INSERT INTO trait_schemas \
                      (id, tenant_id, environment_id, version, schema_json, status, created_at) \
                      VALUES ($1, $2, $3, $4, $5, 'candidate', \
                              TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval)",
                 )
-                .bind(id.to_string())
+                .bind(&id_string)
                 .bind(scope.tenant().to_string())
                 .bind(scope.environment().to_string())
-                .bind(next)
+                .bind(version)
                 .bind(&schema_owned)
                 .bind(created_at_micros)
                 .execute(&mut **tx)
-                .await?;
-                Ok(())
+                .await;
+                match result {
+                    Ok(_) => Ok(()),
+                    // The append-only unique index refused a concurrently-taken version.
+                    Err(error) if is_unique_violation(&error) => Err(StoreError::Conflict),
+                    Err(error) => Err(error.into()),
+                }
             },
             false,
         )
-        .await?;
-        // Read back the version the audited insert minted (the in-transaction
-        // MAX + 1), keyed by the id we just created.
-        let mut tx = begin_scoped(self.store, scope).await?;
-        let version: i32 = sqlx::query(
-            "SELECT version FROM trait_schemas \
-             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
-        )
-        .bind(id.to_string())
-        .bind(scope.tenant().to_string())
-        .bind(scope.environment().to_string())
-        .fetch_one(&mut *tx)
-        .await?
-        .get("version");
-        tx.commit().await?;
-        Ok((id, version))
+        .await
     }
 
     /// Activate a candidate version as the scope's served default (the cutover). The
@@ -50222,6 +50494,26 @@ impl ActingTraitSchemaRepo<'_> {
     /// [`StoreError::Encryption`] if no master key is configured or a sealed value
     /// cannot be opened; [`StoreError::Database`] on a persistence failure.
     pub async fn activate_version(&self, env: &Env, version: i32) -> Result<(), StoreError> {
+        self.activate_version_idempotent(env, version, None).await
+    }
+
+    /// Activate `version` as the scope's served default, storing the activation, its
+    /// `trait_schema.activate` audit row, and the optional idempotency record in ONE
+    /// transaction (issue #53). See [`activate_version`](Self::activate_version) for the
+    /// cutover rule; this is the spelling the management surface uses, so a retried
+    /// activation under the same Idempotency-Key REPLAYS rather than re-running the
+    /// live scan.
+    ///
+    /// # Errors
+    ///
+    /// As [`activate_version`](Self::activate_version), plus
+    /// [`StoreError::IdempotencyConflict`] if the idempotency key is already stored.
+    pub async fn activate_version_idempotent(
+        &self,
+        env: &Env,
+        version: i32,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
         let master = self.store.master().ok_or(StoreError::Encryption)?;
         let scope = self.scope;
         let detail = version.to_string();
@@ -50239,6 +50531,16 @@ impl ActingTraitSchemaRepo<'_> {
                 target: &target,
             },
             async move |tx| {
+                // The cutover lock, EXCLUSIVE and taken before anything this transaction
+                // reads, so the scan below is authoritative: no trait write can read the
+                // still-old active pointer while this runs, and every write that already
+                // read it has committed and is therefore visible to the scan. Without it
+                // the gate is a MEASURED TOCTOU (see `lock_trait_schema_scope`).
+                lock_trait_schema_scope(tx, scope, true).await?;
+                // The idempotency record goes in next, so a concurrent retry under the
+                // SAME key is caught before the live cutover scan is paid for a second
+                // time. A failure of either rolls the whole transaction back.
+                insert_idempotency(tx, idempotency).await?;
                 let schema_json: Option<String> = sqlx::query(
                     "SELECT schema_json FROM trait_schemas \
                      WHERE tenant_id = $1 AND environment_id = $2 AND version = $3",
@@ -50292,32 +50594,83 @@ impl ActingTraitSchemaRepo<'_> {
     }
 }
 
-/// Count the scope's identities whose sealed traits fail `schema`. Opens each
-/// identity's trait document under its recorded DEK version and validates it. Used by
-/// the activation cutover guard.
+/// How many identities the cutover scan reads per round trip (issue #53). The scan runs
+/// inside the activation's HELD WRITE TRANSACTION, so its cost is time the whole scope's
+/// trait writes are blocked; a keyset page keeps its MEMORY constant regardless of the
+/// population, and a page this size keeps the number of round trips (and so the latency
+/// floor on a high-round-trip topology) two orders of magnitude below one per identity.
+const CUTOVER_SCAN_PAGE: i64 = 500;
+
+/// Count the scope's identities whose sealed traits fail `schema`. Opens each identity's
+/// trait document under its recorded DEK version and validates it. Used by the activation
+/// cutover guard.
+///
+/// STREAMED and DEK-CACHED, because this runs inside a held write transaction and its cost
+/// is the cutover's blocking window. The first cut did `fetch_all` (every sealed blob in
+/// the scope materialized at once) and re-fetched-and-unwrapped the DEK and its KEK per
+/// identity: TWO uncached round trips plus a KEK unwrap and a DEK unwrap for every row.
+/// MEASURED strictly linear at about 0.1 ms/identity locally, which on a topology with 0.5
+/// ms round trips is dominated by those two per identity and makes a million identities a
+/// multi-minute blocking window with O(N) memory. A scope has very few DEK VERSIONS (one
+/// per rotation), so the DEK is resolved once per version and reused, and the rows are
+/// walked with a keyset cursor so memory is one page.
+#[allow(clippy::map_entry)]
 async fn count_identities_failing_schema(
     tx: &mut Transaction<'_, Postgres>,
     scope: Scope,
     master: &MasterKey,
     schema: &TraitSchema,
 ) -> Result<i64, StoreError> {
-    let rows = sqlx::query(
-        "SELECT id, traits_sealed, traits_dek_version FROM users \
-         WHERE tenant_id = $1 AND environment_id = $2 \
-         AND deleted_at IS NULL AND traits_sealed IS NOT NULL ORDER BY id",
-    )
-    .bind(scope.tenant().to_string())
-    .bind(scope.environment().to_string())
-    .fetch_all(&mut **tx)
-    .await?;
     let mut invalid: i64 = 0;
-    for row in &rows {
-        let traits = open_user_traits(tx, scope, master, row).await?;
-        if !schema.validate(&traits).is_empty() {
-            invalid += 1;
+    let mut deks: BTreeMap<i32, Dek> = BTreeMap::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let rows = sqlx::query(
+            "SELECT id, traits_sealed, traits_dek_version FROM users \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+             AND deleted_at IS NULL AND traits_sealed IS NOT NULL \
+             AND ($3::text IS NULL OR id > $3) ORDER BY id LIMIT $4",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(cursor.as_deref())
+        .bind(CUTOVER_SCAN_PAGE)
+        .fetch_all(&mut **tx)
+        .await?;
+        if rows.is_empty() {
+            return Ok(invalid);
         }
+        for row in &rows {
+            let dek_version: i32 = row.get("traits_dek_version");
+            // The unwrap chain (KEK fetch, KEK unwrap, DEK unwrap) is paid ONCE per DEK
+            // VERSION, not once per identity. `clippy::map_entry` is allowed on this
+            // function because its suggestion is not expressible here: `Entry::or_insert`
+            // and `or_insert_with` take a VALUE or a synchronous infallible closure, and
+            // resolving a DEK is both fallible and `async`.
+            if !deks.contains_key(&dek_version) {
+                let dek = fetch_dek_by_version(tx, scope, master, dek_version).await?;
+                deks.insert(dek_version, dek);
+            }
+            let dek = deks.get(&dek_version).ok_or(StoreError::Encryption)?;
+            let sealed: Vec<u8> = row.get("traits_sealed");
+            let plaintext = dek.open(
+                &user_pii_seal_aad(scope, USER_TRAITS_PURPOSE, dek_version),
+                &Sealed::from_bytes(sealed)?,
+            )?;
+            let traits: serde_json::Value =
+                serde_json::from_slice(&plaintext).map_err(|_| StoreError::Encryption)?;
+            if !schema.validate(&traits).is_empty() {
+                invalid += 1;
+            }
+        }
+        // The keyset cursor: the last id of this page. A page shorter than the limit is
+        // the last one.
+        if i64::try_from(rows.len()).unwrap_or(i64::MAX) < CUTOVER_SCAN_PAGE {
+            return Ok(invalid);
+        }
+        let last: String = rows[rows.len() - 1].get("id");
+        cursor = Some(last);
     }
-    Ok(invalid)
 }
 
 /// Open one identity's sealed trait document from a selected row carrying
@@ -50913,7 +51266,125 @@ impl UserRepo<'_> {
     }
 }
 
+/// Which surface class a trait write comes from, and therefore whether the admin-only
+/// visibility split applies to it (issue #53).
+///
+/// The split has two halves and BOTH belong on the write seam, not on the callers: a
+/// rule enforced by one writer and not another reads as enforced while a second writer
+/// walks around it.
+///
+/// ## Every persisting path states a class
+///
+/// There are FOUR places in the tree that write the `users.traits_sealed` column, and the
+/// class is a required input to three of them (the fourth is the migration job, whose
+/// input is the store's OWN already-classed document, not a submission):
+///
+/// - [`ActingUserRepo::set_traits_with_visibility`], the replace seam (management PATCH,
+///   progressive profiling, returning federated login);
+/// - `insert_admin_user_row`, the CREATE seam, reached by [`ActingUserRepo::admin_create`]
+///   and by the joined invitation create; the class rides on
+///   [`NewUserTraits::visibility`], so a create carrying traits cannot be written without
+///   naming one;
+/// - `register_inner`, the SELF-SERVICE SIGNUP seam, which is self-service by
+///   construction and so states [`TraitWriteVisibility::SelfService`] itself rather than
+///   taking it from a caller who could get it wrong.
+///
+/// This was MEASURED, not assumed: before this, the class existed only on the replace
+/// seam, and a signup form configured on a trait that a LATER schema version marked
+/// admin-only let an end-user signup write admin-only metadata, while a first federated
+/// login wrote it straight through `NewAdminUser`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraitWriteVisibility {
+    /// A MANAGEMENT-plane write. The submitted document is authoritative over every
+    /// field, admin-only metadata included: an admin surface is precisely where
+    /// admin-only metadata is written.
+    Admin,
+    /// A SELF-SERVICE (end-user-driven) write. Admin-only metadata is INVISIBLE and
+    /// IMMUTABLE: a submission NAMING an admin-only field is refused with a per-field
+    /// JSON Pointer failure, and the identity's existing admin-only fields are carried
+    /// onto the submission, so a write that OMITS them cannot clear them.
+    SelfService,
+}
+
+impl TraitWriteVisibility {
+    /// THE one expression of the admin-only split on a trait write (issue #53). Applied by
+    /// every seam that persists a submitted trait document, in this order and no other:
+    ///
+    /// 1. a submission NAMING an admin-only field is refused before anything else (the
+    ///    "cannot set" half; refusing an explicit `null` alike is what keeps the refusal
+    ///    from being a presence oracle);
+    /// 2. a NON-OBJECT submission is refused when the identity's existing document IS an
+    ///    object, because there is no member to preserve onto and the write would
+    ///    therefore CLEAR every admin-only field by replacement. Nothing requires a
+    ///    schema to assert a root `type`, so the schema cannot be relied on for this
+    ///    (MEASURED: with a root-`type`-free schema, `[1, 2]` passed both the violation
+    ///    check and validation and cleared the identity's admin-only metadata). Refusing
+    ///    HERE rather than adding a mandatory root `type: object` to
+    ///    `check_schema_wellformed` keeps every already-stored schema compiling;
+    /// 3. the identity's EXISTING admin-only fields are carried onto the submission (the
+    ///    "cannot clear" half), because a self-service caller reads a REDACTED document
+    ///    and so can never send them back.
+    ///
+    /// The caller validates the RESULT against the schema, so a schema that `required`s an
+    /// admin-only field still validates for a self-service write.
+    ///
+    /// `existing` is [`None`] on a CREATE, where there is nothing to preserve and nothing
+    /// to clear; steps 2 and 3 are then no-ops and only the refusal applies.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::TraitsInvalid`] with one per-field failure per named admin-only
+    /// field, or a single root-pointer failure for the non-object shape.
+    fn apply(
+        self,
+        schema: &TraitSchema,
+        submitted: &mut serde_json::Value,
+        existing: Option<&serde_json::Value>,
+    ) -> Result<(), StoreError> {
+        if self == TraitWriteVisibility::Admin {
+            return Ok(());
+        }
+        let annotations = schema.annotations();
+        let refused = annotations.self_service_violations(submitted);
+        if !refused.is_empty() {
+            return Err(StoreError::TraitsInvalid(refused));
+        }
+        let Some(existing) = existing else {
+            return Ok(());
+        };
+        if !submitted.is_object() && existing.is_object() && !annotations.admin_only.is_empty() {
+            return Err(StoreError::TraitsInvalid(vec![ValidationFailure {
+                pointer: String::new(),
+                message: "a self-service submission must be an object where the identity's \
+                          stored traits are, because a non-object replacement would clear \
+                          admin-only metadata it is not allowed to write"
+                    .to_string(),
+            }]));
+        }
+        annotations.preserve_admin_only(submitted, existing);
+        Ok(())
+    }
+}
+
 impl ActingUserRepo<'_> {
+    /// Set (or replace) an identity's traits through the ADMIN visibility class: the
+    /// submitted document is authoritative over every field. See
+    /// [`set_traits_with_visibility`](Self::set_traits_with_visibility), of which this is
+    /// the [`TraitWriteVisibility::Admin`] spelling.
+    ///
+    /// # Errors
+    ///
+    /// As [`set_traits_with_visibility`](Self::set_traits_with_visibility).
+    pub async fn set_traits(
+        &self,
+        env: &Env,
+        id: &UserId,
+        traits_json: &str,
+    ) -> Result<i32, StoreError> {
+        self.set_traits_with_visibility(env, id, traits_json, TraitWriteVisibility::Admin)
+            .await
+    }
+
     /// Set (or replace) an identity's traits, validated against the scope's ACTIVE
     /// schema version and sealed at rest (issue #53). The traits document is validated
     /// before anything is written; an invalid document is refused with per-field JSON
@@ -50922,47 +51393,50 @@ impl ActingUserRepo<'_> {
     /// recorded in the same transaction. Returns the schema version the traits were
     /// validated against.
     ///
+    /// `visibility` selects the surface class (issue #53), applied by the one shared
+    /// [`TraitWriteVisibility::apply`] every persisting seam calls, so this seam and the
+    /// create seams cannot drift.
+    ///
+    /// ## Everything happens in ONE locked transaction
+    ///
+    /// The active-schema read, the class, the validation, and the replace are all inside a
+    /// single transaction holding the scope's cutover lock SHARED
+    /// ([`lock_trait_schema_scope`]). Reading the active pointer in a transaction of its
+    /// own is a MEASURED TOCTOU against the activation's cutover gate: the write validates
+    /// against the still-active OLD schema and commits inside the activation's window, so
+    /// the new version goes active while an identity holds a value that fails it. Reading
+    /// the EXISTING document inside the same transaction closes the smaller twin of the
+    /// same hole: a concurrent admin write of admin-only metadata landing between the
+    /// preservation read and the replace would be silently dropped.
+    ///
     /// # Errors
     ///
     /// [`StoreError::NotFound`] if the identity is absent in this scope;
     /// [`StoreError::NoActiveTraitSchema`] if the scope has no active schema;
-    /// [`StoreError::TraitsInvalid`] if the traits fail the active schema;
+    /// [`StoreError::TraitsInvalid`] if the traits fail the active schema, or (under
+    /// [`TraitWriteVisibility::SelfService`]) name an admin-only field;
     /// [`StoreError::Encryption`] if no master key is configured;
     /// [`StoreError::Database`] on a persistence failure.
-    pub async fn set_traits(
+    pub async fn set_traits_with_visibility(
         &self,
         env: &Env,
         id: &UserId,
         traits_json: &str,
+        visibility: TraitWriteVisibility,
     ) -> Result<i32, StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
         let master = self.store.master().ok_or(StoreError::Encryption)?;
         let scope = self.scope;
-        // The active schema is the write-time contract. No active schema is a distinct,
-        // legible error (register and activate a schema first).
-        let read = TraitSchemaRepo {
-            store: self.store,
-            scope,
-        };
-        let active = read
-            .active()
-            .await?
-            .ok_or(StoreError::NoActiveTraitSchema)?;
-        let schema = TraitSchema::compile(&active.schema_json)?;
-        let value: serde_json::Value = serde_json::from_str(traits_json).map_err(|err| {
+        // Parsing the submission is pure, so it is done before the transaction: a
+        // syntactically broken document never opens one.
+        let submitted: serde_json::Value = serde_json::from_str(traits_json).map_err(|err| {
             StoreError::TraitsInvalid(vec![ValidationFailure {
                 pointer: String::new(),
                 message: format!("traits are not valid JSON: {err}"),
             }])
         })?;
-        let failures = schema.validate(&value);
-        if !failures.is_empty() {
-            return Err(StoreError::TraitsInvalid(failures));
-        }
-        let schema_version = active.version;
-        let serialized = serde_json::to_vec(&value).map_err(|_| StoreError::Encryption)?;
         write_audited(
             AuditedWrite {
                 store: self.store,
@@ -50973,6 +51447,32 @@ impl ActingUserRepo<'_> {
                 target: id,
             },
             async move |tx| {
+                // The cutover lock, SHARED: concurrent writes to different identities in
+                // one environment do not serialize against each other, but none of them
+                // can straddle an activation.
+                lock_trait_schema_scope(tx, scope, false).await?;
+                // The active schema is the write-time contract, read under that lock. No
+                // active schema is a distinct, legible error (register and activate one
+                // first).
+                let active = active_trait_schema_in_tx(tx, scope)
+                    .await?
+                    .ok_or(StoreError::NoActiveTraitSchema)?;
+                let schema = TraitSchema::compile(&active.schema_json)?;
+                let mut value = submitted;
+                // The class: refuse what this surface may not write, then carry over what
+                // it was never shown. `None` existing traits means the identity has none,
+                // so there is nothing to preserve and nothing a replacement could clear.
+                let existing = user_traits_in_tx(tx, scope, master, id).await?;
+                visibility.apply(&schema, &mut value, existing.as_ref())?;
+                // The RESULT of the class is what the schema validates and what is
+                // persisted, so a schema that `required`s an admin-only field still
+                // validates for a self-service write.
+                let failures = schema.validate(&value);
+                if !failures.is_empty() {
+                    return Err(StoreError::TraitsInvalid(failures));
+                }
+                let schema_version = active.version;
+                let serialized = serde_json::to_vec(&value).map_err(|_| StoreError::Encryption)?;
                 // The identity must exist and be live; a missing row updates nothing,
                 // which is reported as the uniform not-found.
                 let (dek_version, dek) = fetch_active_dek(tx, scope, master).await?;
@@ -50999,12 +51499,11 @@ impl ActingUserRepo<'_> {
                 if affected == 0 {
                     return Err(StoreError::NotFound);
                 }
-                Ok(())
+                Ok(schema_version)
             },
             false,
         )
-        .await?;
-        Ok(schema_version)
+        .await
     }
 }
 

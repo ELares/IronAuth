@@ -144,6 +144,21 @@ name = "signup_forms"
 path = "tests/signup_forms.rs"
 required-features = ["testing"]
 
+# Identity trait schemas over HTTP (issue #53, PR 1): the trait-schema version registry
+# (append-only create idempotent on the Idempotency-Key, list, get, the active-version
+# introspection read, and the CUTOVER-GATED activate that is refused while an identity fails
+# the target schema), the validation wired into the user create and PATCH (a violating document
+# is a 422 carrying one RFC 6901 JSON Pointer PER FIELD and writes nothing; a valid one
+# persists the version it validated against and is NOT restamped by a later activation), the
+# admin-only visibility split in BOTH directions (a self-service write can neither set nor
+# clear admin-only metadata, while the management read still sees it), and the named Kratos
+# regression: a document carrying an array of objects AND a nested object round-trips through
+# create, PATCH, and export byte for byte. Needs a real database.
+[[test]]
+name = "trait_schemas"
+path = "tests/trait_schemas.rs"
+required-features = ["testing"]
+
 # Per-environment custom-journey version management endpoint (issue #92, PR 5): the POST
 # append-only create idempotent on the Idempotency-Key (a retry returns the same version, a
 # reused key with a different body is 422), the load-valid write validation (a precise 400), and

@@ -257,6 +257,24 @@ fn template_matches(template: &str, path: &str) -> bool {
         .all(|(pattern, segment)| pattern.starts_with('{') || pattern == segment)
 }
 
+/// How many PARAMETER segments a template carries. This is the router's precedence key: a
+/// path with a static segment where another has a parameter is the MORE specific of the
+/// two, and axum's matcher (matchit) ranks static above parameter at every position.
+///
+/// Without it this file models the router incorrectly wherever a STATIC segment is a
+/// sibling of a parameterized one, which is a shape the surface already uses in several
+/// places (`.../brands/{slug}/logo` beside `.../brands/{slug}`, and, at the same position
+/// rather than a deeper one, `.../trait-schemas/active` beside `.../trait-schemas/{version}`).
+/// MEASURED: `GET .../trait-schemas/active` matched BOTH templates, and the sweep reported
+/// the case as ambiguous when the router itself is not ambiguous at all. Ranking here makes
+/// the sweep's matcher agree with the router rather than with the raw glob.
+fn parameter_count(template: &str) -> usize {
+    template
+        .split('/')
+        .filter(|segment| segment.starts_with('{'))
+        .count()
+}
+
 /// Every id the sweep addresses, each naming a row that genuinely exists.
 struct Fixture {
     tenant: String,
@@ -308,6 +326,8 @@ struct Fixture {
     /// The target's promotable-config revision, as the plan over `snapshot` reported it.
     base_revision: String,
     flow_version: i64,
+    /// The activated trait-schema version, so the registry reads address a real row.
+    trait_schema_version: i64,
 }
 
 /// Read a JSON field out of a response body, failing loudly with the body when it is
@@ -498,6 +518,35 @@ impl Fixture {
             .pointer("/version")
             .and_then(serde_json::Value::as_i64)
             .unwrap_or_else(|| panic!("no /version in {body}"));
+
+        // A trait-schema version, ACTIVATED, so the active read, the by-version read, and
+        // the activation all address a real row (issue #53). Reach, not verdict: a 404
+        // would not be a server error, but it would also never touch the `trait_schemas`
+        // relation this sweep exists to prove the control role can reach.
+        let (status, _, body) = h
+            .post(
+                &format!("{base}/trait-schemas"),
+                "seed-trait-schema",
+                &serde_json::json!({ "schema": {"type": "object"} }).to_string(),
+            )
+            .await;
+        assert!(status.is_success(), "create trait schema: {status} {body}");
+        let trait_schema_version = serde_json::from_str::<serde_json::Value>(&body)
+            .expect("trait schema json")
+            .pointer("/version")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or_else(|| panic!("no /version in {body}"));
+        let (status, _, body) = h
+            .post(
+                &format!("{base}/trait-schemas/{trait_schema_version}/activate"),
+                "seed-trait-schema-activate",
+                "",
+            )
+            .await;
+        assert!(
+            status.is_success(),
+            "activate trait schema: {status} {body}"
+        );
 
         // Every day-one algorithm, so the compatibility wizard resolves this issuer as
         // fully provisioned and the signing-algorithm pin reaches its write.
@@ -848,6 +897,7 @@ impl Fixture {
             user,
             quarantined_user,
             flow_version,
+            trait_schema_version,
         }
     }
 }
@@ -890,6 +940,7 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
         snapshot,
         base_revision,
         flow_version,
+        trait_schema_version,
     } = f;
     let base = format!("/v1/tenants/{tenant}/environments/{environment}");
     let org_base = format!("{base}/organizations/{organization}");
@@ -1232,6 +1283,33 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             "flow_versions.pinFlowVersion",
             "POST",
             format!("{base}/journeys/login/versions/{flow_version}/pin"),
+        ),
+        // ---- identity trait schemas (issue #53) ----
+        Case::empty(
+            "trait_schemas.listTraitSchemaVersions",
+            "GET",
+            format!("{base}/trait-schemas"),
+        ),
+        Case::json(
+            "trait_schemas.createTraitSchemaVersion",
+            "POST",
+            format!("{base}/trait-schemas"),
+            &serde_json::json!({ "schema": {"type": "object", "properties": {}} }),
+        ),
+        Case::empty(
+            "trait_schemas.getActiveTraitSchema",
+            "GET",
+            format!("{base}/trait-schemas/active"),
+        ),
+        Case::empty(
+            "trait_schemas.getTraitSchemaVersion",
+            "GET",
+            format!("{base}/trait-schemas/{trait_schema_version}"),
+        ),
+        Case::empty(
+            "trait_schemas.activateTraitSchemaVersion",
+            "POST",
+            format!("{base}/trait-schemas/{trait_schema_version}/activate"),
         ),
         // ---- management keys ----
         Case::empty("keys.listManagementKeys", "GET", format!("{base}/keys")),
@@ -1612,6 +1690,11 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             &serde_json::json!({ "identifier": "sweep2@example.test" }),
         ),
         Case::empty("users.getUser", "GET", format!("{base}/users/{user}")),
+        Case::empty(
+            "users.getUserTraits",
+            "GET",
+            format!("{base}/users/{user}/traits"),
+        ),
         Case::json(
             "users.updateUser",
             "PATCH",
@@ -1765,6 +1848,7 @@ fn every_documented_operation_is_driven_by_a_case() {
         snapshot: "{}".to_owned(),
         base_revision: "0".to_owned(),
         flow_version: 1,
+        trait_schema_version: 1,
     };
     let cases = all_cases(&fixture);
     let documented = documented_operations();
@@ -1775,10 +1859,20 @@ fn every_documented_operation_is_driven_by_a_case() {
     //    answers an unrouted path with a 404, and a 404 is not a server error.
     let mut covered: BTreeSet<String> = BTreeSet::new();
     for case in &cases {
-        let addressed: Vec<&DocumentedOperation> = documented
+        let mut addressed: Vec<&DocumentedOperation> = documented
             .iter()
             .filter(|op| op.method == case.method && template_matches(&op.template, &case.path))
             .collect();
+        // Keep only the MOST SPECIFIC matches, which is the router's own rule: a template
+        // whose segment is a literal outranks one whose segment is a parameter. Anything
+        // still tied after that is genuinely ambiguous and fails below.
+        if let Some(best) = addressed
+            .iter()
+            .map(|op| parameter_count(&op.template))
+            .min()
+        {
+            addressed.retain(|op| parameter_count(&op.template) == best);
+        }
         let named: Vec<&str> = addressed
             .iter()
             .map(|op| op.operation_id.as_str())

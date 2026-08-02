@@ -6,6 +6,93 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The trait-write visibility class reaches EVERY path that persists the column** (issue
+  #53, PR 1, review fold). The first cut of this work put the class on
+  `set_traits_with_visibility` and asserted that "every trait write in the tree goes
+  through" it. MEASURED, that was false: FOUR SQL sites write `users.traits_sealed`, and
+  only one was the classed seam. `insert_admin_user_row` (the CREATE, reached by
+  `admin_create` and by the joined invitation create) and `register_inner` (the
+  SELF-SERVICE SIGNUP) both sealed a submitted document verbatim with no class at all.
+
+  - `NewAdminUser`'s `traits_json` and `traits_schema_version` are replaced by one
+    `traits: Option<NewUserTraits>`, which carries the document, its recorded schema
+    version, AND its `TraitWriteVisibility`. The class rides WITH the document because a
+    field that can be defaulted can be forgotten, and forgetting it is exactly the defect
+    this replaces.
+  - `register_inner` states `SelfService` itself rather than taking it from a caller: every
+    path into it is a self-service signup, so the class is a property of the seam.
+  - `TraitWriteVisibility::apply` is the ONE expression of the split, called by the replace
+    seam and by both create seams, so a rule spelled once cannot drift.
+
+- **The admin-only annotation is refused where it would be INERT.** `x-ironauth` is read
+  only off the schema ROOT's `properties`, so the same keyword one level down compiled,
+  activated, and enforced nothing. That is tolerable for a documentary keyword and not for
+  `visibility`, which this work makes a security boundary: MEASURED, with a nested
+  `visibility: admin`, a self-service write overwrote `address.secret` and a later omission
+  CLEARED it, while the root-level control in the same write was correctly preserved.
+  `check_schema_wellformed` now refuses an annotation anywhere but a top-level property,
+  with a `SchemaMalformed` naming the offending RFC 6901 pointer.
+
+- **A NON-OBJECT self-service submission can no longer clear admin-only metadata.** The
+  "cannot clear" half works by carrying the existing admin-only members onto the
+  submission, and a non-object has no members to carry onto, so it walked past both halves.
+  The doc claimed the schema's own root `type` refused it; nothing requires a schema to
+  carry one, and MEASURED, with a root-`type`-free schema, `[1, 2]` produced zero
+  violations, survived preservation unchanged, and cleared the identity's admin-only
+  metadata. `TraitWriteVisibility::apply` refuses that shape when the stored document is an
+  object. Refusing there rather than mandating a root `type: object` in
+  `check_schema_wellformed` keeps every already-stored schema compiling.
+
+- **The cutover gate was a TOCTOU and is now serialized by a per-scope advisory lock.**
+  `begin_scoped` pins READ COMMITTED, `count_identities_failing_schema` is a plain `SELECT`
+  with no `FOR SHARE`, and a trait write read the active pointer in a transaction of its
+  own, so a write that validated against the still-active OLD schema committed INSIDE the
+  activation's window. MEASURED at population 300 with zero delay: `write_ok=true
+  activate_ok=true` with version 2 active while an identity held a value that fails it (a
+  150 ms delay does not race, which is why the sequential test could not see it).
+  `set_traits_with_visibility` now does its active-schema read, its class, its validation
+  and its write in ONE transaction holding the scope's cutover lock SHARED;
+  `activate_version_idempotent` takes the same lock EXCLUSIVE before anything it reads.
+  Different modes rather than two exclusive locks, so ordinary trait writes still run
+  concurrently with each other and only an activation excludes them.
+
+- **The cutover scan is streamed and DEK-cached.** It runs inside the activation's held
+  write transaction, so its cost is the blocking window. It used to `fetch_all` every
+  sealed blob in the scope at once and re-fetch-and-unwrap the DEK and its KEK per
+  identity: two uncached round trips plus two unwraps for every row, MEASURED strictly
+  linear at about 0.1 ms/identity locally. A scope has very few DEK VERSIONS, so the DEK is
+  resolved once per version and reused, and the rows are walked with a keyset cursor, so
+  memory is one page rather than the whole population.
+
+- Identity trait writes are VISIBILITY CLASSED (issue #53, PR 1).
+  `ActingUserRepo::set_traits_with_visibility` takes a `TraitWriteVisibility`, and
+  `set_traits` is now the `Admin` spelling of it. Under `SelfService` the admin-only split
+  the schema's `x-ironauth: {visibility: admin}` annotation declares is enforced on the WRITE
+  SEAM rather than by each caller, because a rule enforced by one writer and not another
+  reads as enforced while a second writer walks around it:
+
+  - a submission NAMING an admin-only field is refused with a per-field RFC 6901 JSON
+    Pointer failure, whether the value is new, identical, or an explicit `null`, so the
+    refusal is not a presence oracle; and
+  - the identity's EXISTING admin-only fields are carried onto the submission before
+    validation, so a write that OMITS them cannot CLEAR them. This is the half that is easy
+    to miss and the one every well-behaved self-service write needs, because a self-service
+    caller reads the REDACTED document (`TraitAnnotations::redact_for_user`) and so can never
+    send those fields back. The MERGED document is what the schema validates, so a schema
+    that `required`s an admin-only field still validates for a self-service write.
+
+  The two halves are pure value functions on `TraitAnnotations`
+  (`self_service_violations`, `preserve_admin_only`), unit tested without a database.
+
+- The trait-schema registry create and activate can JOIN an idempotency record.
+  `create_version_at` and `activate_version_idempotent` take an `Option<IdempotencyWrite>`
+  and write it in the SAME transaction as the mutation and its audit row, matching the
+  journey-version registry; `TraitSchemaRepo::next_version` lets the management surface
+  resolve the version BEFORE the write so it can store the response it will return.
+  `create_version` keeps its old signature as the non-idempotent convenience and no longer
+  reads the minted version back in a second transaction. A concurrently-taken version is now
+  a typed `Conflict` from the unique index rather than a bare database error.
+
 - Control-plane writes on `environment_secrets` (issue #250, migration 0100, an expand).
   `ironauth_control` gains INSERT and DELETE plus a COLUMN-SCOPED UPDATE over exactly the
   four columns an overwrite rewrites (`ciphertext`, `dek_version`, `version`, `updated_at`),

@@ -23,7 +23,7 @@ use axum::response::Response;
 use ironauth_connector::ConnectorDefinition;
 use ironauth_store::{
     ConnectorId, ConnectorRecord, CorrelationId, IdempotencyWrite, NewConnector, Scope, StoreError,
-    TenantId,
+    TenantId, TraitSchema,
 };
 
 use crate::auth::Principal;
@@ -79,6 +79,56 @@ fn parse_and_validate(body: &Bytes) -> Result<ConnectorDefinition, ApiError> {
     Ok(definition)
 }
 
+/// Refuse a claim mapping that TARGETS an admin-only trait, at CONFIG time (issue #53).
+///
+/// A connector's claim mapping is the other configuration surface that can name a trait, and
+/// it had NO admin-only gate at all: `grep -rn "is_admin_only|admin_only|visibility"` over
+/// `ironauth-connector` and this file returned nothing. MEASURED consequence: a mapping
+/// naming an admin-only trait let an upstream identity provider WRITE admin-only metadata
+/// onto a local identity on first login. The store's self-service write class refuses that
+/// now, but a login-time refusal breaks the END USER for a fault only the operator can fix,
+/// so the refusal belongs here, exactly where `validate_signup_form` puts the same refusal
+/// for the other trait-naming surface.
+///
+/// Deterministic and per field: every offending trait is named at once, each as the JSON
+/// pointer into the DEFINITION (`/claim_mapping/traits/<field>`) that the operator edits, so
+/// the message is actionable and value-free.
+///
+/// A scope with no active trait schema declares no annotations, so nothing can be admin-only
+/// and there is nothing to refuse; a mapping that produces traits against no active schema
+/// already fails closed in the evaluator.
+async fn refuse_admin_only_claim_mapping(
+    state: &AdminState,
+    scope: Scope,
+    definition: &ConnectorDefinition,
+) -> Result<(), ApiError> {
+    if definition.claim_mapping.traits.is_empty() {
+        return Ok(());
+    }
+    let Some(active) = state.store().scoped(scope).trait_schemas().active().await? else {
+        return Ok(());
+    };
+    // A STORED schema is proved well formed on write, so a compile fault is a persistence
+    // corruption and never a caller fault.
+    let schema = TraitSchema::compile(&active.schema_json).map_err(|_| ApiError::Internal)?;
+    let annotations = schema.annotations();
+    let offending: Vec<String> = definition
+        .claim_mapping
+        .traits
+        .keys()
+        .filter(|field| annotations.is_admin_only(field))
+        .map(|field| format!("/claim_mapping/traits/{field}"))
+        .collect();
+    if offending.is_empty() {
+        return Ok(());
+    }
+    Err(ApiError::BadRequest(format!(
+        "the claim mapping targets an admin-only trait, which an upstream identity provider \
+         must never be a channel into: {}",
+        offending.join(", ")
+    )))
+}
+
 /// Resolve the definition's upstream client secret to its plaintext bytes for sealing.
 /// A file/env indirection that cannot be read is an operator configuration error (a
 /// 400 naming only the source, never the value).
@@ -127,7 +177,8 @@ fn view_of(record: &ConnectorRecord) -> Result<ConnectorView, ApiError> {
     security(("bearer" = [])),
     responses(
         (status = 201, description = "Created", body = ConnectorView),
-        (status = 400, description = "Malformed or invalid definition (JSON-pointer error)", body = ErrorBody),
+        (status = 400, description = "Malformed or invalid definition (JSON-pointer error), \
+         including a claim mapping that targets an admin-only trait", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
         (status = 404, description = "Environment not found", body = ErrorBody),
@@ -159,6 +210,8 @@ pub async fn create_connector(
     }
 
     let definition = parse_and_validate(&body)?;
+    // The trait-visibility gate (issue #53), at CONFIG time, before anything is written.
+    refuse_admin_only_claim_mapping(&state, scope, &definition).await?;
     let secret = resolve_client_secret(&definition)?;
     let projection = definition
         .secret_free_json()
@@ -442,7 +495,8 @@ fn unix_ms(at: std::time::SystemTime) -> i64 {
     security(("bearer" = [])),
     responses(
         (status = 200, description = "Updated", body = ConnectorView),
-        (status = 400, description = "Malformed or invalid definition (JSON-pointer error)", body = ErrorBody),
+        (status = 400, description = "Malformed or invalid definition (JSON-pointer error), \
+         including a claim mapping that targets an admin-only trait", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
         (status = 404, description = "Not found (absent or in another scope). The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody)
@@ -469,6 +523,10 @@ pub async fn update_connector(
         .parse_id(&connector_id)?;
 
     let definition = parse_and_validate(&body)?;
+    // The SAME config-time trait-visibility gate the create makes (issue #53). An update is
+    // the other way a mapping enters the store, so a gate on only one of them would read as
+    // enforced while the update walked around it.
+    refuse_admin_only_claim_mapping(&state, scope, &definition).await?;
 
     // The slug is the IMMUTABLE natural key (and the anchor the sealed-secret AAD is
     // bound to on the store's immutable id): it cannot be changed via an update. A body
