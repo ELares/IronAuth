@@ -134,6 +134,10 @@ mod probe;
 mod quota;
 mod recover;
 pub mod recovery;
+/// The STRUCTURAL recover-factor honesty rule (issue #295): the opaque
+/// [`ProvenFactor`](recovery_proof::ProvenFactor) capability token every recovery
+/// initiation takes in place of a caller-supplied factor.
+pub mod recovery_proof;
 mod register;
 mod registry;
 mod resource;
@@ -246,6 +250,7 @@ pub use recovery::{
     FactorChangeDecision, NullRiskEvaluator, RecoveryFactor, RecoverySettings, RiskDirective,
     RiskEvaluator, RiskEvent, factor_change_decision,
 };
+pub use recovery_proof::ProvenFactor;
 pub use registry::{
     GrantType, PkceMethod, PromptSet, PromptSetError, PromptValue, ResponseMode, ResponseType,
 };
@@ -559,6 +564,40 @@ pub fn oidc_router(state: OidcState) -> Router {
         .route(
             "/t/{tenant_id}/e/{environment_id}/recover/idv/callback",
             post(advanced_recovery::idv_callback),
+        )
+        // The HOSTED advanced-recovery INITIATION surface (issue #295): the user-facing half
+        // PR 3 left library-only. Each mode's endpoint PROVES control of the account's email
+        // channel through the one email-OTP verify core and mints a server-derived
+        // `ProvenFactor` from it, so the `hold_until`-gating recovery factor is established
+        // from the evidence rather than accepted from the request; there is no request field
+        // and no function parameter an inflated factor could travel through. `finalize`
+        // establishes the recovered subject's session, and does so ONLY when
+        // `finalize_recovery` reports the mode precondition satisfied AND the #81 delay window
+        // elapsed. Every refusal is one uniform 401; the flag/mode-off answer is the same
+        // uniform 404 the PR 3 routes give, so the route literals stay UNCONDITIONAL for the
+        // RFC 9700 endpoint inventory.
+        //
+        // ONLY the two modes that can COMPLETE are mounted. The TRUSTED-CONTACT initiation is
+        // deliberately NOT here, and neither is a contact-enrollment surface: the notification
+        // layer this repository ships carries a coarse per-channel ALERT with no room for a
+        // link or a token (`notify_all_channels` takes no URL, and the initiation's own
+        // cancellation link binds into `let _link` for the same reason), so a designated
+        // contact can never receive the single-use token
+        // `/recover/trusted-contact/confirm` needs. The mode's library seams stay (the
+        // completion machinery is real and PR 3's suite drives it); mounting a self-service
+        // entry point to a mode that cannot reach its own confirmation step would be a
+        // promise the surface cannot keep. Issue #295 stays open for it.
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/recover/admin-approved/initiate",
+            post(advanced_recovery::admin_approved_initiate),
+        )
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/recover/idv/initiate",
+            post(advanced_recovery::idv_initiate),
+        )
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/recover/finalize",
+            post(advanced_recovery::finalize),
         )
         // The OAuth 2.0 Authorization Challenge Endpoint (issue #93, Bet 3, EXPERIMENTAL,
         // draft-ietf-oauth-first-party-apps): the browserless first-party native login surface. A

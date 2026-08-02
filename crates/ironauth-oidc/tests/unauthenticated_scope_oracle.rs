@@ -205,6 +205,34 @@ fn cases() -> Vec<Case> {
             body: r#"{"token":"not-a-real-invitation-token"}"#,
             live_status: StatusCode::NOT_FOUND,
         },
+        // The three issue #295 advanced-recovery endpoints. This harness runs
+        // `OidcConfig::default()`, so the `advanced-recovery` experimental feature is OFF, and
+        // what these three cases pin is that THE FEATURE GATE ITSELF is not a scope oracle: a
+        // disabled feature answers the same `404` for a live scope as for one that never
+        // existed. The flag-ON half, where the answer is the uniform `401 recovery_unavailable`
+        // for both, is pinned separately by the ghost-scope probe in `advanced_recovery.rs`.
+        // Both halves matter: a gate that 404s only for real scopes would be the oracle.
+        Case {
+            template: "/t/{tenant_id}/e/{environment_id}/recover/admin-approved/initiate",
+            method: "POST",
+            content_type: "application/json",
+            body: r#"{"identifier":"sweep@example.test","code":"000000"}"#,
+            live_status: StatusCode::NOT_FOUND,
+        },
+        Case {
+            template: "/t/{tenant_id}/e/{environment_id}/recover/idv/initiate",
+            method: "POST",
+            content_type: "application/json",
+            body: r#"{"identifier":"sweep@example.test","code":"000000","provider":"sweep"}"#,
+            live_status: StatusCode::NOT_FOUND,
+        },
+        Case {
+            template: "/t/{tenant_id}/e/{environment_id}/recover/finalize",
+            method: "POST",
+            content_type: "application/json",
+            body: r#"{"identifier":"sweep@example.test","code":"000000"}"#,
+            live_status: StatusCode::NOT_FOUND,
+        },
     ]
 }
 

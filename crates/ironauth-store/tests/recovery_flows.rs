@@ -376,6 +376,128 @@ async fn the_recipient_is_sealed_at_rest() {
 }
 
 #[tokio::test]
+async fn the_post_recovery_window_reads_only_a_recently_completed_flow() {
+    // The issue #295 post-recovery audit-and-notify window (see
+    // `recovery::gate_factor_removal`): completing a recovery is what ENDS the pending
+    // state the live downgrade gate keys on, so the gate reads this to keep AUDITING and
+    // NOTIFYING a factor removal made in the window after a recovery. Three things must
+    // hold or the window is either blind or unbounded: only a COMPLETED flow qualifies, the
+    // `since` cutoff really bounds it, and `hold_until` comes back so the caller can tell a
+    // delay-served recovery from one that was never held.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let subject = register_user(&db, &env, scope, RECIPIENT).await;
+
+    let flows = || db.store().scoped(scope).recovery_flows();
+
+    // Nothing completed yet.
+    assert!(
+        flows()
+            .completed_since_for_subject(&subject, 0)
+            .await
+            .expect("read")
+            .is_none()
+    );
+
+    // A PENDING held flow does not qualify: the gate already sees that one, and returning
+    // it here would double-audit every removal made during the delay window.
+    let pending = initiate(
+        &db,
+        &env,
+        scope,
+        &subject,
+        "ira_rcv_win_pending~s",
+        Some(9_999_999_999_000_000),
+    )
+    .await;
+    assert!(
+        flows()
+            .completed_since_for_subject(&subject, 0)
+            .await
+            .expect("read")
+            .is_none(),
+        "a pending flow is not a completed one"
+    );
+
+    // A CANCELLED flow does not qualify either: the user revoked the recovery, so there is
+    // no recovered access to attribute a later removal to.
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .recovery_flows()
+        .cancel(&env, &pending, RecoveryCancelReason::UserNotification)
+        .await
+        .expect("cancel");
+    assert!(
+        flows()
+            .completed_since_for_subject(&subject, 0)
+            .await
+            .expect("read")
+            .is_none(),
+        "a cancelled flow is not a completed one"
+    );
+
+    // A HELD flow whose horizon has elapsed, completed: this is the one.
+    let elapsed_hold: i64 = 1_000_000_000_000;
+    let done = initiate(
+        &db,
+        &env,
+        scope,
+        &subject,
+        "ira_rcv_win_done~s",
+        Some(elapsed_hold),
+    )
+    .await;
+    assert!(
+        db.store()
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .recovery_flows()
+            .complete(&env, &done, "urn:ironauth:acr:pwd")
+            .await
+            .expect("complete")
+    );
+    let found = flows()
+        .completed_since_for_subject(&subject, 0)
+        .await
+        .expect("read")
+        .expect("the completed flow");
+    assert_eq!(found.id, done);
+    assert_eq!(found.state, RecoveryState::Completed);
+    assert_eq!(
+        found.hold_until_unix_micros,
+        Some(elapsed_hold),
+        "the horizon comes back, so the caller can restrict the window to HELD recoveries"
+    );
+
+    // The cutoff is a real bound, not decoration: a completion is invisible once it falls
+    // outside the window. Without this the window would be "forever", and every factor
+    // removal for the rest of the account's life would be attributed to one old recovery.
+    assert!(
+        flows()
+            .completed_since_for_subject(&subject, i64::MAX)
+            .await
+            .expect("read")
+            .is_none(),
+        "a completion older than the cutoff is outside the window"
+    );
+
+    // Cross-scope: a subject of another environment reads nothing, whatever it names.
+    let other = db.seed_scope(&env).await;
+    assert!(
+        db.store()
+            .scoped(other)
+            .recovery_flows()
+            .completed_since_for_subject(&subject, 0)
+            .await
+            .expect("read")
+            .is_none(),
+        "a subject from another scope resolves nothing"
+    );
+}
+
+#[tokio::test]
 async fn cooldown_count_sees_recent_initiations() {
     let db = TestDatabase::start().await;
     let env = Env::system();

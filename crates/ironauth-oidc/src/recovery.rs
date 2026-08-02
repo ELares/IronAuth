@@ -37,6 +37,7 @@ use sha2::{Digest, Sha256};
 
 use crate::authn::{self, AuthMethod};
 use crate::interaction;
+use crate::recovery_proof::ProvenFactor;
 use crate::state::OidcState;
 use crate::step_up;
 use crate::util::epoch_micros;
@@ -74,8 +75,14 @@ pub struct RecoverySettings {
 /// (the credential/flow that was really verified), NEVER taken from caller-supplied,
 /// untrusted input. An inflated value (for example claiming [`AttestedPasskey`](Self::AttestedPasskey)
 /// when only an email OTP was proven) would make the reduces-security test pass, SKIP the
-/// `hold_until` delay, and let a recovery complete WITHOUT the security delay. See the guard
-/// on `initiate_recovery`'s `recover_factor` parameter.
+/// `hold_until` delay, and let a recovery complete WITHOUT the security delay.
+///
+/// That is no longer a rule a caller could break (issue #295). Every recovery-initiation
+/// entry point takes a [`ProvenFactor`](crate::recovery_proof::ProvenFactor) instead of a
+/// bare `RecoveryFactor`, and that token has private fields and no public constructor, so
+/// the rung on an initiation is whatever the code that read the evidence attested and there
+/// is no argument position in a production build into which a caller could write another
+/// one. This enum remains the vocabulary; it is no longer the ingress.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryFactor {
     /// A password (a knowledge factor). `pwd`-level.
@@ -455,6 +462,34 @@ pub fn fresh_session_reverify_acr(
 /// re-verify permits it immediately ([`FactorChangeDecision::AllowedByReverify`]). A
 /// stale delay-elapsed flow therefore stops blocking, so there is no perpetual lock. This
 /// is the spec's "delay window with notifications OR fresh re-verify" rule.
+///
+/// # The post-recovery AUDIT-AND-NOTIFY window (issue #295)
+///
+/// COMPLETING a recovery ends its pending state, so the lookup above stops finding it at
+/// exactly the moment a recovered session comes into existence. For BLOCKING that is
+/// correct and deliberate: `complete` only succeeds once `hold_until <= now`, so the delay
+/// the invariant exists to impose has already been served. For RECORDING it was a hole.
+/// Before issue #295 mounted a completion endpoint the same removal, made against the
+/// still-pending delay-elapsed flow, was [`FactorChangeDecision::AllowedByDelay`], which
+/// writes a `recovery.factor_change` audit row AND notifies every channel. Left alone,
+/// mounting the finalize would have converted an audited, notified downgrade into a silent
+/// one: no row, no alert, the passkey simply gone.
+///
+/// So when no flow is pending, this consults the newest recovery that COMPLETED inside the
+/// post-recovery window and, if there is one, evaluates the change against it. The window
+/// is the deployment's own `oidc.recovery_delay_secs`, reused rather than duplicated into a
+/// second knob that could drift from the first: the delay is the deployment's statement of
+/// how long a recovery-driven change stays security-relevant.
+///
+/// Only a flow that was HELD is consulted, and that restriction is load-bearing in the
+/// safety direction. A held flow can only have completed after its `hold_until`, so the
+/// decision it yields is [`FactorChangeDecision::AllowedByDelay`] (or
+/// [`FactorChangeDecision::AllowedByReverify`]) and never
+/// [`FactorChangeDecision::Blocked`]: this window can only ever ADD an audit row and a
+/// notification, never refuse a removal that would otherwise have been permitted. A flow
+/// that was never held has a `NULL` `hold_until`, which can never satisfy the delay branch,
+/// so consulting one WOULD block, and would lock out a user who legitimately enrolled a new
+/// strong factor after recovering.
 pub async fn gate_factor_removal(
     state: &OidcState,
     scope: Scope,
@@ -462,17 +497,28 @@ pub async fn gate_factor_removal(
     target_factor: RecoveryFactor,
     reverify_acr: Option<&str>,
 ) -> FactorChangeDecision {
-    match state
-        .store()
-        .scoped(scope)
-        .recovery_flows()
-        .pending_for_subject(subject)
-        .await
-    {
+    let flows = state.store().scoped(scope).recovery_flows();
+    match flows.pending_for_subject(subject).await {
         Ok(Some(flow)) => {
             evaluate_factor_change(state, scope, &flow.id, target_factor, reverify_acr).await
         }
-        Ok(None) => FactorChangeDecision::NotADowngrade,
+        Ok(None) => {
+            // The post-recovery audit-and-notify window. See the doc above.
+            let window_micros = i64::try_from(state.recovery_settings().delay_secs)
+                .unwrap_or(i64::MAX)
+                .saturating_mul(1_000_000);
+            let since = epoch_micros(state.now()).saturating_sub(window_micros);
+            match flows.completed_since_for_subject(subject, since).await {
+                // A HELD flow that completed: its delay was served, so the change is
+                // permitted, but it is still recorded and still announced.
+                Ok(Some(flow)) if flow.hold_until_unix_micros.is_some() => {
+                    record_factor_change_against(state, scope, &flow, target_factor, reverify_acr)
+                        .await
+                }
+                Ok(_) => FactorChangeDecision::NotADowngrade,
+                Err(_) => FactorChangeDecision::Blocked,
+            }
+        }
         Err(_) => FactorChangeDecision::Blocked,
     }
 }
@@ -530,34 +576,33 @@ pub async fn notify_owner_channels(state: &OidcState, scope: Scope, subject: &Us
 /// identifier never reaches it; both the known and unknown paths return the same
 /// acknowledgment upstream.
 ///
-/// # `recover_factor` is SECURITY-LOAD-BEARING and MUST be server-derived
+/// # The recover factor is SECURITY-LOAD-BEARING, and is now STRUCTURALLY server-derived
 ///
-/// `recover_factor` names the factor the recovery was ACTUALLY proven with. It drives the
+/// The recover factor names the factor the recovery was ACTUALLY proven with. It drives the
 /// reduces-security test below (`recover_acr` vs the account's strongest factor): a value that
 /// REACHES the account's strength makes `reduces_security = false`, so the flow is NOT held and
-/// the `hold_until` delay is SKIPPED. It therefore MUST be established SERVER-SIDE from the real
-/// recovery evidence (the credential/flow that was genuinely verified), and NEVER accepted from
-/// caller-supplied, untrusted input. The advanced-recovery initiation functions
-/// (`initiate_admin_approved` / `initiate_trusted_contact` / `initiate_idv`) are LIBRARY-ONLY
-/// today and pass a value their trusted caller supplies. WHEN this surface is later wired to a
-/// PUBLIC endpoint, that endpoint MUST derive `recover_factor` from the actually-proven
-/// credential (never a request field): an inflated value would skip the security delay and let
-/// a recovery complete instantly. A cheap future STRUCTURAL hardening is a server-derived
-/// newtype (a `ProvenRecoveryFactor` the public endpoint can only mint from real evidence),
-/// deferred to the wiring PR to keep this change minimal; the doc guard is the invariant now.
-#[allow(clippy::too_many_arguments)]
+/// the `hold_until` delay is SKIPPED. An inflated value would skip the security delay and let a
+/// recovery complete instantly.
+///
+/// It used to arrive as a bare [`RecoveryFactor`] parameter, guarded by this doc comment alone,
+/// which was safe only because no public endpoint reached here. Issue #295 mounts those
+/// endpoints, so the guard is now the type: this takes a
+/// [`ProvenFactor`](crate::recovery_proof::ProvenFactor), whose fields are private, whose
+/// minting function is module-private, and none of whose PRODUCTION constructors takes a rung
+/// as a parameter. The scope and the subject come from the same token, so a caller can no more
+/// aim a recovery at an account it did not prove than it can inflate the rung it proved.
 pub async fn initiate_recovery(
     state: &OidcState,
-    scope: Scope,
-    subject: &UserId,
+    proven: &ProvenFactor,
     entry_point: RecoveryEntryPoint,
-    recover_factor: RecoveryFactor,
     recipient: &str,
     client_ip: Option<&str>,
     method: RecoveryMethod,
 ) -> RecoveryInitiation {
+    let scope = proven.scope();
+    let subject = proven.subject();
     let settings = state.recovery_settings();
-    let recover_acr = recover_factor.strength_acr();
+    let recover_acr = proven.factor().strength_acr();
     let now_micros = epoch_micros(state.now());
 
     // Risk-score the attempt through the #79 seam (null/allow by default).
@@ -595,10 +640,10 @@ pub async fn initiate_recovery(
     // A recovery would REDUCE security when the recovery factor does not reach the
     // account's strongest factor. That, or a risk-forced delay, holds the flow.
     //
-    // GUARD: `recover_acr` derives from `recover_factor`, which MUST reflect the ACTUALLY-proven
-    // factor (established server-side; never caller-supplied). An inflated `recover_factor` would
-    // make `reduces_security = false` here and SKIP the `hold_until` delay below, completing a
-    // recovery with no security delay. See this function's `recover_factor` doc guard.
+    // GUARD: `recover_acr` derives from the ProvenFactor's rung, which is whatever the code that
+    // actually read the evidence attested. An inflated rung would make `reduces_security = false`
+    // here and SKIP the `hold_until` delay below, completing a recovery with no security delay,
+    // which is why no production mint accepts a rung as a parameter. See `crate::recovery_proof`.
     let account_acr = account_strength_acr(state, scope, subject).await;
     let order = state.acr_order();
     let reduces_security = !step_up::acr_satisfies(recover_acr, account_acr, &order);
@@ -673,20 +718,30 @@ pub async fn initiate_recovery(
 /// the send. Nothing is written. The reads share the exact helpers the known path uses, so
 /// the two branches issue the same query shapes and comparable DB work before the identical
 /// acknowledgment.
+///
+/// It takes NO recover factor (issue #295). It never creates a flow, so the rung would only
+/// ever feed the risk event, and the two branches must nonetheless score the SAME rung or the
+/// risk seam could tell them apart. The rung is therefore not a second literal here: it is
+/// READ OFF the very mint the known branch uses,
+/// [`crate::recovery_proof::from_notified_channel`], against the decoy subject. Changing what
+/// that mint attests moves both branches together, which is what "symmetric by construction"
+/// has to mean to be worth saying.
 pub async fn decoy_recovery_work(
     state: &OidcState,
     scope: Scope,
     entry_point: RecoveryEntryPoint,
-    recover_factor: RecoveryFactor,
     recipient: &str,
     client_ip: Option<&str>,
 ) {
     let settings = state.recovery_settings();
-    let recover_acr = recover_factor.strength_acr();
     let now_micros = epoch_micros(state.now());
     // A synthesized in-scope subject drives the same subject-bound reads as a real account;
     // every read resolves to no rows, and nothing is ever persisted under it.
     let decoy_subject = UserId::generate(state.env(), &scope);
+    // THE same mint the known branch runs, so the scored rung cannot drift between them.
+    let recover_acr = crate::recovery_proof::from_notified_channel(scope, decoy_subject)
+        .factor()
+        .strength_acr();
 
     // The SAME risk-seam evaluation the known path runs (the directive is discarded).
     let _ = state.evaluate_recovery_risk(&RiskEvent {
@@ -790,6 +845,10 @@ pub async fn cancel_from_token(state: &OidcState, token: &str) -> bool {
 /// outright (there is no pending recovery to protect against); the invariant only
 /// constrains a change made while a recovery is pending or within its delay window. When
 /// the change IS an allowed downgrade, every registered channel is notified again.
+///
+/// This entry point is named by a FLOW, so "terminal" is genuinely nothing to enforce here.
+/// The SUBJECT-keyed [`gate_factor_removal`] is the one that must not go quiet the instant a
+/// recovery completes, and it carries the post-recovery audit-and-notify window; see its doc.
 pub async fn evaluate_factor_change(
     state: &OidcState,
     scope: Scope,
@@ -809,6 +868,24 @@ pub async fn evaluate_factor_change(
     if !flow.state.is_pending() {
         return FactorChangeDecision::NotADowngrade;
     }
+    record_factor_change_against(state, scope, &flow, target_factor, reverify_acr).await
+}
+
+/// DECIDE a factor change against an already-read recovery `flow`, AUDIT the decision, and
+/// notify on an allowed downgrade. The shared body of [`evaluate_factor_change`] (which
+/// reaches it with a PENDING flow) and [`gate_factor_removal`]'s post-recovery
+/// audit-and-notify window (which reaches it with a recently COMPLETED held flow).
+///
+/// Extracted rather than duplicated on purpose: the audit detail format, the actor, and the
+/// notify-on-allowed-downgrade rule are the properties an operator reconstructs a downgrade
+/// from, and two copies of them would be two things to keep in step.
+async fn record_factor_change_against(
+    state: &OidcState,
+    scope: Scope,
+    flow: &ironauth_store::RecoveryFlowRecord,
+    target_factor: RecoveryFactor,
+    reverify_acr: Option<&str>,
+) -> FactorChangeDecision {
     let order = state.acr_order();
     let now = epoch_micros(state.now());
     let target_acr = target_factor.strength_acr();
@@ -832,7 +909,7 @@ pub async fn evaluate_factor_change(
             CorrelationId::generate(state.env()),
         )
         .recovery_flows()
-        .record_factor_change(state.env(), flow_id, &detail)
+        .record_factor_change(state.env(), &flow.id, &detail)
         .await;
     // A factor change actually carried out (an allowed DOWNGRADE) notifies every channel
     // again, so the owner is alerted that a stronger factor was removed under recovery.

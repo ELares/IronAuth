@@ -6,6 +6,107 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **Two of the three advanced recovery modes get a MOUNTED initiation, and the recover factor
+  stopped being something a caller could say** (issue #295, following issue #82 PR 3; issue #295
+  stays OPEN for the trusted contact half). PR 3 shipped the three modes' completion machinery
+  and left the user facing initiation library only, guarded by a doc comment that read
+  "`recover_factor` is security load bearing and MUST be server derived, never caller supplied".
+  That comment was true and it was also the only thing holding the line, which was survivable
+  exactly because nothing was mounted. Mounting the endpoints is the act that turns a documented
+  rule into an exploitable one, so the rule moved into the type system first and the routes went
+  up second.
+  - `ProvenFactor` is a capability token with three private fields, a module private minting
+    function, and no public constructor. A handler that writes the struct literal gets `E0451`
+    (`fields ... are private`); one that reaches for the mint gets `E0603` (`function mint is
+    private`). Every PRODUCTION mint hard codes the rung it attests and not one of them takes a
+    factor as a parameter, so there is no argument position anywhere in a shipped build into which
+    an inflated rung could be written. The single constructor that does take a rung lives behind
+    the non default `testing` feature, which no binary enables, and it exists because the recovery
+    suites drive ladder rungs no production surface can prove.
+  - The token carries the scope and the subject the evidence was proven FOR, and the three
+    `initiate_*` seams plus `initiate_recovery` now take it INSTEAD of a scope, a subject, and a
+    factor. Aiming a recovery at an account you did not prove, or at another environment, became
+    unsayable in the same move rather than in a second one.
+  - `prove_email_otp` is the one production mint that reads evidence. It drives the ONE email OTP
+    verify core on the recovery purpose, so the independent recovery path throttle, the anti timing
+    dummy spend, the constant time compare, the per code attempt budget, and the single use consume
+    are the existing ones rather than a second copy, and the subject comes back from that core, on
+    BOTH arms of the outcome rather than only on the verified one.
+  - MOUNTED: `POST .../recover/admin-approved/initiate`, `POST .../recover/idv/initiate`, and
+    `POST .../recover/finalize`. NOT mounted: the trusted contact initiation, and no contact
+    enrollment surface either. That mode completes only when `required_confirmations` distinct
+    contacts each present a single use confirmation token, and the notification layer this
+    repository ships carries a coarse per channel alert with no parameter a link or a token could
+    ride, so no contact can ever reach the confirmation endpoint. A mounted initiation would open
+    cases that can never complete, and an enrollment surface would let a user designate contacts
+    for a mode that cannot run while creating a durable new path to the account. The library seams,
+    the `/recover/trusted-contact/confirm` route PR 3 mounted, and the distinct contact threshold
+    are all unchanged and still covered; only the self service entry points wait for the transport.
+  - The same missing seam means the recovery notification is NOTIFIED but not yet CANCELLABLE.
+    `initiate_recovery` mints a cancellation token and stores only its digest, and the delivery
+    that would put the link in front of the account owner does not exist, so the token reaches
+    nobody today. The delay window and the per channel alerts are real; the cancellation control is
+    not deliverable yet, and the prose no longer claims otherwise.
+  - The hosted `finalize` establishes the recovered subject's session, the other half of PR 3's
+    deferred mint. Three gates in order: a fresh channel proof that also resolves the subject, a
+    PENDING flow for that subject looked up under the proof's own scope (so the flow id, which
+    rides the IDV redirect to a third party and sits in the admin queue, authorizes nothing), and
+    `finalize_recovery` reporting both the mode precondition satisfied and the `hold_until` delay
+    elapsed. A `Standard` method flow, which is what every `/recover` and every headless recovery
+    journey creates, is never satisfiable through that gate and is now pinned by a test rather than
+    by a sentence. The issue #267 no silent downgrade gate deliberately does not decide this mint:
+    its question is whether a weak factor may SILENTLY take a protected account, and a notified,
+    delay held, mode gated recovery case is the opposite of silent. Refusing it would leave a
+    passkey holder who lost their passkey with no recovery at all.
+  - **The downgrade invariant's AUDIT AND NOTIFY arm now survives a completion**, which mounting
+    the finalize would otherwise have destroyed. `gate_factor_removal` keys on a PENDING recovery
+    flow, and completing a case is what ends the pending state, so a passkey removal minutes after
+    a recovered session was minted fell straight through to `NotADowngrade`: no
+    `recovery.factor_change` row, no notification, the passkey simply gone. The removal being
+    PERMITTED was never the defect, because a delay elapsed pending flow permits it too; it being
+    SILENT was. The gate now consults the newest recovery that COMPLETED inside a post recovery
+    window, which is the deployment's own `oidc.recovery_delay_secs` rather than a second knob that
+    could drift from the first. Only a flow that was HELD is consulted, and that is load bearing:
+    such a flow can only have completed after its horizon, so the window can add an audit row and a
+    notification and can never refuse a removal that would otherwise have been allowed.
+  - A refusal is no longer recorded on a path that then proceeds. The email OTP verify core takes
+    the caller's `BlockedDisposition`, so a session minting surface still emits
+    `ironauth_factor_downgrade_refused_total` when it renders its uniform refusal, and the recovery
+    surfaces, which read a blocked gate decision as the proven possession it literally is and
+    continue, emit `ironauth_factor_downgrade_recovery_permitted_total` under their own surface
+    label instead. That label is deliberately not a `GatedSessionPath`: those are registered
+    session mint surfaces whose sweeps demand no session for exactly the protected accounts
+    recovery serves, so `/recover/*` needs a name that is not a member of that enum.
+  - A proven code now RELAXES the abuse counters, as it does on every other consumer of that core.
+    `prove_email_otp` was the one that discarded the abuse context, so the independent
+    `AuthPath::Recovery` counters never relaxed on this path: a real user at the shipped
+    `soft_threshold` of 5 spent four attempts on the happy path with no relaxation and one mistyped
+    code pushed them over. The hosted suite consequently ran with the threshold raised to 1000; it
+    now runs at the production default.
+  - Every refusal on the three public endpoints is one uniform `401`, in BOTH phases. An unknown
+    identifier, a wrong or spent code, a throttle, a cooldown or risk suppression, an unknown or
+    absent IDV provider, no pending flow, an unsatisfied method, an unelapsed delay, the account
+    lifecycle fence, and a store fault are indistinguishable. The suite drives the post proof
+    reasons with a GOOD code, not only the pre proof ones, because each of those is a separate
+    return with its own natural status. A well formed but nonexistent scope answers exactly what a
+    real one does, which is pinned by a test, because this project has shipped a scope routed
+    existence oracle before.
+  - `scripts/invariant-lints.sh` gains rule `session-mint-registry`, which pins every call site of
+    `interaction::establish_session` against `docs/design/session-mint-sites.txt` and requires each
+    file to be justified in `docs/design/SESSION-MINT-SITES.md`. Issue #267's `GatedSessionPath` is
+    a hard structural registry, but it fences only the weak possession factors, so a new session
+    minting surface that is not one of those got neither a sweep nor a compiler error. This change
+    added exactly such a surface; the deliberate exception is now named by
+    `factor_downgrade::UngatedSessionMint` and unit tested against the two things that would make
+    it stale.
+  - Worth recording because a mutation found it rather than a reading did. The first draft of the
+    "a handler cannot inflate the factor" test drove only a passkey protected account, and on such
+    an account the issue #267 gate refuses the email OTP a primary session, so the verify core
+    returns `Blocked` and the `Verified` arm of the mint was never reached. Inflating that arm
+    changed nothing any test could see. The case now drives BOTH arms, and the hosted suite runs
+    under the NULL risk evaluator rather than the force delay one, so `held` tracks the derived rung
+    alone instead of being true whatever the rung says.
+
 - **The node group vocabulary is now LOCKED to the `NodeGroup` enum across the crate boundary**
   (issues #92 and #347). `ironauth-journey` is a pure crate and cannot depend on the flow engine,
   so its `NODE_GROUPS` array is a hand maintained mirror of this crate's `NodeGroup` wire forms.

@@ -56,7 +56,7 @@ use super::message::{self, Message};
 use super::model::{Autocomplete, InputType, Node, NodeAttributes, NodeGroup, Transport};
 use super::{FlowError, Submission};
 use crate::email_otp::{self, EmailCodeOutcome};
-use crate::recovery::{self, RecoveryFactor};
+use crate::recovery;
 use crate::state::OidcState;
 
 /// The outcome of the recovery INITIATE transition (issue #84).
@@ -331,9 +331,10 @@ pub(super) async fn advance_start(
     // The convergent anti enumeration work. The lookup runs for both present and absent
     // identifiers; a known account creates the #81 recovery case (through the SAME
     // `initiate_recovery` the bootstrap uses, so the delay/downgrade rule applies), an unknown
-    // one runs the decoy (the SAME store round trips, no writes). The RecoveryFactor is the
-    // email one time code this surface delivers through, the method is Standard, and the entry
-    // point is a lost password, exactly as `recover_post`.
+    // one runs the decoy (the SAME store round trips, no writes). The recovery factor is the
+    // email one time code this surface delivers through, minted server side by the issue #295
+    // proof seam; the method is Standard and the entry point is a lost password, exactly as
+    // `recover_post`.
     let client_ip = crate::abuse::resolved_client_ip(headers);
     let resolved = state
         .store()
@@ -342,12 +343,13 @@ pub(super) async fn advance_start(
         .by_identifier(identifier)
         .await;
     if let Ok(Some(user)) = resolved {
+        // The `pwd` rung is minted SERVER SIDE for the subject the store just resolved
+        // (issue #295), never named by this step.
+        let proven = crate::recovery_proof::from_notified_channel(scope, user.id);
         let _ = recovery::initiate_recovery(
             state,
-            scope,
-            &user.id,
+            &proven,
             RecoveryEntryPoint::LostPassword,
-            RecoveryFactor::EmailOtp,
             identifier,
             client_ip.as_deref(),
             RecoveryMethod::Standard,
@@ -358,7 +360,6 @@ pub(super) async fn advance_start(
             state,
             scope,
             RecoveryEntryPoint::LostPassword,
-            RecoveryFactor::EmailOtp,
             identifier,
             client_ip.as_deref(),
         )
@@ -423,6 +424,7 @@ pub(super) async fn advance_verify(
         code,
         headers,
         crate::factor_downgrade::GatedSessionPath::FlowRecoveryVerify,
+        email_otp::BlockedDisposition::Refuses,
     )
     .await
     {
@@ -435,12 +437,12 @@ pub(super) async fn advance_verify(
         // A wrong/expired/absent code, a throttle, and a REFUSED downgrade all render the
         // SAME uniform incorrect code failure with the flow OPEN (existence independent,
         // factor independent, never an oracle). The refused code is already burned.
-        EmailCodeOutcome::Invalid | EmailCodeOutcome::Blocked | EmailCodeOutcome::Throttled(_) => {
-            Ok(RecoveryVerifyStep::Render {
-                nodes: ack_nodes(transport, flow_id, true),
-                messages: Vec::new(),
-            })
-        }
+        EmailCodeOutcome::Invalid
+        | EmailCodeOutcome::Blocked { .. }
+        | EmailCodeOutcome::Throttled(_) => Ok(RecoveryVerifyStep::Render {
+            nodes: ack_nodes(transport, flow_id, true),
+            messages: Vec::new(),
+        }),
         // A saturated pool or a store fault: the neutral store error (never a 500 to the
         // client, mapped by the driver/transport), never a wrong code oracle.
         EmailCodeOutcome::Rejected(_) | EmailCodeOutcome::ServerError => Err(FlowError::Store),

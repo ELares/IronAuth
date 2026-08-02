@@ -21666,6 +21666,53 @@ impl RecoveryFlowRepo<'_> {
         Ok(row.and_then(|row| recovery_flow_from_row(&row)))
     }
 
+    /// Resolve the NEWEST recovery flow for `subject` that COMPLETED at or after
+    /// `since_micros` (issue #295): the post-recovery audit-and-notify window the live
+    /// factor-removal gate reads once [`Self::pending_for_subject`] has stopped returning
+    /// the flow.
+    ///
+    /// Completing a recovery is what ENDS the pending state, so the gate that keys on a
+    /// pending flow goes quiet at exactly the moment a recovered session exists. That is
+    /// correct for BLOCKING (the delay was served) and wrong for RECORDING: before the
+    /// hosted finalize of issue #295 shipped, a delay-elapsed downgrade was still
+    /// `AllowedByDelay`, which writes a `recovery.factor_change` audit row and notifies
+    /// every channel. This lookup is what keeps that arm alive across the completion, so a
+    /// factor removal in the window after a recovery is announced to the owner rather than
+    /// silent. Bounded by `recovery_flows_subject_idx` on (scope, subject).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn completed_since_for_subject(
+        &self,
+        subject: &UserId,
+        since_micros: i64,
+    ) -> Result<Option<RecoveryFlowRecord>, StoreError> {
+        if subject.scope() != self.scope {
+            return Ok(None);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, subject, state, entry_point, recover_acr, method, \
+             (EXTRACT(EPOCH FROM initiated_at) * 1000000)::bigint AS initiated_us, \
+             (EXTRACT(EPOCH FROM hold_until) * 1000000)::bigint AS hold_us \
+             FROM recovery_flows \
+             WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 \
+             AND state = 'completed' AND completed_at IS NOT NULL \
+             AND completed_at >= \
+                 (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval) \
+             ORDER BY completed_at DESC, id DESC LIMIT 1",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(subject.to_string())
+        .bind(since_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.and_then(|row| recovery_flow_from_row(&row)))
+    }
+
     /// Count `subject`'s recovery flows initiated at or after `since_micros` (issue
     /// #81): the per-account COOLDOWN signal. A non-zero count inside the cooldown
     /// window means a repeated initiation must be refused.
