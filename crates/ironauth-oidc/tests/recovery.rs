@@ -34,7 +34,7 @@ use ironauth_oidc::recovery::{
     initiate_recovery,
 };
 use ironauth_oidc::{
-    FactorChangeDecision, RecoveryFactor, RiskDirective, RiskEvaluator, RiskEvent,
+    FactorChangeDecision, ProvenFactor, RecoveryFactor, RiskDirective, RiskEvaluator, RiskEvent,
     VerificationPurpose, VerificationSender,
 };
 use ironauth_store::{
@@ -88,6 +88,19 @@ fn subject_id(harness: &Harness, subject: &str) -> UserId {
         .users()
         .parse_id(subject)
         .expect("parse subject")
+}
+
+/// Fabricate the SERVER-DERIVED recovery proof these ladder tests need (issue #295).
+///
+/// `initiate_recovery` no longer takes a bare [`RecoveryFactor`]: it takes a [`ProvenFactor`]
+/// whose fields are private and whose production mints all hard-code the `pwd` rung, so an
+/// inflated rung is not expressible in a shipped build. These tests DO need the stronger rungs
+/// (`mfa`, `phr`, `phrh`), which no production recovery surface can prove today, so they reach
+/// for the one constructor that takes a rung: `fabricated_for_tests`, compiled only under the
+/// non-default `testing` feature. That this helper has to exist here, in a test binary, and
+/// nowhere in `src/`, IS the shape of the guarantee.
+fn proof(harness: &Harness, subject: &UserId, factor: RecoveryFactor) -> ProvenFactor {
+    ProvenFactor::fabricated_for_tests(harness.scope(), *subject, factor)
 }
 
 /// Add a verified flexible identifier (issue #54) to a user, so the recovery
@@ -163,10 +176,8 @@ async fn email_recovery_against_a_passkey_account_cannot_remove_the_passkey_with
     // An attacker files a recovery via the WEAKER email-OTP channel.
     let outcome = initiate_recovery(
         harness.state(),
-        harness.scope(),
-        &subject,
+        &proof(&harness, &subject, RecoveryFactor::EmailOtp),
         RecoveryEntryPoint::LostPassword,
-        RecoveryFactor::EmailOtp,
         "ada@example.test",
         Some("203.0.113.7"),
         RecoveryMethod::Standard,
@@ -239,10 +250,8 @@ async fn email_recovery_can_remove_an_equal_or_weaker_factor_outright() {
     // No stronger factor enrolled, so the recovery is NOT held.
     let outcome = initiate_recovery(
         harness.state(),
-        harness.scope(),
-        &subject,
+        &proof(&harness, &subject, RecoveryFactor::EmailOtp),
         RecoveryEntryPoint::LostPassword,
-        RecoveryFactor::EmailOtp,
         "bob@example.test",
         None,
         RecoveryMethod::Standard,
@@ -298,10 +307,8 @@ async fn initiating_recovery_notifies_every_verified_channel() {
 
     let outcome = initiate_recovery(
         harness.state(),
-        harness.scope(),
-        &subject,
+        &proof(&harness, &subject, RecoveryFactor::EmailOtp),
         RecoveryEntryPoint::LostAllFactors,
-        RecoveryFactor::EmailOtp,
         "carol@example.test",
         None,
         RecoveryMethod::Standard,
@@ -341,10 +348,8 @@ async fn a_held_recovery_is_cancellable_from_its_notification_token_and_cancella
 
     let outcome = initiate_recovery(
         harness.state(),
-        harness.scope(),
-        &subject,
+        &proof(&harness, &subject, RecoveryFactor::EmailOtp),
         RecoveryEntryPoint::LostPassword,
-        RecoveryFactor::EmailOtp,
         "dave@example.test",
         None,
         RecoveryMethod::Standard,
@@ -426,10 +431,8 @@ async fn cooldown_rate_limits_repeated_recovery_initiations() {
 
     let first = initiate_recovery(
         harness.state(),
-        harness.scope(),
-        &subject,
+        &proof(&harness, &subject, RecoveryFactor::EmailOtp),
         RecoveryEntryPoint::LostPassword,
-        RecoveryFactor::EmailOtp,
         "erin@example.test",
         None,
         RecoveryMethod::Standard,
@@ -440,10 +443,8 @@ async fn cooldown_rate_limits_repeated_recovery_initiations() {
     // A repeat inside the cooldown window is SUPPRESSED (no second flow).
     let second = initiate_recovery(
         harness.state(),
-        harness.scope(),
-        &subject,
+        &proof(&harness, &subject, RecoveryFactor::EmailOtp),
         RecoveryEntryPoint::LostPassword,
-        RecoveryFactor::EmailOtp,
         "erin@example.test",
         None,
         RecoveryMethod::Standard,
@@ -460,10 +461,8 @@ async fn cooldown_rate_limits_repeated_recovery_initiations() {
     ));
     let third = initiate_recovery(
         harness.state(),
-        harness.scope(),
-        &subject,
+        &proof(&harness, &subject, RecoveryFactor::EmailOtp),
         RecoveryEntryPoint::LostPassword,
-        RecoveryFactor::EmailOtp,
         "erin@example.test",
         None,
         RecoveryMethod::Standard,
@@ -491,10 +490,8 @@ async fn every_recovery_step_appears_in_the_audit_log() {
 
     let outcome = initiate_recovery(
         harness.state(),
-        harness.scope(),
-        &subject,
+        &proof(&harness, &subject, RecoveryFactor::EmailOtp),
         RecoveryEntryPoint::LostSecondFactor,
-        RecoveryFactor::EmailOtp,
         "frank@example.test",
         Some("203.0.113.9"),
         RecoveryMethod::Standard,
@@ -559,10 +556,8 @@ async fn a_risk_block_suppresses_recovery() {
 
     let outcome = initiate_recovery(
         &state,
-        harness.scope(),
-        &subject,
+        &proof(&harness, &subject, RecoveryFactor::EmailOtp),
         RecoveryEntryPoint::LostPassword,
-        RecoveryFactor::EmailOtp,
         "grace@example.test",
         None,
         RecoveryMethod::Standard,
@@ -590,10 +585,8 @@ async fn a_risk_forced_delay_holds_an_otherwise_immediate_recovery() {
 
     let outcome = initiate_recovery(
         &state,
-        harness.scope(),
-        &subject,
+        &proof(&harness, &subject, RecoveryFactor::EmailOtp),
         RecoveryEntryPoint::LostPassword,
-        RecoveryFactor::EmailOtp,
         "heidi@example.test",
         None,
         RecoveryMethod::Standard,
@@ -739,10 +732,8 @@ async fn live_endpoint_a_held_recovery_blocks_passkey_removal_until_a_fresh_reve
     // A pending email-OTP recovery against a passkey account is HELD (security-reducing).
     let outcome = initiate_recovery(
         harness.state(),
-        harness.scope(),
-        &subject,
+        &proof(&harness, &subject, RecoveryFactor::EmailOtp),
         RecoveryEntryPoint::LostPassword,
-        RecoveryFactor::EmailOtp,
         "ada@example.test",
         None,
         RecoveryMethod::Standard,
@@ -811,10 +802,8 @@ async fn live_endpoint_a_held_recovery_blocks_passkey_removal_until_the_delay_el
 
     let outcome = initiate_recovery(
         harness.state(),
-        harness.scope(),
-        &subject,
+        &proof(&harness, &subject, RecoveryFactor::EmailOtp),
         RecoveryEntryPoint::LostPassword,
-        RecoveryFactor::EmailOtp,
         "bob@example.test",
         None,
         RecoveryMethod::Standard,
@@ -880,10 +869,8 @@ async fn live_endpoint_a_held_recovery_blocks_totp_removal_until_the_delay_elaps
 
     let outcome = initiate_recovery(
         harness.state(),
-        harness.scope(),
-        &subject,
+        &proof(&harness, &subject, RecoveryFactor::EmailOtp),
         RecoveryEntryPoint::LostSecondFactor,
-        RecoveryFactor::EmailOtp,
         "dave@example.test",
         None,
         RecoveryMethod::Standard,
@@ -954,10 +941,8 @@ async fn live_endpoint_password_removal_still_works_via_fresh_passkey_reauth() {
     // passkey re-auth proves an equal-or-stronger factor, so the conversion still succeeds.
     let outcome = initiate_recovery(
         harness.state(),
-        harness.scope(),
-        &subject,
+        &proof(&harness, &subject, RecoveryFactor::EmailOtp),
         RecoveryEntryPoint::LostPassword,
-        RecoveryFactor::EmailOtp,
         "erin@example.test",
         None,
         RecoveryMethod::Standard,
@@ -1021,10 +1006,8 @@ async fn the_known_and_unknown_init_paths_do_comparable_work() {
     // The KNOWN path scores exactly one recovery event through the risk seam.
     let _ = initiate_recovery(
         &state,
-        harness.scope(),
-        &subject,
+        &proof(&harness, &subject, RecoveryFactor::EmailOtp),
         RecoveryEntryPoint::LostPassword,
-        RecoveryFactor::EmailOtp,
         "frank@example.test",
         None,
         RecoveryMethod::Standard,
@@ -1040,7 +1023,6 @@ async fn the_known_and_unknown_init_paths_do_comparable_work() {
         &state,
         harness.scope(),
         RecoveryEntryPoint::LostPassword,
-        RecoveryFactor::EmailOtp,
         "nobody@example.test",
         None,
     )
@@ -1074,10 +1056,9 @@ async fn a_device_bound_passkey_holder_is_held_at_its_true_rung() {
 
     let outcome = initiate_recovery(
         harness.state(),
-        harness.scope(),
-        &subject,
+        // Recover at the synced-passkey rung (phr).
+        &proof(&harness, &subject, RecoveryFactor::Passkey),
         RecoveryEntryPoint::LostPassword,
-        RecoveryFactor::Passkey, // recover at the synced-passkey rung (phr).
         "grace@example.test",
         None,
         RecoveryMethod::Standard,

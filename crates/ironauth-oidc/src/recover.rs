@@ -151,14 +151,15 @@ pub async fn recover_post(
         // only, so a known account stays byte-identical to an unknown one in the response.
         // The entry point defaults to a lost-password recovery (the common /recover case;
         // the finer entry-point selection is a hosted-page concern) and the recovery
-        // factor is the email one-time proof this surface delivers through (issue #68).
+        // factor is the email one-time proof this surface delivers through (issue #68),
+        // minted as the SERVER-DERIVED `pwd`-rung proof for the subject the store just
+        // resolved (issue #295), never a value this handler chose.
         let client_ip = crate::abuse::resolved_client_ip(&headers);
+        let proven = crate::recovery_proof::from_notified_channel(resume.scope, user.id);
         let _ = crate::recovery::initiate_recovery(
             &state,
-            resume.scope,
-            &user.id,
+            &proven,
             ironauth_store::RecoveryEntryPoint::LostPassword,
-            crate::recovery::RecoveryFactor::EmailOtp,
             identifier,
             client_ip.as_deref(),
             ironauth_store::RecoveryMethod::Standard,
@@ -175,7 +176,6 @@ pub async fn recover_post(
             &state,
             resume.scope,
             ironauth_store::RecoveryEntryPoint::LostPassword,
-            crate::recovery::RecoveryFactor::EmailOtp,
             identifier,
             client_ip.as_deref(),
         )

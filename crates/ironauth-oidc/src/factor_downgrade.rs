@@ -215,6 +215,49 @@ impl GatedSessionPath {
     }
 }
 
+/// A surface that mints a PRIMARY SESSION on a possibly stronger-factor account and is
+/// deliberately NOT a member of [`GatedSessionPath`] (issue #295).
+///
+/// [`GatedSessionPath`] is a registry with eight sweeps behind it, and every one of those
+/// sweeps asserts the same thing: on a protected account, the surface mints NO session. A
+/// recovery finalization exists to do the opposite. Its whole purpose is to give a passkey
+/// holder who LOST the passkey a way back in, and it earns that through a different
+/// compensating control (the issue #81 delay window, held and notified, plus the mode
+/// precondition) rather than through the issue #267 refusal. Registering it would fail those
+/// sweeps by construction, so it is not registered.
+///
+/// What it was, before this type existed, was simply absent: a session mint that no registry
+/// listed and no sweep drove, distinguishable from an oversight only by reading the handler.
+/// Naming it here is the difference between a decision and a gap. The count of mint sites is
+/// pinned separately by `scripts/invariant-lints.sh` (rule `session-mint-registry`) against
+/// `docs/design/session-mint-sites.txt`, so a FUTURE ungated mint cannot be added silently
+/// either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UngatedSessionMint {
+    /// `POST /t/{tenant}/e/{environment}/recover/finalize` (issue #295): the recovered
+    /// subject's session. Gated by `advanced_recovery::finalize_recovery`, which requires the
+    /// mode's `method_satisfied` precondition AND the store `complete`'s `hold_until <= now`
+    /// delay guard, neither of which the issue #267 gate can express.
+    RecoveryFinalize,
+}
+
+impl UngatedSessionMint {
+    /// Every session-minting surface deliberately outside [`GatedSessionPath`].
+    pub const ALL: [UngatedSessionMint; 1] = [UngatedSessionMint::RecoveryFinalize];
+
+    /// The stable label, which is the SAME label the surface reports on the observability
+    /// plane. Binding the two means the registry cannot name a surface that no longer exists
+    /// under that name.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UngatedSessionMint::RecoveryFinalize => {
+                crate::recovery_proof::RecoveryProofSurface::Finalize.as_str()
+            }
+        }
+    }
+}
+
 /// The account's STRONGEST enrolled factor, as an `acr` on the issue #66 ladder
 /// (issue #267).
 ///
@@ -331,6 +374,13 @@ pub async fn blocked(
 /// log line and one metric, never a body difference. Called by every gated surface
 /// immediately before it renders its uniform refusal, so an operator can see WHICH
 /// surface refused and how often without the response revealing anything.
+///
+/// A REFUSAL means the request answered its uniform failure and minted nothing. A surface
+/// that treats a `Blocked` gate decision as a successful possession proof and CONTINUES
+/// calls [`record_downgrade_permitted`] instead, so this counter never mixes the two: an
+/// operator reading `ironauth_factor_downgrade_refused_total` is reading refusals only.
+/// See [`crate::email_otp::BlockedDisposition`], which is the parameter that decides which
+/// of the two the one verify core emits.
 pub fn record_refusal(scope: Scope, path: GatedSessionPath, purpose: &str) {
     tracing::info!(
         target: "ironauth.abuse",
@@ -345,6 +395,47 @@ pub fn record_refusal(scope: Scope, path: GatedSessionPath, purpose: &str) {
     metrics::counter!(
         "ironauth_factor_downgrade_refused_total",
         "path" => path.as_str(),
+        "factor" => path.factor().as_str(),
+    )
+    .increment(1);
+}
+
+/// Record a downgrade the gate DECIDED against but the surface deliberately proceeded past
+/// (issue #295): the account-recovery case.
+///
+/// The issue #81 recovery subsystem exists precisely to let a weak factor reach a
+/// strong-factor account, under a delay window with notifications rather than under a flat
+/// refusal, so `/recover/*` drives the gated email-OTP verify core, reads a `Blocked` as a
+/// proven possession, and continues. That is a real and deliberate downgrade, worth exactly
+/// as much operator visibility as a refusal, and it is NOT a refusal: recording it as one
+/// would put events on `ironauth_factor_downgrade_refused_total` that ended in a session,
+/// which is the shape of an operator drawing the wrong conclusion from a true number.
+///
+/// `surface` is a label of the CALLING endpoint, deliberately distinct from
+/// [`GatedSessionPath`]: the recovery surfaces are not session-mint registrations (they are
+/// not in [`GatedSessionPath::ALL`], and the issue #267 sweeps over `ALL` demand behaviour
+/// they cannot have), so attributing them needs a label that is not a member of that enum.
+/// `path` still names the verify core that was driven, so the two are readable together.
+pub fn record_downgrade_permitted(
+    scope: Scope,
+    path: GatedSessionPath,
+    surface: &str,
+    purpose: &str,
+) {
+    tracing::info!(
+        target: "ironauth.abuse",
+        tenant = %scope.tenant(),
+        environment = %scope.environment(),
+        path = path.as_str(),
+        surface,
+        factor = path.factor().as_str(),
+        purpose,
+        "factor-downgrade permitted by account recovery: the account holds a stronger \
+         factor and the recovery subsystem's delay window is the compensating control"
+    );
+    metrics::counter!(
+        "ironauth_factor_downgrade_recovery_permitted_total",
+        "surface" => surface.to_owned(),
         "factor" => path.factor().as_str(),
     )
     .increment(1);
@@ -380,6 +471,52 @@ mod tests {
             "GatedSessionPath::ALL must list every variant; add the new surface here \
              AND drive it in tests/factor_downgrade.rs"
         );
+    }
+
+    /// The DELIBERATE exceptions to that registry are themselves a closed, named list, and
+    /// each one's label is the label the surface actually reports (issue #295).
+    ///
+    /// Two failure modes are pinned. A second ungated mint added without a decision changes
+    /// the length. And a label that drifts from the surface's own
+    /// `RecoveryProofSurface::Finalize` would leave the registry naming something that no
+    /// longer exists under that name, which is how a registry becomes documentation.
+    #[test]
+    fn the_ungated_session_mints_are_a_closed_named_list() {
+        use super::UngatedSessionMint;
+        use crate::recovery_proof::RecoveryProofSurface;
+
+        assert_eq!(
+            UngatedSessionMint::ALL.len(),
+            1,
+            "a session mint outside GatedSessionPath is a DECISION; name it here, justify it \
+             in docs/design/SESSION-MINT-SITES.md, and say what gates it instead"
+        );
+        assert_eq!(
+            UngatedSessionMint::RecoveryFinalize.as_str(),
+            RecoveryProofSurface::Finalize.as_str(),
+            "the registry's label must be the label the surface itself reports"
+        );
+        // And no recovery surface's label may collide with a gated path's: the whole reason
+        // these labels exist is that `/recover/*` must be attributable on the observability
+        // plane WITHOUT being a member of GatedSessionPath::ALL, whose sweeps demand
+        // no-session behaviour on exactly the protected accounts recovery serves. A label
+        // that drifted onto `email_otp_verify` would silently fold the permitted-downgrade
+        // events back in with the refusals they were split out of.
+        let gated: Vec<&'static str> = GatedSessionPath::ALL
+            .iter()
+            .map(|path| path.as_str())
+            .collect();
+        for surface in [
+            RecoveryProofSurface::AdminApprovedInitiate,
+            RecoveryProofSurface::IdvInitiate,
+            RecoveryProofSurface::Finalize,
+        ] {
+            assert!(
+                !gated.contains(&surface.as_str()),
+                "the recovery surface label {} collides with a gated path label",
+                surface.as_str()
+            );
+        }
     }
 
     /// The ordering is the whole gate, so it is pinned rather than assumed. Every weak

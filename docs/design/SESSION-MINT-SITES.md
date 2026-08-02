@@ -1,0 +1,71 @@
+# The session-mint site registry
+
+Every primary session in IronAuth is minted by one function,
+`crate::interaction::establish_session`, which carries the central account-lifecycle fence
+(issues #80 and #52). That funnel is old and load-bearing. What did not exist until issue #295
+is a record of WHO calls it.
+
+## Why a registry, and why now
+
+Issue #267 shipped `factor_downgrade::GatedSessionPath`, a structural registry of the surfaces
+where a WEAK POSSESSION factor can reach a primary session. It is enforced hard: eight separate
+sweeps iterate `GatedSessionPath::ALL` and drive every member end to end over HTTP, and the
+exhaustive matches on `factor()` and `as_str()` mean a new variant does not compile until it is
+classified.
+
+That registry is deliberately narrower than "everything that mints". It answers one question
+(may a mailbox or a phone number stand in for a passkey), so the password login, the federated
+login, the device-flow login, and the WebAuthn ceremonies are all outside it on purpose. The
+consequence is that a NEW session-minting surface gets neither a sweep nor a compiler error
+from `GatedSessionPath`: it simply exists.
+
+Issue #295 added exactly such a surface. `advanced_recovery::finalize` mints a primary session
+over a passkey-protected account, deliberately and correctly (it is the terminus of a
+delay-held, notified, mode-gated recovery case), and it is deliberately NOT registered in
+`GatedSessionPath::ALL`, because several of the sweeps over `ALL` demand NO SESSION for exactly
+the protected accounts recovery exists to serve. Registering it would fail them by design.
+
+So the deliberate exception needed a name and a count, rather than being the one path that
+escapes both. The name is `factor_downgrade::UngatedSessionMint`, which is unit-tested against
+the two things that would make it stale. The count is
+[`session-mint-sites.txt`](session-mint-sites.txt), regenerated and diffed by
+`scripts/invariant-lints.sh` under rule `session-mint-registry`, exactly the way
+`scripts/rfc9700-scan.sh` pins the mounted endpoint inventory. There are 13 call sites across
+10 files today.
+
+## What the lint does
+
+`scripts/invariant-lints.sh` walks `crates/ironauth-oidc/src`, counts every call to
+`establish_session(` (the definition itself and the private `establish_session_page` wrapper
+are not calls and are excluded), writes `<count>\t<path>` per file, and diffs the result
+against the committed inventory. A new call in an existing file bumps its count; a call in a
+new file adds a row. Either way the diff is non-empty and CI fails until an author regenerates
+the inventory AND names the file in the table below.
+
+The lint is a COUNT, not a proof of correctness. What it buys is that no session-minting call
+site can be added silently: the author has to come here and write down what mints and under
+what gate.
+
+## The registry
+
+| File | What mints there | Gated by |
+|------|------------------|----------|
+| `login.rs` (3) | The hosted password login, the MFA continuation, and the trusted-device continuation | The password credential itself; MFA where enrolled. Not a `GatedSessionPath`: a password is not a weak possession factor, and whether enrolling a passkey should raise the floor for a password login is issue #267's stated non-question |
+| `register.rs` | The self-service registration completion | The registration itself (a brand-new account holds no stronger factor to downgrade past) |
+| `email_otp.rs` | `POST /otp/verify` | `GatedSessionPath::EmailOtpVerify` |
+| `magic_link.rs` | `POST /magic/consume` | `GatedSessionPath::MagicLinkConsume` |
+| `sms_otp.rs` | `POST /otp/sms/verify` | `GatedSessionPath::SmsOtpVerify` |
+| `flow/mod.rs` | The headless flow engine's completion mint (login, registration, recovery, MFA) | `GatedSessionPath::FlowRecoveryVerify` on the recovery journey; the flow's own step preconditions otherwise |
+| `webauthn.rs` (2) | The passkey authentication ceremony and the passkey-first registration ceremony | The ceremony. A passkey is the TOP of the ladder, so there is no downgrade to gate |
+| `federation.rs` | The upstream-IdP callback | The verified upstream assertion |
+| `device_verify.rs` | The device-authorization user-code approval | The approving user's own session |
+| `advanced_recovery.rs` | `POST /recover/finalize` (issue #295) | **The deliberate exception.** Gated by `finalize_recovery`: the mode precondition AND the store `complete`'s `hold_until <= now` delay guard. NOT in `GatedSessionPath::ALL`, named instead by `factor_downgrade::UngatedSessionMint::RecoveryFinalize`. See that type's doc for why registering it would fail the issue #267 sweeps by construction |
+
+## Adding a session-minting surface
+
+1. Write the call. `scripts/invariant-lints.sh` fails.
+2. Decide whether the surface presents a WEAK POSSESSION factor. If it does, add a
+   `GatedSessionPath` variant and drive it in `tests/factor_downgrade.rs`; the exhaustive
+   matches and the registry-length assertion will not let you skip either.
+3. If it does not, say why in the table above.
+4. Regenerate the inventory (run the lint; it rewrites the file) and commit it.

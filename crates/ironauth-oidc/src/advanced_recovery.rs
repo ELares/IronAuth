@@ -29,21 +29,96 @@
 //! The whole surface is gated by the `advanced-recovery` experimental feature
 //! ([`OidcState::advanced_recovery_enabled`]) plus each mode's config sub-toggle; with the
 //! feature off every entry point here is inert (`None`) and every route answers a 404.
+//!
+//! # The HOSTED flow (issue #295)
+//!
+//! PR 3 shipped the completion machinery and left the user-facing INITIATION library-only.
+//! It is now mounted, as three public endpoints:
+//!
+//! - `POST .../recover/admin-approved/initiate` and `.../recover/idv/initiate` open a case in
+//!   the corresponding mode;
+//! - `POST .../recover/finalize` establishes the recovered subject's session, the other half
+//!   of PR 3's deferred session mint.
+//!
+//! ## Why the TRUSTED-CONTACT mode has no hosted entry point
+//!
+//! Two of the three modes are mounted; the trusted-contact one is not, and neither is a
+//! self-service contact-enrollment surface. The reason is a delivery seam this repository
+//! does not have yet. [`crate::recovery::notify_owner_channels`] sends a COARSE per-channel
+//! alert and takes no URL, and the standard initiation's own cancellation link binds into a
+//! discarded local for the same reason. A trusted-contact recovery completes only when
+//! `required_confirmations` DISTINCT contacts each present the single-use token minted by
+//! [`initiate_trusted_contact`], and there is no transport that can put that token in front
+//! of a contact. A mounted initiation would therefore open cases that can never reach
+//! [`trusted_contact_confirm`], and an enrollment surface would let a user designate contacts
+//! for a mode that cannot run while creating a durable new path to their account.
+//!
+//! The library seams stay: [`initiate_trusted_contact`], [`consume_trusted_contact_confirmation`],
+//! the `/recover/trusted-contact/confirm` route PR 3 mounted, and the whole distinct-contact
+//! threshold are unchanged and still covered. Only the self-service ENTRY POINTS are absent,
+//! and they arrive with the transport (issue #295 stays open for exactly that half).
+//!
+//! ## The recover factor is minted, not accepted
+//!
+//! Each initiation begins by PROVING control of the account's email channel through
+//! [`recovery_proof::prove_email_otp`], which drives the ONE email-OTP verify core on the
+//! recovery purpose and mints a [`ProvenFactor`] at the `pwd` rung. The subject comes from
+//! that proof (resolved by the verify core from the presented identifier, never from a
+//! request field), and so does the rung. There is no request field, and no parameter on any
+//! of the three initiation functions, that could name a stronger factor: see
+//! [`crate::recovery_proof`] for the two compiler errors that enforce it.
+//!
+//! The hosted surface therefore covers the user who lost their AUTHENTICATION factors and
+//! still reads their mail. A user who has also lost the channel is the admin-approved mode's
+//! management-plane case, which shipped in PR 3; no self-service endpoint can identify such a
+//! user, and inventing one that could would be the hole this module exists to avoid.
+//!
+//! ## Uniform refusal
+//!
+//! The statement that holds across the whole module is narrower than "three shapes", and the
+//! narrower one is the one worth writing down: EVERY endpoint here answers a refusal with a
+//! SINGLE shape that does not vary with the reason, so no endpoint is an oracle. Which shape
+//! that is differs by endpoint, because the surfaces have different callers:
+//!
+//! - the three issue #295 endpoints ([`admin_approved_initiate`], [`idv_initiate`],
+//!   [`finalize`]) answer `200` with a JSON body on success and ONE
+//!   [`recovery_unavailable`] `401` for every refusal: an unknown identifier, a wrong,
+//!   expired, over-attempted or spent code, a throttled verify, a suppressed initiation
+//!   (cooldown, risk block), an unknown or disabled IDV provider, no pending flow, an
+//!   unsatisfied method, an unelapsed delay window, the account-lifecycle fence, and a store
+//!   fault alike;
+//! - [`idv_callback`] (PR 3) answers `202` on a consumed callback and ONE uniform `400`
+//!   ([`callback_rejected`]) for every rejection, because its caller is a provider rather
+//!   than a browser and it establishes nothing;
+//! - [`trusted_contact_confirm`] (PR 3) answers the SAME `200` acknowledgment page whether
+//!   the token confirmed anything or was a no-op, which is the same property expressed as a
+//!   single SUCCESS shape rather than a single refusal one.
+//!
+//! Across all five, a `404` when the feature or the mode sub-toggle is off, or the scope path
+//! does not parse: a deployment-wide constant, identical for every tenant and every subject.
+//!
+//! ## The session mint is downstream of the gate, never beside it
+//!
+//! [`finalize_recovery`] is the ONLY thing that can turn a pending case into a completed one,
+//! and it refuses unless the method precondition holds AND
+//! [`ironauth_store::ActingRecoveryFlowRepo::complete`]'s `hold_until <= now` guard passes.
+//! The hosted finalize endpoint mints a session ONLY on its `true`, so a session cannot exist
+//! for a case whose delay window has not elapsed or whose mode is unsatisfied.
 
+use axum::Json;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use ironauth_jose::{
     ExpectedTyp, JwsAlgorithm, VerificationPolicy, VerifiedToken, trusted_keys_from_jwks, verify,
 };
-use ironauth_store::{
-    CorrelationId, RecoveryEntryPoint, RecoveryFlowId, RecoveryMethod, Scope, UserId,
-};
-use serde_json::Value;
+use ironauth_store::{CorrelationId, RecoveryEntryPoint, RecoveryFlowId, RecoveryMethod, Scope};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::interaction;
-use crate::recovery::{self, RecoveryFactor, RecoveryInitiation};
+use crate::recovery::{self, RecoveryInitiation};
+use crate::recovery_proof::{self, ProvenFactor, RecoveryProofSurface};
 use crate::state::OidcState;
 use crate::verification::VerificationPurpose;
 use crate::wellknown::{not_found, parse_scope};
@@ -105,16 +180,14 @@ pub struct IdvInitiation {
 /// or [`None`] when the mode is inert (the feature is off or the sub-toggle is disabled) or
 /// the initiation was suppressed (anti-enumeration / cooldown / risk block).
 ///
-/// SECURITY: `recover_factor` is security-load-bearing (it gates the `hold_until` delay) and
-/// MUST be server-derived from the ACTUALLY-proven factor, never caller-supplied. This is
-/// library-only today; a future public initiation endpoint MUST establish it from the real
-/// recovery evidence. See [`recovery::initiate_recovery`]'s `recover_factor` doc guard.
+/// SECURITY (issue #295): the recovery's factor, scope, and subject all come from `proven`,
+/// a [`ProvenFactor`] the caller cannot fabricate (private fields, module-private mint, no
+/// production constructor that takes a rung). The `hold_until` delay is gated on that rung,
+/// so this entry point no longer HAS an argument position an inflated factor could occupy.
 pub async fn initiate_admin_approved(
     state: &OidcState,
-    scope: Scope,
-    subject: &UserId,
+    proven: &ProvenFactor,
     entry_point: RecoveryEntryPoint,
-    recover_factor: RecoveryFactor,
     recipient: &str,
     client_ip: Option<&str>,
 ) -> Option<RecoveryFlowId> {
@@ -123,12 +196,12 @@ pub async fn initiate_admin_approved(
     {
         return None;
     }
+    let scope = proven.scope();
+    let subject = proven.subject();
     let RecoveryInitiation::Created { flow_id, .. } = recovery::initiate_recovery(
         state,
-        scope,
-        subject,
+        proven,
         entry_point,
-        recover_factor,
         recipient,
         client_ip,
         RecoveryMethod::AdminApproved,
@@ -159,16 +232,12 @@ pub async fn initiate_admin_approved(
 /// the confirmation tokens, or [`None`] when the mode is inert, the initiation was
 /// suppressed, or the subject has designated no contacts (an unreachable recovery).
 ///
-/// SECURITY: `recover_factor` is security-load-bearing (it gates the `hold_until` delay) and
-/// MUST be server-derived from the ACTUALLY-proven factor, never caller-supplied. This is
-/// library-only today; a future public initiation endpoint MUST establish it from the real
-/// recovery evidence. See [`recovery::initiate_recovery`]'s `recover_factor` doc guard.
+/// SECURITY (issue #295): the recovery's factor, scope, and subject all come from `proven`,
+/// a [`ProvenFactor`] the caller cannot fabricate. See [`initiate_admin_approved`].
 pub async fn initiate_trusted_contact(
     state: &OidcState,
-    scope: Scope,
-    subject: &UserId,
+    proven: &ProvenFactor,
     entry_point: RecoveryEntryPoint,
-    recover_factor: RecoveryFactor,
     recipient: &str,
     client_ip: Option<&str>,
 ) -> Option<TrustedContactInitiation> {
@@ -177,6 +246,8 @@ pub async fn initiate_trusted_contact(
     {
         return None;
     }
+    let scope = proven.scope();
+    let subject = proven.subject();
     // The designated contacts (opened for the out-of-band send). No contacts means the
     // threshold is unreachable, so the mode does not apply.
     let contacts = state
@@ -191,10 +262,8 @@ pub async fn initiate_trusted_contact(
     }
     let RecoveryInitiation::Created { flow_id, .. } = recovery::initiate_recovery(
         state,
-        scope,
-        subject,
+        proven,
         entry_point,
-        recover_factor,
         recipient,
         client_ip,
         RecoveryMethod::TrustedContact,
@@ -238,17 +307,12 @@ pub async fn initiate_trusted_contact(
 /// the initiation, or [`None`] when the mode is inert, the provider is unknown/disabled, or
 /// the initiation was suppressed.
 ///
-/// SECURITY: `recover_factor` is security-load-bearing (it gates the `hold_until` delay) and
-/// MUST be server-derived from the ACTUALLY-proven factor, never caller-supplied. This is
-/// library-only today; a future public initiation endpoint MUST establish it from the real
-/// recovery evidence. See [`recovery::initiate_recovery`]'s `recover_factor` doc guard.
-#[allow(clippy::too_many_arguments)]
+/// SECURITY (issue #295): the recovery's factor, scope, and subject all come from `proven`,
+/// a [`ProvenFactor`] the caller cannot fabricate. See [`initiate_admin_approved`].
 pub async fn initiate_idv(
     state: &OidcState,
-    scope: Scope,
-    subject: &UserId,
+    proven: &ProvenFactor,
     entry_point: RecoveryEntryPoint,
-    recover_factor: RecoveryFactor,
     recipient: &str,
     client_ip: Option<&str>,
     provider_slug: &str,
@@ -256,16 +320,16 @@ pub async fn initiate_idv(
     if !state.advanced_recovery_enabled() || !state.advanced_recovery_config().idv_enabled {
         return None;
     }
+    let scope = proven.scope();
+    let subject = proven.subject();
     let provider = state
         .advanced_recovery_config()
         .idv_provider(provider_slug)?
         .clone();
     let RecoveryInitiation::Created { flow_id, .. } = recovery::initiate_recovery(
         state,
-        scope,
-        subject,
+        proven,
         entry_point,
-        recover_factor,
         recipient,
         client_ip,
         RecoveryMethod::Idv,
@@ -703,4 +767,350 @@ fn callback_rejected() -> Response {
 /// completed the recovery, a FAIL was recorded). `202 Accepted` with an empty body.
 fn callback_accepted() -> Response {
     StatusCode::ACCEPTED.into_response()
+}
+
+// ---------------------------------------------------------------------------------------
+// The HOSTED initiation and finalization surface (issue #295).
+// ---------------------------------------------------------------------------------------
+
+/// The posted body of a hosted advanced-recovery INITIATION (issue #295).
+///
+/// It carries the channel proof and, for the IDV mode, the provider slug. It carries NO
+/// subject and NO recovery factor: both are established server side from the proof, which is
+/// the entire point of the surface.
+#[derive(serde::Deserialize)]
+pub struct InitiateBody {
+    /// The identifier the recovery is for. Used ONLY to resolve the account inside the
+    /// email-OTP verify core; the resolved subject comes back from that core.
+    pub identifier: Option<String>,
+    /// The email one-time code, issued for the `recovery` purpose, that proves channel
+    /// control.
+    pub code: Option<String>,
+    /// The registered IDV provider slug (the IDV mode only). Ignored by the other two modes.
+    pub provider: Option<String>,
+}
+
+/// The posted body of a hosted recovery FINALIZATION (issue #295): the same channel proof the
+/// initiation took, re-presented with a fresh code (the initiation's was consumed single-use).
+#[derive(serde::Deserialize)]
+pub struct FinalizeBody {
+    /// The identifier the recovery is for.
+    pub identifier: Option<String>,
+    /// A fresh email one-time code, issued for the `recovery` purpose.
+    pub code: Option<String>,
+}
+
+/// THE single refusal the three issue #295 endpoints answer with.
+///
+/// One constant response for an unknown identifier, a wrong / expired / over-attempted /
+/// spent code, a throttled or pool-rejected verify, a suppressed initiation (the per-account
+/// cooldown or a risk block), an unknown or disabled IDV provider, no pending flow, an
+/// unsatisfied method, an unelapsed delay window, the account-lifecycle fence, and a store
+/// fault alike. The endpoint is therefore no oracle for account existence, account
+/// protection posture, account lifecycle state, recovery-case state, or provider
+/// configuration.
+///
+/// The ONLY other refusal shape on those three is the feature/mode/scope `404`, which is a
+/// deployment-wide constant identical for every tenant and every subject.
+fn recovery_unavailable() -> Response {
+    no_store(
+        StatusCode::UNAUTHORIZED,
+        json!({ "error": "recovery_unavailable" }),
+    )
+}
+
+/// A JSON response at `status` with the hardened no-store header, mirroring the email-factor
+/// surfaces.
+fn no_store(status: StatusCode, body: Value) -> Response {
+    let mut response = (status, Json(body)).into_response();
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+/// Resolve the scope and PROVE the channel for a hosted initiation / finalization (issue
+/// #295), or return the uniform refusal.
+///
+/// `armed` is the mode's own gate, evaluated by the caller. It is taken as a bool rather than
+/// probed here so each endpoint states its own sub-toggle at its own call site.
+// Eight parameters, one more than the lint allows. Every one of them is a distinct fact the
+// endpoint knows and this helper does not: which scope path was routed, whether THIS mode's
+// sub-toggle is armed, which surface to attribute the proof to, and the two presented
+// credential fields. Bundling them into a struct would move the argument list rather than
+// shorten it, and the point of the helper is that no endpoint re-implements the proof.
+#[allow(clippy::too_many_arguments)]
+async fn proven_or_refused(
+    state: &OidcState,
+    tenant_id: &str,
+    environment_id: &str,
+    armed: bool,
+    surface: RecoveryProofSurface,
+    identifier: Option<&str>,
+    code: Option<&str>,
+    headers: &HeaderMap,
+) -> Result<ProvenFactor, Response> {
+    if !state.advanced_recovery_enabled() || !armed {
+        return Err(not_found());
+    }
+    let Some(scope) = parse_scope(tenant_id, environment_id) else {
+        return Err(not_found());
+    };
+    let identifier = identifier.map(str::trim).unwrap_or_default();
+    let code = code.map(str::trim).unwrap_or_default();
+    if identifier.is_empty() || code.is_empty() {
+        return Err(recovery_unavailable());
+    }
+    // THE mint. It resolves the subject and attests the rung; this handler supplies neither.
+    recovery_proof::prove_email_otp(state, scope, surface, identifier, code, headers)
+        .await
+        .ok_or_else(recovery_unavailable)
+}
+
+/// `POST /t/{tenant}/e/{env}/recover/admin-approved/initiate`: open an ADMIN-APPROVED recovery
+/// case (issue #295). Proves channel control, mints the server-derived `pwd`-rung
+/// [`ProvenFactor`], creates the flow (HELD whenever that rung does not reach the account's
+/// strongest factor), and lands a pending row in the control-plane approval queue. Uniform
+/// refusal on everything else.
+pub(crate) async fn admin_approved_initiate(
+    State(state): State<OidcState>,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<InitiateBody>,
+) -> Response {
+    let armed = state.advanced_recovery_config().admin_approved_enabled;
+    let proven = match proven_or_refused(
+        &state,
+        &tenant_id,
+        &environment_id,
+        armed,
+        RecoveryProofSurface::AdminApprovedInitiate,
+        body.identifier.as_deref(),
+        body.code.as_deref(),
+        &headers,
+    )
+    .await
+    {
+        Ok(proven) => proven,
+        Err(response) => return response,
+    };
+    let client_ip = crate::abuse::resolved_client_ip(&headers);
+    let recipient = body
+        .identifier
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default();
+    match initiate_admin_approved(
+        &state,
+        &proven,
+        RecoveryEntryPoint::LostAllFactors,
+        recipient,
+        client_ip.as_deref(),
+    )
+    .await
+    {
+        Some(_flow_id) => initiated(None),
+        None => recovery_unavailable(),
+    }
+}
+
+/// `POST /t/{tenant}/e/{env}/recover/idv/initiate`: open an IDV-GATED recovery case (issue
+/// #295) and return the provider redirect URL carrying the case binding. The redirect URL is
+/// returned ONLY on success; every refusal is the uniform shape, so the presence of a URL
+/// discloses nothing an actor who did not already prove the channel could read.
+pub(crate) async fn idv_initiate(
+    State(state): State<OidcState>,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<InitiateBody>,
+) -> Response {
+    let armed = state.advanced_recovery_config().idv_enabled;
+    let proven = match proven_or_refused(
+        &state,
+        &tenant_id,
+        &environment_id,
+        armed,
+        RecoveryProofSurface::IdvInitiate,
+        body.identifier.as_deref(),
+        body.code.as_deref(),
+        &headers,
+    )
+    .await
+    {
+        Ok(proven) => proven,
+        Err(response) => return response,
+    };
+    let provider = body.provider.as_deref().map(str::trim).unwrap_or_default();
+    if provider.is_empty() {
+        return recovery_unavailable();
+    }
+    let client_ip = crate::abuse::resolved_client_ip(&headers);
+    let recipient = body
+        .identifier
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default();
+    match initiate_idv(
+        &state,
+        &proven,
+        RecoveryEntryPoint::LostAllFactors,
+        recipient,
+        client_ip.as_deref(),
+        provider,
+    )
+    .await
+    {
+        Some(initiation) => initiated(Some(&initiation.redirect_url)),
+        None => recovery_unavailable(),
+    }
+}
+
+/// The uniform initiation acknowledgment: the SAME body for all three modes, plus the IDV
+/// redirect URL when there is one. It carries NO flow id: the flow id rides the IDV redirect
+/// to a third party and appears in the admin queue, so it is not a secret and must never be
+/// the thing that authorizes anything.
+fn initiated(redirect_url: Option<&str>) -> Response {
+    let body = match redirect_url {
+        Some(url) => json!({ "status": "initiated", "redirect_url": url }),
+        None => json!({ "status": "initiated" }),
+    };
+    no_store(StatusCode::OK, body)
+}
+
+/// `POST /t/{tenant}/e/{env}/recover/finalize`: establish the RECOVERED subject's session
+/// (issue #295), the other half of PR 3's deferred session mint.
+///
+/// # Why a session may exist here, and only here
+///
+/// The mint is guarded by three things IN ORDER, and every one of them must pass:
+///
+/// 1. The caller PROVES channel control with a fresh recovery-purpose email one-time code, so
+///    the session can only ever go to someone who reads the account's mail. The proof also
+///    RESOLVES the subject; the endpoint reads no subject from the request.
+/// 2. The proven subject must have a PENDING recovery flow, which
+///    [`ironauth_store::RecoveryFlowRepo::pending_for_subject`] looks up under the proof's own
+///    scope. A caller cannot name a flow, so a flow id leaked through the IDV redirect or the
+///    admin queue authorizes nothing.
+/// 3. [`finalize_recovery`] must return `true`. That is the #81 gate: it refuses unless the
+///    mode's `method_satisfied` precondition holds AND
+///    [`ironauth_store::ActingRecoveryFlowRepo::complete`]'s `hold_until <= now` guard passes.
+///    A case whose delay window has not elapsed, whose mode is unsatisfied, or whose method is
+///    `Standard` (never satisfiable through this gate) mints nothing.
+///
+/// # What the recovered session can and cannot then do
+///
+/// The session is an ORDINARY email-OTP session, `amr = ["otp"]` at the `pwd` rung, exactly
+/// what [`crate::recovery::fresh_session_reverify_acr`] already documents recovered access to
+/// be. It cannot itself re-verify a stronger factor, so it can never present the fresh
+/// equal-or-stronger proof that is [`crate::recovery::FactorChangeDecision::AllowedByReverify`].
+///
+/// It is worth being exact about what that does and does not buy, because an earlier draft of
+/// this comment said the recovered session "can never unblock a downgrade under
+/// `gate_factor_removal`", which was true as written and misleading in effect. The recovered
+/// session does not need to unblock anything: COMPLETING the case is what ends the pending
+/// flow the gate keys on, and the delay the gate exists to impose was already served before
+/// `complete` would return `true` at all. So a passkey removal after this endpoint succeeds is
+/// PERMITTED, and always was going to be, on the same reasoning that permits it once
+/// `hold_until` has elapsed with the flow still pending.
+///
+/// What must NOT change across the completion is the other arm of that permission: the
+/// `recovery.factor_change` audit row and the notification to every channel.
+/// [`crate::recovery::gate_factor_removal`] keeps them alive with its post-recovery
+/// audit-and-notify window, so a factor removal in the window after a recovery is announced to
+/// the owner rather than silent. See that function's doc.
+///
+/// The issue #267 no-silent-downgrade gate deliberately does NOT decide this mint. Its
+/// question is whether a weak factor may SILENTLY take a protected account, and this mint is
+/// the opposite of silent: it is the terminus of a notified, delay-held, mode-gated recovery
+/// case. (Not a CANCELLABLE one, on this surface: `initiate_recovery` mints a cancellation
+/// token, but the notification seam carries a coarse per-channel alert with nowhere to put the
+/// link, so the token reaches nobody today. That gap is a delivery one, tracked with the rest
+/// of issue #295's transport work, and it is a reason to keep the notification arm above
+/// intact rather than to weaken it.) Refusing here would leave a passkey holder who lost their
+/// passkey with no recovery at all, which is the case this whole subsystem exists to serve.
+pub(crate) async fn finalize(
+    State(state): State<OidcState>,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<FinalizeBody>,
+) -> Response {
+    // The finalize surface is armed by the FEATURE alone: a case opened while a mode was armed
+    // must stay finalizable, and which mode it used is a property of the flow, not the request.
+    let proven = match proven_or_refused(
+        &state,
+        &tenant_id,
+        &environment_id,
+        true,
+        RecoveryProofSurface::Finalize,
+        body.identifier.as_deref(),
+        body.code.as_deref(),
+        &headers,
+    )
+    .await
+    {
+        Ok(proven) => proven,
+        Err(response) => return response,
+    };
+    let scope = proven.scope();
+    let Ok(Some(flow)) = state
+        .store()
+        .scoped(scope)
+        .recovery_flows()
+        .pending_for_subject(proven.subject())
+        .await
+    else {
+        return recovery_unavailable();
+    };
+    // THE gate. Nothing below runs unless the method precondition AND the delay window both
+    // passed inside `complete`.
+    if !finalize_recovery(&state, scope, &flow.id).await {
+        return recovery_unavailable();
+    }
+    let event =
+        crate::authn::AuthenticationEvent::email_otp(crate::util::epoch_micros(state.now()));
+    let subject = proven.subject().to_string();
+    match interaction::establish_session(
+        &state,
+        scope,
+        &subject,
+        &event,
+        interaction::user_actor(proven.subject()),
+        &headers,
+    )
+    .await
+    {
+        Ok(cookies) => {
+            // Completion notifies every channel again, so the owner sees the case closed and
+            // the recovered access announced (the #81 notification pillar).
+            recovery::notify_owner_channels(&state, scope, proven.subject()).await;
+            let body = no_store(
+                StatusCode::OK,
+                json!({ "recovered": true, "authenticated": true, "amr": ["otp"] }),
+            );
+            interaction::attach_session_cookies(body, &cookies)
+        }
+        // Both refusals are named rather than collapsed into `Err(_)`, because
+        // `every_session_mint_tells_the_lifecycle_fence_apart_from_a_store_fault` requires every
+        // mint to have CONSIDERED them separately: a fence is a deliberate administrative state
+        // and must never be reported as a server fault. This surface then deliberately renders
+        // the SAME uniform refusal for each, which is a stronger answer than that sweep asks for.
+        //
+        // `NotAuthenticatable` is the fence: a blocked, disabled, or absent account. Rendering
+        // the uniform refusal keeps it from being an account-state oracle, exactly as
+        // `email_otp`'s `invalid_code()` does for the same fence.
+        //
+        // `Store` is a fault, and unlike `email_otp` this surface deliberately does NOT render a
+        // 500 for it: the recovered subject was resolved from PROVEN evidence and the flow is
+        // already completed, so a distinguishable fault here would tell an attacker their
+        // evidence was accepted. The fault is not swallowed; the store layer logs it.
+        //
+        // They share one arm because they share one answer. An or-pattern rather than `Err(_)`
+        // is what makes that a decision a reader can see, and it is why clippy's
+        // `match_same_arms` is satisfied without the two collapsing back into a wildcard.
+        Err(
+            interaction::EstablishSessionError::NotAuthenticatable
+            | interaction::EstablishSessionError::Store,
+        ) => recovery_unavailable(),
+    }
 }

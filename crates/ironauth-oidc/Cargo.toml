@@ -488,7 +488,11 @@ required-features = ["testing"]
 # Advanced recovery modes (issue #82, PR 3): admin-approved, trusted-contact, and IDV-gated
 # recovery each complete THROUGH the #81 delay window and downgrade invariant; the IDV callback
 # is a single-use, case-bound, JOSE-verified signed callback driven by an in-repo fixture
-# provider. Needs a real database.
+# provider. Plus the HOSTED surface (issue #295): a mounted initiation cannot inflate the
+# server-derived recover factor on either arm of the proof, the hosted finalize mints no session
+# until the mode precondition AND the delay window are both satisfied (and never for a
+# `Standard`-method flow), a factor removal AFTER a recovery is still audited and notified, and
+# every refusal is one uniform answer both before and after the proof. Needs a real database.
 [[test]]
 name = "advanced_recovery"
 path = "tests/advanced_recovery.rs"

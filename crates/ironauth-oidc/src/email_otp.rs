@@ -365,6 +365,7 @@ pub async fn verify(
         code,
         &headers,
         factor_downgrade::GatedSessionPath::EmailOtpVerify,
+        BlockedDisposition::Refuses,
     )
     .await
     {
@@ -384,8 +385,10 @@ pub async fn verify(
             establish_and_respond(&state, scope, &subject, &ctx, &headers).await
         }
         // A refused downgrade renders the SAME uniform invalid-code result a wrong code
-        // does, so the refusal is never a factor-possession oracle.
-        EmailCodeOutcome::Invalid | EmailCodeOutcome::Blocked => invalid_code(),
+        // does, so the refusal is never a factor-possession oracle. The throttle is NOT
+        // relaxed here even though the code matched: this surface refused, so nothing was
+        // proven that it is willing to act on.
+        EmailCodeOutcome::Invalid | EmailCodeOutcome::Blocked { .. } => invalid_code(),
         EmailCodeOutcome::Throttled(snapshot) => {
             let mut response = json_response(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -397,6 +400,36 @@ pub async fn verify(
         EmailCodeOutcome::Rejected(rejection) => rejection.to_response(),
         EmailCodeOutcome::ServerError => server_error(),
     }
+}
+
+/// What a caller of [`verify_email_code`] DOES with an [`EmailCodeOutcome::Blocked`], declared
+/// at the call site (issue #295).
+///
+/// The issue #267 gate decides one question, "may this weak factor mint a PRIMARY session on
+/// an account that holds a stronger one", and every session-minting surface answers a `Blocked`
+/// with its uniform refusal. The account-recovery surfaces drive the same core for a different
+/// question: they want the POSSESSION PROOF, which a `Blocked` is (the code matched and was
+/// burned), and they route the recovery onto issue #81's delay-and-notify path rather than
+/// minting a session on the spot.
+///
+/// This exists as a parameter rather than as a convention because the two callers must not
+/// write the same observability record. `record_refusal`'s own contract is "called by every
+/// gated surface immediately before it renders its uniform refusal"; the recovery surfaces
+/// render no refusal, so a shared record would make
+/// `ironauth_factor_downgrade_refused_total` count events that ended in a session. Making the
+/// disposition a required argument means a new caller has to state which it is, and cannot
+/// inherit the wrong record by default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockedDisposition {
+    /// The caller renders its UNIFORM REFUSAL on a `Blocked` and mints nothing.
+    Refuses,
+    /// The caller reads a `Blocked` as a proven possession of the channel and CONTINUES on
+    /// the issue #81 recovery path, which holds the case for the notified delay window.
+    /// `surface` labels the calling endpoint on the observability plane.
+    ProceedsAsRecoveryProof {
+        /// The label of the recovery endpoint that drove this verify.
+        surface: &'static str,
+    },
 }
 
 /// The typed outcome of verifying an email-OTP code WITHOUT establishing a session (issue
@@ -417,14 +450,30 @@ pub(crate) enum EmailCodeOutcome {
     /// an existence or state oracle.
     Invalid,
     /// The code was CORRECT and was consumed single-use, but the no-silent-downgrade gate
-    /// refused the session mint (issue #267): the account holds a stronger factor and this
-    /// scope has no downgrade opt-in.
+    /// decided against the session mint (issue #267): the account holds a stronger factor
+    /// and this scope has no downgrade opt-in.
     ///
-    /// A separate variant from [`Self::Invalid`] so the caller cannot accidentally treat a
-    /// refusal as a mint, but every caller renders it IDENTICALLY to [`Self::Invalid`]:
-    /// the response must not distinguish a refused downgrade from a wrong guess. The
-    /// proven code is already BURNED when this is returned, so it is never replayable.
-    Blocked,
+    /// A separate variant from [`Self::Invalid`] so a caller cannot accidentally treat it as
+    /// an ordinary mint. Every SESSION-MINTING caller renders it IDENTICALLY to
+    /// [`Self::Invalid`]: the response must not distinguish a decided-against downgrade from
+    /// a wrong guess. The account-recovery surfaces (issue #295) instead read it as what it
+    /// literally is, a PROVEN possession of the channel, and continue; they declare that at
+    /// the call site with [`BlockedDisposition`]. The proven code is already BURNED when
+    /// this is returned, so it is never replayable either way.
+    ///
+    /// It carries the same `subject` and `ctx` [`Self::Verified`] does, and for the same two
+    /// reasons. The subject was ALREADY resolved to decide the gate, so a consumer that needs
+    /// it would otherwise re-resolve it with a second `by_identifier` round trip that the
+    /// `Verified` arm does not perform, which is a drift shape (two arms doing different
+    /// work) this codebase has removed elsewhere. The `ctx` is the abuse context: a code that
+    /// MATCHED is not a brute-force attempt, so a consumer that proceeds must be able to
+    /// relax the counters exactly as the `Verified` arm does.
+    Blocked {
+        /// The verified account, resolved by the core before the gate was decided.
+        subject: UserId,
+        /// The abuse attempt context to relax when the consumer proceeds on the proof.
+        ctx: crate::abuse::AttemptContext,
+    },
     /// The verify path is throttled (the #64 per-recipient / per-IP brute-force bound).
     Throttled(ironauth_quota::RateLimitSnapshot),
     /// The admission-controlled hashing pool refused the verify (saturated or disabled).
@@ -463,6 +512,18 @@ pub(crate) enum EmailCodeOutcome {
 /// Applying LAST is equally load-bearing in the other direction. The gate must not short
 /// circuit past the resolve, the Argon2 compare, and the durable write a wrong guess performs,
 /// and the proven-but-refused code must be BURNED rather than left replayable.
+///
+/// # Which observability record a `Blocked` decision emits
+///
+/// `disposition` is the caller's declaration of what it DOES with a
+/// [`EmailCodeOutcome::Blocked`], and it decides which record the core writes. It is a
+/// required parameter for the same reason `gate` is: a caller cannot opt out, only choose,
+/// and the choice is visible at the call site. See [`BlockedDisposition`].
+// Eight parameters. The last two, `gate` and `disposition`, are the ones that push it over,
+// and both are REQUIRED on purpose: a caller must name the surface it attributes a refusal to
+// and must declare what it does with a blocked decision, with no value that opts out of
+// either. Shortening the list by defaulting one of them is exactly the hole they close.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn verify_email_code(
     state: &OidcState,
     scope: ironauth_store::Scope,
@@ -471,6 +532,7 @@ pub(crate) async fn verify_email_code(
     code: &str,
     headers: &HeaderMap,
     gate: crate::factor_downgrade::GatedSessionPath,
+    disposition: BlockedDisposition,
 ) -> EmailCodeOutcome {
     // Throttle the VERIFY on the flow's path, keyed on the recipient and the peer IP, so a
     // brute force escalates to a uniform failure (issue #64).
@@ -567,13 +629,30 @@ pub(crate) async fn verify_email_code(
         .consume(state.env(), &active.id, epoch_micros(state.now()))
         .await;
     match consumed {
-        // APPLY the gate decision taken before the compare. The refusal is recorded on the
+        // APPLY the gate decision taken before the compare. The record is written on the
         // observability plane HERE rather than at the decision, so a wrong guess on a
-        // protected account never logs a refusal it did not earn.
+        // protected account never logs an event it did not earn. WHICH record is written is
+        // the caller's declared `disposition`: a refusal for a surface that answers its
+        // uniform failure, a permitted-by-recovery event for one that proceeds on the proof.
         Ok(true) => match refused {
             Some(path) => {
-                crate::factor_downgrade::record_refusal(scope, path, purpose.as_str());
-                EmailCodeOutcome::Blocked
+                match disposition {
+                    BlockedDisposition::Refuses => {
+                        crate::factor_downgrade::record_refusal(scope, path, purpose.as_str());
+                    }
+                    BlockedDisposition::ProceedsAsRecoveryProof { surface } => {
+                        crate::factor_downgrade::record_downgrade_permitted(
+                            scope,
+                            path,
+                            surface,
+                            purpose.as_str(),
+                        );
+                    }
+                }
+                EmailCodeOutcome::Blocked {
+                    subject: user.id,
+                    ctx,
+                }
             }
             None => EmailCodeOutcome::Verified {
                 subject: user.id,
