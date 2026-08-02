@@ -15,7 +15,7 @@ use axum::http::{StatusCode, Uri};
 use axum::response::Response;
 use ironauth_store::{
     CorrelationId, EnvironmentId, EnvironmentType, GuardrailReport, GuardrailSet, IdempotencyWrite,
-    NewEnvironment, Scope, StoreError, TenantId,
+    NewEnvironment, ResolvedIdempotencyWrite, Scope, StoreError, TenantId, TenantStatus,
 };
 
 use crate::auth::Principal;
@@ -407,7 +407,9 @@ pub async fn resume_tenant(
     ),
     security(("bearer" = [])),
     responses(
-        (status = 200, description = "Restored (post-condition)", body = TenantStatusView),
+        (status = 200, description = "Restored; reports the lifecycle status the restore \
+         committed, which is the status the tenant had before it was deleted (a restore \
+         does not resume a suspended tenant)", body = TenantStatusView),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
         (status = 404, description = "Not found (never offboarded, already restored, or purged)", body = ErrorBody),
@@ -438,18 +440,27 @@ pub async fn restore_tenant(
         .tenants(state.bootstrap_operator_id())
         .parse_id(&tenant_id)?;
 
-    // The deterministic POST-condition: a restored tenant is active.
-    let view = TenantStatusView {
-        id: id.to_string(),
-        status: "active".to_owned(),
+    // A restore is NOT a status transition, so its status is not a post-condition the
+    // caller can state (issue #438). It undoes the DELETE and leaves the lifecycle
+    // status alone, so a tenant suspended before its grace deletion comes back
+    // suspended; this body said `active` regardless, and so did every replay of that
+    // Idempotency-Key, forever. The body is therefore rendered from the status the
+    // STORE committed, by a renderer used twice for the same reason and with the same
+    // argument (the #395 pattern): once by the store, to fill the Idempotency-Key
+    // record inside the write's own transaction, and once here for the 200 itself. The
+    // response, its replays and a subsequent GET are the same value by construction.
+    let render = |status: &TenantStatus| {
+        serde_json::to_string(&TenantStatusView {
+            id: id.to_string(),
+            status: status.as_str().to_owned(),
+        })
     };
-    let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
-    let write = IdempotencyWrite {
+    let write = ResolvedIdempotencyWrite {
         credential_ref: &credential_ref,
         key: &key,
         request_fingerprint: &fingerprint,
         response_status: 200,
-        response_body: &body_string,
+        response_body: &render,
     };
 
     let result = state
@@ -461,7 +472,10 @@ pub async fn restore_tenant(
         .await;
 
     match result {
-        Ok(()) => Ok(json(StatusCode::OK, body_string)),
+        Ok(status) => {
+            let body_string = render(&status).map_err(|_| ApiError::Internal)?;
+            Ok(json(StatusCode::OK, body_string))
+        }
         Err(StoreError::IdempotencyConflict) => {
             idempotency::replay_after_conflict(&state, &credential_ref, &key, &fingerprint).await
         }

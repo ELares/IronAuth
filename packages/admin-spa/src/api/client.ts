@@ -35,8 +35,10 @@ export type EnvironmentView = components["schemas"]["EnvironmentView"];
 // (issue #90, PR 4). Re-exported from the generated schema so the resource views
 // never hand maintain a shape the management contract already owns:
 // CreateTenantRequest / TenantCreated for the tenant create, TenantStatusView for
-// the suspend / resume / restore lifecycle post-condition, and
-// CreateEnvironmentRequest for the environment create.
+// the suspend / resume / restore lifecycle result (a post-condition for the two
+// transitions; for restore, the status the write committed, which is whatever the
+// tenant held before it was deleted, issue #438), and CreateEnvironmentRequest for
+// the environment create.
 export type CreateTenantRequest = components["schemas"]["CreateTenantRequest"];
 export type TenantCreated = components["schemas"]["TenantCreated"];
 export type TenantStatusView = components["schemas"]["TenantStatusView"];

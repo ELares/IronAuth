@@ -4,9 +4,10 @@
 //!
 //! Drives the operator-plane endpoints through the real management router: create
 //! with a validated residency region, suspend and resume with the state machine and
-//! Idempotency-Key discipline, invalid transitions refused with a loud 409, and the
+//! Idempotency-Key discipline, invalid transitions refused with a loud 409, the
 //! plane guard (a data-plane management key cannot drive an operator-plane
-//! lifecycle action).
+//! lifecycle action), and the restore 200 reporting the status the write COMMITTED
+//! rather than a post-condition the handler predicted (issue #438).
 
 mod common;
 
@@ -205,6 +206,69 @@ async fn a_grace_deleted_tenant_is_restorable_inside_the_window() {
     let (status, _, response) = harness.get(&format!("/v1/tenants/{tenant_id}")).await;
     assert_eq!(status, StatusCode::OK, "restored tenant is visible again");
     assert_eq!(json(&response)["status"], "active");
+}
+
+#[tokio::test]
+async fn a_restore_200_reports_the_status_it_committed_and_replays_the_same_bytes() {
+    // A restore is not a status TRANSITION: it undoes the delete and leaves the
+    // lifecycle status alone. The 200 said `active` regardless, because the body was
+    // asserted before the store call and stored as the Idempotency-Key replay body, so
+    // a suspended tenant's restore reported a status the row never held and every
+    // replay of that key served it again (issue #438).
+    let harness = Harness::start(50).await;
+
+    // The SUBJECT: suspended, then grace-deleted, then restored. It comes back
+    // suspended (issue #432), so that is what the 200 must say.
+    let (suspended, _env) = harness.create_tenant("Suspended Co", "k-create-s").await;
+    let (status, _, _) = harness
+        .post(&format!("/v1/tenants/{suspended}/suspend"), "k-susp", "{}")
+        .await;
+    assert_eq!(status, StatusCode::OK, "suspend");
+    let (status, _, _) = harness.delete(&format!("/v1/tenants/{suspended}")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "grace delete");
+
+    let path = format!("/v1/tenants/{suspended}/restore");
+    let (status, _, first) = harness.post(&path, "k-rest-s", "{}").await;
+    assert_eq!(status, StatusCode::OK, "restore in window: {first}");
+    assert_eq!(
+        json(&first)["status"],
+        "suspended",
+        "the 200 reports the status the restore COMMITTED, not a wished-for active"
+    );
+
+    // The 200 agrees with a subsequent READ. This is the disagreement the defect
+    // produced, so it is asserted directly rather than inferred.
+    let (status, _, read) = harness.get(&format!("/v1/tenants/{suspended}")).await;
+    assert_eq!(status, StatusCode::OK, "get restored: {read}");
+    assert_eq!(
+        json(&read)["status"],
+        json(&first)["status"],
+        "the restore 200 and a subsequent GET report the same status"
+    );
+
+    // The Idempotency-Key record was rendered from the same committed value, inside
+    // the restore's own transaction, so a replay is the ORIGINAL BYTES rather than the
+    // stale literal. A replay is also the only way to read that stored record back.
+    let (status, _, replay) = harness.post(&path, "k-rest-s", "{}").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "same-key replay is the original 200"
+    );
+    assert_eq!(first, replay, "the replay body is byte-identical");
+
+    // The CONTROL, in the same test, so `suspended` above is attributable to the
+    // tenant's status rather than to a report hardwired the other way: an ACTIVE
+    // tenant's restore still reports active, and still replays its own bytes.
+    let (active, _env) = harness.create_tenant("Active Co", "k-create-a").await;
+    let (status, _, _) = harness.delete(&format!("/v1/tenants/{active}")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "grace delete control");
+    let path = format!("/v1/tenants/{active}/restore");
+    let (status, _, first) = harness.post(&path, "k-rest-a", "{}").await;
+    assert_eq!(status, StatusCode::OK, "restore control: {first}");
+    assert_eq!(json(&first)["status"], "active");
+    let (_, _, replay) = harness.post(&path, "k-rest-a", "{}").await;
+    assert_eq!(first, replay, "the control's replay body is byte-identical");
 }
 
 #[tokio::test]

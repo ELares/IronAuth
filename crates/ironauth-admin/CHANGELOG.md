@@ -6,6 +6,20 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **BEHAVIOR FIX. `POST /v1/tenants/{tenant_id}/restore` reports the status it actually
+  committed** (issue #438). The 200 body was built BEFORE the store call, hardcoded to
+  `active` and commented as the deterministic post-condition, and that same string was
+  stored as the Idempotency-Key replay body. It is not a post-condition: a restore undoes
+  the DELETE without touching the lifecycle status, so a tenant suspended before its grace
+  deletion is restored still suspended, `GET /v1/tenants/{tenant_id}` reads `suspended`, and
+  the restore's own 200 said `active` anyway, as did every replay of that key, forever. The
+  body is now rendered from the status the store committed, by one renderer used twice: once
+  by the store to fill the Idempotency-Key record inside the write's own transaction, and
+  once by the handler for the 200 itself, so the response, its replays and a subsequent read
+  cannot drift. This is the #395 pattern, applied to the second endpoint that needed it. The
+  wire SHAPE is unchanged; the documented 200 description and the `TenantStatusView` schema
+  description are corrected, so `docs/openapi/management.json` and the generated console
+  bindings move with it.
 - **WIRE ADDITION. Per-environment BRANDS have a management surface** (issue #475): `GET`,
   `PUT` and `DELETE` on `/v1/tenants/{tenant_id}/environments/{environment_id}/brands` and
   `.../brands/{slug}`. `brands` shipped with a store-level writer and no endpoint, so a brand

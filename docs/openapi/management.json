@@ -14317,7 +14317,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Restored (post-condition)",
+            "description": "Restored; reports the lifecycle status the restore committed, which is the status the tenant had before it was deleted (a restore does not resume a suspended tenant)",
             "content": {
               "application/json": {
                 "schema": {
@@ -19118,7 +19118,7 @@
       },
       "TenantStatusView": {
         "type": "object",
-        "description": "The result of a tenant lifecycle transition (issue #46): the tenant id and its\nnew status. It states the POST-CONDITION (what is true after the call), so the\nbody is known before the write and stored verbatim for an Idempotency-Key\nreplay, exactly like the session-revocation views.",
+        "description": "The result of a tenant lifecycle call (issue #46): the tenant id and the status\nit now has.\n\nFor `suspend` and `resume` the status is a POST-CONDITION the call chooses: the\nstore refuses any transition whose source state is wrong, so a 200 means the\ntenant now holds the requested status, and the body can be serialized before the\nwrite and stored verbatim for an Idempotency-Key replay, exactly like the\nsession-revocation views.\n\n`restore` is NOT a transition and its status is NOT predictable that way (issue\n#438): it undoes the DELETE and leaves the lifecycle status untouched, so a tenant\nsuspended before its grace deletion comes back suspended. That endpoint therefore\nrenders this view from the status the store COMMITTED, inside the write's own\ntransaction, so the 200, its replays and a subsequent read agree.",
         "required": [
           "id",
           "status"
