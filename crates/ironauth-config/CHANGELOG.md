@@ -6,6 +6,65 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **BREAKING: three `oidc` back-channel logout keys are REMOVED rather than deprecated
+  (issue #104, PR 2).** `oidc.backchannel_logout_max_attempts`,
+  `oidc.backchannel_logout_retry_base_secs` and `oidc.backchannel_logout_poll_interval_secs`
+  are gone. Back-channel logout delivery is now a consumer on the generic outbox, so those
+  three are `outbox.max_attempts`, `outbox.retry_base_secs` and `outbox.poll_interval_secs`,
+  which every consumer shares. They are removed rather than deprecated because a duplicate
+  knob that no longer reaches anything is worse than an absent one: it agrees with the
+  section that DOES reach the worker only until an operator tunes either side, and then it
+  silently describes a schedule nothing runs. Their defaults and the `[outbox]` defaults
+  are identical today (5 attempts, a 10 second base, a 5 second poll), so a deployment that
+  never tuned them keeps exactly the behaviour it had.
+
+  `oidc.backchannel_logout_enabled` STAYS: it is the posture switch, not a tuning knob.
+  `oidc.backchannel_logout_request_timeout_secs` STAYS: it is an ironauth-fetch budget on a
+  single outbound request and has no equivalent in `[outbox]`.
+
+- **`Config::validate` now refuses a logout HTTP budget its outbox lease cannot cover
+  (issue #104, PR 2).** With `oidc.backchannel_logout_enabled` on,
+  `oidc.backchannel_logout_request_timeout_secs` must be strictly LESS than
+  `outbox.visibility_timeout_secs`.
+
+  This check exists because the collapse above removed the thing that used to make the
+  disagreement impossible. Before #104 the worker DERIVED its visibility lease from the
+  request timeout, so raising one raised the other. The lease is now
+  `outbox.visibility_timeout_secs` and the two numbers are independent, so an operator who
+  raises the request timeout to accommodate a slow relying party, and does not know to
+  raise the lease with it, gets a handler that outruns its lease on EVERY slow delivery:
+  the message is re-claimed while the first POST is still in flight, the RP is POSTed
+  twice, and nothing anywhere reports it. The comparison is `>=` and not `>` because
+  equality is already too late, and it is gated on the SAME predicate the boot path spawns
+  the pools under, `oidc.enabled && oidc.backchannel_logout_enabled`, because a deployment
+  running no such handler must not be refused a boot over an inert number. Gating it on the
+  posture switch alone (which is what the first cut did) refused exactly the boot that
+  reasoning says to allow: with the OIDC provider off, `backchannel_worker_inputs` returns
+  `None` and no pool is ever built. It fails CLOSED either way, so the defect was a wrong
+  refusal rather than a missed one, but a check whose predicate does not match its stated
+  rationale is one somebody later widens in the wrong direction.
+
+- **`oidc.backchannel_logout_enabled`'s documentation said something FALSE about the default
+  build (issue #104, PR 2, review fold).** It read "the default build enqueues nothing and
+  sends nothing". The second half is true; the first is not, and the correction is in the
+  generated `docs/CONFIG.md` because it is regenerated from this doc comment. Ending an SSO
+  session enqueues one durable `session_ended` message inside the revoking transaction
+  whatever this switch is set to, because `session_ended` is a DOMAIN EVENT and back-channel
+  logout is one consumer of it; the switch gates the consumers, not the producer. With the
+  switch off nothing consumes those messages, so they accumulate in `outbox_messages` and
+  turning the switch on later begins by draining the backlog.
+
+  The accumulation itself is deliberately NOT changed here, and the reasoning is worth
+  recording rather than leaving as a silent choice. Gating the producer on this switch would
+  make an OIDC-specific posture flag decide whether a domain event is recorded at all, which
+  is the wrong layer: the store crate has no view of configuration, the enqueue is inside the
+  session-revoke transaction on the hot path of every logout, and any FUTURE consumer of
+  `session_ended` (a SIEM sink, an audit export) would silently receive nothing on a
+  deployment that happens to have back-channel logout off. The general answer is retention
+  for `outbox_messages` as a whole, which no consumer has today either (nothing prunes
+  COMPLETED messages, so every consumer accumulates); that is a substrate-level decision
+  about the whole table rather than something to decide inside a logout change.
+
 - **BREAKING, and the four keys are removed rather than deprecated (issue #250).**
   `admin.outbound_verification_enabled`, `admin.outbound_verification_token`,
   `admin.outbound_verification_tenant`, and `admin.outbound_verification_environment` are

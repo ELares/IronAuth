@@ -6,6 +6,91 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **Back-channel logout delivery is TWO outbox consumers, and the hand-rolled worker is
+  gone (issue #104, PR 2).** `BackChannelLogoutWorker`, its `WorkerSettings`, its
+  `DrainStats` and its `next_attempt_micros` backoff arithmetic are removed;
+  `SessionEndedExplodeConsumer` and `BackChannelLogoutConsumer` replace them, and the
+  substrate owns the lease, the backoff schedule, the attempts cap and the dead letter.
+
+  - **Why two consumers and not one.** Fusing the fan-out and the delivery into a single
+    handler would give the N relying parties of one session a SHARED attempts counter: one
+    dead RP would burn the attempts of a message that also carries the healthy RPs, and the
+    dead letter would take the whole session's logout with it, including the RPs that would
+    have succeeded. That is a LOST LOGOUT, and a message boundary per recipient is what
+    keeps the per-RP isolation this module has always claimed structural rather than
+    aspirational.
+  - **Why two and not zero.** Doing the fan-out in the producer would leave
+    `session_ended` with no consumer at all, stranding its messages forever in a table with
+    no reaper and no `DELETE` grant, and would move an unbounded per-client query and N
+    inserts inside the transaction that ends a session, which is on the hot path of every
+    logout and every revoke.
+  - **The ordering key of a delivery is its idempotency key, `{session_id}:{client_id}`,**
+    so every delivery is a SINGLETON group and nothing serializes. Keying the order on the
+    client id instead would put every logout bound for one RP in one group, and the
+    substrate leases only a group's head, so one unreachable RP would stall every
+    subsequent logout to that RP, for every user, for the whole backoff schedule. Nothing
+    is given up: two Logout Tokens for one RP name different sessions through their own
+    `sid` and carry no `sub`, so they commute.
+  - **The `jti` is minted at explode time and lives on the message payload,** which is
+    immutable once enqueued, so it is stable across retries BY CONSTRUCTION rather than by
+    a rule someone has to remember. A re-explode mints a fresh id and discards it, because
+    the conflicting insert does nothing.
+  - **ALL FOUR `SendFailure` variants are RETRYABLE, uniformly, and there is no 4xx
+    special case.** A blocked destination, a timeout, a non-2xx status and a transport fault
+    go through one `.map_err(|failure| ConsumerError::retryable(failure.label()))`;
+    `ConsumerError::permanent` appears in this module only on the two MALFORMED-PAYLOAD
+    sites. This is recorded because a summary of this change claimed the opposite (that
+    `Blocked` was now permanent and 4xx handling was split), and it is not true of the code.
+    The uniform treatment is deliberate: the substrate's finite attempts cap is what turns a
+    persistently refused destination into a dead letter, so nothing here needs a second way
+    to give up, and a relying party that is temporarily behind a misconfigured DNS record
+    should not have its logout discarded on one unlucky pass.
+  - **A mint failure is retryable, and the comment saying so no longer overclaims.** It said
+    the commonest cause "is an environment whose signing key is not provisioned yet, which a
+    later attempt fixes"; a later attempt fixes it only while attempts remain, and the cause
+    that reliably outlasted the schedule was a SUSPENDED environment, whose every mint fails
+    for as long as the suspension does. That case no longer reaches the mint at all: the
+    substrate skips a fenced scope before claiming from it (see the ironauth-store
+    changelog).
+
+- **BREAKING for an operator who tuned them: three `oidc` keys are gone.**
+  `backchannel_logout_max_attempts`, `backchannel_logout_retry_base_secs` and
+  `backchannel_logout_poll_interval_secs` were a second, per-consumer copy of numbers the
+  shared `[outbox]` section already owns; they agreed with it only by coincidence of
+  defaults. See the ironauth-config changelog for the mapping and for the new cross-section
+  check that closes the lease-versus-budget disagreement the collapse creates.
+
+- **OPERATOR OBLIGATION: drain `backchannel_logout_deliveries` before retiring the last
+  old replica.** After this cutover NOTHING drains rows left in that table, and no SQL
+  backfill is offered: the table FORCES row-level security, which applies to the table
+  owner a migration runs as, so a set-based copy would either be refused or silently depend
+  on the migration role happening to be a superuser. That is the same ruling `0099` made
+  for `session_ended_events`.
+
+  A deployment with `oidc.backchannel_logout_enabled` OFF (the default) loses nothing. A
+  deployment with it ON must QUIESCE session-end traffic first, THEN drive
+
+      SELECT count(*) FROM backchannel_logout_deliveries
+       WHERE delivered_at IS NULL AND dead_lettered_at IS NULL;
+
+  to 0, THEN retire the last old replica, THEN resume traffic.
+
+  Quiescing FIRST is the part a rolling upgrade does not give you, and the reason is that
+  the old tail GROWS rather than shrinks while both versions run. A new replica ending a
+  session enqueues a `session_ended` message; an old replica drains that same queue under
+  that same consumer name and its explode writes one row per relying party into
+  `backchannel_logout_deliveries`. So traffic served by the NEW replicas keeps filling the
+  OLD table for as long as any old replica lives. Read the count without quiescing and you
+  can watch it reach 0, watch it rise, and strand the remainder the moment the last old
+  replica stops, because the new binary has no consumer for that table. See the
+  ironauth-store changelog for the numbered procedure.
+
+  The SECOND predicate is deliberate and differs from the `session_ended_events` drain
+  query on `0099:69`: that table has no dead-letter state and this one does, and a
+  dead-lettered row is work already given up on. Counting it would make the query never
+  reach 0 for any deployment that ever dead-lettered, turning a real gate into one
+  operators learn to ignore.
+
 - The end-user-driven trait paths are held to the SELF-SERVICE class on BOTH the replace and
   the CREATE seam (issue #53, PR 1, review fold), and two live bypasses that survived the
   first cut are closed.

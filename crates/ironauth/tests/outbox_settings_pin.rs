@@ -18,10 +18,22 @@
 //! crate's changelog false about the shipped behaviour with nothing going red.
 //!
 //! This crate is the one place that depends on both, so this is where the pin can live.
-//! It sits under `tests/` rather than in `src/` on purpose: `src/` is the BOOT PATH, and
-//! `shared_config.rs` measures that no boot path reads this section yet by scanning that
-//! whole tree for the section's accessor and its type name. A pin that named the type in
-//! `src/` would be indistinguishable, to that scan, from the wiring it is watching for.
+//!
+//! It sat under `tests/` rather than in `src/` originally because `shared_config.rs`
+//! measured, by scanning this crate's whole `src/` tree for the section's accessor and its
+//! type name, that NO boot path read `[outbox]`, and a pin naming `OutboxConfig` in `src/`
+//! would have been indistinguishable to that scan from the wiring it was watching for.
+//! Neither half of that is true any more: the boot path DOES read the section (PR 2 of
+//! issue #104 builds a `WorkerSettings` from it in `outbox_worker_settings`), the key is
+//! reclassified to `OnePlaneOrNoState`, and that classification's own documentation says
+//! nothing measures it. So `src/` is no longer forbidden to this pin; it stays here because
+//! `tests/` is where a cross-crate agreement between two `Default` impls belongs, and
+//! because moving a green test buys nothing.
+//!
+//! The `src/` seam that PR 2 does add, one running pool per REGISTERED consumer, is not
+//! pinned from here and could not be: it needs a database. It is driven and asserted in
+//! `src/outbox_wiring_tests.rs`, which names `OutboxConfig` freely for exactly the reason
+//! above.
 
 use std::time::Duration;
 

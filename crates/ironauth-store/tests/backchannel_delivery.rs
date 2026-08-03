@@ -1,28 +1,44 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The per-RP back-channel-logout delivery queue (issue #34), against a real database.
+//! The two store-side halves of back-channel logout fan-out (issues #34 and #104),
+//! against a real database.
 //!
-//! The #35 outbox tells a worker "a session ended, fan out". This queue is what the
-//! back-channel logout worker EXPLODES each drained session-ended event into: one row per
-//! participating relying party (a client that registered a `backchannel_logout_uri`),
-//! each carrying that client's OWN `sid` (never another client's), with its own
-//! at-least-once retry state. This suite pins the queue's guarantees:
+//! Until #104 this suite pinned a dedicated `backchannel_logout_deliveries` queue. That
+//! queue is retired: delivery is now a consumer on the generic outbox, so the store owes
+//! the fan-out exactly two things, and this suite pins both.
 //!
-//! - Explode targets ONLY registered participants, one row per (event, client), each with
-//!   the client's own sid; a re-explode of the same event queues nothing new.
-//! - `claim_due` leases due rows; a lapsed lease reappears them (a crashed worker
-//!   re-delivers); `mark_delivered` retires a row idempotently.
-//! - `record_failure` schedules a bounded backoff retry, or DEAD-LETTERS the row once the
-//!   caller decides the attempts cap is reached, recording the last error.
-//! - Two concurrent claimers lease DISJOINT sets and never block (FOR UPDATE SKIP LOCKED),
-//!   so two workers never double-deliver.
-//! - The queue is cross-tenant isolated: a scope never drains another tenant's deliveries.
+//! - `ClientSessionRepo::backchannel_participants` RESOLVES the recipients of one ended
+//!   session as values: only clients that registered a non-empty `backchannel_logout_uri`,
+//!   each with its OWN `sid` (never a co-scoped client's), and nothing outside the scope.
+//!   It is a read rather than a write because the explode that consumes it lives in
+//!   ironauth-oidc and `scripts/query-audit.sh` keeps scoped SQL in the repository module.
+//!
+//! - `OutboxRepo::enqueue_all` ENQUEUES that fan-out, and its two properties are the ones
+//!   a lost logout hinges on:
+//!
+//!   * IDEMPOTENT. A key already enqueued is skipped, not raised on. The explode runs
+//!     inside a consumer, so a lapsed lease re-runs it; under the RAISING `enqueue` the
+//!     re-run would fail with a unique violation, fail the same way every retry, and
+//!     dead-letter the session's whole fan-out with every RP the first pass had not
+//!     reached left permanently un-notified.
+//!   * ATOMIC. One transaction spans the slice, so a refused message commits none of its
+//!     neighbours and the retry starts from a clean slate rather than an arbitrary prefix.
+//!
+//! It also pins the thing `0099_outbox_messages.sql:104` gets WRONG. That comment says
+//! enqueuing twice for one domain fact is "a no-op rather than a double delivery, which
+//! is what lets a producer retry an enqueue safely". The plain `enqueue` carries no
+//! `ON CONFLICT` and RAISES, which is deliberate and load-bearing for a transactional
+//! producer. A test asserts the raise, so the shipped comment cannot mislead the next
+//! implementer into looping `enqueue` in a consumer.
 
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
-use ironauth_store::{ClientId, CorrelationId, Scope, SessionEndCause, SessionId, UserId};
+use ironauth_store::{
+    BACKCHANNEL_LOGOUT_CONSUMER, ClientId, CorrelationId, NewOutboxMessage, SESSION_ENDED_CONSUMER,
+    Scope, SessionEndCause, SessionId, UserId,
+};
 use sqlx::Row;
 
 /// A far-future expiry (year 2100) in epoch microseconds, so a session is live until it is
@@ -91,9 +107,8 @@ async fn create_participant(
     (client, sid)
 }
 
-/// End `session` as a logout (enqueues one session-ended outbox event) and return the
-/// enqueued event's id.
-async fn end_session(db: &TestDatabase, env: &Env, scope: Scope, session: &SessionId) -> String {
+/// End `session` as a logout (which enqueues one session-ended outbox message).
+async fn end_session(db: &TestDatabase, env: &Env, scope: Scope, session: &SessionId) {
     db.store()
         .scoped(scope)
         .acting(db.test_actor(env), CorrelationId::generate(env))
@@ -101,20 +116,33 @@ async fn end_session(db: &TestDatabase, env: &Env, scope: Scope, session: &Sessi
         .revoke(env, session, SessionEndCause::LoggedOut, false, None)
         .await
         .expect("revoke session");
+}
+
+/// One per-RP delivery message for `(session, client)`, keyed exactly as the explode keys
+/// it: the idempotency key and the ordering key are the SAME value, so every delivery is
+/// its own singleton ordering group and no RP can queue behind another.
+fn delivery<'a>(key: &'a str, uri: &str) -> NewOutboxMessage<'a> {
+    NewOutboxMessage {
+        consumer: BACKCHANNEL_LOGOUT_CONSUMER,
+        idempotency_key: key,
+        ordering_key: key,
+        payload: serde_json::json!({ "logout_uri": uri }),
+    }
+}
+
+/// How many messages are queued for `consumer` in `scope`, in any non-terminal state.
+async fn pending_count(db: &TestDatabase, scope: Scope, consumer: &str) -> usize {
     db.store()
         .scoped(scope)
-        .session_events()
-        .pending(100)
+        .outbox()
+        .pending(consumer, 1_000)
         .await
-        .expect("pending events")
-        .into_iter()
-        .find(|event| event.session_id == session.to_string())
-        .expect("an outbox event for the ended session")
-        .id
+        .expect("pending")
+        .len()
 }
 
 #[tokio::test]
-async fn explode_queues_one_delivery_per_registered_rp_each_with_its_own_sid() {
+async fn backchannel_participants_lists_only_registered_rps_each_with_its_own_sid() {
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
@@ -126,278 +154,46 @@ async fn explode_queues_one_delivery_per_registered_rp_each_with_its_own_sid() {
         create_participant(&db, &env, scope, &session, Some("https://a.example/bc")).await;
     let (client_b, sid_b) =
         create_participant(&db, &env, scope, &session, Some("https://b.example/bc")).await;
-    let (_client_c, _sid_c) = create_participant(&db, &env, scope, &session, None).await;
+    let (client_c, _sid_c) = create_participant(&db, &env, scope, &session, None).await;
 
     // The two sids are distinct per (client, session): an RP only ever learns its own.
     assert_ne!(sid_a, sid_b, "each client's sid is distinct");
 
-    let event_id = end_session(&db, &env, scope, &session).await;
-    let queued = db
+    let participants = db
         .store()
         .scoped(scope)
-        .backchannel_deliveries()
-        .enqueue_for_event(&env, &event_id, &session.to_string())
+        .client_sessions()
+        .backchannel_participants(&session)
         .await
-        .expect("explode");
-    assert_eq!(queued, 2, "only the two registered RPs get a delivery");
+        .expect("resolve participants");
 
-    let deliveries = db
-        .store()
-        .scoped(scope)
-        .backchannel_deliveries()
-        .pending(100)
-        .await
-        .expect("pending deliveries");
-    assert_eq!(deliveries.len(), 2);
-    // Each delivery carries its OWN client's sid and logout_uri (no cross-client leak).
-    let for_a = deliveries
-        .iter()
-        .find(|d| d.client_id == client_a.to_string())
-        .expect("a delivery for client A");
-    let for_b = deliveries
-        .iter()
-        .find(|d| d.client_id == client_b.to_string())
-        .expect("a delivery for client B");
-    assert_eq!(for_a.sid, sid_a, "A's delivery carries A's sid");
-    assert_eq!(for_a.logout_uri, "https://a.example/bc");
-    assert_eq!(for_b.sid, sid_b, "B's delivery carries B's sid");
-    assert_eq!(for_b.logout_uri, "https://b.example/bc");
-
-    // Re-exploding the same outbox event queues nothing new (idempotent, at-least-once).
-    let requeued = db
-        .store()
-        .scoped(scope)
-        .backchannel_deliveries()
-        .enqueue_for_event(&env, &event_id, &session.to_string())
-        .await
-        .expect("re-explode");
     assert_eq!(
-        requeued, 0,
-        "a redelivered outbox event queues no duplicate"
+        participants.len(),
+        2,
+        "only the two clients that registered a URI participate"
     );
-}
-
-#[tokio::test]
-async fn claim_due_leases_then_reappears_after_lease_and_mark_delivered_retires() {
-    let db = TestDatabase::start().await;
-    let (env, clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 7);
-    let scope = db.seed_scope(&env).await;
-    let subject = UserId::generate(&env, &scope).to_string();
-    let session = create_session(&db, &env, scope, &subject).await;
-    create_participant(&db, &env, scope, &session, Some("https://a.example/bc")).await;
-    let event_id = end_session(&db, &env, scope, &session).await;
-
-    let scoped = db.store().scoped(scope);
-    let queue = scoped.backchannel_deliveries();
-    queue
-        .enqueue_for_event(&env, &event_id, &session.to_string())
-        .await
-        .expect("explode");
-    let lease = Duration::from_secs(60);
-
-    let claimed = queue.claim_due(&env, lease, 100).await.expect("claim");
-    assert_eq!(claimed.len(), 1, "the one due delivery is claimed");
-    let id = claimed[0].id.clone();
-
-    // A second claim before the lease lapses sees nothing (hidden in flight).
-    assert!(
-        queue
-            .claim_due(&env, lease, 100)
-            .await
-            .expect("claim")
-            .is_empty(),
-        "a leased delivery is hidden until its lease lapses"
-    );
-
-    // The lease lapses; the delivery reappears (at-least-once).
-    clock.advance(Duration::from_secs(61));
-    let reclaimed = queue.claim_due(&env, lease, 100).await.expect("re-claim");
-    assert_eq!(reclaimed.len(), 1, "a lapsed lease reappears the delivery");
-    assert_eq!(reclaimed[0].id, id);
-
-    // Marking it delivered retires it; the mark is idempotent.
-    assert!(queue.mark_delivered(&env, &id).await.expect("mark"));
-    assert!(!queue.mark_delivered(&env, &id).await.expect("mark again"));
-    clock.advance(Duration::from_secs(3600));
-    assert!(
-        queue
-            .claim_due(&env, lease, 100)
-            .await
-            .expect("claim")
-            .is_empty(),
-        "a delivered delivery never redrains"
-    );
-}
-
-#[tokio::test]
-async fn record_failure_schedules_backoff_then_dead_letters() {
-    let db = TestDatabase::start().await;
-    let (env, clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 11);
-    let scope = db.seed_scope(&env).await;
-    let subject = UserId::generate(&env, &scope).to_string();
-    let session = create_session(&db, &env, scope, &subject).await;
-    create_participant(&db, &env, scope, &session, Some("https://a.example/bc")).await;
-    let event_id = end_session(&db, &env, scope, &session).await;
-
-    let scoped = db.store().scoped(scope);
-    let queue = scoped.backchannel_deliveries();
-    queue
-        .enqueue_for_event(&env, &event_id, &session.to_string())
-        .await
-        .expect("explode");
-    let lease = Duration::from_secs(30);
-
-    // First attempt fails: schedule a backoff retry 100s out.
-    let claimed = queue.claim_due(&env, lease, 100).await.expect("claim");
-    let id = claimed[0].id.clone();
-    let now_micros = 0_i64;
-    let next = now_micros + 100 * 1_000_000;
-    assert!(
-        queue
-            .record_failure(&env, &id, 1, Some(next), "http_status_503")
-            .await
-            .expect("record failure")
-    );
-
-    // Not due yet (the backoff gate holds it back), even though the lease was released.
-    assert!(
-        queue
-            .claim_due(&env, lease, 100)
-            .await
-            .expect("claim")
-            .is_empty(),
-        "the backoff gate hides the delivery until next_attempt_at"
-    );
-
-    // Advance past the backoff: it is due again and carries the recorded attempts count.
-    clock.advance(Duration::from_secs(101));
-    let reclaimed = queue.claim_due(&env, lease, 100).await.expect("re-claim");
-    assert_eq!(reclaimed.len(), 1);
-    assert_eq!(
-        reclaimed[0].attempts, 1,
-        "the recorded attempt count survives"
-    );
-
-    // Second attempt fails and hits the cap: dead-letter it (no next attempt).
-    assert!(
-        queue
-            .record_failure(&env, &id, 2, None, "http_status_503")
-            .await
-            .expect("dead-letter")
-    );
-    assert!(
-        queue
-            .claim_due(&env, lease, 100)
-            .await
-            .expect("claim")
-            .is_empty(),
-        "a dead-lettered delivery never drains again"
-    );
-    assert!(
-        queue.pending(100).await.expect("pending").is_empty(),
-        "a dead-lettered delivery is not pending"
-    );
-    // The full listing shows the terminal dead-letter state with its last error.
-    let listed = queue.list(100).await.expect("list");
-    assert_eq!(listed.len(), 1);
-    assert_eq!(listed[0].attempts, 2);
-    assert_eq!(listed[0].last_error.as_deref(), Some("http_status_503"));
-    assert!(listed[0].dead_lettered_at_unix_micros.is_some());
-    assert!(listed[0].delivered_at_unix_micros.is_none());
-}
-
-#[tokio::test]
-async fn two_concurrent_claimers_lease_disjoint_via_skip_locked() {
-    let db = TestDatabase::start().await;
-    let env = Env::system();
-    let scope = db.seed_scope(&env).await;
-    let subject = UserId::generate(&env, &scope).to_string();
-    let session = create_session(&db, &env, scope, &subject).await;
-
-    // Four registered RPs on one session, so ending it explodes into four deliveries.
-    for _ in 0..4 {
-        create_participant(&db, &env, scope, &session, Some("https://rp.example/bc")).await;
-    }
-    let event_id = end_session(&db, &env, scope, &session).await;
-    db.store()
-        .scoped(scope)
-        .backchannel_deliveries()
-        .enqueue_for_event(&env, &event_id, &session.to_string())
-        .await
-        .expect("explode");
-    let all_ids: std::collections::HashSet<String> = db
-        .store()
-        .scoped(scope)
-        .backchannel_deliveries()
-        .pending(100)
-        .await
-        .expect("pending")
-        .into_iter()
-        .map(|d| d.id)
-        .collect();
-    assert_eq!(all_ids.len(), 4, "four deliveries are queued");
-
-    let tenant = scope.tenant().to_string();
-    let environment = scope.environment().to_string();
-
-    // Worker A leases the first two rows with claim_due's own SELECT (FOR UPDATE SKIP
-    // LOCKED) and HOLDS the transaction open so its locks stay held.
-    let mut worker_a = db.app_pool().begin().await.expect("begin worker A");
-    bind_scope(&mut worker_a, &tenant, &environment).await;
-    let a_rows = sqlx::query(
-        "SELECT id FROM backchannel_logout_deliveries \
-         WHERE tenant_id = $1 AND environment_id = $2 \
-         AND delivered_at IS NULL AND dead_lettered_at IS NULL AND claimed_at IS NULL \
-         ORDER BY next_attempt_at LIMIT 2 FOR UPDATE SKIP LOCKED",
-    )
-    .bind(&tenant)
-    .bind(&environment)
-    .fetch_all(&mut *worker_a)
-    .await
-    .expect("worker A leases");
-    let a_ids: std::collections::HashSet<String> = a_rows
+    let found_a = participants
         .iter()
-        .map(|row| row.get::<String, _>("id"))
-        .collect();
-    assert_eq!(a_ids.len(), 2);
-
-    // Worker B claims through the store while A holds its locks: SKIP LOCKED means B
-    // never blocks and never sees A's rows.
-    let b_ids: std::collections::HashSet<String> = db
-        .store()
-        .scoped(scope)
-        .backchannel_deliveries()
-        .claim_due(&env, Duration::from_secs(60), 100)
-        .await
-        .expect("worker B claims")
-        .into_iter()
-        .map(|d| d.id)
-        .collect();
-    assert_eq!(b_ids.len(), 2);
+        .find(|p| p.client_id == client_a.to_string())
+        .expect("client A participates");
+    assert_eq!(found_a.sid, sid_a, "A carries its OWN sid");
+    assert_eq!(found_a.logout_uri, "https://a.example/bc");
+    let found_b = participants
+        .iter()
+        .find(|p| p.client_id == client_b.to_string())
+        .expect("client B participates");
+    assert_eq!(found_b.sid, sid_b, "B carries its OWN sid");
+    assert_ne!(found_b.sid, sid_a, "B never learns A's sid");
     assert!(
-        a_ids.is_disjoint(&b_ids),
-        "concurrent claimers lease disjoint sets (no double delivery)"
+        !participants
+            .iter()
+            .any(|p| p.client_id == client_c.to_string()),
+        "a client with no backchannel_logout_uri is not a participant"
     );
-    let union: std::collections::HashSet<String> = a_ids.union(&b_ids).cloned().collect();
-    assert_eq!(union, all_ids, "together they cover every delivery once");
-
-    // A rolls back (a crashed worker): its rows never got a claimed_at, so they reappear.
-    worker_a.rollback().await.expect("worker A rolls back");
-    let reappeared: std::collections::HashSet<String> = db
-        .store()
-        .scoped(scope)
-        .backchannel_deliveries()
-        .claim_due(&env, Duration::from_secs(60), 100)
-        .await
-        .expect("drain after rollback")
-        .into_iter()
-        .map(|d| d.id)
-        .collect();
-    assert_eq!(reappeared, a_ids, "A's un-committed rows reappear");
 }
 
 #[tokio::test]
-async fn the_delivery_queue_is_isolated_across_tenants() {
+async fn backchannel_participants_refuses_a_session_from_another_scope() {
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope_a = db.seed_scope(&env).await;
@@ -405,35 +201,238 @@ async fn the_delivery_queue_is_isolated_across_tenants() {
     let subject = UserId::generate(&env, &scope_a).to_string();
     let session = create_session(&db, &env, scope_a, &subject).await;
     create_participant(&db, &env, scope_a, &session, Some("https://a.example/bc")).await;
-    let event_id = end_session(&db, &env, scope_a, &session).await;
+
+    // The uniform not-found, never an oracle for whether A's session exists.
+    let refused = db
+        .store()
+        .scoped(scope_b)
+        .client_sessions()
+        .backchannel_participants(&session)
+        .await;
+    assert!(
+        matches!(refused, Err(ironauth_store::StoreError::NotFound)),
+        "a foreign-scope session id is refused uniformly"
+    );
+}
+
+#[tokio::test]
+async fn enqueue_all_inserts_every_message_and_reports_the_new_count() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let queued = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .enqueue_all(
+            &env,
+            &[
+                delivery("ses_1:cli_a", "https://a.example/bc"),
+                delivery("ses_1:cli_b", "https://b.example/bc"),
+                delivery("ses_1:cli_c", "https://c.example/bc"),
+            ],
+        )
+        .await
+        .expect("enqueue the fan-out");
+    assert_eq!(queued, 3, "every message is new");
+    assert_eq!(
+        pending_count(&db, scope, BACKCHANNEL_LOGOUT_CONSUMER).await,
+        3
+    );
+
+    // An empty slice is a no-op rather than an error: a session with no participating RP
+    // is the common case and must not fail its explode.
+    let none = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .enqueue_all(&env, &[])
+        .await
+        .expect("empty fan-out");
+    assert_eq!(none, 0);
+    assert_eq!(
+        pending_count(&db, scope, BACKCHANNEL_LOGOUT_CONSUMER).await,
+        3
+    );
+}
+
+#[tokio::test]
+async fn a_re_run_of_enqueue_all_skips_what_is_there_and_adds_only_what_is_missing() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let outbox = db.store().scoped(scope);
+    let outbox = outbox.outbox();
+
+    // A first pass reaches two of the three RPs (the shape a lapsed lease leaves behind).
+    let first = outbox
+        .enqueue_all(
+            &env,
+            &[
+                delivery("ses_1:cli_a", "https://a.example/bc"),
+                delivery("ses_1:cli_b", "https://b.example/bc"),
+            ],
+        )
+        .await
+        .expect("first pass");
+    assert_eq!(first, 2);
+
+    // The re-run sees the SAME session and the SAME participants, plus the one it never
+    // reached. It must not raise, and it must enqueue the missing RP. Under the raising
+    // `enqueue` this call would fail on cli_a, fail identically on every retry, and
+    // dead-letter the fan-out with cli_c NEVER notified.
+    let second = outbox
+        .enqueue_all(
+            &env,
+            &[
+                delivery("ses_1:cli_a", "https://a.example/bc"),
+                delivery("ses_1:cli_b", "https://b.example/bc"),
+                delivery("ses_1:cli_c", "https://c.example/bc"),
+            ],
+        )
+        .await
+        .expect("a re-run must not raise on its own earlier output");
+    assert_eq!(second, 1, "only the RP that was missing is newly enqueued");
+
+    let pending = outbox
+        .pending(BACKCHANNEL_LOGOUT_CONSUMER, 100)
+        .await
+        .expect("pending");
+    assert_eq!(pending.len(), 3, "no RP is enqueued twice and none is lost");
+    let mut keys: Vec<&str> = pending
+        .iter()
+        .map(|message| message.idempotency_key.as_str())
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["ses_1:cli_a", "ses_1:cli_b", "ses_1:cli_c"]);
+}
+
+#[tokio::test]
+async fn enqueue_all_dedups_a_key_repeated_inside_one_call() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    // The second message sees the first's row inside the SAME transaction, so the count
+    // is the number of DISTINCT keys rather than the slice length.
+    let queued = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .enqueue_all(
+            &env,
+            &[
+                delivery("ses_1:cli_a", "https://a.example/bc"),
+                delivery("ses_1:cli_a", "https://a.example/bc"),
+            ],
+        )
+        .await
+        .expect("enqueue with a repeated key");
+    assert_eq!(queued, 1);
+    assert_eq!(
+        pending_count(&db, scope, BACKCHANNEL_LOGOUT_CONSUMER).await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn enqueue_all_commits_nothing_when_one_message_in_the_slice_is_refused() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    // The middle message violates the migration's nonempty-key CHECK, so the database
+    // refuses it. The whole slice must roll back: an arbitrary committed prefix would
+    // leave the retry unable to tell which RPs were reached.
+    let refused = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .enqueue_all(
+            &env,
+            &[
+                delivery("ses_1:cli_a", "https://a.example/bc"),
+                delivery("", "https://bad.example/bc"),
+                delivery("ses_1:cli_c", "https://c.example/bc"),
+            ],
+        )
+        .await;
+    assert!(refused.is_err(), "a refused message fails the whole call");
+    assert_eq!(
+        pending_count(&db, scope, BACKCHANNEL_LOGOUT_CONSUMER).await,
+        0,
+        "the message BEFORE the refused one is rolled back too"
+    );
+}
+
+#[tokio::test]
+async fn the_raising_enqueue_still_raises_on_a_duplicate_key() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let scoped = db.store().scoped(scope);
+    let outbox = scoped.outbox();
+
+    outbox
+        .enqueue(&env, &delivery("ses_1:cli_a", "https://a.example/bc"))
+        .await
+        .expect("first enqueue");
+    // `0099_outbox_messages.sql:104` says a second enqueue for one domain fact is "a
+    // no-op rather than a double delivery". It is not: there is no ON CONFLICT on this
+    // path and the unique key raises. The behaviour is deliberate (a transactional
+    // producer cannot retry an enqueue on its own, so a conflict means two domain writes
+    // claimed one fact) and it is exactly why a producer that DOES retry, like the logout
+    // explode, must use `enqueue_all` instead. The shipped comment is not edited; this
+    // assertion is where the truth is kept.
+    let again = outbox
+        .enqueue(&env, &delivery("ses_1:cli_a", "https://a.example/bc"))
+        .await;
+    assert!(
+        again.is_err(),
+        "the plain enqueue RAISES on a duplicate key, whatever 0099's comment says"
+    );
+    assert_eq!(
+        pending_count(&db, scope, BACKCHANNEL_LOGOUT_CONSUMER).await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn the_logout_fan_out_is_isolated_across_tenants() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope_a = db.seed_scope(&env).await;
+    let scope_b = db.seed_scope(&env).await;
+
     db.store()
         .scoped(scope_a)
-        .backchannel_deliveries()
-        .enqueue_for_event(&env, &event_id, &session.to_string())
+        .outbox()
+        .enqueue_all(&env, &[delivery("ses_1:cli_a", "https://a.example/bc")])
         .await
-        .expect("explode in A");
+        .expect("enqueue in A");
 
     assert_eq!(
-        db.store()
-            .scoped(scope_a)
-            .backchannel_deliveries()
-            .pending(100)
-            .await
-            .expect("A pending")
-            .len(),
+        pending_count(&db, scope_a, BACKCHANNEL_LOGOUT_CONSUMER).await,
         1,
         "A sees its own delivery"
     );
     assert!(
         db.store()
             .scoped(scope_b)
-            .backchannel_deliveries()
-            .claim_due(&env, Duration::from_secs(60), 100)
+            .outbox()
+            .claim(
+                &env,
+                BACKCHANNEL_LOGOUT_CONSUMER,
+                Duration::from_secs(60),
+                100
+            )
             .await
             .expect("B claim")
             .is_empty(),
         "B never claims A's deliveries"
     );
+
     // A raw B-scoped SELECT sees nothing: RLS enforces the boundary beneath the repo.
     let mut tx = db.app_pool().begin().await.expect("begin B tx");
     bind_scope(
@@ -442,7 +441,8 @@ async fn the_delivery_queue_is_isolated_across_tenants() {
         &scope_b.environment().to_string(),
     )
     .await;
-    let visible: i64 = sqlx::query("SELECT count(*) AS n FROM backchannel_logout_deliveries")
+    let visible: i64 = sqlx::query("SELECT count(*) AS n FROM outbox_messages WHERE consumer = $1")
+        .bind(BACKCHANNEL_LOGOUT_CONSUMER)
         .fetch_one(&mut *tx)
         .await
         .expect("count")
@@ -455,66 +455,34 @@ async fn the_delivery_queue_is_isolated_across_tenants() {
 }
 
 #[tokio::test]
-async fn a_foreign_scope_or_malformed_id_is_a_uniform_no_op() {
+async fn ending_a_session_still_enqueues_exactly_one_session_ended_message() {
     let db = TestDatabase::start().await;
     let env = Env::system();
-    let scope_a = db.seed_scope(&env).await;
-    let scope_b = db.seed_scope(&env).await;
-    let subject = UserId::generate(&env, &scope_a).to_string();
-    let session = create_session(&db, &env, scope_a, &subject).await;
-    create_participant(&db, &env, scope_a, &session, Some("https://a.example/bc")).await;
-    let event_id = end_session(&db, &env, scope_a, &session).await;
-    db.store()
-        .scoped(scope_a)
-        .backchannel_deliveries()
-        .enqueue_for_event(&env, &event_id, &session.to_string())
-        .await
-        .expect("explode");
-    let id = db
-        .store()
-        .scoped(scope_a)
-        .backchannel_deliveries()
-        .pending(100)
-        .await
-        .expect("pending")[0]
-        .id
-        .clone();
+    let scope = db.seed_scope(&env).await;
+    let subject = UserId::generate(&env, &scope).to_string();
+    let session = create_session(&db, &env, scope, &subject).await;
+    create_participant(&db, &env, scope, &session, Some("https://a.example/bc")).await;
 
-    // Marking or failing A's delivery through B's scope is a uniform no-op.
-    assert!(
-        !db.store()
-            .scoped(scope_b)
-            .backchannel_deliveries()
-            .mark_delivered(&env, &id)
-            .await
-            .expect("cross-scope mark")
-    );
-    assert!(
-        !db.store()
-            .scoped(scope_a)
-            .backchannel_deliveries()
-            .mark_delivered(&env, "not-an-id")
-            .await
-            .expect("malformed mark")
-    );
-    assert!(
-        !db.store()
-            .scoped(scope_b)
-            .backchannel_deliveries()
-            .record_failure(&env, &id, 1, None, "x")
-            .await
-            .expect("cross-scope record")
-    );
-    // A's delivery is untouched.
+    // The producer side is untouched by #104's second stage: one terminal session end
+    // still enqueues ONE session_ended message, and the fan-out is what consumes it.
+    end_session(&db, &env, scope, &session).await;
+    let pending = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .pending(SESSION_ENDED_CONSUMER, 100)
+        .await
+        .expect("pending session_ended");
+    assert_eq!(pending.len(), 1);
     assert_eq!(
-        db.store()
-            .scoped(scope_a)
-            .backchannel_deliveries()
-            .pending(100)
-            .await
-            .expect("pending")
-            .len(),
-        1
+        pending[0].idempotency_key,
+        session.to_string(),
+        "the session id is the dedup handle, so a re-end cannot double the fan-out"
+    );
+    assert_eq!(
+        pending_count(&db, scope, BACKCHANNEL_LOGOUT_CONSUMER).await,
+        0,
+        "nothing is delivered until the explode consumer runs"
     );
 }
 

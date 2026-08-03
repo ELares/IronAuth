@@ -663,20 +663,18 @@ mod tests {
         ),
         (
             "outbox",
-            Reach::UnreadAtBoot {
-                config_type: "OutboxConfig",
-            },
-            "the transactional outbox and job queue tuning (issue #104, PR 1). Read by no \
-             boot path YET, and deliberately so: PR 1 lands the substrate, the consumer \
-             framework and the first consumer, and registers no consumer that runs as a \
-             worker POOL, so there is nothing for these knobs to size. The first reader is \
-             the back-channel logout worker's migration onto the framework in PR 2 of the \
-             same issue, which is where the boot path builds a WorkerSettings from this \
-             section. Classified here rather than left unstated so that `unread` is a fact \
-             this crate MEASURES (see no_key_classified_unread_is_read_by_the_boot_path) \
-             rather than a promise in a changelog: if a later change starts reading it and \
-             forgets to reclassify, that test goes red. PR 2 is a NEW MODULE in this crate, \
-             which is precisely the shape the check had to be widened to catch.",
+            Reach::OnePlaneOrNoState,
+            "the transactional outbox and job queue tuning (issue #104). RECLASSIFIED in \
+             PR 2, which is the reader PR 1's UnreadAtBoot entry named in advance: the boot \
+             path reads this section in outbox_worker_settings, which is the only place \
+             that maps it however many consumers are registered, and hands the result to \
+             one worker pool per registered consumer. It reaches NEITHER plane state. The \
+             pools run beside the server on their own data-plane and control-plane stores, \
+             and nothing on OidcState or AdminState holds these knobs, so there is no \
+             shared value here to install; that stays true as consumers are added, because \
+             a pool is not plane state. The reclassification is not a formality: the check \
+             went RED on this key the moment the boot path read it, which is exactly the \
+             rot-detection PR 1 was buying.",
         ),
         (
             "features",

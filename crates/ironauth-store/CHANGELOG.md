@@ -6,6 +6,129 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **Back-channel logout delivery runs on the outbox consumer framework, and the interim
+  delivery queue is retired IN CODE (issue #104, PR 2).** This is the FIRST production
+  wiring of the #104 framework: before this change `ConsumerRegistry`, `OutboxWorker` and
+  `OutboxWorkerPool` had never run outside a test, and the boot seam did not exist.
+
+  - `OutboxRepo::enqueue_all` enqueues a whole fan-out in ONE transaction, skipping any
+    `(consumer, idempotency_key)` that is already present, and returns the count of NEW
+    rows. It is the enqueue a producer that runs INSIDE a consumer needs, and the raising
+    `OutboxRepo::enqueue` is left exactly as it was, because a TRANSACTIONAL producer
+    cannot retry an enqueue on its own and a conflict there means two domain writes
+    claimed one fact.
+  - `ClientSessionRepo::backchannel_participants` resolves the recipients of one ended
+    session as VALUES: client id, that client's own `sid`, and its registered
+    `backchannel_logout_uri`. The explode that consumes it lives in ironauth-oidc, and
+    `scripts/query-audit.sh` keeps SQL against a scoped table in the repository module,
+    so the resolution is a read here and the fan-out is a call from there.
+  - `BACKCHANNEL_LOGOUT_CONSUMER` is the ONE exported name the producer and the consumer
+    both read. A consumer whose name does not equal its producers' `consumer`
+    discriminator drains nothing at all, silently, while every pool reports full health,
+    so the two sides are never two string literals that agree today.
+  - `outbox::ControlPlaneScopes` is the production `ScopeSource`, resolving live
+    `(tenant, environment)` scopes from the control plane on every sweep. It returns
+    `Err` on a database fault and never panics: a panic out of that seam unwinds through
+    the worker loop, which has no `catch_unwind` around it, and kills the task.
+  - `outbox::OutboxObserver` is how a pool's outcomes LEAVE this crate, and
+    `OutboxWorkerPool::spawn` now REQUIRES one (`SilentObserver` is the way to say
+    "nothing"). The loop's inner call was `let _ = worker.run_once(scope).await;` and this
+    crate takes no logging dependency, so a dead-lettered message, a drain pass that failed
+    on a persistence fault, and a `ScopeSource` that never returned a scope were all
+    indistinguishable from an empty queue: `OutboxRepo::depth` had no production caller and
+    the pool reported full health throughout, because its workers were alive and looping. It
+    is a required argument rather than an optional one because an optional observer is one a
+    caller can forget, and forgetting it restores exactly that state.
+  - A FENCED scope is no longer drained at all. `OutboxWorker::run_once` reads
+    `environment_state()` before it claims, and a suspended or offboarded scope returns an
+    empty pass. This is a correctness fix and not an optimization: everything a handler
+    touches in a fenced scope refuses, those refusals are retryable, retryable failures burn
+    a finite attempts budget, and a suspension that outlasts the backoff schedule therefore
+    DEAD-LETTERS everything queued in the scope, discarding the work precisely because an
+    operator paused the tenant. `ControlPlaneScopes` deliberately does not filter these out
+    instead: `environment_states` forces row-level security keyed on the scope, so a
+    cross-scope control-plane read cannot see it, and the check belongs where a scoped store
+    already exists. Measured in
+    `a_fenced_scope_is_not_drained_and_its_work_survives_the_suspension`.
+  - `shutdown()` now costs at most one poll interval plus ONE handler, not one CLAIM BATCH
+    of them. `OutboxWorker::run_once_until` reads the stop flag between the messages of a
+    claimed batch; without it, at the shipped `claim_batch` of 64 and a logout request
+    timeout of 10 seconds, `pool.shutdown().await` could hold process exit for about ten
+    minutes and be SIGKILLed by an orchestrator, turning a graceful stop into an abrupt one.
+    Nothing is lost by abandoning the rest of a batch: their leases lapse and they are
+    re-claimed, which is the same path a crash takes. The `shutdown` documentation said "at
+    most one poll interval plus the in-flight pass", which was the batch reading; it now says
+    what the code does.
+  - `OutboxWorkerPool::consumer_name` names the consumer a pool drains for, so a caller
+    holding a VECTOR of pools can assert about them by name rather than only by length.
+  - `BackChannelDeliveryRepo`, `LogoutDelivery`, and the `backchannel_deliveries()`
+    accessor are GONE. The TABLE `backchannel_logout_deliveries` is NOT dropped and no
+    migration touches it, for the reason `0099_outbox_messages.sql` already gave for
+    `session_ended_events`: it holds the delivery record (which RP was told about which
+    session, under which jti, and the dead-letter tail), `0025` grants `ironauth_control`
+    SELECT over it, and dropping is destructive. It stays registered in
+    `scripts/query-audit.sh`, with its prose block now in the past tense.
+
+- **A comment in a SHIPPED migration is WRONG, and this is where the correction lives.**
+  `0099_outbox_messages.sql:104` says of `idempotency_key`: "Enqueuing twice for the same
+  domain fact is a no-op rather than a double delivery, which is what lets a producer
+  retry an enqueue safely." MEASURED: the `INSERT` in `enqueue_outbox_in_tx` carries NO
+  `ON CONFLICT` clause, so a second enqueue under one key RAISES a unique violation,
+  exactly as the Rust documentation on `NewOutboxMessage::idempotency_key` and
+  `OutboxRepo::enqueue` says it does. A shipped migration's text is never edited, so the
+  correction is recorded here, on `enqueue_outbox_in_tx_ignoring_conflict`, and in an
+  assertion (`the_raising_enqueue_still_raises_on_a_duplicate_key`). It matters because
+  believing the comment is exactly how the logout fan-out loses a logout: a producer that
+  loops the raising `enqueue` inside a consumer fails its first re-run on a unique
+  violation, fails identically on every retry, and DEAD-LETTERS the message it was fanning
+  out, leaving every recipient the first pass had not reached permanently un-notified and
+  traced only by a dead-letter row nothing reads.
+
+- **OPERATOR OBLIGATION: drain `backchannel_logout_deliveries` before retiring the last
+  old replica.** After this cutover NOTHING drains rows left in that table. A SQL backfill
+  is refused for the same reason `0099` refused one for `session_ended_events`: the table
+  FORCES row-level security, which applies to the table owner the migration runs as, so a
+  set-based copy would either be refused outright or silently depend on the deployment's
+  migration role happening to be a superuser, which is a worse property than the one it
+  would fix.
+
+  A deployment with `oidc.backchannel_logout_enabled` OFF (the default) loses nothing:
+  nothing ever wrote the table. A deployment with it ON must run, IN THIS ORDER:
+
+  1. QUIESCE session-end traffic (logout, admin revoke, global revoke) across the whole
+     deployment;
+  2. wait for
+
+         SELECT count(*) FROM backchannel_logout_deliveries
+          WHERE delivered_at IS NULL AND dead_lettered_at IS NULL;
+
+     to reach 0, which the still-running OLD replicas are what drives;
+  3. retire the last old replica;
+  4. resume traffic.
+
+  The order matters and the reason is the opposite of the obvious one. The old tail does
+  NOT merely shrink while both versions run: it GROWS. A new replica ending a session
+  enqueues a `session_ended` message onto `outbox_messages`, and an old replica drains that
+  same queue under that same consumer name (`SessionEventOutboxRepo::claim` calls
+  `outbox().claim(env, SESSION_ENDED_CONSUMER, ...)`), after which the old binary's explode
+  INSERTs one row per relying party into `backchannel_logout_deliveries`. So for as long as
+  ANY old replica is running, traffic served by the NEW replicas keeps producing new rows in
+  the OLD table, and the two versions race for every message. An operator who reads the
+  count without quiescing first can watch it reach 0, watch it rise again, and strand
+  whatever is left the instant the last old replica stops, because the new binary has no
+  consumer for that table.
+
+  (This differs from the sentence `0099` used for its own cutover, and it is not a copy of
+  it: there the old table was a SEPARATE queue with a separate producer, so the tail really
+  did only shrink. Here both versions consume ONE queue.)
+
+  Note the SECOND predicate, which differs DELIBERATELY from the `session_ended_events`
+  drain query on `0099:69`. That table has no dead-letter state; this one does, and a
+  dead-lettered row is work the old worker already gave up on. Counting it would make the
+  query never reach 0 for any deployment that ever dead-lettered a delivery, turning a
+  real cutover gate into one operators learn to ignore. It matches the predicate the
+  table's own `claim_due` used.
+
 - `ingest_outcomes` now RETURNS the number of ledger rows it actually wrote (issue #55,
   review fold). It is not the number of outcomes it was handed: the `ON CONFLICT DO NOTHING`
   silently absorbs every outcome whose subject the run already accounts, and reporting the

@@ -29,6 +29,17 @@
 //! So `concurrency` workers in one process and N replicas of that process are both safe,
 //! and neither needs coordination, a leader election, or a lock service.
 //!
+//! ## Nothing here is silent
+//!
+//! The other half of Kratos's cautionary example is that its courier has no health
+//! surface at all. Two things answer that here, and both are required rather than
+//! optional: [`OutboxWorkerPool::size`] is the LIVE worker count measured against
+//! [`OutboxWorkerPool::configured_size`], and every drain pass, every persistence fault
+//! and every failed scope sweep is reported to an [`OutboxObserver`] the caller must
+//! supply. This crate takes no logging dependency, so the observer is how a dead letter
+//! reaches an operator; a pool whose outcomes are discarded is a queue that looks idle
+//! while it silently gives work up.
+//!
 //! The one number an operator still owns is the visibility timeout, and what it has to
 //! exceed is ONE handler's duration, not a batch of them: [`OutboxWorker::run_once`]
 //! re-stamps each message's lease immediately before handing it over, so the batch size
@@ -384,15 +395,65 @@ impl OutboxWorker {
     /// Each message's lease is re-stamped immediately before it is handed over, so the
     /// visibility timeout is a deadline on one handler rather than on the whole batch.
     /// A message whose lease has already gone to another worker is skipped, counted in
-    /// [`DrainStats::lease_lost`], and left entirely to that worker.
+    /// [`DrainStats::lease_lost`], and left entirely to that worker. A FENCED scope is not
+    /// drained at all: see [`run_once_until`](OutboxWorker::run_once_until), which this
+    /// calls with a flag nothing ever sets.
     ///
     /// # Errors
     ///
     /// [`StoreError`] on a persistence fault.
     pub async fn run_once(&self, scope: Scope) -> Result<DrainStats, StoreError> {
+        self.run_once_until(scope, &AtomicBool::new(false)).await
+    }
+
+    /// [`run_once`](OutboxWorker::run_once), abandoning the rest of the claimed batch as
+    /// soon as `stop` is set. The pool hands its shutdown flag here.
+    ///
+    /// # The stop check sits BETWEEN MESSAGES, not only around the batch
+    ///
+    /// A pass that only checked the flag around its whole batch had to run every message
+    /// the last claim took before it could return, so a stop cost one claim batch of
+    /// handlers rather than one handler. At the shipped `claim_batch` of 64 and a logout
+    /// request timeout of 10 seconds that is about ten minutes of `shutdown().await`,
+    /// which an orchestrator resolves with SIGKILL. Measured here at a smaller scale, in
+    /// `a_stop_between_messages_abandons_the_rest_of_the_claimed_batch`.
+    ///
+    /// Nothing is lost by abandoning them. A claimed message that is neither completed nor
+    /// failed keeps its lease until it lapses and is then re-claimed, by another worker or
+    /// by the next boot, which is the same path a crash takes. [`DrainStats::claimed`]
+    /// still reports what the claim leased, because that is what it means.
+    ///
+    /// # A FENCED scope is skipped before anything is claimed
+    ///
+    /// A suspended or offboarded scope ([`ScopedStore::environment_state`]) is not drained
+    /// at all, and this is a correctness property rather than an optimization. The data
+    /// plane fences such a scope, so every handler that touches it fails; those failures
+    /// are retryable, and retryable failures burn a FINITE attempts budget, so a
+    /// suspension that outlasts the backoff schedule DEAD-LETTERS everything queued in the
+    /// scope. The work would be discarded precisely because an operator paused the tenant,
+    /// and resuming would not bring it back. Skipping leaves it queued and due, so a
+    /// resume drains it.
+    ///
+    /// It also makes the [`ScopeSource`] documentation true: that seam resolves scopes per
+    /// sweep so "a suspended one must stop", and until this check existed nothing stopped.
+    ///
+    /// The cost is one indexed, scope-local lookup per scope per pass, which is the same
+    /// order as the claim it guards and is paid only while a pool is running.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] on a persistence fault.
+    pub async fn run_once_until(
+        &self,
+        scope: Scope,
+        stop: &AtomicBool,
+    ) -> Result<DrainStats, StoreError> {
         let mut stats = DrainStats::default();
-        let queue = self.store.scoped(scope);
-        let queue = queue.outbox();
+        let scoped = self.store.scoped(scope);
+        if scoped.environment_state().await?.is_fenced() {
+            return Ok(stats);
+        }
+        let queue = scoped.outbox();
         let mut claimed = queue
             .claim(
                 &self.env,
@@ -403,6 +464,11 @@ impl OutboxWorker {
             .await?;
         stats.claimed = u64::try_from(claimed.len()).unwrap_or(u64::MAX);
         for message in &mut claimed {
+            // The stop check, BEFORE the renewal rather than after the handler, so a
+            // shutdown costs at most the handler already running and never one more.
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
             // Re-stamp before handing over, and skip anything whose lease is no longer
             // ours. Doing this per message is what keeps the batch from sharing one
             // deadline; doing it BEFORE the handler is what makes the skip free, because
@@ -517,6 +583,12 @@ pub const CONSUMER_PANIC_LABEL: &str = "consumer_panic";
 /// drained without a restart, and a suspended one must stop. Resolving it per sweep is
 /// also what keeps this crate from having to know whether the scope list comes from the
 /// control plane, a static configuration, or a test fixture.
+///
+/// An implementor does NOT have to filter out suspended scopes, and
+/// [`ControlPlaneScopes`] deliberately does not: the serving state lives on a
+/// row-level-security scoped table that a cross-scope control-plane read cannot see, so
+/// the stop is enforced one layer down, per scope, in
+/// [`OutboxWorker::run_once_until`].
 pub trait ScopeSource: Send + Sync {
     /// The scopes to drain on this sweep.
     fn scopes(&self) -> Pin<Box<dyn Future<Output = Result<Vec<Scope>, StoreError>> + Send + '_>>;
@@ -540,14 +612,115 @@ impl ScopeSource for StaticScopes {
     }
 }
 
+/// The live `(tenant, environment)` scopes, read from the CONTROL plane on every sweep
+/// (issue #104): the production [`ScopeSource`], and the counterpart to [`StaticScopes`].
+///
+/// Scope enumeration reads the `environments` table, which is NOT row-level-security
+/// scoped and which only the `ironauth_control` role may read, so this holds a control
+/// plane [`Store`] while the workers it feeds drain through a separate data plane one. A
+/// binary therefore connects twice, and that separation is the point: a pool that could
+/// enumerate scopes from its data-plane connection would be a data-plane role with a
+/// cross-tenant read.
+///
+/// It lives here rather than in the binary because every consumer of this framework needs
+/// exactly this and would otherwise write it again, differently, and at least one of
+/// those copies would panic on the error path.
+///
+/// It reports every environment, INCLUDING suspended ones, and that is not an oversight.
+/// The serving state lives on `environment_states`, which FORCES row-level security keyed
+/// on the scope, so a control-plane connection that has set no scope reads nothing there
+/// and a set-based filter here would either return every scope or none. The stop for a
+/// suspended scope is therefore enforced per scope, on the data plane, in
+/// [`OutboxWorker::run_once_until`], which already holds a scoped store.
+pub struct ControlPlaneScopes {
+    control: Store,
+}
+
+impl ControlPlaneScopes {
+    /// Enumerate scopes on `control`, which must be a store connected with the
+    /// control-plane role.
+    #[must_use]
+    pub fn new(control: Store) -> Self {
+        Self { control }
+    }
+}
+
+impl ScopeSource for ControlPlaneScopes {
+    /// # A database fault here is an `Err`, never a panic
+    ///
+    /// That is a hard requirement of this seam and not a style preference. A panic out of
+    /// [`ScopeSource::scopes`] unwinds through the worker loop, which has no
+    /// `catch_unwind` around it (the one in [`OutboxWorker::run_once`] wraps the CONSUMER,
+    /// not the sweep), so the task dies. The pool then keeps its
+    /// [`configured_size`](OutboxWorkerPool::configured_size) while its
+    /// [`size`](OutboxWorkerPool::size) falls, and a control plane that is briefly
+    /// unreachable at the wrong moment permanently costs the process its workers.
+    /// Returning `Err` costs one sweep instead: the loop abandons the pass and retries
+    /// after `poll_interval`.
+    fn scopes(&self) -> Pin<Box<dyn Future<Output = Result<Vec<Scope>, StoreError>> + Send + '_>> {
+        Box::pin(async move { self.control.management().list_environment_scopes().await })
+    }
+}
+
+/// What a pool's drain passes did, reported OUT of this crate (issue #104).
+///
+/// The pool would otherwise discard every outcome it produces, and that is not a
+/// hypothetical: the loop's inner call read `let _ = worker.run_once(scope).await;`, and
+/// this crate takes no logging dependency at all, so a dead-lettered message, a pass that
+/// failed on a persistence fault, and a [`ScopeSource`] that never returned a scope were
+/// all indistinguishable, from outside the process, from a queue with no work in it. The
+/// pool reports through this seam and the BINARY decides what a log line, a metric or an
+/// alert is; the store crate keeps its freedom from a logging framework.
+///
+/// Every method takes the consumer name, because a process runs one pool per consumer and
+/// a report that does not say which one is not actionable.
+///
+/// An implementor must not block or panic: it is called on the worker task, between
+/// passes, and a panic here kills that worker exactly as a panicking [`ScopeSource`] does
+/// (the `catch_unwind` in [`OutboxWorker::run_once`] wraps the CONSUMER, nothing else).
+pub trait OutboxObserver: Send + Sync {
+    /// One drain pass over one scope finished. [`DrainStats::dead_lettered`] is the number
+    /// an alert fires on: a dead letter is work that will never happen unless an operator
+    /// replays it, and for a fan-out consumer one dead letter can be a whole session's
+    /// worth of notifications.
+    fn pass_finished(&self, consumer: &str, scope: Scope, stats: &DrainStats);
+
+    /// One drain pass failed on a persistence fault. Nothing is lost, because the queue
+    /// still holds the work and the next pass retries, but a pass that keeps failing is a
+    /// pool draining nothing while reporting full health.
+    fn pass_failed(&self, consumer: &str, scope: Scope, error: &StoreError);
+
+    /// The sweep could not resolve its scopes, so NO scope was drained this pass. This is
+    /// the one that most needs saying: [`OutboxWorkerPool::size`] cannot see it (the
+    /// workers are alive and looping), so a `ScopeSource` that always errors is a
+    /// permanently idle pool at full reported health.
+    fn scopes_unavailable(&self, consumer: &str, error: &StoreError);
+}
+
+/// An observer that reports nothing (issue #104): for tests, and for a caller that has
+/// deliberately decided a pool's outcomes are not worth surfacing.
+///
+/// Named rather than made the default, so that choosing silence is a line of code somebody
+/// wrote and a reviewer can see, instead of the absence of an argument.
+pub struct SilentObserver;
+
+impl OutboxObserver for SilentObserver {
+    fn pass_finished(&self, _consumer: &str, _scope: Scope, _stats: &DrainStats) {}
+
+    fn pass_failed(&self, _consumer: &str, _scope: Scope, _error: &StoreError) {}
+
+    fn scopes_unavailable(&self, _consumer: &str, _error: &StoreError) {}
+}
+
 /// A running pool of workers for ONE consumer (issue #104).
 ///
 /// [`spawn`](OutboxWorkerPool::spawn) starts `settings.concurrency` independent tasks.
-/// Each sweeps every scope the [`ScopeSource`] reports, running one pass per scope, then
-/// waits `poll_interval` and sweeps again. The tasks share nothing: they are safe because
-/// every claim is leased and skip-locked, which is the same reason a second REPLICA of
-/// the whole process is safe.
+/// Each sweeps every scope the [`ScopeSource`] reports, running one pass per scope,
+/// reporting each outcome to the [`OutboxObserver`], then waits `poll_interval` and
+/// sweeps again. The tasks share nothing: they are safe because every claim is leased and
+/// skip-locked, which is the same reason a second REPLICA of the whole process is safe.
 pub struct OutboxWorkerPool {
+    consumer: String,
     handles: Vec<tokio::task::JoinHandle<()>>,
     stop: Arc<AtomicBool>,
     live: Arc<AtomicUsize>,
@@ -573,8 +746,17 @@ impl OutboxWorkerPool {
     ///
     /// A `concurrency` of 0 is treated as 1: a configured pool that silently drains
     /// nothing is the failure mode that makes a queue look healthy while it fills.
+    ///
+    /// `observer` is REQUIRED rather than optional, and [`SilentObserver`] is the way to
+    /// say "nothing". An optional observer is one a caller can forget, and forgetting it
+    /// reproduces exactly the state this seam exists to end: a pool whose every outcome,
+    /// including a dead letter, is discarded by a `let _ =`.
     #[must_use]
-    pub fn spawn(worker: &OutboxWorker, scopes: &Arc<dyn ScopeSource>) -> Self {
+    pub fn spawn(
+        worker: &OutboxWorker,
+        scopes: &Arc<dyn ScopeSource>,
+        observer: &Arc<dyn OutboxObserver>,
+    ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let workers = usize::try_from(worker.settings.concurrency.max(1)).unwrap_or(1);
         let poll = worker.settings.poll_interval;
@@ -583,6 +765,7 @@ impl OutboxWorkerPool {
         for _ in 0..workers {
             let worker = worker.clone();
             let scopes = Arc::clone(scopes);
+            let observer = Arc::clone(observer);
             let stop = Arc::clone(&stop);
             // Counted UP here rather than inside the task, so `size` is the configured
             // count the instant `spawn` returns and only ever falls from a real death.
@@ -597,13 +780,31 @@ impl OutboxWorkerPool {
                     // transient database fault from this loop's point of view: the work
                     // is still durably in the queue, so the pass is abandoned and the
                     // next one retries. Nothing is dropped and nothing is retried here in
-                    // a tight loop.
-                    if let Ok(scopes) = scopes.scopes().await {
-                        for scope in scopes {
-                            if stop.load(Ordering::Relaxed) {
-                                break;
+                    // a tight loop. Every one of those outcomes is REPORTED rather than
+                    // discarded, because a loop that swallows them makes a permanently
+                    // failing pool indistinguishable from an idle one.
+                    match scopes.scopes().await {
+                        Ok(scopes) => {
+                            for scope in scopes {
+                                if stop.load(Ordering::Relaxed) {
+                                    break;
+                                }
+                                match worker.run_once_until(scope, &stop).await {
+                                    Ok(stats) => {
+                                        observer.pass_finished(
+                                            worker.consumer_name(),
+                                            scope,
+                                            &stats,
+                                        );
+                                    }
+                                    Err(error) => {
+                                        observer.pass_failed(worker.consumer_name(), scope, &error);
+                                    }
+                                }
                             }
-                            let _ = worker.run_once(scope).await;
+                        }
+                        Err(error) => {
+                            observer.scopes_unavailable(worker.consumer_name(), &error);
                         }
                     }
                     tokio::time::sleep(poll).await;
@@ -611,10 +812,19 @@ impl OutboxWorkerPool {
             }));
         }
         Self {
+            consumer: worker.consumer_name().to_owned(),
             handles,
             stop,
             live,
         }
+    }
+
+    /// The consumer this pool drains for. A process runs one pool per registered consumer,
+    /// so this is what makes a VECTOR of pools something a caller can assert about by name
+    /// rather than only by length.
+    #[must_use]
+    pub fn consumer_name(&self) -> &str {
+        &self.consumer
     }
 
     /// How many of this pool's worker tasks are still ALIVE.
@@ -628,7 +838,7 @@ impl OutboxWorkerPool {
     ///
     /// A consumer panic does NOT show up here, because [`OutboxWorker::run_once`] catches
     /// it. What does is a panic in the surrounding loop, which in practice means a
-    /// [`ScopeSource`] that panics.
+    /// [`ScopeSource`] or an [`OutboxObserver`] that panics.
     #[must_use]
     pub fn size(&self) -> usize {
         self.live.load(Ordering::Relaxed)
@@ -642,10 +852,20 @@ impl OutboxWorkerPool {
 
     /// Signal every worker to stop and wait for the current passes to finish.
     ///
-    /// A worker checks the flag between scopes and between sweeps, so shutdown takes at
-    /// most one poll interval plus the in-flight pass. Messages already claimed but not
-    /// completed are NOT lost: their leases lapse and another worker (or the next boot)
-    /// picks them up, which is the same path a crash takes.
+    /// A worker checks the flag between sweeps, between scopes, and between the MESSAGES
+    /// of one claimed batch, so shutdown takes at most one poll interval plus ONE handler.
+    ///
+    /// The last of those three is not a refinement. Without it the bound is one poll
+    /// interval plus a whole CLAIM BATCH of handlers, which at the shipped `claim_batch`
+    /// of 64 and a logout request timeout of 10 seconds is about ten minutes: long enough
+    /// that an orchestrator stops waiting and SIGKILLs the process, so a stop that was
+    /// meant to be graceful is not. [`OutboxWorker::run_once_until`] is where the flag is
+    /// read, and `a_stop_between_messages_abandons_the_rest_of_the_claimed_batch` measures
+    /// that it is read there.
+    ///
+    /// Messages already claimed but not completed are NOT lost: their leases lapse and
+    /// another worker (or the next boot) picks them up, which is the same path a crash
+    /// takes.
     ///
     /// A worker that DIED rather than stopped is joined here too, and its `JoinError` is
     /// discarded rather than propagated, because shutdown has nothing useful to do with a

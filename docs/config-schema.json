@@ -754,33 +754,12 @@
         },
         "backchannel_logout_enabled": {
           "default": false,
-          "description": "Whether the OIDC Back-Channel Logout delivery worker runs (issue #34). OFF by\ndefault (the covenant posture: no mandatory background infrastructure), so the\ndefault build enqueues nothing and sends nothing. When enabled, the worker drains\nthe durable session-ended outbox, builds one signed Logout Token per participating\nrelying party (each carrying that RP's own `sid`), and POSTs it to the RP's\nregistered `backchannel_logout_uri` through the SSRF-hardened outbound fetcher,\nwith bounded-backoff retries and a dead-letter state. Discovery advertises\n`backchannel_logout_supported` regardless (the OP supports the mechanism); this\nswitch governs only whether the delivery worker is scheduled.",
+          "description": "Whether the OIDC Back-Channel Logout delivery consumers run (issue #34). OFF by\ndefault (the covenant posture: no mandatory background infrastructure), so the\ndefault build SENDS nothing. When enabled, the consumers drain the durable\nsession-ended outbox, fan one ended session out into one message per participating\nrelying party, build a signed Logout Token for each (carrying that RP's own `sid`),\nand POST it to the RP's registered `backchannel_logout_uri` through the\nSSRF-hardened outbound fetcher, with bounded-backoff retries and a dead-letter\nstate. Discovery advertises `backchannel_logout_supported` regardless (the OP\nsupports the mechanism); this switch governs only whether the consumers are\nscheduled: ending a session ENQUEUES a durable `session_ended` message either way,\nso with this off those messages accumulate undrained (see below).\n\nThis switch does NOT gate the PRODUCER, and an operator sizing a database should\nknow it. Ending an SSO session enqueues one durable `session_ended` message inside\nthe revoking transaction whatever this is set to, because `session_ended` is a\ndomain event rather than a logout implementation detail: it commits with the\nsession flip or not at all, and back-channel logout is one consumer of it. With\nthis switch off nothing consumes those messages, so they accumulate, and turning it\non later starts by draining the accumulated backlog and notifying relying parties\nabout sessions that ended long ago. A deployment that leaves it off and ends many\nsessions should expect `outbox_messages` to grow accordingly.",
           "type": "boolean"
-        },
-        "backchannel_logout_max_attempts": {
-          "default": 5,
-          "description": "The maximum number of delivery attempts the back-channel logout worker makes for\none relying party before it DEAD-LETTERS the delivery (issue #34). A slow or down\nRP is retried with exponential backoff up to this cap, then given up on (recorded\nwith its last error) so it never retries unboundedly. The default (5) is\nconservative. Must be at least 1.",
-          "format": "uint32",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "backchannel_logout_poll_interval_secs": {
-          "default": 5,
-          "description": "How often, in seconds, the back-channel logout worker polls the queue for due work\n(issue #34). The default (5) is a responsive-yet-cheap cadence. Must be at least 1\nand at most `OIDC_MAX_LIFETIME_SECS`.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
         },
         "backchannel_logout_request_timeout_secs": {
           "default": 10,
-          "description": "The per-delivery total time budget in seconds for one back-channel logout POST\n(issue #34): the SSRF-hardened fetcher aborts a delivery that exceeds it, so a slow\nRP cannot wedge the worker or block other RPs. The default (10) is conservative.\nMust be at least 1 and at most `OIDC_MAX_LIFETIME_SECS`.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "backchannel_logout_retry_base_secs": {
-          "default": 10,
-          "description": "The base delay in seconds for the back-channel logout worker's exponential backoff\nbetween delivery retries (issue #34). The nth retry waits about\n`base * 2^(n-1)` seconds plus jitter (both drawn from the deterministic clock and\nentropy seams). The default (10) is conservative. Must be at least 1 and at most\n`OIDC_MAX_LIFETIME_SECS`.",
+          "description": "The per-delivery total time budget in seconds for one back-channel logout POST\n(issue #34): the SSRF-hardened fetcher aborts a delivery that exceeds it, so a slow\nRP cannot wedge the worker or block other RPs. The default (10) is conservative.\nMust be at least 1 and at most `OIDC_MAX_LIFETIME_SECS`.\n\nIt is NOT a lease, and since issue #104 it is no longer the thing the lease is\nderived from: the attempts cap, the backoff schedule, the poll cadence and the\nvisibility lease all come from the `[outbox]` section that every consumer shares.\nThis one survives because it is an ironauth-fetch budget on a single outbound\nrequest and has no equivalent there. It must stay strictly BELOW\n`outbox.visibility_timeout_secs`, which [`Config::validate`] enforces: a handler\nallowed to run longer than its lease is re-claimed mid-POST by another worker, and\nthe relying party receives the token twice with nothing anywhere recording that it\nhappened.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -1527,7 +1506,7 @@
         },
         "max_attempts": {
           "default": 5,
-          "description": "The total number of attempts a message gets before it is DEAD-LETTERED. `1` means\nno retry at all: the first failure is terminal.\n\nThis bound is not only a politeness to a failing endpoint. A message that shares\nan ordering key with others BLOCKS them until it reaches a terminal state, so the\ndead letter is what releases the aggregate; an unbounded retry would wedge that\naggregate forever, which is why there is no \"unlimited\" value here and never will\nbe. The default (5) is conservative. Must be at least 1.",
+          "description": "The total number of attempts a message gets before it is DEAD-LETTERED. `1` means\nno retry at all: the first failure is terminal.\n\nThis bound is not only a politeness to a failing endpoint. A message that shares\nan ordering key with others BLOCKS them until it reaches a terminal state, so the\ndead letter is what releases the aggregate; an unbounded retry would wedge that\naggregate forever, which is why there is no \"unlimited\" value here and never will\nbe. The default (5) is conservative. Must be at least 1.\n\nThe wedge argument does not reach a consumer whose producers give every message its\nOWN ordering key, because each of its groups is a singleton with nothing behind it\nto block. Such a consumer may be given a larger budget IN CODE, where the singleton\nproperty can be argued for that consumer specifically; the back-channel logout\nfan-out is the one that is. It stays out of this knob deliberately: this value\napplies to EVERY consumer at once, and most of them do have aggregates.",
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
@@ -2559,10 +2538,7 @@
         },
         "authorization_code_ttl_secs": 60,
         "backchannel_logout_enabled": false,
-        "backchannel_logout_max_attempts": 5,
-        "backchannel_logout_poll_interval_secs": 5,
         "backchannel_logout_request_timeout_secs": 10,
-        "backchannel_logout_retry_base_secs": 10,
         "client_assertion_audience": "token_endpoint_or_issuer",
         "client_assertion_max_skew_secs": 60,
         "client_credentials_default_audience": "client_id",
