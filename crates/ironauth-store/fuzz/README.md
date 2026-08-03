@@ -1,5 +1,10 @@
 # ironauth-store fuzzing
 
+Two targets live here: `redirect_match` over the redirect-URI comparator, and
+`canonicalize_identifier` over the identifier canonicalization seam.
+
+## `redirect_match`
+
 A cargo-fuzz harness over the redirect-URI comparator and registrability rule
 (issue #13), `ironauth_store::redirect_uri_matches` and
 `ironauth_store::redirect_uri_is_registrable`. These two pure functions are the
@@ -37,6 +42,33 @@ candidate whose byte 7 falls inside a multi-byte character, which the http-prefi
 strip used to slice through). Continuous fuzzing should persist and grow this
 corpus; a reproducer for a fixed crash belongs here, since `artifacts/` is
 scratch and is not committed.
+
+## `canonicalize_identifier`
+
+A harness over `ironauth_store::identifier::canonicalize_identifier` (issue #54),
+the single seam every login-identifier comparison and uniqueness check routes
+through. It proves the function is TOTAL (never panics on any byte string, fed
+lossily as text) and IDEMPOTENT for all three identifier kinds.
+
+### Seed corpus
+
+`corpus/canonicalize_identifier/` had NO seeds until the branding sanitizer's
+idempotence defect prompted an audit of every target asserting that property.
+A target with an empty corpus starts each nightly run from zero, and byte-level
+mutation reaches an interesting Unicode sequence rarely, so "the fuzzer has never
+complained" said very little about this function. The seeds now cover the classes
+that make canonicalization non-trivial: a mixed-case email, invisible padding, a
+fullwidth homoglyph, E.164 separators, the full case-fold EXPANSIONS (the sharp s
+and the `ﬀ` ligature, whose folds are sequences rather than single characters),
+the Greek sigma and iota-subscript cases, compatibility singletons (OHM SIGN,
+KELVIN SIGN, the squared and ligature forms), default-ignorable fillers, a
+bidirectional override, and a shapeless all-`@` value.
+
+The property itself was verified DIRECTLY rather than left to the fuzzer: an
+exhaustive sweep of all 1,112,064 Unicode scalar values plus 1,000,000
+pseudorandom sequences, canonicalized twice for each kind, found zero
+divergences. The seeds exist so a future change to the folding steps has a
+running start at breaking that.
 
 ## Stable, in-CI coverage of the same input space
 

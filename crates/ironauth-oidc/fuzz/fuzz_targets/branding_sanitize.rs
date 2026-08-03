@@ -18,11 +18,21 @@
 //!   attribute can only appear inside `<...>`), so an escaped `onerror=` in text is not a
 //!   false positive; and
 //! - [`sanitize`] is IDEMPOTENT: re-sanitizing its own output is a fixed point, so re-running
-//!   the sanitizer on a stored value (defense in depth on read) never changes a safe value.
+//!   the sanitizer on a stored value (defense in depth on read) never changes a safe value,
+//!   and a snapshot IronAuth exported passes the config-promotion import wall, which asks
+//!   exactly "is this string already sanitizer output".
+//!
+//! That third property is the one this target has already earned its keep on. A single
+//! `ammonia` pass did NOT have it: an element outside the allowlist can suppress the implied
+//! `</p>`, and stripping that element leaves a `<p>` nested inside a `<p>`, which no parser can
+//! produce, so the next parse unfolded it into siblings and the value moved. `sanitize` now
+//! applies the allowlist until a pass changes nothing. The reproducer is pinned as
+//! `corpus/branding_sanitize/seed_regression_select_nested_p`.
 //!
 //! This is the exact function the live branding ingest and render paths route through, so the
 //! fuzzer exercises the real allowlist sanitizer, not a divergent copy. The seed corpus is the
-//! Casdoor-class bypass corpus asserted every-PR in the crate's `branding::sanitize` unit tests.
+//! Casdoor-class bypass corpus asserted every-PR in the crate's `branding::sanitize` unit tests,
+//! plus the reproducer above, which those unit tests read from the corpus file itself.
 //!
 //! Run locally: `cargo +nightly fuzz run branding_sanitize` from this directory.
 

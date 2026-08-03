@@ -53,7 +53,12 @@
 //! The two doors differ in DISPOSITION, deliberately. This one SANITIZES a submitted slot and
 //! stores the result; the promotion door REFUSES a slot that is not already sanitizer output.
 //! A snapshot's contract is the canonical shape the export returns, and the export returns
-//! sanitizer output, so a genuine document round-trips (the sanitizer is idempotent). Rewriting
+//! sanitizer output, so a genuine document round-trips. That rests ENTIRELY on the sanitizer
+//! returning a fixed point of itself: while it applied a single allowlist pass, a slot whose
+//! markup the pass reshaped was stored in a form this door then refused, and a document
+//! IronAuth exported could not be re-imported. It applies the allowlist to convergence now,
+//! and `a_slot_that_needed_a_second_pass_still_round_trips_through_the_promotion_wall`
+//! drives both doors in one test so the two can never disagree again. Rewriting
 //! a submitted document instead would mean the plan an operator reviewed and the bytes the apply
 //! stored were different documents.
 //!
@@ -202,7 +207,9 @@ fn validated_slots(raw: &BTreeMap<String, String>) -> Result<String, ApiError> {
 ///
 /// 1. `tokens` and `tokens_dark` must deserialize into the closed [`DesignTokens`] grammar.
 /// 2. every `slots` value must be a string with a known key, within the size cap, and ALREADY
-///    sanitizer output (the sanitizer is idempotent, so an exported document round-trips).
+///    sanitizer output. `ironauth_oidc::branding::sanitize` returns a FIXED POINT of the
+///    allowlist, so an exported document round-trips through this rule rather than being
+///    refused by it.
 /// 3. no two brands may claim the same CANONICAL host. The apply releases every other claimant
 ///    of a promoted host before binding it, which is only faithful to the document if the
 ///    document names one claimant per host; two would make the last-applied slug win and the
@@ -743,6 +750,32 @@ mod tests {
     /// the apply RELEASES the other claimant and DEMOTES the other default, so a document with
     /// two would land whichever slug sorted last and no re-plan would reproduce it. The host
     /// rule compares CANONICAL forms, because two spellings are one claim.
+    /// THE ROUND TRIP, end to end through both doors: what the MANAGEMENT door stores is
+    /// exactly what an export carries, so the promotion wall must accept it. The slot here
+    /// is raw operator markup whose first allowlist pass emits `<p>` nested inside `<p>`;
+    /// while the sanitizer settled after one pass, the stored value was NOT its own
+    /// sanitizer output, and this document, exported from IronAuth unaltered, was refused
+    /// on re-import by the very wall that tells the operator to "submit the exported value".
+    #[test]
+    fn a_slot_that_needed_a_second_pass_still_round_trips_through_the_promotion_wall() {
+        // Door one: the management ingest, which sanitizes and stores the result.
+        let stored = validated_slots(&slots(vec![("login_help", "<p>Help<select><p>more")]))
+            .expect("the management door sanitizes and stores");
+        // The export embeds that stored JSON verbatim as parsed JSON.
+        let mut exported = exported_brand("acme");
+        exported.slots = serde_json::from_str(&stored).expect("the stored slots are JSON");
+        assert!(
+            exported.slots.get("login_help").is_some(),
+            "the slot survived ingest: {stored}"
+        );
+        // Door two: the promotion wall, on the document the export just produced.
+        let faults = promoted_brand_faults(&document(vec![exported]));
+        assert!(
+            faults.is_empty(),
+            "a document IronAuth itself exported must re-import: {faults:?}"
+        );
+    }
+
     #[test]
     fn a_document_that_could_never_converge_is_refused() {
         let mut first = exported_brand("aaa");

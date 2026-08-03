@@ -125,8 +125,9 @@ runs, every brand the document carries is validated against exactly the grammar
   (hex-only colors, an allowlisted font enum, clamped numerics). Never CSS.
 - every `slots` key must be a known slot id, within the per-slot size cap, and
   the value must already be **sanitizer output**. The export emits sanitizer
-  output and the sanitizer is idempotent, so an exported document round-trips;
-  raw markup is refused rather than silently rewritten, because a rewritten
+  output and the sanitizer returns a **fixed point** of its own allowlist, so an
+  exported document round-trips; raw markup is refused rather than silently
+  rewritten, because a rewritten
   document would mean the plan an operator reviewed and the bytes the apply
   stored were different documents.
 - no two brands may claim the same host, and no two may be the environment

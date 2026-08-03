@@ -6,6 +6,19 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **A brand snapshot IronAuth exported can be re-imported again (issue #86).** The promotion
+  wall refuses a `slots` value that is not already sanitizer output, and its message tells the
+  operator to "submit the exported value rather than raw markup". Because
+  `ironauth_oidc::branding::sanitize` applied a SINGLE allowlist pass and was therefore not a
+  fixed point of itself, a slot whose markup the pass reshaped was stored in a form this wall
+  then refused: the exported value was precisely what the wall rejected. The sanitizer now
+  applies the allowlist to convergence (see the `ironauth-oidc` changelog for the mechanism and
+  the measured bound), and the wall itself is unchanged. Nothing an operator could previously
+  import is refused now; a slot that was previously refused is accepted.
+  `a_slot_that_needed_a_second_pass_still_round_trips_through_the_promotion_wall` drives the
+  management ingest door and the promotion door in ONE test, so the two disposition rules can
+  never again disagree about what "sanitizer output" means.
+
 - Review fold on the streaming bulk-import job surface (issue #55).
 
   - **Resuming a TERMINAL run no longer creates identities before answering 409.** The
