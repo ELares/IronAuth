@@ -93,7 +93,7 @@ jobs:
           -timeout=25
       - name: Upload crash artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-artifacts-${{ matrix.target }}
           path: ${{ matrix.dir }}/fuzz/artifacts/

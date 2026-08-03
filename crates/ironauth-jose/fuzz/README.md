@@ -72,7 +72,7 @@ jobs:
           cargo +nightly fuzz run verify_jws -- -max_total_time=600 -timeout=25
       - name: Upload crashes on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: jose-fuzz-crashes
           path: crates/ironauth-jose/fuzz/artifacts/
