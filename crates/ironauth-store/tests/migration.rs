@@ -50,7 +50,8 @@ const CHAIN_SUBJECTS: &str = "isolation, audit log, \
      permission claims, token size event budget columns, client allowed scopes, \
      email-factor downgrade configuration, control-plane dead-surface grants, generic \
      transactional outbox, control-plane writes on environment secrets, \
-     control-plane writes on the migration-run ledger, outbox retention.";
+     control-plane writes on the migration-run ledger, outbox retention, \
+     broker cutover and policy bounds.";
 
 /// A throwaway migration with the given version, phase, and SQL text.
 fn step(version: i64, phase: Phase, sql: &'static str) -> Migration {
@@ -656,7 +657,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
     );
     assert_eq!(
         report.already_applied(),
-        102,
+        103,
         "a migration was added to or removed from the production chain; this count is a \
          deliberate checkpoint, not a bug, so read the new migration, satisfy yourself that it \
          belongs in the shipped chain, then update this number and CHAIN_SUBJECTS and the \
@@ -692,7 +693,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
             46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67,
             68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89,
-            90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102
+            90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103
         ]
     );
     let phase_of = |version: i64| async move {
@@ -4398,12 +4399,46 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
     for constraint in [
         "org_connections_scope_nonempty",
         "org_connections_overlay_min_class_known",
+        // 0103 (issue #286). 0059 pinned the CLASS ladder and left the ACR column open, so a
+        // typo became an unranked floor that the federated context can never reach, making
+        // the ceremony unsatisfiable. It fails closed, which is why this is hardening.
+        "org_connections_overlay_min_acr_known",
+        // 0103. A negative bound is silently dropped by the unsigned conversion at the
+        // enforcement read, which is fail OPEN on a nonsense value: the bound reads as
+        // absent and nothing is enforced.
+        "org_connections_max_age_nonnegative",
     ] {
         assert!(
             check_constraint_exists(pool, "org_connections", constraint).await,
             "org_connections must carry the {constraint} CHECK constraint"
         );
     }
+
+    // 0103 (issue #286): the sibling bound on the per-CLIENT step-up policy. 0047 gave this
+    // CHECK to the scope_step_up_policies table it CREATED and did not give it to the column
+    // it added to `clients` in the same file; this closes that gap.
+    assert!(
+        check_constraint_exists(pool, "clients", "clients_step_up_max_age_nonnegative").await,
+        "clients must carry the step-up max-age nonnegative CHECK after 0103"
+    );
+
+    // 0103 (issue #286): the per-account broker-then-migrate cutover marker, and the
+    // column-scoped grant that lets the data plane stamp it and nothing else.
+    assert!(
+        column_exists(pool, "users", "local_cutover_marked_at").await,
+        "users.local_cutover_marked_at exists after 0103"
+    );
+    assert!(
+        role_has_column_privilege(
+            pool,
+            "ironauth_app",
+            "users",
+            "local_cutover_marked_at",
+            "UPDATE"
+        )
+        .await,
+        "the data plane must be able to stamp the cutover marker"
+    );
 
     // The routing-rule table.
     assert!(

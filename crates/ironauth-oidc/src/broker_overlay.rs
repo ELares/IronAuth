@@ -290,23 +290,29 @@ pub(crate) async fn enforce_on_callback(ctx: CallbackContext<'_>) -> CallbackOve
     // would loop back through `/login` (a password re-entry a federated user has no way to
     // satisfy). Passing `acr_unmet = true` keeps decide_remediation on the factor-challenge
     // branch (never the full-reauth branch).
-    let remediation_requirement = if acr_unmet {
-        requirement.clone()
-    } else {
-        AuthnRequirement {
-            min_acr: Some(authn::acr_for_mfa().to_owned()),
-            max_auth_age_secs: None,
-        }
-    };
+    // The pure-age synthesis that used to live here now lives in `decide_remediation`
+    // itself (issue #286), so the authorize gate gives the SAME answer to a federated
+    // session and the client and scope age policies it never covered are fixed too. This
+    // call passes the REAL `acr_unmet` and the REAL requirement: an unmet acr keeps its own
+    // floor, so a `phr` overlay still routes to a passkey ceremony rather than a TOTP
+    // prompt. `session_is_federated` is unconditionally true here because this IS the
+    // federation callback.
     let remediation = step_up::decide_remediation(
         ctx.state,
         ctx.scope,
         ctx.subject,
-        &remediation_requirement,
-        true,
+        &requirement,
+        acr_unmet,
         age_lapsed,
+        true,
     )
     .await;
+
+    // The cutover moment: an overlay has just forced a real local factor on an account that
+    // federated in. Marked best effort, because the subject is already authenticated.
+    if remediation_is_a_local_ceremony(remediation) {
+        mark_local_cutover(&ctx).await;
+    }
 
     let response = match remediation {
         // A second factor against the LIVE federated session (an enrolled TOTP).
@@ -325,6 +331,26 @@ pub(crate) async fn enforce_on_callback(ctx: CallbackContext<'_>) -> CallbackOve
         // with no passkey and no enrollable factor): FAIL CLOSED with NO session cookies, so
         // the brokered login does not resume at a weaker context.
         step_up::Remediation::Fail => {
+            // Still fail CLOSED with no cookies. What changes (issue #286) is that the
+            // operator can now tell this apart from a store fault: the response is the same
+            // uniform page, so nothing leaks to the user, but the log names the cause.
+            //
+            // The common cause is a DEPLOYMENT one rather than a policy contradiction: the
+            // overlay reaches an `mfa`-level floor and this deployment mounts NO factor that
+            // can satisfy it, so every member of the org is locked out on their first login.
+            // Config validation cannot catch that pairing, because the overlay is a
+            // per-tenant database document and the factor switches are per-deployment
+            // configuration, and neither validator may read the other.
+            tracing::error!(
+                org_connection = %ocn_id,
+                subject = %ctx.subject,
+                totp_enabled = ctx.state.totp_enabled(),
+                webauthn_enabled = ctx.state.webauthn_enabled(),
+                "broker overlay requires a local factor this subject and deployment cannot \
+                 satisfy; the federated login is refused with no session. Check that the \
+                 org connection's overlay floor is reachable and that this deployment \
+                 mounts TOTP or WebAuthn"
+            );
             return CallbackOverlay::Respond(interaction::server_error_page());
         }
     };
@@ -332,6 +358,54 @@ pub(crate) async fn enforce_on_callback(ctx: CallbackContext<'_>) -> CallbackOve
     // Carry the federated session cookies onto the ceremony redirect so the ceremony runs
     // against this session and, on completion, records the honest combined factors.
     CallbackOverlay::Respond(interaction::attach_session_cookies(response, ctx.cookies))
+}
+
+/// Whether this remediation is a REAL local ceremony, which is the broker-then-migrate
+/// cutover moment (issue #286).
+///
+/// `Fail` is excluded because nothing was forced: the login was refused outright.
+fn remediation_is_a_local_ceremony(remediation: step_up::Remediation) -> bool {
+    matches!(
+        remediation,
+        step_up::Remediation::SecondFactor
+            | step_up::Remediation::Enroll
+            | step_up::Remediation::PasskeyReauth
+            | step_up::Remediation::FullReauth
+    )
+}
+
+/// Mark a brokered account for local-credential cutover (issue #286).
+///
+/// This is the cutover signal the #56 lazy-migration hook cannot express: `attempt()` wants a
+/// plaintext credential a brokered login never possesses, and `record_migrated()` is a
+/// process-global counter meaning "created locally by a verified first login", which a step-up
+/// is not.
+///
+/// BEST EFFORT by design. The subject is already authenticated when this runs, so a stamp
+/// failure must never turn a successful federated login into an error. The mark is
+/// write-and-report only, so losing one costs a progress count and nothing else, the same
+/// posture the upstream token capture takes.
+async fn mark_local_cutover(ctx: &CallbackContext<'_>) {
+    let actor = interaction::user_actor(ctx.subject);
+    let correlation = ironauth_store::CorrelationId::generate(ctx.state.env());
+    // The callback instant already threaded into this context; recomputing the clock here
+    // would stamp a DIFFERENT instant than the one this callback is reasoning about.
+    if let Err(error) = ctx
+        .state
+        .store()
+        .scoped(ctx.scope)
+        .acting(actor, correlation)
+        .users()
+        .set_local_cutover_mark(ctx.state.env(), ctx.subject, Some(ctx.now_micros))
+        .await
+    {
+        tracing::warn!(
+            %error,
+            subject = %ctx.subject,
+            "could not mark the brokered account for local-credential cutover; the login \
+             continues and only the migration progress count is affected"
+        );
+    }
 }
 
 #[cfg(test)]

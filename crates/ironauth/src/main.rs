@@ -23,7 +23,8 @@ use ironauth_oidc::{
     BackChannelLogoutConsumer, CredentialClass, DiscoveryCapabilities, DiscoveryState,
     FederationKeyResolver, FederationRuntime, FetchLogoutSender, IssuerRegistry, IssuerState,
     JwksCacheWindow, OidcState, SessionEndedExplodeConsumer, canonical_login_identifier,
-    canonical_step_up_acr, discovery_router, issuer_router, oidc_router,
+    canonical_step_up_acr, discovery_router, is_known_step_up_acr, issuer_router,
+    known_step_up_acrs, oidc_router,
 };
 use ironauth_quota::QuotaEnforcer;
 use ironauth_server::{Server, ServerError};
@@ -2263,6 +2264,15 @@ fn parse_step_up_policy_args(
                 let secs = value
                     .parse::<i64>()
                     .map_err(|_| "--max-age expects a whole number of seconds".to_owned())?;
+                // A negative bound is silently dropped by the unsigned conversion at the
+                // enforcement read, so the CLI would report success while storing a floor
+                // that never gates anything: fail OPEN on a nonsense value (issue #286).
+                // Zero is VALID and means always reauthenticate.
+                if secs < 0 {
+                    return Err("--max-age must be zero or greater (0 means always \
+                                reauthenticate)"
+                        .to_owned());
+                }
                 parsed.max_age = Some(secs);
             }
             other => return Err(format!("unrecognized argument '{other}'")),
@@ -2368,6 +2378,21 @@ async fn set_step_up_policy(
 ) -> ExitCode {
     // A short acr alias (mfa/pwd/phr/phrh) is canonicalized to the value the enforcement
     // path compares against, so `--acr mfa` actually gates.
+    // An unrecognized acr becomes an UNRANKED floor, which the enforcement path can only
+    // ever match exactly, so the ceremony it gates is unsatisfiable and the operator has
+    // locked the client out rather than tightened it (issue #286). Refuse it here, at the
+    // one write path, rather than by a database CHECK: this column has held operator-set
+    // values since #72 and a CHECK would fail the migration on boot for a deployment that
+    // already carries one.
+    if let Some(value) = parsed.acr.as_deref() {
+        if !is_known_step_up_acr(value) {
+            eprintln!(
+                "ironauth step-up-policy set: unknown --acr '{value}'; expected one of {}",
+                known_step_up_acrs().join(", ")
+            );
+            return ExitCode::FAILURE;
+        }
+    }
     let acr = parsed.acr.as_deref().map(canonical_step_up_acr);
     let acr_ref = acr.as_deref();
     let max_age = parsed.max_age;

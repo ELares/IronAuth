@@ -126,7 +126,16 @@ pub(super) async fn plan_after_primary(
         min_acr: Some(authn::acr_for_mfa().to_owned()),
         max_auth_age_secs: None,
     };
-    match crate::step_up::decide_remediation(state, scope, subject, &requirement, true, false).await
+    match crate::step_up::decide_remediation(
+        state,
+        scope,
+        subject,
+        &requirement,
+        true,
+        false,
+        false,
+    )
+    .await
     {
         crate::step_up::Remediation::SecondFactor => MfaPlan::Challenge,
         // Enrollment is offered only where the flow can actually drive it (TOTP). A tenant

@@ -272,7 +272,10 @@ pub use state::{
     OidcState, PASSWORD_BREACHED_AT_LOGIN_TOTAL, PASSWORD_SCREEN_TOTAL, ResourceTargetError,
     describe_screening_metrics,
 };
-pub use step_up::{canonical_step_up_acr, privilege_is_fresh, required_credential_class};
+pub use step_up::{
+    canonical_step_up_acr, is_known_step_up_acr, known_step_up_acrs, privilege_is_fresh,
+    required_credential_class,
+};
 pub use subject::{
     MAX_SUBJECT_LEN, PairwiseSalt, SubjectCache, SubjectConfig, SubjectType, resolve_subject,
     subject_within_cap,
