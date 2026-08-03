@@ -185,6 +185,8 @@ jobs:
         run: scripts/hashing-pool-boundary.sh
       - name: http audit (no outbound HTTP client outside the fetch dispatcher)
         run: scripts/http-audit.sh
+      - name: jose audit (no second JOSE verification path outside ironauth-jose)
+        run: scripts/jose-audit.sh
       - name: no M2M metering (no metering/billing/quota hook on the client-credentials path)
         run: scripts/no-m2m-metering.sh
       - name: dash scan
@@ -241,6 +243,10 @@ jobs:
         run: |
           scripts/flow-schema.sh
           git diff --exit-code docs/flow-schema.json docs/flow-messages.json
+      - name: journey schema freshness (published journey artifact contract)
+        run: |
+          scripts/journey-schema.sh
+          git diff --exit-code docs/journey-schema.json
       - name: reference app bindings freshness (generated from the published contract)
         # The reference app's TypeScript types, its schema derived validation
         # constants, and its numeric id to copy map are GENERATED from
