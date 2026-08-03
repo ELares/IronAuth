@@ -399,6 +399,14 @@ async fn every_identity_column_is_exported_or_a_documented_non_exported_field() 
                 // identity and is not re-linked at import, so it is not carried across,
                 // exactly like the WebAuthn handle above.
                 "org_connection_id",
+                // The broker-then-migrate cutover mark (issue #286) is instance-local
+                // CEREMONY state: it records that a broker overlay on THIS instance forced a
+                // real local factor for this account, which is a fact about a ceremony this
+                // deployment ran, not about the subject. It self-heals exactly like the
+                // org binding above, because a returning brokered login on the destination
+                // re-evaluates the imported overlay and re-marks if that overlay still forces
+                // a factor. Carrying it would assert a cutover the destination never ran.
+                "local_cutover_marked_at",
                 // The signup-quarantine flag (issue #82, PR 2) is instance-local RISK state,
                 // not portable identity: it is an orthogonal restriction a risky signup was
                 // parked under on THIS instance, tracked by the runtime signup_quarantines

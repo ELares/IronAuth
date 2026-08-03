@@ -1687,9 +1687,26 @@ async fn evaluate_step_up(
     //    contribution), and otherwise a real second factor must be challenged. A UV
     //    passkey and a real TOTP/recovery code already `performed_second_factor`, so they
     //    satisfy the baseline with NO extra prompt (the conditional-credential skip).
+    // Whether this session can refresh its `auth_time` by re-entering a password (issue
+    // #286). A brokered account was JIT-provisioned with NO password hash, so a
+    // `FullReauth` to `/login` is unsatisfiable for it. Computed NARROWLY: a session that
+    // federated AND has since performed a genuine second factor can complete a local
+    // ceremony, so it is not treated as federated here. Computing this loosely would route
+    // a LOCAL subject with a lapsed client policy to a factor challenge they may not have,
+    // converting a working re-login into a lockout.
+    let session_is_federated = methods.contains(&authn::AuthMethod::Federated)
+        && !authn::performed_second_factor(&methods);
     let remediation = if let Some((acr_unmet, age_lapsed)) = explicit_step_up {
-        step_up::decide_remediation(state, scope, &subject, &requirement, acr_unmet, age_lapsed)
-            .await
+        step_up::decide_remediation(
+            state,
+            scope,
+            &subject,
+            &requirement,
+            acr_unmet,
+            age_lapsed,
+            session_is_federated,
+        )
+        .await
     } else if mfa_baseline_required && !authn::performed_second_factor(&methods) {
         // The tenant baseline MFA floor is unmet by a genuine factor. A valid remembered
         // device satisfies it: consume the device (sliding its idle window), UPGRADE the
@@ -1716,7 +1733,8 @@ async fn evaluate_step_up(
             min_acr: Some(authn::acr_for_mfa().to_owned()),
             max_auth_age_secs: None,
         };
-        step_up::decide_remediation(state, scope, &subject, &mfa_requirement, true, false).await
+        step_up::decide_remediation(state, scope, &subject, &mfa_requirement, true, false, false)
+            .await
     } else {
         // Every applicable requirement is satisfied by the login as it stands.
         return StepUpOutcome::Satisfied {

@@ -48,6 +48,33 @@ pub fn default_acr_order() -> Vec<String> {
         .collect()
 }
 
+/// The acr values a step-up floor may name, canonical form, for an operator-facing error.
+///
+/// Derived from the live registry, so it cannot drift from what
+/// [`is_known_step_up_acr`] accepts.
+#[must_use]
+pub fn known_step_up_acrs() -> Vec<&'static str> {
+    authn::acr_values_supported()
+}
+
+/// Whether `value` names a rung of the acr ladder, canonical or short alias (issue #286).
+///
+/// A value that is neither becomes an UNRANKED floor, and an unranked floor is satisfiable
+/// only by an exact string match, so the enforcement path can never reach it and the
+/// ceremony it gates is unsatisfiable. That fails CLOSED, so it locks an operator out
+/// rather than letting anyone in, which is why this is a write-path guard and not a
+/// security fix.
+///
+/// The canonical set is derived from the live acr registry rather than restated, so a rung
+/// added or renamed there cannot leave this behind. `acr_values_supported` deliberately
+/// omits the federated acr, so a federated value is correctly refused as a step-up floor.
+#[must_use]
+pub fn is_known_step_up_acr(value: &str) -> bool {
+    authn::acr_values_supported()
+        .iter()
+        .any(|acr| *acr == value || acr.rsplit(':').next() == Some(value))
+}
+
 /// Canonicalize an operator-supplied `acr` alias to the value the enforcement path
 /// compares against (issue #72). A short alias (`pwd`, `mfa`, `phr`, `phrh`) maps to the
 /// server's canonical `acr` for that level (for example `mfa` -> `urn:ironauth:acr:mfa`),
@@ -483,6 +510,7 @@ pub(crate) async fn decide_remediation(
     requirement: &AuthnRequirement,
     acr_unmet: bool,
     age_lapsed: bool,
+    session_is_federated: bool,
 ) -> Remediation {
     let order = state.acr_order();
     let floor = requirement.min_acr.as_deref();
@@ -543,7 +571,48 @@ pub(crate) async fn decide_remediation(
     // Only the age window lapsed (the acr is met but the authentication is stale):
     // a full re-authentication refreshes auth_time honestly and terminates (the acr
     // already satisfies the floor, so a plain re-login is enough).
-    let _ = age_lapsed;
+    // The floor is MET and only the authentication AGE has lapsed. A local subject can
+    // refresh `auth_time` by re-entering a password, so `FullReauth` terminates for them.
+    //
+    // A FEDERATED subject cannot (issue #286). `FullReauth` routes to `/login`, which is a
+    // password re-entry a brokered account has no way to satisfy: it was JIT-provisioned
+    // with no password hash at all. The request-parameter loop-breaker cannot rescue it
+    // either, because that consumes `params.max_age` and EVERY age bound reaching here from
+    // a client policy, a scope policy or a broker overlay is DATABASE-sourced and invisible
+    // to it, so the resumed `/authorize` re-evaluates the identical bound.
+    //
+    // Synthesize an `mfa` floor and re-decide: a fresh second factor mints a new
+    // `auth_time` and TERMINATES. This is the behaviour the federation callback already
+    // implemented for its own overlay; moving it here gives the SAME answer to the
+    // authorize gate, and therefore to the client and scope policies the callback never
+    // covered.
+    //
+    // `!acr_unmet` is BELT AND BRACES, not the thing that prevents a downgrade, and this
+    // says so because the difference matters to anyone editing above. The `if acr_unmet`
+    // block earlier returns on EVERY path, so control only reaches here with the floor
+    // already SATISFIED and `acr_unmet` already false. Measured: dropping this condition
+    // changes no observable behaviour today, because a `phr` overlay never arrives here.
+    //
+    // It is retained so that a future fall-through added to that block cannot silently start
+    // substituting an `mfa` floor for a phishing-resistant one, which would satisfy a passkey
+    // policy with a TOTP code. What actually protects that property today is the early
+    // return, and a test asserting otherwise would be asserting the wrong thing.
+    if age_lapsed && !acr_unmet && session_is_federated {
+        let synthesized = AuthnRequirement {
+            min_acr: Some(authn::acr_for_mfa().to_owned()),
+            max_auth_age_secs: None,
+        };
+        return Box::pin(decide_remediation(
+            state,
+            scope,
+            subject,
+            &synthesized,
+            true,
+            age_lapsed,
+            session_is_federated,
+        ))
+        .await;
+    }
     Remediation::FullReauth
 }
 

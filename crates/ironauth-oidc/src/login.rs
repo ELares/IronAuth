@@ -168,10 +168,20 @@ pub async fn mfa_challenge_get(
         return interaction::login_redirect(&resume.return_to);
     }
     let banner = state.environment_banner(&resume.scope).await;
+    // The enrollment prompt offers exactly ONE link, and it is the TOTP enrollment page.
+    // Every TOTP endpoint answers a uniform 404 when `oidc.totp_enabled` is off, so on a
+    // deployment that mounts WebAuthn alone this page used to present a single link that
+    // 404s, with no passkey affordance beside it: a dead end reached by a remediation that
+    // is not a `Fail` and is therefore invisible to any audit that looks for one
+    // (issue #286).
+    //
+    // Offer the link only where the page it points at exists. With TOTP off the page still
+    // renders and still explains what is required, it simply stops pointing at a 404.
     let enroll_url = query
         .enroll
         .as_deref()
         .filter(|value| *value == "1")
+        .filter(|_| state.totp_enabled())
         .map(|_| {
             format!(
                 "/t/{}/e/{}/account/mfa/totp/enroll",

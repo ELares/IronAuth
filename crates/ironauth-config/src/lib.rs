@@ -4370,6 +4370,16 @@ pub enum Warning {
     /// an operator who genuinely wants the two toggles independent is never blocked; it just
     /// surfaces that the intended cutover will NOT take effect until the flow engine is also on.
     HostedPagesEnabledWithoutFlows,
+    /// OIDC is on but this deployment mounts NO second factor: both `oidc.totp_enabled`
+    /// and `oidc.webauthn_enabled` are off (issue #286). Any step-up floor at `mfa` level or
+    /// above is then unsatisfiable by every subject, and a broker overlay that reaches such a
+    /// floor refuses the login with no session, which is a permanent lockout for that org.
+    ///
+    /// Advisory rather than a boot error, deliberately. A password-only deployment is a
+    /// legitimate posture, both switches default ON so reaching this took two explicit opt
+    /// outs, and the thing that makes it harmful is a per-tenant DATABASE document (an org
+    /// connection's overlay) that configuration validation may never read.
+    NoSecondFactorMounted,
     /// `oidc.id_token_ttl_secs` is LONGER than `oidc.access_token_ttl_secs` (issue
     /// #192). The two used to be one number, and the ID token's default is now a flat
     /// 300 rather than an inheritance, so a deployment that lowered the access TTL as
@@ -4414,6 +4424,14 @@ impl fmt::Display for Warning {
                  browser silently ignores origins past its cap, so some listed origins may never \
                  work (this is an advisory approximation by SLD label; the browser enforces the \
                  real limit)"
+            ),
+            Warning::NoSecondFactorMounted => write!(
+                f,
+                "oidc.enabled is on but both oidc.totp_enabled and oidc.webauthn_enabled are \
+                 off, so no subject can satisfy a step-up floor at mfa level or above. A \
+                 per-client, per-scope or broker-overlay floor that reaches mfa will refuse \
+                 every affected login with no session and no way to enroll. Mount TOTP or \
+                 WebAuthn, or make sure no policy sets such a floor"
             ),
             Warning::HostedPagesEnabledWithoutFlows => write!(
                 f,
@@ -4518,6 +4536,13 @@ impl Config {
         // not left believing the flow pages are live when the bootstrap pages still serve.
         if self.hosted_pages.enabled && !self.flows.enabled {
             warnings.push(Warning::HostedPagesEnabledWithoutFlows);
+        }
+        // A deployment with OIDC on and NO factor mounted cannot satisfy any mfa-level
+        // step-up floor (issue #286). Surfaced rather than refused: the posture is
+        // legitimate on its own, and what makes it a lockout is an org-connection overlay
+        // that lives in the database, which this validator may never read.
+        if self.oidc.enabled && !self.oidc.totp_enabled && !self.oidc.webauthn_enabled {
+            warnings.push(Warning::NoSecondFactorMounted);
         }
         // The ID token's lifetime is its own setting now (issue #192) with a FLAT
         // default of 300, so the coupling can no longer hide a change in either

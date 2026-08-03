@@ -1506,6 +1506,64 @@ async fn a_max_age_overlay_forces_reauth_when_the_federated_auth_time_is_stale()
     );
 }
 
+/// A phishing-resistant overlay with a LAPSED age still routes to the passkey ceremony, never
+/// to the TOTP prompt (issue #286).
+///
+/// The shared-decider refactor moved the pure-age `mfa` synthesis out of the federation
+/// callback and into `decide_remediation`, so this pins that an overlay whose acr floor is
+/// UNMET is untouched by it: a phishing-resistant policy must never be remediated by a TOTP
+/// prompt.
+///
+/// Honest about what this does and does not prove. It does NOT discriminate the terminal's
+/// `!acr_unmet` condition: the `if acr_unmet` block returns on every path, so a `phr` overlay
+/// never reaches the terminal and removing that condition leaves this test green (measured by
+/// mutation). What this pins is the end-to-end property that matters, that an unreachable
+/// phishing-resistant floor still fails closed rather than being downgraded, and it would
+/// catch any future change that let an unmet acr fall through to the age synthesis.
+#[tokio::test]
+async fn a_passkey_overlay_with_a_lapsed_age_still_demands_a_passkey_not_a_totp_code() {
+    let harness = Harness::start().await;
+    // Both an acr floor the federated context cannot reach AND a lapsed age window.
+    let ocn_id = seed_binding_with_overlay(&harness, "acme", Some("phr"), Some(1), None).await;
+    seed_rule(&harness, RoutingSelector::Domain(ROUTED_DOMAIN), &ocn_id).await;
+    let upstream = start_upstream().await;
+    let runtime = build_runtime(upstream.addr);
+    let return_to = full_authorize_return_to(&harness);
+
+    harness.clock().advance(Duration::from_secs(3_600));
+
+    let callback = brokered_login(
+        &harness,
+        &runtime,
+        &upstream,
+        "dana@acme.example",
+        "acme-sub-phr-age",
+        &return_to,
+        Some(0),
+    )
+    .await;
+    // The subject holds no passkey, so the phishing-resistant floor is unreachable and the
+    // login FAILS CLOSED with no session. That is the shipped behaviour and it is the point:
+    // a TOTP enrollment can never yield `phr`, so offering one would be a dead end.
+    //
+    // The discriminator this test exists for is the alternative. Had the pure-age synthesis
+    // been guarded on the lapse ALONE, the real `phr` requirement would have been replaced
+    // by `mfa`, TOTP would have become an acceptable remedy, and the callback would have
+    // answered 303 to /login/mfa instead. A phishing-resistant policy satisfied by a TOTP
+    // code is a silent downgrade, so the redirect is the failure and the refusal is correct.
+    assert_ne!(
+        callback.status(),
+        StatusCode::SEE_OTHER,
+        "a phishing-resistant floor was remediated by a redirect; if that redirect is \
+         /login/mfa then an mfa floor was substituted for phr and the policy was downgraded"
+    );
+    assert_eq!(
+        callback.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "an unreachable phishing-resistant floor fails closed with no session"
+    );
+}
+
 // ---- Broker overlay over an OAuth 2.0 (GitHub) backed org connection (issue #77 PR 2) ----
 //
 // The routing machinery and the shared finalize path are protocol-agnostic: an org connection

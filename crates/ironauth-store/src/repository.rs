@@ -14832,6 +14832,42 @@ impl UserRepo<'_> {
         Ok(stored.and_then(|value| OrgConnectionId::parse_in_scope(&value, &self.scope).ok()))
     }
 
+    /// Whether this account has been marked for local-credential cutover, and when, as
+    /// UNIX MICROSECONDS (the store's uniform time representation; the sqlx build carries no
+    /// `time` feature, so every timestamptz is read as an integer)
+    /// (issue #286). A brokered account is marked at the moment a broker overlay forces a
+    /// real local factor, which is the cutover moment the #56 lazy-migration hook cannot
+    /// express: that hook needs a plaintext credential a brokered login never possesses.
+    ///
+    /// The mark is WRITE-AND-REPORT ONLY in this change. Nothing gates a login on it; the
+    /// only reader is the migration progress count. Gating on it would need its own change
+    /// and its own tests, because a clear condition that misses a path (a passkey ceremony,
+    /// say, or the flow engine's own factor route) would leave an account marked forever and
+    /// steer a user into an enrollment they already completed.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] when the id is out of scope or names no live user.
+    pub async fn local_cutover_mark(&self, id: &UserId) -> Result<Option<i64>, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT (EXTRACT(EPOCH FROM local_cutover_marked_at) * 1000000)::bigint \
+             AS marked_us FROM users \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND deleted_at IS NULL",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        Ok(row.get("marked_us"))
+    }
+
     /// One page of live users matching `filter`, ordered by `(created_at, id)`,
     /// starting strictly after `after` (issue #52). The filter searches by
     /// lifecycle state, by external id, and by login handle within this scope; the
@@ -15660,6 +15696,69 @@ impl ActingUserRepo<'_> {
                 .bind(scope.tenant().to_string())
                 .bind(scope.environment().to_string())
                 .bind(&org_connection)
+                .bind(updated_micros)
+                .execute(&mut **tx)
+                .await?
+                .rows_affected();
+                if affected == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Mark this account for local-credential cutover, or clear the mark, at the moment a
+    /// broker overlay forces a real local factor (issue #286).
+    ///
+    /// `at_micros` of `None` CLEARS the mark. Both directions are audited as a
+    /// [`Action::UserUpdate`] in the SAME transaction as the update, exactly as
+    /// [`Self::set_org_connection`] is, so the mark can never move without a row saying who
+    /// moved it. Idempotent: setting a mark that is already set, or clearing one that is
+    /// already clear, writes the value again and audits it rather than failing.
+    ///
+    /// The mark is WRITE-AND-REPORT ONLY. Nothing gates a login on it; see
+    /// [`UserRepo::local_cutover_mark`] for why gating needs its own change.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] when the id is out of scope or names no live user.
+    pub async fn set_local_cutover_mark(
+        &self,
+        env: &Env,
+        id: &UserId,
+        at_micros: Option<i64>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let id = *id;
+        let scope = self.scope;
+        let updated_micros = epoch_micros(env.clock().now_utc());
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::UserUpdate,
+                target: &id,
+            },
+            async move |tx| {
+                let affected = sqlx::query(
+                    "UPDATE users SET local_cutover_marked_at = CASE WHEN $4::bigint IS NULL \
+                     THEN NULL ELSE TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+                     END, \
+                     updated_at = TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval \
+                     WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
+                       AND deleted_at IS NULL",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(at_micros)
                 .bind(updated_micros)
                 .execute(&mut **tx)
                 .await?
