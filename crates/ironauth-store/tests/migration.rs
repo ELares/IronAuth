@@ -8,8 +8,11 @@
 //! real schema), and the production chain is separately asserted to contain
 //! only its two migrations and leave no demo object behind.
 
+use std::time::Duration;
+
+use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
-use ironauth_store::{Migration, MigrationError, MigrationRunner, Phase};
+use ironauth_store::{Migration, MigrationError, MigrationRunner, NewOutboxMessage, Phase};
 use sqlx::Row;
 
 /// What every shipped migration is ABOUT, in chain order, comma separated.
@@ -47,7 +50,7 @@ const CHAIN_SUBJECTS: &str = "isolation, audit log, \
      permission claims, token size event budget columns, client allowed scopes, \
      email-factor downgrade configuration, control-plane dead-surface grants, generic \
      transactional outbox, control-plane writes on environment secrets, \
-     control-plane writes on the migration-run ledger.";
+     control-plane writes on the migration-run ledger, outbox retention.";
 
 /// A throwaway migration with the given version, phase, and SQL text.
 fn step(version: i64, phase: Phase, sql: &'static str) -> Migration {
@@ -653,7 +656,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
     );
     assert_eq!(
         report.already_applied(),
-        101,
+        102,
         "a migration was added to or removed from the production chain; this count is a \
          deliberate checkpoint, not a bug, so read the new migration, satisfy yourself that it \
          belongs in the shipped chain, then update this number and CHAIN_SUBJECTS and the \
@@ -689,7 +692,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
             46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67,
             68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89,
-            90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101
+            90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102
         ]
     );
     let phase_of = |version: i64| async move {
@@ -7460,7 +7463,10 @@ async fn outbox_messages_holds_its_lifecycle_only_grants_on_both_planes() {
     );
     assert!(
         !role_has_table_privilege(pool, "ironauth_app", "outbox_messages", "DELETE").await,
-        "a drain retires a message by marking it terminal, never by deleting it"
+        "a drain retires a message by marking it terminal, never by deleting it. This must \
+         hold AFTER 0102 as well as before it: the data plane is the role that writes \
+         dead_lettered_at, so DELETE here would let ONE role give up on a message and then \
+         erase the record of having given up"
     );
 
     // The control plane can enqueue (its own domain writes must be able to emit a message
@@ -7475,12 +7481,265 @@ async fn outbox_messages_holds_its_lifecycle_only_grants_on_both_planes() {
     }
     assert!(
         !role_has_any_column_privilege(pool, "ironauth_control", "outbox_messages", "UPDATE").await,
-        "the control plane does not drain, so it holds no UPDATE on outbox_messages"
+        "the control plane does not drain, so it holds no UPDATE on outbox_messages: this \
+         is what makes it safe for it to hold DELETE, because a role that can retire a row \
+         can never have been the role that marked it terminal"
     );
+    // DELETE is the ONE grant this shape gained after 0099, in 0102, and it went to the
+    // control plane alone. Its POSITIVE half is asserted in
+    // `outbox_retention_delete_is_the_control_planes_alone_and_is_bound_by_scope` below,
+    // which also measures what bounds it. Nothing about it is repeated here: the assertion
+    // that the data plane still holds no DELETE is the one already made above, beside the
+    // rest of that role's shape, and a second copy of it here would look like new coverage
+    // while guarding a predicate that is already guarded.
+}
+
+/// Migration 0102's retention grant on the generic outbox (issue #104, PR 3): the one
+/// capability the table gained after 0099, and the three things that bound it.
+///
+/// 0099 said "no role is granted DELETE, and there is no reaper", and PR 2 multiplied the
+/// table's growth by roughly `1 + N_relying_parties` per session end.
+///
+/// This asserts the grant landed AND that it is bounded in the two ways the migration
+/// header claims, both of which are properties of the database rather than of the
+/// repository: row-level security confines an in-scope delete to its own scope, and an
+/// UNSCOPED delete matches zero rows rather than every row. The second is the one worth
+/// measuring, because the intuitive guess about an unscoped statement under FORCE
+/// row-level security is that it deletes everything.
+///
+/// The unscoped case here runs on a connection that has ALSO been used for scoped work, so
+/// it exercises the version of it that a pooled connection actually reaches. That
+/// distinction is not cosmetic: `current_setting('ironauth.tenant_id', true)` is NULL only
+/// on a connection that has never bound a scope, and reads as the EMPTY STRING once a
+/// transaction-local binding has committed on it. Both match no row, but for different
+/// reasons: NULL because a comparison with NULL is not true, and the empty string because
+/// the `outbox_messages_scope_nonempty` CHECK forbids the only row that could match it.
+#[tokio::test]
+async fn outbox_retention_delete_is_the_control_planes_alone_and_is_bound_by_scope() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let other = db.seed_scope(&env).await;
+    assert_ne!(
+        scope, other,
+        "the isolation half of this test needs two distinct scopes"
+    );
+
     assert!(
-        !role_has_table_privilege(pool, "ironauth_control", "outbox_messages", "DELETE").await,
-        "the control plane cannot delete a queued message"
+        role_has_table_privilege(
+            db.owner_pool(),
+            "ironauth_control",
+            "outbox_messages",
+            "DELETE"
+        )
+        .await,
+        "0102 must grant the control plane DELETE on outbox_messages: without it nothing \
+         in the system can remove a retired message and the table grows forever"
     );
+
+    // A COMPLETED message in each scope, enqueued and retired through the real repository
+    // as the data plane, so the rows under test are rows the production path wrote.
+    for target in [scope, other] {
+        seed_retired_outbox_message(&db, &env, target).await;
+    }
+
+    // ONE connection for all three control-plane steps, taken out of the pool explicitly.
+    // The point of (3) is what the SAME connection does after a scoped transaction has run
+    // on it, and a pool is free to hand back a different connection each time.
+    let control = db.control_pool();
+    let mut conn = control
+        .acquire()
+        .await
+        .expect("take one control connection");
+    let who: String = sqlx::query("SELECT current_user AS u")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("identify session role")
+        .get("u");
+    assert_eq!(
+        who, "ironauth_control",
+        "the delete under test must run as the low-privilege control role"
+    );
+
+    // (1) An UNSCOPED delete on a VIRGIN connection, exactly as a reaper that forgot to
+    // bind its scope would issue it. Zero rows, not two.
+    assert_eq!(
+        bound_tenant(&mut conn).await,
+        None,
+        "a connection that has never bound a scope reports NULL, which is the case the \
+         NULL-comparison argument covers"
+    );
+    assert_eq!(
+        unscoped_retention_delete(&mut conn).await,
+        0,
+        "a DELETE with no scope bound must affect ZERO rows: the policy's USING compares \
+         each row against current_setting(...), which is NULL here"
+    );
+
+    // (2) The SAME delete inside a scoped transaction removes that scope's row and only
+    // that scope's row.
+    {
+        let mut tx = sqlx::Connection::begin(&mut *conn)
+            .await
+            .expect("begin scoped delete");
+        bind_scope(
+            &mut tx,
+            &scope.tenant().to_string(),
+            &scope.environment().to_string(),
+        )
+        .await;
+        let removed = sqlx::query("DELETE FROM outbox_messages WHERE completed_at IS NOT NULL")
+            .execute(&mut *tx)
+            .await
+            .expect("the control role may delete a retired message in its own scope")
+            .rows_affected();
+        assert_eq!(removed, 1, "the in-scope completed row is removed");
+        tx.commit().await.expect("commit scoped delete");
+    }
+
+    // (3) The same unscoped delete AGAIN, on the same connection, now that a
+    // transaction-local binding has committed on it. This is the state a pooled connection
+    // is actually in, and the NULL argument no longer describes it: the setting reads as
+    // the EMPTY STRING. It must still remove nothing, and what refuses it now is the
+    // `outbox_messages_scope_nonempty` CHECK, because no row can carry an empty tenant.
+    assert_eq!(
+        bound_tenant(&mut conn).await.as_deref(),
+        Some(""),
+        "a transaction-local binding reverts to the EMPTY STRING rather than to NULL, which \
+         is why the fail-closed argument cannot rest on NULL alone"
+    );
+    assert_eq!(
+        unscoped_retention_delete(&mut conn).await,
+        0,
+        "an unscoped delete on a REUSED connection must still remove nothing: the CHECK \
+         forbids the only row an empty-string scope could match"
+    );
+    drop(conn);
+
+    assert_eq!(
+        db.store()
+            .scoped(other)
+            .outbox()
+            .list("retention_probe", 10)
+            .await
+            .expect("list the other scope")
+            .len(),
+        1,
+        "another scope's retired message is untouched: row-level security, not the \
+         statement's WHERE clause, is what confines the delete"
+    );
+}
+
+/// The other half of 0102's grant: the DATA plane is still refused DELETE outright, by
+/// GRANT, before any policy runs (issue #104, PR 3).
+///
+/// A separate test from the one above only because the combined body outran the
+/// readable-length lint; the two are one obligation. `ironauth_app` holds the column-scoped
+/// UPDATE that writes `dead_lettered_at`, so a data plane with DELETE could give up on a
+/// message and then erase the record of having given up, and 0102 must not have widened
+/// anything on that role.
+#[tokio::test]
+async fn outbox_retention_leaves_the_data_plane_refused_delete_by_grant() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    seed_retired_outbox_message(&db, &env, scope).await;
+
+    let mut tx = db.app_pool().begin().await.expect("begin app delete");
+    bind_scope(
+        &mut tx,
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+    )
+    .await;
+    let refused = sqlx::query("DELETE FROM outbox_messages WHERE completed_at IS NOT NULL")
+        .execute(&mut *tx)
+        .await;
+    assert!(
+        refused
+            .as_ref()
+            .err()
+            .and_then(sqlx::Error::as_database_error)
+            .and_then(sqlx::error::DatabaseError::code)
+            .is_some_and(|code| code == "42501"),
+        "the data plane must be refused DELETE as insufficient privilege, in the scope it \
+         legitimately holds every other grant on: {refused:?}"
+    );
+    let _ = tx.rollback().await;
+}
+
+/// What `current_setting('ironauth.tenant_id', true)` reads as on `conn` right now.
+///
+/// The three values it can take are the whole of the fail-closed argument: NULL on a
+/// connection that never bound a scope, the bound tenant inside a scoped transaction, and
+/// the EMPTY STRING on the same connection once that transaction has committed.
+async fn bound_tenant(conn: &mut sqlx::PgConnection) -> Option<String> {
+    sqlx::query("SELECT current_setting('ironauth.tenant_id', true) AS t")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("read the bound tenant setting")
+        .get("t")
+}
+
+/// Issue the reaper's DELETE with NO scope bound on `conn`, returning the rows removed.
+/// This is exactly what a reaper that forgot to bind its scope would send.
+async fn unscoped_retention_delete(conn: &mut sqlx::PgConnection) -> u64 {
+    sqlx::query("DELETE FROM outbox_messages WHERE completed_at IS NOT NULL")
+        .execute(&mut *conn)
+        .await
+        .expect("an unscoped delete is permitted by GRANT and matched by no policy row")
+        .rows_affected()
+}
+
+/// Enqueue one message in `scope` and retire it, through the real repository as the DATA
+/// plane, so what the retention test deletes is a row the production path wrote.
+async fn seed_retired_outbox_message(db: &TestDatabase, env: &Env, scope: ironauth_store::Scope) {
+    let store = db.store();
+    let scoped = store.scoped(scope);
+    let queue = scoped.outbox();
+    queue
+        .enqueue(
+            env,
+            &NewOutboxMessage {
+                consumer: "retention_probe",
+                idempotency_key: "fact",
+                ordering_key: "fact",
+                payload: serde_json::json!({}),
+            },
+        )
+        .await
+        .expect("enqueue");
+    let claimed = queue
+        .claim(env, "retention_probe", Duration::from_secs(60), 10)
+        .await
+        .expect("claim");
+    assert_eq!(claimed.len(), 1, "one message to retire");
+    assert!(
+        queue
+            .complete(env, &claimed[0])
+            .await
+            .expect("complete the message"),
+        "the lease is still ours, so the completion lands"
+    );
+}
+
+/// Bind the transaction-local row-level-security scope variables, exactly as the repository
+/// does. Mirrors the helper in `tests/append_only.rs`.
+async fn bind_scope(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant: &str,
+    environment: &str,
+) {
+    sqlx::query("SELECT set_config('ironauth.tenant_id', $1, true)")
+        .bind(tenant)
+        .execute(&mut **tx)
+        .await
+        .expect("bind tenant scope");
+    sqlx::query("SELECT set_config('ironauth.environment_id', $1, true)")
+        .bind(environment)
+        .execute(&mut **tx)
+        .await
+        .expect("bind environment scope");
 }
 
 /// Migration 0101's control-plane write grants on the migration-run ledger (issue #55).

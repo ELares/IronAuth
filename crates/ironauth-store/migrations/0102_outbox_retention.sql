@@ -1,0 +1,134 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+--
+-- Retention for the generic outbox (issue #104, PR 3).
+--
+-- 0099 shipped `outbox_messages` with NO retention and said so: "outbox_messages grows
+-- monotonically: completed and dead-lettered rows are never removed, no role is granted
+-- DELETE, and there is no reaper. That is deliberate for PR 1 ... Retention is carried in
+-- the #104 sequence." That sentence stands, is historically true, and is superseded here;
+-- 0099 is shipped and is not edited, including its comments.
+--
+-- PR 2 made the obligation urgent rather than theoretical. Ending a session now enqueues
+-- one `session_ended` message AND, once that message is handled, one
+-- `backchannel_logout` message per participating relying party, so the table grows by
+-- roughly `1 + N_relying_parties` rows per session end where it used to grow by one.
+--
+-- WHAT THIS MIGRATION DOES NOT FIX, said here so nobody reads the grant as more than it is.
+-- The reaper this grant enables keys on the TERMINAL columns, and the consumer pools are
+-- the only thing that ever writes one. `oidc.backchannel_logout_enabled` defaults OFF while
+-- the producer runs regardless, so in a default deployment NOTHING becomes terminal and the
+-- reaper removes zero rows forever. That is correct behaviour (an undrained message is
+-- undelivered work, see below) and it is not a solution to that deployment's growth: the
+-- answer there is on the producer side and is an owner decision, recorded in
+-- docs/design/RETENTION.md. What this DOES bound is the deployment where consumers run,
+-- which is exactly the `1 + N_relying_parties` volume PR 2 introduced, all of which becomes
+-- terminal and none of which anything removed before now.
+--
+-- ---------------------------------------------------------------------------
+-- WHY `ironauth_control` AND NOT `ironauth_app`
+--
+-- The reaper deletes as the CONTROL plane. That is a separation of duty, not a
+-- convenience, and it is the split `0002_audit_log.sql` already named for the audit log:
+-- "Retention and pruning are a later, explicit operation performed by a different,
+-- privileged path, never by the application role."
+--
+-- `ironauth_app` holds the COLUMN-scoped UPDATE that writes `dead_lettered_at` (0099).
+-- It is the role that gives up on a message. Granting it DELETE as well would let ONE
+-- role mark a message terminal and then erase the record of having marked it, and PR 2
+-- established that the dead-letter tail is how a lost logout is discovered at all: a
+-- dead-lettered `session_ended` message is an entire session's worth of relying parties
+-- that will never be notified, and nothing else in the system says so.
+--
+-- `ironauth_control` holds SELECT and INSERT on this table and no UPDATE of any shape
+-- (0099 withheld it deliberately: "It does not drain, so it gets no UPDATE"). So the
+-- role that can retire a row is structurally incapable of ever having been the role that
+-- marked it terminal. Erasing the evidence and creating it now require two roles.
+--
+-- ---------------------------------------------------------------------------
+-- WHY THE GRANT CANNOT BE NARROWER, AND WHAT ACTUALLY BOUNDS IT
+--
+-- Postgres has no row-scoped DELETE privilege and no column-scoped one (a column list is
+-- accepted for INSERT, UPDATE and REFERENCES only). `GRANT DELETE ON outbox_messages` is
+-- therefore the narrowest grant that expresses "may remove a row from this table", and
+-- the bounds on WHICH rows come from two other places, both of which already exist:
+--
+--   (a) ROW-LEVEL SECURITY. 0099 ENABLEs and FORCEs row-level security on this table and
+--       its `outbox_messages_tenant_isolation` policy carries no `TO` clause, so it
+--       applies to `ironauth_control` exactly as it applies to `ironauth_app`. A policy's
+--       `USING` expression is what decides which rows a DELETE may even see, so the
+--       delete is confined to the caller's bound `(tenant, environment)` by the database
+--       rather than by the statement's WHERE clause.
+--
+--       The failure mode this closes is an UNSCOPED delete, and the argument for why it
+--       affects zero rows rather than every row has to be made carefully, because the
+--       obvious version of it is wrong. MEASURED on Postgres 18.4 against this schema,
+--       as `ironauth_control`:
+--
+--         * on a connection that has never bound a scope, `current_setting('ironauth.
+--           tenant_id', true)` is NULL, `tenant_id = NULL` is NULL rather than true, and
+--           an unscoped `DELETE FROM outbox_messages WHERE completed_at IS NOT NULL`
+--           removes 0 rows;
+--         * after ONE transaction-local binding commits, the same setting on the same
+--           pooled connection reads as the EMPTY STRING, not NULL. The unscoped delete
+--           still removes 0 rows, but the NULL reasoning no longer applies to it. What
+--           refuses it is the `outbox_messages_scope_nonempty` CHECK 0099 added: no row
+--           can carry an empty `tenant_id`, so nothing matches `tenant_id = ''`;
+--         * a connection left carrying a SESSION-level binding (`set_config(..., false)`)
+--           DOES delete that scope's rows from an unscoped statement, removing 1 row in
+--           the probe. Nothing in this tree issues one: `begin_scoped` is the only path
+--           that binds, and it binds transaction-locally.
+--
+--       So the fail-closed property rests on TWO facts and not on one: `set_config(...,
+--       true)` is the only binding path in the repository, so a connection is either
+--       inside a scoped transaction or carries no session binding at all; and both values
+--       an unbound connection can report, NULL and the empty string, match no row, the
+--       first because comparison with NULL is not true and the second because the
+--       nonempty CHECK forbids the only row that could match.
+--
+--   (b) THE REPOSITORY PREDICATE. `OutboxRepo::reap_completed` and
+--       `OutboxRepo::reap_dead_lettered` key on `completed_at` and `dead_lettered_at`
+--       respectively, never on `enqueued_at`, and each takes a bounded subselect. A
+--       message that is neither completed nor dead-lettered is UNDELIVERED work however
+--       old it is, and deleting it would both discard a pending logout and, because the
+--       claim's head-of-group rule reads terminal state, unblock its ordering group so
+--       the survivors deliver out of order.
+--
+-- Neither bound is a substitute for the other: (a) is enforced by the database and
+-- survives a wrong statement, (b) is enforced by the repository and is what distinguishes
+-- a retired message from a pending one. The grant is the capability; these are its shape.
+--
+-- ---------------------------------------------------------------------------
+-- WHAT A DELETED ROW GIVES UP, AND THE SECOND THING IT IS
+--
+-- A completed row is delivery evidence, which is the reason the operator-facing window has
+-- a floor. It is also, and this is the part that is easy to miss, the queue's AT-MOST-ONCE
+-- LEDGER ENTRY: while it exists it occupies its slot in the
+-- UNIQUE (tenant_id, environment_id, consumer, idempotency_key) constraint 0099 created,
+-- which is the constraint a producer's re-enqueue conflicts with. Deleting the row FREES
+-- that key.
+--
+-- MEASURED: once a completed row is reaped, `OutboxRepo::enqueue_all` under the same key
+-- inserts a row again and that row is CLAIMABLE, so the work becomes deliverable a second
+-- time. The one production caller of `enqueue_all` (the back-channel logout fan-out) rests
+-- its idempotence argument on this index, and its downstream defence does not cover the
+-- case either: a re-explode mints a FRESH `jti`, so the relying party sees a new token
+-- rather than a replay it can dedup.
+--
+-- It is not reachable with today's consumers, because a producer can only re-enqueue under
+-- a key while its OWN driving message is still non-terminal, and that horizon is bounded by
+-- `outbox.max_attempts` claims separated by the retry backoff or a lapsed lease: minutes at
+-- the shipped defaults, against a one hour floor and a seven day default window. So this is
+-- a LATENT contract change rather than a live duplicate, and it is written down here rather
+-- than left for the deployment that first raises `max_attempts` to discover. The floor on
+-- `outbox.completed_retention_secs` is documented as
+--   max(evidence window, longest producer re-enqueue horizon)
+-- rather than as the evidence window alone, and `docs/design/RETENTION.md` carries the
+-- operator obligation that raising the retry knobs raises the second term.
+--
+-- ---------------------------------------------------------------------------
+-- Migration safety obligation (see migrate.rs): this migration creates no object, adds no
+-- column, and changes no data. It is one additive GRANT, so it is an EXPAND and a binary
+-- that predates it simply never issues the statement it permits. Nothing is granted to
+-- `ironauth_app`, so no existing role gains a capability it did not already exercise.
+
+GRANT DELETE ON outbox_messages TO ironauth_control;

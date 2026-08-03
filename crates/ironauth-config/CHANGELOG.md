@@ -6,6 +6,47 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **Five `[outbox]` retention knobs, two of which read the OPPOSITE way to
+  `diagnostics.retention_secs` (issue #104, PR 3).** `outbox_messages` had no retention at
+  all, so these are the settings of the reaper that gives it one.
+
+  - `outbox.reap_enabled` (default `true`) is the only switch in THIS section the sweeper
+    answers to, and it is not gated on `oidc.backchannel_logout_enabled`, because that
+    switch gates ONE consumer of a generic queue and the next consumer will run behind a
+    different one. Two other things stop a sweeper and neither is a setting: a missing
+    control-plane DSN (the default deployment; logged at error) and a deployment whose
+    consumers never run, where only a consumer makes a message reapable. See
+    `docs/design/RETENTION.md`.
+  - `outbox.completed_retention_secs` (default seven days) has a FLOOR of one hour
+    (`OUTBOX_MIN_COMPLETED_RETENTION_SECS`), where `diagnostics.retention_secs` deliberately
+    has none, and the floor stands for `max(evidence window, longest producer re-enqueue
+    horizon)`. A completed outbox row is the only evidence that a message was DELIVERED, so
+    a window shorter than an operator's reaction time makes a lost delivery permanently
+    unanswerable; and it also holds the row's slot in the outbox's idempotency-key unique
+    index, so reaping it early would let a producer still inside its retry window enqueue
+    the same work a second time. OPERATOR OBLIGATION: raising `max_attempts`,
+    `retry_base_secs` or `visibility_timeout_secs` lengthens the second term and this window
+    must stay above it (documented rather than cross-validated, because the exact horizon
+    would need the store's backoff schedule copied into this crate). The default and the
+    ninety day ceiling are `DIAGNOSTICS_DEFAULT_RETENTION_SECS` and
+    `DIAGNOSTICS_MAX_RETENTION_SECS`, so the tree has one answer to how long an operational
+    record is kept.
+  - `outbox.dead_letter_retention_secs` (default `0`) means NEVER REAP, not "reap
+    immediately". This is the exact inversion of `diagnostics.retention_secs`, where `0`
+    prunes everything on the next insert. A dead letter is work given up on, and for the
+    back-channel logout fan-out it can be an entire session's relying parties left
+    un-notified with nothing else recording that it happened.
+  - `outbox.reap_batch` (default 1000, ceiling `OUTBOX_MAX_REAP_BATCH`) is a HARD bound per
+    pass, not a chunk size to loop over: an unbounded delete across an accumulated backlog
+    stalls a replica. In arithmetic, the default at the default cadence removes at most
+    `1000 * (604800 / 3600) = 168,000` rows a week per (scope, consumer) per tail, which is
+    about 33,600 ended sessions a week at five relying parties each. Past that, passes report
+    SATURATED and the batch or the interval has to move.
+  - `outbox.reap_interval_secs` (default one hour) is the sweep cadence.
+
+  Retention is not latency-sensitive, so nothing waits on these; what they trade is
+  database load against how far the table runs ahead of the window.
+
 - **BREAKING: three `oidc` back-channel logout keys are REMOVED rather than deprecated
   (issue #104, PR 2).** `oidc.backchannel_logout_max_attempts`,
   `oidc.backchannel_logout_retry_base_secs` and `oidc.backchannel_logout_poll_interval_secs`

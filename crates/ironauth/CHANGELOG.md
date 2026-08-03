@@ -6,6 +6,44 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The boot path starts the outbox RETENTION sweeper (issue #104, PR 3).**
+  `spawn_retention_sweeper` takes the store, the scopes and the observer as ARGUMENTS, for
+  the reason `spawn_consumer_pools` does: it is what lets a test drive the real seam against
+  a real database instead of asserting about a copy.
+
+  - WHEN IT ACTUALLY RUNS, stated exactly, because an earlier draft of this entry said
+    "unconditionally" and that was measured false. `serve` starts it independently of
+    `backchannel_worker_inputs` and shuts it down alongside the logout pools, but THREE
+    things stop it: `outbox.reap_enabled = false` (a deliberate operator choice, logged at
+    warn); no control-plane DSN, which is the DEFAULT deployment, because
+    `admin.control_database_url` is unset and `dev_mode` is off (logged at error); and a
+    deployment whose consumers never run, where the sweeper starts and correctly removes
+    nothing, because only a consumer makes a message reapable.
+  - It does NOT share the consumer pools' gate. Those are the switches of ONE consumer of a
+    generic queue; the next consumer to register will run behind a different one, and
+    retention must not have to be re-wired per consumer.
+    `retention_is_not_gated_on_the_back_channel_logout_switch` is what turns red if such a
+    gate is added, and `tests/serve_retention_boot.rs` boots the real binary to pin that the
+    `serve` call site exists at all: replacing it with a no-op used to leave the whole suite
+    green.
+  - `outbox_retention_settings` resolves the inverted sentinel at ONE seam:
+    `dead_letter_retention_secs = 0` becomes `None` (never), not `Duration::ZERO` (always).
+    All four config-to-settings mappings are now pinned at distinct values, because swapping
+    the completed window with the interval, and replacing the batch with `i64::MAX`, were
+    both undetected.
+  - `TracingRetentionObserver` logs a SATURATED pass at warn, naming the two knobs that fix
+    it; a failed pass at warn, naming the missing 0102 grant as the likely cause; and an
+    IDLE pass at debug, so a healthy reaper with nothing to do and a dead one are not the
+    same silence.
+  - OPERATOR OBLIGATION: retention deletes as `ironauth_control`, the only role migration
+    0102 grants DELETE on `outbox_messages`. With NO control-plane DSN there is NO REAPING
+    AT ALL: the boot logs an error saying so, and `outbox_messages` grows without bound,
+    because every ended session enqueues one message plus one per participating relying
+    party and nothing else removes any of them. Set `admin.control_database_url` (or run in
+    dev mode). `outbox.reap_enabled = false` disables the sweeper deliberately and logs a
+    warning saying the same thing. See `docs/design/RETENTION.md` for what this reaper does
+    and does not bound.
+
 - **The boot path spawns the outbox consumer pools (issue #104, PR 2).** Back-channel logout
   delivery is no longer a hand-rolled worker: `spawn_backchannel_logout_pools` registers the
   two logout consumers, and `spawn_consumer_pools` turns that registry into one running
