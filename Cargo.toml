@@ -190,7 +190,7 @@ sha2 = "0.11"
 # (RustCrypto), permissive (MIT OR Apache-2.0), no C dependency, so the tree stays
 # musl-static clean and MSRV 1.85 holds. Shares the RustCrypto `digest` traits already
 # in the tree via sha2, so this adds a direct edge, not a new trait graph.
-sha1 = "0.10"
+sha1 = "0.11"
 # CBOR decoding for the WebAuthn ceremony layer (crates/ironauth-webauthn, issue
 # #65): the registration attestationObject and the COSE credential public key are
 # CBOR. ciborium is the standard Rust CBOR implementation, pure Rust with no build
