@@ -59,7 +59,7 @@ jobs:
         run: ./run-conformance.sh --trigger nightly --up
       - name: Archive master-run logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: conformance-logs-track-master
           path: deploy/conformance/results/
