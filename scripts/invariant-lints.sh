@@ -42,26 +42,43 @@ cd "$(git rev-parse --show-toplevel)"
 . scripts/lib/generated-artifact.sh
 
 fail=0
+allow_report=""
 
 scan() {
-  local rule="$1" pattern="$2"
-  local hits
-  hits=$(grep -rn --include='*.rs' -E "$pattern" crates fuzz \
-    | grep -v '^crates/ironauth-env/' \
-    | grep -v "invariant-allow: ${rule}" || true)
+  local rule="$1" pattern="$2" allow_ceiling="$3"
+  local matched hits allows
+  matched=$(grep -rn --include='*.rs' -E "$pattern" crates fuzz \
+    | grep -v '^crates/ironauth-env/' || true)
+  hits=$(printf '%s\n' "$matched" | grep -v "invariant-allow: ${rule}" | grep -v '^$' || true)
   if [ -n "$hits" ]; then
     echo "invariant-lints: rule '${rule}' violated:"
     echo "$hits"
     fail=1
   fi
+  # The exemption CEILING. Every `invariant-allow` marker silently removes a line from this
+  # rule's scrutiny, so an unbounded number of them retires the rule one call site at a time
+  # and the run still prints clean. This is the mirror of the FLOORS in test-registration.sh
+  # and scoped-table-registration.sh: those stop a check shrinking, this stops one being
+  # bypassed. RAISE it in the same change that adds a justified exemption and say why, exactly
+  # as those scripts require for lowering; a raise is then a reviewable line in the diff rather
+  # than a silent grep -v.
+  allows=$(printf '%s\n' "$matched" | grep -c "invariant-allow: ${rule}" || true)
+  if [ "$allows" -gt "$allow_ceiling" ]; then
+    echo "invariant-lints: rule '${rule}' carries ${allows} exemptions, ceiling is ${allow_ceiling}."
+    echo "  An exemption retires a call site from this rule. Justify the new one and raise the"
+    echo "  ceiling in the same change, or remove it."
+    printf '%s\n' "$matched" | grep "invariant-allow: ${rule}"
+    fail=1
+  fi
+  allow_report="${allow_report}  ${rule}: ${allows}/${allow_ceiling} exemptions\n"
 }
 
-scan time-via-env 'SystemTime::now|Instant::now'
+scan time-via-env 'SystemTime::now|Instant::now' 2
 # The `rand::` guard requires a non-identifier char (or start of line) before `rand`
 # so a real `rand` crate path is caught while an identifier that merely ENDS in "rand"
 # (for example a `Brand::` associated call) is not a false positive.
-scan entropy-via-env 'getrandom::|(^|[^A-Za-z0-9_])rand::|rand_core::'
-scan typ-via-declaration '(\.|::)\s*with_typ\s*\('
+scan entropy-via-env 'getrandom::|(^|[^A-Za-z0-9_])rand::|rand_core::' 1
+scan typ-via-declaration '(\.|::)\s*with_typ\s*\(' 11
 
 # Rule session-mint-registry: every call site of `interaction::establish_session`, the ONE
 #   function that mints a primary session (and carries the issue #80/#52 account-lifecycle
@@ -190,7 +207,7 @@ mint_names='mint_client_credentials_access_token|mint_refresh_token|mint_access_
 # these five names exceeds) puts the imported names on continuation lines carrying no
 # `use ... tokens`, and this rule does not see them. docs/design/USER-BOUND-MINT-SITES.md
 # lists that limit beside the other two.
-scan user-token-mint-qualified "use[[:space:]]+([A-Za-z0-9_]+::)*tokens(::([^;]*[^A-Za-z0-9_])?(${mint_names})([^A-Za-z0-9_]|$)|[[:space:]]+as[[:space:]])"
+scan user-token-mint-qualified "use[[:space:]]+([A-Za-z0-9_]+::)*tokens(::([^;]*[^A-Za-z0-9_])?(${mint_names})([^A-Za-z0-9_]|$)|[[:space:]]+as[[:space:]])" 0
 
 token_inventory="docs/design/user-bound-mint-sites.txt"
 token_doc="docs/design/USER-BOUND-MINT-SITES.md"
