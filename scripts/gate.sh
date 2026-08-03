@@ -50,6 +50,9 @@ scripts/hashing-pool-boundary.sh
 echo "==> http audit (ironauth-fetch is the only outbound HTTP path)"
 scripts/http-audit.sh
 
+echo "==> jose audit (ironauth-jose is the only JOSE verification path)"
+scripts/jose-audit.sh
+
 echo "==> no M2M metering (no metering/billing/quota hook on the client-credentials path)"
 scripts/no-m2m-metering.sh
 
@@ -79,6 +82,10 @@ git diff --exit-code docs/connector-schema.json docs/capability-matrix.schema.js
 echo "==> flow schema freshness (flow object schema + message id registry)"
 scripts/flow-schema.sh
 git diff --exit-code docs/flow-schema.json docs/flow-messages.json
+
+echo "==> journey schema freshness (published journey artifact contract)"
+scripts/journey-schema.sh
+git diff --exit-code docs/journey-schema.json
 
 echo "==> flow golden corpus freshness (rendered flow shape, all journeys x both transports)"
 scripts/flow-golden.sh
