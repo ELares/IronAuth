@@ -44,8 +44,8 @@ use std::time::{Duration, SystemTime};
 
 use ironauth_env::Env;
 use ironauth_store::outbox::{
-    ConsumerError, ConsumerRegistry, DrainStats, OutboxConsumer, OutboxWorker, OutboxWorkerPool,
-    ScopeSource, StaticScopes, WorkerSettings,
+    ConsumerError, ConsumerRegistry, DrainStats, OutboxConsumer, OutboxObserver, OutboxWorker,
+    OutboxWorkerPool, ScopeSource, SilentObserver, StaticScopes, WorkerSettings,
 };
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
@@ -60,6 +60,12 @@ const FAR_FUTURE_MICROS: i64 = 4_102_444_800_000_000;
 /// The consumer name every message in this suite is routed to, unless a test is about
 /// two consumers sharing the queue.
 const CONSUMER: &str = "test_consumer";
+
+/// The observer a test that is not ABOUT observability passes: reports nothing. Spelled
+/// out at each call site rather than defaulted, because the pool requires the argument.
+fn silent() -> Arc<dyn OutboxObserver> {
+    Arc::new(SilentObserver)
+}
 
 /// Enqueue one message under `CONSUMER` with the given keys and a trivial payload.
 async fn enqueue(
@@ -1018,6 +1024,7 @@ async fn the_pool_runs_every_configured_worker_and_drains_to_completion() {
             settings,
         ),
         &scopes,
+        &silent(),
     );
     assert_eq!(
         pool.configured_size(),
@@ -1702,7 +1709,7 @@ async fn a_pool_survives_a_poison_message_and_keeps_draining_other_aggregates() 
     }
 
     let scopes: Arc<dyn ScopeSource> = Arc::new(StaticScopes::new(vec![scope]));
-    let pool = OutboxWorkerPool::spawn(&worker, &scopes);
+    let pool = OutboxWorkerPool::spawn(&worker, &scopes, &silent());
     let mut drained = false;
     for _ in 0..200 {
         if consumer.handled().len() == 4 {
@@ -1734,6 +1741,195 @@ async fn a_pool_survives_a_poison_message_and_keeps_draining_other_aggregates() 
         ],
         "each healthy message once, and the poison one never handled successfully"
     );
+}
+
+#[tokio::test]
+async fn a_fenced_scope_is_not_drained_and_its_work_survives_the_suspension() {
+    // A SUSPENDED scope is fenced on the data plane: its issuer will not load, its keys
+    // will not sign, everything a handler touches there refuses. Draining it anyway is not
+    // merely wasted work, it DESTROYS the queued work: every one of those refusals is a
+    // retryable failure, retryable failures burn a finite attempts budget, and a suspension
+    // that outlasts the backoff schedule dead-letters everything queued in the scope. The
+    // work would be discarded precisely BECAUSE an operator paused the tenant, and resuming
+    // would not bring it back.
+    //
+    // So a fenced scope is skipped before anything is claimed, and the measurement is that
+    // the message is untouched (attempts still zero, not merely undelivered) and drains
+    // normally the moment the scope is resumed.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let consumer = ScriptedConsumer::new(CONSUMER);
+    let worker = OutboxWorker::new(
+        db.store().clone(),
+        env.clone(),
+        Arc::clone(&consumer) as Arc<dyn OutboxConsumer>,
+        WorkerSettings {
+            concurrency: 1,
+            visibility_timeout: Duration::from_secs(30),
+            poll_interval: Duration::from_secs(5),
+            batch: 64,
+            retry: RetryPolicy::default(),
+        },
+    );
+    enqueue(&db, &env, scope, "fact-1", "agg-a").await;
+
+    db.set_environment_serving_state(scope, "suspended").await;
+    // Several passes, because ONE pass not draining could be a claim that found nothing
+    // due; the attempts assertion below is what distinguishes "skipped" from "failed".
+    for _ in 0..3 {
+        assert_eq!(
+            worker.run_once(scope).await.expect("pass"),
+            DrainStats::default(),
+            "a fenced scope is not claimed from at all"
+        );
+    }
+    assert!(
+        consumer.handled().is_empty(),
+        "the handler was never called in a fenced scope"
+    );
+    let held = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .pending(CONSUMER, 10)
+        .await
+        .expect("pending");
+    assert_eq!(held.len(), 1, "the work is still queued");
+    assert_eq!(
+        held[0].attempts, 0,
+        "and UNTOUCHED: not one attempt was burned against the suspension, which is what          keeps a long suspension from dead-lettering everything queued in the scope"
+    );
+
+    // Resumed, it drains normally. Without this the assertions above would also pass
+    // against a worker that had simply stopped draining anything.
+    db.set_environment_serving_state(scope, "active").await;
+    assert_eq!(
+        worker.run_once(scope).await.expect("pass"),
+        DrainStats {
+            claimed: 1,
+            completed: 1,
+            retried: 0,
+            dead_lettered: 0,
+            lease_lost: 0
+        },
+        "a resumed scope drains the work the suspension preserved"
+    );
+    assert_eq!(consumer.handled(), vec!["fact-1".to_owned()]);
+}
+
+/// A consumer that sets a flag the FIRST time it is called: a stand-in for the shutdown
+/// signal arriving while a handler is running, which is the only moment the stop check
+/// between messages can be distinguished from a stop check around the batch.
+struct StoppingConsumer {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    handled: std::sync::Mutex<Vec<String>>,
+}
+
+impl OutboxConsumer for StoppingConsumer {
+    fn name(&self) -> &str {
+        CONSUMER
+    }
+
+    fn handle<'a>(
+        &'a self,
+        _env: &'a Env,
+        _scope: Scope,
+        message: &'a OutboxMessage,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ConsumerError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            self.handled
+                .lock()
+                .expect("handled lock")
+                .push(message.idempotency_key.clone());
+            self.stop.store(true, Ordering::Relaxed);
+            Ok(())
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_stop_between_messages_abandons_the_rest_of_the_claimed_batch() {
+    // What `shutdown().await` actually costs. A pass that only checked the stop flag
+    // around its whole batch had to run every message the last claim took, so a stop cost
+    // one CLAIM BATCH of handlers rather than one handler: at the shipped `claim_batch` of
+    // 64 and a logout request timeout of 10 seconds, about ten minutes of a shutdown an
+    // orchestrator resolves with SIGKILL.
+    //
+    // Driven deterministically rather than by timing: the consumer itself raises the flag
+    // as it handles the first message, which is exactly the moment the check has to be read
+    // at. Nothing is lost by abandoning the rest, and the last assertion measures that:
+    // they are still queued, unattempted, and drain on the next pass.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let consumer = Arc::new(StoppingConsumer {
+        stop: Arc::clone(&stop),
+        handled: std::sync::Mutex::new(Vec::new()),
+    });
+    let worker = OutboxWorker::new(
+        db.store().clone(),
+        env.clone(),
+        Arc::clone(&consumer) as Arc<dyn OutboxConsumer>,
+        WorkerSettings {
+            concurrency: 1,
+            visibility_timeout: Duration::from_secs(30),
+            poll_interval: Duration::from_secs(5),
+            batch: 64,
+            retry: RetryPolicy::default(),
+        },
+    );
+    // Four messages in FOUR ordering groups, so all four are claimable at once and the
+    // count below is about the stop check rather than about head-of-group blocking.
+    for n in 0..4 {
+        enqueue(&db, &env, scope, &format!("fact-{n}"), &format!("agg-{n}")).await;
+    }
+
+    let stats = worker
+        .run_once_until(scope, &stop)
+        .await
+        .expect("the pass returns rather than erroring when it is stopped");
+    assert_eq!(
+        stats.claimed, 4,
+        "the claim leased the whole batch, which is what makes the rest abandonable rather          than never taken"
+    );
+    assert_eq!(
+        stats.completed, 1,
+        "exactly ONE handler ran after the flag was raised inside it"
+    );
+    assert_eq!(
+        consumer.handled.lock().expect("handled lock").len(),
+        1,
+        "a stop costs one handler, not one claim batch of them"
+    );
+
+    // Nothing was lost. The three abandoned messages are leased, not terminal, and not
+    // attempted; once their lease lapses another worker or the next boot takes them, which
+    // is the same path a crash takes.
+    let remaining = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .list(CONSUMER, 100)
+        .await
+        .expect("list");
+    let abandoned: Vec<&OutboxMessage> = remaining
+        .iter()
+        .filter(|message| message.completed_at_unix_micros.is_none())
+        .collect();
+    assert_eq!(abandoned.len(), 3, "three were abandoned mid-batch");
+    for message in abandoned {
+        assert_eq!(
+            message.attempts, 0,
+            "an abandoned message is not a failed one: it burned no attempt"
+        );
+        assert!(
+            message.dead_lettered_at_unix_micros.is_none(),
+            "and it is not terminal"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1777,6 +1973,7 @@ async fn the_pools_size_is_the_live_worker_count_and_falls_when_a_worker_dies() 
             settings,
         ),
         &scopes,
+        &silent(),
     );
     assert_eq!(pool.configured_size(), 3, "three were started");
 

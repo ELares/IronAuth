@@ -6,6 +6,45 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The boot path spawns the outbox consumer pools (issue #104, PR 2).** Back-channel logout
+  delivery is no longer a hand-rolled worker: `spawn_backchannel_logout_pools` registers the
+  two logout consumers, and `spawn_consumer_pools` turns that registry into one running
+  worker pool each, all sweeping one `ControlPlaneScopes` and reporting to one
+  `TracingOutboxObserver`. `outbox_worker_settings` is the single place the `[outbox]`
+  section becomes a `WorkerSettings`.
+
+  - **The FAN-OUT consumer gets an effectively unbounded attempts budget, and the delivery
+    consumer keeps the shared cap.** Both pools were first given `outbox.max_attempts`, and
+    that loses logouts. A `session_ended` message is an ENTIRE session's fan-out, held at a
+    moment when no per-relying-party message exists yet, so dead-lettering it leaves every
+    RP of that session permanently un-notified with nothing anywhere to replay from. Its
+    handler makes no outbound call, so the only failure it can classify as retryable is a
+    DATABASE fault, and at the shipped defaults five attempts on a ten second base is about
+    150 seconds of database trouble to discard a session's logout forever. The bound cannot
+    be doing the other job a bound does either: every input this handler cannot process is
+    already `permanent` and dead-letters on its first attempt regardless. This also restores
+    what the deleted worker did, which was to let the lease lapse and re-claim, forever;
+    moving onto a generic substrate is what introduced a terminal state here. It is safe
+    HERE specifically because a `session_ended` message's ordering key is the ended session
+    id, so its group is a singleton and there is nothing behind it to block; a consumer
+    whose producers share ordering keys must keep the finite bound.
+  - **The pools' outcomes are LOGGED.** The migration deleted two `tracing::warn!` calls and
+    replaced them with nothing, and the new pool loop discarded its results, so a
+    dead-lettered logout, a drain pass failing on a persistence fault, and a scope sweep
+    that never returned a scope were all silent. `TracingOutboxObserver` reports a
+    dead-lettering pass at ERROR (naming the consumer, the scope and the count), and a
+    failed pass or a failed sweep at WARN. A healthy pass is deliberately not logged: one
+    line per pool per scope per poll interval would bury the three that matter.
+  - **The wiring is MEASURED, in `src/outbox_wiring_tests.rs`.** PR 1 shipped a framework
+    with zero call sites; the same defect one layer up is a wiring that runs and that nothing
+    observes. Measured with `.take(1)` on the pool loop, so the binary spawns the fan-out
+    pool and never the delivery pool: with this suite SKIPPED, all 17 remaining tests of the
+    crate pass and `cargo clippy --workspace --all-targets --all-features -- -D warnings` is
+    clean, so nothing but this suite can see it. The suite
+    drives the REAL `spawn_consumer_pools` and `outbox_worker_settings` against a real
+    database and asserts BEHAVIOUR: a message enqueued for every registered consumer must be
+    handled, whichever subset a broken loop would have covered.
+
 - **The `dev_mode` control-DSN fallback warning now names the consequence that actually
   bites** (issue #441). When `admin.control_database_url` is unset and `dev_mode` is on, the
   management plane connects on `database.url`. A development database is usually a

@@ -261,6 +261,13 @@ pub struct OutboxConfig {
     /// dead letter is what releases the aggregate; an unbounded retry would wedge that
     /// aggregate forever, which is why there is no "unlimited" value here and never will
     /// be. The default (5) is conservative. Must be at least 1.
+    ///
+    /// The wedge argument does not reach a consumer whose producers give every message its
+    /// OWN ordering key, because each of its groups is a singleton with nothing behind it
+    /// to block. Such a consumer may be given a larger budget IN CODE, where the singleton
+    /// property can be argued for that consumer specifically; the back-channel logout
+    /// fan-out is the one that is. It stays out of this knob deliberately: this value
+    /// applies to EVERY consumer at once, and most of them do have aggregates.
     pub max_attempts: u32,
 
     /// The base delay in seconds of the exponential backoff between retries. The nth
@@ -1994,40 +2001,43 @@ pub struct OidcConfig {
     /// setting in spirit; the process value is the deployment default until
     /// per-environment overrides ride the M5 promotion pipeline.
     pub frontchannel_logout_enabled: bool,
-    /// Whether the OIDC Back-Channel Logout delivery worker runs (issue #34). OFF by
+    /// Whether the OIDC Back-Channel Logout delivery consumers run (issue #34). OFF by
     /// default (the covenant posture: no mandatory background infrastructure), so the
-    /// default build enqueues nothing and sends nothing. When enabled, the worker drains
-    /// the durable session-ended outbox, builds one signed Logout Token per participating
-    /// relying party (each carrying that RP's own `sid`), and POSTs it to the RP's
-    /// registered `backchannel_logout_uri` through the SSRF-hardened outbound fetcher,
-    /// with bounded-backoff retries and a dead-letter state. Discovery advertises
-    /// `backchannel_logout_supported` regardless (the OP supports the mechanism); this
-    /// switch governs only whether the delivery worker is scheduled.
+    /// default build SENDS nothing. When enabled, the consumers drain the durable
+    /// session-ended outbox, fan one ended session out into one message per participating
+    /// relying party, build a signed Logout Token for each (carrying that RP's own `sid`),
+    /// and POST it to the RP's registered `backchannel_logout_uri` through the
+    /// SSRF-hardened outbound fetcher, with bounded-backoff retries and a dead-letter
+    /// state. Discovery advertises `backchannel_logout_supported` regardless (the OP
+    /// supports the mechanism); this switch governs only whether the consumers are
+    /// scheduled: ending a session ENQUEUES a durable `session_ended` message either way,
+    /// so with this off those messages accumulate undrained (see below).
+    ///
+    /// This switch does NOT gate the PRODUCER, and an operator sizing a database should
+    /// know it. Ending an SSO session enqueues one durable `session_ended` message inside
+    /// the revoking transaction whatever this is set to, because `session_ended` is a
+    /// domain event rather than a logout implementation detail: it commits with the
+    /// session flip or not at all, and back-channel logout is one consumer of it. With
+    /// this switch off nothing consumes those messages, so they accumulate, and turning it
+    /// on later starts by draining the accumulated backlog and notifying relying parties
+    /// about sessions that ended long ago. A deployment that leaves it off and ends many
+    /// sessions should expect `outbox_messages` to grow accordingly.
     pub backchannel_logout_enabled: bool,
-
-    /// The maximum number of delivery attempts the back-channel logout worker makes for
-    /// one relying party before it DEAD-LETTERS the delivery (issue #34). A slow or down
-    /// RP is retried with exponential backoff up to this cap, then given up on (recorded
-    /// with its last error) so it never retries unboundedly. The default (5) is
-    /// conservative. Must be at least 1.
-    pub backchannel_logout_max_attempts: u32,
-
-    /// The base delay in seconds for the back-channel logout worker's exponential backoff
-    /// between delivery retries (issue #34). The nth retry waits about
-    /// `base * 2^(n-1)` seconds plus jitter (both drawn from the deterministic clock and
-    /// entropy seams). The default (10) is conservative. Must be at least 1 and at most
-    /// `OIDC_MAX_LIFETIME_SECS`.
-    pub backchannel_logout_retry_base_secs: u64,
-
-    /// How often, in seconds, the back-channel logout worker polls the queue for due work
-    /// (issue #34). The default (5) is a responsive-yet-cheap cadence. Must be at least 1
-    /// and at most `OIDC_MAX_LIFETIME_SECS`.
-    pub backchannel_logout_poll_interval_secs: u64,
 
     /// The per-delivery total time budget in seconds for one back-channel logout POST
     /// (issue #34): the SSRF-hardened fetcher aborts a delivery that exceeds it, so a slow
     /// RP cannot wedge the worker or block other RPs. The default (10) is conservative.
     /// Must be at least 1 and at most `OIDC_MAX_LIFETIME_SECS`.
+    ///
+    /// It is NOT a lease, and since issue #104 it is no longer the thing the lease is
+    /// derived from: the attempts cap, the backoff schedule, the poll cadence and the
+    /// visibility lease all come from the `[outbox]` section that every consumer shares.
+    /// This one survives because it is an ironauth-fetch budget on a single outbound
+    /// request and has no equivalent there. It must stay strictly BELOW
+    /// `outbox.visibility_timeout_secs`, which [`Config::validate`] enforces: a handler
+    /// allowed to run longer than its lease is re-claimed mid-POST by another worker, and
+    /// the relying party receives the token twice with nothing anywhere recording that it
+    /// happened.
     pub backchannel_logout_request_timeout_secs: u64,
 
     /// The INBOUND lazy-migration hook (issue #56): verify a first login against a
@@ -2561,9 +2571,6 @@ impl Default for OidcConfig {
             session_management_enabled: false,
             frontchannel_logout_enabled: false,
             backchannel_logout_enabled: false,
-            backchannel_logout_max_attempts: 5,
-            backchannel_logout_retry_base_secs: 10,
-            backchannel_logout_poll_interval_secs: 5,
             backchannel_logout_request_timeout_secs: 10,
             lazy_migration: LazyMigrationConfig::default(),
             federation: FederationConfig::default(),
@@ -4495,6 +4502,9 @@ impl Config {
         validate_organizations(&self.organizations)?;
         validate_token_claims(&self.token_claims)?;
         validate_outbox(&self.outbox)?;
+        // Last, and after both halves have been checked on their own, so a cross-section
+        // report is never produced from a value that is independently out of range.
+        validate_backchannel_logout_lease(&self.oidc, &self.outbox)?;
         Ok(())
     }
 }
@@ -5987,43 +5997,78 @@ fn validate_quota(quota: &QuotaConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
-/// Validate the back-channel logout worker settings (issue #34), kept out of
-/// [`Config::validate`] so each stays within the readable-length lint. The attempts cap
-/// must admit at least one attempt, and the backoff base, poll cadence, and per-delivery
-/// timeout are bounded like the other second-valued knobs: a zero is meaningless, and a
-/// value beyond the ceiling is a misconfiguration.
+/// Validate the back-channel logout settings (issue #34), kept out of
+/// [`Config::validate`] so each stays within the readable-length lint.
+///
+/// Since issue #104 only ONE numeric knob is left here. The attempts cap, the backoff
+/// base and the poll cadence were removed because back-channel logout delivery is a
+/// consumer on the generic outbox and takes all three from `[outbox]`; keeping a second
+/// copy per consumer meant two sets of numbers that happened to agree at their defaults
+/// and would silently diverge the moment an operator tuned either one.
 fn validate_backchannel_logout(oidc: &OidcConfig) -> Result<(), ConfigError> {
-    if oidc.backchannel_logout_max_attempts < 1 {
+    let value = oidc.backchannel_logout_request_timeout_secs;
+    if value < 1 {
         return Err(ConfigError::Invalid {
-            message: "oidc.backchannel_logout_max_attempts must be at least 1".to_owned(),
+            message: "oidc.backchannel_logout_request_timeout_secs must be at least 1 second"
+                .to_owned(),
         });
     }
-    for (name, value) in [
-        (
-            "oidc.backchannel_logout_retry_base_secs",
-            oidc.backchannel_logout_retry_base_secs,
-        ),
-        (
-            "oidc.backchannel_logout_poll_interval_secs",
-            oidc.backchannel_logout_poll_interval_secs,
-        ),
-        (
-            "oidc.backchannel_logout_request_timeout_secs",
-            oidc.backchannel_logout_request_timeout_secs,
-        ),
-    ] {
-        if value < 1 {
-            return Err(ConfigError::Invalid {
-                message: format!("{name} must be at least 1 second"),
-            });
-        }
-        if value > OIDC_MAX_LIFETIME_SECS {
-            return Err(ConfigError::Invalid {
-                message: format!(
-                    "{name} ({value}) must not exceed {OIDC_MAX_LIFETIME_SECS} seconds"
-                ),
-            });
-        }
+    if value > OIDC_MAX_LIFETIME_SECS {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "oidc.backchannel_logout_request_timeout_secs ({value}) must not exceed \
+                 {OIDC_MAX_LIFETIME_SECS} seconds"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Refuse a back-channel logout HTTP budget that its outbox LEASE cannot cover
+/// (issue #104).
+///
+/// This is the one check that spans two sections, so it lives here rather than in either
+/// per-section validator, both of which see only their own half.
+///
+/// Before #104 the disagreement was impossible: the worker DERIVED its lease from the
+/// request timeout, so raising one raised the other. Delivery is now a consumer, its lease
+/// is `outbox.visibility_timeout_secs`, and the two numbers are independent. An operator
+/// who raises the request timeout to cover a slow relying party, and does not know to
+/// raise the lease with it, gets a handler that outruns its lease on EVERY slow delivery:
+/// the message is re-claimed while the first POST is still in flight, the RP receives the
+/// token twice, and nothing reports it. The claim is skip-locked and leased, so it is not
+/// a correctness bug in the queue; it is a duplicate POST an operator never asked for and
+/// cannot see.
+///
+/// The comparison is `>=` rather than `>` because equality is already too late: a handler
+/// that takes exactly its whole budget finishes at the instant the lease expires, and the
+/// completion write is fenced on a lease another worker may already hold.
+///
+/// It is gated on the SAME predicate the boot path spawns the pools under, which is
+/// `oidc.enabled && oidc.backchannel_logout_enabled` and not the posture switch alone. The
+/// rationale for gating at all is that a deployment running no such handler must not be
+/// refused a boot over an inert number, and with the OIDC provider off there is no handler:
+/// `backchannel_worker_inputs` returns `None` and no pool is ever built. Gating on the
+/// posture switch alone made the check refuse exactly the boot its own stated reason says
+/// it must allow. It fails CLOSED either way, so the defect was a wrong refusal rather than
+/// a missed one, but a check whose predicate does not match its rationale is a check
+/// somebody will later widen in the wrong direction.
+fn validate_backchannel_logout_lease(
+    oidc: &OidcConfig,
+    outbox: &OutboxConfig,
+) -> Result<(), ConfigError> {
+    if !(oidc.enabled && oidc.backchannel_logout_enabled) {
+        return Ok(());
+    }
+    if oidc.backchannel_logout_request_timeout_secs >= outbox.visibility_timeout_secs {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "oidc.backchannel_logout_request_timeout_secs ({}) must be less than \
+                 outbox.visibility_timeout_secs ({}): a logout POST allowed to outrun its \
+                 visibility lease is re-claimed mid-flight and delivered twice",
+                oidc.backchannel_logout_request_timeout_secs, outbox.visibility_timeout_secs
+            ),
+        });
     }
     Ok(())
 }
@@ -6737,6 +6782,105 @@ mod tests {
         assert!(
             Config::from_toml_str("[outbox]\nvisibility_timeout_sec = 60\n", "<inline>").is_err(),
             "a misspelled key in [outbox] must fail the load"
+        );
+    }
+
+    #[test]
+    fn a_logout_http_budget_that_outruns_its_outbox_lease_is_refused_at_load() {
+        // The three per-consumer copies of the outbox tuning are GONE (issue #104): they
+        // duplicated `[outbox]` and agreed with it only by coincidence of defaults. A
+        // configuration that still sets one must fail the load rather than be ignored,
+        // which is what would leave an operator convinced they had raised an attempts cap.
+        for key in [
+            "backchannel_logout_max_attempts = 9",
+            "backchannel_logout_retry_base_secs = 30",
+            "backchannel_logout_poll_interval_secs = 1",
+        ] {
+            assert!(
+                Config::from_toml_str(&format!("[oidc]\n{key}\n"), "<inline>").is_err(),
+                "a removed key must fail the load rather than be silently ignored: {key}"
+            );
+        }
+
+        // The defaults are compatible: a 10 second HTTP budget under a 30 second lease.
+        let defaults = Config::from_toml_str(
+            "[oidc]\nenabled = true\nbackchannel_logout_enabled = true\n",
+            "<inline>",
+        )
+        .expect("the shipped defaults are compatible")
+        .config;
+        assert_eq!(defaults.oidc.backchannel_logout_request_timeout_secs, 10);
+        assert_eq!(defaults.outbox.visibility_timeout_secs, 30);
+
+        // Raising the HTTP budget to or past the lease is REFUSED. Before #104 the worker
+        // derived its lease from this budget, so the two could not disagree; they are now
+        // independent, and a handler allowed to outrun its lease is re-claimed mid-POST
+        // and the relying party is told twice with nothing reporting it.
+        for (label, timeout) in [("above the lease", 45_u64), ("equal to the lease", 30)] {
+            let toml = format!(
+                "[oidc]\nenabled = true\nbackchannel_logout_enabled = true\n\
+                 backchannel_logout_request_timeout_secs = {timeout}\n"
+            );
+            let err = Config::from_toml_str(&toml, "ironauth.toml")
+                .expect_err(&format!("a budget {label} must be refused"));
+            assert!(
+                matches!(err, ConfigError::Invalid { .. }),
+                "a budget {label} must be a boot-time Invalid: {err:?}"
+            );
+        }
+
+        // The control at the other end: one second BELOW the lease loads. Without it the
+        // refusals above would pass against a validator that rejected everything.
+        let ok = Config::from_toml_str(
+            "[oidc]\nenabled = true\nbackchannel_logout_enabled = true\n\
+             backchannel_logout_request_timeout_secs = 29\n",
+            "<inline>",
+        )
+        .expect("a budget strictly below the lease is valid")
+        .config;
+        assert_eq!(ok.oidc.backchannel_logout_request_timeout_secs, 29);
+
+        // And raising the LEASE is the supported way to accommodate a slow relying party.
+        let raised = Config::from_toml_str(
+            "[oidc]\nenabled = true\nbackchannel_logout_enabled = true\n\
+             backchannel_logout_request_timeout_secs = 45\n\
+             [outbox]\nvisibility_timeout_secs = 90\n",
+            "<inline>",
+        )
+        .expect("raising the lease with the budget is valid")
+        .config;
+        assert_eq!(raised.outbox.visibility_timeout_secs, 90);
+
+        // With delivery OFF (the default posture) the budget is inert, so an otherwise
+        // refused pair must NOT block the boot: refusing over a number nothing reads is a
+        // misconfiguration report about nothing.
+        let inert = Config::from_toml_str(
+            "[oidc]\nenabled = true\nbackchannel_logout_request_timeout_secs = 45\n",
+            "<inline>",
+        )
+        .expect("the check is gated on the posture switch")
+        .config;
+        assert!(!inert.oidc.backchannel_logout_enabled);
+        assert_eq!(inert.oidc.backchannel_logout_request_timeout_secs, 45);
+
+        // And the OTHER half of the same gate: the OIDC provider off. `serve` spawns the
+        // pools only when `oidc.enabled && oidc.backchannel_logout_enabled`, so with the
+        // provider off no logout handler exists to outrun any lease, and a refusal here
+        // would be the very "misconfiguration report about nothing" the gate exists to
+        // avoid. Measured with the gate on the posture switch alone: this load was
+        // REFUSED.
+        let provider_off = Config::from_toml_str(
+            "[oidc]\nenabled = false\nbackchannel_logout_enabled = true\n\
+             backchannel_logout_request_timeout_secs = 45\n",
+            "<inline>",
+        )
+        .expect("with the OIDC provider off no logout handler runs, so nothing is refused")
+        .config;
+        assert!(!provider_off.oidc.enabled);
+        assert!(provider_off.oidc.backchannel_logout_enabled);
+        assert_eq!(
+            provider_off.oidc.backchannel_logout_request_timeout_secs,
+            45
         );
     }
 

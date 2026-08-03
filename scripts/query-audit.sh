@@ -109,6 +109,17 @@ cd "$(git rev-parse --show-toplevel)"
 # ordering key. TENANT-SCOPED with forced row-level security, so its SQL stays in the
 # repository module too.
 #
+# backchannel_logout_deliveries (#34) was the per-RP back-channel logout delivery queue:
+# one row per participating relying party, exploded from a drained session-ended event,
+# with its own attempts / backoff / dead-letter state. TENANT-SCOPED with forced row-level
+# security, so its SQL stays in the repository module too. Since #104 back-channel logout
+# delivery is a pair of consumers on the generic outbox above and nothing reads or writes
+# this table any more; it stays listed for the same reason session_ended_events does,
+# because it still exists, still forces row-level security, still holds the delivery
+# record an operator may need (which RP was told about which session, under which jti,
+# and the dead-letter tail), and raw SQL against it from another crate would still be an
+# isolation bypass.
+#
 # tenant_keks, tenant_deks, and encrypted_secrets (#48) are the per-tenant envelope
 # encryption tables: the wrapped key-encryption keys, the wrapped data-encryption
 # keys, and the transparent encrypted-secret store. All three are TENANT-SCOPED with

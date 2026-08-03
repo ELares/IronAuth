@@ -21,23 +21,39 @@
 //!   N pairs emits N tokens, avoiding the keycloak#22914 ambiguous sub-only token.
 //!
 //! - **Delivery is a distributed-systems problem, so it is a WORKER, not a request-path
-//!   POST.** RPs are down, slow, or misconfigured. The worker drains the durable
-//!   session-ended outbox (#35), EXPLODES each ended session into one per-RP delivery,
-//!   and POSTs the token through the SSRF-hardened outbound fetcher (the
-//!   `backchannel_logout_uri` is an RP-controlled URL, an SSRF vector). A failure is
-//!   retried with bounded exponential backoff (its schedule and jitter drawn from the
-//!   deterministic clock and entropy seams) up to an attempts cap, then dead-lettered
-//!   with its last error. A slow or failing RP never blocks the others (each delivery is
-//!   its own row) or wedges the worker (a per-delivery timeout via the fetcher caps).
-//!   Delivery is at-least-once; the RP dedups on `jti`.
+//!   POST.** RPs are down, slow, or misconfigured. Delivery therefore runs off the
+//!   generic outbox consumer framework (#104) as TWO registered consumers, and the split
+//!   is the safety property: [`SessionEndedExplodeConsumer`] turns one ended session into
+//!   one outbox message PER participating relying party, and
+//!   [`BackChannelLogoutConsumer`] handles exactly ONE of those, sending the token
+//!   through the SSRF-hardened outbound fetcher (the `backchannel_logout_uri` is an
+//!   RP-controlled URL, an SSRF vector). A failure is retried with the substrate's
+//!   bounded exponential backoff up to its attempts cap, then dead-lettered with its last
+//!   error. A slow or failing RP never blocks the others (each delivery is its own
+//!   message, in its own singleton ordering group) or wedges a worker (a per-delivery
+//!   timeout via the fetcher caps). Delivery is at-least-once; the RP dedups on `jti`.
+//!
+//! ## Why two consumers and not one
+//!
+//! Fusing the fan-out and the delivery into one handler would give N relying parties a
+//! SHARED attempts counter: one dead RP would burn the attempts of a message that also
+//! carries the healthy RPs, and the dead-letter would take the whole session's logout
+//! with it, including the RPs that would have succeeded. That is a lost logout, so the
+//! per-RP isolation stated at the top of this module is structural rather than a
+//! best-effort property, and it is a message boundary that keeps it so.
 
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use ironauth_env::Env;
 use ironauth_jose::{EmissionOptions, TokenTyp, sign_jws_with_policy};
-use ironauth_store::{Scope, Store};
+use ironauth_store::outbox::{ConsumerError, OutboxConsumer};
+use ironauth_store::{
+    BACKCHANNEL_LOGOUT_CONSUMER, IssuedTokenId, NewOutboxMessage, OutboxMessage,
+    SESSION_ENDED_CONSUMER, Scope, SessionId, Store,
+};
 use serde_json::json;
 
 use crate::issuer::IssuerRegistry;
@@ -56,10 +72,6 @@ pub const LOGOUT_TOKEN_TYP: &str = TokenTyp::LogoutToken.media_type();
 /// The Logout Token lifetime: short, because it is a one-shot notification the RP acts on
 /// immediately (and dedups on `jti`), never a bearer credential it stores.
 const LOGOUT_TOKEN_TTL: Duration = Duration::from_secs(120);
-
-/// The largest backoff, in seconds, any single retry waits: caps the exponential growth
-/// so a long attempts cap can never schedule an absurd or overflowing delay.
-const MAX_BACKOFF_SECS: u64 = 86_400;
 
 /// Build the Logout Token claim set (OIDC Back-Channel Logout 2.4). Pure, so the claim
 /// shape is unit-tested without a signer or a store.
@@ -210,216 +222,226 @@ impl LogoutSender for FetchLogoutSender {
     }
 }
 
-/// The tuning knobs for the delivery worker (issue #34), sourced from `OidcConfig`.
-#[derive(Debug, Clone, Copy)]
-pub struct WorkerSettings {
-    /// The maximum number of delivery attempts before a delivery is dead-lettered.
-    pub max_attempts: u32,
-    /// The base delay for the exponential backoff between retries.
-    pub retry_base: Duration,
-    /// The visibility lease a claim stamps (a crashed worker's delivery reappears once
-    /// this lapses).
-    pub lease: Duration,
-    /// The maximum number of rows claimed per drain pass, for both the explode and the
-    /// deliver stage.
-    pub batch: i64,
+/// The payload key naming the ended SSO session, written by the session-ended producer
+/// and read by [`SessionEndedExplodeConsumer`].
+const PAYLOAD_SESSION_ID: &str = "session_id";
+/// The payload key naming the target relying party on a per-RP delivery message.
+const PAYLOAD_CLIENT_ID: &str = "client_id";
+/// The payload key carrying THAT client's own per-(client, session) `sid`.
+const PAYLOAD_SID: &str = "sid";
+/// The payload key carrying the RP's registered `backchannel_logout_uri`, snapshotted at
+/// explode time.
+const PAYLOAD_LOGOUT_URI: &str = "logout_uri";
+/// The payload key carrying the Logout Token `jti`, minted once at explode time.
+const PAYLOAD_JTI: &str = "jti";
+
+/// The `last_error` label recorded when a message's payload cannot be read. Bounded and
+/// non-secret, like every other label, and PERMANENT: no further attempt can make an
+/// unreadable body readable.
+const MALFORMED_PAYLOAD_LABEL: &str = "malformed_payload";
+
+/// The `last_error` label recorded when a persistence fault interrupts a handler.
+/// Retryable: the queue still holds the work and the next attempt re-runs it.
+const STORE_ERROR_LABEL: &str = "store_error";
+
+/// Read a required string field off a message payload.
+fn payload_str<'a>(message: &'a OutboxMessage, key: &str) -> Result<&'a str, ConsumerError> {
+    message
+        .payload
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ConsumerError::permanent(MALFORMED_PAYLOAD_LABEL))
 }
 
-impl Default for WorkerSettings {
-    fn default() -> Self {
-        Self {
-            max_attempts: 5,
-            retry_base: Duration::from_secs(10),
-            lease: Duration::from_secs(30),
-            batch: 64,
-        }
-    }
-}
-
-/// The outcome of one drain pass, for observability and tests.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct DrainStats {
-    /// Session-ended outbox events exploded into per-RP deliveries this pass.
-    pub events_exploded: u64,
-    /// Per-RP deliveries that succeeded (a 2xx) this pass.
-    pub delivered: u64,
-    /// Deliveries that failed and were scheduled for a backoff retry this pass.
-    pub retried: u64,
-    /// Deliveries that reached the attempts cap and were dead-lettered this pass.
-    pub dead_lettered: u64,
-}
-
-/// The OIDC Back-Channel Logout delivery worker (issue #34).
+/// The idempotency key AND the ordering key of ONE per-RP delivery: the (session, client)
+/// pair it notifies.
 ///
-/// It consumes the durable session-ended outbox (#35) as the source of truth for "a
-/// session ended, fan out", resolves the participating relying parties per (client,
-/// session), builds each RP its OWN signed Logout Token, and delivers it through the
-/// injected [`LogoutSender`] (production: the SSRF-hardened fetcher). It is generic over
-/// the sender so the network is injectable in tests. Multiple workers or replicas are
-/// safe: every claim is `FOR UPDATE SKIP LOCKED`.
-pub struct BackChannelLogoutWorker<S> {
-    store: Store,
-    env: Env,
-    issuers: Arc<IssuerRegistry>,
-    sender: S,
-    settings: WorkerSettings,
+/// The two being the SAME value is the decision that keeps a dead RP from delaying a live
+/// one, and it is worth stating why the obvious alternative is worse. Keying the ORDER on
+/// the client id would put every logout bound for one RP into a single group, and the
+/// substrate leases only a group's HEAD; one unreachable RP would then stall every
+/// subsequent logout to that RP, for every user, for the whole backoff schedule, and the
+/// stall would be invisible because the messages behind the head are not failing, merely
+/// never claimed. A per-message key makes every group a SINGLETON and removes the
+/// head-of-group predicate entirely.
+///
+/// Nothing is given up by not ordering these. Two Logout Tokens for one RP name different
+/// sessions through their own `sid` and carry no `sub`, so they commute: an RP that
+/// applies them in either order ends the same two sessions.
+fn delivery_key(session_id: &str, client_id: &str) -> String {
+    format!("{session_id}:{client_id}")
 }
 
-impl<S: LogoutSender> BackChannelLogoutWorker<S> {
-    /// Build a worker over the data-plane `store`, the environment seam, the shared
-    /// issuer registry (for the per-environment signing key and issuer string), a
-    /// `sender`, and the tuning `settings`.
+/// The FAN-OUT consumer (issue #104): one ended SSO session becomes one per-RP delivery
+/// message, and nothing more.
+///
+/// It registers under [`SESSION_ENDED_CONSUMER`], which is the discriminator the session
+/// flip writes inside its own transaction, and produces under
+/// [`BACKCHANNEL_LOGOUT_CONSUMER`]. Both names come from the ONE exported constant each,
+/// never a literal spelled here: a consumer whose name does not match its producers'
+/// discriminator drains nothing at all and reports perfect health while doing it.
+///
+/// # Why the fan-out is a CONSUMER and not part of the session-end transaction
+///
+/// Moving it into the producer would put an unbounded per-client query and N inserts
+/// inside the transaction that ends a session, which is on the hot path of every logout
+/// and every revoke, and it would make the cost of ending one session scale with how many
+/// relying parties that user ever logged into. It would also leave `session_ended`
+/// without a consumer, so its messages would accumulate forever in a table that has no
+/// reaper and grants no role DELETE.
+///
+/// # Idempotence, which is what makes a lapsed lease harmless
+///
+/// The handler is re-run whenever its lease lapses mid-explode, so it MUST tolerate
+/// finding its own earlier output. It does, through
+/// [`OutboxRepo::enqueue_all`](ironauth_store::OutboxRepo::enqueue_all), which skips an
+/// existing `(consumer, idempotency_key)` instead of raising. Looping the raising
+/// `enqueue` here would instead fail the re-explode with a unique violation, fail
+/// identically on every retry, and DEAD-LETTER this session's fan-out with every RP the
+/// first pass had not yet reached left permanently un-notified.
+///
+/// A consequence worth naming: the `jti` is minted at explode time and lives in the
+/// message payload, which is immutable once written. A re-explode mints a fresh id and
+/// then DISCARDS it, because the conflicting insert does nothing, so every attempt of a
+/// delivery re-POSTs a token bearing the same `jti` and the RP's dedup holds.
+pub struct SessionEndedExplodeConsumer {
+    store: Store,
+}
+
+impl SessionEndedExplodeConsumer {
+    /// Explode ended sessions found on the data-plane `store` into per-RP deliveries.
     #[must_use]
-    pub fn new(
-        store: Store,
-        env: Env,
-        issuers: Arc<IssuerRegistry>,
-        sender: S,
-        settings: WorkerSettings,
-    ) -> Self {
-        Self {
-            store,
-            env,
-            issuers,
-            sender,
-            settings,
-        }
+    pub fn new(store: Store) -> Self {
+        Self { store }
     }
 
-    /// Run ONE drain pass for `scope`: explode any newly-drained session-ended events
-    /// into per-RP deliveries, then attempt every due delivery. Returns the per-pass
-    /// statistics. A production loop calls this on a cadence per scope; a test calls it
-    /// directly, advancing the manual clock to exercise the backoff schedule.
-    ///
-    /// # Errors
-    ///
-    /// [`ironauth_store::StoreError`] on a persistence fault; a single RP's delivery
-    /// failure is NOT an error (it is retried or dead-lettered), so a failing RP never
-    /// aborts the pass or blocks the others.
-    pub async fn run_once(&self, scope: Scope) -> Result<DrainStats, ironauth_store::StoreError> {
-        let mut stats = DrainStats::default();
-        self.explode(scope, &mut stats).await?;
-        self.deliver(scope, &mut stats).await?;
-        Ok(stats)
-    }
-
-    /// The explode stage: claim newly-visible session-ended events off the #35 outbox and
-    /// fan each into one per-RP delivery row, then mark the outbox event delivered so it
-    /// never drains again. The explode is idempotent (a redelivered outbox event queues
-    /// no duplicate deliveries), so marking the event delivered only after the deliveries
-    /// are durably queued is safe.
+    /// Resolve the participants of ONE ended session and enqueue one delivery message
+    /// each. Returns how many were NEWLY enqueued (zero on a re-run that finds them all).
     async fn explode(
         &self,
+        env: &Env,
         scope: Scope,
-        stats: &mut DrainStats,
-    ) -> Result<(), ironauth_store::StoreError> {
+        message: &OutboxMessage,
+    ) -> Result<u64, ConsumerError> {
+        let session_text = payload_str(message, PAYLOAD_SESSION_ID)?;
+        // A session id that does not parse in this scope can never parse in it, so this
+        // is permanent: retrying would burn the attempts cap to reach the same dead
+        // letter.
+        let session_id = SessionId::parse_in_scope(session_text, &scope)
+            .map_err(|_| ConsumerError::permanent(MALFORMED_PAYLOAD_LABEL))?;
         let scoped = self.store.scoped(scope);
-        let events = scoped
-            .session_events()
-            .claim(&self.env, self.settings.lease, self.settings.batch)
-            .await?;
-        for event in &events {
-            scoped
-                .backchannel_deliveries()
-                .enqueue_for_event(&self.env, &event.id, &event.session_id)
-                .await?;
-            // The deliveries are durably queued; retire the outbox event. The mark is
-            // FENCED on the lease this claim was handed (issue #104), so if the explode
-            // outran the visibility timeout and another worker has since taken the event,
-            // this one does not retire it out from under that worker. Either way it is
-            // idempotent: a re-drain simply re-explodes into the same rows.
-            scoped
-                .session_events()
-                .mark_delivered(&self.env, event)
-                .await?;
-            stats.events_exploded += 1;
-        }
-        Ok(())
+        let participants = scoped
+            .client_sessions()
+            .backchannel_participants(&session_id)
+            .await
+            .map_err(|_| ConsumerError::retryable(STORE_ERROR_LABEL))?;
+        // The keys are built first and borrowed by the messages, because
+        // `NewOutboxMessage` holds `&str` and the fan-out must be ONE slice so it commits
+        // atomically.
+        let keys: Vec<String> = participants
+            .iter()
+            .map(|rp| delivery_key(session_text, &rp.client_id))
+            .collect();
+        let payloads: Vec<serde_json::Value> = participants
+            .iter()
+            .map(|rp| {
+                json!({
+                    PAYLOAD_SESSION_ID: session_text,
+                    PAYLOAD_CLIENT_ID: rp.client_id,
+                    PAYLOAD_SID: rp.sid,
+                    PAYLOAD_LOGOUT_URI: rp.logout_uri,
+                    // Minted HERE, once, and carried on the immutable payload, so every
+                    // attempt of this delivery presents the identical jti.
+                    PAYLOAD_JTI: IssuedTokenId::generate(env, &scope).to_string(),
+                })
+            })
+            .collect();
+        let messages: Vec<NewOutboxMessage<'_>> = keys
+            .iter()
+            .zip(payloads)
+            .map(|(key, payload)| NewOutboxMessage {
+                consumer: BACKCHANNEL_LOGOUT_CONSUMER,
+                idempotency_key: key,
+                // The SAME value as the idempotency key: a singleton ordering group per
+                // delivery, so no RP can ever be behind another in a queue.
+                ordering_key: key,
+                payload,
+            })
+            .collect();
+        scoped
+            .outbox()
+            .enqueue_all(env, &messages)
+            .await
+            .map_err(|_| ConsumerError::retryable(STORE_ERROR_LABEL))
+    }
+}
+
+impl OutboxConsumer for SessionEndedExplodeConsumer {
+    fn name(&self) -> &str {
+        SESSION_ENDED_CONSUMER
     }
 
-    /// The deliver stage: claim due deliveries and attempt each. On a 2xx the delivery is
-    /// marked delivered; on a failure it is scheduled for a bounded backoff retry, or
-    /// dead-lettered once the attempts cap is reached. Each delivery is independent, so a
-    /// slow or failing RP never blocks another.
-    async fn deliver(
-        &self,
+    fn handle<'a>(
+        &'a self,
+        env: &'a Env,
         scope: Scope,
-        stats: &mut DrainStats,
-    ) -> Result<(), ironauth_store::StoreError> {
-        let scoped = self.store.scoped(scope);
-        let due = scoped
-            .backchannel_deliveries()
-            .claim_due(&self.env, self.settings.lease, self.settings.batch)
-            .await?;
-        for delivery in &due {
-            let outcome = self.attempt_one(scope, delivery).await;
-            let deliveries = scoped.backchannel_deliveries();
-            match outcome {
-                Ok(()) => {
-                    deliveries.mark_delivered(&self.env, &delivery.id).await?;
-                    stats.delivered += 1;
-                }
-                Err(failure) => {
-                    // This claim was one attempt; count it and decide.
-                    let attempts_after = delivery.attempts.saturating_add(1);
-                    let cap = i32::try_from(self.settings.max_attempts).unwrap_or(i32::MAX);
-                    if attempts_after >= cap {
-                        deliveries
-                            .record_failure(
-                                &self.env,
-                                &delivery.id,
-                                attempts_after,
-                                None,
-                                &failure.label(),
-                            )
-                            .await?;
-                        stats.dead_lettered += 1;
-                    } else {
-                        let next = self.next_attempt_micros(attempts_after);
-                        deliveries
-                            .record_failure(
-                                &self.env,
-                                &delivery.id,
-                                attempts_after,
-                                Some(next),
-                                &failure.label(),
-                            )
-                            .await?;
-                        stats.retried += 1;
-                    }
-                }
-            }
-        }
-        Ok(())
+        message: &'a OutboxMessage,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ConsumerError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.explode(env, scope, message).await?;
+            Ok(())
+        })
     }
+}
 
-    /// Attempt ONE delivery: build the RP's own signed Logout Token, then POST it through
-    /// the sender. A missing signing key (an unprovisioned environment) is a
-    /// [`SendFailure::Transport`], so the delivery is retried and eventually dead-lettered
-    /// rather than lost.
-    async fn attempt_one(
-        &self,
-        scope: Scope,
-        delivery: &ironauth_store::LogoutDelivery,
-    ) -> Result<(), SendFailure> {
-        let token = self
-            .build_token(scope, &delivery.client_id, &delivery.sid, &delivery.jti)
-            .await?;
-        self.sender.deliver(&delivery.logout_uri, &token).await
+/// The DELIVERY consumer (issue #104): exactly ONE relying party's Logout Token POST.
+///
+/// It registers under [`BACKCHANNEL_LOGOUT_CONSUMER`], the name
+/// [`SessionEndedExplodeConsumer`] produces under, read from the same exported constant.
+/// It is generic over [`LogoutSender`] so the network is injectable; production passes
+/// [`FetchLogoutSender`], which routes every POST through the SSRF-hardened fetcher.
+///
+/// One message is one recipient, so a dead RP consumes only its OWN attempts and
+/// dead-letters only its OWN delivery. The substrate owns the backoff schedule, the
+/// attempts cap and the dead-letter, which is why this type has no retry arithmetic of
+/// its own.
+///
+/// Delivery is at-least-once: a handler that POSTs and then loses its lease before the
+/// completion is recorded is re-run, and the RP sees the same token twice. That is the
+/// contract, and the stable `jti` on the immutable payload is what makes it safe.
+pub struct BackChannelLogoutConsumer<S> {
+    issuers: Arc<IssuerRegistry>,
+    sender: S,
+}
+
+impl<S: LogoutSender> BackChannelLogoutConsumer<S> {
+    /// Build a delivery consumer over the shared issuer registry (for the per-environment
+    /// signing key and issuer string) and a `sender`.
+    ///
+    /// It deliberately holds NO environment seam of its own. The clock it stamps `iat` and
+    /// `exp` from is the one the WORKER hands to
+    /// [`handle`](OutboxConsumer::handle), which is the same seam the queue reads its
+    /// visibility lease and backoff gate from. A stored second copy could be a different
+    /// `Env` from the worker's, and the symptom would be logout tokens minted against a
+    /// clock the queue does not share.
+    #[must_use]
+    pub fn new(issuers: Arc<IssuerRegistry>, sender: S) -> Self {
+        Self { issuers, sender }
     }
 
     /// Build and sign the Logout Token for one (client, session) pair, through the SAME
     /// per-environment issuer/key and ironauth-jose core an ID token uses. The `jti` is
-    /// the delivery's OWN, minted once at explode time and reused across every attempt, so
-    /// a retry re-POSTs the SAME token and the RP dedups on it.
+    /// the delivery message's OWN, minted once at explode time and carried on its
+    /// immutable payload, so a retry re-POSTs the SAME token and the RP dedups on it.
     async fn build_token(
         &self,
+        env: &Env,
         scope: Scope,
         client_id: &str,
         sid: &str,
         jti: &str,
     ) -> Result<String, SendFailure> {
-        let now = self.env.clock().now_utc();
+        let now = env.clock().now_utc();
         let entry = self
             .issuers
             .entry_for(&scope, now)
@@ -441,25 +463,55 @@ impl<S: LogoutSender> BackChannelLogoutWorker<S> {
         .map_err(|_| SendFailure::Transport)
     }
 
-    /// The instant (epoch micros) the next retry becomes due: `now + base * 2^(n-1)`
-    /// seconds plus a jitter of up to `base` seconds, both drawn from the deterministic
-    /// clock and entropy seams (so the schedule is exact under a manual clock in tests).
-    /// The exponential term is capped to avoid an absurd or overflowing delay.
-    fn next_attempt_micros(&self, attempt_after: i32) -> i64 {
-        let now = self.env.clock().now_utc();
-        let base = self.settings.retry_base.as_secs().max(1);
-        let shift = u32::try_from(attempt_after.saturating_sub(1))
-            .unwrap_or(0)
-            .min(16);
-        let backoff = base.saturating_mul(1_u64 << shift).min(MAX_BACKOFF_SECS);
-        let mut bytes = [0_u8; 8];
-        self.env.entropy().fill_bytes(&mut bytes);
-        let jitter = u64::from_le_bytes(bytes) % base;
-        let total = backoff.saturating_add(jitter).min(MAX_BACKOFF_SECS);
-        let delta_micros = i64::try_from(total)
-            .unwrap_or(i64::MAX)
-            .saturating_mul(1_000_000);
-        unix_micros(now).saturating_add(delta_micros)
+    /// Deliver ONE message: read the recipient off the payload, mint its token, POST it.
+    async fn deliver_one(
+        &self,
+        env: &Env,
+        scope: Scope,
+        message: &OutboxMessage,
+    ) -> Result<(), ConsumerError> {
+        let client_id = payload_str(message, PAYLOAD_CLIENT_ID)?;
+        let sid = payload_str(message, PAYLOAD_SID)?;
+        let logout_uri = payload_str(message, PAYLOAD_LOGOUT_URI)?;
+        let jti = payload_str(message, PAYLOAD_JTI)?;
+        let token = self
+            .build_token(env, scope, client_id, sid, jti)
+            .await
+            // Every mint failure is RETRYABLE, because a mint that failed once can
+            // succeed later (an environment whose signing key is not provisioned yet, a
+            // control-plane read that did not answer) and treating it as permanent would
+            // discard the logout on one unlucky pass.
+            //
+            // "A later attempt fixes it" is true only while attempts REMAIN, and that is
+            // worth stating rather than implying: the budget is finite, so any cause that
+            // outlasts the backoff schedule ends in a dead letter, not in a fix. The one
+            // cause that reliably outlasts it was a SUSPENDED environment, whose every
+            // mint fails for as long as the suspension lasts; that case no longer reaches
+            // this line, because a fenced scope is skipped before its messages are
+            // claimed (`OutboxWorker::run_once_until`).
+            .map_err(|failure| ConsumerError::retryable(failure.label()))?;
+        self.sender
+            .deliver(logout_uri, &token)
+            .await
+            // A refused destination, a timeout, a non-2xx and a transport fault are all
+            // retryable: the substrate's finite attempts cap is what turns a persistently
+            // dead RP into a dead letter, so nothing here needs a second way to give up.
+            .map_err(|failure| ConsumerError::retryable(failure.label()))
+    }
+}
+
+impl<S: LogoutSender> OutboxConsumer for BackChannelLogoutConsumer<S> {
+    fn name(&self) -> &str {
+        BACKCHANNEL_LOGOUT_CONSUMER
+    }
+
+    fn handle<'a>(
+        &'a self,
+        env: &'a Env,
+        scope: Scope,
+        message: &'a OutboxMessage,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ConsumerError>> + Send + 'a>> {
+        Box::pin(async move { self.deliver_one(env, scope, message).await })
     }
 }
 
@@ -467,14 +519,6 @@ impl<S: LogoutSender> BackChannelLogoutWorker<S> {
 fn unix_secs(at: SystemTime) -> i64 {
     match at.duration_since(SystemTime::UNIX_EPOCH) {
         Ok(delta) => i64::try_from(delta.as_secs()).unwrap_or(i64::MAX),
-        Err(_) => 0,
-    }
-}
-
-/// Microseconds since the Unix epoch for a wall-clock instant (saturating).
-fn unix_micros(at: SystemTime) -> i64 {
-    match at.duration_since(SystemTime::UNIX_EPOCH) {
-        Ok(delta) => i64::try_from(delta.as_micros()).unwrap_or(i64::MAX),
         Err(_) => 0,
     }
 }

@@ -183,8 +183,8 @@ pub use authn::{
     methods_token, parse_methods, required_class, satisfied_class,
 };
 pub use backchannel::{
-    BACKCHANNEL_LOGOUT_EVENT, BackChannelLogoutWorker, DrainStats, FetchLogoutSender,
-    LOGOUT_TOKEN_TYP, LogoutSender, SendFailure, WorkerSettings, build_logout_token_claims,
+    BACKCHANNEL_LOGOUT_EVENT, BackChannelLogoutConsumer, FetchLogoutSender, LOGOUT_TOKEN_TYP,
+    LogoutSender, SendFailure, SessionEndedExplodeConsumer, build_logout_token_claims,
 };
 pub use client_auth::{
     AuthenticatedClient, ClientAuthError, ClientAuthInputs, ClientAuthMethod, ClientAuthParseError,

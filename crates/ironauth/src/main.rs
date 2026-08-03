@@ -14,22 +14,27 @@ use axum::Router;
 use ironauth_admin::{AdminOidcBridge, AdminState};
 use ironauth_config::{
     ADVANCED_RECOVERY_FEATURE, Config, FEDCM_FEATURE, FIRST_PARTY_CHALLENGE_FEATURE,
-    FeatureRegistry, GLOBAL_TOKEN_REVOCATION_FEATURE, Loaded, OidcConfig, PasswordPolicyConfig,
-    RISK_SIGNALS_FEATURE, ScreeningFailurePolicy, ScreeningProvider,
+    FeatureRegistry, GLOBAL_TOKEN_REVOCATION_FEATURE, Loaded, OidcConfig, OutboxConfig,
+    PasswordPolicyConfig, RISK_SIGNALS_FEATURE, ScreeningFailurePolicy, ScreeningProvider,
 };
 use ironauth_env::Env;
 use ironauth_jose::MasterKey;
 use ironauth_oidc::{
-    BackChannelLogoutWorker, CredentialClass, DiscoveryCapabilities, DiscoveryState,
+    BackChannelLogoutConsumer, CredentialClass, DiscoveryCapabilities, DiscoveryState,
     FederationKeyResolver, FederationRuntime, FetchLogoutSender, IssuerRegistry, IssuerState,
-    JwksCacheWindow, OidcState, WorkerSettings, canonical_login_identifier, canonical_step_up_acr,
-    discovery_router, issuer_router, oidc_router,
+    JwksCacheWindow, OidcState, SessionEndedExplodeConsumer, canonical_login_identifier,
+    canonical_step_up_acr, discovery_router, issuer_router, oidc_router,
 };
 use ironauth_quota::QuotaEnforcer;
 use ironauth_server::{Server, ServerError};
 use ironauth_store::{
     AbuseBanId, AbuseSubject, AbuseSubjectKind, ActorRef, AuthPath, ClientId, CorrelationId,
-    EnvironmentId, NewBan, Scope, ServiceId, Store, TenantId,
+    EnvironmentId, NewBan, RetryPolicy, SESSION_ENDED_CONSUMER, Scope, ServiceId, Store,
+    StoreError, TenantId,
+    outbox::{
+        ConsumerRegistry, ControlPlaneScopes, DrainStats, OutboxConsumer, OutboxObserver,
+        OutboxWorker, OutboxWorkerPool, ScopeSource, WorkerSettings,
+    },
 };
 
 use crate::shared_config::SharedPlaneInputs;
@@ -42,6 +47,13 @@ mod shared_config;
 /// exactly as the CLI integration suite does.
 #[cfg(all(test, feature = "testing"))]
 mod boot_wiring_tests;
+
+/// The outbox boot seam (issue #104, PR 2): drives the REAL `spawn_consumer_pools` and
+/// `outbox_worker_settings` against a real database, because a pool loop that covers a
+/// subset of the registry compiles, lints and tests clean. DB-backed, so it rides the
+/// `testing` feature exactly as the boot-wiring harness does.
+#[cfg(all(test, feature = "testing"))]
+mod outbox_wiring_tests;
 
 /// Semantic version of this build, injected by Cargo.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -334,13 +346,17 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // The OIDC Back-Channel Logout delivery worker (issue #34), spawned only when the
         // OIDC provider is mounted AND its posture switch is on. Off by default (the
         // covenant: no mandatory background infrastructure).
-        if let Some(inputs) = backchannel_inputs {
-            spawn_backchannel_logout_worker(inputs, server.base_url()).await;
-        }
+        // The pools are BOUND rather than detached, so the shutdown below can await them.
+        // Dropping them here instead would stop the workers at the next flag check, which
+        // is the opposite of what a graceful stop wants.
+        let logout_pools = match backchannel_inputs {
+            Some(inputs) => spawn_backchannel_logout_pools(inputs, server.base_url()).await,
+            None => Vec::new(),
+        };
 
         tracing::info!(base_url = %server.base_url(), "starting ironauth");
 
-        match server.run(ironauth_server::shutdown_signal()).await {
+        let outcome = match server.run(ironauth_server::shutdown_signal()).await {
             Ok(()) => {
                 tracing::info!("ironauth stopped cleanly");
                 ExitCode::SUCCESS
@@ -349,7 +365,14 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
                 tracing::error!(%error, "server exited with error");
                 ExitCode::FAILURE
             }
+        };
+        // Stop the outbox pools and WAIT for their in-flight passes. A claimed message
+        // that is not completed is not lost: its lease lapses and the next boot re-claims
+        // it, which is the same path a crash takes.
+        for pool in logout_pools {
+            pool.shutdown().await;
         }
+        outcome
     })
 }
 
@@ -1149,8 +1172,12 @@ fn build_breach_provider(
 /// What the Back-Channel Logout delivery worker (issue #34) needs to start, captured
 /// before `config` moves into the server.
 struct BackChannelWorkerInputs {
-    /// The OIDC settings (the worker tuning knobs and the JWKS cache window).
+    /// The OIDC settings (the per-delivery HTTP budget and the JWKS cache window).
     oidc: OidcConfig,
+    /// The shared `[outbox]` tuning every consumer's pool is built from (issue #104):
+    /// concurrency, the visibility lease, the poll cadence, the claim batch and the
+    /// retry schedule. Back-channel logout no longer carries its own copy of any of them.
+    outbox: OutboxConfig,
     /// The data-plane DSN the worker drains and signs through (the least-privilege
     /// `ironauth_app` role in production).
     data_plane_dsn: String,
@@ -1172,6 +1199,7 @@ fn backchannel_worker_inputs(config: &Config, env: &Env) -> Option<BackChannelWo
     }
     Some(BackChannelWorkerInputs {
         oidc: config.oidc.clone(),
+        outbox: config.outbox.clone(),
         data_plane_dsn: config.database.url.expose().to_owned(),
         control_dsn: select_control_dsn(config),
         env: env.clone(),
@@ -1258,21 +1286,220 @@ async fn run_signing_algorithm_backfill(inputs: SigningBackfillInputs) {
     }
 }
 
-/// Spawn the OIDC Back-Channel Logout delivery worker (issue #34) as a detached
-/// background task.
+/// The attempts budget a FAN-OUT consumer runs under (issue #104): effectively unbounded.
 ///
-/// The worker drains the durable session-ended outbox per scope, builds one signed
-/// Logout Token per participating relying party, and POSTs it through the SSRF-hardened
-/// outbound fetcher, with bounded-backoff retries and a dead-letter state. Scope
-/// enumeration is a CONTROL-plane read (the data-plane role cannot see the non-RLS
-/// `environments` table), so the worker needs both a data-plane store (to drain and sign)
-/// and a control-plane store (to enumerate). Any failure to connect or a missing control
-/// DSN is logged and the worker is simply not spawned; the rest of the server runs
-/// unaffected (the delivery queue is provisional and deliberately minimal, per issue #34,
-/// and M11 migrates it onto the shared job-queue substrate).
-async fn spawn_backchannel_logout_worker(inputs: BackChannelWorkerInputs, issuer_base: String) {
+/// It is not a tuning preference, it is the difference between losing one notification and
+/// losing all of them, and it is worth spelling the derivation out.
+///
+/// `outbox.max_attempts` is the right bound for a DELIVERY message. One such message is one
+/// relying party, its retryable failures are an unreachable network endpoint, and a finite
+/// bound is exactly what turns a permanently dead RP into a dead letter instead of an
+/// infinite retry.
+///
+/// A `session_ended` message is the opposite in every one of those respects. It is the
+/// WHOLE fan-out of one ended session, and it is the whole fan-out at a moment when no
+/// per-RP message exists yet, so dead-lettering it leaves every relying party of that
+/// session un-notified, with no per-RP record anywhere to replay from and nothing an
+/// operator would ever see except a row in a dead-letter tail. Its handler makes no
+/// outbound call at all: it reads participants and enqueues rows, both against the local
+/// database, so the ONLY failure it can classify as retryable is a database fault. A
+/// database fault is transient by construction (a permanent one has already taken the whole
+/// process with it), which means a bound on this consumer cannot distinguish "give up on
+/// bad work" from "give up because the database was unwell for a few minutes". At the
+/// shipped defaults it is the latter: five attempts on a 10 second base is about 150
+/// seconds of trouble, after which a session's entire logout fan-out is discarded forever.
+///
+/// The bound cannot be doing the OTHER job a finite bound does either, which is escaping a
+/// poison message. Every input this handler cannot process (an unreadable payload, a
+/// session id that does not parse in its scope) is already classified `permanent` and
+/// dead-letters on its FIRST attempt whatever this number is. What is left for the bound to
+/// catch is a `consumer_panic`, and retrying that forever is the better failure: the panic
+/// is a code defect that will affect every session, so dead-lettering would discard all of
+/// them permanently rather than replaying them once the defect is fixed.
+///
+/// Unbounded retry is also what this consumer did BEFORE it moved onto the substrate. The
+/// deleted hand-rolled worker propagated a store fault out of its loop, logged it, let the
+/// lease lapse, and re-claimed the message on the next pass, forever. Migrating to a generic
+/// substrate is what introduced a terminal state here, so this restores the property rather
+/// than inventing one.
+///
+/// The objection `OutboxConfig::max_attempts` states against an unlimited value, that "a
+/// message that shares an ordering key with others BLOCKS them until it reaches a terminal
+/// state, so the dead letter is what releases the aggregate", does not reach this consumer,
+/// and that is why the exemption is safe HERE and is not offered as a configuration value
+/// for consumers in general. A `session_ended` message's ordering key is the ended session
+/// id, and a session ends once, so every group is a SINGLETON: there is nothing behind it
+/// to block. A consumer whose producers share ordering keys must keep the finite bound.
+///
+/// "Effectively" unbounded and not literally so: the retry schedule caps its backoff at one
+/// hour, so this budget is roughly two billion hourly attempts. Nothing reaches it, and
+/// nothing here has to reason about what an unbounded loop would mean.
+const FANOUT_MAX_ATTEMPTS: u32 = u32::MAX;
+
+/// Map the shared `[outbox]` section to the worker tuning ONE consumer's pool is built
+/// from (issue #104), in ONE place.
+///
+/// Every pool reads the same numbers, so translating them per call site is how two pools
+/// end up with different leases from one configuration. `claim_batch` is a `u32` in
+/// configuration and an `i64` on the claim, and the widening is infallible.
+///
+/// EXACTLY ONE number varies by consumer, the attempts budget, and it varies here rather
+/// than at a call site so that "the lease, the cadence, the batch and the backoff base are
+/// the same for every pool" stays a property of one function a reader can check.
+/// [`FANOUT_MAX_ATTEMPTS`] argues why the fan-out consumer is the one that differs.
+fn outbox_worker_settings(outbox: &OutboxConfig, consumer: &str) -> WorkerSettings {
+    let max_attempts = if consumer == SESSION_ENDED_CONSUMER {
+        FANOUT_MAX_ATTEMPTS
+    } else {
+        outbox.max_attempts
+    };
+    WorkerSettings {
+        concurrency: outbox.worker_concurrency,
+        visibility_timeout: std::time::Duration::from_secs(outbox.visibility_timeout_secs),
+        poll_interval: std::time::Duration::from_secs(outbox.poll_interval_secs),
+        batch: i64::from(outbox.claim_batch),
+        retry: RetryPolicy {
+            max_attempts,
+            retry_base: std::time::Duration::from_secs(outbox.retry_base_secs),
+        },
+    }
+}
+
+/// Report what the outbox pools are doing, from the side of the process that has a logging
+/// framework (issue #104).
+///
+/// ironauth-store deliberately takes no tracing dependency, and its pool loop used to
+/// discard every outcome with a `let _ =`. That made a dead-lettered logout, a drain pass
+/// failing on a persistence fault, and a scope sweep that never returned a scope all
+/// invisible: the pool reported full health throughout, because its workers were alive and
+/// looping. This is the binary half of the seam that ends that.
+struct TracingOutboxObserver;
+
+/// How loud one finished drain pass deserves to be (issue #104). Split out from the log
+/// call so the decision is a value a test can assert on rather than a side effect it would
+/// have to capture a subscriber to observe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PassSeverity {
+    /// Nothing an operator needs to see: work happened, or none was due.
+    Quiet,
+    /// Work was GIVEN UP ON. A dead letter never happens unless somebody replays it, and
+    /// for the fan-out consumer one of them is an entire session's worth of logouts.
+    Alert,
+}
+
+/// The severity of one finished pass.
+fn pass_severity(stats: &DrainStats) -> PassSeverity {
+    if stats.dead_lettered > 0 {
+        PassSeverity::Alert
+    } else {
+        PassSeverity::Quiet
+    }
+}
+
+impl OutboxObserver for TracingOutboxObserver {
+    fn pass_finished(&self, consumer: &str, scope: Scope, stats: &DrainStats) {
+        match pass_severity(stats) {
+            // Deliberately not logged at all: one line per pool per scope per poll
+            // interval is a log the useful lines below would be lost in.
+            PassSeverity::Quiet => {}
+            PassSeverity::Alert => tracing::error!(
+                consumer,
+                tenant = %scope.tenant(),
+                environment = %scope.environment(),
+                dead_lettered = stats.dead_lettered,
+                claimed = stats.claimed,
+                "outbox messages were DEAD-LETTERED and will not be retried; replay them"
+            ),
+        }
+    }
+
+    fn pass_failed(&self, consumer: &str, scope: Scope, error: &StoreError) {
+        tracing::warn!(
+            consumer,
+            tenant = %scope.tenant(),
+            environment = %scope.environment(),
+            %error,
+            "outbox drain pass failed for a scope; the work is still queued and will be retried"
+        );
+    }
+
+    fn scopes_unavailable(&self, consumer: &str, error: &StoreError) {
+        tracing::warn!(
+            consumer,
+            %error,
+            "outbox worker could not enumerate scopes; NO scope was drained this pass"
+        );
+    }
+}
+
+/// Spawn ONE pool per registered consumer (issue #104), each with the tuning its own name
+/// selects, all sweeping the same scopes and reporting to the same observer.
+///
+/// This is the loop the whole framework exists to be driven by, so it is a named function
+/// with the store, the scopes and the observer as arguments rather than a closure buried in
+/// `spawn_backchannel_logout_pools`: that is what lets a test in this crate drive the REAL
+/// seam against a real database, instead of re-implementing it and asserting about the copy.
+/// Measured, with `.take(1)` dropped into this iterator so that the binary spawns the
+/// fan-out pool and never the delivery pool: with `outbox_wiring_tests` SKIPPED, all 17
+/// remaining tests of this crate pass and
+/// `cargo clippy --workspace --all-targets --all-features -- -D warnings` is clean. A build
+/// that fans every ended session out into per-relying-party messages and then POSTs not one
+/// Logout Token passes the whole local gate. With the suite present the same mutation turns
+/// `every_registered_consumer_gets_a_pool_that_actually_drains_it` RED.
+///
+/// It covers the registry EXHAUSTIVELY by construction, and `every_registered_consumer_gets_a_pool`
+/// is the assertion that it still does.
+fn spawn_consumer_pools(
+    consumers: &ConsumerRegistry,
+    store: &Store,
+    env: &Env,
+    outbox: &OutboxConfig,
+    scopes: &Arc<dyn ScopeSource>,
+    observer: &Arc<dyn OutboxObserver>,
+) -> Vec<OutboxWorkerPool> {
+    consumers
+        .all()
+        .into_iter()
+        .map(|consumer| {
+            let settings = outbox_worker_settings(outbox, consumer.name());
+            let worker = OutboxWorker::new(store.clone(), env.clone(), consumer, settings);
+            OutboxWorkerPool::spawn(&worker, scopes, observer)
+        })
+        .collect()
+}
+
+/// Start the OIDC Back-Channel Logout consumers (issue #34) on the generic outbox worker
+/// pool (issue #104), returning the RUNNING pools so the caller can shut them down.
+///
+/// This is the first production wiring of the outbox consumer framework. What is
+/// BACK-CHANNEL LOGOUT specific is here: the two logout consumers, the issuer registry and
+/// the SSRF-hardened sender they need, and the two stores. What is GENERIC is deliberately
+/// not, so the second subsystem to arrive extends it rather than copying it:
+/// [`outbox_worker_settings`] maps the configuration section, [`spawn_consumer_pools`]
+/// turns a [`ConsumerRegistry`] into one running pool each, [`ControlPlaneScopes`] resolves
+/// the scopes, and [`TracingOutboxObserver`] is what makes any of it visible.
+///
+/// TWO consumers, and the split is a safety property rather than a decomposition
+/// preference. [`SessionEndedExplodeConsumer`] turns one ended session into one message
+/// per participating relying party; [`BackChannelLogoutConsumer`] delivers exactly one of
+/// them. Fusing them would give every RP of a session a shared attempts counter, so one
+/// dead RP would dead-letter the whole session's logout, including the RPs that would have
+/// succeeded.
+///
+/// Scope enumeration is a CONTROL-plane read (the data-plane role cannot see the non-RLS
+/// `environments` table), so this needs both a data-plane store (to drain, resolve and
+/// sign) and a control-plane store (to enumerate). Any failure to connect or a missing
+/// control DSN is logged and NOTHING is started; the rest of the server runs unaffected
+/// and the queue is durable, so the work waits rather than being lost.
+///
+/// Returns an empty vector on every early return, which the caller shuts down as a no-op.
+async fn spawn_backchannel_logout_pools(
+    inputs: BackChannelWorkerInputs,
+    issuer_base: String,
+) -> Vec<OutboxWorkerPool> {
     let BackChannelWorkerInputs {
         oidc,
+        outbox,
         data_plane_dsn,
         control_dsn,
         env,
@@ -1284,21 +1511,21 @@ async fn spawn_backchannel_logout_worker(inputs: BackChannelWorkerInputs, issuer
              (set admin.control_database_url, or run in dev_mode). The delivery queue is durable, \
              so nothing is lost; enable the control plane to drain it."
         );
-        return;
+        return Vec::new();
     };
 
     let data_store = match Store::connect(&data_plane_dsn).await {
         Ok(store) => store,
         Err(error) => {
             tracing::error!(%error, "back-channel logout worker not started: data-plane connect failed");
-            return;
+            return Vec::new();
         }
     };
     let control_store = match Store::connect(&control_dsn).await {
         Ok(store) => store,
         Err(error) => {
             tracing::error!(%error, "back-channel logout worker not started: control-plane connect failed");
-            return;
+            return Vec::new();
         }
     };
 
@@ -1314,38 +1541,40 @@ async fn spawn_backchannel_logout_worker(inputs: BackChannelWorkerInputs, issuer
         Ok(sender) => sender,
         Err(error) => {
             tracing::error!(%error, "back-channel logout worker not started: fetcher setup failed");
-            return;
+            return Vec::new();
         }
     };
-    let settings = WorkerSettings {
-        max_attempts: oidc.backchannel_logout_max_attempts,
-        retry_base: std::time::Duration::from_secs(oidc.backchannel_logout_retry_base_secs),
-        lease: std::time::Duration::from_secs(oidc.backchannel_logout_request_timeout_secs.max(30)),
-        batch: 64,
-    };
-    let poll = std::time::Duration::from_secs(oidc.backchannel_logout_poll_interval_secs);
-    let worker = BackChannelLogoutWorker::new(data_store, env, registry, sender, settings);
+
+    let mut consumers = ConsumerRegistry::new();
+    // A duplicate name is refused by the registry, and refusing to start is the right
+    // answer to it: two consumers under one name means one subsystem's messages vanish
+    // into another's handler. It cannot happen with these two fixed registrations, so it
+    // is reported and treated as fatal for the pools rather than silently tolerated.
+    for consumer in [
+        Arc::new(SessionEndedExplodeConsumer::new(data_store.clone())) as Arc<dyn OutboxConsumer>,
+        Arc::new(BackChannelLogoutConsumer::new(
+            Arc::clone(&registry),
+            sender,
+        )) as Arc<dyn OutboxConsumer>,
+    ] {
+        if let Err(error) = consumers.register(consumer) {
+            tracing::error!(%error, "back-channel logout worker not started: duplicate consumer name");
+            return Vec::new();
+        }
+    }
+
+    // ONE mapping of the `[outbox]` section for every pool, in `outbox_worker_settings`,
+    // so two pools can never be handed different leases from one configuration.
+    let scopes: Arc<dyn ScopeSource> = Arc::new(ControlPlaneScopes::new(control_store));
+    let observer: Arc<dyn OutboxObserver> = Arc::new(TracingOutboxObserver);
+    let pools = spawn_consumer_pools(&consumers, &data_store, &env, &outbox, &scopes, &observer);
 
     tracing::info!(
-        "back-channel logout delivery worker started; draining the session-ended outbox per scope"
+        consumers = ?consumers.names(),
+        pools = pools.len(),
+        "back-channel logout delivery started on the outbox consumer pools"
     );
-    tokio::spawn(async move {
-        loop {
-            match control_store.management().list_environment_scopes().await {
-                Ok(scopes) => {
-                    for scope in scopes {
-                        if let Err(error) = worker.run_once(scope).await {
-                            tracing::warn!(%error, "back-channel logout drain pass failed for a scope");
-                        }
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "back-channel logout worker could not enumerate scopes");
-                }
-            }
-            tokio::time::sleep(poll).await;
-        }
-    });
+    pools
 }
 
 /// Choose the control-plane database DSN for the management store (D2).
