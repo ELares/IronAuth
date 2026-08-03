@@ -6,6 +6,83 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **`outbox_messages` finally has retention, and it keys on the TERMINAL columns
+  (issue #104, PR 3).** Migration 0099 shipped the table saying "no role is granted DELETE,
+  and there is no reaper", and PR 2 multiplied its growth rate by roughly
+  `1 + N_relying_parties` rows per session end. It is not the only table in the schema that
+  only grows (the token and session tables do too, for a harder reason that
+  `docs/design/RETENTION.md` sets out), but it is the first with a PERIODIC SWEEPER and an
+  operator-configurable window rather than a prune keyed on a producer-stamped `expires_at`.
+  Migration 0102 grants DELETE to `ironauth_control` and to no other role.
+
+  - `OutboxRepo::reap_completed` and `OutboxRepo::reap_dead_lettered` are TWO methods
+    rather than one with a flag, so the path that erases evidence of work GIVEN UP ON is
+    greppable by name. Each is a bounded subselect (`DELETE` takes no `LIMIT` in Postgres),
+    copying the shape `PowChallengeRepo::reclaim_expired` already uses.
+  - The predicates key on `completed_at` and `dead_lettered_at`, NEVER on `enqueued_at`. A
+    message with both terminal columns NULL is not stale however old it is; it is
+    UNDELIVERED, and there is a shipped configuration that produces exactly that population
+    at scale, because `oidc.backchannel_logout_enabled` defaults off while the producer runs
+    regardless. An age-based reaper would delete pending logouts and leave `depth()`
+    reporting a clean queue. Worse, the claim's head-of-group rule reads terminal state, so
+    deleting a group's non-terminal head would unblock its group and deliver the survivors
+    out of order.
+  - `OutboxRepo::consumers_in_scope` enumerates the consumers with rows in a scope. The
+    sweep reads the TABLE rather than a registry: a consumer retired in an earlier release,
+    or one this replica does not run, has rows and no registration, and sweeping the
+    registry would leave exactly those rows unreapable forever. It is a RECURSIVE INDEX WALK
+    and not `SELECT DISTINCT`, because it is the first thing a pass does and the pass's whole
+    story is boundedness: `DISTINCT` reads every row of the scope, so its cost grows with
+    exactly the backlog the reaper has not cleared. Measured on Postgres 18.4 against the
+    shipped schema: 781 buffers and 8.0 ms at 50,000 rows and 7,908 buffers and 33.5 ms at
+    500,000, against 15 buffers and 0.07 ms, then 15 buffers and 0.09 ms, for the walk. The
+    walk is FLAT in the backlog; the scan is not.
+  - `OutboxDepth` gains `completed`, the reapable backlog. Without it zero was not
+    measurable against a known non-zero on the gauge that already existed: the other four
+    counters count non-terminal rows and the dead-letter tail retention keeps forever by
+    default. Note what it is NOT: `OutboxRepo::depth` has no production caller, so nothing
+    exports this number yet. The retention outcomes that leave the process today are the
+    observer reports the binary logs, and wiring the depth gauge to the metrics exporter is
+    recorded as the remaining gap in `docs/design/RETENTION.md`.
+  - `outbox::RetentionObserver` and `SilentRetentionObserver` are a SIBLING of
+    `OutboxObserver` rather than methods added to it, so a future non-outbox retention
+    target does not widen the trait every outbox consumer implements. Required rather than
+    optional, for the same reason the drain's is.
+  - `outbox::OutboxReaper` and `outbox::RetentionSweeper` are the periodic task. A pass
+    removes at most `batch` rows per (scope, consumer) per tail and does NOT loop until
+    drained: an unbounded delete over a first run's backlog is a long lock and one enormous
+    WAL record that stalls a replica. Hitting the bound is reported as SATURATED, so
+    "keeping up" and "falling behind forever" are distinguishable. The stop flag is read
+    between scopes and between consumers, and the wait between passes is sliced rather than
+    slept whole, because an hourly interval slept whole would make a graceful shutdown take
+    up to an hour.
+  - A FENCED scope is skipped entirely. A suspended tenant is one an operator paused, and
+    quietly deleting its data while it is paused is the last thing a pause should do; its
+    completed tail is precisely the delivery evidence somebody investigating the suspension
+    reads.
+  - WHAT A REAPED ROW GIVES UP, beyond the delivery evidence: its slot in the
+    `UNIQUE (tenant_id, environment_id, consumer, idempotency_key)` constraint 0099 created,
+    which is the queue's at-most-once ledger. Measured: after a reap, `enqueue_all` under the
+    same key inserts a CLAIMABLE row, so the work becomes deliverable twice, and a re-explode
+    mints a fresh `jti` so the relying party's own dedup does not catch it. It is not
+    reachable with today's consumers (a producer's re-enqueue window is bounded by
+    `max_attempts` and the backoff: about 200 seconds at the shipped defaults, against a one
+    hour floor), so the floor on `outbox.completed_retention_secs` is now documented as
+    `max(evidence window, longest producer re-enqueue horizon)` and pinned by a test.
+  - WHAT THIS DOES NOT SOLVE. Both reap predicates key on terminal columns and the consumer
+    pools are the only thing that writes one, so in a deployment where no consumer runs this
+    removes ZERO rows, forever, and correctly. It bounds the deployment where consumers DO
+    run, which is the `1 + N_relying_parties` volume PR 2 introduced. The undrained backlog
+    of a default deployment is a producer-side owner decision, recorded rather than papered
+    over.
+  - OPERATOR OBLIGATION: only `ironauth_control` may delete here, so a deployment with no
+    control-plane DSN gets NO REAPING AT ALL and `outbox_messages` grows without bound. The
+    binary logs that at error on boot. See `docs/design/RETENTION.md`, which also records
+    which other tables are not reaped and, for each, whether that is an owner policy
+    decision or an unsolved correctness problem, and which corrects this file's earlier
+    claim that `outbox_messages` was the only table with a shipped reaper (seven others
+    already prune on a producer-stamped `expires_at`).
+
 - **The identifier seam's NFKC rationale said "for idempotence", and that is not what it
   buys (issue #54).** Auditing every target that asserts idempotence, after the branding
   sanitizer's turned out to be false, put a mutation through `case_fold`: with the trailing

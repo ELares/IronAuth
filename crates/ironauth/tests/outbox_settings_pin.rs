@@ -38,7 +38,7 @@
 use std::time::Duration;
 
 use ironauth_config::OutboxConfig;
-use ironauth_store::outbox::WorkerSettings;
+use ironauth_store::outbox::{RetentionSettings, WorkerSettings};
 
 #[test]
 fn the_store_worker_defaults_are_the_configuration_defaults() {
@@ -87,5 +87,58 @@ fn the_store_worker_defaults_are_the_configuration_defaults() {
         settings.retry.max_attempts >= 1,
         "the attempts bound is finite and at least one: an unbounded retry wedges an \
          ordering group forever, which is why there is no unlimited value"
+    );
+}
+
+#[test]
+fn the_store_retention_defaults_are_the_configuration_defaults() {
+    // The same cross-crate agreement, for the retention half (issue #104, PR 3).
+    // `RetentionSettings::default()` writes the shipped windows a second time, in a crate
+    // that cannot see the configuration crate, so nothing in either would notice them
+    // drifting apart. Two of these are load-bearing CLAIMS made in prose rather than
+    // numbers a reader would check: that dead letters are kept FOREVER by default, and that
+    // the batch is a real bound rather than a chunk size.
+    let config = OutboxConfig::default();
+    let settings = RetentionSettings::default();
+
+    assert_eq!(
+        settings.completed_retention,
+        Duration::from_secs(config.completed_retention_secs),
+        "the completed window must agree: it bounds how long the only evidence a message \
+         was delivered survives"
+    );
+    assert_eq!(
+        settings.batch,
+        i64::from(config.reap_batch),
+        "the reap batch must agree"
+    );
+    assert_eq!(
+        settings.interval,
+        Duration::from_secs(config.reap_interval_secs),
+        "the sweep cadence must agree"
+    );
+
+    // The inverted sentinel, pinned from BOTH sides. `0` in configuration and `None` in the
+    // store are the same posture, and it is the opposite of the one a reader arriving from
+    // `diagnostics.retention_secs` would assume, where `0` prunes everything.
+    assert_eq!(
+        config.dead_letter_retention_secs, 0,
+        "the shipped configuration keeps dead letters forever"
+    );
+    assert_eq!(
+        settings.dead_letter_retention, None,
+        "and so does the shipped store default: a dead letter is the only record that a \
+         session's relying parties were never notified"
+    );
+
+    assert!(
+        settings.batch >= 1,
+        "the batch is a real bound: a zero batch is a sweeper that runs on a cadence and \
+         removes nothing, which looks exactly like a working one"
+    );
+    assert!(
+        config.reap_enabled,
+        "retention ships ON: outbox_messages otherwise grows monotonically, and migration \
+         0099 shipped the table with no retention of any kind"
     );
 }

@@ -1,7 +1,14 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! The outbox consumer framework (issue #104): the registration seam every async path
-//! implements, and the horizontally scalable worker pool that drives it.
+//! implements, the horizontally scalable worker pool that drives it, and the periodic
+//! reaper that bounds the queue's TERMINAL tail (PR 3, at the bottom of this file).
+//!
+//! The reaper is deliberately NOT a consumer and shares nothing with the pool but the
+//! `ScopeSource`, so it reaps the rows of consumers this binary does not run. What it
+//! bounds and what it does NOT is set out at [`RetentionSweeper`]; the short version is
+//! that it removes rows a consumer already RETIRED, so a deployment that drains nothing
+//! has nothing here for it to remove.
 //!
 //! ## Why this is a pool and never a singleton
 //!
@@ -64,7 +71,7 @@ use std::time::Duration;
 use ironauth_env::Env;
 
 use crate::error::StoreError;
-use crate::repository::{FailureOutcome, OutboxMessage, RetryPolicy};
+use crate::repository::{FailureOutcome, OutboxMessage, RetryPolicy, epoch_micros};
 use crate::scope::Scope;
 use crate::store::Store;
 
@@ -889,6 +896,452 @@ impl Drop for OutboxWorkerPool {
         // A dropped pool must not leave detached tasks claiming messages behind an
         // operator's back. The flag stops them at the next check; a caller that needs to
         // WAIT for them uses `shutdown`.
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Retention (issue #104, PR 3).
+//
+// `outbox_messages` grew monotonically: nothing removed a completed or dead-lettered row
+// and no role held DELETE. PR 2 multiplied the volume by roughly `1 + N_relying_parties`
+// per session end. What follows is the reaper, and it is deliberately NOT a consumer of
+// the queue it reaps.
+//
+// # Why this is a separate task and not an outbox consumer
+//
+// A reaper registered as a consumer, or folded into `OutboxWorker::run_once_until`, would
+// only ever reap the consumers THIS BINARY drains, and would only run where their pools
+// run. Both halves of that are wrong for retention.
+//
+// The rows are not the registry's. A consumer retired in an earlier release, or one this
+// replica does not run because its own feature switch is off, has rows in the table and no
+// registration; a registry-driven sweep leaves exactly those unreapable forever. So the
+// sweep enumerates the TABLE (`OutboxRepo::consumers_in_scope`), not the registry.
+//
+// And the pools' gate is not retention's gate. Today's pools are spawned behind
+// `oidc.enabled && oidc.backchannel_logout_enabled`, both default OFF. The outbox is a
+// GENERIC substrate: the next consumer to register (webhook delivery, a SIEM sink, a
+// migration job) will run behind a different switch, and retention must not have to be
+// re-wired for each one. A reaper on the pools' path would be one feature switch away from
+// being present, reviewed, tested and inert, which is the dead-surface shape PR 2 was
+// written to end.
+//
+// # What this does NOT solve, stated because an earlier draft of this comment claimed it did
+//
+// The growth that is worst in a DEFAULT deployment is not the growth this removes, and the
+// two must not be confused. `oidc.backchannel_logout_enabled` defaults off, the producer
+// that enqueues `session_ended` runs regardless, and the consumer pools are the ONLY thing
+// in the tree that ever writes `completed_at` or `dead_lettered_at`. Both reap methods key
+// on those columns, and they MUST (a non-terminal row of any age is undelivered work, not
+// a stale one: see `OutboxRepo::reap_completed`). So in exactly that deployment this
+// reaper removes ZERO rows, on every pass, forever, and it is correct to.
+//
+// Where it is valuable is where the consumers DO run, and that is the volume PR 2
+// multiplied: ending one session there enqueues roughly `1 + N_relying_parties` rows,
+// every one of which becomes terminal, and before this nothing removed any of them.
+//
+// The remaining gap is therefore real and is recorded rather than papered over. A
+// deployment with the logout switch off still accumulates undrained `session_ended`
+// messages without bound, and no setting here changes that. The answer lives on the
+// PRODUCER side (not enqueuing work no consumer will ever take), which is an owner decision
+// already deferred and is written up in `docs/design/RETENTION.md`. Widening this reaper to
+// non-terminal rows is NOT the answer and must not be done: those rows are precisely the
+// backlog that turning the switch on begins by draining.
+// ---------------------------------------------------------------------------
+
+/// How long a retired outbox message is kept, and how much of the backlog one pass may
+/// remove (issue #104, PR 3).
+///
+/// The two windows are NOT symmetric and the asymmetry is the design. A completed message
+/// is delivery evidence and is retired on a default window; a dead letter is work GIVEN UP
+/// ON, which for the back-channel logout fan-out is an entire session's relying parties
+/// that will never be notified, so it is kept forever unless an operator deliberately
+/// chooses otherwise.
+#[derive(Debug, Clone, Copy)]
+pub struct RetentionSettings {
+    /// How long a COMPLETED message is kept after its `completed_at`.
+    pub completed_retention: Duration,
+    /// How long a DEAD-LETTERED message is kept after its `dead_lettered_at`, or [`None`]
+    /// to keep it forever, which is the default.
+    ///
+    /// An [`Option`] rather than a duration with a magic zero, because in this crate the
+    /// distinction has to be un-mistakable: a zero-second window would mean "delete every
+    /// dead letter on the next pass", which is the opposite of the shipped posture and the
+    /// exact reading a caller coming from a diagnostics-style retention would assume.
+    pub dead_letter_retention: Option<Duration>,
+    /// The largest number of rows ONE pass removes per (scope, consumer) per tail.
+    ///
+    /// A hard bound rather than a chunk size to loop over. An unbounded delete across a
+    /// first run's accumulated backlog holds a long lock and produces one enormous WAL
+    /// record, which stalls a replica; the pass stops at this bound and reports
+    /// [`RetentionStats::saturated`] instead.
+    ///
+    /// This struct is publicly constructible, so a caller CAN write `batch: 0` here, and
+    /// nothing rejects it: a sweeper built that way runs on its cadence and removes
+    /// nothing, which looks exactly like a healthy idle one. It is not reachable from
+    /// configuration (`outbox.reap_batch` is refused below 1 and above
+    /// `OUTBOX_MAX_REAP_BATCH`), and the binary is the only production constructor, so this
+    /// is a note for a future in-tree caller rather than an operator-facing hazard. It is
+    /// not validated in this crate because a `Result` on a plain settings struct would
+    /// move the refusal off the boot path, where an operator can read it, and onto the
+    /// sweep, where nobody would.
+    pub batch: i64,
+    /// How long the sweeper waits between passes.
+    pub interval: Duration,
+}
+
+impl Default for RetentionSettings {
+    /// The same numbers `ironauth_config::OutboxConfig::default` ships, written here
+    /// because this crate deliberately does not depend on the configuration crate. The two
+    /// are pinned against each other in the `ironauth` crate, which depends on both.
+    fn default() -> Self {
+        Self {
+            completed_retention: Duration::from_secs(7 * 24 * 60 * 60),
+            dead_letter_retention: None,
+            batch: 1_000,
+            interval: Duration::from_secs(60 * 60),
+        }
+    }
+}
+
+/// What one retention pass removed for ONE consumer in ONE scope (issue #104, PR 3).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetentionStats {
+    /// Completed messages removed.
+    pub completed_reaped: u64,
+    /// Dead-lettered messages removed. Zero at the shipped default, where dead letters are
+    /// kept forever.
+    pub dead_letters_reaped: u64,
+    /// Whether either delete hit [`RetentionSettings::batch`] exactly, meaning the pass ran
+    /// out of budget rather than out of work.
+    ///
+    /// A distinct signal rather than an inference a reader might not make. Without it
+    /// "removed 1000 rows" is the same report whether the reaper is keeping up or has been
+    /// falling permanently behind for a month, and the two need different actions: the
+    /// second wants a larger batch or a shorter interval, and until it gets one the table
+    /// grows despite a reaper that reports work every pass.
+    pub saturated: bool,
+}
+
+/// What the retention sweeper's passes did, reported OUT of this crate (issue #104, PR 3).
+///
+/// A SIBLING of [`OutboxObserver`] rather than methods added to it, deliberately. The two
+/// report different work at different cadences (a drain pass per poll interval, a
+/// retention pass per hour) and a caller may want one loud and the other quiet. Folding
+/// them together would also mean every future non-outbox retention target widens the one
+/// trait that every outbox consumer's observer has to implement.
+///
+/// REQUIRED rather than optional, for the reason [`OutboxWorkerPool::spawn`] gives about
+/// its own: an optional observer is one a caller can forget, and a forgotten one restores
+/// exactly the silence this seam exists to end. [`SilentRetentionObserver`] is how a caller
+/// says "nothing" in a line of code a reviewer can see.
+///
+/// An implementor must not block or panic: it is called on the sweeper task, and a panic
+/// here kills that task.
+pub trait RetentionObserver: Send + Sync {
+    /// One retention pass over one consumer in one scope finished.
+    fn pass_finished(&self, scope: Scope, consumer: &str, stats: &RetentionStats);
+
+    /// One retention pass failed on a persistence fault. `consumer` is [`None`] when the
+    /// fault was in the per-SCOPE work that precedes any consumer (reading the scope's
+    /// serving state, or enumerating the consumers with rows in it), because attributing
+    /// that to a consumer name would be a guess an operator would then chase.
+    ///
+    /// Nothing is lost: the rows are still there and the next pass retries. A pass that
+    /// keeps failing is a table that keeps growing while a sweeper reports it is running,
+    /// which is the failure this method exists to make visible. The "permission denied"
+    /// from a deployment whose control-plane role never received the 0102 DELETE grant
+    /// arrives here.
+    fn pass_failed(&self, scope: Scope, consumer: Option<&str>, error: &StoreError);
+
+    /// The sweep could not resolve its scopes, so NO scope was reaped this pass. Nothing
+    /// about the sweeper's liveness can reveal this: the task is alive and looping.
+    fn scopes_unavailable(&self, error: &StoreError);
+}
+
+/// A [`RetentionObserver`] that reports nothing (issue #104, PR 3): for tests, and for a
+/// caller that has deliberately decided a sweeper's outcomes are not worth surfacing.
+///
+/// Named rather than made the default, so that choosing silence is a line of code somebody
+/// wrote and a reviewer can see, instead of the absence of an argument.
+pub struct SilentRetentionObserver;
+
+impl RetentionObserver for SilentRetentionObserver {
+    fn pass_finished(&self, _scope: Scope, _consumer: &str, _stats: &RetentionStats) {}
+
+    fn pass_failed(&self, _scope: Scope, _consumer: Option<&str>, _error: &StoreError) {}
+
+    fn scopes_unavailable(&self, _error: &StoreError) {}
+}
+
+/// The bounded retention reaper for `outbox_messages` (issue #104, PR 3).
+///
+/// It holds a CONTROL-plane [`Store`], because `0102_outbox_retention.sql` grants DELETE on
+/// this table to `ironauth_control` and to no other role. The reason is separation of duty
+/// rather than convenience: `ironauth_app` holds the column-scoped UPDATE that writes
+/// `dead_lettered_at`, so a data plane with DELETE could give up on a message and then
+/// erase the record of having given up.
+#[derive(Clone)]
+pub struct OutboxReaper {
+    store: Store,
+    env: Env,
+    settings: RetentionSettings,
+}
+
+impl OutboxReaper {
+    /// Build a reaper over a CONTROL-plane `store`, the environment seam, and its windows.
+    #[must_use]
+    pub fn new(store: Store, env: Env, settings: RetentionSettings) -> Self {
+        Self {
+            store,
+            env,
+            settings,
+        }
+    }
+
+    /// The windows this reaper runs to.
+    #[must_use]
+    pub fn settings(&self) -> RetentionSettings {
+        self.settings
+    }
+
+    /// Run ONE bounded retention pass for `consumer` in `scope`.
+    ///
+    /// At most [`RetentionSettings::batch`] rows are removed from each tail, and the
+    /// predicates key on the TERMINAL columns (`completed_at`, `dead_lettered_at`), never
+    /// on `enqueued_at`. See [`OutboxRepo::reap_completed`](crate::repository::OutboxRepo::reap_completed)
+    /// for why an age-based predicate would delete undelivered work and reorder the
+    /// messages it left behind.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] on a persistence fault.
+    pub async fn reap_once(
+        &self,
+        scope: Scope,
+        consumer: &str,
+    ) -> Result<RetentionStats, StoreError> {
+        let queue = self.store.scoped(scope).outbox();
+        let now_micros = epoch_micros(self.env.clock().now_utc());
+        let batch = self.settings.batch;
+
+        let completed_cutoff = cutoff_micros(now_micros, self.settings.completed_retention);
+        let completed_reaped = queue
+            .reap_completed(consumer, completed_cutoff, batch)
+            .await?;
+
+        // The dead-letter tail is reaped ONLY when an operator has chosen a window. `None`
+        // is "keep forever", which is the shipped default, so this branch does not run at
+        // all in a deployment that never opened the setting.
+        let dead_letters_reaped = match self.settings.dead_letter_retention {
+            Some(window) => {
+                queue
+                    .reap_dead_lettered(consumer, cutoff_micros(now_micros, window), batch)
+                    .await?
+            }
+            None => 0,
+        };
+
+        let saturated = u64::try_from(batch)
+            .is_ok_and(|batch| completed_reaped >= batch || dead_letters_reaped >= batch);
+        Ok(RetentionStats {
+            completed_reaped,
+            dead_letters_reaped,
+            saturated,
+        })
+    }
+
+    /// Run one retention pass over EVERY consumer with rows in `scope`, reporting each to
+    /// `observer`, and abandoning the rest as soon as `stop` is set.
+    ///
+    /// # A FENCED scope is skipped entirely, before anything is deleted
+    ///
+    /// A suspended or offboarded scope is one an operator PAUSED, and quietly deleting its
+    /// data while it is paused is the last thing a pause should do. The drain already
+    /// refuses a fenced scope ([`OutboxWorker::run_once_until`]), which means a fenced
+    /// scope's queue does not move: its completed tail is exactly the delivery evidence an
+    /// operator investigating the suspension reads, and its dead letters are exactly the
+    /// work that was lost. Reaping through a pause would also make resumption
+    /// unreconstructable, because nothing else records that those messages existed.
+    ///
+    /// A per-consumer fault is REPORTED and the sweep moves to the next consumer, so one
+    /// consumer whose delete fails does not cost the scope's other consumers their pass.
+    /// The two per-scope reads that precede any consumer (the serving state and the
+    /// consumer enumeration) return `Err` instead, because with either of them unanswered
+    /// there is no list to continue down.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] if the scope's serving state or its consumer list cannot be read.
+    pub async fn sweep_scope_until(
+        &self,
+        scope: Scope,
+        stop: &AtomicBool,
+        observer: &dyn RetentionObserver,
+    ) -> Result<(), StoreError> {
+        let scoped = self.store.scoped(scope);
+        if scoped.environment_state().await?.is_fenced() {
+            return Ok(());
+        }
+        let consumers = scoped.outbox().consumers_in_scope().await?;
+        for consumer in consumers {
+            // Checked BETWEEN consumers as well as between scopes, so a shutdown costs at
+            // most one bounded delete rather than a whole scope's worth of them.
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            match self.reap_once(scope, &consumer).await {
+                Ok(stats) => observer.pass_finished(scope, &consumer, &stats),
+                Err(error) => observer.pass_failed(scope, Some(consumer.as_str()), &error),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The cutoff instant a retention window puts on `now`, in epoch microseconds.
+///
+/// A cutoff BEFORE the epoch is negative and that is correct rather than a special case: a
+/// deterministic clock starts at the Unix epoch, so a seven day window subtracted from time
+/// zero is seven days before it, and every row is newer than that, which is exactly "nothing
+/// is old enough yet". What the saturating subtraction protects against is the arithmetic
+/// wrapping instead, which would turn a window into an instant far in the FUTURE and make
+/// every row reapable at once.
+fn cutoff_micros(now_micros: i64, window: Duration) -> i64 {
+    let window_micros = i64::try_from(window.as_micros()).unwrap_or(i64::MAX);
+    now_micros.saturating_sub(window_micros)
+}
+
+/// The longest a sweeper sleeps without looking at its stop flag.
+const RETENTION_STOP_CHECK_SLICE: Duration = Duration::from_millis(250);
+
+/// Sleep `total`, in slices, returning early once `stop` is set.
+///
+/// A single `sleep(interval).await` would be correct and unusable. The drain's poll
+/// interval is five seconds, so a pool that sleeps it whole costs a shutdown five seconds;
+/// retention's interval is an HOUR, so the same shape would make `shutdown().await` take up
+/// to an hour, which an orchestrator resolves with SIGKILL. The stop checks between scopes
+/// and between consumers bound the WORKING part of a pass and say nothing about the
+/// waiting part, which is almost all of it.
+async fn sleep_watching_stop(total: Duration, stop: &AtomicBool) {
+    let mut remaining = total;
+    while !remaining.is_zero() && !stop.load(Ordering::Relaxed) {
+        let slice = remaining.min(RETENTION_STOP_CHECK_SLICE);
+        tokio::time::sleep(slice).await;
+        remaining -= slice;
+    }
+}
+
+/// A running retention sweeper for `outbox_messages` (issue #104, PR 3).
+///
+/// # What it bounds, and what it leaves growing
+///
+/// It removes rows a consumer already RETIRED: completed past their window, and
+/// dead-lettered past a window an operator deliberately set. It removes nothing else, ever,
+/// and a non-terminal row of any age is undelivered work rather than a stale one.
+///
+/// The consequence is worth stating at the type rather than leaving a reader to derive it.
+/// In a deployment where no consumer runs, nothing writes a terminal column, so this
+/// sweeper removes ZERO rows on every pass and the queue still grows. That is not a defect
+/// in the sweeper; it is the shape of the problem, and the remaining half of it is a
+/// producer-side owner decision recorded in `docs/design/RETENTION.md`. Where consumers DO
+/// run, this is what stops a table that previously only ever grew.
+///
+/// # ONE task, not a pool
+///
+/// A considered difference from [`OutboxWorkerPool`].
+/// The drain is a throughput problem, so it scales out; retention is a bounded periodic
+/// delete on an hourly cadence, so a second task would contend for the same rows to remove
+/// the same bounded number of them. Concurrent sweepers are still SAFE (the delete is
+/// scoped, bounded and idempotent, and a row another sweeper already removed simply is not
+/// matched), so several replicas each running one are fine; there is just nothing to buy
+/// by running two in one process.
+pub struct RetentionSweeper {
+    handle: Option<tokio::task::JoinHandle<()>>,
+    stop: Arc<AtomicBool>,
+    live: Arc<AtomicUsize>,
+}
+
+impl RetentionSweeper {
+    /// Spawn the sweeper. Returns immediately; it runs until
+    /// [`shutdown`](RetentionSweeper::shutdown) is awaited or it is dropped.
+    ///
+    /// `observer` is REQUIRED, and [`SilentRetentionObserver`] is the way to say "nothing".
+    #[must_use]
+    pub fn spawn(
+        reaper: &OutboxReaper,
+        scopes: &Arc<dyn ScopeSource>,
+        observer: &Arc<dyn RetentionObserver>,
+    ) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let interval = reaper.settings.interval;
+        let live = Arc::new(AtomicUsize::new(1));
+        let reaper = reaper.clone();
+        let scopes = Arc::clone(scopes);
+        let observer = Arc::clone(observer);
+        let task_stop = Arc::clone(&stop);
+        let liveness = WorkerLiveness(Arc::clone(&live));
+        let handle = tokio::spawn(async move {
+            let _liveness = liveness;
+            while !task_stop.load(Ordering::Relaxed) {
+                match scopes.scopes().await {
+                    Ok(resolved) => {
+                        for scope in resolved {
+                            // Checked BETWEEN scopes, and again between consumers inside
+                            // the pass, so a stop is bounded by one delete.
+                            if task_stop.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            if let Err(error) = reaper
+                                .sweep_scope_until(scope, &task_stop, observer.as_ref())
+                                .await
+                            {
+                                observer.pass_failed(scope, None, &error);
+                            }
+                        }
+                    }
+                    Err(error) => observer.scopes_unavailable(&error),
+                }
+                sleep_watching_stop(interval, &task_stop).await;
+            }
+        });
+        Self {
+            handle: Some(handle),
+            stop,
+            live,
+        }
+    }
+
+    /// Whether the sweeper task is still ALIVE.
+    ///
+    /// The LIVE state, not "was spawned", for the reason [`OutboxWorkerPool::size`] gives:
+    /// a task that unwinds is gone and nothing restarts it, so a handle that reported its
+    /// own existence would go on claiming a reaper was running with none left. A panicking
+    /// [`ScopeSource`] or [`RetentionObserver`] is what gets here.
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        self.live.load(Ordering::Relaxed) > 0
+    }
+
+    /// Signal the sweeper to stop and wait for the current pass to finish.
+    ///
+    /// The flag is read between sweeps, between scopes, and between the CONSUMERS of one
+    /// scope, so a shutdown takes at most one interval plus one bounded delete. Nothing is
+    /// lost by stopping mid-sweep: retention is idempotent and the rows the pass did not
+    /// reach are still there for the next one.
+    pub async fn shutdown(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.await;
+        }
+    }
+}
+
+impl Drop for RetentionSweeper {
+    fn drop(&mut self) {
+        // A dropped sweeper must not leave a detached task deleting rows behind an
+        // operator's back. A caller that needs to WAIT for it uses `shutdown`.
         self.stop.store(true, Ordering::Relaxed);
     }
 }

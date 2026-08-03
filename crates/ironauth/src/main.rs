@@ -33,7 +33,8 @@ use ironauth_store::{
     StoreError, TenantId,
     outbox::{
         ConsumerRegistry, ControlPlaneScopes, DrainStats, OutboxConsumer, OutboxObserver,
-        OutboxWorker, OutboxWorkerPool, ScopeSource, WorkerSettings,
+        OutboxReaper, OutboxWorker, OutboxWorkerPool, RetentionObserver, RetentionSettings,
+        RetentionStats, RetentionSweeper, ScopeSource, WorkerSettings,
     },
 };
 
@@ -267,6 +268,12 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // Capture what the Back-Channel Logout delivery worker (issue #34) needs before
         // config moves into the server (only when OIDC is mounted AND the switch is on).
         let backchannel_inputs = backchannel_worker_inputs(&config, &env);
+        // Capture what the outbox RETENTION sweeper (issue #104, PR 3) needs, before config
+        // moves into the server. Deliberately INDEPENDENT of `backchannel_inputs` above:
+        // the queue's producer is unconditional and its consumers are not, so a reaper
+        // gated on the consumer switch would be missing from the deployment where the table
+        // grows fastest. The only switch is `outbox.reap_enabled`, which defaults ON.
+        let retention_inputs = retention_sweeper_inputs(&config, &env);
         // Capture what the one-shot signing-algorithm backfill (issue #93) needs before
         // config moves into the server (only when its switch is on). Runs before serving.
         let signing_backfill_inputs = signing_backfill_inputs(&config, &env);
@@ -353,6 +360,23 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             Some(inputs) => spawn_backchannel_logout_pools(inputs, server.base_url()).await,
             None => Vec::new(),
         };
+        // The outbox retention sweeper (issue #104, PR 3), started here and not inside the
+        // block above: the outbox is a GENERIC substrate whose next consumer will run
+        // behind a different switch, so the reaper must not share the back-channel logout
+        // gate. It is NOT started unconditionally, and the two things that stop it are
+        // named where they are decided: `outbox.reap_enabled` in `retention_sweeper_inputs`
+        // and a missing control-plane DSN in `start_retention_sweeper`. BOUND rather than
+        // detached, so the shutdown below can await it.
+        let retention_sweeper = if let Some(inputs) = retention_inputs {
+            start_retention_sweeper(inputs).await
+        } else {
+            tracing::warn!(
+                "outbox retention is DISABLED (outbox.reap_enabled = false); \
+                 outbox_messages will grow without bound unless something outside this \
+                 process reaps it"
+            );
+            None
+        };
 
         tracing::info!(base_url = %server.base_url(), "starting ironauth");
 
@@ -371,6 +395,12 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // it, which is the same path a crash takes.
         for pool in logout_pools {
             pool.shutdown().await;
+        }
+        // Stopped alongside the pools. Nothing is lost by stopping a retention pass part
+        // way through: the delete is bounded and idempotent, and the rows this pass did not
+        // reach are still there for the next boot.
+        if let Some(sweeper) = retention_sweeper {
+            sweeper.shutdown().await;
         }
         outcome
     })
@@ -1432,6 +1462,93 @@ impl OutboxObserver for TracingOutboxObserver {
     }
 }
 
+/// Map the shared `[outbox]` section to the retention windows the sweeper runs to
+/// (issue #104, PR 3), in ONE place, for the same reason [`outbox_worker_settings`] exists.
+///
+/// The one translation worth naming is `dead_letter_retention_secs`: `0` in configuration
+/// means NEVER, and it becomes `None` here rather than a zero-second window. A zero
+/// duration would mean "every dead letter is older than the window", which is the exact
+/// inversion of the shipped posture, so the sentinel is resolved at this single seam
+/// instead of at whatever call site reads the number.
+fn outbox_retention_settings(outbox: &OutboxConfig) -> RetentionSettings {
+    RetentionSettings {
+        completed_retention: std::time::Duration::from_secs(outbox.completed_retention_secs),
+        dead_letter_retention: match outbox.dead_letter_retention_secs {
+            0 => None,
+            secs => Some(std::time::Duration::from_secs(secs)),
+        },
+        batch: i64::from(outbox.reap_batch),
+        interval: std::time::Duration::from_secs(outbox.reap_interval_secs),
+    }
+}
+
+/// Report what the retention sweeper is doing (issue #104, PR 3), the counterpart to
+/// [`TracingOutboxObserver`] for the reaper.
+struct TracingRetentionObserver;
+
+impl RetentionObserver for TracingRetentionObserver {
+    fn pass_finished(&self, scope: Scope, consumer: &str, stats: &RetentionStats) {
+        if stats.saturated {
+            // The one finished-pass outcome that is loud. A saturated pass removed its
+            // whole budget and stopped because it ran out of budget, not out of work, so
+            // the table is growing faster than the sweeper is allowed to shrink it. This is
+            // the difference between "keeping up" and "falling behind forever", which
+            // "removed N rows" alone cannot express.
+            tracing::warn!(
+                consumer,
+                tenant = %scope.tenant(),
+                environment = %scope.environment(),
+                completed_reaped = stats.completed_reaped,
+                dead_letters_reaped = stats.dead_letters_reaped,
+                "outbox retention pass hit its batch bound; the backlog is larger than one \
+                 pass can remove, so raise outbox.reap_batch or shorten outbox.reap_interval_secs"
+            );
+        } else if stats.completed_reaped > 0 || stats.dead_letters_reaped > 0 {
+            tracing::debug!(
+                consumer,
+                tenant = %scope.tenant(),
+                environment = %scope.environment(),
+                completed_reaped = stats.completed_reaped,
+                dead_letters_reaped = stats.dead_letters_reaped,
+                "outbox retention pass removed retired messages"
+            );
+        } else {
+            // A pass that removed NOTHING still says so, and this branch is the reason the
+            // `if` above is not the whole method. Without it a healthy idle reaper and a
+            // dead one produce identical output (none), so the only way to tell a working
+            // deployment from one whose sweeper task unwound an hour ago would be to look
+            // at the table. At debug rather than info because on a healthy deployment this
+            // is every consumer of every scope every hour, and it is the line an operator
+            // turns on precisely when they are asking "is it running at all".
+            tracing::debug!(
+                consumer,
+                tenant = %scope.tenant(),
+                environment = %scope.environment(),
+                "outbox retention pass found nothing to remove"
+            );
+        }
+    }
+
+    fn pass_failed(&self, scope: Scope, consumer: Option<&str>, error: &StoreError) {
+        tracing::warn!(
+            consumer = consumer.unwrap_or("<scope>"),
+            tenant = %scope.tenant(),
+            environment = %scope.environment(),
+            %error,
+            "outbox retention pass failed; the table keeps growing until this is resolved. \
+             A permission failure here means the control-plane role is missing the DELETE \
+             grant migration 0102 adds"
+        );
+    }
+
+    fn scopes_unavailable(&self, error: &StoreError) {
+        tracing::warn!(
+            %error,
+            "outbox retention could not enumerate scopes; NO scope was reaped this pass"
+        );
+    }
+}
+
 /// Spawn ONE pool per registered consumer (issue #104), each with the tuning its own name
 /// selects, all sweeping the same scopes and reporting to the same observer.
 ///
@@ -1466,6 +1583,143 @@ fn spawn_consumer_pools(
             OutboxWorkerPool::spawn(&worker, scopes, observer)
         })
         .collect()
+}
+
+/// Spawn the outbox RETENTION sweeper (issue #104, PR 3), reaping the terminal tail of
+/// `outbox_messages` on a cadence.
+///
+/// A named function with the store, the scopes and the observer as ARGUMENTS, for the
+/// reason [`spawn_consumer_pools`] states about itself: it is what lets a test in this
+/// crate drive the REAL seam against a real database instead of re-implementing it and
+/// asserting about the copy.
+///
+/// `store` must be a CONTROL-plane store. `0102_outbox_retention.sql` grants DELETE on
+/// `outbox_messages` to `ironauth_control` alone, because `ironauth_app` holds the
+/// column-scoped UPDATE that writes `dead_lettered_at` and one role must not be able to
+/// both give up on a message and erase the record of having given up.
+///
+/// # This is NOT gated on the consumer pools, and why that is right
+///
+/// The pools are spawned behind `oidc.enabled && oidc.backchannel_logout_enabled`, both of
+/// which default FALSE. The outbox is a GENERIC substrate: the next consumer to register
+/// (webhook delivery, a SIEM sink, a migration job) will run behind a different switch
+/// again, and retention must not have to be re-wired for each one. A sweeper on the logout
+/// pools' path would be one feature switch away from being present, reviewed, tested and
+/// inert. `retention_is_not_gated_on_the_back_channel_logout_switch` is what turns RED if
+/// such a gate is added.
+///
+/// What this does NOT buy, because an earlier draft of this comment claimed it did: it does
+/// not make a default deployment's `outbox_messages` stop growing. Nothing but a consumer
+/// writes a terminal column, both reap predicates key on terminal columns, and they must,
+/// so with the logout switch off this sweeper removes zero rows forever. It bounds the
+/// deployment where consumers DO run, which is the `1 + N_relying_parties` volume PR 2
+/// introduced. The rest is a producer-side owner decision, recorded in
+/// `docs/design/RETENTION.md`.
+fn spawn_retention_sweeper(
+    store: &Store,
+    env: &Env,
+    outbox: &OutboxConfig,
+    scopes: &Arc<dyn ScopeSource>,
+    observer: &Arc<dyn RetentionObserver>,
+) -> RetentionSweeper {
+    let reaper = OutboxReaper::new(
+        store.clone(),
+        env.clone(),
+        outbox_retention_settings(outbox),
+    );
+    RetentionSweeper::spawn(&reaper, scopes, observer)
+}
+
+/// What the outbox retention sweeper (issue #104, PR 3) needs to run, captured before
+/// `config` moves into the server.
+struct RetentionSweeperInputs {
+    /// The shared `[outbox]` section, whose retention half this sweeper reads.
+    outbox: OutboxConfig,
+    /// The control-plane DSN. The sweeper both enumerates scopes on it and DELETEs through
+    /// it, because `ironauth_control` is the only role migration 0102 grants DELETE on
+    /// `outbox_messages` to. [`None`] disables retention entirely.
+    control_dsn: Option<String>,
+    /// The environment seam (deterministic clock and entropy).
+    env: Env,
+}
+
+/// Capture the retention sweeper's inputs from config (issue #104, PR 3), or `None` when
+/// `outbox.reap_enabled` is off.
+///
+/// The ONLY switch consulted here is `outbox.reap_enabled`. In particular this does NOT
+/// look at `oidc.enabled` or `oidc.backchannel_logout_enabled`, unlike
+/// [`backchannel_worker_inputs`] beside it, and the asymmetry is deliberate rather than an
+/// oversight: those two gate ONE consumer of a generic queue, and the reaper's job spans
+/// every consumer that ever had rows in it, including consumers this binary does not run.
+///
+/// Returning `Some` is not the same as a sweeper running. The control-plane DSN is resolved
+/// here but only CONSUMED in [`start_retention_sweeper`], which refuses (at error) when
+/// there is none, and there is none in a default deployment. See that function.
+fn retention_sweeper_inputs(config: &Config, env: &Env) -> Option<RetentionSweeperInputs> {
+    if !config.outbox.reap_enabled {
+        return None;
+    }
+    Some(RetentionSweeperInputs {
+        outbox: config.outbox.clone(),
+        control_dsn: select_control_dsn(config),
+        env: env.clone(),
+    })
+}
+
+/// Start the outbox retention sweeper (issue #104, PR 3), returning the RUNNING sweeper so
+/// the caller can shut it down, or `None` when it could not be started.
+///
+/// Every early return says, at error, WHAT is not running and WHY, matching the specificity
+/// [`spawn_backchannel_logout_pools`] uses for its own. A silent absence here is the worst
+/// outcome available: the queue keeps growing, nothing fails, and the first symptom is a
+/// disk.
+async fn start_retention_sweeper(inputs: RetentionSweeperInputs) -> Option<RetentionSweeper> {
+    let RetentionSweeperInputs {
+        outbox,
+        control_dsn,
+        env,
+    } = inputs;
+
+    let Some(control_dsn) = control_dsn else {
+        tracing::error!(
+            "outbox retention NOT running: no control-plane DSN (set \
+             admin.control_database_url, or run in dev_mode). Only the ironauth_control \
+             role is granted DELETE on outbox_messages, so with no control-plane \
+             connection NOTHING reaps the queue and outbox_messages grows without bound: \
+             every ended session enqueues one message plus one per participating relying \
+             party, and no other path removes any of them."
+        );
+        return None;
+    };
+
+    let control_store = match Store::connect(&control_dsn).await {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "outbox retention NOT running: control-plane connect failed. \
+                 outbox_messages will grow without bound until this is resolved."
+            );
+            return None;
+        }
+    };
+
+    // ONE store for both halves, deliberately: the scope enumeration reads `environments`,
+    // which only the control role may read, and the delete needs the control role's 0102
+    // grant. A second connection would be a second role to get wrong.
+    let scopes: Arc<dyn ScopeSource> = Arc::new(ControlPlaneScopes::new(control_store.clone()));
+    let observer: Arc<dyn RetentionObserver> = Arc::new(TracingRetentionObserver);
+    let sweeper = spawn_retention_sweeper(&control_store, &env, &outbox, &scopes, &observer);
+
+    tracing::info!(
+        completed_retention_secs = outbox.completed_retention_secs,
+        dead_letter_retention_secs = outbox.dead_letter_retention_secs,
+        reap_batch = outbox.reap_batch,
+        reap_interval_secs = outbox.reap_interval_secs,
+        "outbox retention started; a dead_letter_retention_secs of 0 means dead letters \
+         are kept FOREVER"
+    );
+    Some(sweeper)
 }
 
 /// Start the OIDC Back-Channel Logout consumers (issue #34) on the generic outbox worker

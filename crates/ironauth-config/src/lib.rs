@@ -164,16 +164,21 @@ pub struct Config {
     /// Transactional outbox and job queue settings (issue #104): the tuning of the
     /// at-least-once dispatch substrate every async path (webhook delivery,
     /// back-channel logout delivery, SIEM sinks, migration jobs, notification
-    /// fan-out) drains through. Worker concurrency, the visibility timeout, the
-    /// poll cadence, the claim batch, and the retry bound are all settings with
-    /// safe defaults per the tunability principle, because the right value depends
-    /// on the deployment's connection pool, its consumers' handler latency, and how
-    /// long its operators are willing to wait for a crashed worker's messages.
+    /// fan-out) drains through. Two halves: the DRAIN tuning (worker concurrency,
+    /// the visibility timeout, the poll cadence, the claim batch, the retry bound)
+    /// and, since PR 3 of that issue, the RETENTION tuning (`reap_enabled`, the
+    /// completed and dead-letter windows, the per-pass reap batch, and the sweep
+    /// interval). All have safe defaults per the tunability principle, because the
+    /// right value depends on the deployment's connection pool, its consumers'
+    /// handler latency, how long its operators are willing to wait for a crashed
+    /// worker's messages, and how long it must keep the evidence that a message was
+    /// delivered. Two retention defaults read the OPPOSITE way to
+    /// `diagnostics.retention_secs` and are called out on their own rows below.
     ///
     /// A top-level section rather than a field on any one consumer's section
     /// deliberately: the substrate is shared, so one set of knobs governs every
     /// consumer's workers and an operator tunes the QUEUE once rather than
-    /// rediscovering the same four settings under each subsystem.
+    /// rediscovering the same settings under each subsystem.
     ///
     /// There is no mode selection here and no mention of a durable message bus.
     /// The Postgres queue is the only implementation that exists, and a knob whose
@@ -277,6 +282,124 @@ pub struct OutboxConfig {
     /// The default (10) is conservative. Must be at least 1 and at most
     /// `OIDC_MAX_LIFETIME_SECS`.
     pub retry_base_secs: u64,
+
+    /// Whether the periodic retention sweeper runs at all (issue #104, PR 3). ON by
+    /// default, because `outbox_messages` otherwise grows monotonically: migration 0099
+    /// shipped the table with no retention of any kind, and every ended session enqueues
+    /// roughly `1 + N_relying_parties` rows.
+    ///
+    /// Turning it OFF is a deliberate operator choice with a stated consequence: the table
+    /// keeps every completed message forever, and nothing else in the system removes one.
+    /// The reason to have the switch is that a deployment may want to reap on its own
+    /// schedule from outside the process, and a knob whose only alternative is editing
+    /// code is not a knob.
+    ///
+    /// The sweeper is started INDEPENDENTLY of `oidc.backchannel_logout_enabled`, because
+    /// the outbox is a generic substrate and that switch gates ONE of its consumers; the
+    /// next consumer to register will run behind a different switch again, and retention
+    /// must not have to be re-wired for each.
+    ///
+    /// Two things other than this switch stop a sweeper from running, and neither is a bug:
+    /// a deployment with no control-plane DSN cannot start one at all (only
+    /// `ironauth_control` is granted DELETE, and the boot logs an error saying so), and a
+    /// deployment whose consumers never run has nothing for one to remove, because a
+    /// message only becomes reapable once a consumer retires it. See
+    /// `docs/design/RETENTION.md`.
+    pub reap_enabled: bool,
+
+    /// How long a COMPLETED message is kept after it was completed, in seconds. Unlike
+    /// `diagnostics.retention_secs`, which has NO lower bound, this one has a floor of one
+    /// hour: a reader arriving from that setting would reasonably expect a near-zero window
+    /// to be a valid "keep almost nothing" posture, and here it is not, because a completed
+    /// outbox row carries TWO things and both are lost when it goes.
+    ///
+    /// The floor is [`OUTBOX_MIN_COMPLETED_RETENTION_SECS`], and the quantity it stands for
+    /// is `max(evidence window, longest producer re-enqueue horizon)`:
+    ///
+    ///   * the EVIDENCE window. A completed row is what says a message was delivered rather
+    ///     than lost, and it is what an operator reads when a relying party reports not
+    ///     having been logged out. A retention shorter than the time it takes a human to
+    ///     notice and look makes that question permanently unanswerable, and unlike a
+    ///     diagnostic there is no second record of it anywhere.
+    ///   * the RE-ENQUEUE horizon. The row also occupies its slot in the outbox's
+    ///     `UNIQUE (tenant, environment, consumer, idempotency_key)` constraint, which is
+    ///     the at-most-once ledger a producer's re-enqueue conflicts with. Reap it and the
+    ///     key is free: a producer that re-enqueues the same domain fact afterwards inserts
+    ///     a second, claimable message and the work is delivered twice. A producer can only
+    ///     do that while its OWN driving message is still non-terminal, so the horizon is
+    ///     bounded by `max_attempts` claims separated by the retry backoff or a lapsed
+    ///     lease. At the shipped defaults (5 attempts, a 10 second base doubling with up to
+    ///     a base of jitter, a 30 second lease) the four gaps are at most 30, 30, 50 and 90
+    ///     seconds, so the horizon is about 200 seconds: 18 times inside the one hour floor
+    ///     and 3,000 times inside the seven day default.
+    ///
+    /// OPERATOR OBLIGATION, because the second term is the one that moves. Raising
+    /// `max_attempts`, `retry_base_secs` or `visibility_timeout_secs` lengthens the
+    /// re-enqueue horizon, and this window must stay above it. It is documented rather than
+    /// cross-validated at load: computing the horizon exactly means re-implementing the
+    /// store's backoff schedule (its doubling and its one hour cap) in this crate, which
+    /// would be a second copy of an arithmetic that has to agree with the first, and a
+    /// wrong copy would refuse configurations that are in fact safe. No deployment reaches
+    /// this without deliberately lowering the window toward its floor AND raising the retry
+    /// knobs.
+    ///
+    /// The predicate keys on the message's completion, never on when it was enqueued: a
+    /// message that is neither completed nor dead-lettered is UNDELIVERED work however old
+    /// it is, and no setting here can cause one to be removed.
+    ///
+    /// The default (seven days) and the ceiling (ninety days) are
+    /// [`DIAGNOSTICS_DEFAULT_RETENTION_SECS`] and [`DIAGNOSTICS_MAX_RETENTION_SECS`], so
+    /// the tree has ONE answer to "how long do we keep this class of operational record".
+    pub completed_retention_secs: u64,
+
+    /// How long a DEAD-LETTERED message is kept after it was given up on, in seconds,
+    /// where `0` means NEVER REAP IT and is the default. That is the opposite reading from
+    /// `diagnostics.retention_secs`, where a zero-second retention prunes everything on the
+    /// next insert, and the inversion is deliberate rather than an oversight.
+    ///
+    /// A dead letter is work that will never happen unless an operator replays it. For the
+    /// back-channel logout fan-out one dead letter can be an entire session's relying
+    /// parties left un-notified, and the row is the ONLY record that it happened. So the
+    /// safe default here is to keep it, and "delete these on a schedule" has to be
+    /// something an operator typed.
+    ///
+    /// A nonzero value is a real window and is bounded by the same ninety day ceiling
+    /// ([`DIAGNOSTICS_MAX_RETENTION_SECS`]) as the completed tail. There is no floor,
+    /// because unlike the completed window there is no default value to protect: an
+    /// operator who sets this at all has already decided.
+    pub dead_letter_retention_secs: u64,
+
+    /// The largest number of rows ONE retention pass removes per scope, per consumer, per
+    /// tail. It is a HARD bound and the sweeper does NOT loop until the backlog is drained.
+    ///
+    /// The bound is the design. A first run over an accumulated backlog can face millions
+    /// of rows, and an unbounded `DELETE` over them holds a long lock and produces one
+    /// enormous WAL record, which stalls a replica. A pass that hits this bound is reported
+    /// as SATURATED, so "keeping up" and "falling behind forever" are distinguishable
+    /// rather than both reading as "removed some rows".
+    ///
+    /// What the default (1000) actually buys, in arithmetic rather than in adjectives,
+    /// because the first draft of this sentence claimed more than the number supports. At
+    /// the default hourly cadence one pass per hour removes at most
+    /// `1000 * (604800 / 3600) = 168,000` rows per week, PER (scope, consumer) PER tail.
+    /// Both halves of that qualifier matter: the fan-out this substrate exists for turns
+    /// one ended session into roughly `1 + N_relying_parties` rows, and those rows are
+    /// spread across TWO consumers, so a deployment ending S sessions a week in one scope
+    /// produces about S rows for the fan-out consumer and about `S * N` for the delivery
+    /// consumer. The delivery consumer is the binding one: 168,000 a week covers 168,000
+    /// deliveries, which is 33,600 sessions a week at five relying parties each, not
+    /// "a few hundred thousand sessions". A deployment past that raises the batch, shortens
+    /// the interval, or watches for SATURATED passes and does one of the two. Must be at
+    /// least 1 and at most [`OUTBOX_MAX_REAP_BATCH`], which is 100 times the default.
+    pub reap_batch: u32,
+
+    /// How often, in seconds, the retention sweeper runs a pass over every scope.
+    ///
+    /// Retention is not latency-sensitive: nothing waits on a row being removed, so this
+    /// trades database load against how far the table is allowed to run ahead of the
+    /// window. The default (one hour) with the default batch removes up to 1000 rows per
+    /// consumer per scope per hour. Must be at least 1 and at most `OIDC_MAX_LIFETIME_SECS`.
+    pub reap_interval_secs: u64,
 }
 
 impl Default for OutboxConfig {
@@ -288,6 +411,12 @@ impl Default for OutboxConfig {
             claim_batch: 64,
             max_attempts: 5,
             retry_base_secs: 10,
+            reap_enabled: true,
+            completed_retention_secs: DIAGNOSTICS_DEFAULT_RETENTION_SECS,
+            // NEVER, not "immediately". See the field documentation.
+            dead_letter_retention_secs: 0,
+            reap_batch: 1_000,
+            reap_interval_secs: 60 * 60,
         }
     }
 }
@@ -340,6 +469,44 @@ pub const OUTBOX_MAX_WORKER_CONCURRENCY: u32 = 64;
 /// works forward, which another worker then takes off it. 1024 is far past useful and
 /// still bounds both to something an operator can reason about.
 pub const OUTBOX_MAX_CLAIM_BATCH: u32 = 1_024;
+
+/// The floor on `outbox.completed_retention_secs`, in seconds (one hour), issue #104 PR 3.
+///
+/// `diagnostics.retention_secs` deliberately has NO floor, and its documentation says a
+/// zero-second retention is "a valid, safe posture". This setting is the one place in the
+/// tree where that reasoning does not carry, so the difference is a named constant rather
+/// than an inline number.
+///
+/// The value stands for `max(evidence window, longest producer re-enqueue horizon)`, and
+/// both terms are real:
+///
+///   * EVIDENCE. A completed outbox row is the evidence that a message was DELIVERED, and
+///     it is the only such evidence. An operator asked whether a relying party was logged
+///     out has nothing else to read. A window shorter than the time it takes a human to
+///     notice a problem and go looking makes the question permanently unanswerable, which
+///     is a different kind of loss from pruning a diagnostic.
+///   * RE-ENQUEUE. The row also holds its slot in the outbox's
+///     `UNIQUE (tenant, environment, consumer, idempotency_key)` constraint, which is the
+///     queue's at-most-once ledger. Reaping it frees the key, so a producer still capable
+///     of re-enqueueing that domain fact would enqueue a second CLAIMABLE copy and the work
+///     would be delivered twice. That capability lasts as long as the producer's own
+///     driving message stays non-terminal, which at the shipped outbox defaults is about
+///     200 seconds.
+///
+/// One hour is chosen against the LARGER of the two at the shipped defaults, which is the
+/// evidence term, and it leaves the re-enqueue term 18 times of headroom. It is not raised
+/// to cover an arbitrarily-tuned retry schedule: a constant large enough for every legal
+/// `max_attempts` would impose a policy on every deployment to protect a configuration
+/// almost none of them have. The obligation to keep this window above a LENGTHENED
+/// re-enqueue horizon is documented on `OutboxConfig::completed_retention_secs` instead.
+pub const OUTBOX_MIN_COMPLETED_RETENTION_SECS: u64 = 60 * 60;
+
+/// The hard ceiling on `outbox.reap_batch` (issue #104, PR 3). The batch exists to keep one
+/// pass's `DELETE` off a replica's write-ahead log, so a batch an operator could raise
+/// without limit would defeat the setting's only purpose: at some size the pass is once
+/// again a long lock and one enormous WAL record. `100_000` is far past what an hourly
+/// cadence needs and still bounds a single statement to something a replica survives.
+pub const OUTBOX_MAX_REAP_BATCH: u32 = 100_000;
 
 /// The default client-authentication diagnostic retention, in seconds (seven days).
 ///
@@ -4641,6 +4808,7 @@ fn validate_outbox(outbox: &OutboxConfig) -> Result<(), ConfigError> {
         ),
         ("outbox.poll_interval_secs", outbox.poll_interval_secs),
         ("outbox.retry_base_secs", outbox.retry_base_secs),
+        ("outbox.reap_interval_secs", outbox.reap_interval_secs),
     ] {
         if value < 1 {
             return Err(ConfigError::Invalid {
@@ -4654,6 +4822,70 @@ fn validate_outbox(outbox: &OutboxConfig) -> Result<(), ConfigError> {
                 ),
             });
         }
+    }
+    validate_outbox_retention(outbox)
+}
+
+/// Validate the outbox RETENTION settings (issue #104, PR 3), split out so
+/// [`validate_outbox`] stays within the readable-length lint.
+///
+/// The two windows are validated to DIFFERENT rules, and the difference is the whole
+/// reason this is not a loop over a list of names:
+///
+///   * `completed_retention_secs` has a FLOOR ([`OUTBOX_MIN_COMPLETED_RETENTION_SECS`]).
+///     It bounds how long the only evidence that a message was delivered survives.
+///   * `dead_letter_retention_secs` has NO floor, because `0` is not a short window there;
+///     it is the sentinel for "never reap a dead letter", which is the shipped default.
+///     Validating it like the other window would reject the default.
+///
+/// Both share the ninety day ceiling, which is [`DIAGNOSTICS_MAX_RETENTION_SECS`]: the
+/// tree gives one answer to how long an operational record may be kept, and a second
+/// number here would be a second thing to keep in step.
+fn validate_outbox_retention(outbox: &OutboxConfig) -> Result<(), ConfigError> {
+    if outbox.completed_retention_secs < OUTBOX_MIN_COMPLETED_RETENTION_SECS {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "outbox.completed_retention_secs ({}) must be at least \
+                 {OUTBOX_MIN_COMPLETED_RETENTION_SECS} seconds: a completed row is the only \
+                 evidence a message was delivered, so a window shorter than an operator's \
+                 reaction time makes a lost delivery permanently unanswerable",
+                outbox.completed_retention_secs
+            ),
+        });
+    }
+    for (name, value) in [
+        (
+            "outbox.completed_retention_secs",
+            outbox.completed_retention_secs,
+        ),
+        (
+            "outbox.dead_letter_retention_secs",
+            outbox.dead_letter_retention_secs,
+        ),
+    ] {
+        if value > DIAGNOSTICS_MAX_RETENTION_SECS {
+            return Err(ConfigError::Invalid {
+                message: format!(
+                    "{name} ({value}) must not exceed {DIAGNOSTICS_MAX_RETENTION_SECS} seconds"
+                ),
+            });
+        }
+    }
+    if outbox.reap_batch < 1 {
+        return Err(ConfigError::Invalid {
+            message: "outbox.reap_batch must be at least 1: a zero batch is a sweeper that \
+                      runs on a cadence and removes nothing, which looks exactly like a \
+                      working one"
+                .to_owned(),
+        });
+    }
+    if outbox.reap_batch > OUTBOX_MAX_REAP_BATCH {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "outbox.reap_batch ({}) must not exceed {OUTBOX_MAX_REAP_BATCH}",
+                outbox.reap_batch
+            ),
+        });
     }
     Ok(())
 }
@@ -6783,6 +7015,130 @@ mod tests {
             Config::from_toml_str("[outbox]\nvisibility_timeout_sec = 60\n", "<inline>").is_err(),
             "a misspelled key in [outbox] must fail the load"
         );
+    }
+
+    #[test]
+    fn the_outbox_retention_knobs_ship_safely_and_two_of_them_read_the_opposite_way() {
+        // The retention half of the section (issue #104, PR 3). Two of these read the
+        // OPPOSITE way to `diagnostics.retention_secs`, and a reader arriving from that
+        // setting will assume the other reading, so both are asserted BY VALUE here.
+        let config = Config::from_toml_str("", "<inline>").expect("valid").config;
+        assert!(
+            config.outbox.reap_enabled,
+            "retention ships ON: outbox_messages otherwise grows monotonically, because \
+             0099 shipped it with no reaper and every ended session enqueues at least one row"
+        );
+        assert_eq!(
+            config.outbox.completed_retention_secs, DIAGNOSTICS_DEFAULT_RETENTION_SECS,
+            "the completed window is the SAME seven days the diagnostics sink uses: the \
+             tree gives one answer to how long an operational record is kept"
+        );
+        assert_eq!(
+            config.outbox.dead_letter_retention_secs, 0,
+            "0 here means NEVER REAP, which is the inverse of diagnostics.retention_secs = \
+             0, where it prunes everything on the next insert. A dead letter can be a whole \
+             session's relying parties left un-notified and is the only record of it"
+        );
+        assert_eq!(config.outbox.reap_batch, 1_000);
+        assert_eq!(config.outbox.reap_interval_secs, 60 * 60);
+
+        // The FLOOR under the completed window, which diagnostics deliberately does not
+        // have. It is asserted from both sides: one second below is refused and the floor
+        // itself loads.
+        let below = format!(
+            "[outbox]\ncompleted_retention_secs = {}\n",
+            OUTBOX_MIN_COMPLETED_RETENTION_SECS - 1
+        );
+        assert!(
+            matches!(
+                Config::from_toml_str(&below, "<inline>"),
+                Err(ConfigError::Invalid { .. })
+            ),
+            "a completed window below the floor is refused: it is the only evidence a \
+             message was delivered"
+        );
+        for (label, toml) in [
+            (
+                "the completed floor itself",
+                format!(
+                    "[outbox]\ncompleted_retention_secs = {OUTBOX_MIN_COMPLETED_RETENTION_SECS}\n"
+                ),
+            ),
+            (
+                "the shared ceiling on both windows",
+                format!(
+                    "[outbox]\ncompleted_retention_secs = {DIAGNOSTICS_MAX_RETENTION_SECS}\n\
+                     dead_letter_retention_secs = {DIAGNOSTICS_MAX_RETENTION_SECS}\n"
+                ),
+            ),
+            (
+                "a zero dead-letter window, which is the DEFAULT and must stay legal",
+                "[outbox]\ndead_letter_retention_secs = 0\n".to_owned(),
+            ),
+            (
+                "the batch ceiling itself",
+                format!("[outbox]\nreap_batch = {OUTBOX_MAX_REAP_BATCH}\n"),
+            ),
+            (
+                "retention turned off deliberately",
+                "[outbox]\nreap_enabled = false\n".to_owned(),
+            ),
+        ] {
+            assert!(
+                Config::from_toml_str(&toml, "<inline>").is_ok(),
+                "{label} must LOAD; without these controls the refusals below would pass \
+                 against a validator that rejected everything"
+            );
+        }
+    }
+
+    #[test]
+    fn the_outbox_retention_knobs_refuse_every_value_that_would_lose_or_stall_the_reaper() {
+        // Split from the defaults above only because the combined body outran the
+        // readable-length lint; the two halves are one obligation. Every refusal, each with
+        // the failure it prevents.
+        for (label, toml) in [
+            (
+                "a completed window past the ninety day ceiling",
+                format!(
+                    "[outbox]\ncompleted_retention_secs = {}\n",
+                    DIAGNOSTICS_MAX_RETENTION_SECS + 1
+                ),
+            ),
+            (
+                "a dead-letter window past the ninety day ceiling",
+                format!(
+                    "[outbox]\ndead_letter_retention_secs = {}\n",
+                    DIAGNOSTICS_MAX_RETENTION_SECS + 1
+                ),
+            ),
+            (
+                "a zero reap batch, which is a sweeper that removes nothing on a cadence",
+                "[outbox]\nreap_batch = 0\n".to_owned(),
+            ),
+            (
+                "a reap batch past the ceiling, which puts one enormous DELETE on a replica",
+                format!("[outbox]\nreap_batch = {}\n", OUTBOX_MAX_REAP_BATCH + 1),
+            ),
+            (
+                "a zero sweep interval",
+                "[outbox]\nreap_interval_secs = 0\n".to_owned(),
+            ),
+            (
+                "a sweep interval past the ceiling",
+                format!(
+                    "[outbox]\nreap_interval_secs = {}\n",
+                    OIDC_MAX_LIFETIME_SECS + 1
+                ),
+            ),
+        ] {
+            let err = Config::from_toml_str(&toml, "ironauth.toml")
+                .expect_err(&format!("{label} must be refused at load"));
+            assert!(
+                matches!(err, ConfigError::Invalid { .. }),
+                "{label} must be a boot-time Invalid: {err:?}"
+            );
+        }
     }
 
     #[test]

@@ -84,5 +84,13 @@ serde_json.workspace = true
 name = "step_up_policy_cli"
 required-features = ["testing"]
 
+# The outbox retention boot suite (issue #104, PR 3) boots the COMPILED `ironauth serve`
+# against a throwaway database and watches the queue. It is the only thing in the tree that
+# observes the `serve` call site itself: replacing that call with a no-op left every other
+# test green. Same gating as the CLI suite above.
+[[test]]
+name = "serve_retention_boot"
+required-features = ["testing"]
+
 [lints]
 workspace = true

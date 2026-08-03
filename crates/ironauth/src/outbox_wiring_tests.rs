@@ -29,16 +29,26 @@
 //! SSRF-hardened sender, and registers the two logout consumers by name. That function
 //! takes DSNs and opens sockets; what is testable in it is the registry-to-pools step,
 //! which is exactly what was extracted into `spawn_consumer_pools` and is driven here.
+//!
+//! ## PR 3: the retention sweeper
+//!
+//! The same file, for the same reason, one layer along. The defect PR 3 deliberately does
+//! not reproduce is a reaper hung off `backchannel_worker_inputs`: the consumer pools are
+//! gated on `oidc.enabled && oidc.backchannel_logout_enabled`, BOTH of which default false,
+//! while the producer that enqueues `session_ended` is unconditional. Such a reaper would
+//! be absent from exactly the deployment whose table grows fastest, and absent silently.
+//! [`retention_sweeper_inputs`] is driven directly for that, and
+//! [`spawn_retention_sweeper`] is driven against a real database for the behaviour.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
-use ironauth_config::OutboxConfig;
+use ironauth_config::{Config, OutboxConfig};
 use ironauth_env::Env;
 use ironauth_store::outbox::{
     ConsumerError, ConsumerRegistry, DrainStats, OutboxConsumer, OutboxObserver, OutboxWorker,
-    ScopeSource, SilentObserver, StaticScopes,
+    RetentionObserver, ScopeSource, SilentObserver, SilentRetentionObserver, StaticScopes,
 };
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
@@ -46,7 +56,10 @@ use ironauth_store::{
     StoreError,
 };
 
-use super::{PassSeverity, outbox_worker_settings, pass_severity, spawn_consumer_pools};
+use super::{
+    PassSeverity, outbox_retention_settings, outbox_worker_settings, pass_severity,
+    retention_sweeper_inputs, spawn_consumer_pools, spawn_retention_sweeper,
+};
 
 /// A consumer that records what it was handed and answers with a programmable outcome.
 /// Registered under a caller-chosen NAME, because the property under test is that every
@@ -317,6 +330,7 @@ fn only_the_attempts_budget_varies_by_consumer() {
         claim_batch: 11,
         max_attempts: 4,
         retry_base_secs: 13,
+        ..OutboxConfig::default()
     };
     let fanout = outbox_worker_settings(&outbox, SESSION_ENDED_CONSUMER);
     let delivery = outbox_worker_settings(&outbox, BACKCHANNEL_LOGOUT_CONSUMER);
@@ -584,5 +598,202 @@ async fn a_drain_pass_that_faults_is_reported_rather_than_swallowed() {
         consumer.handled().is_empty(),
         "nothing was drained while the grant was gone, which is what makes the silence \
          dangerous: the queue simply stops moving"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Retention (issue #104, PR 3): the sweeper the boot path spawns.
+
+#[test]
+fn retention_is_not_gated_on_the_back_channel_logout_switch() {
+    // The dead-surface defect this PR exists NOT to reproduce, made a test.
+    //
+    // The consumer pools are spawned behind `oidc.enabled && oidc.backchannel_logout_enabled`
+    // (`backchannel_worker_inputs`), and BOTH default false. The producer that fills the
+    // queue is unconditional: ending a session enqueues a `session_ended` message whatever
+    // those switches say. So a reaper hung off the pools would be missing from exactly the
+    // deployment whose table grows fastest relative to what drains it, and it would be
+    // missing silently, which is the same shape as the `.take(1)` defect one layer up.
+    //
+    // This is the mutation that must turn it RED: adding `config.oidc.enabled` or
+    // `config.oidc.backchannel_logout_enabled` to the predicate in
+    // `retention_sweeper_inputs`.
+    let env = Env::system();
+    let config = Config::from_toml_str("", "<inline>")
+        .expect("the empty config is valid")
+        .config;
+    assert!(
+        !config.oidc.enabled,
+        "the precondition of this test: the OIDC provider is OFF by default"
+    );
+    assert!(
+        !config.oidc.backchannel_logout_enabled,
+        "and so is the back-channel logout switch, which is the gate the reaper must not \
+         share"
+    );
+    assert!(
+        config.outbox.reap_enabled,
+        "and retention is ON by default, because outbox_messages otherwise grows forever"
+    );
+    assert!(
+        retention_sweeper_inputs(&config, &env).is_some(),
+        "the retention sweeper must be captured with the OIDC provider off AND the \
+         back-channel logout switch off: that is the deployment where the queue grows and \
+         nothing drains it"
+    );
+
+    // And the ONE switch it does answer to.
+    let disabled = Config::from_toml_str("[outbox]\nreap_enabled = false\n", "<inline>")
+        .expect("valid")
+        .config;
+    assert!(
+        retention_sweeper_inputs(&disabled, &env).is_none(),
+        "outbox.reap_enabled = false is the only thing that turns the sweeper off"
+    );
+}
+
+#[test]
+fn a_zero_dead_letter_retention_means_never_and_not_immediately() {
+    // The inverted sentinel, resolved at ONE seam. `diagnostics.retention_secs = 0` prunes
+    // everything on the next insert; `outbox.dead_letter_retention_secs = 0` keeps dead
+    // letters FOREVER. A reader arriving from the first will assume the second, and a
+    // mapping that turned 0 into `Duration::ZERO` would delete every dead letter on the
+    // first pass of a default build, which for the logout fan-out is the record that a
+    // session's relying parties were never notified.
+    let shipped = OutboxConfig::default();
+    assert_eq!(
+        shipped.dead_letter_retention_secs, 0,
+        "the shipped default is the sentinel, so this mapping is on the default path"
+    );
+    assert_eq!(
+        outbox_retention_settings(&shipped).dead_letter_retention,
+        None,
+        "0 seconds means NEVER REAP, not a zero-length window"
+    );
+
+    let chosen = OutboxConfig {
+        dead_letter_retention_secs: 3_600,
+        ..OutboxConfig::default()
+    };
+    assert_eq!(
+        outbox_retention_settings(&chosen).dead_letter_retention,
+        Some(Duration::from_secs(3_600)),
+        "a nonzero value is a real window"
+    );
+}
+
+#[test]
+fn every_retention_knob_lands_in_its_own_settings_field_and_none_is_dropped() {
+    // Four config numbers become four store fields, and until this test only ONE of the
+    // four mappings was measured. Measured on the un-guarded version: SWAPPING
+    // `completed_retention` with `interval` was undetected, and so was replacing the batch
+    // with `i64::MAX`. The second is the worse of the two, because the hard batch bound is
+    // what the whole "one pass does not stall a replica" argument rests on, and a bound
+    // that never survives the config-to-store seam is not a bound.
+    //
+    // Every value here is DISTINCT and none is a shipped default, so a mapping that reads
+    // the wrong field, or that ignores its input and writes a constant, is a failure rather
+    // than a coincidence.
+    let outbox = OutboxConfig {
+        completed_retention_secs: 3_601,
+        dead_letter_retention_secs: 3_602,
+        reap_batch: 3_603,
+        reap_interval_secs: 3_604,
+        ..OutboxConfig::default()
+    };
+    let settings = outbox_retention_settings(&outbox);
+    assert_eq!(
+        settings.completed_retention,
+        Duration::from_secs(3_601),
+        "completed_retention_secs is the COMPLETED window"
+    );
+    assert_eq!(
+        settings.dead_letter_retention,
+        Some(Duration::from_secs(3_602)),
+        "dead_letter_retention_secs is the DEAD-LETTER window"
+    );
+    assert_eq!(
+        settings.batch, 3_603,
+        "reap_batch is the per-pass HARD BOUND, carried through unchanged: this is the \
+         seam where an i64::MAX would have made the bound imaginary"
+    );
+    assert_eq!(
+        settings.interval,
+        Duration::from_secs(3_604),
+        "reap_interval_secs is the CADENCE, and it is not the completed window"
+    );
+}
+
+#[tokio::test]
+async fn the_boot_paths_retention_sweeper_actually_reaps_a_retired_message() {
+    // The REAL `spawn_retention_sweeper`, driven against a real database, for the same
+    // reason `every_registered_consumer_gets_a_pool_that_actually_drains_it` drives the real
+    // `spawn_consumer_pools`: a sweeper that is wired but never runs looks exactly like one
+    // that has nothing to do.
+    //
+    // It reaps through the CONTROL store, because `0102_outbox_retention.sql` grants DELETE
+    // to `ironauth_control` alone. Handing this the app store is a failure mode with a
+    // measured symptom: the pass reports a permission fault and the table keeps growing.
+    let db = TestDatabase::start().await;
+    let (env, clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 104);
+    let scope = db.seed_scope(&env).await;
+
+    // A retired message, written the way production writes one: enqueued, claimed, and
+    // completed through the data plane.
+    enqueue(&db, &env, scope, BACKCHANNEL_LOGOUT_CONSUMER).await;
+    let store = db.store();
+    let data_plane = store.scoped(scope);
+    let queue = data_plane.outbox();
+    let claimed = queue
+        .claim(
+            &env,
+            BACKCHANNEL_LOGOUT_CONSUMER,
+            Duration::from_secs(300),
+            10,
+        )
+        .await
+        .expect("claim");
+    assert_eq!(claimed.len(), 1);
+    assert!(
+        queue.complete(&env, &claimed[0]).await.expect("complete"),
+        "the lease is ours, so the completion lands"
+    );
+
+    let outbox = OutboxConfig {
+        // The only departure from the shipped defaults: a one second cadence, so the test
+        // finishes in a test's patience. The retention WINDOW is the shipped seven days.
+        reap_interval_secs: 1,
+        ..OutboxConfig::default()
+    };
+    // Past the window. Nothing on the row changes; the reaper's answer does.
+    clock.advance(Duration::from_secs(outbox.completed_retention_secs) + Duration::from_secs(1));
+
+    let scopes: Arc<dyn ScopeSource> = Arc::new(StaticScopes::new(vec![scope]));
+    let observer: Arc<dyn RetentionObserver> = Arc::new(SilentRetentionObserver);
+    let sweeper = spawn_retention_sweeper(db.control_store(), &env, &outbox, &scopes, &observer);
+
+    let mut reaped = false;
+    for _ in 0..400 {
+        if queue
+            .list(BACKCHANNEL_LOGOUT_CONSUMER, 10)
+            .await
+            .expect("list")
+            .is_empty()
+        {
+            reaped = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        sweeper.is_running(),
+        "the sweeper task is alive throughout: a dead one would explain an unreaped row \
+         for a reason that has nothing to do with the predicate"
+    );
+    sweeper.shutdown().await;
+    assert!(
+        reaped,
+        "the sweeper the boot path spawns must actually remove a retired message past its \
+         window; the row was still there"
     );
 }

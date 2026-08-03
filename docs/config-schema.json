@@ -1504,6 +1504,20 @@
           "minimum": 0,
           "type": "integer"
         },
+        "completed_retention_secs": {
+          "default": 604800,
+          "description": "How long a COMPLETED message is kept after it was completed, in seconds. Unlike\n`diagnostics.retention_secs`, which has NO lower bound, this one has a floor of one\nhour: a reader arriving from that setting would reasonably expect a near-zero window\nto be a valid \"keep almost nothing\" posture, and here it is not, because a completed\noutbox row carries TWO things and both are lost when it goes.\n\nThe floor is [`OUTBOX_MIN_COMPLETED_RETENTION_SECS`], and the quantity it stands for\nis `max(evidence window, longest producer re-enqueue horizon)`:\n\n  * the EVIDENCE window. A completed row is what says a message was delivered rather\n    than lost, and it is what an operator reads when a relying party reports not\n    having been logged out. A retention shorter than the time it takes a human to\n    notice and look makes that question permanently unanswerable, and unlike a\n    diagnostic there is no second record of it anywhere.\n  * the RE-ENQUEUE horizon. The row also occupies its slot in the outbox's\n    `UNIQUE (tenant, environment, consumer, idempotency_key)` constraint, which is\n    the at-most-once ledger a producer's re-enqueue conflicts with. Reap it and the\n    key is free: a producer that re-enqueues the same domain fact afterwards inserts\n    a second, claimable message and the work is delivered twice. A producer can only\n    do that while its OWN driving message is still non-terminal, so the horizon is\n    bounded by `max_attempts` claims separated by the retry backoff or a lapsed\n    lease. At the shipped defaults (5 attempts, a 10 second base doubling with up to\n    a base of jitter, a 30 second lease) the four gaps are at most 30, 30, 50 and 90\n    seconds, so the horizon is about 200 seconds: 18 times inside the one hour floor\n    and 3,000 times inside the seven day default.\n\nOPERATOR OBLIGATION, because the second term is the one that moves. Raising\n`max_attempts`, `retry_base_secs` or `visibility_timeout_secs` lengthens the\nre-enqueue horizon, and this window must stay above it. It is documented rather than\ncross-validated at load: computing the horizon exactly means re-implementing the\nstore's backoff schedule (its doubling and its one hour cap) in this crate, which\nwould be a second copy of an arithmetic that has to agree with the first, and a\nwrong copy would refuse configurations that are in fact safe. No deployment reaches\nthis without deliberately lowering the window toward its floor AND raising the retry\nknobs.\n\nThe predicate keys on the message's completion, never on when it was enqueued: a\nmessage that is neither completed nor dead-lettered is UNDELIVERED work however old\nit is, and no setting here can cause one to be removed.\n\nThe default (seven days) and the ceiling (ninety days) are\n[`DIAGNOSTICS_DEFAULT_RETENTION_SECS`] and [`DIAGNOSTICS_MAX_RETENTION_SECS`], so\nthe tree has ONE answer to \"how long do we keep this class of operational record\".",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "dead_letter_retention_secs": {
+          "default": 0,
+          "description": "How long a DEAD-LETTERED message is kept after it was given up on, in seconds,\nwhere `0` means NEVER REAP IT and is the default. That is the opposite reading from\n`diagnostics.retention_secs`, where a zero-second retention prunes everything on the\nnext insert, and the inversion is deliberate rather than an oversight.\n\nA dead letter is work that will never happen unless an operator replays it. For the\nback-channel logout fan-out one dead letter can be an entire session's relying\nparties left un-notified, and the row is the ONLY record that it happened. So the\nsafe default here is to keep it, and \"delete these on a schedule\" has to be\nsomething an operator typed.\n\nA nonzero value is a real window and is bounded by the same ninety day ceiling\n([`DIAGNOSTICS_MAX_RETENTION_SECS`]) as the completed tail. There is no floor,\nbecause unlike the completed window there is no default value to protect: an\noperator who sets this at all has already decided.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "max_attempts": {
           "default": 5,
           "description": "The total number of attempts a message gets before it is DEAD-LETTERED. `1` means\nno retry at all: the first failure is terminal.\n\nThis bound is not only a politeness to a failing endpoint. A message that shares\nan ordering key with others BLOCKS them until it reaches a terminal state, so the\ndead letter is what releases the aggregate; an unbounded retry would wedge that\naggregate forever, which is why there is no \"unlimited\" value here and never will\nbe. The default (5) is conservative. Must be at least 1.\n\nThe wedge argument does not reach a consumer whose producers give every message its\nOWN ordering key, because each of its groups is a singleton with nothing behind it\nto block. Such a consumer may be given a larger budget IN CODE, where the singleton\nproperty can be argued for that consumer specifically; the back-channel logout\nfan-out is the one that is. It stays out of this knob deliberately: this value\napplies to EVERY consumer at once, and most of them do have aggregates.",
@@ -1514,6 +1528,25 @@
         "poll_interval_secs": {
           "default": 5,
           "description": "How often, in seconds, an idle worker polls for due work. It bounds the latency\nbetween a message being enqueued and being picked up, and it is a straight trade\nagainst database load: every worker of every consumer issues one claim per\ninterval per scope even when the queue is empty.\n\nThe default (5) matches the cadence the back-channel logout worker already runs\nat. Must be at least 1 and at most `OIDC_MAX_LIFETIME_SECS`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "reap_batch": {
+          "default": 1000,
+          "description": "The largest number of rows ONE retention pass removes per scope, per consumer, per\ntail. It is a HARD bound and the sweeper does NOT loop until the backlog is drained.\n\nThe bound is the design. A first run over an accumulated backlog can face millions\nof rows, and an unbounded `DELETE` over them holds a long lock and produces one\nenormous WAL record, which stalls a replica. A pass that hits this bound is reported\nas SATURATED, so \"keeping up\" and \"falling behind forever\" are distinguishable\nrather than both reading as \"removed some rows\".\n\nWhat the default (1000) actually buys, in arithmetic rather than in adjectives,\nbecause the first draft of this sentence claimed more than the number supports. At\nthe default hourly cadence one pass per hour removes at most\n`1000 * (604800 / 3600) = 168,000` rows per week, PER (scope, consumer) PER tail.\nBoth halves of that qualifier matter: the fan-out this substrate exists for turns\none ended session into roughly `1 + N_relying_parties` rows, and those rows are\nspread across TWO consumers, so a deployment ending S sessions a week in one scope\nproduces about S rows for the fan-out consumer and about `S * N` for the delivery\nconsumer. The delivery consumer is the binding one: 168,000 a week covers 168,000\ndeliveries, which is 33,600 sessions a week at five relying parties each, not\n\"a few hundred thousand sessions\". A deployment past that raises the batch, shortens\nthe interval, or watches for SATURATED passes and does one of the two. Must be at\nleast 1 and at most [`OUTBOX_MAX_REAP_BATCH`], which is 100 times the default.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "reap_enabled": {
+          "default": true,
+          "description": "Whether the periodic retention sweeper runs at all (issue #104, PR 3). ON by\ndefault, because `outbox_messages` otherwise grows monotonically: migration 0099\nshipped the table with no retention of any kind, and every ended session enqueues\nroughly `1 + N_relying_parties` rows.\n\nTurning it OFF is a deliberate operator choice with a stated consequence: the table\nkeeps every completed message forever, and nothing else in the system removes one.\nThe reason to have the switch is that a deployment may want to reap on its own\nschedule from outside the process, and a knob whose only alternative is editing\ncode is not a knob.\n\nThe sweeper is started INDEPENDENTLY of `oidc.backchannel_logout_enabled`, because\nthe outbox is a generic substrate and that switch gates ONE of its consumers; the\nnext consumer to register will run behind a different switch again, and retention\nmust not have to be re-wired for each.\n\nTwo things other than this switch stop a sweeper from running, and neither is a bug:\na deployment with no control-plane DSN cannot start one at all (only\n`ironauth_control` is granted DELETE, and the boot logs an error saying so), and a\ndeployment whose consumers never run has nothing for one to remove, because a\nmessage only becomes reapable once a consumer retires it. See\n`docs/design/RETENTION.md`.",
+          "type": "boolean"
+        },
+        "reap_interval_secs": {
+          "default": 3600,
+          "description": "How often, in seconds, the retention sweeper runs a pass over every scope.\n\nRetention is not latency-sensitive: nothing waits on a row being removed, so this\ntrades database load against how far the table is allowed to run ahead of the\nwindow. The default (one hour) with the default batch removes up to 1000 rows per\nconsumer per scope per hour. Must be at least 1 and at most `OIDC_MAX_LIFETIME_SECS`.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -2735,13 +2768,18 @@
       "$ref": "#/$defs/OutboxConfig",
       "default": {
         "claim_batch": 64,
+        "completed_retention_secs": 604800,
+        "dead_letter_retention_secs": 0,
         "max_attempts": 5,
         "poll_interval_secs": 5,
+        "reap_batch": 1000,
+        "reap_enabled": true,
+        "reap_interval_secs": 3600,
         "retry_base_secs": 10,
         "visibility_timeout_secs": 30,
         "worker_concurrency": 2
       },
-      "description": "Transactional outbox and job queue settings (issue #104): the tuning of the\nat-least-once dispatch substrate every async path (webhook delivery,\nback-channel logout delivery, SIEM sinks, migration jobs, notification\nfan-out) drains through. Worker concurrency, the visibility timeout, the\npoll cadence, the claim batch, and the retry bound are all settings with\nsafe defaults per the tunability principle, because the right value depends\non the deployment's connection pool, its consumers' handler latency, and how\nlong its operators are willing to wait for a crashed worker's messages.\n\nA top-level section rather than a field on any one consumer's section\ndeliberately: the substrate is shared, so one set of knobs governs every\nconsumer's workers and an operator tunes the QUEUE once rather than\nrediscovering the same four settings under each subsystem.\n\nThere is no mode selection here and no mention of a durable message bus.\nThe Postgres queue is the only implementation that exists, and a knob whose\nvalue does nothing is worse than an absent knob; mode selection lands with\nthe implementation it selects."
+      "description": "Transactional outbox and job queue settings (issue #104): the tuning of the\nat-least-once dispatch substrate every async path (webhook delivery,\nback-channel logout delivery, SIEM sinks, migration jobs, notification\nfan-out) drains through. Two halves: the DRAIN tuning (worker concurrency,\nthe visibility timeout, the poll cadence, the claim batch, the retry bound)\nand, since PR 3 of that issue, the RETENTION tuning (`reap_enabled`, the\ncompleted and dead-letter windows, the per-pass reap batch, and the sweep\ninterval). All have safe defaults per the tunability principle, because the\nright value depends on the deployment's connection pool, its consumers'\nhandler latency, how long its operators are willing to wait for a crashed\nworker's messages, and how long it must keep the evidence that a message was\ndelivered. Two retention defaults read the OPPOSITE way to\n`diagnostics.retention_secs` and are called out on their own rows below.\n\nA top-level section rather than a field on any one consumer's section\ndeliberately: the substrate is shared, so one set of knobs governs every\nconsumer's workers and an operator tunes the QUEUE once rather than\nrediscovering the same settings under each subsystem.\n\nThere is no mode selection here and no mention of a durable message bus.\nThe Postgres queue is the only implementation that exists, and a knob whose\nvalue does nothing is worse than an absent knob; mode selection lands with\nthe implementation it selects."
     },
     "password_hashing": {
       "$ref": "#/$defs/PasswordHashingConfig",

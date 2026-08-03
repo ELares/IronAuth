@@ -30,8 +30,12 @@
 //!   failure dead-letters without burning the schedule, a consumer PANIC costs its message
 //!   an attempt and the pool nothing, the pool is a pool, and `size` is the LIVE worker
 //!   count rather than the number that were started.
-//! - **The depth gauge.** All four counters measured at once, at four distinct non-zero
+//! - **The depth gauge.** All five counters measured at once, at five distinct non-zero
 //!   values, and again after the clock moves.
+//! - **Retention** (issue #104, PR 3). The reap predicates, the batch bound and its
+//!   saturation signal, the fenced-scope skip, the missing-grant fault, what a reaped row
+//!   gives up, and the SWEEPER's own liveness properties: the sliced sleep, the drop guard,
+//!   the unavailable-scopes report, and a task that unwinds.
 //!
 //! The isolation and least-privilege halves are not restated here: they live in
 //! `tests/migration.rs` (the policy, the CHECKs, the three indexes, the grant shape) and
@@ -44,13 +48,15 @@ use std::time::{Duration, SystemTime};
 
 use ironauth_env::Env;
 use ironauth_store::outbox::{
-    ConsumerError, ConsumerRegistry, DrainStats, OutboxConsumer, OutboxObserver, OutboxWorker,
-    OutboxWorkerPool, ScopeSource, SilentObserver, StaticScopes, WorkerSettings,
+    ConsumerError, ConsumerRegistry, DrainStats, OutboxConsumer, OutboxObserver, OutboxReaper,
+    OutboxWorker, OutboxWorkerPool, RetentionObserver, RetentionSettings, RetentionStats,
+    RetentionSweeper, ScopeSource, SilentObserver, SilentRetentionObserver, StaticScopes,
+    WorkerSettings,
 };
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
     CorrelationId, FailureOutcome, NewOutboxMessage, OutboxMessage, RetryPolicy, Scope,
-    SessionEndCause, SessionId, UserId,
+    SessionEndCause, SessionId, StoreError, UserId,
 };
 
 /// A far-future expiry (year 2100) in epoch microseconds, so a session that stops
@@ -556,6 +562,7 @@ async fn a_failing_message_backs_off_and_the_attempts_bound_dead_letters_it() {
             in_flight: 0,
             scheduled: 0,
             dead_lettered: 1,
+            completed: 0,
         },
         "the dead letter is the number an alert fires on"
     );
@@ -2157,14 +2164,19 @@ async fn the_claim_batch_is_a_hard_bound_and_not_a_hint_the_planner_may_decline(
 // 8. The depth gauge, in a state where every counter is distinct and non-zero.
 
 #[tokio::test]
-async fn depth_reports_ready_in_flight_scheduled_and_dead_lettered_separately() {
+async fn depth_reports_ready_in_flight_scheduled_dead_lettered_and_completed_separately() {
     // `depth` is the observability primitive an exporter reads and an alert fires on, and
-    // three of its four counters were previously only ever asserted as zero. Measured: the
+    // three of its counters were previously only ever asserted as zero. Measured: the
     // `ready` filter's due gate could be INVERTED (`next_attempt_at > now` instead of
     // `<=`) and the entire suite stayed green.
     //
-    // The four counts here are deliberately DISTINCT (1, 2, 3, 4) rather than all one, so
-    // a pair of swapped filters is a failure too, not just a wrong predicate.
+    // The five counts here are deliberately DISTINCT (1, 2, 3, 4, 5) rather than all one,
+    // so a pair of swapped filters is a failure too, not just a wrong predicate.
+    //
+    // `completed` is the retention counter (issue #104, PR 3). Without it an operator has
+    // no number that moves when a reaper works and no number that stands still when one is
+    // missing: the other four count non-terminal rows and the dead-letter tail retention
+    // keeps forever by default, so none of them could ever show the reapable backlog.
     let db = TestDatabase::start().await;
     let (env, clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 41);
     let scope = db.seed_scope(&env).await;
@@ -2173,9 +2185,9 @@ async fn depth_reports_ready_in_flight_scheduled_and_dead_lettered_separately() 
     let queue = store.scoped(scope);
     let queue = queue.outbox();
 
-    // Ten messages in ten groups, so none of them blocks another and the state each ends
-    // in is the state this test put it in.
-    for n in 0..10 {
+    // Fifteen messages in fifteen groups, so none of them blocks another and the state each
+    // ends in is the state this test put it in.
+    for n in 0..15 {
         enqueue(
             &db,
             &env,
@@ -2185,11 +2197,11 @@ async fn depth_reports_ready_in_flight_scheduled_and_dead_lettered_separately() 
         )
         .await;
     }
-    // Claim the first nine, leaving the tenth never claimed: that one is READY.
-    let claimed = queue.claim(&env, CONSUMER, lease, 9).await.expect("claim");
+    // Claim the first fourteen, leaving the fifteenth never claimed: that one is READY.
+    let claimed = queue.claim(&env, CONSUMER, lease, 14).await.expect("claim");
     assert_eq!(
         claimed.len(),
-        9,
+        14,
         "the batch limit left exactly one unclaimed; got {:?}",
         claimed
             .iter()
@@ -2227,6 +2239,13 @@ async fn depth_reports_ready_in_flight_scheduled_and_dead_lettered_separately() 
             FailureOutcome::DeadLettered { .. }
         ));
     }
+    // Five are completed: those are the reapable backlog.
+    for message in &claimed[9..14] {
+        assert!(
+            queue.complete(&env, message).await.expect("completion"),
+            "the lease is still ours, so the completion lands"
+        );
+    }
 
     assert_eq!(
         queue.depth(&env, CONSUMER, lease).await.expect("depth"),
@@ -2235,6 +2254,7 @@ async fn depth_reports_ready_in_flight_scheduled_and_dead_lettered_separately() 
             in_flight: 2,
             scheduled: 3,
             dead_lettered: 4,
+            completed: 5,
         },
         "every counter is separately measured, and no two of them are the same number"
     );
@@ -2251,9 +2271,10 @@ async fn depth_reports_ready_in_flight_scheduled_and_dead_lettered_separately() 
             in_flight: 0,
             scheduled: 0,
             dead_lettered: 4,
+            completed: 5,
         },
         "in flight and scheduled are readings of the clock against the row, not stored \
-         states; only the dead letters are permanent"
+         states; the dead letters and the completions are the two permanent ones"
     );
 }
 
@@ -2344,6 +2365,888 @@ async fn the_data_plane_can_resurrect_a_completed_message_so_terminality_is_enfo
         pending_keys(&db, scope).await,
         vec!["fact-1".to_owned()],
         "and it redrains: the CHECK is not what makes a completion final"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 10. Retention (issue #104, PR 3).
+//
+// Every test in this section reaps through the CONTROL store, because
+// `0102_outbox_retention.sql` grants DELETE on `outbox_messages` to `ironauth_control`
+// and to no other role. Enqueue, claim and complete still go through the app store, so
+// the rows being reaped are rows the real drain path wrote.
+
+/// The shipped retention windows, with only the batch shrunk where a test is about the
+/// bound. Seven days for the completed tail; dead letters kept FOREVER, which is the
+/// shipped default and the opposite of what a zero-second window would mean.
+fn retention() -> RetentionSettings {
+    RetentionSettings::default()
+}
+
+/// A reaper over the CONTROL store, which is the only role that may delete here.
+fn reaper(db: &TestDatabase, env: &Env, settings: RetentionSettings) -> OutboxReaper {
+    OutboxReaper::new(db.control_store().clone(), env.clone(), settings)
+}
+
+/// Claim and COMPLETE every due message of `CONSUMER` in `scope`, returning how many were
+/// retired. Runs as the data plane, which is the role that drains.
+async fn complete_all_due(db: &TestDatabase, env: &Env, scope: Scope) -> usize {
+    let store = db.store();
+    let scoped = store.scoped(scope);
+    let queue = scoped.outbox();
+    let claimed = queue
+        .claim(env, CONSUMER, Duration::from_secs(300), 1_000)
+        .await
+        .expect("claim");
+    for message in &claimed {
+        assert!(
+            queue.complete(env, message).await.expect("completion"),
+            "the lease is still ours"
+        );
+    }
+    claimed.len()
+}
+
+/// How many messages of `CONSUMER` remain in `scope`, in ANY state.
+async fn remaining(db: &TestDatabase, scope: Scope) -> usize {
+    db.store()
+        .scoped(scope)
+        .outbox()
+        .list(CONSUMER, 1_000)
+        .await
+        .expect("list")
+        .len()
+}
+
+/// A [`RetentionObserver`] that records what it was told, so a test can assert on the
+/// reports rather than only on the rows.
+#[derive(Default)]
+struct RecordingRetentionObserver {
+    finished: std::sync::Mutex<Vec<(String, RetentionStats)>>,
+    failures: std::sync::Mutex<Vec<String>>,
+    /// How many times the sweep said it could not resolve its scopes. A COUNT rather than
+    /// a boolean, so a test can watch it move across passes.
+    unavailable: std::sync::atomic::AtomicUsize,
+}
+
+impl RecordingRetentionObserver {
+    fn finished(&self) -> Vec<(String, RetentionStats)> {
+        self.finished.lock().expect("finished lock").clone()
+    }
+
+    fn failures(&self) -> Vec<String> {
+        self.failures.lock().expect("failures lock").clone()
+    }
+
+    fn unavailable(&self) -> usize {
+        self.unavailable.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl RetentionObserver for RecordingRetentionObserver {
+    fn pass_finished(&self, _scope: Scope, consumer: &str, stats: &RetentionStats) {
+        self.finished
+            .lock()
+            .expect("finished lock")
+            .push((consumer.to_owned(), *stats));
+    }
+
+    fn pass_failed(&self, _scope: Scope, consumer: Option<&str>, _error: &StoreError) {
+        self.failures
+            .lock()
+            .expect("failures lock")
+            .push(consumer.unwrap_or("<scope>").to_owned());
+    }
+
+    fn scopes_unavailable(&self, _error: &StoreError) {
+        self.unavailable
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// A [`ScopeSource`] that always fails, so the sweeper's own loop is the thing under test
+/// rather than anything it would have swept.
+struct FailingScopes;
+
+impl ScopeSource for FailingScopes {
+    fn scopes(
+        &self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<Scope>, StoreError>> + Send + '_>,
+    > {
+        // The variant is immaterial: all the loop can observe is that the answer was
+        // `Err`, and what it must not do is swallow it.
+        Box::pin(async { Err(StoreError::NotFound) })
+    }
+}
+
+/// A [`ScopeSource`] that PANICS, which is how a sweeper task dies. A panic in the source
+/// or the observer is the only thing that unwinds it, and nothing restarts it.
+struct PanickingScopes;
+
+impl ScopeSource for PanickingScopes {
+    fn scopes(
+        &self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<Scope>, StoreError>> + Send + '_>,
+    > {
+        Box::pin(async { panic!("the scope source panicked") })
+    }
+}
+
+/// A [`ScopeSource`] that answers with a fixed list and COUNTS how many times it was asked.
+/// The count is what makes "the task stopped" observable from outside the task.
+struct CountingScopes {
+    scopes: Vec<Scope>,
+    calls: Arc<AtomicUsize>,
+}
+
+impl ScopeSource for CountingScopes {
+    fn scopes(
+        &self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<Scope>, StoreError>> + Send + '_>,
+    > {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        let scopes = self.scopes.clone();
+        Box::pin(async move { Ok(scopes) })
+    }
+}
+
+#[tokio::test]
+async fn a_completed_message_is_reaped_past_its_window_and_kept_inside_it() {
+    // The base case, and the one that makes every other test in this section mean
+    // something: without it a reaper that deleted NOTHING would satisfy all of them.
+    let db = TestDatabase::start().await;
+    let (env, clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 91);
+    let scope = db.seed_scope(&env).await;
+
+    enqueue(&db, &env, scope, "fact-1", "agg-a").await;
+    assert_eq!(complete_all_due(&db, &env, scope).await, 1);
+
+    let reaper = reaper(&db, &env, retention());
+    let inside = reaper.reap_once(scope, CONSUMER).await.expect("pass");
+    assert_eq!(
+        inside,
+        RetentionStats::default(),
+        "a message completed a moment ago is inside the window and is not touched"
+    );
+    assert_eq!(remaining(&db, scope).await, 1);
+
+    // Past the seven day window, by one second, so the boundary is the thing under test
+    // rather than an arbitrary jump.
+    clock.advance(retention().completed_retention + Duration::from_secs(1));
+    let past = reaper.reap_once(scope, CONSUMER).await.expect("pass");
+    assert_eq!(
+        past,
+        RetentionStats {
+            completed_reaped: 1,
+            dead_letters_reaped: 0,
+            saturated: false,
+        },
+        "past its window the completed message is removed, and one row is not a saturated \
+         pass"
+    );
+    assert_eq!(
+        remaining(&db, scope).await,
+        0,
+        "the row is gone from the table, not merely from a projection"
+    );
+}
+
+#[tokio::test]
+async fn a_non_terminal_message_is_never_reaped_however_old_it_is() {
+    // THE test of this PR. A message with both terminal columns NULL is not stale, it is
+    // UNDELIVERED, and there is a shipped configuration that produces exactly that
+    // population at scale: `oidc.backchannel_logout_enabled` defaults OFF while the
+    // producer that enqueues `session_ended` runs regardless, so a deployment accumulates
+    // undrained messages by design and turning the switch on begins by draining them.
+    //
+    // A predicate keyed on `enqueued_at` deletes those pending logouts, and `depth` then
+    // reports a clean queue because the rows it counted are gone. It is worse than a silent
+    // loss: the claim's head-of-group rule reads TERMINAL state, so deleting a group's
+    // non-terminal head unblocks the rest of its group and the survivors deliver out of
+    // order. The second aggregate below is that case.
+    let db = TestDatabase::start().await;
+    let (env, clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 92);
+    let scope = db.seed_scope(&env).await;
+
+    // Three shapes of non-terminal row, all enqueued at the epoch and then left to age far
+    // past every window this reaper knows: never claimed, claimed and released with a
+    // retry pending, and the HEAD of a two message ordering group.
+    enqueue(&db, &env, scope, "never-claimed", "agg-a").await;
+    enqueue(&db, &env, scope, "failed-once", "agg-b").await;
+    enqueue(&db, &env, scope, "group-head", "agg-c").await;
+    enqueue(&db, &env, scope, "group-tail", "agg-c").await;
+
+    let store = db.store();
+    let scoped = store.scoped(scope);
+    let queue = scoped.outbox();
+    let claimed = queue
+        .claim(&env, CONSUMER, Duration::from_secs(30), 10)
+        .await
+        .expect("claim");
+    let failed = claimed
+        .iter()
+        .find(|m| m.idempotency_key == "failed-once")
+        .expect("the retryable message was claimed");
+    assert!(matches!(
+        queue
+            .fail(&env, failed, "http_status_503", RetryPolicy::default())
+            .await
+            .expect("retryable failure"),
+        FailureOutcome::Retrying { .. }
+    ));
+
+    // A YEAR past enqueue, which is far beyond the seven day completed window and beyond
+    // the ninety day ceiling any operator could configure.
+    clock.advance(Duration::from_secs(365 * 24 * 60 * 60));
+    let stats = reaper(&db, &env, retention())
+        .reap_once(scope, CONSUMER)
+        .await
+        .expect("pass");
+    assert_eq!(
+        stats,
+        RetentionStats::default(),
+        "a message that is neither completed nor dead-lettered is UNDELIVERED work, not a \
+         stale row, whatever its age: a predicate keyed on enqueued_at deletes pending \
+         logouts and leaves depth() reporting a clean queue"
+    );
+
+    let mut left = pending_keys(&db, scope).await;
+    left.sort();
+    assert_eq!(
+        left,
+        vec![
+            "failed-once".to_owned(),
+            "group-head".to_owned(),
+            "group-tail".to_owned(),
+            "never-claimed".to_owned(),
+        ],
+        "every non-terminal message survives, including the ordering-group head whose \
+         deletion would let its tail jump the queue"
+    );
+}
+
+#[tokio::test]
+async fn a_dead_letter_is_kept_forever_by_default_and_only_a_window_an_operator_set_reaps_it() {
+    // The two tails are NOT the same kind of row and the tree ships them different
+    // defaults. A dead letter is work GIVEN UP ON, which for the back-channel logout
+    // fan-out can be an entire session's relying parties left un-notified, and the row is
+    // the only record that it happened.
+    //
+    // Two failures are measured here, and they are different failures. Folding the dead
+    // letters into the completed predicate would delete this row on the FIRST pass below,
+    // where no dead-letter window is configured at all. Keying `reap_dead_lettered` on
+    // `completed_at` instead of `dead_lettered_at` would delete NOTHING on the second pass,
+    // because a dead-lettered row has `completed_at IS NULL`.
+    let db = TestDatabase::start().await;
+    let (env, clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 93);
+    let scope = db.seed_scope(&env).await;
+
+    enqueue(&db, &env, scope, "poison", "agg-a").await;
+    let store = db.store();
+    let scoped = store.scoped(scope);
+    let queue = scoped.outbox();
+    let claimed = queue
+        .claim(&env, CONSUMER, Duration::from_secs(30), 10)
+        .await
+        .expect("claim");
+    assert!(matches!(
+        queue
+            .fail(
+                &env,
+                &claimed[0],
+                "poison",
+                RetryPolicy {
+                    max_attempts: 1,
+                    retry_base: Duration::from_secs(10),
+                },
+            )
+            .await
+            .expect("terminal failure"),
+        FailureOutcome::DeadLettered { .. }
+    ));
+
+    // A year later, at the SHIPPED default, where dead letters are kept forever.
+    clock.advance(Duration::from_secs(365 * 24 * 60 * 60));
+    let default_settings = retention();
+    assert!(
+        default_settings.dead_letter_retention.is_none(),
+        "the shipped default keeps dead letters forever, which is what this case measures"
+    );
+    let kept = reaper(&db, &env, default_settings)
+        .reap_once(scope, CONSUMER)
+        .await
+        .expect("pass");
+    assert_eq!(
+        kept,
+        RetentionStats::default(),
+        "with no dead-letter window configured the dead letter is kept, and it is far past \
+         the COMPLETED window, so a reaper that folded the two tails together would have \
+         taken it"
+    );
+    assert_eq!(remaining(&db, scope).await, 1);
+
+    // The same row, with a window an operator chose that it is NOT yet past.
+    let far = RetentionSettings {
+        dead_letter_retention: Some(Duration::from_secs(400 * 24 * 60 * 60)),
+        ..retention()
+    };
+    assert_eq!(
+        reaper(&db, &env, far)
+            .reap_once(scope, CONSUMER)
+            .await
+            .expect("pass"),
+        RetentionStats::default(),
+        "a dead letter inside its own window stays: the window is measured from \
+         dead_lettered_at"
+    );
+    assert_eq!(remaining(&db, scope).await, 1);
+
+    // And now a window it IS past.
+    let near = RetentionSettings {
+        dead_letter_retention: Some(Duration::from_secs(30 * 24 * 60 * 60)),
+        ..retention()
+    };
+    assert_eq!(
+        reaper(&db, &env, near)
+            .reap_once(scope, CONSUMER)
+            .await
+            .expect("pass"),
+        RetentionStats {
+            completed_reaped: 0,
+            dead_letters_reaped: 1,
+            saturated: false,
+        },
+        "past a window an operator deliberately set, the dead letter is reaped, and it is \
+         counted on the dead-letter side rather than the completed one"
+    );
+    assert_eq!(remaining(&db, scope).await, 0);
+}
+
+#[tokio::test]
+async fn the_reap_batch_is_a_hard_bound_and_a_saturated_pass_says_so() {
+    // The pass is bounded and does NOT loop until drained: an unbounded delete over a first
+    // run's accumulated backlog holds a long lock and produces one enormous WAL record,
+    // which stalls a replica.
+    //
+    // Saturation is a distinct signal because without it "removed 2 rows" is the same
+    // report whether the reaper is keeping up or has been falling behind for a month, and
+    // those need different actions.
+    let db = TestDatabase::start().await;
+    let (env, clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 94);
+    let scope = db.seed_scope(&env).await;
+
+    for n in 0..5 {
+        enqueue(&db, &env, scope, &format!("fact-{n}"), &format!("agg-{n}")).await;
+    }
+    assert_eq!(complete_all_due(&db, &env, scope).await, 5);
+    clock.advance(retention().completed_retention + Duration::from_secs(1));
+
+    let reaper = reaper(
+        &db,
+        &env,
+        RetentionSettings {
+            batch: 2,
+            ..retention()
+        },
+    );
+    for expected_left in [3, 1] {
+        let stats = reaper.reap_once(scope, CONSUMER).await.expect("pass");
+        assert_eq!(
+            stats,
+            RetentionStats {
+                completed_reaped: 2,
+                dead_letters_reaped: 0,
+                saturated: true,
+            },
+            "a pass removes at most its batch and REPORTS that it ran out of budget rather \
+             than out of work"
+        );
+        assert_eq!(remaining(&db, scope).await, expected_left);
+    }
+    let last = reaper.reap_once(scope, CONSUMER).await.expect("pass");
+    assert_eq!(
+        last,
+        RetentionStats {
+            completed_reaped: 1,
+            dead_letters_reaped: 0,
+            saturated: false,
+        },
+        "the pass that finally clears the backlog removed less than its budget, so it is \
+         NOT saturated: that is the transition an operator watches for"
+    );
+    assert_eq!(remaining(&db, scope).await, 0);
+}
+
+#[tokio::test]
+async fn retention_removes_only_its_own_scopes_messages() {
+    // Row-level security is what confines the delete, and it is the bound the migration
+    // header claims. A reaper that dropped its scope binding would take every tenant's
+    // retired messages in one statement.
+    let db = TestDatabase::start().await;
+    let (env, clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 95);
+    let mine = db.seed_scope(&env).await;
+    let theirs = db.seed_scope(&env).await;
+
+    for scope in [mine, theirs] {
+        enqueue(&db, &env, scope, "fact-1", "agg-a").await;
+        assert_eq!(complete_all_due(&db, &env, scope).await, 1);
+    }
+    clock.advance(retention().completed_retention + Duration::from_secs(1));
+
+    let stats = reaper(&db, &env, retention())
+        .reap_once(mine, CONSUMER)
+        .await
+        .expect("pass");
+    assert_eq!(stats.completed_reaped, 1);
+    assert_eq!(remaining(&db, mine).await, 0, "my retired message is gone");
+    assert_eq!(
+        remaining(&db, theirs).await,
+        1,
+        "another scope's retired message is untouched, and nothing in the reap statement \
+         names that scope: the policy is what refused it"
+    );
+}
+
+#[tokio::test]
+async fn a_fenced_scope_is_not_reaped_and_a_sweep_covers_every_consumer_in_a_live_one() {
+    // A suspended scope is one an operator PAUSED, and quietly deleting its data while it
+    // is paused is the last thing a pause should do. The drain already refuses a fenced
+    // scope, so its queue does not move: its completed tail is exactly the delivery
+    // evidence somebody investigating the suspension reads.
+    //
+    // The same test drives the live half, because "reaped nothing" has to be measured
+    // against a scope where the identical sweep reaps everything. It also covers the
+    // consumer enumeration: TWO consumers have rows here, and a sweep that walked a
+    // registry rather than the table would miss whichever one this process does not run.
+    let db = TestDatabase::start().await;
+    let (env, clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 96);
+    let paused = db.seed_scope(&env).await;
+    let live = db.seed_scope(&env).await;
+
+    for scope in [paused, live] {
+        for consumer in [CONSUMER, "second_consumer"] {
+            enqueue_for(&db, &env, scope, consumer, "fact-1", "agg-a").await;
+            let store = db.store();
+            let scoped = store.scoped(scope);
+            let queue = scoped.outbox();
+            let claimed = queue
+                .claim(&env, consumer, Duration::from_secs(300), 10)
+                .await
+                .expect("claim");
+            assert_eq!(claimed.len(), 1);
+            assert!(queue.complete(&env, &claimed[0]).await.expect("complete"));
+        }
+    }
+    clock.advance(retention().completed_retention + Duration::from_secs(1));
+    db.set_environment_serving_state(paused, "suspended").await;
+
+    let reaper = reaper(&db, &env, retention());
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let observer = RecordingRetentionObserver::default();
+
+    reaper
+        .sweep_scope_until(paused, &stop, &observer)
+        .await
+        .expect("the fenced sweep is not an error");
+    assert!(
+        observer.finished().is_empty() && observer.failures().is_empty(),
+        "a fenced scope is skipped before anything is read per consumer, so it reports no \
+         pass at all; it reported {:?}",
+        observer.finished()
+    );
+    assert_eq!(
+        db.store()
+            .scoped(paused)
+            .outbox()
+            .list(CONSUMER, 10)
+            .await
+            .expect("list")
+            .len(),
+        1,
+        "the paused scope keeps its retired messages: they are the evidence an operator \
+         investigating the suspension reads"
+    );
+
+    reaper
+        .sweep_scope_until(live, &stop, &observer)
+        .await
+        .expect("the live sweep");
+    let mut reported = observer.finished();
+    reported.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        reported,
+        vec![
+            (
+                "second_consumer".to_owned(),
+                RetentionStats {
+                    completed_reaped: 1,
+                    dead_letters_reaped: 0,
+                    saturated: false,
+                }
+            ),
+            (
+                CONSUMER.to_owned(),
+                RetentionStats {
+                    completed_reaped: 1,
+                    dead_letters_reaped: 0,
+                    saturated: false,
+                }
+            ),
+        ],
+        "the live scope's sweep covers EVERY consumer with rows in it and reports each by \
+         name; the consumer list comes from the table, not from a registry this process \
+         happens to hold"
+    );
+    assert_eq!(remaining(&db, live).await, 0);
+}
+
+#[tokio::test]
+async fn a_stop_between_consumers_abandons_the_rest_of_the_sweep() {
+    // The flag is read between consumers as well as between scopes, so a shutdown costs at
+    // most one bounded delete. Measured by setting it BEFORE the sweep: nothing is reaped
+    // and nothing is reported, which is only possible if the check sits inside the loop.
+    let db = TestDatabase::start().await;
+    let (env, clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 97);
+    let scope = db.seed_scope(&env).await;
+
+    enqueue(&db, &env, scope, "fact-1", "agg-a").await;
+    assert_eq!(complete_all_due(&db, &env, scope).await, 1);
+    clock.advance(retention().completed_retention + Duration::from_secs(1));
+
+    let observer = RecordingRetentionObserver::default();
+    let stop = std::sync::atomic::AtomicBool::new(true);
+    reaper(&db, &env, retention())
+        .sweep_scope_until(scope, &stop, &observer)
+        .await
+        .expect("sweep");
+    assert!(
+        observer.finished().is_empty(),
+        "a stopped sweep reaps nothing and reports nothing"
+    );
+    assert_eq!(remaining(&db, scope).await, 1);
+}
+
+#[tokio::test]
+async fn a_reaper_without_the_delete_grant_reports_the_fault_rather_than_reaping_nothing_quietly() {
+    // The failure an operator actually hits: a deployment upgraded past this PR whose
+    // control-plane role never received the 0102 grant. Postgres refuses the DELETE, and
+    // the whole point of the observer is that the refusal LEAVES the process. Without it a
+    // table that grows forever and a reaper with nothing to do look identical.
+    //
+    // Induced the way an operator induces it by accident, by taking the grant away, so the
+    // fault is a real permission fault on the real statement.
+    let db = TestDatabase::start().await;
+    let (env, clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 98);
+    let scope = db.seed_scope(&env).await;
+
+    enqueue(&db, &env, scope, "fact-1", "agg-a").await;
+    assert_eq!(complete_all_due(&db, &env, scope).await, 1);
+    clock.advance(retention().completed_retention + Duration::from_secs(1));
+
+    db.execute_owner_sql("REVOKE DELETE ON outbox_messages FROM ironauth_control")
+        .await;
+    let observer = RecordingRetentionObserver::default();
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    reaper(&db, &env, retention())
+        .sweep_scope_until(scope, &stop, &observer)
+        .await
+        .expect("the scope-level reads still succeed");
+    db.execute_owner_sql("GRANT DELETE ON outbox_messages TO ironauth_control")
+        .await;
+
+    assert_eq!(
+        observer.failures(),
+        vec![CONSUMER.to_owned()],
+        "the refusal is reported OUT, naming the consumer whose tail was not reaped"
+    );
+    assert!(
+        observer.finished().is_empty(),
+        "and no pass is reported as finished, so a fault cannot read as a quiet success"
+    );
+    assert_eq!(remaining(&db, scope).await, 1);
+}
+
+#[tokio::test]
+async fn reaping_a_completed_message_frees_its_idempotency_key_and_the_work_becomes_deliverable_again()
+ {
+    // What a completed row carries that is NOT delivery evidence, measured rather than
+    // asserted. While it exists the row occupies its slot in
+    // `UNIQUE (tenant_id, environment_id, consumer, idempotency_key)`, and that constraint
+    // IS the queue's at-most-once ledger: it is what `enqueue_all` relies on to make a
+    // producer's re-run a no-op. Reaping the row frees the key.
+    //
+    // This is the contract, pinned so it is measured rather than believed. It is not
+    // reachable with today's consumers (a producer can only re-enqueue while its own
+    // driving message is still non-terminal, which at the shipped outbox defaults is about
+    // 200 seconds against a one hour floor), and that is exactly why it needs a test: the
+    // thing that makes it safe is arithmetic in another section of the config, not
+    // anything the queue enforces.
+    let db = TestDatabase::start().await;
+    let (env, clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 99);
+    let scope = db.seed_scope(&env).await;
+    let key = "one-domain-fact";
+
+    enqueue(&db, &env, scope, key, "agg-a").await;
+    assert_eq!(complete_all_due(&db, &env, scope).await, 1);
+
+    // BEFORE the reap: the ledger holds, and a producer re-running its enqueue is a no-op.
+    let store = db.store();
+    let scoped = store.scoped(scope);
+    let queue = scoped.outbox();
+    let again = queue
+        .enqueue_all(
+            &env,
+            &[NewOutboxMessage {
+                consumer: CONSUMER,
+                idempotency_key: key,
+                ordering_key: "agg-a",
+                payload: serde_json::json!({}),
+            }],
+        )
+        .await
+        .expect("re-enqueue over a live completed row");
+    assert_eq!(
+        again, 0,
+        "while the completed row exists the unique index refuses the second insert, which \
+         is the at-most-once property the fan-out consumer rests its idempotence on"
+    );
+    assert_eq!(remaining(&db, scope).await, 1);
+
+    // AFTER the reap: the same call inserts, and what it inserted is CLAIMABLE.
+    clock.advance(retention().completed_retention + Duration::from_secs(1));
+    assert_eq!(
+        reaper(&db, &env, retention())
+            .reap_once(scope, CONSUMER)
+            .await
+            .expect("pass")
+            .completed_reaped,
+        1
+    );
+    let after = queue
+        .enqueue_all(
+            &env,
+            &[NewOutboxMessage {
+                consumer: CONSUMER,
+                idempotency_key: key,
+                ordering_key: "agg-a",
+                payload: serde_json::json!({}),
+            }],
+        )
+        .await
+        .expect("re-enqueue after the reap");
+    assert_eq!(
+        after, 1,
+        "reaping the completed row FREED its idempotency key: the second enqueue conflicts \
+         with nothing and inserts. This is the contract the retention floor exists to keep \
+         out of a producer's reach"
+    );
+    let claimed = queue
+        .claim(&env, CONSUMER, Duration::from_secs(300), 10)
+        .await
+        .expect("claim");
+    assert_eq!(
+        claimed.len(),
+        1,
+        "and the re-inserted message is CLAIMABLE, so the work is deliverable a second \
+         time rather than merely re-recorded"
+    );
+    assert_eq!(claimed[0].idempotency_key, key);
+}
+
+#[tokio::test]
+async fn a_sweeper_reports_scopes_it_could_not_resolve_rather_than_looping_at_full_health() {
+    // Nothing about the sweeper's liveness can reveal this: the task is alive and looping,
+    // the interval is being honoured, and not one row is being examined. Without the
+    // report a permanently broken scope enumeration and a healthy idle reaper produce the
+    // same evidence, which is none.
+    let observer = Arc::new(RecordingRetentionObserver::default());
+    let reported: Arc<dyn RetentionObserver> = observer.clone();
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 100);
+    let reaper = reaper(
+        &db,
+        &env,
+        RetentionSettings {
+            interval: Duration::from_millis(50),
+            ..retention()
+        },
+    );
+    let scopes: Arc<dyn ScopeSource> = Arc::new(FailingScopes);
+    let sweeper = RetentionSweeper::spawn(&reaper, &scopes, &reported);
+
+    let mut seen = 0;
+    for _ in 0..400 {
+        seen = observer.unavailable();
+        if seen > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    // The sweeper is at full health while this is happening, which is the whole point.
+    assert!(
+        sweeper.is_running(),
+        "the task is alive: liveness cannot be what tells an operator about this"
+    );
+    sweeper.shutdown().await;
+    assert!(
+        seen > 0,
+        "a sweep that cannot resolve its scopes reaped NO scope at all, and that has to \
+         leave the process: swallowing it makes a permanently failing sweeper \
+         indistinguishable from an idle one"
+    );
+    assert!(
+        observer.finished().is_empty(),
+        "and no pass is reported as finished, so the failure cannot read as a quiet success"
+    );
+}
+
+#[tokio::test]
+async fn a_sweeper_whose_task_unwinds_stops_reporting_itself_as_running() {
+    // `is_running` is the LIVE state and not "was spawned", and the difference is only
+    // observable when the task actually dies. A panicking `ScopeSource` is what gets there;
+    // nothing restarts the task, so a handle that reported its own existence would go on
+    // claiming a reaper was running with none left.
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 101);
+    let reaper = reaper(
+        &db,
+        &env,
+        RetentionSettings {
+            interval: Duration::from_millis(50),
+            ..retention()
+        },
+    );
+    let scopes: Arc<dyn ScopeSource> = Arc::new(PanickingScopes);
+    let observer: Arc<dyn RetentionObserver> = Arc::new(SilentRetentionObserver);
+    let sweeper = RetentionSweeper::spawn(&reaper, &scopes, &observer);
+
+    let mut alive = true;
+    for _ in 0..400 {
+        alive = sweeper.is_running();
+        if !alive {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        !alive,
+        "a sweeper whose task unwound must report itself as NOT running: nothing restarts \
+         it, so the alternative is a handle that claims a reaper exists forever"
+    );
+}
+
+#[tokio::test]
+async fn an_hourly_sweeper_still_shuts_down_promptly_because_it_sleeps_in_slices() {
+    // The wait between passes is almost all of a sweeper's life, and the stop checks
+    // between scopes and between consumers say nothing about it. A single
+    // `sleep(interval).await` would be correct and unusable: at the shipped hourly
+    // interval, `shutdown().await` would take up to an hour, which an orchestrator
+    // resolves with SIGKILL.
+    //
+    // Measured through the real seam rather than against the private helper. The interval
+    // here is a full hour, so a sweeper that slept it whole could not answer inside the
+    // timeout below, and the assertion is a TIMEOUT rather than a stopwatch so no
+    // wall-clock reading appears in this test.
+    let db = TestDatabase::start().await;
+    let (env, clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 102);
+    let scope = db.seed_scope(&env).await;
+    enqueue(&db, &env, scope, "fact-1", "agg-a").await;
+    assert_eq!(complete_all_due(&db, &env, scope).await, 1);
+    clock.advance(retention().completed_retention + Duration::from_secs(1));
+
+    let reaper = reaper(
+        &db,
+        &env,
+        RetentionSettings {
+            interval: Duration::from_secs(60 * 60),
+            ..retention()
+        },
+    );
+    let scopes: Arc<dyn ScopeSource> = Arc::new(StaticScopes::new(vec![scope]));
+    let observer: Arc<dyn RetentionObserver> = Arc::new(SilentRetentionObserver);
+    let sweeper = RetentionSweeper::spawn(&reaper, &scopes, &observer);
+
+    // Wait until the FIRST pass has finished, so the task is demonstrably inside its long
+    // wait rather than still working. Without this the task could observe the stop flag at
+    // the top of the loop and a whole sleep would survive the test.
+    let mut first_pass_landed = false;
+    for _ in 0..400 {
+        if remaining(&db, scope).await == 0 {
+            first_pass_landed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        first_pass_landed,
+        "the first pass must land before the wait is measured"
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    tokio::time::timeout(Duration::from_secs(10), sweeper.shutdown())
+        .await
+        .expect(
+            "shutdown must return while the sweeper is inside an HOUR-long wait: the wait \
+             is sliced and each slice re-reads the stop flag. A single un-sliced sleep \
+             makes a graceful stop take up to the whole interval",
+        );
+}
+
+#[tokio::test]
+async fn a_dropped_sweeper_stops_rather_than_leaving_a_task_deleting_rows_behind_it() {
+    // Dropping the handle DETACHES the tokio task, so without the `Drop` guard a sweeper
+    // that goes out of scope keeps sweeping forever with nothing left to stop it: rows
+    // keep being deleted behind an operator's back and no handle exists to await.
+    //
+    // Measured through the ScopeSource, because that is the one thing the loop touches on
+    // every single pass whether or not there is anything to reap.
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 103);
+    let scope = db.seed_scope(&env).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let reaper = reaper(
+        &db,
+        &env,
+        RetentionSettings {
+            interval: Duration::from_millis(25),
+            ..retention()
+        },
+    );
+    let scopes: Arc<dyn ScopeSource> = Arc::new(CountingScopes {
+        scopes: vec![scope],
+        calls: Arc::clone(&calls),
+    });
+    let observer: Arc<dyn RetentionObserver> = Arc::new(SilentRetentionObserver);
+
+    {
+        let sweeper = RetentionSweeper::spawn(&reaper, &scopes, &observer);
+        for _ in 0..400 {
+            if calls.load(Ordering::Relaxed) >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            calls.load(Ordering::Relaxed) >= 2,
+            "the sweeper must be genuinely LOOPING before the drop, otherwise a flat count \
+             afterwards would prove nothing"
+        );
+        drop(sweeper);
+    }
+
+    // Past several intervals, so a still-running task would certainly have swept again.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let settled = calls.load(Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        settled,
+        "the dropped sweeper stopped: its task observed the flag `Drop` set and left the \
+         loop. Without that guard the detached task keeps deleting rows with no handle \
+         left to stop it"
     );
 }
 

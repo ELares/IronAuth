@@ -18762,6 +18762,27 @@ pub struct OutboxDepth {
     /// Messages given up on. This is the number an alert should fire on: a dead letter
     /// is work that will never happen unless an operator replays it.
     pub dead_lettered: i64,
+    /// Messages that were DELIVERED and are now retired: the terminal tail
+    /// [`OutboxRepo::reap_completed`] removes once it is older than the configured
+    /// retention (issue #104, PR 3).
+    ///
+    /// It is here because zero has to be measurable against a known non-zero on the gauge
+    /// that already exists: `ready`, `in_flight` and `scheduled` count only NON-terminal
+    /// rows and `dead_lettered` counts the tail retention deliberately keeps forever by
+    /// default, so none of the four could ever have shown the reapable backlog.
+    ///
+    /// What this is NOT, stated because the obvious reading is wrong and this crate was
+    /// caught making it: it is not an operator-facing surface today.
+    /// [`depth`](OutboxRepo::depth) has NO production caller in this tree, so nothing
+    /// exports this number and no deployment can read it. What actually leaves the process
+    /// are the [`RetentionObserver`](crate::outbox::RetentionObserver) reports the binary
+    /// logs, and the SATURATED flag on them is the signal that distinguishes "keeping up"
+    /// from "falling behind forever". Exporting the depth gauge, this field included, is
+    /// recorded as the remaining gap in `docs/design/RETENTION.md`. It is deliberately NOT
+    /// done from inside the sweep: `depth` is an unbounded `count(*)` over the scope, and
+    /// a pass whose whole story is boundedness must not grow a second unbounded read to
+    /// produce a number nothing reads.
+    pub completed: i64,
 }
 
 /// The columns every outbox read selects, in one place so the claim, the pending peek,
@@ -19224,9 +19245,14 @@ impl OutboxRepo<'_> {
     }
 
     /// The per-consumer queue depth in this scope (issue #104): ready, in flight,
-    /// scheduled, and dead-lettered. The observability primitive a metrics exporter reads
-    /// on a cadence; `ready` is consumer lag and `dead_lettered` is the number an alert
-    /// fires on.
+    /// scheduled, dead-lettered, and completed. The observability primitive a metrics
+    /// exporter is MEANT to read on a cadence; `ready` is consumer lag, `dead_lettered` is
+    /// the number an alert fires on, and `completed` is the reapable backlog retention
+    /// works against.
+    ///
+    /// No such exporter exists in this tree yet: this method has no production caller, so
+    /// the sentence above is the intent rather than the state. See
+    /// [`OutboxDepth::completed`] for what an operator can actually read today.
     ///
     /// `lease` must be the same visibility timeout the drain claims with, because "in
     /// flight" means "leased and the lease has not lapsed" and nothing about the row says
@@ -19266,7 +19292,8 @@ impl OutboxRepo<'_> {
                  WHERE completed_at IS NULL AND dead_lettered_at IS NULL \
                  AND next_attempt_at > bounds.now_at \
                  AND (claimed_at IS NULL OR claimed_at < bounds.lease_at)) AS scheduled, \
-               count(*) FILTER (WHERE dead_lettered_at IS NOT NULL) AS dead_lettered \
+               count(*) FILTER (WHERE dead_lettered_at IS NOT NULL) AS dead_lettered, \
+               count(*) FILTER (WHERE completed_at IS NOT NULL) AS completed \
              FROM outbox_messages, bounds \
              WHERE tenant_id = $1 AND environment_id = $2 AND consumer = $3",
         )
@@ -19283,7 +19310,248 @@ impl OutboxRepo<'_> {
             in_flight: row.get("in_flight"),
             scheduled: row.get("scheduled"),
             dead_lettered: row.get("dead_lettered"),
+            completed: row.get("completed"),
         })
+    }
+
+    /// The distinct consumer names that have at least ONE message in this scope
+    /// (issue #104, PR 3).
+    ///
+    /// The retention sweeper needs it because retention is bounded PER consumer and there
+    /// is no other honest source for the list. The registry a process holds is the set of
+    /// consumers THIS BINARY drains, and the rows in the table are the set some binary
+    /// ever enqueued: a consumer retired in an earlier release, or one this replica does
+    /// not run because its feature switch is off, has rows and no registration. Sweeping
+    /// the registry would leave exactly those rows unreapable forever, which is the growth
+    /// this whole PR exists to stop.
+    ///
+    /// Ordered so a pass is deterministic and an operator reading two passes' reports can
+    /// compare them.
+    ///
+    /// # Why this is a recursive walk and not `SELECT DISTINCT consumer`
+    ///
+    /// It runs FIRST, once per scope, on every pass, and the pass's entire story is
+    /// boundedness. `DISTINCT` would have been the one UNBOUNDED read in it, and worse, it
+    /// scales with exactly the backlog the reaper has not cleared yet: Postgres has no
+    /// loose index scan for `DISTINCT`, so it reads every row of the scope and aggregates.
+    ///
+    /// Measured on Postgres 18.4 against the shipped schema, one scope, three consumers,
+    /// with the scope bound as the repository binds it:
+    ///
+    /// | rows in scope | `SELECT DISTINCT` | this walk |
+    /// |---|---|---|
+    /// | 50,000 | Seq Scan, 50,000 rows, 781 buffers, 8.0 ms | 4 index searches, 15 buffers, 0.07 ms |
+    /// | 500,000 | Parallel Seq Scan, 500,000 rows, 7,908 buffers, 33.5 ms | 4 index searches, 15 buffers, 0.09 ms |
+    ///
+    /// The number that matters is not the ratio, it is the SHAPE: the walk is FLAT in the
+    /// backlog (15 buffers at both sizes) because its cost is one index descent per
+    /// DISTINCT consumer, which is a handful, and the scan is not. A reaper that fell
+    /// behind would otherwise pay more to find out what to reap the further behind it
+    /// got.
+    ///
+    /// The walk is the standard emulation of a loose index scan: seek the smallest
+    /// `consumer` in the scope, then repeatedly seek the smallest one greater than the
+    /// last. Every step is an index-only seek on `outbox_messages_scope_idx`
+    /// `(tenant_id, environment_id, consumer, sequence)`, whose leading columns are exactly
+    /// this predicate. The terminating step yields NULL, which is why the outer select
+    /// filters it out; an empty scope yields that NULL on the first step and returns no
+    /// rows. Row-level security applies to every step exactly as it does to the flat
+    /// statement (measured: bound to one scope, a walk naming another returns zero rows).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault.
+    pub async fn consumers_in_scope(&self) -> Result<Vec<String>, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let rows = sqlx::query(
+            "WITH RECURSIVE walk AS ( \
+                 SELECT (SELECT m.consumer FROM outbox_messages m \
+                          WHERE m.tenant_id = $1 AND m.environment_id = $2 \
+                          ORDER BY m.consumer LIMIT 1) AS consumer \
+               UNION ALL \
+                 SELECT (SELECT m.consumer FROM outbox_messages m \
+                          WHERE m.tenant_id = $1 AND m.environment_id = $2 \
+                          AND m.consumer > walk.consumer \
+                          ORDER BY m.consumer LIMIT 1) \
+                 FROM walk WHERE walk.consumer IS NOT NULL \
+             ) \
+             SELECT consumer FROM walk WHERE consumer IS NOT NULL ORDER BY consumer",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows.iter().map(|row| row.get("consumer")).collect())
+    }
+
+    /// Remove up to `limit` COMPLETED messages of `consumer` in this scope whose
+    /// `completed_at` is at or before `cutoff_micros` (issue #104, PR 3). Returns how many
+    /// rows were removed.
+    ///
+    /// # The predicate keys on `completed_at` and never on `enqueued_at`
+    ///
+    /// This is the whole correctness argument of the reaper, so it is stated here rather
+    /// than left to the caller. A message with both terminal columns NULL is not stale
+    /// however old it is; it is UNDELIVERED. There is a shipped configuration that
+    /// produces exactly that population at scale: `oidc.backchannel_logout_enabled`
+    /// defaults OFF while the producer that enqueues `session_ended` runs regardless, so a
+    /// deployment accumulates undrained messages by design, and turning the switch ON
+    /// begins by draining that backlog. An age-based reaper deletes those pending logouts,
+    /// and [`depth`](OutboxRepo::depth) then reports a clean queue because the rows it
+    /// counted are gone.
+    ///
+    /// It is worse than a silent loss. The claim's head-of-group rule reads TERMINAL
+    /// state, so deleting a group's non-terminal head UNBLOCKS the rest of that group: the
+    /// survivors become claimable at once and are delivered out of the order their
+    /// producers established. So an age-based predicate would break the ordering guarantee
+    /// of messages it did not touch.
+    ///
+    /// `enqueued_at` is not even the right AGE for a retired message. A message enqueued
+    /// long ago and completed a minute ago is one minute of retention old, and the
+    /// operator's question ("how long do I keep delivery evidence after delivery?") is
+    /// about the completion.
+    ///
+    /// # The SECOND thing a completed row carries: its at-most-once ledger entry
+    ///
+    /// Delivery evidence is the obvious one and it is not the only one. While the row
+    /// exists it also OCCUPIES its slot in the
+    /// `UNIQUE (tenant_id, environment_id, consumer, idempotency_key)` constraint 0099
+    /// created, and that constraint IS the queue's at-most-once ledger. Removing the row
+    /// frees the key, and a producer that re-enqueues under it afterwards no longer
+    /// conflicts with anything.
+    ///
+    /// This is not hypothetical about the shape, only about the timing. MEASURED: after
+    /// one pass past the window,
+    /// [`enqueue_all`](OutboxRepo::enqueue_all) under the same key inserts a row, and that
+    /// row is CLAIMABLE, so the work is deliverable a second time. The one production
+    /// caller of `enqueue_all` (the back-channel logout fan-out) rests its safety argument
+    /// directly on this index, and its own second line of defence does not hold either: a
+    /// re-explode mints a FRESH `jti`, so the relying party's token dedup sees a new token
+    /// rather than a replay.
+    ///
+    /// What makes it unreachable TODAY is arithmetic, not design. A producer can only
+    /// re-enqueue under a key while ITS OWN driving message is still non-terminal, and that
+    /// window is bounded by `max_attempts` claims separated by the retry backoff or a
+    /// lapsed lease. At the shipped outbox defaults that horizon is a few minutes, against
+    /// a retention floor of one hour and a default window of seven days. It is a LATENT
+    /// contract, so it is written down here, in `0102_outbox_retention.sql`, and in
+    /// `docs/design/RETENTION.md`, and the floor on `outbox.completed_retention_secs` is
+    /// stated as `max(evidence window, longest producer re-enqueue horizon)` rather than
+    /// as the evidence window alone.
+    ///
+    /// # Bounded, and the bound is the point
+    ///
+    /// Postgres `DELETE` takes no `LIMIT`, so the bound is a subselect, exactly as
+    /// [`PowChallengeRepo::reclaim_expired`] does it. `ORDER BY sequence` orders the
+    /// ELIGIBLE rows by ENQUEUE order (`sequence` is the enqueue counter, not a completion
+    /// stamp), so a saturated pass takes the earliest-enqueued of the rows already past
+    /// the window and makes monotonic progress through the eligible set instead of
+    /// sampling it. It is deliberately not ordered by `completed_at`: the eligible set is
+    /// what the window already decided, and `sequence` is indexed with the scope and the
+    /// consumer while `completed_at` is not. The caller must not loop this until it
+    /// drains: on a first run over an accumulated backlog that is one long lock and one
+    /// enormous WAL record, which stalls a replica.
+    ///
+    /// Row-level security confines the delete to this scope, and a caller that bound no
+    /// scope would match zero rows rather than every row (see
+    /// `0102_outbox_retention.sql`).
+    ///
+    /// The explicit `tenant_id`/`environment_id` predicate in the subselect is therefore a
+    /// BELT over that brace, and its redundancy is measured rather than assumed: removing
+    /// it leaves the whole suite green, because the policy is what confines the statement.
+    /// It is kept for two reasons and no test can distinguish them from the outside,
+    /// because [`begin_scoped`] is the only way into this method and it always binds. It
+    /// states the intended scope where a reader reads the statement, and it is what the
+    /// planner uses when this shape is copied to a path that is not policy-covered. The
+    /// same predicate in [`consumers_in_scope`](OutboxRepo::consumers_in_scope) is NOT
+    /// redundant: it is what makes that walk an index seek.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault, including the "permission denied"
+    /// a role without the 0102 DELETE grant gets.
+    pub async fn reap_completed(
+        &self,
+        consumer: &str,
+        cutoff_micros: i64,
+        limit: i64,
+    ) -> Result<u64, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let result = sqlx::query(
+            "DELETE FROM outbox_messages \
+             WHERE id IN ( \
+                 SELECT id FROM outbox_messages \
+                 WHERE tenant_id = $1 AND environment_id = $2 AND consumer = $3 \
+                 AND completed_at IS NOT NULL \
+                 AND completed_at <= \
+                     (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval) \
+                 ORDER BY sequence \
+                 LIMIT $5 \
+             )",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(consumer)
+        .bind(cutoff_micros)
+        .bind(limit)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Remove up to `limit` DEAD-LETTERED messages of `consumer` in this scope whose
+    /// `dead_lettered_at` is at or before `cutoff_micros` (issue #104, PR 3). Returns how
+    /// many rows were removed.
+    ///
+    /// A SEPARATE method rather than a flag on [`reap_completed`](OutboxRepo::reap_completed),
+    /// so that the path which erases evidence of work GIVEN UP ON is greppable by name.
+    /// The two tails are not the same kind of row and the tree ships them different
+    /// default windows: a completed message is delivery evidence and is retired after a
+    /// week, a dead letter is a lost logout and is kept FOREVER unless an operator
+    /// deliberately sets a window. A boolean argument at a call site would have made the
+    /// difference between those two invisible in a grep for the dangerous one.
+    ///
+    /// Everything [`reap_completed`](OutboxRepo::reap_completed) documents about the
+    /// terminal-column predicate, the bounded subselect, and row-level security applies
+    /// here with `dead_lettered_at` in place of `completed_at`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault, including the "permission denied"
+    /// a role without the 0102 DELETE grant gets.
+    pub async fn reap_dead_lettered(
+        &self,
+        consumer: &str,
+        cutoff_micros: i64,
+        limit: i64,
+    ) -> Result<u64, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let result = sqlx::query(
+            "DELETE FROM outbox_messages \
+             WHERE id IN ( \
+                 SELECT id FROM outbox_messages \
+                 WHERE tenant_id = $1 AND environment_id = $2 AND consumer = $3 \
+                 AND dead_lettered_at IS NOT NULL \
+                 AND dead_lettered_at <= \
+                     (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval) \
+                 ORDER BY sequence \
+                 LIMIT $5 \
+             )",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(consumer)
+        .bind(cutoff_micros)
+        .bind(limit)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(result.rows_affected())
     }
 
     /// RE-STAMP the visibility lease on a message this worker holds (issue #104), just
@@ -34057,7 +34325,12 @@ async fn insert_audit_row<T: AuditTarget>(
 
 /// Microseconds since the Unix epoch for a wall-clock instant. Negative for
 /// pre-epoch times (never reached in practice; kept total for safety).
-fn epoch_micros(at: SystemTime) -> i64 {
+///
+/// Crate-visible so the outbox framework's retention sweeper derives its cutoff from the
+/// SAME clock seam every instant in the queue is written from. A second conversion there
+/// would be a second place for the epoch mapping to be got wrong, against rows this one
+/// wrote.
+pub(crate) fn epoch_micros(at: SystemTime) -> i64 {
     match at.duration_since(SystemTime::UNIX_EPOCH) {
         Ok(delta) => i64::try_from(delta.as_micros()).unwrap_or(i64::MAX),
         Err(before) => {

@@ -902,6 +902,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0101_migration_run_control_writes.sql"),
         },
+        Migration {
+            version: 102,
+            name: "outbox_retention",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0102_outbox_retention.sql"),
+        },
     ]
 }
 
