@@ -281,3 +281,8 @@ if [ "$fail" -ne 0 ]; then
   exit 1
 fi
 echo "invariant-lints: clean"
+# Report the exemption budget on every run. A ceiling that is never shown is a ceiling
+# nobody notices approaching: the point is that a reviewer sees 11/11 before the twelfth
+# exemption is written, not after the run fails. This is the counterpart to the counts
+# the registration scripts already print in their own clean lines.
+printf "%b" "$allow_report"
