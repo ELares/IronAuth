@@ -1,22 +1,79 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# Every ecosystem below groups its MINOR and PATCH version updates into a single
+# weekly PR. Ungrouped, one quiet week produced twelve open dependabot PRs, each
+# needing its own review, its own CI run and its own rebase against a moving
+# main under strict up to date branch protection; the batch rots faster than it
+# can be merged. MAJOR updates are deliberately left OUT of every group so they
+# arrive as individual PRs: a major is the update that can be un-takeable (see
+# the jsdom ignore below), and one un-takeable major inside a grouped PR would
+# block every safe minor riding with it.
+#
+# `applies-to: version-updates` is set explicitly on every group so SECURITY
+# updates stay ungrouped and keep arriving as their own immediate PRs, never
+# waiting on the weekly batch.
 version: 2
 updates:
   - package-ecosystem: cargo
     directory: "/"
     schedule:
       interval: weekly
+    groups:
+      cargo-minor-patch:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
       interval: weekly
-  # The admin console SPA (issue #90), the repo's first npm prod dependency tree.
-  # package-lock.json is committed and CI runs npm ci, so dependabot keeps the
-  # locked tree current.
+    groups:
+      github-actions-minor-patch:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    ignore:
+      # dtolnay/rust-toolchain is a github-actions dependency, so this rule
+      # belongs here and NOT under the npm entry, where it was inert and
+      # asserted an MSRV policy it was not enforcing.
+      #
+      # The `@1.85` ref pinned in the msrv job of .github/workflows/ci.yml IS
+      # the MSRV policy, not a dependency version; MSRV bumps are deliberate
+      # PRs with changelog entries (docs/RELEASING.md).
+      - dependency-name: dtolnay/rust-toolchain
+  # The admin console SPA (issue #90), the repo's first npm prod dependency
+  # tree. package-lock.json is committed and CI runs npm ci, so dependabot keeps
+  # the locked tree current.
   - package-ecosystem: npm
     directory: "/packages/admin-spa"
     schedule:
       interval: weekly
+    groups:
+      npm-minor-patch:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
     ignore:
-      # The @1.85 ref IS the MSRV policy, not a dependency version; MSRV
-      # bumps are deliberate PRs with changelog entries (docs/RELEASING.md).
-      - dependency-name: dtolnay/rust-toolchain
+      # jsdom 30 cannot run on the Node this repo builds and tests on.
+      #
+      # Measured 2026-08-02 with `npm view jsdom@<v> engines`:
+      #   jsdom 29.1.1  ->  { node: '^20.19.0 || ^22.13.0 || >=24.0.0' }
+      #   jsdom 30.0.1  ->  { node: '^22.22.2 || ^24.15.0 || >=26.0.0' }
+      # CI pins `node-version: "20"` for the admin-spa and reference-app jobs in
+      # .github/workflows/ci.yml, and packages/admin-spa/package.json declares
+      # `"engines": {"node": ">=20"}`. jsdom 30 excludes the whole 20.x line.
+      #
+      # This is a Node floor, not a jsdom defect: delete this entry when CI and
+      # the package engines move off Node 20, not before. jsdom 29.x patch and
+      # minor updates are unaffected and still flow.
+      - dependency-name: jsdom
+        versions: [">=30"]
