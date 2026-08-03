@@ -37,10 +37,13 @@ pub mod record;
 pub mod run;
 pub mod scheme;
 
-pub use engine::{ImportContext, ImportReport, RecordError, RecordOutcome, import_stream};
+pub use engine::{
+    CollectOutcomes, DiscardOutcomes, ImportContext, ImportReport, IterLines, LineSource,
+    OutcomeSink, RecordError, RecordOutcome, import_stream, import_stream_lines,
+};
 pub use record::{
     ImportCredential, ImportRecord, ImportRecoveryCode, ImportTotp, RecordParseError,
     parse_record_line, to_record_line,
 };
-pub use run::import_into_run;
+pub use run::{RunImportReport, import_into_run, import_lines_into_run};
 pub use scheme::{ForeignHash, HashError, Scheme};

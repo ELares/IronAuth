@@ -84,6 +84,7 @@ fn operation_ids_are_the_stable_set() {
     assert_eq!(
         ids,
         vec![
+            "abandonMigrationRun",
             "activateTraitSchemaVersion",
             "addOrgGroupMember",
             "applyConfigPromotion",
@@ -100,6 +101,7 @@ fn operation_ids_are_the_stable_set() {
             "createDcrPolicy",
             "createEnvironment",
             "createFlowVersion",
+            "createIdentityImport",
             "createInvitation",
             "createManagementKey",
             "createMembership",
@@ -210,6 +212,7 @@ fn operation_ids_are_the_stable_set() {
             "removeOrgGroupMember",
             "resendInvitation",
             "restoreTenant",
+            "resumeIdentityImport",
             "resumeTenant",
             "revokeInvitation",
             "revokeSession",
@@ -486,12 +489,15 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/dcr/initial-access-tokens",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/dcr/policies",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/flow/dry-run",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/imports",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/imports/{run_id}",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/invitations",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/invitations/{invitation_id}/resend",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/invitations/{invitation_id}/revoke",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/journeys/{journey_id}/versions",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/journeys/{journey_id}/versions/{version}/pin",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/keys",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/migration-runs/{run_id}/abandon",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/migration/verify-credential",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/disable",
@@ -625,7 +631,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        156,
+        159,
         "the documented route count is pinned"
     );
 

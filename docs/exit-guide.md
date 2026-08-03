@@ -345,6 +345,147 @@ separated windows rather than a handful of requests. Both cases answer the same 
 and the token itself is compared in constant time, so neither its length nor the
 position of its first wrong byte leaks.
 
+## The import API (the inbound direction)
+
+```
+POST /v1/tenants/{tenant_id}/environments/{environment_id}/imports?source_total=<n>
+Authorization: Bearer <management token>
+Idempotency-Key: <key>
+Content-Type: application/x-ndjson
+
+<the export body, verbatim>
+```
+
+The request body is the SAME newline-delimited record format `GET .../export` emits,
+so an export pipes straight into an import. `source_total` declares how many records
+the SOURCE holds; it is the ground truth the run's count invariant reconciles against,
+so a job that silently lost records cannot report success.
+
+The response is `202 Accepted` and a job HANDLE:
+
+```json
+{
+  "run_id": "mgr_...",
+  "source_total": 100000,
+  "progress_path": "/v1/tenants/.../environments/.../migration-runs/mgr_..."
+}
+```
+
+It carries no counters on purpose. Progress is read at `progress_path`, which is the
+migration state machine's operator view and the ONE projection of those numbers: the run's
+`state`, its per-outcome record counts (`imported`, `failed`, `skipped`, `inconsistent`,
+`unmarked_backfill`, and their `accounted` sum), and each invariant's live evaluation with
+the blocking ones named. How far the job has to go is `source_total` less `accounted`; the
+view publishes no separate `processed` or `remaining` field.
+
+### Resuming an interrupted import
+
+```
+POST /v1/tenants/{tenant_id}/environments/{environment_id}/imports/{run_id}
+Content-Type: application/x-ndjson
+
+<the remaining records, or the whole source again>
+```
+
+There is no byte offset, no page token, and no server-side cursor into your file. A
+resume may safely RE-PRESENT records, including the entire source, because both layers
+deduplicate on the record itself:
+
+- a record whose id, external id, or login handle already exists in the scope is refused
+  by the scope's unique constraints and reported as an idempotent SKIP, never a second
+  identity;
+- the run's ledger accounts each record under its LOGIN HANDLE behind a per-run unique
+  index, so re-presenting an already-accounted record adds no second accounting row.
+
+The login handle, and not an id or an external id, because the handle is the one field a
+record must carry. A key drawn from an optional field is stable only while the SOURCE is
+byte-identical between attempts, and the recovery procedure below tells you to post the
+source again, which you will do from whatever export you have now. Adding an
+`external_id` to a record between two attempts is enough to make an id-preferring key
+account the same identity twice.
+
+That is deliberate rather than a missing feature. A byte offset is only correct if the
+caller can compute exactly where the interruption landed, which a caller that was KILLED
+generally cannot. Re-presenting everything is always safe, so the recovery procedure for
+an interrupted import is a single sentence: post the source again to the same `run_id`.
+
+When every declared source record is accounted AND every accounted record is consistent,
+the run takes the gated `reconciling -> complete` transition, which re-evaluates every
+invariant LIVE. A run that does not reconcile stays open and the next resume continues it.
+A COMPLETE run is terminal and answers `409` to a further resume, refused before a single
+identity is created.
+
+### When a run cannot finish, and how to close it
+
+Two conditions leave a run legitimately unable to complete, and neither is fixed by
+posting the source again:
+
+- a record FAILED. Its ledger row is accounted (so the count reconciles) and marked
+  inconsistent, which is what puts it on the violations page; the run stays in
+  `reconciling` blocked on `consistency`. Clearing that flag is a data-plane triage
+  operation and is not on this API, so from here the choice is to fix the source, run a new
+  import, and abandon this one;
+- your source carries TWO records under one login handle. They are one ledger subject, so
+  they account one row against a `source_total` of two and the count invariant can never
+  be satisfied. Fix the source and run a NEW import; this one cannot be repaired.
+
+Nothing on this API can rewrite a run's declared `source_total` or delete a ledger row,
+deliberately: a count invariant you can move is not an invariant. The exit is to abandon
+the run, which is terminal, audited, and carries your reason:
+
+```
+POST /v1/tenants/{tenant_id}/environments/{environment_id}/migration-runs/{run_id}/abandon
+Content-Type: application/json
+
+{"reason": "source carried two records for alice@example.test; re-running from a corrected export"}
+```
+
+It answers the run's operator view with `state: "abandoned"` and your `abandoned_reason`.
+Repeating it is safe and keeps the FIRST reason. A `complete` run is a `409`: nothing may
+quietly take a completion back.
+
+### Memory
+
+The request body is read one frame at a time and never buffered whole, and the ledger
+accounting is flushed in bounded batches, so a 100k-record import holds one record plus
+one frame plus one batch regardless of how large the source is. A single record line may
+not exceed 1 MiB.
+
+### Bounded input, per record errors
+
+Every foreign hash is bounds-checked at import (bcrypt cost, scrypt N/r/p, PBKDF2
+iterations, Argon2 memory and passes), and an out-of-bounds record is rejected with a per
+record error rather than stored: an attacker-supplied cost parameter can never turn a
+later login verification into a denial-of-service vector. A malformed line, a line that is
+not valid UTF-8, a blank or over-long login handle, an invalid lifecycle state, a
+cross-scope id, and a traits document that fails the target scope's active schema are all
+per RECORD failures too, and the login handle and external id are trimmed and required
+exactly as `POST .../users` requires them, so the two writers of an identity agree.
+
+Nothing is silently dropped. Every failure is accounted in the run's ledger under its own
+subject (a record's login handle, or a one-way digest of the line for a line that could not
+be parsed into one), with an operator-safe reason, and it is READABLE: it pages at
+`GET .../migration-runs/{run_id}/violations?invariant=consistency`.
+
+The one thing that is NOT per record is a body the server could not read to the end: a
+single line over the 1 MiB cap, or a transport failure mid-upload. Those truncate the
+record set rather than damage one record, so the request is refused with `400` naming the
+cause and the `run_id` to resume. The records delivered before the fault are durable and
+accounted; a truncated upload is never answered `202`.
+
+### Vendor exports
+
+The import endpoint accepts the first-party record format only. A Keycloak realm export,
+an Auth0 bulk export, or a Firebase `auth:export` has to be TRANSLATED into that format
+first.
+
+Be aware of what does not ship yet. `ironauth-importers` parses all three vendor documents
+and emits exactly this format, but it is a LIBRARY: it has no binary and no command-line
+entry point, so today translating a vendor export means writing a small program against
+that crate. There is no shipped command whose output you can pipe here, and this guide
+will not pretend otherwise. Its validation-only GAP REPORT (which records in your vendor
+document this instance would refuse, and why) is likewise reachable only from the library.
+
 ## The round-trip guarantee
 
 The acceptance bar for the covenant is a round-trip, exercised in CI: a full export

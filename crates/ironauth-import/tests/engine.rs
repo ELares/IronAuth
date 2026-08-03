@@ -16,8 +16,8 @@ use ironauth_import::scheme::{ForeignHash, firebase_stored};
 use ironauth_import::{ImportContext, RecordOutcome, import_into_run, import_stream};
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
-    CompletionOutcome, CorrelationId, MigrationKind, MigrationState, NewMigrationRun, Scope,
-    UserId, UserListFilter, UserRecord, UserState,
+    CompletionOutcome, CorrelationId, InvariantKind, MigrationKind, MigrationState,
+    NewMigrationRun, Scope, UserId, UserListFilter, UserRecord, UserState,
 };
 use sqlx::Row;
 
@@ -104,9 +104,11 @@ async fn run_import(
     lines: Vec<String>,
 ) -> (ironauth_import::ImportReport, Vec<RecordOutcome>) {
     let context = ctx(db, env, scope);
-    let mut outcomes = Vec::new();
-    let report = import_stream(&context, lines, |outcome| outcomes.push(outcome)).await;
-    (report, outcomes)
+    let mut outcomes = ironauth_import::CollectOutcomes::default();
+    let report = import_stream(&context, lines, &mut outcomes)
+        .await
+        .expect("the collecting observer never fails");
+    (report, outcomes.0)
 }
 
 async fn count_users(db: &TestDatabase, scope: Scope) -> usize {
@@ -429,14 +431,23 @@ async fn imported_states_and_claims_round_trip() {
     );
 }
 
-/// Wrapping a bulk import in the migration state machine (issue #59): the import runs
-/// into a run, every record is accounted, and when the declared source total matches
-/// the machine COMPLETES. An off-by-one source total instead BLOCKS on the count
-/// invariant, so an import that does not reconcile with its source cannot declare
-/// victory.
+/// Wrapping a bulk import in the migration state machine (issue #59): every record is
+/// accounted, and BOTH gates are real.
+///
+/// * A run whose source carried a FAILED record has its count invariant satisfied (the
+///   failure is accounted, not dropped) and is BLOCKED on CONSISTENCY, because a failed
+///   record is written `consistent = false` and is therefore READABLE on the violations
+///   surface. Writing it `consistent = true` (which the first cut did) made the
+///   consistency invariant vacuous for every bulk import: the run reported `failed = 1`
+///   while both violation queries returned an empty page, so issue #55's "every failure
+///   reported with its record identity" was unmet on the only surface that reports.
+/// * A run whose declared source total is one too high is BLOCKED on COUNT, so an import
+///   that does not reconcile with its source cannot declare victory.
+/// * And a run with no failure and a matching total COMPLETES, which is the control that
+///   keeps the two blocks above from being satisfied by a gate that refuses everything.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn a_bulk_import_wrapped_in_the_migration_machine_gates_on_the_count_invariant() {
+async fn a_bulk_import_wrapped_in_the_migration_machine_gates_on_its_invariants() {
     let db = TestDatabase::start().await;
     let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x59);
     let scope = db.seed_scope(&env).await;
@@ -483,9 +494,13 @@ async fn a_bulk_import_wrapped_in_the_migration_machine_gates_on_the_count_invar
     let report = import_into_run(&context, &run, lines)
         .await
         .expect("import into run");
-    assert_eq!(report.processed, 4);
-    assert_eq!(report.succeeded, 3);
-    assert_eq!(report.failed, 1);
+    assert_eq!(report.records.processed, 4);
+    assert_eq!(report.records.succeeded, 3);
+    assert_eq!(report.records.failed, 1);
+    // A first pass over a source with four distinct keys writes four ledger rows and
+    // dedups nothing.
+    assert_eq!(report.ledger_written, 4, "{report:?}");
+    assert_eq!(report.ledger_deduped, 0, "{report:?}");
 
     // The tallies re-derive live: 3 imported + 1 failed == 4 accounted == source_total.
     let tallies = store
@@ -497,8 +512,29 @@ async fn a_bulk_import_wrapped_in_the_migration_machine_gates_on_the_count_invar
     assert_eq!(tallies.imported, 3);
     assert_eq!(tallies.failed, 1);
     assert_eq!(tallies.accounted, source_total);
+    assert_eq!(
+        tallies.inconsistent, 1,
+        "the failed record is written INCONSISTENT, which is what puts it on the \
+         violations surface: {tallies:?}"
+    );
 
-    // With the source total matching, the wrapped import COMPLETES.
+    // And it is genuinely READABLE there, with its reason. This is the assertion the
+    // vacuous `consistent: true` passed while the surface returned an empty page.
+    let offenders = store
+        .scoped(scope)
+        .migration_runs()
+        .list_violations(&run, InvariantKind::Consistency, 10, None)
+        .await
+        .expect("violations");
+    assert_eq!(offenders.len(), 1, "{offenders:?}");
+    let detail = offenders[0].detail.as_deref().unwrap_or_default();
+    assert!(
+        detail.contains("parse error"),
+        "the violation carries the per-record reason: {detail}"
+    );
+
+    // The count invariant IS satisfied (nothing was dropped), and completion is blocked
+    // by CONSISTENCY alone: a run that imported a bad record has not reconciled.
     store
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
@@ -513,7 +549,15 @@ async fn a_bulk_import_wrapped_in_the_migration_machine_gates_on_the_count_invar
         .try_complete(&env, &run)
         .await
         .expect("try_complete");
-    assert_eq!(outcome, CompletionOutcome::Completed);
+    let CompletionOutcome::Blocked(violated) = outcome else {
+        panic!("a run holding a failed record must not complete: {outcome:?}");
+    };
+    let blocked: Vec<InvariantKind> = violated.iter().map(|eval| eval.kind).collect();
+    assert_eq!(
+        blocked,
+        vec![InvariantKind::Consistency],
+        "only consistency blocks: the failure was accounted, so the count reconciles"
+    );
 
     // A SECOND run over the same source but with an inflated source total (an injected
     // off-by-one) is BLOCKED by the count invariant: it cannot complete.
@@ -566,9 +610,14 @@ async fn a_bulk_import_wrapped_in_the_migration_machine_gates_on_the_count_invar
         .try_complete(&env, &run2)
         .await
         .expect("try_complete");
+    let CompletionOutcome::Blocked(violated) = blocked else {
+        panic!("an inflated source total must block completion: {blocked:?}");
+    };
     assert!(
-        matches!(blocked, CompletionOutcome::Blocked(_)),
-        "an inflated source total must block completion: {blocked:?}"
+        violated
+            .iter()
+            .any(|eval| eval.kind == InvariantKind::Count),
+        "the COUNT invariant is what an inflated source total violates: {violated:?}"
     );
     assert_eq!(
         store
@@ -579,5 +628,632 @@ async fn a_bulk_import_wrapped_in_the_migration_machine_gates_on_the_count_invar
             .expect("get")
             .state,
         MigrationState::Reconciling
+    );
+
+    // ---- run 3: the anti-vacuity control -----------------------------------------
+    // A source with NO failed record and a matching declared total still COMPLETES, so
+    // neither block above is a gate that refuses everything. Every record here is an
+    // idempotent skip (the users exist from run 1), which is still an accounted,
+    // consistent record.
+    let clean = vec![
+        record_line("alice@example.test", &argon2_hash("pw-a")),
+        record_line("bob@example.test", &argon2_hash("pw-b")),
+        record_line("carol@example.test", &argon2_hash("pw-c")),
+    ];
+    let clean_total = i64::try_from(clean.len()).expect("fits");
+    let run3 = store
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .migration_runs()
+        .create(
+            &env,
+            NewMigrationRun {
+                kind: MigrationKind::BulkImport,
+                source_total: clean_total,
+                backfill_expected: 0,
+                subject_ref: None,
+            },
+            1_000_000,
+        )
+        .await
+        .expect("create run3");
+    for state in [MigrationState::Validating, MigrationState::Running] {
+        store
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .migration_runs()
+            .transition(&env, &run3, state)
+            .await
+            .expect("transition");
+    }
+    let clean_report = import_into_run(&ctx(&db, &env, scope), &run3, clean)
+        .await
+        .expect("import into run3");
+    assert_eq!(clean_report.records.skipped, 3, "{clean_report:?}");
+    assert_eq!(clean_report.records.failed, 0, "{clean_report:?}");
+    store
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .migration_runs()
+        .transition(&env, &run3, MigrationState::Reconciling)
+        .await
+        .expect("-> reconciling");
+    let completed = store
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .migration_runs()
+        .try_complete(&env, &run3)
+        .await
+        .expect("try_complete");
+    assert_eq!(
+        completed,
+        CompletionOutcome::Completed,
+        "a clean run still completes: the gates above are not refusing everything"
+    );
+}
+
+/// KILLING a bulk import mid-stream and RESUMING it neither duplicates nor loses a
+/// record (issue #55's last acceptance criterion).
+///
+/// # Why this is a real kill and not a smaller import
+///
+/// The first pass is CANCELLED, not truncated. The line source parks forever
+/// ([`std::future::pending`]) on record [`KILL_AT`] after setting a flag; `tokio::select!`
+/// sees the flag through [`WhenSet`] and DROPS the import future at that await point.
+/// Nothing unwinds, no cleanup runs, no report is returned: the future simply stops
+/// existing, which is what a killed process does to the work in flight. Everything the
+/// import had already COMMITTED (the users, and every ledger batch already flushed)
+/// survives, because those are committed transactions and not future state.
+///
+/// The cancellation point is deterministic (the source decides it), so this test cannot
+/// pass by accident with a kill that landed at 0 or at the end. It asserts the strict
+/// interval explicitly.
+///
+/// # What it then proves
+///
+/// The resume re-presents the WHOLE source, including every record the first pass already
+/// imported, which is the honest worst case: a resumed operator generally cannot know
+/// where the kill landed. After it:
+///
+/// * the population is EXACTLY the source set, once each (no duplicate, no loss);
+/// * the run's ledger accounts EXACTLY `source_total` records, not one more (this is the
+///   assertion that fails when a created record is keyed on the minted `usr_` id instead
+///   of the record key: the resumed pass then reports the same source record as `skipped`
+///   under a different blind index and the ledger double counts);
+/// * and the run therefore COMPLETES through the same invariant-gated path an
+///   uninterrupted import takes.
+///
+/// [`KILL_AT`]: a local constant
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn a_killed_import_resumes_without_duplicating_or_losing_records() {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
+
+    /// The source set. Larger than the adapter's ingest batch, so the kill lands AFTER
+    /// at least one ledger flush and the resume genuinely re-presents already-accounted
+    /// records to the ingest's conflict clause.
+    const TOTAL: usize = 700;
+    /// Where the first pass is cancelled. Chosen past the 256-record ingest batch so
+    /// some records are durable in the ledger and some are durable ONLY as users.
+    const KILL_AT: usize = 400;
+
+    /// A future that completes as soon as the shared flag is set, so `select!` can drop
+    /// the import at a point the LINE SOURCE chooses rather than at a timeout.
+    struct WhenSet(Arc<AtomicBool>);
+    impl Future for WhenSet {
+        type Output = ();
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if self.0.load(Ordering::SeqCst) {
+                Poll::Ready(())
+            } else {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+    }
+
+    /// A line source that yields the first `kill_at` records and then PARKS FOREVER,
+    /// having flipped `reached` so the test can drop the import at exactly that point.
+    struct KilledSource {
+        lines: Vec<String>,
+        cursor: usize,
+        kill_at: usize,
+        reached: Arc<AtomicBool>,
+    }
+    impl ironauth_import::LineSource for KilledSource {
+        async fn next_line(&mut self) -> Option<Vec<u8>> {
+            if self.cursor == self.kill_at {
+                self.reached.store(true, Ordering::SeqCst);
+                std::future::pending::<()>().await;
+            }
+            let line = self.lines[self.cursor].clone();
+            self.cursor += 1;
+            Some(line.into_bytes())
+        }
+    }
+
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x55);
+    let scope = db.seed_scope(&env).await;
+    let store = db.store();
+    let source: Vec<String> = (0..TOTAL)
+        .map(|n| format!(r#"{{"identifier":"resume-{n}@example.test"}}"#))
+        .collect();
+    let source_total = i64::try_from(TOTAL).expect("source total fits");
+
+    let run = store
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .migration_runs()
+        .create(
+            &env,
+            NewMigrationRun {
+                kind: MigrationKind::BulkImport,
+                source_total,
+                backfill_expected: 0,
+                subject_ref: Some("import:resume"),
+            },
+            1_000_000,
+        )
+        .await
+        .expect("create run");
+    for state in [MigrationState::Validating, MigrationState::Running] {
+        store
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .migration_runs()
+            .transition(&env, &run, state)
+            .await
+            .expect("transition");
+    }
+
+    // ---- pass 1: killed at KILL_AT -----------------------------------------------
+    let context = ctx(&db, &env, scope);
+    let reached = Arc::new(AtomicBool::new(false));
+    {
+        // The source announces the kill point and then parks forever. `select!` drops
+        // the import future there, so it never observes another line and never returns.
+        let killed = ironauth_import::import_lines_into_run(
+            &context,
+            &run,
+            KilledSource {
+                lines: source.clone(),
+                cursor: 0,
+                kill_at: KILL_AT,
+                reached: Arc::clone(&reached),
+            },
+        );
+        tokio::select! {
+            _ = killed => panic!("the import must not run to completion: it was killed"),
+            () = WhenSet(Arc::clone(&reached)) => {}
+        }
+    }
+    assert!(
+        reached.load(Ordering::SeqCst),
+        "the source reached the kill point"
+    );
+
+    let after_kill = count_users(&db, scope).await;
+    assert!(
+        after_kill > 0 && after_kill < TOTAL,
+        "the kill must land strictly inside the import: {after_kill} of {TOTAL} users"
+    );
+    assert_eq!(
+        after_kill, KILL_AT,
+        "the kill lands where the source put it, so the interruption is not timing dependent"
+    );
+    let ledger_after_kill = store
+        .scoped(scope)
+        .migration_runs()
+        .tallies(&run)
+        .await
+        .expect("tallies");
+    assert!(
+        ledger_after_kill.accounted > 0,
+        "at least one ledger batch flushed before the kill: {ledger_after_kill:?}"
+    );
+    assert!(
+        ledger_after_kill.accounted < i64::try_from(after_kill).expect("fits"),
+        "the ledger lags the creates by less than one batch, so some users are durable \
+         with no ledger row and the resume must re-account them: {ledger_after_kill:?} \
+         against {after_kill} users"
+    );
+
+    // ---- pass 2: resume by re-presenting the WHOLE source -------------------------
+    let resumed = import_into_run(&context, &run, source.clone())
+        .await
+        .expect("resume the killed import");
+    assert_eq!(resumed.records.processed, TOTAL as u64);
+    assert_eq!(
+        resumed.records.succeeded + resumed.records.skipped,
+        TOTAL as u64,
+        "every source record is either newly created or an idempotent skip: {resumed:?}"
+    );
+    assert_eq!(
+        resumed.records.failed, 0,
+        "a resume introduces no failures: {resumed:?}"
+    );
+    // The ledger halves say WHERE the first pass got to, which is the distinction the
+    // ingest used to throw away: the resume wrote only the rows pass 1 had not, and
+    // deduped exactly the ones it had.
+    assert_eq!(
+        resumed.ledger_written + resumed.ledger_deduped,
+        TOTAL as u64,
+        "every presented outcome was either written or deduped: {resumed:?}"
+    );
+    assert_eq!(
+        resumed.ledger_deduped,
+        u64::try_from(ledger_after_kill.accounted).expect("fits"),
+        "the resume deduped exactly what the killed pass had already accounted: {resumed:?}"
+    );
+
+    // No LOSS: every source identifier exists.
+    let population = count_users(&db, scope).await;
+    assert_eq!(
+        population, TOTAL,
+        "the resumed population is exactly the source set"
+    );
+    // No DUPLICATE: the scope holds exactly one row per source identifier. `count_users`
+    // above already equals TOTAL, so a duplicate would have to have displaced a distinct
+    // record; this pins it directly against the database.
+    let distinct: i64 = sqlx::query_scalar(
+        "SELECT count(DISTINCT identifier_bidx) FROM users \
+         WHERE tenant_id = $1 AND environment_id = $2",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("count distinct identifiers");
+    assert_eq!(
+        distinct, source_total,
+        "one row per source identifier: no record was imported twice"
+    );
+
+    // The LEDGER accounts each source record exactly once, however many passes presented
+    // it. Without the record-key subject this is TOTAL + (whatever the first pass had
+    // flushed) and the run can never complete.
+    let tallies = store
+        .scoped(scope)
+        .migration_runs()
+        .tallies(&run)
+        .await
+        .expect("tallies");
+    assert_eq!(
+        tallies.accounted, source_total,
+        "the resumed ledger accounts each source record exactly once: {tallies:?}"
+    );
+
+    // And the run therefore completes through the ordinary invariant gate.
+    store
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .migration_runs()
+        .transition(&env, &run, MigrationState::Reconciling)
+        .await
+        .expect("-> reconciling");
+    let outcome = store
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .migration_runs()
+        .try_complete(&env, &run)
+        .await
+        .expect("try_complete");
+    assert_eq!(
+        outcome,
+        CompletionOutcome::Completed,
+        "a killed-then-resumed import completes exactly like an uninterrupted one"
+    );
+}
+
+/// Create a run declaring `source_total` and drive it to `running`.
+async fn running_run(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    source_total: i64,
+) -> ironauth_store::MigrationRunId {
+    let store = db.store();
+    let run = store
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .migration_runs()
+        .create(
+            env,
+            NewMigrationRun {
+                kind: MigrationKind::BulkImport,
+                source_total,
+                backfill_expected: 0,
+                subject_ref: None,
+            },
+            1_000_000,
+        )
+        .await
+        .expect("create run");
+    for state in [MigrationState::Validating, MigrationState::Running] {
+        store
+            .scoped(scope)
+            .acting(db.test_actor(env), CorrelationId::generate(env))
+            .migration_runs()
+            .transition(env, &run, state)
+            .await
+            .expect("transition");
+    }
+    run
+}
+
+/// TWO unparseable lines are TWO accounted ledger rows, so a run carrying them can still
+/// reconcile its COUNT (issue #55).
+///
+/// The defect this pins is a ledger one and is invisible at the engine's own report. Every
+/// parse failure was keyed on one constant subject, the ingest dedups on the subject, and
+/// so the second and every later bad line was silently DISCARDED by the `ON CONFLICT DO
+/// NOTHING`. MEASURED with two bad lines and one good against a declared `source_total` of
+/// 3: `imported=1 failed=1 accounted=2 remainder=1`, short forever, with no route on this
+/// plane that could ever correct it. It also refuted the engine's own documented "nothing
+/// is silently dropped".
+#[tokio::test]
+async fn two_unparseable_lines_are_two_accounted_ledger_rows() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x1a);
+    let scope = db.seed_scope(&env).await;
+    let store = db.store();
+
+    let lines = vec![
+        "{ this is not json".to_string(),
+        "{ this is also not json, but different".to_string(),
+        record_line("good@example.test", &argon2_hash("pw")),
+    ];
+    let source_total = i64::try_from(lines.len()).expect("fits");
+    let run = running_run(&db, &env, scope, source_total).await;
+    let report = import_into_run(&ctx(&db, &env, scope), &run, lines)
+        .await
+        .expect("import");
+    assert_eq!(report.records.failed, 2, "{report:?}");
+    assert_eq!(report.records.succeeded, 1, "{report:?}");
+    // Three presented outcomes, three rows WRITTEN: nothing was absorbed by the conflict
+    // clause. This is the exact quantity the constant key destroyed.
+    assert_eq!(report.ledger_written, 3, "{report:?}");
+    assert_eq!(report.ledger_deduped, 0, "{report:?}");
+
+    let tallies = store
+        .scoped(scope)
+        .migration_runs()
+        .tallies(&run)
+        .await
+        .expect("tallies");
+    assert_eq!(
+        tallies.accounted, source_total,
+        "every source line is accounted, so the COUNT invariant reconciles: {tallies:?}"
+    );
+    assert_eq!(tallies.failed, 2, "{tallies:?}");
+
+    // Both failures are READABLE, with distinct subjects and their own reasons.
+    let offenders = store
+        .scoped(scope)
+        .migration_runs()
+        .list_violations(&run, InvariantKind::Consistency, 10, None)
+        .await
+        .expect("violations");
+    assert_eq!(offenders.len(), 2, "{offenders:?}");
+    assert_ne!(
+        offenders[0].subject, offenders[1].subject,
+        "two bad lines are two subjects: {offenders:?}"
+    );
+
+    // And re-presenting the SAME bad lines adds no third and fourth row: the key is a
+    // function of the line, so a resume dedups it exactly like a good record.
+    let again = vec![
+        "{ this is not json".to_string(),
+        "{ this is also not json, but different".to_string(),
+    ];
+    let resumed = import_into_run(&ctx(&db, &env, scope), &run, again)
+        .await
+        .expect("re-present");
+    assert_eq!(resumed.ledger_written, 0, "{resumed:?}");
+    assert_eq!(resumed.ledger_deduped, 2, "{resumed:?}");
+    let after = store
+        .scoped(scope)
+        .migration_runs()
+        .tallies(&run)
+        .await
+        .expect("tallies");
+    assert_eq!(after.accounted, source_total, "{after:?}");
+}
+
+/// A source EDITED between two attempts still reconciles (issue #55).
+///
+/// The ledger key has to be a property of the record that cannot appear or disappear, and
+/// "the id, else the external id, else the login handle" is not one: the documented
+/// recovery procedure is to post the source again, and an operator does that from whatever
+/// export they have now. MEASURED on the old key: pass 1 delivers a record with no external
+/// id, pass 2 re-presents the same identity now carrying one, `accounted` reaches 3 against
+/// a `source_total` of 2, `remainder == -1`, and the run is stuck in `reconciling` with an
+/// invariant that can never be satisfied again. The POPULATION was correct throughout,
+/// which is what makes the defect so quiet.
+#[tokio::test]
+async fn a_source_edited_between_attempts_still_reconciles() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x1b);
+    let scope = db.seed_scope(&env).await;
+    let store = db.store();
+
+    let run = running_run(&db, &env, scope, 2).await;
+
+    // Pass 1: two records, the first carrying NO external id.
+    let pass1 = vec![
+        r#"{"identifier":"drift@example.test"}"#.to_string(),
+        r#"{"identifier":"steady@example.test"}"#.to_string(),
+    ];
+    let first = import_into_run(&ctx(&db, &env, scope), &run, pass1)
+        .await
+        .expect("pass 1");
+    assert_eq!(first.records.succeeded, 2, "{first:?}");
+    assert_eq!(first.ledger_written, 2, "{first:?}");
+
+    // Pass 2: the SAME two identities, but the first now carries an external id, exactly
+    // as a corrected export would.
+    let pass2 = vec![
+        r#"{"identifier":"drift@example.test","external_id":"crm-77"}"#.to_string(),
+        r#"{"identifier":"steady@example.test"}"#.to_string(),
+    ];
+    let second = import_into_run(&ctx(&db, &env, scope), &run, pass2)
+        .await
+        .expect("pass 2");
+    assert_eq!(
+        second.records.skipped, 2,
+        "both identities already exist: {second:?}"
+    );
+    assert_eq!(
+        second.ledger_written, 0,
+        "the edited record is the SAME ledger subject, so it writes no second row: \
+         {second:?}"
+    );
+    assert_eq!(second.ledger_deduped, 2, "{second:?}");
+
+    let tallies = store
+        .scoped(scope)
+        .migration_runs()
+        .tallies(&run)
+        .await
+        .expect("tallies");
+    assert_eq!(
+        tallies.accounted, 2,
+        "two source records, two accounted rows, however the source was edited: {tallies:?}"
+    );
+    assert_eq!(count_users(&db, scope).await, 2);
+
+    // And the run COMPLETES, which under the old key it could never do again.
+    store
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .migration_runs()
+        .transition(&env, &run, MigrationState::Reconciling)
+        .await
+        .expect("-> reconciling");
+    let outcome = store
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .migration_runs()
+        .try_complete(&env, &run)
+        .await
+        .expect("try_complete");
+    assert_eq!(outcome, CompletionOutcome::Completed, "{outcome:?}");
+}
+
+/// A source carrying TWO records under ONE login handle wedges its run, and the report
+/// SAYS SO (issue #55).
+///
+/// This is the residue the handle key does not remove and cannot: two records with one
+/// handle are one ledger subject by construction, so they account one row against a
+/// declared two and the count invariant is unsatisfiable. What the engine owes an operator
+/// in that case is the difference between "the ledger took this record" and "the ledger
+/// already had this subject", which is `ledger_deduped`. On a FIRST pass over a fresh run
+/// there is nothing else to dedup against, so a non-zero value there is a duplicate key IN
+/// THE SOURCE and nothing else. Before this, a caller could not tell that from a truncated
+/// upload.
+#[tokio::test]
+async fn two_records_sharing_a_login_handle_wedge_the_run_and_the_report_says_so() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x1c);
+    let scope = db.seed_scope(&env).await;
+    let store = db.store();
+
+    let run = running_run(&db, &env, scope, 2).await;
+    let lines = vec![
+        r#"{"identifier":"twin@example.test","external_id":"crm-1"}"#.to_string(),
+        r#"{"identifier":"twin@example.test","external_id":"crm-2"}"#.to_string(),
+    ];
+    let report = import_into_run(&ctx(&db, &env, scope), &run, lines)
+        .await
+        .expect("import");
+    assert_eq!(report.records.processed, 2, "{report:?}");
+    assert_eq!(report.records.succeeded, 1, "{report:?}");
+    assert_eq!(
+        report.records.skipped, 1,
+        "the scope's unique constraint refuses the second: {report:?}"
+    );
+    assert_eq!(
+        report.ledger_written, 1,
+        "one subject, one ledger row: {report:?}"
+    );
+    assert_eq!(
+        report.ledger_deduped, 1,
+        "and the pass REPORTS the row it could not write, which is the whole signal: \
+         {report:?}"
+    );
+
+    // The run is genuinely wedged: one accounted against a declared two, and no amount of
+    // re-presenting the source changes it.
+    let again = import_into_run(
+        &ctx(&db, &env, scope),
+        &run,
+        vec![
+            r#"{"identifier":"twin@example.test","external_id":"crm-1"}"#.to_string(),
+            r#"{"identifier":"twin@example.test","external_id":"crm-2"}"#.to_string(),
+        ],
+    )
+    .await
+    .expect("re-present");
+    assert_eq!(again.ledger_written, 0, "{again:?}");
+    let tallies = store
+        .scoped(scope)
+        .migration_runs()
+        .tallies(&run)
+        .await
+        .expect("tallies");
+    assert_eq!(tallies.accounted, 1, "{tallies:?}");
+
+    store
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .migration_runs()
+        .transition(&env, &run, MigrationState::Reconciling)
+        .await
+        .expect("-> reconciling");
+    let blocked = store
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .migration_runs()
+        .try_complete(&env, &run)
+        .await
+        .expect("try_complete");
+    let CompletionOutcome::Blocked(violated) = blocked else {
+        panic!("a run one record short must not complete: {blocked:?}");
+    };
+    assert!(
+        violated
+            .iter()
+            .any(|eval| eval.kind == InvariantKind::Count),
+        "{violated:?}"
+    );
+
+    // The ONLY exit is the audited abandonment, because nothing may rewrite the declared
+    // ground truth or delete a ledger row.
+    store
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .migration_runs()
+        .abandon(
+            &env,
+            &run,
+            "source carried two records for one login handle",
+        )
+        .await
+        .expect("abandon");
+    let closed = store
+        .scoped(scope)
+        .migration_runs()
+        .get(&run)
+        .await
+        .expect("get");
+    assert_eq!(closed.state, MigrationState::Abandoned);
+    assert_eq!(
+        closed.abandoned_reason.as_deref(),
+        Some("source carried two records for one login handle")
     );
 }

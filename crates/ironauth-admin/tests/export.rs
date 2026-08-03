@@ -175,7 +175,9 @@ async fn full_export_reimports_into_a_fresh_instance_with_logins_working() {
         env: &env,
         actor,
     };
-    let report = import_stream(&ctx, lines.clone(), |_| {}).await;
+    let report = import_stream(&ctx, lines.clone(), ironauth_import::DiscardOutcomes)
+        .await
+        .expect("the discarding sink never fails");
     assert_eq!(
         report.succeeded, 3,
         "every exported user re-imports: {report:?}"
@@ -310,7 +312,9 @@ async fn re_importing_into_the_same_scope_is_idempotent() {
         env: &env,
         actor,
     };
-    let report = import_stream(&ctx, lines, |_| {}).await;
+    let report = import_stream(&ctx, lines, ironauth_import::DiscardOutcomes)
+        .await
+        .expect("the discarding sink never fails");
     assert_eq!(report.succeeded, 0, "no new users: {report:?}");
     assert_eq!(
         report.skipped, 1,
@@ -878,7 +882,9 @@ async fn enrolled_credentials_round_trip_through_the_export() {
         env: &env,
         actor,
     };
-    let report = import_stream(&ctx, lines, |_| {}).await;
+    let report = import_stream(&ctx, lines, ironauth_import::DiscardOutcomes)
+        .await
+        .expect("the discarding sink never fails");
     assert_eq!(report.succeeded, 1, "the user re-imports: {report:?}");
     assert_eq!(report.failed, 0, "no record fails: {report:?}");
 
@@ -1048,7 +1054,9 @@ async fn totp_and_recovery_codes_round_trip_and_still_verify_after_reimport() {
         env: &env,
         actor,
     };
-    let report = import_stream(&ctx, lines, |_| {}).await;
+    let report = import_stream(&ctx, lines, ironauth_import::DiscardOutcomes)
+        .await
+        .expect("the discarding sink never fails");
     assert_eq!(report.succeeded, 1, "the user re-imports: {report:?}");
     assert_eq!(report.failed, 0, "no record fails: {report:?}");
 
@@ -1286,9 +1294,10 @@ async fn an_import_validates_against_an_active_schema_and_needs_none_without_one
             actor,
         },
         lines.clone(),
-        |_| {},
+        ironauth_import::DiscardOutcomes,
     )
-    .await;
+    .await
+    .expect("the discarding sink never fails");
     assert_eq!(
         (report.succeeded, report.failed),
         (2, 0),
@@ -1318,7 +1327,7 @@ async fn an_import_validates_against_an_active_schema_and_needs_none_without_one
         .await
         .expect("activate schema version");
 
-    let mut failures: Vec<String> = Vec::new();
+    let mut outcomes = ironauth_import::CollectOutcomes::default();
     let report = import_stream(
         &ImportContext {
             store,
@@ -1327,13 +1336,20 @@ async fn an_import_validates_against_an_active_schema_and_needs_none_without_one
             actor,
         },
         lines,
-        |outcome| {
-            if let ironauth_import::RecordOutcome::Failed(error) = outcome {
-                failures.push(format!("{}: {}", error.key, error.reason));
-            }
-        },
+        &mut outcomes,
     )
-    .await;
+    .await
+    .expect("the collecting sink never fails");
+    let failures: Vec<String> = outcomes
+        .0
+        .into_iter()
+        .filter_map(|outcome| match outcome {
+            ironauth_import::RecordOutcome::Failed(error) => {
+                Some(format!("{}: {}", error.key, error.reason))
+            }
+            _ => None,
+        })
+        .collect();
     assert_eq!(
         (report.succeeded, report.failed),
         (1, 1),

@@ -8,7 +8,7 @@
 //! parameter cannot turn a later login verification into a denial-of-service vector
 //! (the Kratos lesson: out-of-bounds imported costs are rejected at import, never
 //! silently accepted). The module has NO database or store dependency, so it is
-//! self-contained and the login path ([`ironauth_oidc`]) can consume it directly.
+//! self-contained and the login path (`ironauth-oidc`) can consume it directly.
 //!
 //! # Storage contract
 //!

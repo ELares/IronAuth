@@ -896,6 +896,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0100_environment_secret_control_writes.sql"),
         },
+        Migration {
+            version: 101,
+            name: "migration_run_control_writes",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0101_migration_run_control_writes.sql"),
+        },
     ]
 }
 

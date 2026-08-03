@@ -6,6 +6,78 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Review fold on the streaming bulk-import job surface (issue #55).
+
+  - **Resuming a TERMINAL run no longer creates identities before answering 409.** The
+    resume checked the run's kind and its reconciling back edge but never
+    `state.is_terminal()`, so the refusal arrived from the ledger ingest at the first batch
+    flush, up to 256 audited `admin_create` calls too late. MEASURED: a `complete` run
+    resumed with five records answered 409 and took the environment from one user to SIX,
+    every one accounted in no ledger anywhere. The shipped test asserted only the status
+    code, so it passed throughout; it now asserts the POPULATION.
+  - **A body the server could not read to the end is REFUSED rather than answered 202.**
+    The reader's fault was recorded in a private field nothing ever read. MEASURED with one
+    good record, a line one byte over the 1 MiB cap, and four more good records against a
+    declared `source_total` of 6: `202 Accepted`, one user, five records dropped on the
+    floor, and no signal to the caller. The same silent path absorbed a mid-upload transport
+    error, which is the common production case. The fault now reaches the handler, which
+    answers `400` naming the cause and the run id to resume; the records delivered before it
+    stay durable and accounted.
+  - **`POST .../migration-runs/{run_id}/abandon`**, the audited, reason-carrying terminal
+    giving-up, mounted as a management route with its own grant in migration 0101. Without
+    it a wedged run is wedged FOREVER: a source carrying two records under one login handle
+    accounts one row against a declared two, a failed record is accounted inconsistent and
+    nothing on this plane reconciles it, and 0101 withholds `UPDATE (source_total)`,
+    `UPDATE` on the ledger rows, and `DELETE` on purpose. It is idempotent (a run already
+    abandoned answers 200 with its FIRST reason) and refuses a `complete` run with 409,
+    because a completion may not be quietly taken back.
+  - **`progress_path` no longer promises fields the progress view does not publish.**
+    `MigrationRunCountsView` has exactly `imported`, `failed`, `skipped`, `inconsistent`,
+    `unmarked_backfill`, and `accounted`: there is no `processed` and no `remaining`. The
+    false sentence shipped in `docs/openapi/management.json` and in the generated SPA
+    bindings, and is corrected at its source and regenerated.
+  - **The one-input-shape justification rests on the THREAT MODEL alone.** It also claimed a
+    vendor route would "buy no capability", which is false twice: `ironauth-importers` has
+    no dependent in the shipped graph, no `[[bin]]`, and no command-line entry point, so the
+    exit guide was instructing operators to pipe the output of a program that does not
+    exist; and its issue-#57 validation-only gap report is a fact about the VENDOR document
+    that the line-delimited format structurally cannot carry.
+
+- **The streaming bulk-import JOB surface** (issue #55): `POST .../imports` creates a
+  migration run declaring the source record count and streams a newline-delimited identity
+  record set into it; `POST .../imports/{run_id}` resumes that run. This is the write half
+  the import engine never had. Before it, `ironauth_import::import_stream` and
+  `import_into_run` both existed, were tested, and had ZERO production callers (the only
+  apparent one was a commented-out line inside a doc comment), so nothing that shipped could
+  perform an import at all.
+
+  - **The body is read one frame at a time**, not through axum's `Bytes` extractor, which
+    buffers the whole request before the handler runs. A 100k-record upload therefore holds
+    one record plus one frame between the socket and the `INSERT`. A single line is capped at
+    1 MiB so a body carrying no newline cannot grow the reader without bound either.
+  - **Resumability is keyed on the record, never on a position.** There is no byte offset and
+    no server-side cursor into the caller's file: a resume may re-present anything, including
+    the whole source, because a duplicate identity is refused by the scope's unique
+    constraints and reported as an idempotent skip, and a duplicate ledger row is refused by
+    the run's per-subject unique index. A killed caller generally cannot compute where the
+    kill landed, which is exactly what a byte offset would require of it.
+  - **Progress is the surface that already exists.** The handlers answer `202 Accepted` with a
+    job HANDLE (the run id and the path to read it at) and no counters; the counters are
+    `getMigrationRun`, which shipped with issue #59. That is also what lets the
+    `Idempotency-Key` record commit in the SAME transaction as the run creation: the stored
+    response has to be knowable BEFORE the import runs, and a counter in the body is not.
+  - **The active trait schema is not bypassed.** The job drives the same engine path issue #53
+    PR 1 gave the schema check to, so a record violating the target scope's active schema
+    fails that record and no other, with the rest of the import proceeding.
+  - **One input shape, deliberately.** The route accepts the first-party line-delimited record
+    format only, and not a Keycloak realm export, an Auth0 bulk export, or a Firebase
+    `auth:export`, even though `ironauth-importers` parses all three: those front-ends
+    translate a vendor document INTO this format, so a vendor-shaped route would put a second
+    parser of attacker-supplied documents on the network surface, and those parsers consume
+    whole documents rather than a line at a time, giving up this route's memory bound with
+    it. The threat model is the whole justification; see the fold entry above for the two
+    capabilities a vendor route WOULD buy.
+
 - Review fold on the identity trait-schema surface (issue #53, PR 1).
 
   - **A connector claim mapping that targets an admin-only trait is refused at CONFIG time**,

@@ -10,10 +10,15 @@
 //!
 //! Three properties the engine guarantees:
 //!
-//! * PER-RECORD FAILURE ISOLATION: a malformed line, an out-of-bounds foreign hash,
-//!   an invalid state, or a cross-scope id fails only THAT record (reported with its
-//!   stable key and an operator-safe reason); the stream continues. Nothing is
-//!   silently dropped.
+//! * PER-RECORD FAILURE ISOLATION: a malformed line, a line that is not valid UTF-8, a
+//!   blank login handle, an out-of-bounds foreign hash, an invalid state, or a cross-scope
+//!   id fails only THAT record (reported with its stable key and an operator-safe reason);
+//!   the stream continues. Nothing is silently dropped, and that is a claim about the
+//!   KEY as much as about the report: a record's key is its LOGIN HANDLE, and a line that
+//!   never became a record is keyed on a digest of its own bytes, so two failures are two
+//!   accounted failures. Keying every parse failure on one constant string (which the
+//!   first cut did) means the ledger's per-subject dedup DISCARDS all but the first, which
+//!   is exactly the silent drop this sentence denies.
 //! * IDEMPOTENCE: re-running an import does not duplicate. A record whose id,
 //!   external id, or login handle already exists in the scope is reported as
 //!   SKIPPED (the scope's unique constraints reject the duplicate), not created
@@ -27,6 +32,8 @@
 //! maximum is rejected with a per-record error, never stored, so a later login
 //! verification can never be a denial-of-service vector.
 
+use std::fmt::Write as _;
+use std::future::Future;
 use std::time::SystemTime;
 
 use ironauth_env::Env;
@@ -34,9 +41,111 @@ use ironauth_store::{
     ActorRef, CorrelationId, CredentialType, NewAdminUser, NewUserTraits, RestoredRecoveryCode,
     RestoredTotp, Scope, Store, StoreError, TraitSchema, TraitWriteVisibility, UserId, UserState,
 };
+use sha2::{Digest as _, Sha256};
 
 use crate::record::{ImportRecord, parse_record_line};
 use crate::scheme::ForeignHash;
+
+/// A PULL source of import lines: awaited once per line, yielding [`None`] at end of
+/// input.
+///
+/// A line is RAW BYTES rather than a `String`, and that is the difference between an
+/// undecodable line being REPORTED and being silently rewritten. A transport that decodes
+/// lossily turns a Latin-1 login handle into one carrying U+FFFD, which imports cleanly,
+/// counts as a success, and produces an account whose owner can never log in, with no
+/// error anywhere (MEASURED before this signature). Handing the engine the bytes puts the
+/// UTF-8 decision in the one place that can fail a RECORD, which is where this module's
+/// per-record failure isolation lives.
+///
+/// It is a trait rather than an `AsyncFnMut() -> Option<String>` bound, and that is not a
+/// style choice. A borrowing async CLOSURE produces a future whose `Send` implementation
+/// rustc cannot generalize over lifetimes, so an axum handler driving one is refused with
+/// "implementation of `Send` is not general enough" at the ROUTER, naming types the
+/// handler never mentions (MEASURED: nine such errors, on `&Store`, `&AdminState`,
+/// `&str`, and the store's own audited-write closure). Declaring the returned future
+/// `Send` HERE is what makes the bound general, so the management import job can drive
+/// the engine at all.
+///
+/// A synchronous iterator adapts through [`IterLines`]; a transport (an HTTP body read
+/// frame by frame) implements this directly.
+pub trait LineSource {
+    /// The next line's bytes, or [`None`] at end of input.
+    fn next_line(&mut self) -> impl Future<Output = Option<Vec<u8>>> + Send;
+}
+
+/// A SINK for per-record outcomes: awaited once per record as the stream drains, so an
+/// observer that persists outcomes can do so INCREMENTALLY rather than being handed the
+/// whole run at the end.
+///
+/// A trait for the same reason [`LineSource`] is one: an observer that borrows what it
+/// writes into is an async closure, and a borrowing async closure's future has no general
+/// `Send` implementation, which puts the whole engine out of reach of an axum handler.
+pub trait OutcomeSink {
+    /// Record one outcome durably.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the sink's persistence layer returns. An error STOPS the import: the
+    /// alternative is creating identities that nothing is accounting.
+    fn record(
+        &mut self,
+        outcome: RecordOutcome,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+}
+
+/// A sink that DISCARDS every per-record outcome, for a caller that wants only the
+/// aggregate [`ImportReport`].
+///
+/// The counts survive; the per-record REASONS do not, so this is not what a production
+/// import wants (issue #55 requires every failure be reported with its record identity).
+/// It exists for callers that genuinely have nowhere to put them.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DiscardOutcomes;
+
+impl OutcomeSink for DiscardOutcomes {
+    async fn record(&mut self, _outcome: RecordOutcome) -> Result<(), StoreError> {
+        Ok(())
+    }
+}
+
+/// A sink that KEEPS every per-record outcome in memory.
+///
+/// Its footprint grows with the record count, which is exactly what the streaming profile
+/// forbids, so it is NOT what a bulk import uses: the shipped observer is the migration
+/// run's ledger, which flushes a bounded batch and holds nothing else. This is for a
+/// caller with a small, known-bounded input that wants to inspect the individual
+/// outcomes, which in practice means a test.
+#[derive(Debug, Default)]
+pub struct CollectOutcomes(pub Vec<RecordOutcome>);
+
+impl OutcomeSink for &mut CollectOutcomes {
+    async fn record(&mut self, outcome: RecordOutcome) -> Result<(), StoreError> {
+        self.0.push(outcome);
+        Ok(())
+    }
+}
+
+/// Adapts a synchronous [`Iterator`] of lines to a [`LineSource`].
+pub struct IterLines<I>(I);
+
+impl<I> IterLines<I>
+where
+    I: Iterator<Item = String> + Send,
+{
+    /// Wrap `lines` as a pull source.
+    pub fn new(lines: I) -> Self {
+        Self(lines)
+    }
+}
+
+impl<I> LineSource for IterLines<I>
+where
+    I: Iterator<Item = String> + Send,
+{
+    async fn next_line(&mut self) -> Option<Vec<u8>> {
+        self.0.next().map(String::into_bytes)
+    }
+}
 
 /// Everything a streaming import needs besides the input itself: the store, the
 /// target scope, the determinism seam, and the acting principal every create is
@@ -76,9 +185,11 @@ pub struct ImportReport {
 /// reason that never echoes a secret (never a password, and never a stored hash).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordError {
-    /// The stable identity the failure is reported against: the caller-supplied id,
-    /// else the external id, else the login handle (or a placeholder when the line
-    /// could not be parsed at all).
+    /// The stable identity the failure is reported against: the record's LOGIN HANDLE,
+    /// or, for a line the engine could not decode or parse into a record at all, a
+    /// truncated one-way digest of the line's own bytes, prefixed `unparsable-line:`.
+    /// Distinct per distinct line either way, which is what keeps two bad lines two
+    /// accounted failures.
     pub key: String,
     /// The operator-safe reason.
     pub reason: String,
@@ -184,22 +295,63 @@ impl std::fmt::Debug for PreparedRecoveryCode {
     }
 }
 
-/// Stream a bulk import to completion, creating each user through the audited admin
-/// create path and reporting every record's outcome to `on_record` as it is
-/// processed.
+/// Stream a bulk import to completion from a SYNCHRONOUS line iterator, creating each
+/// user through the audited admin create path and reporting every record's outcome to
+/// `on_record` as it is processed.
 ///
 /// `lines` is consumed lazily (one owned line held at a time), so the engine's
 /// memory is bounded by a single record regardless of how many the input yields.
 /// A blank line is a benign separator (skipped, not counted). The return value is
 /// the final aggregate tally; individual creates, skips, and failures arrive
 /// through `on_record`.
-pub async fn import_stream<I>(
+///
+/// This is the thin adapter over [`import_stream_lines`], which is the general form: a
+/// caller whose input arrives ASYNCHRONOUSLY (an HTTP request body read frame by frame)
+/// cannot express itself as an [`Iterator`] without buffering the whole body first, which
+/// is exactly the bound this engine exists to hold.
+///
+/// # Errors
+///
+/// Whatever `on_record` returns. A per-RECORD failure is never an error here (it is
+/// reported through `on_record` and the stream continues); an error means the OBSERVER
+/// could not durably account an outcome, so the import stops rather than processing
+/// records nothing is recording.
+pub async fn import_stream<I, F>(
     ctx: &ImportContext<'_>,
     lines: I,
-    on_record: impl FnMut(RecordOutcome),
-) -> ImportReport
+    on_record: F,
+) -> Result<ImportReport, StoreError>
 where
     I: IntoIterator<Item = String>,
+    I::IntoIter: Send,
+    F: OutcomeSink,
+{
+    import_stream_lines(ctx, IterLines::new(lines.into_iter()), on_record).await
+}
+
+/// Stream a bulk import to completion from an ASYNCHRONOUS pull source (issue #55).
+///
+/// `next_line` is awaited once per line and yields [`None`] at end of input; the engine
+/// holds exactly ONE line at a time, so its memory is bounded by a single record
+/// regardless of how many the source yields. `on_record` is awaited once per record, so
+/// an observer that DURABLY records each outcome (the migration-run ledger) can do so
+/// INCREMENTALLY rather than accumulating the whole run in memory first.
+///
+/// A source that stops early (a truncated upload, a killed producer) is not an error: it
+/// is a partially completed import, which the run's ledger has durably accounted and a
+/// later call resumes. That is the resumability contract, not a failure mode.
+///
+/// # Errors
+///
+/// Whatever `on_record` returns; see [`import_stream`].
+pub async fn import_stream_lines<N, F>(
+    ctx: &ImportContext<'_>,
+    lines: N,
+    on_record: F,
+) -> Result<ImportReport, StoreError>
+where
+    N: LineSource,
+    F: OutcomeSink,
 {
     // The target scope's ACTIVE trait schema, resolved ONCE for the whole run rather than
     // per record (a scope has one active version for the duration of an import, and the
@@ -222,13 +374,30 @@ where
         Ok(Some(version)) => TraitSchema::compile(&version.schema_json).ok(),
         Ok(None) | Err(_) => None,
     };
-    drive_import(
-        ctx.scope,
-        lines,
-        async |prepared: PreparedCreate| create_user(ctx, schema.as_ref(), prepared).await,
-        on_record,
-    )
-    .await
+    drive_import(ctx.scope, lines, StoreCreator { ctx, schema }, on_record).await
+}
+
+/// How [`drive_import`] creates one prepared record. A trait rather than an async closure
+/// for the reason [`LineSource`] records.
+trait RecordCreator {
+    /// Create one prepared record, returning its `usr_` id.
+    fn create(
+        &mut self,
+        prepared: PreparedCreate,
+    ) -> impl Future<Output = Result<String, CreateError>> + Send;
+}
+
+/// The SHIPPED creator: the audited, isolation-scoped admin create path, with the target
+/// scope's active trait schema resolved once for the whole run.
+struct StoreCreator<'a> {
+    ctx: &'a ImportContext<'a>,
+    schema: Option<TraitSchema>,
+}
+
+impl RecordCreator for StoreCreator<'_> {
+    async fn create(&mut self, prepared: PreparedCreate) -> Result<String, CreateError> {
+        create_user(self.ctx, self.schema.as_ref(), prepared).await
+    }
 }
 
 /// Validate an imported traits document against the target scope's active schema, or
@@ -291,9 +460,13 @@ async fn create_user(
                 state: prepared.state,
                 foreign_password_hash: prepared.foreign_hash.as_deref(),
                 foreign_password_algo: prepared.foreign_algo,
-                // Traits are restored VERBATIM (issue #58): sealed as-is without
-                // re-validating against the target scope's active schema, so a full
-                // export imports losslessly even into a fresh scope with no schema. The
+                // Traits are restored VERBATIM (issue #58): the document is sealed exactly
+                // as the source instance held it, with no coercion, no defaulting, and no
+                // re-serialization of its shape. It IS re-validated first when the target
+                // scope serves an active schema (`check_imported_traits`, called at the
+                // top of this function); a scope with NO active schema validates nothing,
+                // which is the exit covenant's carve-out and the reason a full export
+                // imports losslessly into a fresh instance. The
                 // ADMIN class, because a restore is an operator action carrying the SOURCE
                 // instance's own admin-only metadata: refusing the fields the operator is
                 // restoring would make the round trip lossy by construction.
@@ -428,67 +601,178 @@ async fn restore_recovery_codes(
 }
 
 /// The pure streaming driver: pull lines lazily, parse and validate each, and hand a
-/// prepared record to `create`, tallying and reporting outcomes. Generic over the
-/// create step so the parsing / validation / streaming behavior is testable without
-/// a database.
-async fn drive_import<I, C>(
+/// prepared record to `create`, tallying and awaiting `on_record` for each outcome.
+/// Generic over the line source, the create step, and the observer, so the parsing /
+/// validation / streaming behavior is testable without a database.
+///
+/// TWO memory bounds, not one, and the second is the reason this signature is what it
+/// is. The driver holds at most ONE line at a time (the input is never collected), and
+/// it awaits the observer per record, so an observer that persists outcomes never has to
+/// be handed the whole run at the end. The previous signature took a SYNCHRONOUS
+/// observer, which forced the migration-run adapter to collect every translated outcome
+/// into a `Vec` before it could ingest any of them: the engine was bounded and the
+/// adapter above it was O(n).
+async fn drive_import<N, C, F>(
     scope: Scope,
-    lines: I,
+    mut lines: N,
     mut create: C,
-    mut on_record: impl FnMut(RecordOutcome),
-) -> ImportReport
+    mut on_record: F,
+) -> Result<ImportReport, StoreError>
 where
-    I: IntoIterator<Item = String>,
-    C: AsyncFnMut(PreparedCreate) -> Result<String, CreateError>,
+    N: LineSource,
+    C: RecordCreator,
+    F: OutcomeSink,
 {
     let mut report = ImportReport::default();
-    for line in lines {
-        let record = match parse_record_line(&line) {
+    while let Some(bytes) = lines.next_line().await {
+        // The UTF-8 decision is the engine's, not the transport's: an undecodable line is
+        // THIS record's failure, reported under a key derived from its own bytes, and the
+        // stream continues.
+        let line = match std::str::from_utf8(&bytes) {
+            Ok(line) => line,
+            Err(error) => {
+                report.processed += 1;
+                report.failed += 1;
+                on_record
+                    .record(RecordOutcome::Failed(RecordError {
+                        key: undecodable_line_key(&bytes),
+                        reason: format!(
+                            "line is not valid UTF-8 (first invalid byte at offset {})",
+                            error.valid_up_to()
+                        ),
+                    }))
+                    .await?;
+                continue;
+            }
+        };
+        let record = match parse_record_line(line) {
             Ok(Some(record)) => record,
             // A blank separator line: not a record, not counted.
             Ok(None) => continue,
             Err(error) => {
                 report.processed += 1;
                 report.failed += 1;
-                on_record(RecordOutcome::Failed(RecordError {
-                    key: "<unparsable record>".to_owned(),
-                    reason: format!("parse error: {}", error.message()),
-                }));
+                on_record
+                    .record(RecordOutcome::Failed(RecordError {
+                        key: undecodable_line_key(&bytes),
+                        reason: format!("parse error: {}", error.message()),
+                    }))
+                    .await?;
                 continue;
             }
         };
         report.processed += 1;
-        let key = record.record_key().to_owned();
+        let key = ledger_key(&record, &bytes);
         let prepared = match prepare_record(record, scope) {
             Ok(prepared) => prepared,
             Err(reason) => {
                 report.failed += 1;
-                on_record(RecordOutcome::Failed(RecordError { key, reason }));
+                on_record
+                    .record(RecordOutcome::Failed(RecordError { key, reason }))
+                    .await?;
                 continue;
             }
         };
-        match create(prepared).await {
+        match create.create(prepared).await {
             Ok(id) => {
                 report.succeeded += 1;
-                on_record(RecordOutcome::Created { key, id });
+                on_record.record(RecordOutcome::Created { key, id }).await?;
             }
             Err(CreateError::Conflict) => {
                 report.skipped += 1;
-                on_record(RecordOutcome::Skipped { key });
+                on_record.record(RecordOutcome::Skipped { key }).await?;
             }
             Err(CreateError::Failed(reason)) => {
                 report.failed += 1;
-                on_record(RecordOutcome::Failed(RecordError { key, reason }));
+                on_record
+                    .record(RecordOutcome::Failed(RecordError { key, reason }))
+                    .await?;
             }
         }
     }
-    report
+    Ok(report)
+}
+
+/// The ledger subject one line is accounted under when the engine cannot get a login
+/// handle out of it: a truncated SHA-256 of the line's own BYTES.
+///
+/// It has to be a property OF THE LINE, and the first cut made it the constant
+/// `"<unparsable record>"`. Every malformed line in a run then shared one subject, and the
+/// ledger's `ON CONFLICT (tenant, environment, run, subject_bidx) DO NOTHING` discarded
+/// the second and every later one. MEASURED with two bad lines and one good against a
+/// declared `source_total` of 3: `imported=1 failed=1 accounted=2`, one record short
+/// FOREVER, so the count invariant could never be satisfied and the run could never
+/// complete. It also refuted this module's own "nothing is silently dropped".
+///
+/// A digest of the bytes has both properties the subject needs. It is STABLE across
+/// attempts, so a genuinely repeated bad line still dedups to one row on a resume; and it
+/// is DISTINCT per distinct bad line, so two different bad lines are two accounted
+/// failures. It is one-way, so it carries no PII out of the line it summarizes even though
+/// the line itself may be full of it. Sixteen hex characters is 64 bits, whose birthday
+/// collision probability across the ten million records the management route's largest
+/// accepted `source_total` allows is under three in a million.
+fn undecodable_line_key(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut key = String::from("unparsable-line:");
+    for byte in &digest[..8] {
+        write!(key, "{byte:02x}").expect("writing to a String never fails");
+    }
+    key
+}
+
+/// The stable ledger subject one PARSED record is accounted under: its LOGIN HANDLE,
+/// trimmed exactly as the create path trims it.
+///
+/// The login handle is the only field of a record that is REQUIRED and therefore the only
+/// one that cannot appear or disappear between two presentations of the same identity. The
+/// first cut keyed on the id, else the external id, else the handle, which is stable only
+/// while the SOURCE does not change. MEASURED: pass 1 delivers a record with no external
+/// id; pass 2 resumes with the same identity now carrying one. The two passes account it
+/// under two different subjects, `accounted` reaches 3 against a `source_total` of 2, and
+/// `remainder == 0` can never hold again. The identity population stayed correct
+/// throughout: only the ledger broke. Since the whole documented recovery procedure is
+/// "post the source again", a key that survives only an UNCHANGED source is not a
+/// resumability mechanism.
+///
+/// A record whose handle is blank has no usable subject and is a per-record failure
+/// anyway ([`prepare_record`] refuses it, exactly as `POST .../users` does); it falls back
+/// to the line digest so two blank-handle records stay two accounted failures rather than
+/// one.
+fn ledger_key(record: &ImportRecord, bytes: &[u8]) -> String {
+    let handle = record.record_key();
+    if handle.is_empty() {
+        return undecodable_line_key(bytes);
+    }
+    handle.to_owned()
+}
+
+/// Require a field the MANAGEMENT EDGE requires: non-blank after trimming, returned
+/// trimmed.
+///
+/// This is `ironauth_admin::input::require_non_empty` applied on the import path, and it
+/// is here because the two paths were measurably disagreeing about what a login handle is.
+/// MEASURED: `{"identifier":""}` is a 400 on `POST .../users` and was IMPORTED here, and
+/// `" a@x.test "` was stored verbatim here and trimmed there, so the same login handle
+/// written by the two writers produced two different rows. A bulk import writes the same
+/// column through the same repository; it does not get its own idea of validity.
+fn required_field(value: &str, field: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{field} must not be empty"));
+    }
+    Ok(trimmed.to_owned())
 }
 
 /// Parse and bounds-check one record into a [`PreparedCreate`], or return an
 /// operator-safe reason it was rejected (issue #55). This is where the foreign-hash
-/// denial-of-service bounds are enforced AT IMPORT.
+/// denial-of-service bounds are enforced AT IMPORT, and where the management edge's own
+/// input validation is applied so the two writers of a login handle agree.
 fn prepare_record(record: ImportRecord, scope: Scope) -> Result<PreparedCreate, String> {
+    let identifier = required_field(&record.identifier, "identifier")?;
+    let external_id = match record.external_id.as_deref() {
+        None => None,
+        Some(raw) => Some(required_field(raw, "external_id")?),
+    };
     let state = match record.state.as_deref() {
         None => UserState::Active,
         Some(tag) => {
@@ -510,7 +794,8 @@ fn prepare_record(record: ImportRecord, scope: Scope) -> Result<PreparedCreate, 
     let (foreign_hash, foreign_algo) = match record.password_hash.as_deref() {
         None => (None, None),
         Some(raw) => {
-            let parsed = ForeignHash::parse(raw)
+            let raw = required_field(raw, "password_hash")?;
+            let parsed = ForeignHash::parse(&raw)
                 .map_err(|error| format!("foreign hash rejected: {error}"))?;
             (Some(parsed.stored().to_owned()), Some(parsed.tag()))
         }
@@ -533,9 +818,9 @@ fn prepare_record(record: ImportRecord, scope: Scope) -> Result<PreparedCreate, 
     let totp = prepare_totp(record.totp)?;
     let recovery_codes = prepare_recovery_codes(record.recovery_codes)?;
     Ok(PreparedCreate {
-        identifier: record.identifier,
+        identifier,
         id,
-        external_id: record.external_id,
+        external_id,
         claims_json,
         traits_json,
         traits_schema_version: record.traits_schema_version,
@@ -659,7 +944,6 @@ fn epoch_micros(at: SystemTime) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -667,6 +951,18 @@ mod tests {
     use ironauth_store::{EnvironmentId, Scope, TenantId};
 
     use super::*;
+
+    /// A creator double: runs `step` on each prepared record. The DB-free driver tests
+    /// need a creator, and a trait needs a named implementor, so this is the one.
+    struct MockCreator<S>(S);
+    impl<S> RecordCreator for MockCreator<S>
+    where
+        S: FnMut(PreparedCreate) -> Result<String, CreateError> + Send,
+    {
+        async fn create(&mut self, prepared: PreparedCreate) -> Result<String, CreateError> {
+            (self.0)(prepared)
+        }
+    }
 
     /// A scope built from raw ids for the DB-free driver tests (no database needed:
     /// the driver's create step is mocked).
@@ -720,14 +1016,15 @@ mod tests {
         let alive_for_create = Arc::clone(&alive);
         let report = drive_import(
             test_scope(),
-            lazy,
-            async move |prepared: PreparedCreate| {
+            IterLines::new(lazy),
+            MockCreator(move |prepared: PreparedCreate| {
                 alive_for_create.fetch_sub(1, Ordering::SeqCst);
                 Ok(format!("usr_{}", prepared.identifier))
-            },
-            |_| {},
+            }),
+            &mut CollectOutcomes::default(),
         )
-        .await;
+        .await
+        .expect("the observer never fails");
 
         assert_eq!(report.processed, N);
         assert_eq!(report.succeeded, N);
@@ -751,18 +1048,15 @@ mod tests {
             line(""),
             line(r#"{"identifier":"ok-3"}"#),
         ];
-        let outcomes = Cell::new(Vec::new());
+        let mut outcomes = CollectOutcomes::default();
         let report = drive_import(
             test_scope(),
-            lines,
-            async |prepared: PreparedCreate| Ok(format!("usr_{}", prepared.identifier)),
-            |outcome| {
-                let mut v = outcomes.take();
-                v.push(outcome);
-                outcomes.set(v);
-            },
+            IterLines::new(lines.into_iter()),
+            MockCreator(|prepared: PreparedCreate| Ok(format!("usr_{}", prepared.identifier))),
+            &mut outcomes,
         )
-        .await;
+        .await
+        .expect("the observer never fails");
 
         // Three good records created, three bad ones failed, one blank skipped;
         // crucially the batch ran to the end past every failure.
@@ -770,7 +1064,7 @@ mod tests {
         assert_eq!(report.succeeded, 3, "ok-1, ok-2, ok-3");
         assert_eq!(report.failed, 3, "malformed json, bad cost, bad state");
         let failures = outcomes
-            .take()
+            .0
             .into_iter()
             .filter(|o| matches!(o, RecordOutcome::Failed(_)))
             .count();
@@ -787,20 +1081,187 @@ mod tests {
         // conflict, exactly as a re-import hits the scope's unique constraint.
         let report = drive_import(
             test_scope(),
-            lines,
-            async |prepared: PreparedCreate| {
+            IterLines::new(lines.into_iter()),
+            MockCreator(|prepared: PreparedCreate| {
                 if prepared.identifier == "dup" {
                     Err(CreateError::Conflict)
                 } else {
                     Ok(format!("usr_{}", prepared.identifier))
                 }
-            },
-            |_| {},
+            }),
+            &mut CollectOutcomes::default(),
         )
-        .await;
+        .await
+        .expect("the observer never fails");
         assert_eq!(report.succeeded, 1);
         assert_eq!(report.skipped, 1, "the duplicate is a skip, not a failure");
         assert_eq!(report.failed, 0);
+    }
+
+    /// A byte source, for the cases a `String` cannot express.
+    struct ByteLines(std::vec::IntoIter<Vec<u8>>);
+    impl LineSource for ByteLines {
+        async fn next_line(&mut self) -> Option<Vec<u8>> {
+            self.0.next()
+        }
+    }
+
+    #[tokio::test]
+    async fn every_unparseable_line_is_its_own_accounted_failure() {
+        // The defect: keying every parse failure on one constant subject. The ledger
+        // dedups on the subject, so the SECOND bad line and every later one was silently
+        // discarded, `accounted` came up short of `source_total` forever, and the run
+        // could never complete. MEASURED at `imported=1 failed=1 accounted=2` against a
+        // declared 3.
+        let lines = vec![
+            line("{ not json at all"),
+            line("{ also not json, differently"),
+            line(r#"{"identifier":"ok@example.test"}"#),
+        ];
+        let mut outcomes = CollectOutcomes::default();
+        let report = drive_import(
+            test_scope(),
+            IterLines::new(lines.into_iter()),
+            MockCreator(|prepared: PreparedCreate| Ok(format!("usr_{}", prepared.identifier))),
+            &mut outcomes,
+        )
+        .await
+        .expect("the observer never fails");
+        assert_eq!(report.processed, 3);
+        assert_eq!(report.failed, 2);
+
+        let keys: Vec<&str> = outcomes
+            .0
+            .iter()
+            .filter_map(|outcome| match outcome {
+                RecordOutcome::Failed(error) => Some(error.key.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(keys.len(), 2, "{keys:?}");
+        assert_ne!(
+            keys[0], keys[1],
+            "two DIFFERENT bad lines must be two different ledger subjects, or the second \
+             is discarded by the ingest's conflict clause: {keys:?}"
+        );
+        for key in &keys {
+            assert!(
+                key.starts_with("unparsable-line:"),
+                "the subject says what it is: {key}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_repeated_bad_line_keeps_one_stable_key_across_attempts() {
+        // The other half of the property: the key is a function of the LINE, so the same
+        // bad line presented on a resume dedups to the one ledger row it already has.
+        let bad = "{ not json at all";
+        let first = undecodable_line_key(bad.as_bytes());
+        let second = undecodable_line_key(bad.as_bytes());
+        assert_eq!(first, second, "stable across attempts");
+        assert_ne!(
+            first,
+            undecodable_line_key(b"{ not json at all "),
+            "and sensitive to one trailing byte"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_undecodable_line_fails_its_own_record_rather_than_being_rewritten() {
+        // A Latin-1 identifier. Decoding it lossily (which the transport used to do)
+        // created a user carrying U+FFFD who cannot log in, counted as imported, with no
+        // error anywhere.
+        let latin1 = b"{\"identifier\":\"caf\xe9@x.test\"}".to_vec();
+        let good = br#"{"identifier":"ok@x.test"}"#.to_vec();
+        let mut outcomes = CollectOutcomes::default();
+        let report = drive_import(
+            test_scope(),
+            ByteLines(vec![latin1, good].into_iter()),
+            MockCreator(|prepared: PreparedCreate| Ok(format!("usr_{}", prepared.identifier))),
+            &mut outcomes,
+        )
+        .await
+        .expect("the observer never fails");
+        assert_eq!(report.processed, 2);
+        assert_eq!(report.failed, 1, "the undecodable line fails, alone");
+        assert_eq!(report.succeeded, 1, "and the stream continues");
+        let Some(RecordOutcome::Failed(error)) = outcomes.0.first() else {
+            panic!("the first outcome is the failure: {:?}", outcomes.0);
+        };
+        assert!(
+            error.reason.contains("not valid UTF-8"),
+            "the reason says what happened: {}",
+            error.reason
+        );
+        // And no created record carries a replacement character.
+        for outcome in &outcomes.0 {
+            if let RecordOutcome::Created { id, .. } = outcome {
+                assert!(!id.contains('\u{fffd}'), "{id}");
+            }
+        }
+    }
+
+    #[test]
+    fn prepare_applies_the_management_edges_own_input_validation() {
+        // `POST .../users` runs `require_non_empty` (which also TRIMS) on the identifier,
+        // the external id, and the password hash. The import path ran none of it, so
+        // `identifier: ""` was a 400 there and an IMPORT here, and `" a@x.test "` was
+        // stored verbatim here and trimmed there: two writers of one column disagreeing
+        // about what a login handle is.
+        for (line, field) in [
+            (r#"{"identifier":"   "}"#, "identifier"),
+            (
+                r#"{"identifier":"a@x.test","external_id":" "}"#,
+                "external_id",
+            ),
+            (
+                r#"{"identifier":"a@x.test","password_hash":"  "}"#,
+                "password_hash",
+            ),
+        ] {
+            let record = parse_record_line(line).expect("parse").expect("some");
+            let error = prepare_record(record, test_scope())
+                .expect_err("a blank required field is a per-record failure");
+            assert_eq!(error, format!("{field} must not be empty"), "{line}");
+        }
+        // And the surviving values are TRIMMED, exactly as the live path stores them.
+        let record = parse_record_line(r#"{"identifier":"  a@x.test  ","external_id":" crm-1 "}"#)
+            .expect("parse")
+            .expect("some");
+        let prepared = prepare_record(record, test_scope()).expect("prepared");
+        assert_eq!(prepared.identifier, "a@x.test");
+        assert_eq!(prepared.external_id.as_deref(), Some("crm-1"));
+    }
+
+    #[tokio::test]
+    async fn a_blank_handle_record_is_keyed_on_its_line_and_not_on_the_empty_string() {
+        // Two records with blank handles are two failures, and they must not collapse into
+        // one ledger subject any more than two unparseable lines do.
+        let lines = vec![
+            line(r#"{"identifier":"","external_id":"a"}"#),
+            line(r#"{"identifier":"  ","external_id":"b"}"#),
+        ];
+        let mut outcomes = CollectOutcomes::default();
+        let report = drive_import(
+            test_scope(),
+            IterLines::new(lines.into_iter()),
+            MockCreator(|prepared: PreparedCreate| Ok(format!("usr_{}", prepared.identifier))),
+            &mut outcomes,
+        )
+        .await
+        .expect("the observer never fails");
+        assert_eq!(report.failed, 2);
+        let keys: Vec<&str> = outcomes
+            .0
+            .iter()
+            .filter_map(|outcome| match outcome {
+                RecordOutcome::Failed(error) => Some(error.key.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_ne!(keys[0], keys[1], "{keys:?}");
+        assert!(keys.iter().all(|key| !key.is_empty()));
     }
 
     #[test]

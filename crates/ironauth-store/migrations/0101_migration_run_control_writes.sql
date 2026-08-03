@@ -1,0 +1,91 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+--
+-- Control-plane writes on the migration-run ledger (issue #55).
+--
+-- Migration 0043 created the invariant-checked migration state machine and granted
+-- `ironauth_control` SELECT and nothing else, with an explicit reason: "Only the DATA
+-- plane (`ironauth_app`) drives a run ... The CONTROL plane is READ-ONLY over these
+-- tables: its three operator endpoints only list runs and read live state, tallies, and
+-- violations, so it is granted SELECT alone and never INSERT or UPDATE (the #31
+-- least-privilege lesson: a role holds only the privileges its callers exercise)."
+--
+-- That reason was correct and is now out of date, which is exactly the condition under
+-- which a grant should move. Issue #55 gives the management API the WRITE half of the
+-- migration on-ramp: `POST .../imports` creates a bulk-import run, drives it through
+-- `defined -> validating -> running`, ingests one ledger row per record, and attempts
+-- the gated completion; `POST .../imports/{run_id}` resumes it. The management API
+-- authenticates as `ironauth_control`, so the control plane now HAS callers that
+-- exercise these privileges, and 0043's sentence about the data plane being the only
+-- driver describes a world with no import route in it, which was the whole defect issue
+-- #55 names (`import_stream` and `import_into_run` shipped with zero production
+-- callers).
+--
+-- MEASURED before this migration: every `crates/ironauth-admin/tests/imports.rs` case
+-- that REACHES an INSERT into `migration_runs` answered 500 rather than its documented
+-- status, because Postgres refuses that INSERT before any application logic runs. The
+-- cases that refuse earlier (a missing Idempotency-Key, a malformed source_total: 400
+-- before any INSERT) were green WITHOUT this grant and measure nothing about it, which
+-- is why this note says "every case that reaches an INSERT" and not a count: a number
+-- here is a claim that goes stale the next time a case is added, and a migration file is
+-- the most permanent prose in the tree. That failure is the `abuse_bans` shape
+-- `crates/ironauth-admin/tests/live_surface.rs` exists to catch: correct SQL, correct
+-- scoping, a row that is there, and a dead surface.
+--
+-- # Least privilege, kept
+--
+-- The grants below are exactly what the import handlers and the abandon route issue and
+-- nothing more:
+--
+--   * INSERT on `migration_runs` (the run creation, joined in one transaction with the
+--     caller's Idempotency-Key record);
+--   * a COLUMN-SCOPED UPDATE over `state`, `updated_at`, and `abandoned_reason`, which is
+--     what a lifecycle transition, the gated completion, and an abandonment write. NOT
+--     the table-wide UPDATE the data plane holds: the control plane never rewrites
+--     `source_total`, `backfill_expected`, or `subject_ref`, because it never re-declares
+--     a run's ground truth after creation. Those withheld capabilities are refused by
+--     Postgres rather than by a code path that could be edited away.
+--   * INSERT on `migration_run_records` (the per-record accounting the ingest writes,
+--     with its `ON CONFLICT DO NOTHING` dedup on the per-run subject index).
+--
+-- # Why `abandoned_reason` is in the column list
+--
+-- 0043 said the control plane never abandons a run, and this migration's own first cut
+-- repeated it. Issue #55 made that false in the way 0043's template anticipates ("If a
+-- management reconcile surface is ever added, it adds its own grant with its own
+-- reason"): `POST .../migration-runs/{run_id}/abandon` is the ONLY exit from a run whose
+-- invariants can never be satisfied, and a bulk import can reach that state without doing
+-- anything wrong. Two source records carrying one login handle are one ledger subject, so
+-- they account one row against a `source_total` of two; a failed record is accounted
+-- INCONSISTENT and nothing on this plane reconciles it. Since `UPDATE (source_total)`,
+-- `UPDATE` on `migration_run_records`, and `DELETE` are all withheld here on purpose,
+-- WITHOUT the abandon edge such a run would be immortal and the operator would have no
+-- audited way to say so. `ActingMigrationRunRepo::abandon` writes `state`,
+-- `abandoned_reason`, and `updated_at` in one statement and a `migration_run.abandon`
+-- audit row carrying the reason, so the giving-up is explicit, attributed, and terminal:
+-- it makes a stuck migration LOUDER, not quieter.
+--
+-- Deliberately NOT granted to `ironauth_control`:
+--
+--   * UPDATE on `migration_run_records`. The reconciliation columns (`consistent`,
+--     `backfilled`, `detail`) are flipped by the operator triage and backfill passes,
+--     which run on the data plane; the import job only ever INSERTS its accounting, so
+--     an UPDATE grant here would be a privilege with no caller. If a management
+--     reconcile surface is ever added, it adds its own grant with its own reason.
+--   * DELETE on either table. The ledger is append-only by design (the count invariant
+--     is a statement about rows that exist), and nothing on this plane removes one.
+--
+-- Row-level security is unchanged and still FORCED on both tables: 0043's isolation
+-- policies carry no `TO` clause, so they already apply to `ironauth_control`, and every
+-- statement the import job issues runs inside the scoped transaction that binds
+-- `ironauth.tenant_id` and `ironauth.environment_id`. A control-plane write therefore
+-- lands in exactly the addressed environment or in none, and a cross-scope INSERT is
+-- refused by the policy's WITH CHECK rather than by application code.
+--
+-- Expand-only and safe for the old binary: additive grants alone, no schema change and
+-- no data change. A binary that predates this migration simply never issues the
+-- statements it permits.
+
+GRANT INSERT ON migration_runs TO ironauth_control;
+GRANT UPDATE (state, updated_at, abandoned_reason) ON migration_runs TO ironauth_control;
+
+GRANT INSERT ON migration_run_records TO ironauth_control;
