@@ -90,6 +90,51 @@ async fn user_count(h: &Harness, tenant: &str, environment: &str) -> usize {
     items
 }
 
+/// A well formed run id that names no run, derived from one that does.
+///
+/// Flips a character the encoding leaves unconstrained rather than the final one. An
+/// identifier renders its payload as no-pad base64, so the LAST character carries only the
+/// leftover bits and ranges over a fraction of the alphabet. Overwriting it with a constant
+/// therefore reproduces the original often enough to redden CI, and the collision is silent
+/// when it lands: the decoy becomes the real run, resuming a terminal run earns a correct
+/// 409, and the caller reports it as a missing not-found.
+fn decoy_run_id(run_id: &str) -> String {
+    let flip = run_id.len() - 2;
+    let replacement = if run_id.as_bytes()[flip] == b'0' {
+        '1'
+    } else {
+        '0'
+    };
+    format!("{}{replacement}{}", &run_id[..flip], &run_id[flip + 1..])
+}
+
+#[test]
+fn the_decoy_run_id_never_reproduces_the_id_it_was_derived_from() {
+    // The case that made this flaky: the character being replaced is ALREADY the constant
+    // the old construction substituted, so a constant substitution is the identity.
+    for original in [
+        "mgr_AAAAAAAAAAAAAAAAAAAA00",
+        "mgr_AAAAAAAAAAAAAAAAAAAA0Q",
+        "mgr_AAAAAAAAAAAAAAAAAAAAQ0",
+        "mgr_zzzzzzzzzzzzzzzzzzzzz1",
+    ] {
+        let decoy = decoy_run_id(original);
+        assert_ne!(
+            decoy, original,
+            "a decoy equal to its source names the real run and inverts the assertion it feeds"
+        );
+        assert_eq!(
+            decoy.len(),
+            original.len(),
+            "the decoy has to stay a well-formed id, so it cannot change length"
+        );
+        assert!(
+            decoy.starts_with("mgr_"),
+            "the decoy has to keep the typed prefix or it is refused as malformed instead"
+        );
+    }
+}
+
 #[tokio::test]
 async fn an_import_creates_users_and_publishes_progress_on_the_migration_run_view() {
     let h = Harness::start(50).await;
@@ -421,7 +466,7 @@ async fn a_terminal_run_cannot_be_resumed_and_a_foreign_run_id_is_the_uniform_no
 
     // A well-formed run id that names no run in this scope is the uniform not-found, and
     // so is a malformed one: the resume route is no existence oracle.
-    let absent = format!("{}0", &run_id[..run_id.len() - 1]);
+    let absent = decoy_run_id(&run_id);
     for candidate in [absent.as_str(), "mgr_not_a_real_id", "../../etc"] {
         let (status, _, _) = post_ndjson(
             &h,
