@@ -6,6 +6,19 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Move the HIBP range-key digest onto the `sha1` 0.11 line (dependabot PR #494). No public
+  API and no behaviour change: SHA-1 is fixed by its specification, and the canonical HIBP
+  known-answer vector (`digest_password("password")` yielding prefix `5BAA6` and suffix
+  `1E4C9B93F3F0682250B6CF8331B7EE68FD8`) still passes unmodified, so the range key put on
+  the wire is unchanged. What DOES change is the dependency surface. `sha1` 0.11 is built on
+  the `digest` 0.11 traits, the same line `sha2` 0.11 already pulls, so this crate stops
+  carrying a second RustCrypto trait graph (`digest` 0.10) beside it; the workspace still
+  carries `digest` 0.10 for sqlx, unchanged. The features `sha1` 0.11 removes (`asm`,
+  `force-soft`, `std`, `compress`) were never enabled here, so nothing is lost. `sha1` 0.11
+  floors its MSRV at 1.85, exactly the workspace floor and not above it, verified by
+  `RUSTUP_TOOLCHAIN=1.85 cargo check --workspace --all-features --all-targets` on 1.85.1.
+  No advisory applies to either the old or the new version, so this closes nothing and
+  opens nothing.
 - Password-strength scoring (issue #66 PR C): `PasswordPolicy` gains a
   `min_password_strength_score` (0-4, default 0 = off) accessor and `evaluate_strength`, a
   separate step scored AFTER the length/composition policy and BEFORE the breach screen,
