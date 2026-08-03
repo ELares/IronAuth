@@ -189,8 +189,13 @@ sha2 = "0.11"
 # LOCALLY so only the 5-char hex prefix ever leaves the process. Pure Rust
 # (RustCrypto), permissive (MIT OR Apache-2.0), no C dependency, so the tree stays
 # musl-static clean and MSRV 1.85 holds. Shares the RustCrypto `digest` traits already
-# in the tree via sha2, so this adds a direct edge, not a new trait graph.
-sha1 = "0.10"
+# in the tree via sha2, so this adds a direct edge, not a new trait graph: that is true
+# only on the 0.11 line, which is built on `digest` 0.11 exactly as sha2 0.11 is. The
+# earlier 0.10 pin sat on `digest` 0.10 and so carried a SECOND trait graph beside sha2.
+# 0.11 floors its own MSRV at 1.85, exactly the workspace floor, so there is no headroom
+# left here: a later sha1 minor that raises its floor cannot be taken without moving the
+# workspace floor first.
+sha1 = "0.11"
 # CBOR decoding for the WebAuthn ceremony layer (crates/ironauth-webauthn, issue
 # #65): the registration attestationObject and the COSE credential public key are
 # CBOR. ciborium is the standard Rust CBOR implementation, pure Rust with no build
