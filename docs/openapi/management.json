@@ -4884,6 +4884,261 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/imports": {
+      "post": {
+        "tags": [
+          "imports"
+        ],
+        "summary": "Start a streaming bulk identity import.",
+        "description": "Creates a migration run declaring `source_total` as the ground truth its invariants\nreconcile against, then streams the newline-delimited request body into it, creating\neach identity through the same audited, isolation-scoped, schema-validated admin\ncreate path `POST .../users` uses.\n\nThe response is the job HANDLE and carries no counters: progress is read from the\nmigration-run view the handle names. Answering `202 Accepted` rather than `200` is\nliteral: the records this call ingested are durable, but the JOB may well be\nunfinished, and the next call is a resume.",
+        "operationId": "createIdentityImport",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "source_total",
+            "in": "query",
+            "description": "The number of records the SOURCE holds: the ground truth the run reconciles\nagainst. Required, and taken as a string so a malformed value is a precise 400\nrather than a framework rejection.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Stored in the SAME transaction as the run creation, so a replay returns the ORIGINAL run id and never creates a second run. A replay does not re-stream the body; resume by posting the remaining records to `.../imports/{run_id}`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "Newline-delimited identity records (application/x-ndjson), one JSON object per line, in exactly the format `exportIdentities` emits. Read one frame at a time: the body is never buffered whole, so a 100k-record upload holds one record at a time. A single line may not exceed 1 MiB.",
+          "content": {
+            "application/x-ndjson": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "The import job handle. The records carried by THIS request are durable; the job may be unfinished, and progress is read at `progress_path`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImportJobView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed or out-of-range source_total, a missing Idempotency-Key, or a body that could not be read to the end (a line over the 1 MiB cap, or a transport failure mid-upload). In the last case the run was created and the records delivered before the fault ARE durable and accounted: the error names the run id to resume.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment is absent or soft-deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency-Key reused with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/imports/{run_id}": {
+      "post": {
+        "tags": [
+          "imports"
+        ],
+        "summary": "Resume a streaming bulk identity import.",
+        "description": "Streams more newline-delimited records into an EXISTING run. Safe to call with records\nthe run has already imported, which is the point: a caller resuming after a kill\ngenerally cannot know where it landed, so it may re-present anything, including the\nwhole source. A record already present in the scope is an idempotent skip, and a\nrecord already accounted in this run adds no second ledger row.\n\nNo `Idempotency-Key` is required, for the same reason `elevateAdminSudo` requires\nnone: the operation is idempotent by construction, and requiring a key would mean a\nkilled caller had to mint a fresh one per attempt merely to be allowed to retry.",
+        "operationId": "resumeIdentityImport",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "run_id",
+            "in": "path",
+            "description": "The migration run to resume",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Optional. Resuming is idempotent by construction, so a retry needs no key.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "Newline-delimited identity records (application/x-ndjson), the same format the create takes. May safely repeat records the run already imported.",
+          "content": {
+            "application/x-ndjson": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "The import job handle; progress is read at `progress_path`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImportJobView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body could not be read to the end (a line over the 1 MiB cap, or a transport failure mid-upload). The records delivered before the fault are durable and accounted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The run does not exist in this scope, or the environment is absent or soft-deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The run is already complete or abandoned; a terminal run cannot be resumed, and the refusal happens BEFORE any identity is created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/invitations": {
       "get": {
         "tags": [
@@ -6655,6 +6910,122 @@
           },
           "404": {
             "description": "Run or environment not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/migration-runs/{run_id}/abandon": {
+      "post": {
+        "tags": [
+          "migration"
+        ],
+        "summary": "Abandon a migration run: the audited, reason-carrying terminal giving-up.",
+        "description": "# Why this route exists\n\nWithout it a wedged run is wedged FOREVER, and a run can be wedged by conditions the\nimport job cannot prevent. A source carrying two records under one login handle is one\nledger subject, so it accounts one row against a `source_total` of two and the count\ninvariant can never be satisfied; a record that FAILED is accounted inconsistent, and\nthe consistency invariant blocks until something reconciles it, which on this plane\nnothing does. Neither the run's declared ground truth nor its rows can be corrected\nthrough this API by design: migration 0101 withholds `UPDATE (source_total)` and\n`DELETE` from the control role, and `UPDATE` on `migration_run_records` with it. So the\nstate machine's own `abandoned` edge is the only correct exit, and this is it.\n\nIt is deliberately NOT a way to make a bad run look finished: `abandoned` is terminal\nand distinct from `complete`, it carries the operator's reason, and it writes a\n`migration_run.abandon` audit row. A stuck half-applied migration stays legible.\n\n# No `Idempotency-Key`\n\nAbandoning is idempotent by construction, exactly as `resumeIdentityImport` and\n`elevateAdminSudo` are: a run already abandoned answers `200` with its existing view\nand the FIRST reason (the stored one is never overwritten, so a retry cannot rewrite\nhistory). A `complete` run is a `409`: completion is a statement that every invariant\nre-evaluated satisfied, and nothing may quietly take that back.",
+        "operationId": "abandonMigrationRun",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "run_id",
+            "in": "path",
+            "description": "The migration-run identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AbandonMigrationRunRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The run's operator view after the abandonment, carrying its recorded reason. Idempotent: a run already abandoned answers with its existing view and its FIRST reason.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MigrationRunDetailView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A missing, blank, or over-long reason",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Run or environment not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The run is COMPLETE; a completed run cannot be abandoned",
             "content": {
               "application/json": {
                 "schema": {
@@ -15364,6 +15735,19 @@
   },
   "components": {
     "schemas": {
+      "AbandonMigrationRunRequest": {
+        "type": "object",
+        "description": "The body of an abandon request (issue #55): the operator's reason, recorded on the run\nand on its audit row.",
+        "required": [
+          "reason"
+        ],
+        "properties": {
+          "reason": {
+            "type": "string",
+            "description": "Why this run is being given up on. Required, non-blank, at most\n[`MAX_ABANDON_REASON_CHARS`] characters. It is stored verbatim and served back on\nthe run's operator view, so it must be operator-safe: a sentence about the JOB, not\na record's contents."
+          }
+        }
+      },
       "AddOrgGroupMemberRequest": {
         "type": "object",
         "description": "The body to bind a membership into a group.",
@@ -17171,6 +17555,30 @@
           "show_environment_banner": {
             "type": "boolean",
             "description": "Whether a visible environment banner is shown (true for non-production only)."
+          }
+        }
+      },
+      "ImportJobView": {
+        "type": "object",
+        "description": "The handle a bulk-import job answers with (issue #55).\n\nDeliberately counter free: progress belongs to the migration-run operator view (issue\n#59) and is read at `progress_path`. See this module's header for why that is also\nwhat lets the `Idempotency-Key` record share a transaction with the run creation.",
+        "required": [
+          "run_id",
+          "source_total",
+          "progress_path"
+        ],
+        "properties": {
+          "progress_path": {
+            "type": "string",
+            "description": "Where to read this job's live progress: the run's state, its per-outcome record\ncounts (`imported`, `failed`, `skipped`, `inconsistent`, `unmarked_backfill`, and\ntheir `accounted` sum), and the live invariant evaluations with the blocking ones\nnamed. The ONE projection of those numbers. How far the job has to go is\n`source_total` less `accounted`, both of which that view publishes; there is no\nseparate `processed` or `remaining` field, and this description said there was."
+          },
+          "run_id": {
+            "type": "string",
+            "description": "The migration run this import feeds (an `mgr_` id). Resume by posting more\nrecords to `.../imports/{run_id}`."
+          },
+          "source_total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The declared ground-truth source record count the run reconciles against."
           }
         }
       },
@@ -20713,6 +21121,10 @@
     {
       "name": "migration",
       "description": "Inbound lazy-migration progress (issue #56): how far an environment's lazy migration has come and the node's circuit-breaker state"
+    },
+    {
+      "name": "imports",
+      "description": "The streaming bulk identity IMPORT job (issue #55): the write half of the migration on-ramp. Create a run declaring the source record count and stream newline-delimited identity records into it, in exactly the format `exportIdentities` emits; resume the same run with more records after an interruption. The body is read one frame at a time and never buffered whole. Resuming is idempotent on each record's stable key, so a caller who does not know where a kill landed may safely re-present the whole source without duplicating or losing a record. These endpoints answer a job HANDLE and no counters: progress is the `migration-runs` view, which is the one projection of them"
     },
     {
       "name": "diagnostics",

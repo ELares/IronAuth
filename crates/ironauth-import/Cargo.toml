@@ -57,6 +57,13 @@ subtle = "2"
 # base64 for the Firebase salt / salt-separator / signer-key / hash operands and
 # the canonical foreign-hash storage serialization. Already in the tree.
 base64.workspace = true
+# The ledger subject an UNPARSEABLE or UNDECODABLE line is accounted under is a
+# truncated SHA-256 of the line's own bytes (issue #55): stable across attempts, so a
+# repeated bad line dedups; distinct per bad line, so two bad lines are two accounted
+# failures rather than one silently discarded row; and one-way, so the subject carries
+# no PII out of the line. sha2 is the workspace digest and is already in the tree, so
+# this adds a direct edge and no new crate.
+sha2.workspace = true
 # The line-delimited import record format is parsed one record at a time (bounded
 # memory): serde derives the record shape and serde_json parses each line.
 serde.workspace = true
@@ -84,6 +91,16 @@ sqlx.workspace = true
 [[test]]
 name = "engine"
 path = "tests/engine.rs"
+required-features = ["testing"]
+
+# The 100k load harness (issue #55): imports one hundred thousand identities into a
+# real database, asserts the run completes with one ledger row per source record, and
+# PRINTS the process's peak resident set beside its baseline. `#[ignore]`d, so it is
+# run by hand and not on every change; the command is in its module header and in the
+# issue #55 CHANGELOG entry.
+[[test]]
+name = "hundred_k_import"
+path = "tests/hundred_k_import.rs"
 required-features = ["testing"]
 
 [lints]

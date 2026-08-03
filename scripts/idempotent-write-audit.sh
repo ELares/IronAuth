@@ -101,7 +101,7 @@ out = sys.argv[1]
 # added; LOWER it only in the same change that deliberately removes one, and say so. Its
 # job is to make a silent SHRINK of the walk impossible, which is the failure mode the
 # test-registration script had in its own first version.
-MINIMUM_ROWS = 46
+MINIMUM_ROWS = 48
 
 # A top-level `async fn`, matched at column zero so a nested closure or an `impl` method
 # indented inside something else cannot be mistaken for one. Every visibility a free

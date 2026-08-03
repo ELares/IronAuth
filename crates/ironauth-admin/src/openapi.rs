@@ -181,6 +181,19 @@ use crate::views::{
         (name = "migration", description = "Inbound lazy-migration progress (issue #56): how \
                                           far an environment's lazy migration has come and the \
                                           node's circuit-breaker state"),
+        (name = "imports", description = "The streaming bulk identity IMPORT job (issue #55): \
+                                         the write half of the migration on-ramp. Create a run \
+                                         declaring the source record count and stream \
+                                         newline-delimited identity records into it, in exactly \
+                                         the format `exportIdentities` emits; resume the same \
+                                         run with more records after an interruption. The body \
+                                         is read one frame at a time and never buffered whole. \
+                                         Resuming is idempotent on each record's stable key, so \
+                                         a caller who does not know where a kill landed may \
+                                         safely re-present the whole source without duplicating \
+                                         or losing a record. These endpoints answer a job HANDLE \
+                                         and no counters: progress is the `migration-runs` view, \
+                                         which is the one projection of them"),
         (name = "diagnostics", description = "Admin flow inspector diagnostics (issue #91): the \
                                             rich, structured record of WHY a client authentication \
                                             failed (the specific reason, the assertion key id and \
@@ -341,9 +354,12 @@ use crate::views::{
         crate::diagnostics::post_flow_dry_run,
         crate::mds3_health::get_mds3_health,
         crate::password_hashing::probe_password_hashing,
+        crate::imports::create_identity_import,
+        crate::imports::resume_identity_import,
         crate::migration_runs::list_migration_runs,
         crate::migration_runs::get_migration_run,
         crate::migration_runs::list_migration_run_violations,
+        crate::migration_runs::abandon_migration_run,
         crate::bans::create_ban,
         crate::bans::lift_ban,
         crate::bans::list_bans,
@@ -508,6 +524,7 @@ use crate::views::{
         crate::mds3_health::Mds3HealthView,
         crate::password_hashing::PasswordHashingProbeRequest,
         crate::password_hashing::PasswordHashingProbeReport,
+        crate::imports::ImportJobView,
         crate::migration_runs::MigrationRunSummaryView,
         crate::migration_runs::MigrationRunList,
         crate::migration_runs::MigrationRunCountsView,
@@ -515,6 +532,7 @@ use crate::views::{
         crate::migration_runs::MigrationRunDetailView,
         crate::migration_runs::OffendingRecordView,
         crate::migration_runs::MigrationRunViolationList,
+        crate::migration_runs::AbandonMigrationRunRequest,
         crate::bans::CreateBanRequest,
         crate::bans::LiftBanRequest,
         crate::bans::BanView,

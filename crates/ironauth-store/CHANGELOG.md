@@ -6,6 +6,43 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- `ingest_outcomes` now RETURNS the number of ledger rows it actually wrote (issue #55,
+  review fold). It is not the number of outcomes it was handed: the `ON CONFLICT DO NOTHING`
+  silently absorbs every outcome whose subject the run already accounts, and reporting the
+  difference is the only way a caller can tell "the ledger took this record" from "the ledger
+  already had this subject". Two SOURCE records sharing one stable key produce one ledger
+  row, so `accounted` stays short of `source_total` forever and the run can never complete;
+  without this count that is indistinguishable from a partial upload.
+  `ingest_schema_migration_job` presents each subject once and discards it.
+
+- **The control plane may now DRIVE a migration run** (issue #55, migration 0101).
+  Migration 0043 granted `ironauth_control` `SELECT` alone on `migration_runs` and
+  `migration_run_records`, with a stated reason that has expired: it said only the data plane
+  drives a run, which described a world with no import route in it. The management API now has
+  one, so the control role is granted exactly what those two handlers issue: `INSERT` on both
+  tables plus a COLUMN-SCOPED `UPDATE (state, updated_at)` on `migration_runs`. It is NOT
+  granted the table-wide `UPDATE` the data plane holds (it never rewrites `source_total`,
+  `backfill_expected`, `subject_ref`, or `abandoned_reason`), nor `UPDATE` on the
+  reconciliation columns, nor `DELETE` on either table. The `UPDATE` list also carries
+  `abandoned_reason`, because issue #55 adds the ONE management write on this surface that
+  0043 said would never exist: `POST .../migration-runs/{run_id}/abandon`, the only exit
+  from a run whose invariants can never be satisfied now that its declared ground truth is
+  unwritable by design. MEASURED before the migration: every
+  `crates/ironauth-admin/tests/imports.rs` case that REACHES an `INSERT` into
+  `migration_runs` answered 500, because Postgres refuses it before any application logic
+  runs, which is the `abuse_bans` dead-surface shape
+  `crates/ironauth-admin/tests/live_surface.rs` exists to catch. The cases that refuse
+  earlier (400 before any `INSERT`) were green without the grant and measure nothing about
+  it. The grants themselves are pinned against `has_table_privilege` and
+  `has_column_privilege` by
+  `the_control_plane_can_drive_a_migration_run_and_nothing_else`.
+
+- `ActingMigrationRunRepo::create_with_id` (issue #55): define a run under a CALLER-MINTED id,
+  optionally storing the caller's `Idempotency-Key` record in the SAME transaction as the run
+  row and its audit row. The caller mints the id so the whole HTTP response is known before the
+  write, which is the only shape in which the key record and the write it guards share a
+  transaction. `create` is unchanged and delegates to it.
+
 - **The trait-write visibility class reaches EVERY path that persists the column** (issue
   #53, PR 1, review fold). The first cut of this work put the class on
   `set_traits_with_visibility` and asserted that "every trait write in the tree goes

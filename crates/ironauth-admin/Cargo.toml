@@ -48,6 +48,14 @@ ironauth-import.workspace = true
 axum = { workspace = true, features = ["matched-path", "query", "json"] }
 tower = { workspace = true }
 http.workspace = true
+# The bulk-import job (issue #55) reads its newline-delimited request body ONE FRAME AT
+# A TIME rather than through axum's `Bytes` extractor, which buffers the whole body: a
+# 100k-record upload has to be streamed for the job's memory ceiling to mean anything at
+# the transport as well as in the engine. `BodyExt::frame` is exactly that pull. Both
+# crates are already in the tree (http-body-util was already a dev-dependency here, and
+# bytes arrives through axum), so cargo-deny, MSRV 1.85, and the musl lane are unchanged.
+http-body-util.workspace = true
+bytes.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
 # Opaque cursor encoding (URL-safe, no padding), matching the identifier codec.
@@ -78,7 +86,6 @@ testing = ["ironauth-store/testing"]
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tower = { workspace = true, features = ["util"] }
-http-body-util.workspace = true
 # The exit-export round-trip test (issue #58) drives the real streaming import
 # engine to re-import an export into a fresh scope, and seeds users carrying real
 # native Argon2id and foreign bcrypt hashes so the round-trip covers both a native
@@ -397,6 +404,19 @@ required-features = ["testing"]
 [[test]]
 name = "export"
 path = "tests/export.rs"
+required-features = ["testing"]
+
+# The streaming bulk-import JOB surface (issue #55): an import creates a run and
+# publishes progress on the migration-run view, an INTERRUPTED import resumes without
+# duplicating or losing a record, a replayed Idempotency-Key returns the original run
+# and creates no second one, the job does not bypass the active trait schema, a
+# terminal run cannot be resumed AND creates nothing while refusing, a truncated body
+# is refused rather than answered 202, two bad lines are two accounted failures, a
+# source edited between attempts still reconciles, the import applies the management
+# edge's own input validation, and a wedged run is closed by the abandon route.
+[[test]]
+name = "imports"
+path = "tests/imports.rs"
 required-features = ["testing"]
 
 # Federation connectors (issue #75): the immutable-slug guard on update and the

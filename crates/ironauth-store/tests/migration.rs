@@ -46,7 +46,8 @@ const CHAIN_SUBJECTS: &str = "isolation, audit log, \
      vocabulary, role-to-permission mapping, organization default role, resource-server \
      permission claims, token size event budget columns, client allowed scopes, \
      email-factor downgrade configuration, control-plane dead-surface grants, generic \
-     transactional outbox, control-plane writes on environment secrets.";
+     transactional outbox, control-plane writes on environment secrets, \
+     control-plane writes on the migration-run ledger.";
 
 /// A throwaway migration with the given version, phase, and SQL text.
 fn step(version: i64, phase: Phase, sql: &'static str) -> Migration {
@@ -652,7 +653,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
     );
     assert_eq!(
         report.already_applied(),
-        100,
+        101,
         "a migration was added to or removed from the production chain; this count is a \
          deliberate checkpoint, not a bug, so read the new migration, satisfy yourself that it \
          belongs in the shipped chain, then update this number and CHAIN_SUBJECTS and the \
@@ -688,7 +689,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
             46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67,
             68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89,
-            90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100
+            90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101
         ]
     );
     let phase_of = |version: i64| async move {
@@ -7479,5 +7480,87 @@ async fn outbox_messages_holds_its_lifecycle_only_grants_on_both_planes() {
     assert!(
         !role_has_table_privilege(pool, "ironauth_control", "outbox_messages", "DELETE").await,
         "the control plane cannot delete a queued message"
+    );
+}
+
+/// Migration 0101's control-plane write grants on the migration-run ledger (issue #55).
+///
+/// Its own test rather than more lines in the production-chain sweep, following the
+/// 0100 precedent, so a failure names this grant. BOTH directions matter and both are
+/// load bearing here: the control plane must be able to DRIVE a bulk-import run
+/// (0043 granted it SELECT alone, which made the whole import surface answer 500), and
+/// it must be able to do exactly that and no more. The withheld privileges are the
+/// reason the abandon route had to exist: with no `UPDATE (source_total)`, no `UPDATE`
+/// on the ledger rows, and no `DELETE`, a run whose invariants cannot be satisfied has
+/// exactly one legal exit, and it is the audited one.
+#[tokio::test]
+async fn the_control_plane_can_drive_a_migration_run_and_nothing_else() {
+    let db = TestDatabase::start().await;
+    let pool = db.owner_pool();
+
+    for table in ["migration_runs", "migration_run_records"] {
+        for privilege in ["SELECT", "INSERT"] {
+            assert!(
+                role_has_table_privilege(pool, "ironauth_control", table, privilege).await,
+                "the control plane needs {privilege} on {table} to create a run and account \
+                 its records"
+            );
+        }
+        assert!(
+            !role_has_table_privilege(pool, "ironauth_control", table, "DELETE").await,
+            "the ledger is append-only: nothing on this plane deletes a {table} row"
+        );
+    }
+
+    // The UPDATE on `migration_runs` is COLUMN SCOPED, which is what keeps a run's
+    // declared ground truth out of reach. `has_table_privilege` does not see a
+    // column-scoped grant, so the table-wide probe must read FALSE while the three named
+    // columns read true.
+    assert!(
+        !role_has_table_privilege(pool, "ironauth_control", "migration_runs", "UPDATE").await,
+        "the control plane must hold NO table-wide UPDATE on migration_runs (the #31 \
+         lesson): a future column would silently fall under it"
+    );
+    // A lifecycle transition writes state and updated_at; an abandonment writes those and
+    // the reason. That is the whole of what this plane changes on a run.
+    for column in ["state", "updated_at", "abandoned_reason"] {
+        assert!(
+            role_has_column_privilege(pool, "ironauth_control", "migration_runs", column, "UPDATE")
+                .await,
+            "a transition or an abandonment writes {column}, so the control plane needs it"
+        );
+    }
+    // And the run's DECLARED GROUND TRUTH is not writable after creation. This is the
+    // fence that makes the count invariant mean something: a run that cannot reconcile
+    // cannot be made to reconcile by moving the target.
+    for column in [
+        "id",
+        "tenant_id",
+        "environment_id",
+        "kind",
+        "source_total",
+        "backfill_expected",
+        "subject_ref",
+        "created_at",
+    ] {
+        assert!(
+            !role_has_column_privilege(
+                pool,
+                "ironauth_control",
+                "migration_runs",
+                column,
+                "UPDATE"
+            )
+            .await,
+            "the control plane must not be able to rewrite {column} on migration_runs"
+        );
+    }
+    // The reconciliation columns belong to the data plane's triage and backfill passes.
+    // The import job only ever INSERTS its accounting.
+    assert!(
+        !role_has_any_column_privilege(pool, "ironauth_control", "migration_run_records", "UPDATE")
+            .await,
+        "the control plane does not reconcile, so it holds no UPDATE of any shape on \
+         migration_run_records"
     );
 }

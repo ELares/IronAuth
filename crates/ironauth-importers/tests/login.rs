@@ -50,9 +50,11 @@ async fn import(
         actor: db.test_actor(env),
     };
     let lines = mapping.record_lines().expect("record lines");
-    let mut outcomes = Vec::new();
-    import_stream(&ctx, lines, |o| outcomes.push(o)).await;
-    outcomes
+    let mut outcomes = ironauth_import::CollectOutcomes::default();
+    import_stream(&ctx, lines, &mut outcomes)
+        .await
+        .expect("the collecting sink never fails");
+    outcomes.0
 }
 
 /// The shared acceptance flow: import one source's fixture, then prove the fixture

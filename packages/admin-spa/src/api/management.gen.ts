@@ -662,6 +662,62 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/imports": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start a streaming bulk identity import.
+         * @description Creates a migration run declaring `source_total` as the ground truth its invariants
+         *     reconcile against, then streams the newline-delimited request body into it, creating
+         *     each identity through the same audited, isolation-scoped, schema-validated admin
+         *     create path `POST .../users` uses.
+         *
+         *     The response is the job HANDLE and carries no counters: progress is read from the
+         *     migration-run view the handle names. Answering `202 Accepted` rather than `200` is
+         *     literal: the records this call ingested are durable, but the JOB may well be
+         *     unfinished, and the next call is a resume.
+         */
+        post: operations["createIdentityImport"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/imports/{run_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Resume a streaming bulk identity import.
+         * @description Streams more newline-delimited records into an EXISTING run. Safe to call with records
+         *     the run has already imported, which is the point: a caller resuming after a kill
+         *     generally cannot know where it landed, so it may re-present anything, including the
+         *     whole source. A record already present in the scope is an idempotent skip, and a
+         *     record already accounted in this run adds no second ledger row.
+         *
+         *     No `Idempotency-Key` is required, for the same reason `elevateAdminSudo` requires
+         *     none: the operation is idempotent by construction, and requiring a key would mean a
+         *     killed caller had to mint a fresh one per attempt merely to be allowed to retry.
+         */
+        post: operations["resumeIdentityImport"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/invitations": {
         parameters: {
             query?: never;
@@ -879,6 +935,48 @@ export interface paths {
         get: operations["getMigrationRun"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/migration-runs/{run_id}/abandon": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Abandon a migration run: the audited, reason-carrying terminal giving-up.
+         * @description # Why this route exists
+         *
+         *     Without it a wedged run is wedged FOREVER, and a run can be wedged by conditions the
+         *     import job cannot prevent. A source carrying two records under one login handle is one
+         *     ledger subject, so it accounts one row against a `source_total` of two and the count
+         *     invariant can never be satisfied; a record that FAILED is accounted inconsistent, and
+         *     the consistency invariant blocks until something reconciles it, which on this plane
+         *     nothing does. Neither the run's declared ground truth nor its rows can be corrected
+         *     through this API by design: migration 0101 withholds `UPDATE (source_total)` and
+         *     `DELETE` from the control role, and `UPDATE` on `migration_run_records` with it. So the
+         *     state machine's own `abandoned` edge is the only correct exit, and this is it.
+         *
+         *     It is deliberately NOT a way to make a bad run look finished: `abandoned` is terminal
+         *     and distinct from `complete`, it carries the operator's reason, and it writes a
+         *     `migration_run.abandon` audit row. A stuck half-applied migration stays legible.
+         *
+         *     # No `Idempotency-Key`
+         *
+         *     Abandoning is idempotent by construction, exactly as `resumeIdentityImport` and
+         *     `elevateAdminSudo` are: a run already abandoned answers `200` with its existing view
+         *     and the FIRST reason (the stored one is never overwritten, so a retry cannot rewrite
+         *     history). A `complete` run is a `409`: completion is a statement that every invariant
+         *     re-evaluated satisfied, and nothing may quietly take that back.
+         */
+        post: operations["abandonMigrationRun"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2029,6 +2127,19 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /**
+         * @description The body of an abandon request (issue #55): the operator's reason, recorded on the run
+         *     and on its audit row.
+         */
+        AbandonMigrationRunRequest: {
+            /**
+             * @description Why this run is being given up on. Required, non-blank, at most
+             *     [`MAX_ABANDON_REASON_CHARS`] characters. It is stored verbatim and served back on
+             *     the run's operator view, so it must be operator-safe: a sentence about the JOB, not
+             *     a record's contents.
+             */
+            reason: string;
+        };
         /** @description The body to bind a membership into a group. */
         AddOrgGroupMemberRequest: {
             /**
@@ -3184,6 +3295,34 @@ export interface components {
             require_https_redirect_uris: boolean;
             /** @description Whether a visible environment banner is shown (true for non-production only). */
             show_environment_banner: boolean;
+        };
+        /**
+         * @description The handle a bulk-import job answers with (issue #55).
+         *
+         *     Deliberately counter free: progress belongs to the migration-run operator view (issue
+         *     #59) and is read at `progress_path`. See this module's header for why that is also
+         *     what lets the `Idempotency-Key` record share a transaction with the run creation.
+         */
+        ImportJobView: {
+            /**
+             * @description Where to read this job's live progress: the run's state, its per-outcome record
+             *     counts (`imported`, `failed`, `skipped`, `inconsistent`, `unmarked_backfill`, and
+             *     their `accounted` sum), and the live invariant evaluations with the blocking ones
+             *     named. The ONE projection of those numbers. How far the job has to go is
+             *     `source_total` less `accounted`, both of which that view publishes; there is no
+             *     separate `processed` or `remaining` field, and this description said there was.
+             */
+            progress_path: string;
+            /**
+             * @description The migration run this import feeds (an `mgr_` id). Resume by posting more
+             *     records to `.../imports/{run_id}`.
+             */
+            run_id: string;
+            /**
+             * Format: int64
+             * @description The declared ground-truth source record count the run reconciles against.
+             */
+            source_total: number;
         };
         /**
          * @description The result of minting a DCR initial access token.
@@ -8793,6 +8932,171 @@ export interface operations {
             };
         };
     };
+    createIdentityImport: {
+        parameters: {
+            query: {
+                /**
+                 * @description The number of records the SOURCE holds: the ground truth the run reconciles
+                 *     against. Required, and taken as a string so a malformed value is a precise 400
+                 *     rather than a framework rejection.
+                 */
+                source_total: string;
+            };
+            header: {
+                /** @description Required. Stored in the SAME transaction as the run creation, so a replay returns the ORIGINAL run id and never creates a second run. A replay does not re-stream the body; resume by posting the remaining records to `.../imports/{run_id}`. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        /** @description Newline-delimited identity records (application/x-ndjson), one JSON object per line, in exactly the format `exportIdentities` emits. Read one frame at a time: the body is never buffered whole, so a 100k-record upload holds one record at a time. A single line may not exceed 1 MiB. */
+        requestBody: {
+            content: {
+                "application/x-ndjson": string;
+            };
+        };
+        responses: {
+            /** @description The import job handle. The records carried by THIS request are durable; the job may be unfinished, and progress is read at `progress_path`. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ImportJobView"];
+                };
+            };
+            /** @description A malformed or out-of-range source_total, a missing Idempotency-Key, or a body that could not be read to the end (a line over the 1 MiB cap, or a transport failure mid-upload). In the last case the run was created and the records delivered before the fault ARE durable and accounted: the error names the run id to resume. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment is absent or soft-deleted */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Idempotency-Key reused with a different request */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    resumeIdentityImport: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional. Resuming is idempotent by construction, so a retry needs no key. */
+                "Idempotency-Key"?: string | null;
+            };
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The migration run to resume */
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        /** @description Newline-delimited identity records (application/x-ndjson), the same format the create takes. May safely repeat records the run already imported. */
+        requestBody: {
+            content: {
+                "application/x-ndjson": string;
+            };
+        };
+        responses: {
+            /** @description The import job handle; progress is read at `progress_path` */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ImportJobView"];
+                };
+            };
+            /** @description The body could not be read to the end (a line over the 1 MiB cap, or a transport failure mid-upload). The records delivered before the fault are durable and accounted. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The run does not exist in this scope, or the environment is absent or soft-deleted */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The run is already complete or abandoned; a terminal run cannot be resumed, and the refusal happens BEFORE any identity is created */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     listInvitations: {
         parameters: {
             query?: {
@@ -9941,6 +10245,82 @@ export interface operations {
             };
             /** @description Run or environment not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    abandonMigrationRun: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The migration-run identifier */
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AbandonMigrationRunRequest"];
+            };
+        };
+        responses: {
+            /** @description The run's operator view after the abandonment, carrying its recorded reason. Idempotent: a run already abandoned answers with its existing view and its FIRST reason. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MigrationRunDetailView"];
+                };
+            };
+            /** @description A missing, blank, or over-long reason */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Run or environment not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The run is COMPLETE; a completed run cannot be abandoned */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

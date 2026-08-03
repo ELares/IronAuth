@@ -52200,8 +52200,8 @@ pub struct ActingMigrationRunRepo<'a> {
 }
 
 impl ActingMigrationRunRepo<'_> {
-    /// Define a new run in the `defined` state. Writes a `migration_run.create` audit
-    /// row in the same transaction.
+    /// Define a new run in the `defined` state, minting its id. Writes a
+    /// `migration_run.create` audit row in the same transaction.
     ///
     /// # Errors
     ///
@@ -52212,9 +52212,46 @@ impl ActingMigrationRunRepo<'_> {
         spec: NewMigrationRun<'_>,
         created_at_micros: i64,
     ) -> Result<MigrationRunId, StoreError> {
+        let id = MigrationRunId::generate(env, &self.scope);
+        self.create_with_id(env, &id, spec, created_at_micros, None)
+            .await?;
+        Ok(id)
+    }
+
+    /// Define a new run under a CALLER-MINTED id, optionally storing the caller's
+    /// `Idempotency-Key` record in the SAME transaction as the run row and its audit row.
+    ///
+    /// The caller mints the id (exactly as `create_version_at` has it mint a trait-schema
+    /// id) so the whole HTTP response is known BEFORE the write, which is the only way
+    /// the key record and the write it guards can share a transaction.
+    ///
+    /// It is the seam the bulk-import management surface (issue #55) needs, and the only
+    /// join available to it: an import is inherently many transactions (one per created
+    /// identity, one per ingested ledger batch), and every one of those is already
+    /// idempotent on a stable key, so the ONE write a replay must not perform twice is
+    /// minting a SECOND run. Joining the key to exactly that write is what makes a retry
+    /// of the POST a resume of the same run rather than a second, half-populated one.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id belongs to another scope;
+    /// [`StoreError::IdempotencyConflict`] if a concurrent request stored the same key
+    /// first (the caller replays the stored response); [`StoreError::Database`] on a
+    /// persistence failure.
+    pub async fn create_with_id(
+        &self,
+        env: &Env,
+        id: &MigrationRunId,
+        spec: NewMigrationRun<'_>,
+        created_at_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
         let scope = self.scope;
-        let id = MigrationRunId::generate(env, &scope);
         let subject_ref = spec.subject_ref.map(str::to_string);
+        let id_string = id.to_string();
         write_audited(
             AuditedWrite {
                 store: self.store,
@@ -52222,9 +52259,14 @@ impl ActingMigrationRunRepo<'_> {
                 acting: &self.acting,
                 env,
                 action: Action::MigrationRunCreate,
-                target: &id,
+                target: id,
             },
             async move |tx| {
+                // The idempotency record goes in FIRST, so a concurrent retry under the
+                // SAME key is caught HERE rather than after a second run row exists.
+                // Either failure rolls the whole transaction back, so the idempotency row
+                // never outlives a failed create.
+                insert_idempotency(tx, idempotency).await?;
                 sqlx::query(
                     "INSERT INTO migration_runs \
                      (id, tenant_id, environment_id, kind, state, source_total, \
@@ -52233,7 +52275,7 @@ impl ActingMigrationRunRepo<'_> {
                              TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval, \
                              TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval)",
                 )
-                .bind(id.to_string())
+                .bind(&id_string)
                 .bind(scope.tenant().to_string())
                 .bind(scope.environment().to_string())
                 .bind(spec.kind.as_str())
@@ -52247,8 +52289,7 @@ impl ActingMigrationRunRepo<'_> {
             },
             false,
         )
-        .await?;
-        Ok(id)
+        .await
     }
 
     /// Drive a NON-gated lifecycle transition (`defined -> validating -> running ->
@@ -52318,6 +52359,17 @@ impl ActingMigrationRunRepo<'_> {
     /// `migration_run.ingest` audit row for the batch (record inserts are data, not
     /// individually attributable transitions).
     ///
+    /// Returns HOW MANY ledger rows the batch actually WROTE, which is not the same as
+    /// how many outcomes it was handed: the `ON CONFLICT DO NOTHING` silently absorbs
+    /// every outcome whose subject this run already accounts. Reporting the difference is
+    /// what lets a caller tell "the ledger took this record" from "the ledger already had
+    /// this subject", and that distinction is the only thing standing between a run whose
+    /// `accounted` total is short of its declared `source_total` and an operator with no
+    /// way to learn WHY (issue #55): two SOURCE records sharing one stable key produce
+    /// one ledger row, so the count invariant can never be satisfied and the run can never
+    /// complete. A caller that discards this number cannot distinguish that from a partial
+    /// upload.
+    ///
     /// # Errors
     ///
     /// [`StoreError::NotFound`] if the run is absent;
@@ -52329,7 +52381,7 @@ impl ActingMigrationRunRepo<'_> {
         env: &Env,
         run_id: &MigrationRunId,
         outcomes: &[RecordOutcomeInput<'_>],
-    ) -> Result<(), StoreError> {
+    ) -> Result<u64, StoreError> {
         if run_id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -52357,6 +52409,9 @@ impl ActingMigrationRunRepo<'_> {
                     });
                 }
                 let (dek_version, dek) = fetch_active_dek(tx, scope, master).await?;
+                // Counted per statement rather than inferred from the batch length: the
+                // conflict clause is what decides, and only the statement knows.
+                let mut written: u64 = 0;
                 for outcome in outcomes {
                     let record_id = MigrationRunRecordId::generate(env, &scope);
                     let bidx =
@@ -52366,7 +52421,7 @@ impl ActingMigrationRunRepo<'_> {
                         &migration_record_subject_seal_aad(scope, dek_version),
                         outcome.subject.as_bytes(),
                     );
-                    sqlx::query(
+                    let result = sqlx::query(
                         "INSERT INTO migration_run_records \
                          (id, tenant_id, environment_id, run_id, subject_bidx, subject_sealed, \
                           subject_dek_version, outcome, consistent, backfilled, detail, created_at) \
@@ -52388,13 +52443,13 @@ impl ActingMigrationRunRepo<'_> {
                     .bind(now_micros)
                     .execute(&mut **tx)
                     .await?;
+                    written += result.rows_affected();
                 }
-                Ok(())
+                Ok(written)
             },
             false,
         )
-        .await?;
-        Ok(())
+        .await
     }
 
     /// Mark a batch of records backfill-touched (the sentinel), by subject. A subject
@@ -52589,7 +52644,10 @@ impl ActingMigrationRunRepo<'_> {
                 detail: Some(detail),
             })
             .collect();
-        self.ingest_outcomes(env, run_id, &inputs).await
+        // The written-row count is the bulk import's signal (issue #55) and means nothing
+        // to a schema-migration job, which presents each failing subject exactly once.
+        self.ingest_outcomes(env, run_id, &inputs).await?;
+        Ok(())
     }
 
     /// Attempt to complete the run: the GATED `reconciling -> complete` transition. The

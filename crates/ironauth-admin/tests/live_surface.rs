@@ -196,6 +196,18 @@ impl Case {
         }
     }
 
+    /// A newline-delimited record body: the streaming bulk-import job's input format.
+    fn ndjson(label: &'static str, path: String, body: &str) -> Self {
+        Self {
+            label,
+            method: "POST",
+            path,
+            body: Some(body.to_owned()),
+            content_type: "application/x-ndjson",
+            token: OPERATOR_TOKEN,
+        }
+    }
+
     fn raster(label: &'static str, path: String) -> Self {
         Self {
             label,
@@ -246,6 +258,11 @@ fn documented_operations() -> Vec<DocumentedOperation> {
 /// segment count, with every templated segment either a `{placeholder}` (which matches any
 /// one segment) or an exact literal.
 fn template_matches(template: &str, path: &str) -> bool {
+    // An OpenAPI path template carries no query string, so a concrete path's query is
+    // stripped before the segment comparison: it addresses the same template. The
+    // bulk-import create is the one case here that carries one, and without this it
+    // would match NO template and fail the coverage check rather than resolve.
+    let path = path.split('?').next().unwrap_or(path);
     let expected: Vec<&str> = template.split('/').collect();
     let actual: Vec<&str> = path.split('/').collect();
     if expected.len() != actual.len() {
@@ -1338,6 +1355,17 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             "DELETE",
             format!("{base}/locales/en"),
         ),
+        // ---- the streaming bulk-import job (issue #55) ----
+        Case::ndjson(
+            "imports.createIdentityImport",
+            format!("{base}/imports?source_total=1"),
+            "{\"identifier\":\"live-sweep-import@x.test\"}\n",
+        ),
+        Case::ndjson(
+            "imports.resumeIdentityImport",
+            format!("{base}/imports/{migration_run}"),
+            "{\"identifier\":\"live-sweep-resume@x.test\"}\n",
+        ),
         // ---- lazy migration ----
         Case::empty(
             "migration_runs.listMigrationRuns",
@@ -1353,6 +1381,14 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             "migration_runs.listMigrationRunViolations",
             "GET",
             format!("{base}/migration-runs/{migration_run}/violations"),
+        ),
+        // Driven LAST of the migration-run cases, because it is terminal: the seeded run
+        // is abandoned here and every case above has already used it.
+        Case::json(
+            "migration_runs.abandonMigrationRun",
+            "POST",
+            format!("{base}/migration-runs/{migration_run}/abandon"),
+            &serde_json::json!({ "reason": "the live-surface sweep abandons its seeded run" }),
         ),
         Case::empty(
             "migration_status.getMigrationProgress",

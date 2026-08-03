@@ -195,14 +195,26 @@ pub fn to_record_line(record: &ImportRecord) -> Result<String, serde_json::Error
 
 impl ImportRecord {
     /// The stable identity a per-record error is reported against and a duplicate is
-    /// keyed on: the caller-supplied id if present, else the external id, else the
-    /// login handle. Never a secret.
+    /// keyed on: the LOGIN HANDLE, trimmed. Never a secret.
+    ///
+    /// It is the login handle and not "the id, else the external id, else the handle"
+    /// because only the handle is REQUIRED. A key drawn from an optional field is a
+    /// property of the input only while the input does not change, and the whole
+    /// documented recovery procedure for an interrupted import is to POST THE SOURCE
+    /// AGAIN. MEASURED on the fallback key: pass 1 delivers a record with no external id,
+    /// pass 2 re-presents the same identity now carrying one, and the two passes account
+    /// it under two different subjects, so `accounted` overshoots `source_total` and the
+    /// count invariant can never be satisfied again. The handle cannot appear or disappear
+    /// between attempts, so the same identity is the same subject however the surrounding
+    /// record was edited.
+    ///
+    /// Trimmed because that is what the create path stores (`identifier` is normalized on
+    /// both the management edge and the import path), so the subject matches the row.
+    /// Empty for a blank handle, which is a per-record failure the engine keys on the
+    /// line's digest instead.
     #[must_use]
     pub fn record_key(&self) -> &str {
-        self.id
-            .as_deref()
-            .or(self.external_id.as_deref())
-            .unwrap_or(&self.identifier)
+        self.identifier.trim()
     }
 }
 
@@ -264,19 +276,33 @@ mod tests {
         assert_eq!(record.id.as_deref(), Some("usr_x"));
         assert_eq!(record.external_id.as_deref(), Some("crm-1"));
         assert_eq!(record.password_hash.as_deref(), Some("$2b$10$abc"));
-        assert_eq!(record.record_key(), "usr_x");
+        assert_eq!(record.record_key(), "a@b.test");
     }
 
     #[test]
-    fn record_key_falls_back_from_id_to_external_to_identifier() {
-        let only_ext = parse_record_line(r#"{"identifier":"a","external_id":"e"}"#)
+    fn the_record_key_is_the_login_handle_whatever_else_the_record_carries() {
+        // The property the resume mechanism rests on: the SAME identity presented with
+        // different optional fields is the SAME ledger subject. An id, an external id,
+        // both, or neither, and the key does not move; the first cut preferred the
+        // optional fields and a source edited between two attempts double counted.
+        let handle = "a@b.test";
+        for line in [
+            r#"{"identifier":"a@b.test"}"#,
+            r#"{"identifier":"a@b.test","external_id":"crm-1"}"#,
+            r#"{"identifier":"a@b.test","id":"usr_x"}"#,
+            r#"{"identifier":"a@b.test","id":"usr_x","external_id":"crm-1"}"#,
+            // And it is TRIMMED, because that is the handle the create path stores.
+            r#"{"identifier":"  a@b.test  "}"#,
+        ] {
+            let record = parse_record_line(line).expect("parse").expect("some");
+            assert_eq!(record.record_key(), handle, "{line}");
+        }
+        // A blank handle has no usable subject: the engine keys that record on the line's
+        // digest instead, and `prepare_record` fails it.
+        let blank = parse_record_line(r#"{"identifier":"   "}"#)
             .expect("parse")
             .expect("some");
-        assert_eq!(only_ext.record_key(), "e");
-        let only_id = parse_record_line(r#"{"identifier":"a"}"#)
-            .expect("parse")
-            .expect("some");
-        assert_eq!(only_id.record_key(), "a");
+        assert_eq!(blank.record_key(), "");
     }
 
     #[test]

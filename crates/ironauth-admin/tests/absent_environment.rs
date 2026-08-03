@@ -70,9 +70,9 @@ use ironauth_admin::ApiError;
 use ironauth_env::Env;
 use ironauth_store::{
     ClientId, ConnectorId, CorrelationId, EnvironmentId, InvitationId, ManagementKeyId,
-    NewRecoveryFlow, OrgGroupId, OrgMembershipId, OrgRoleId, OrganizationId, PermissionId,
-    RecoveryEntryPoint, RecoveryFlowId, RecoveryMethod, ResourceServerId, Scope, SessionId,
-    SignupQuarantineReason, TenantId, UserId,
+    MigrationRunId, NewRecoveryFlow, OrgGroupId, OrgMembershipId, OrgRoleId, OrganizationId,
+    PermissionId, RecoveryEntryPoint, RecoveryFlowId, RecoveryMethod, ResourceServerId, Scope,
+    SessionId, SignupQuarantineReason, TenantId, UserId,
 };
 use sqlx::PgPool;
 
@@ -146,6 +146,11 @@ fn documented_environment_writes() -> Vec<DocumentedWrite> {
 /// segment count, with every templated segment either a `{placeholder}` (which matches
 /// any one segment) or an exact literal.
 fn template_matches(template: &str, path: &str) -> bool {
+    // An OpenAPI path template carries no query string, so a concrete path's query is
+    // stripped before the segment comparison: it addresses the same template. The
+    // bulk-import create is the one case here that carries one, and without this it
+    // would match NO template and fail the coverage check rather than resolve.
+    let path = path.split('?').next().unwrap_or(path);
     let expected: Vec<&str> = template.split('/').collect();
     let actual: Vec<&str> = path.split('/').collect();
     if expected.len() != actual.len() {
@@ -225,6 +230,7 @@ struct Ids {
     flow: String,
     connector: String,
     management_key: String,
+    migration_run: String,
 }
 
 impl Ids {
@@ -245,6 +251,7 @@ impl Ids {
             flow: RecoveryFlowId::generate(&env, &scope).to_string(),
             connector: ConnectorId::generate(&env, &scope).to_string(),
             management_key: ManagementKeyId::generate(&env, &scope).to_string(),
+            migration_run: MigrationRunId::generate(&env, &scope).to_string(),
         }
     }
 }
@@ -456,9 +463,33 @@ fn environment_child_cases(base: &str, ids: &Ids) -> Vec<Case> {
     let Ids {
         management_key,
         invitation,
+        migration_run,
         ..
     } = ids;
     vec![
+        // The streaming bulk-import job (issue #55). Its body is newline-delimited
+        // records rather than a JSON object, which changes nothing here: at an absent
+        // environment neither route reads a byte of it.
+        Case {
+            label: "imports.createIdentityImport",
+            method: "POST",
+            path: format!("{base}/imports?source_total=1"),
+            body: Some("{\"identifier\":\"sweep-import@example.test\"}\n".to_owned()),
+        },
+        Case {
+            label: "imports.resumeIdentityImport",
+            method: "POST",
+            path: format!("{base}/imports/{migration_run}"),
+            body: Some("{\"identifier\":\"sweep-import@example.test\"}\n".to_owned()),
+        },
+        // Abandoning a run is the ONE write on the migration-run surface (issue #55), and
+        // it refuses an absent environment exactly like every other one.
+        Case {
+            label: "migration_runs.abandonMigrationRun",
+            method: "POST",
+            path: format!("{base}/migration-runs/{migration_run}/abandon"),
+            body: Some("{\"reason\":\"sweeping an absent environment\"}".to_owned()),
+        },
         Case {
             label: "invitations.createInvitation",
             method: "POST",

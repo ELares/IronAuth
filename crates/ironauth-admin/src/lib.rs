@@ -59,6 +59,7 @@ mod export;
 mod flow_versions;
 mod hash;
 mod idempotency;
+mod imports;
 mod input;
 mod invitations;
 mod keys;
@@ -293,9 +294,27 @@ pub fn management_router(state: AdminState) -> Router {
             "/v1/tenants/{tenant_id}/environments/{environment_id}/password-hashing/probe",
             post(password_hashing::probe_password_hashing),
         )
+        // The streaming bulk-import JOB (issue #55): the WRITE half of the migration
+        // on-ramp. `POST .../imports` creates a run and streams a newline-delimited
+        // identity record set into it; `POST .../imports/{run_id}` resumes that run.
+        // Progress is NOT served here: it is the migration-run view below, which is the
+        // one projection of a run's counters. A static `imports` suffix, matched before
+        // the parameterized keys/organizations routes, and its `{run_id}` sits at a
+        // position no sibling parameterizes.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/imports",
+            post(imports::create_identity_import),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/imports/{run_id}",
+            post(imports::resume_identity_import),
+        )
         // The migration state-machine operator view (issue #59): list a scope's runs,
         // read one run's state with its per-state counts and LIVE invariant evaluations,
-        // and page the records violating an invariant. Environment-scoped reads. Static
+        // and page the records violating an invariant. Environment-scoped reads, plus the
+        // ONE write (issue #55): abandoning a run that cannot finish, which is the only
+        // exit from a run whose invariants can never be satisfied, because nothing on this
+        // plane may rewrite a run's declared ground truth or delete a ledger row. Static
         // `migration-runs` suffix, matched before the parameterized keys/organizations routes.
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/migration-runs",
@@ -308,6 +327,10 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/migration-runs/{run_id}/violations",
             get(migration_runs::list_migration_run_violations),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/migration-runs/{run_id}/abandon",
+            post(migration_runs::abandon_migration_run),
         )
         // Server-side config promotion (issue #44): the write half of the flagship.
         // A dry-run PLAN and a transactional APPLY into the target environment.
