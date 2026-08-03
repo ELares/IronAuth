@@ -6,6 +6,59 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **`branding::sanitize` returns a FIXED POINT of the allowlist, and the idempotence it has
+  always claimed is now true (issue #86).** The nightly `branding_sanitize` fuzz target found
+  an input where `sanitize(sanitize(x)) != sanitize(x)`, which made two shipped sentences
+  false and broke one live path.
+
+  - **The mechanism, measured.** An element outside the allowlist can suppress the implied
+    `</p>`, so a second `<p>` is parsed as a DESCENDANT of the first rather than its sibling.
+    `select` and `button` both do this; `div`, `span`, and `table` do not. Dropping the
+    non-allowlisted element keeps its children in place, so one pass emitted
+    `<p>a<p>b</p></p>`. No HTML parser can produce a `<p>` inside a `<p>`, so the NEXT parse
+    unfolded it into `<p>a</p><p>b</p><p></p>` and the value moved on every read.
+
+  - **What it actually broke.** `ironauth_admin::brands::promoted_brand_faults` refuses a
+    snapshot slot that is not already sanitizer output, telling the operator to "submit the
+    exported value rather than raw markup". Because the stored value was one pass and not a
+    fixed point, THE EXPORTED VALUE WAS EXACTLY WHAT THE WALL REFUSED: a brand authored
+    through `PUT .../brands/{slug}` with a slot such as `<p>Help<select><p>more`, exported
+    unaltered, was rejected on re-import.
+    `a_slot_that_needed_a_second_pass_still_round_trips_through_the_promotion_wall` drives the
+    real management ingest and the real promotion wall in one test, and it FAILED against the
+    old sanitizer with that exact rejection message.
+
+  - **The fix.** `sanitize` applies the allowlist until a pass changes nothing, spending at
+    most `MAX_SANITIZE_PASSES = 6`. The bound is measured, not chosen by taste: over 200,000
+    pseudorandom fragments drawn from an adversarial tag vocabulary the worst input needed
+    three passes (421 needed three, 196,800 needed two, 2,779 were already fixed points, none
+    needed four), the shipped bypass corpus needs two, and the fuzzer's crash input needs
+    three. Six is twice the measured worst case.
+    `the_measured_worst_case_leaves_headroom_under_the_shipped_budget` recomputes that worst
+    case on every build rather than trusting this paragraph.
+
+  - **Running out of the budget FAILS CLOSED on the empty fragment, and that branch is
+    tested.** Returning the last pass unchecked would put idempotence back at the mercy of
+    the bound. The empty fragment is a fixed point of the allowlist for free, so returning it
+    makes `sanitize(sanitize(x)) == sanitize(x)` hold for EVERY input with no appeal to how
+    large the budget is. An empty slot renders nothing and `BrandSlots::from_raw` drops it, so
+    the degradation is "this slot shows nothing", never unstable or unsafe markup.
+    `the_pass_budget_fails_closed_rather_than_returning_an_unstable_value` reaches the branch
+    by handing the loop a budget of two for an input needing three.
+
+  - **Inertness never depended on the loop.** Every pass is `ammonia` cleaned, so whichever
+    pass the loop stops on is allowlisted markup. Only the fixed-point property needed it.
+    Ordinary cost is unchanged in the common direction: the loop stops at the first pass that
+    changes nothing, so already-sanitized input (the render path's re-sanitize on read) costs
+    one pass and raw markup costs two.
+
+  - **Why the existing test did not catch it.** `sanitize_is_idempotent` iterated
+    `BYPASS_CORPUS` plus one hand-written string, and no entry there could reach the nesting
+    branch, so the test passed while the property was false. The corpus gained a
+    `TREE_RESHAPING_CORPUS` that reaches it, the fuzzer's crash input is pinned as
+    `fuzz/corpus/branding_sanitize/seed_regression_select_nested_p`, and the unit tests
+    `include_bytes!` that seed file so the pin and the regression cannot drift apart.
+
 - **Back-channel logout delivery is TWO outbox consumers, and the hand-rolled worker is
   gone (issue #104, PR 2).** `BackChannelLogoutWorker`, its `WorkerSettings`, its
   `DrainStats` and its `next_attempt_micros` backoff arithmetic are removed;

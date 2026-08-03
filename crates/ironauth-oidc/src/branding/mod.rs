@@ -96,10 +96,11 @@ impl BrandSlots {
     }
 
     /// Parse stored slots (a JSON object of wire-key to string) and RE-SANITIZE each
-    /// value (issue #86). Re-sanitizing on read is idempotent for a value that was
-    /// sanitized at ingest, and it makes the rendered output safe even if the stored
-    /// blob were ever tampered with (defense in depth). An unknown or hostile key is
-    /// ignored. A blob that is not a JSON object yields no slots.
+    /// value (issue #86). Re-sanitizing on read leaves a value that was sanitized at
+    /// ingest byte for byte identical, because [`sanitize`] returns a FIXED POINT of the
+    /// allowlist rather than one pass of it, and it makes the rendered output safe even
+    /// if the stored blob were ever tampered with (defense in depth). An unknown or
+    /// hostile key is ignored. A blob that is not a JSON object yields no slots.
     #[must_use]
     pub fn from_stored_json(json: &str) -> Self {
         let parsed: BTreeMap<String, String> = serde_json::from_str(json).unwrap_or_default();

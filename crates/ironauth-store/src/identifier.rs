@@ -78,7 +78,15 @@
 //!
 //! Case folding uses full Unicode Default Case Folding
 //! (`caseless::default_case_fold_str`, the Unicode 3.13 default case-fold mapping),
-//! re-normalized to NFKC afterward for idempotence. This is stronger than
+//! re-normalized to NFKC afterward so the CANONICAL FORM the store holds, indexes, and
+//! compares is itself NFKC: folding can emit a decomposed sequence (the Greek
+//! dialytika-tonos folds to iota plus two combining marks), and without the trailing
+//! pass that decomposed spelling, not its composed one, would be the stored identity.
+//! Idempotence does not rest on it. That was MEASURED rather than assumed: with the
+//! trailing normalization removed, an exhaustive sweep of all 1,112,064 Unicode scalar
+//! values across all three kinds still found zero idempotence failures, because a
+//! second pass reproduces whichever spelling the first one settled on. This is stronger
+//! than
 //! `str::to_lowercase`: it folds the case pairs where simple lowercasing diverges,
 //! so the German sharp s (`STRASSE` and `straße`), the Greek final sigma (`ΟΔΟΣ` and
 //! `οδοσ`), and the other full-fold expansions collapse to ONE canonical form rather
@@ -220,11 +228,20 @@ pub fn canonicalize_identifier(kind: IdentifierType, raw: &str) -> CanonicalIden
 }
 
 /// Full Unicode Default Case Folding (`caseless::default_case_fold_str`), then
-/// re-normalized to NFKC so the output is stable under a second pass. Full folding
-/// (not simple lowercase) collapses the case pairs where lowercasing diverges, so
-/// the sharp s folds to `ss` and the Greek final sigma folds to a medial sigma;
-/// the trailing NFKC restores the normalization form without changing case, so
-/// `case_fold(case_fold(x)) == case_fold(x)`.
+/// re-normalized to NFKC so the OUTPUT is NFKC. Full folding (not simple lowercase)
+/// collapses the case pairs where lowercasing diverges, so the sharp s folds to `ss`
+/// and the Greek final sigma folds to a medial sigma; the trailing NFKC restores the
+/// normalization form without changing case, because folding can emit a DECOMPOSED
+/// sequence and the canonical form the store indexes and compares should be the
+/// composed one.
+///
+/// What the trailing pass does NOT do is carry the idempotence of
+/// [`canonicalize_identifier`], which is a separate and stronger claim than "the
+/// output is NFKC". Removing it and sweeping every Unicode scalar value across all
+/// three kinds produced zero idempotence failures: a second pass reproduces whichever
+/// spelling the first one settled on either way. Read this as "the canonical form is
+/// NFKC", and read the idempotence guarantee off the property test and the fuzz
+/// target that assert it directly.
 fn case_fold(value: &str) -> String {
     default_case_fold_str(value).nfkc().collect()
 }
@@ -481,7 +498,51 @@ mod tests {
         // A property test without a proptest dependency: a corpus that mixes the
         // stressors the fuzz target explores. canonicalize(canonicalize(x)) must
         // equal canonicalize(x) for every kind.
+        //
+        // The corpus was AUDITED, not assumed, when the sibling `branding::sanitize`
+        // idempotence claim turned out to be false against a corpus that could not
+        // reach the failing branch. An exhaustive sweep of every Unicode scalar value
+        // (1,112,064 of them) and 1,000,000 pseudorandom sequences over the confusable
+        // alphabet below, each canonicalized twice for all three kinds, found ZERO
+        // divergences, so this property holds where the branding one did not. The
+        // entries below are the sharpest points of that sweep, kept here so a future
+        // change to the case-folding or NFKC step has to break something visible: the
+        // fold-expansion pairs, the two characters whose full fold is a SEQUENCE
+        // (U+1E9E, U+FB00), the iota-subscript combining mark whose fold changes its
+        // combining class (U+0345), the singleton compatibility characters (U+2126
+        // OHM, U+212A KELVIN), a compatibility character whose NFKC yields ASCII
+        // PUNCTUATION and digits (U+33C2), the longest compatibility expansion in
+        // Unicode (U+FDFA), the default-ignorable filler that NFKC maps to another
+        // default-ignorable (U+3164), and the Greek dialytika-tonos whose fold is a
+        // three-character sequence NFKC recomposes (U+1FD3).
+        //
+        // The spacing diacritics (U+00A8, U+00B4, U+02D8, U+037A) name the class that
+        // makes the ORDER of steps 2 and 3 load bearing: none of them is whitespace, but
+        // each NFKC-expands to a LEADING SPACE plus a combining mark, so the whitespace
+        // strip has to run AFTER the normalization or that space survives into the
+        // canonical form and the next pass removes it. Measured honestly, they are belt
+        // and braces rather than the sole witness: a mutation that swaps steps 2 and 3 is
+        // killed by this test with OR without them. They are here because the class is
+        // worth naming in the corpus rather than resting on whichever older entry
+        // happens to cover it.
         let corpus = [
+            "\u{00A8}",
+            "\u{00B4}",
+            "\u{02D8}",
+            "\u{037A}",
+            "\u{00B4}user@\u{00A8}.test",
+            "\u{1E9E}",
+            "\u{FB00}",
+            "\u{0345}",
+            "\u{2126}",
+            "\u{212A}",
+            "\u{33C2}",
+            "\u{FDFA}",
+            "\u{3164}",
+            "\u{1FD3}",
+            "\u{0390}",
+            "\u{1FD3}@\u{1E9E}.\u{2126}",
+            "\u{3164}\u{0345}\u{FB00}",
             "",
             "  ",
             "Ada.Lovelace@Example.COM",

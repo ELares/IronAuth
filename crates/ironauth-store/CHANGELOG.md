@@ -6,6 +6,24 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The identifier seam's NFKC rationale said "for idempotence", and that is not what it
+  buys (issue #54).** Auditing every target that asserts idempotence, after the branding
+  sanitizer's turned out to be false, put a mutation through `case_fold`: with the trailing
+  NFKC renormalization removed, an exhaustive sweep of all 1,112,064 Unicode scalar values
+  across all three identifier kinds produced ZERO idempotence failures, and the adversarial
+  property test stayed green. The trailing pass buys the CANONICAL FORM being NFKC (folding
+  can emit a decomposed sequence, and the composed spelling is what the store should index
+  and compare), which is a real and separate reason to keep it. No behaviour changed; the
+  documented reason now matches the measurement.
+
+- **The `canonicalize_identifier` fuzz target had no seed corpus at all, and now has one.**
+  It started every nightly run from zero, and byte-level mutation reaches an interesting
+  Unicode sequence rarely, so "the fuzzer has never complained" said very little. The seeds
+  name the classes that make canonicalization non-trivial (full-fold expansions,
+  compatibility singletons, default-ignorable fillers, spacing diacritics whose NFKC
+  expansion begins with a SPACE, bidirectional overrides, E.164 separators). The in-CI
+  adversarial corpus gained the same classes.
+
 - **Back-channel logout delivery runs on the outbox consumer framework, and the interim
   delivery queue is retired IN CODE (issue #104, PR 2).** This is the FIRST production
   wiring of the #104 framework: before this change `ConsumerRegistry`, `OutboxWorker` and

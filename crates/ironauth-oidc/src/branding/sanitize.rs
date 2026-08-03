@@ -43,6 +43,24 @@
 //! a `url()` / `expression()` sink cannot appear; because only `https` links survive,
 //! a scripting scheme cannot appear; because the output is reserialized from a parsed
 //! DOM, it is always well formed.
+//!
+//! # The output is a FIXED POINT, and that took a loop
+//!
+//! [`sanitize`] returns a value the allowlist leaves alone: `sanitize(sanitize(x)) ==
+//! sanitize(x)` for every input. Two live paths rest on that. The render path
+//! re-sanitizes a stored slot on read (defense in depth), and it must not rewrite a
+//! value that was already safe. The config-promotion import wall asks "is this string
+//! already sanitizer output" and refuses a slot that is not, so a value IronAuth
+//! EXPORTED has to survive its own wall.
+//!
+//! A single `ammonia` pass does not give that. An element outside the allowlist can
+//! suppress the implied `</p>`, leaving one `<p>` nested inside another; stripping the
+//! element keeps its children, so the pass emits `<p>` inside `<p>`, which no parser
+//! can produce, and the next parse unfolds it. [`sanitize`] therefore applies the
+//! allowlist until a pass changes nothing, within a small measured budget, and fails
+//! closed on the empty fragment if the budget runs out. Inertness never depends on the
+//! budget: every pass is `ammonia`-cleaned, so any pass the loop stops on is safe
+//! markup. Only the fixed-point property needs the loop.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
@@ -120,22 +138,92 @@ fn sanitizer() -> &'static ammonia::Builder<'static> {
     })
 }
 
+/// The pass budget [`sanitize_to_fixed_point`] spends before it FAILS CLOSED.
+///
+/// Justified by measurement, not by taste. Over 200,000 pseudorandom fragments drawn
+/// from an adversarial tag vocabulary (`select`, `button`, `table`, `form`, the
+/// clean-content tags, stray `<`/`>`), the worst input needed THREE passes to reach a
+/// pass that changed nothing: one to strip, one to unfold the nesting that stripping
+/// left behind, one to observe the fixed point. 421 inputs needed three, 196,800
+/// needed two, 2,779 were already fixed points, and NONE needed four. The shipped
+/// bypass corpus needs two, and the nightly fuzzer's crash input needs three. Six is
+/// twice the measured worst case, so a future html5ever or `ammonia` that reshapes a
+/// pass differently has room to move before an operator's slot starts emptying.
+///
+/// The budget is not a performance cost in the ordinary case: the loop stops at the
+/// FIRST pass that changes nothing, so already-sanitized input (the render path's
+/// re-sanitize on read) costs one pass and raw markup costs two.
+const MAX_SANITIZE_PASSES: usize = 6;
+
+/// Apply the allowlist repeatedly until a pass changes nothing, spending at most
+/// `max_passes` passes, and FAIL CLOSED with the empty fragment if the budget runs out
+/// before a pass changes nothing.
+///
+/// # Why a loop is needed at all
+///
+/// One `ammonia` pass is not a fixed point. A non-allowlisted element that suppresses
+/// the implied `</p>` (`select` and `button` both do) leaves a second `<p>` as a
+/// DESCENDANT of the first; dropping the non-allowlisted wrapper keeps its children in
+/// place, so the pass emits `<p>a<p>b</p></p>`. No parser can produce a `<p>` inside a
+/// `<p>`, so the next parse unfolds it into siblings and the value moves. The nightly
+/// `branding_sanitize` fuzz target found this, and the seed corpus entry
+/// `seed_regression_select_nested_p` pins the exact input.
+///
+/// # Why failing closed is the safe end of the budget
+///
+/// The alternative, returning the last pass unchecked, would put the idempotence
+/// property back at the mercy of the bound: an input needing one pass more than the
+/// budget would silently reintroduce the exact defect this loop exists to remove.
+/// Returning the empty fragment instead makes idempotence UNCONDITIONAL rather than
+/// bounded, because the empty fragment is a fixed point of the allowlist for free
+/// (`clean("") == ""`), so `sanitize(sanitize(x)) == sanitize(x)` holds for EVERY input
+/// with no appeal to how large the budget is. The cost is a dropped slot in a case no
+/// measurement has ever produced: an empty slot renders nothing ([`SanitizedRichText::is_empty`]),
+/// and [`crate::branding::BrandSlots::from_raw`] drops it rather than storing it, so
+/// the failure degrades to "this slot shows nothing", never to unstable or unsafe
+/// markup. `the_pass_budget_fails_closed_rather_than_returning_an_unstable_value` drives
+/// that branch directly, by handing the loop a budget of two for an input needing three.
+///
+/// Inertness does NOT rest on the budget either: every value this returns is either
+/// `ammonia` output or the empty string, so it is allowlisted markup whichever pass it
+/// stops on.
+fn sanitize_to_fixed_point(input: &str, max_passes: usize) -> String {
+    let mut current = input.to_owned();
+    for _ in 0..max_passes {
+        let next = sanitizer().clean(&current).to_string();
+        if next == current {
+            // A pass that changes nothing PROVES a fixed point: re-sanitizing this
+            // value again, on read or at an import wall, returns it byte for byte.
+            return current;
+        }
+        current = next;
+    }
+    // The budget ran out without a pass that changed nothing. Fail CLOSED: see above.
+    String::new()
+}
+
 /// Sanitize untrusted rich text to the minimal branding allowlist (issue #86): the
 /// ONE constructor of [`SanitizedRichText`].
 ///
 /// The result contains only the allowlisted tags (`b i strong em u p br a`), only an
 /// `https` `href` on an anchor (with a forced `rel`), and NO script, `on*` handler,
 /// `style`, `url()`, or non-https scheme. It is well formed (reserialized from a
-/// parsed DOM) and idempotent (`sanitize(sanitize(x)) == sanitize(x)`), so it is safe
-/// to run again on read even if the stored value were ever tampered with.
+/// parsed DOM).
+///
+/// It is also a FIXED POINT of the allowlist: `sanitize(sanitize(x)) == sanitize(x)`
+/// for every input, so re-sanitizing on read (defense in depth) never changes a safe
+/// value, and a value IronAuth exported is accepted by an import wall that asks "is
+/// this already sanitizer output" (`ironauth_admin::brands::promoted_brand_faults`).
+/// A single `ammonia` pass does NOT have that property; [`sanitize_to_fixed_point`]
+/// explains why, what the pass budget is, and what happens if it runs out.
 #[must_use]
 pub fn sanitize(input: &str) -> SanitizedRichText {
-    SanitizedRichText(sanitizer().clean(input).to_string())
+    SanitizedRichText(sanitize_to_fixed_point(input, MAX_SANITIZE_PASSES))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize;
+    use super::{MAX_SANITIZE_PASSES, sanitize, sanitize_to_fixed_point};
 
     /// The Casdoor-class stored-XSS bypass corpus (issue #86): every entry is a
     /// stored-XSS payload of the kind a branding rich-text slot would be attacked
@@ -216,6 +304,40 @@ mod tests {
         "<p title=\"</noscript><img src=x onerror=a>\" lang=\"en\">x</p>",
         "<Uoscript><p title=\"</noscript><img src=x onerror=a title=>\">",
     ];
+
+    /// The TREE-RESHAPING corpus: inputs whose FIRST allowlist pass emits markup that a
+    /// second parse reshapes, so a single pass is not a fixed point. `BYPASS_CORPUS` cannot
+    /// reach this branch (every entry there settles in one pass), which is exactly why the
+    /// idempotence test passed while the property was false; the nightly `branding_sanitize`
+    /// fuzz target found it instead.
+    ///
+    /// The mechanism, MEASURED (see the crate CHANGELOG): a non-allowlisted element that
+    /// suppresses the implied `</p>` (`select` and `button` both do; `div`, `span`, and
+    /// `table` do not) leaves the second `<p>` as a DESCENDANT of the first. Dropping the
+    /// non-allowlisted wrapper keeps its children in place, so the first pass emits
+    /// `<p>a<p>b</p></p>`. A `<p>` inside a `<p>` is not markup any parser can produce, so
+    /// the next parse unfolds it into siblings, and the value moves.
+    const TREE_RESHAPING_CORPUS: &[&str] = &[
+        // The minimized shapes.
+        "<p>a<select><p>b",
+        "<p>a<button><p>b",
+        "<p>a<select ><p>b",
+        // Stacked wrappers, so a deep nest is covered rather than only a single level.
+        "<p>a<select><p>b<select><p>c<select><p>d",
+        "<p>a<button><p>b<button><p>c<button><p>d<button><p>e<button><p>f",
+        "<p><button><p><button><p><button><p><button><p>x",
+        // The shape a stacked wrapper reaches after one pass, fed in directly.
+        "<p>a<p>b</p></p>",
+        // The worst input the randomized sweep found.
+        "<</select><<p></select><span></button> <button><svg><li><p>",
+    ];
+
+    /// The exact bytes of the nightly fuzzer's crash input, pinned in the fuzz seed corpus
+    /// so this case is exercised every run of that target FOREVER, and read from that file
+    /// here so the unit test and the seed corpus cannot drift apart (deleting the seed
+    /// breaks the build).
+    const FUZZER_CRASH_INPUT: &[u8] =
+        include_bytes!("../../fuzz/corpus/branding_sanitize/seed_regression_select_nested_p");
 
     /// Assert a sanitized fragment is INERT, robustly against inert escaped TEXT. In the
     /// output every text `<` is escaped to `&lt;` and every text `"` to `&quot;`, so a
@@ -322,7 +444,12 @@ mod tests {
 
     #[test]
     fn the_bypass_corpus_produces_zero_dangerous_output() {
-        for payload in BYPASS_CORPUS {
+        let crash = String::from_utf8_lossy(FUZZER_CRASH_INPUT);
+        for payload in BYPASS_CORPUS
+            .iter()
+            .chain(TREE_RESHAPING_CORPUS)
+            .chain(&[crash.as_ref()])
+        {
             let out = sanitize(payload);
             assert_inert(payload, out.as_str());
         }
@@ -397,9 +524,15 @@ mod tests {
     #[test]
     fn sanitize_is_idempotent() {
         // Sanitizing already-sanitized output is a fixed point, so re-sanitizing on
-        // read (defense in depth) never changes a safe value.
+        // read (defense in depth) never changes a safe value. The corpus MUST include
+        // the tree-reshaping inputs: without them the loop below cannot reach the branch
+        // it claims to cover, which is how a one-pass sanitizer passed this test for as
+        // long as it did.
+        let crash = String::from_utf8_lossy(FUZZER_CRASH_INPUT);
         for payload in BYPASS_CORPUS
             .iter()
+            .chain(TREE_RESHAPING_CORPUS)
+            .chain(&[crash.as_ref()])
             .chain(&["<p>Hello <strong>world</strong> <a href=\"https://ok.test\">link</a></p>"])
         {
             let once = sanitize(payload);
@@ -410,6 +543,89 @@ mod tests {
                 "sanitize must be idempotent for {payload:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_nightly_fuzzer_crash_input_is_a_fixed_point() {
+        // The exact bytes that made the `branding_sanitize` fuzz target red on main. A
+        // single allowlist pass left `<p>` nested inside `<p>`, which the next parse
+        // unfolded into siblings, so the value moved on every read.
+        let input = String::from_utf8_lossy(FUZZER_CRASH_INPUT);
+        let once = sanitize(&input);
+        assert_eq!(
+            once.as_str(),
+            sanitize(once.as_str()).as_str(),
+            "the pinned crash input must be a fixed point"
+        );
+        // The specific shape: the paragraphs are SIBLINGS, never nested, so no further
+        // parse can reshape them.
+        assert!(
+            !once.as_str().contains("<p><p>") && !once.as_str().contains("</p></p>"),
+            "no paragraph nests inside another: {}",
+            once.as_str()
+        );
+        assert_inert("the pinned fuzzer crash input", once.as_str());
+    }
+
+    #[test]
+    fn the_pass_budget_fails_closed_rather_than_returning_an_unstable_value() {
+        // The budget's exhausted branch is REACHABLE and TESTED, not a comment. A tree
+        // reshaping input needs three passes; give it two and the sanitizer must refuse
+        // to hand back the value it could not prove stable.
+        let needs_three = "<p>a<select><p>b";
+        assert_eq!(
+            sanitize_to_fixed_point(needs_three, 2),
+            "",
+            "a budget too small to prove a fixed point yields the empty fragment"
+        );
+        // The empty fragment IS a fixed point, so idempotence survives the failure.
+        assert_eq!(sanitize_to_fixed_point("", MAX_SANITIZE_PASSES), "");
+        // One more pass and the value converges, so the failure above is the budget and
+        // not a sanitizer that empties everything.
+        assert_eq!(
+            sanitize_to_fixed_point(needs_three, 3),
+            "<p>a</p><p>b</p><p></p>"
+        );
+    }
+
+    #[test]
+    fn the_measured_worst_case_leaves_headroom_under_the_shipped_budget() {
+        // The bound is JUSTIFIED, and the justification is checked rather than asserted
+        // in prose: the worst corpus entry converges strictly inside the shipped budget,
+        // so a value is never emptied by the fail-closed branch in practice.
+        let crash = String::from_utf8_lossy(FUZZER_CRASH_INPUT);
+        let mut worst = 0;
+        for payload in BYPASS_CORPUS
+            .iter()
+            .chain(TREE_RESHAPING_CORPUS)
+            .chain(&[crash.as_ref()])
+        {
+            // Count the passes UNBOUNDED: allowlist passes until one changes nothing.
+            let mut current = (*payload).to_owned();
+            let mut passes = 0;
+            loop {
+                let next = super::sanitizer().clean(&current).to_string();
+                passes += 1;
+                assert!(passes < 32, "no fixed point at all for {payload:?}");
+                if next == current {
+                    break;
+                }
+                current = next;
+            }
+            // The SHIPPED budget reaches that same converged value, so the fail-closed
+            // branch is never what answers for a corpus entry.
+            assert_eq!(
+                sanitize(payload).as_str(),
+                current,
+                "the shipped budget converges rather than failing closed for {payload:?}"
+            );
+            worst = worst.max(passes);
+        }
+        assert_eq!(worst, 3, "the measured worst case is three passes");
+        assert!(
+            MAX_SANITIZE_PASSES >= worst * 2,
+            "the shipped budget keeps at least double the measured worst case"
+        );
     }
 
     #[test]
