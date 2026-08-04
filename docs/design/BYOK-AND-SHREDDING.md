@@ -38,7 +38,14 @@ forced row-level security, see `TENANCY.md`) remain the default and are unchange
   any kind: only a non-secret reference. `ActingEnvelopeRepo::enroll_byok` records a
   binding (audited `envelope.byok.enroll`); `EnvelopeRepo::byok_binding` reads it.
 - Config: `[byok]` is EXPERIMENTAL and DEFAULT-OFF (`enabled = false`), with a
-  `provider` selector and an external `endpoint`.
+  `provider` selector and an external `endpoint`. NOTHING READS IT. The section is
+  declared, deserialized and validated, and no boot path on either plane installs it
+  into any state, so setting it changes no behaviour (issue #459). Because
+  `enabled = true` would otherwise read as "customer-managed keys protect this
+  deployment", `Config::validate` REFUSES to boot when any field in the section is set
+  away from its default, rather than accept a value it will silently ignore. The
+  refusal names the offending field. It is lifted by the graduation step below, not by
+  editing the check.
 
 **What is owner/infra-gated (NOT shipped, and honestly so).**
 

@@ -133,11 +133,11 @@ pub struct Config {
     pub password_policy: PasswordPolicyConfig,
 
     /// Bring-your-own-key (BYOK) customer-managed encryption settings (issue #49).
-    /// EXPERIMENTAL and DEFAULT-OFF: an opt-in rung on the isolation ladder that
-    /// lets a customer-managed root key (in an external KMS/HSM, or a
-    /// customer-supplied key) wrap a tenant's key-encryption key, so the customer
-    /// controls the root of the tenant's encryption and revoking it crypto-shreds
-    /// the tenant. Off by default; the external-KMS path is owner/infra-gated.
+    /// NOT IMPLEMENTED (issue #459): no boot path reads this section, so no value in
+    /// it changes any behaviour, and startup REFUSES a non-default value rather than
+    /// accept one it will ignore. It WOULD let a customer-managed root key wrap a
+    /// tenant's key-encryption key, so revoking it crypto-shreds the tenant; the store
+    /// half of that exists, the config path to it does not.
     pub byok: ByokConfig,
 
     /// Organization settings (issue #97): the structural safety bound on how deep
@@ -1126,28 +1126,86 @@ pub enum ByokProvider {
 
 /// Bring-your-own-key (BYOK) customer-managed encryption settings (issue #49).
 ///
-/// EXPERIMENTAL and DEFAULT-OFF. When `enabled` is false (the default) no BYOK
-/// path is reachable and the platform envelope keys behave exactly as before. When
-/// enabled, a customer-managed root (selected by `provider`) wraps a tenant's
-/// key-encryption key. The external-KMS `endpoint` is outbound and rides the
-/// SSRF-hardened fetcher; its live use is owner/infra-gated.
+/// NOT IMPLEMENTED, and declared anyway (issue #459). No boot path on either plane
+/// reads this section, so no value in it changes any behaviour. Startup REFUSES a
+/// non-default value rather than accept one it will ignore, because `enabled = true`
+/// otherwise reads as "customer-managed keys protect this deployment" and nothing
+/// implements that.
+///
+/// The STORE half of BYOK does exist (migration 0031's `tenant_byok_bindings`,
+/// `enroll_byok`, and the `ironauth-kms` drivers), which is why the section is kept
+/// rather than deleted: this is the switch that would gate it once the read path is
+/// wired through an external KMS. Until then the honest state is that it is off and
+/// cannot be turned on.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct ByokConfig {
-    /// Whether BYOK is enabled at all. False (the default) leaves every BYOK path
-    /// unreachable; enabling it is an explicit, exploratory opt-in.
+    /// NOT IMPLEMENTED (issue #459). Nothing in the workspace reads this section, so
+    /// setting this changes no behaviour, and startup REFUSES a non-default value
+    /// rather than accept a capability it does not have. Left declared because the
+    /// store half of BYOK does exist; this is the switch that would gate it.
     pub enabled: bool,
 
-    /// Which key-management driver backs the customer root when BYOK is enabled.
-    /// Defaults to `local` (a customer-supplied in-process root); the external
-    /// drivers are owner/infra-gated.
+    /// NOT IMPLEMENTED (issue #459): nothing reads it and a non-default value is
+    /// refused at startup. Would select the key-management driver backing the customer
+    /// root; the external drivers are owner/infra-gated.
     pub provider: ByokProvider,
 
-    /// The external KMS/HSM endpoint URL for an external `provider` (an https URL).
-    /// Outbound and routed through the SSRF-hardened fetcher, so a loopback or
-    /// otherwise internal endpoint is refused. Unset for the `local` provider or
-    /// when BYOK is disabled.
+    /// NOT IMPLEMENTED (issue #459): nothing reads it and a set value is refused at
+    /// startup. Would be the external KMS/HSM endpoint URL for an external `provider`,
+    /// routed through the SSRF-hardened fetcher.
     pub endpoint: Option<String>,
+}
+
+/// Refuse a `[byok]` section set away from its defaults (issue #459).
+///
+/// `[byok]` ships AHEAD of its consumer: no boot path on either plane reads it, so
+/// every value in it is inert. Refusing is deliberately harsher than warning, and the
+/// reason is what the section CLAIMS. `byok.enabled = true` reads as "customer-managed
+/// keys protect this deployment's data"; nothing implements that, so an operator who
+/// sets it holds a false belief about their own security posture, and the configuration
+/// file is the record they will trust when reasoning about it later. A silent no-op is
+/// worse than the setting not existing at all.
+///
+/// Nothing that boots today is affected: every field's default is the inert one, so
+/// only a deployment that explicitly asked for a capability it never received is
+/// stopped, which is exactly who needs to know.
+///
+/// # Errors
+///
+/// [`ConfigError::Invalid`] naming the first offending field.
+fn check_byok_unconsumed(byok: &ByokConfig) -> Result<(), ConfigError> {
+    if let Some(field) = byok.first_non_default_field() {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "{field} is set, but the [byok] section is not implemented: no code \
+                 reads it, so setting it changes nothing (issue #459). Remove the \
+                 [byok] section rather than rely on a capability this build does not \
+                 have."
+            ),
+        });
+    }
+    Ok(())
+}
+
+impl ByokConfig {
+    /// The first field set away from its default, if any.
+    ///
+    /// Nothing in the workspace reads this section (issue #459): an operator can set
+    /// it, the server accepts it, and no behaviour changes. Naming the specific field
+    /// rather than answering yes or no is what makes the boot refusal actionable.
+    fn first_non_default_field(&self) -> Option<&'static str> {
+        if self.enabled {
+            return Some("byok.enabled");
+        }
+        if self.provider != ByokProvider::default() {
+            return Some("byok.provider");
+        }
+        if self.endpoint.is_some() {
+            return Some("byok.endpoint");
+        }
+        None
+    }
 }
 
 /// Trusted-proxy policy.
@@ -4588,6 +4646,7 @@ impl Config {
     /// list hard cap (a larger cap would let the store's has-next sentinel be
     /// clamped away, hiding the last page).
     fn validate(&self) -> Result<(), ConfigError> {
+        check_byok_unconsumed(&self.byok)?;
         if self.admin.max_page_size > MANAGEMENT_LIST_HARD_CAP {
             return Err(ConfigError::Invalid {
                 message: format!(
@@ -8216,23 +8275,56 @@ mod tests {
         assert_eq!(config.byok.provider, ByokProvider::Local);
         assert!(config.byok.endpoint.is_none());
 
-        // The section can be turned on explicitly and parses an external driver.
+        // Turning the section on is now REFUSED rather than accepted and ignored
+        // (issue #459): nothing reads it, so accepting it would let an operator believe
+        // customer-managed keys protect this deployment when nothing implements that.
         let input = "[byok]\nenabled = true\nprovider = \"aws\"\n\
                      endpoint = \"https://kms.example.test/wrap\"\n";
-        let config = Config::from_toml_str(input, "<inline>")
-            .expect("valid")
-            .config;
-        assert!(config.byok.enabled);
-        assert_eq!(config.byok.provider, ByokProvider::Aws);
-        assert_eq!(
-            config.byok.endpoint.as_deref(),
-            Some("https://kms.example.test/wrap")
-        );
+        let err = Config::from_toml_str(input, "<inline>").expect_err("refused");
+        assert!(format!("{err}").contains("byok.enabled"), "{err}");
 
         // A typo in the section is a hard startup failure, never silently ignored.
         let err = Config::from_toml_str("[byok]\nenabld = true\n", "<inline>")
             .expect_err("unknown key rejected");
         assert!(format!("{err}").contains("enabld"), "{err}");
+    }
+
+    #[test]
+    fn every_byok_field_is_refused_on_its_own_and_the_default_still_boots() {
+        // Issue #459. `[byok]` ships ahead of its consumer, so EVERY field in it is
+        // inert, not just the enable toggle. Each is asserted on its own, because a
+        // check that only looked at `enabled` would still accept a provider and an
+        // endpoint that do nothing.
+        for (input, expected) in [
+            ("[byok]\nenabled = true\n", "byok.enabled"),
+            ("[byok]\nprovider = \"aws\"\n", "byok.provider"),
+            (
+                "[byok]\nendpoint = \"https://kms.example.test/wrap\"\n",
+                "byok.endpoint",
+            ),
+        ] {
+            let err = Config::from_toml_str(input, "<inline>")
+                .expect_err("a non-default byok field is refused");
+            let rendered = format!("{err}");
+            assert!(
+                rendered.contains(expected),
+                "the refusal must name the offending field, got: {rendered}"
+            );
+            assert!(
+                rendered.contains("#459"),
+                "the refusal must point at the tracking issue, got: {rendered}"
+            );
+        }
+
+        // The direction that must NOT change, and without it a check that refused every
+        // config would satisfy the loop above: the section left alone still boots, and
+        // so does one written out at its defaults.
+        Config::from_toml_str("", "<inline>").expect("an absent section boots");
+        Config::from_toml_str(
+            "[byok]\nenabled = false\nprovider = \"local\"\n",
+            "<inline>",
+        )
+        .expect("an explicitly-default section boots");
     }
 
     #[test]

@@ -199,16 +199,16 @@
     },
     "ByokConfig": {
       "additionalProperties": false,
-      "description": "Bring-your-own-key (BYOK) customer-managed encryption settings (issue #49).\n\nEXPERIMENTAL and DEFAULT-OFF. When `enabled` is false (the default) no BYOK\npath is reachable and the platform envelope keys behave exactly as before. When\nenabled, a customer-managed root (selected by `provider`) wraps a tenant's\nkey-encryption key. The external-KMS `endpoint` is outbound and rides the\nSSRF-hardened fetcher; its live use is owner/infra-gated.",
+      "description": "Bring-your-own-key (BYOK) customer-managed encryption settings (issue #49).\n\nNOT IMPLEMENTED, and declared anyway (issue #459). No boot path on either plane\nreads this section, so no value in it changes any behaviour. Startup REFUSES a\nnon-default value rather than accept one it will ignore, because `enabled = true`\notherwise reads as \"customer-managed keys protect this deployment\" and nothing\nimplements that.\n\nThe STORE half of BYOK does exist (migration 0031's `tenant_byok_bindings`,\n`enroll_byok`, and the `ironauth-kms` drivers), which is why the section is kept\nrather than deleted: this is the switch that would gate it once the read path is\nwired through an external KMS. Until then the honest state is that it is off and\ncannot be turned on.",
       "properties": {
         "enabled": {
           "default": false,
-          "description": "Whether BYOK is enabled at all. False (the default) leaves every BYOK path\nunreachable; enabling it is an explicit, exploratory opt-in.",
+          "description": "NOT IMPLEMENTED (issue #459). Nothing in the workspace reads this section, so\nsetting this changes no behaviour, and startup REFUSES a non-default value\nrather than accept a capability it does not have. Left declared because the\nstore half of BYOK does exist; this is the switch that would gate it.",
           "type": "boolean"
         },
         "endpoint": {
           "default": null,
-          "description": "The external KMS/HSM endpoint URL for an external `provider` (an https URL).\nOutbound and routed through the SSRF-hardened fetcher, so a loopback or\notherwise internal endpoint is refused. Unset for the `local` provider or\nwhen BYOK is disabled.",
+          "description": "NOT IMPLEMENTED (issue #459): nothing reads it and a set value is refused at\nstartup. Would be the external KMS/HSM endpoint URL for an external `provider`,\nrouted through the SSRF-hardened fetcher.",
           "type": [
             "string",
             "null"
@@ -217,7 +217,7 @@
         "provider": {
           "$ref": "#/$defs/ByokProvider",
           "default": "local",
-          "description": "Which key-management driver backs the customer root when BYOK is enabled.\nDefaults to `local` (a customer-supplied in-process root); the external\ndrivers are owner/infra-gated."
+          "description": "NOT IMPLEMENTED (issue #459): nothing reads it and a non-default value is\nrefused at startup. Would select the key-management driver backing the customer\nroot; the external drivers are owner/infra-gated."
         }
       },
       "type": "object"
@@ -2497,7 +2497,7 @@
         "endpoint": null,
         "provider": "local"
       },
-      "description": "Bring-your-own-key (BYOK) customer-managed encryption settings (issue #49).\nEXPERIMENTAL and DEFAULT-OFF: an opt-in rung on the isolation ladder that\nlets a customer-managed root key (in an external KMS/HSM, or a\ncustomer-supplied key) wrap a tenant's key-encryption key, so the customer\ncontrols the root of the tenant's encryption and revoking it crypto-shreds\nthe tenant. Off by default; the external-KMS path is owner/infra-gated."
+      "description": "Bring-your-own-key (BYOK) customer-managed encryption settings (issue #49).\nNOT IMPLEMENTED (issue #459): no boot path reads this section, so no value in\nit changes any behaviour, and startup REFUSES a non-default value rather than\naccept one it will ignore. It WOULD let a customer-managed root key wrap a\ntenant's key-encryption key, so revoking it crypto-shreds the tenant; the store\nhalf of that exists, the config path to it does not."
     },
     "database": {
       "$ref": "#/$defs/DatabaseConfig",

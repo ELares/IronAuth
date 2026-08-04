@@ -28,7 +28,9 @@
 //!
 //! # Maturity: default-off and honest about the gate
 //!
-//! BYOK is exploratory and ships DEFAULT-OFF (`[byok] enabled = false`). This
+//! BYOK is exploratory and ships DEFAULT-OFF. The `[byok]` config section is NOT
+//! consumed by any boot path and a non-default value is refused at startup (issue
+//! #459), so this crate is reached through the store rather than through config. This
 //! crate deliberately builds the MECHANISM and the SEAM, not four live cloud
 //! integrations:
 //!
