@@ -920,6 +920,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0104_user_identifier_delete_grant.sql"),
         },
+        Migration {
+            version: 105,
+            name: "sms_otp_control_grants",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0105_sms_otp_control_grants.sql"),
+        },
     ]
 }
 

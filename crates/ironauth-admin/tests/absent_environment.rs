@@ -725,6 +725,24 @@ fn user_cases(base: &str, ids: &Ids) -> Vec<Case> {
             body: None,
         },
         Case {
+            label: "sms_otp.setSmsOtpConfig",
+            method: "PUT",
+            path: format!("{base}/sms-otp/config"),
+            body: Some(body_of(&serde_json::json!({ "enabled": true }))),
+        },
+        Case {
+            label: "sms_otp.allowSmsCountry",
+            method: "PUT",
+            path: format!("{base}/sms-otp/allowlist/44"),
+            body: None,
+        },
+        Case {
+            label: "sms_otp.denySmsCountry",
+            method: "DELETE",
+            path: format!("{base}/sms-otp/allowlist/44"),
+            body: None,
+        },
+        Case {
             label: "identifiers.applyIdentifierUniqueness",
             method: "POST",
             path: format!("{base}/identifier-uniqueness/apply"),

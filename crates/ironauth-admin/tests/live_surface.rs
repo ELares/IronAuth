@@ -1795,6 +1795,34 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
         // The environment-level uniqueness mode routes (epic #514). The read evaluates a
         // candidate mode and answers as if live in a soft-deleted environment, like every
         // other read; the apply is a write and must refuse one.
+        // Guarded SMS OTP configuration (issue #70). The two reads answer as if live in a
+        // soft-deleted environment like every other read; the three writes must refuse one.
+        Case::empty(
+            "sms_otp.getSmsOtpConfig",
+            "GET",
+            format!("{base}/sms-otp/config"),
+        ),
+        Case::json(
+            "sms_otp.setSmsOtpConfig",
+            "PUT",
+            format!("{base}/sms-otp/config"),
+            &serde_json::json!({ "enabled": true }),
+        ),
+        Case::empty(
+            "sms_otp.listSmsAllowlist",
+            "GET",
+            format!("{base}/sms-otp/allowlist"),
+        ),
+        Case::empty(
+            "sms_otp.allowSmsCountry",
+            "PUT",
+            format!("{base}/sms-otp/allowlist/44"),
+        ),
+        Case::empty(
+            "sms_otp.denySmsCountry",
+            "DELETE",
+            format!("{base}/sms-otp/allowlist/44"),
+        ),
         Case::empty(
             "identifiers.getIdentifierUniqueness",
             "GET",
