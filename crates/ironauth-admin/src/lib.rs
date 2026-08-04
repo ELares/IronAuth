@@ -97,6 +97,7 @@ mod signup_forms;
 mod signup_quarantine;
 mod sms_otp;
 mod state;
+mod step_up_policies;
 mod sudo;
 mod tenants;
 mod trait_schemas;
@@ -886,6 +887,17 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/abuse/bans",
             post(bans::create_ban).get(bans::list_bans),
+        )
+        // Per-scope step-up policy management (RFC 9470, issue #262): the management
+        // parity for the `ironauth step-up-policy` CLI, over the same audited repos.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/step-up-policies",
+            post(step_up_policies::set_step_up_policy)
+                .get(step_up_policies::list_step_up_policies),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/step-up-policies/{scope_token}",
+            axum::routing::delete(step_up_policies::remove_step_up_policy),
         )
         // Admin session privilege separation (sudo mode, issue #73): the
         // re-authentication endpoint that records a fresh elevation, opening the

@@ -2422,7 +2422,7 @@ async fn set_step_up_policy(
         (Some(scope_token), None) => {
             match acting
                 .scope_step_up_policies()
-                .set(env, scope_token, acr_ref, max_age)
+                .set(env, scope_token, acr_ref, max_age, None)
                 .await
             {
                 Ok(id) => {

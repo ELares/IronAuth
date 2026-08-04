@@ -326,12 +326,12 @@ async fn an_overwriting_upsert_audits_the_row_that_exists_not_a_freshly_minted_i
     // second call genuinely takes the overwrite branch.
     let first = acting()
         .scope_step_up_policies()
-        .set(&env, "urn:example:scope", Some("aal2"), Some(300))
+        .set(&env, "urn:example:scope", Some("aal2"), Some(300), None)
         .await
         .expect("first step-up policy");
     let second = acting()
         .scope_step_up_policies()
-        .set(&env, "urn:example:scope", Some("aal3"), Some(60))
+        .set(&env, "urn:example:scope", Some("aal3"), Some(60), None)
         .await
         .expect("overwrite step-up policy");
     assert_eq!(

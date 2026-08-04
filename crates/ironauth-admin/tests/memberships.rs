@@ -499,3 +499,83 @@ async fn a_retried_org_toggle_replays_the_original_response() {
         "and the live organization is genuinely still enabled, so the two really differ"
     );
 }
+
+#[tokio::test]
+async fn step_up_policies_round_trip_through_the_management_surface() {
+    // Issue #262: management parity for the `ironauth step-up-policy` CLI. The store
+    // repos and the CLI already existed, so the interesting part is the PLANE: the CLI
+    // writes as the data-plane role, which 0047 granted, and this surface runs as the
+    // control-plane role, which it did not. Without migration 0110 every write here is a
+    // 500 and every read an empty list, which is the dead-surface shape #441 described.
+    let h = Harness::start(50).await;
+    let (tenant, environment) = tenant_env(&h).await;
+    let base = format!("/v1/tenants/{tenant}/environments/{environment}/step-up-policies");
+
+    let (status, _, body) = h.get(&base).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        serde_json::from_str::<Value>(&body).expect("json")["items"]
+            .as_array()
+            .expect("items")
+            .is_empty(),
+        "a fresh environment has no policies: {body}"
+    );
+
+    let set = serde_json::json!({
+        "scope_token": "payments:write",
+        "min_acr": "aal2",
+        "max_auth_age_secs": 300
+    })
+    .to_string();
+    let (status, _, body) = h.post(&base, "k-set", &set).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    let (status, _, body) = h.get(&base).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let items = serde_json::from_str::<Value>(&body).expect("json");
+    let items = items["items"].as_array().expect("items");
+    assert_eq!(items.len(), 1, "the policy is listed: {body}");
+    assert_eq!(items[0]["scope_token"], "payments:write");
+    assert_eq!(items[0]["min_acr"], "aal2");
+    assert_eq!(items[0]["max_auth_age_secs"], 300);
+
+    // The set is an UPSERT, so a second set REPLACES rather than duplicating. That branch
+    // is the one needing the column-scoped UPDATE grant, so it is exercised explicitly.
+    let raise =
+        serde_json::json!({ "scope_token": "payments:write", "min_acr": "aal3" }).to_string();
+    let (status, _, body) = h.post(&base, "k-raise", &raise).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (_, _, body) = h.get(&base).await;
+    let items = serde_json::from_str::<Value>(&body).expect("json");
+    let items = items["items"].as_array().expect("items");
+    assert_eq!(items.len(), 1, "replaced, not duplicated: {body}");
+    assert_eq!(items[0]["min_acr"], "aal3");
+
+    // A retry under the SAME key replays rather than re-executing.
+    let (status, _, body) = h.post(&base, "k-raise", &raise).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    // ... and the same key against a DIFFERENT request is the fingerprint conflict.
+    let (status, _, body) = h
+        .post(
+            &base,
+            "k-raise",
+            &serde_json::json!({ "scope_token": "other:scope", "min_acr": "aal2" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+
+    let (status, _, body) = h.delete(&format!("{base}/payments:write")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (_, _, body) = h.get(&base).await;
+    assert!(
+        serde_json::from_str::<Value>(&body).expect("json")["items"]
+            .as_array()
+            .expect("items")
+            .is_empty(),
+        "the policy is gone: {body}"
+    );
+
+    // Removing an absent policy is a no-op success, matching the CLI and the store.
+    let (status, _, body) = h.delete(&format!("{base}/payments:write")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+}

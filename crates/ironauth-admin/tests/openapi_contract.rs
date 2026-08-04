@@ -210,6 +210,7 @@ fn operation_ids_are_the_stable_set() {
             "listSessions",
             "listSignupQuarantines",
             "listSmsAllowlist",
+            "listStepUpPolicies",
             "listTenants",
             "listTraitSchemaVersions",
             "listUserConsents",
@@ -223,6 +224,7 @@ fn operation_ids_are_the_stable_set() {
             "rejectRecoveryApproval",
             "rejectSignupQuarantine",
             "removeOrgGroupMember",
+            "removeStepUpPolicy",
             "removeUserIdentifier",
             "resendInvitation",
             "restoreTenant",
@@ -244,6 +246,7 @@ fn operation_ids_are_the_stable_set() {
             "setOutboundVerification",
             "setSignupForm",
             "setSmsOtpConfig",
+            "setStepUpPolicy",
             "setUserState",
             "setVariable",
             "suspendTenant",
@@ -448,6 +451,7 @@ fn documented_paths_are_the_expected_set() {
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}/permissions/{permission_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/permissions/{permission_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/sms-otp/allowlist/{country_code}",
+            "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/step-up-policies/{scope_token}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/external-id",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/identifiers/{identifier_id}",
@@ -517,6 +521,7 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/signup-quarantine",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/sms-otp/allowlist",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/sms-otp/config",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/step-up-policies",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas/active",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas/{version}",
@@ -575,6 +580,7 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/signup-quarantine/{user_id}/approve",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/signup-quarantine/{user_id}/extend",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/signup-quarantine/{user_id}/reject",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/step-up-policies",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas/{version}/activate",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/users",
@@ -692,7 +698,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        175,
+        178,
         "the documented route count is pinned"
     );
 

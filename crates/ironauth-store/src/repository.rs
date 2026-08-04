@@ -3056,6 +3056,7 @@ impl ActingScopeStepUpPolicyRepo<'_> {
         scope_token: &str,
         min_acr: Option<&str>,
         max_auth_age_secs: Option<i64>,
+        idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<ScopeStepUpPolicyId, StoreError> {
         let scope = self.scope;
         let candidate_id = ScopeStepUpPolicyId::generate(env, &scope);
@@ -3100,6 +3101,8 @@ impl ActingScopeStepUpPolicyRepo<'_> {
             target: &live_id,
         };
         insert_audit_row(&mut tx, &spec, None).await?;
+        // In the SAME transaction as the upsert and its audit row.
+        insert_idempotency(&mut tx, idempotency).await?;
         tx.commit().await?;
         Ok(live_id)
     }

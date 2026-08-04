@@ -14557,6 +14557,266 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/step-up-policies": {
+      "get": {
+        "tags": [
+          "step-up"
+        ],
+        "summary": "List every per-scope step-up policy in the environment.",
+        "operationId": "listStepUpPolicies",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The environment's step-up policies",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpPolicyList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment is absent",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "step-up"
+        ],
+        "summary": "Set the step-up policy for one OAuth scope token.",
+        "operationId": "setStepUpPolicy",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying a POST with the same key returns the original response without re-executing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetStepUpPolicyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "The policy is set. Read it back through the list endpoint"
+          },
+          "400": {
+            "description": "Malformed request or a blank scope token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential, or fresh privilege required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment is absent or deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency-Key reused with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/step-up-policies/{scope_token}": {
+      "delete": {
+        "tags": [
+          "step-up"
+        ],
+        "summary": "Remove the step-up policy for one OAuth scope token.",
+        "operationId": "removeStepUpPolicy",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "scope_token",
+            "in": "path",
+            "description": "The OAuth scope token whose policy is removed",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The policy is gone. Removing an absent policy is a no-op success"
+          },
+          "401": {
+            "description": "Missing or invalid credential, or fresh privilege required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment is absent or deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas": {
       "get": {
         "tags": [
@@ -21746,6 +22006,34 @@
           }
         }
       },
+      "SetStepUpPolicyRequest": {
+        "type": "object",
+        "description": "Set (create or replace) the policy for one OAuth scope token.",
+        "required": [
+          "scope_token"
+        ],
+        "properties": {
+          "max_auth_age_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The maximum authentication age in seconds. Omit to impose no bound."
+          },
+          "min_acr": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The `acr` floor for this scope. Omit to impose no floor."
+          },
+          "scope_token": {
+            "type": "string",
+            "description": "The OAuth scope token to govern (a single scope value)."
+          }
+        }
+      },
       "SetUserStateRequest": {
         "type": "object",
         "description": "The body to transition a user's lifecycle state (issue #52).",
@@ -22106,6 +22394,55 @@
               "null"
             ],
             "description": "The required acr floor, or absent."
+          }
+        }
+      },
+      "StepUpPolicyList": {
+        "type": "object",
+        "description": "Every per-scope step-up policy in the environment.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StepUpPolicyView"
+            },
+            "description": "The policies, oldest first."
+          }
+        }
+      },
+      "StepUpPolicyView": {
+        "type": "object",
+        "description": "One per-scope step-up policy.",
+        "required": [
+          "id",
+          "scope_token"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "The `sup_` policy identifier."
+          },
+          "max_auth_age_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The maximum authentication age in seconds for this scope, if any."
+          },
+          "min_acr": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The `acr` floor an authentication must reach for this scope, if any."
+          },
+          "scope_token": {
+            "type": "string",
+            "description": "The OAuth scope token this policy governs."
           }
         }
       },
