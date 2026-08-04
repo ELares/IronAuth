@@ -1745,6 +1745,36 @@ async fn dispatch_account_linking(dispatch: AccountLinkingDispatch<'_>) -> LinkD
 /// user it is (issue #78, section 3). The lookup is the existing identifier-first blind-index
 /// resolution (never a plaintext scan). `local_exists` is any match (verified or not); the
 /// verified user is the auto-link target (the single `AutoLink` arm requires `local_verified`).
+///
+/// # Two sources, deliberately, for as long as both hold login handles (epic #514)
+///
+/// The flexible `user_identifiers` table is authoritative and is consulted FIRST. It is also
+/// EMPTY for every user who existed before that surface shipped: their one login handle lives
+/// in the bootstrap `users.identifier` column, and nothing backfills a row for them. Against
+/// the flexible table alone this function answered "no local account" for all of them, so the
+/// decision table took its provision branch and a returning user silently got a SECOND
+/// account instead of a link. The owner's call was to dual resolve rather than backfill,
+/// because a backfill writes a blind index for every existing identifier and is not undone
+/// by a `DELETE`.
+///
+/// The fallback contributes `local_exists` and NEVER a verified user, and that asymmetry is
+/// the security property rather than an omission. `users.identifier` carries no per-handle
+/// verified state (there is no such column; `UserState::PendingVerification` is an
+/// ACCOUNT-level lifecycle value, not a channel-level one), so treating a legacy match as
+/// verified would assert a verification nobody performed and would feed the ONE arm that
+/// auto-links a federated identity into an existing account. Structurally, this fallback can
+/// only ever reach `SeparateFederatedAccount` (posture off, unchanged from today) or
+/// `ManualLinkInterstitial` (posture opted in), which is the outcome that asks the human to
+/// prove they own both sides.
+///
+/// The two lookups are NOT interchangeable and the difference is worth knowing: the flexible
+/// index is over the CANONICAL form, so it matches case and homoglyph variants, while the
+/// legacy index is over the RAW stored string. The fallback therefore matches exactly what
+/// the legacy login path has always matched, neither widening nor narrowing it. A soft
+/// deleted user is already read as absent by `by_identifier`, so a tombstone cannot block a
+/// federated provision.
+///
+/// This whole fallback is deletable in one piece once a backfill lands.
 async fn resolve_local_email_match(
     state: &OidcState,
     scope: Scope,
@@ -1756,12 +1786,21 @@ async fn resolve_local_email_match(
         .user_identifiers()
         .resolve(IdentifierType::Email, email)
         .await?;
-    let exists = !resolutions.is_empty();
-    let verified_user = resolutions
-        .into_iter()
-        .find(|resolution| resolution.verified)
-        .map(|resolution| resolution.user_id);
-    Ok((exists, verified_user))
+    if !resolutions.is_empty() {
+        let verified_user = resolutions
+            .into_iter()
+            .find(|resolution| resolution.verified)
+            .map(|resolution| resolution.user_id);
+        return Ok((true, verified_user));
+    }
+    // The legacy handle. Existence only, never a verified user, for the reason above.
+    let legacy = state
+        .store()
+        .scoped(scope)
+        .users()
+        .by_identifier(email)
+        .await?;
+    Ok((legacy.is_some(), None))
 }
 
 /// Auto-link a federated identity into a VERIFIED local account (issue #78): the single
