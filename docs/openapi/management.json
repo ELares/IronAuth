@@ -15024,6 +15024,204 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/identifiers": {
+      "get": {
+        "tags": [
+          "users"
+        ],
+        "summary": "List a user's login identifiers.",
+        "operationId": "listUserIdentifiers",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "user_id",
+            "in": "path",
+            "description": "The user identifier (usr_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The user's login identifiers",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IdentifierList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The user is absent or in another scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "users"
+        ],
+        "summary": "Add a login identifier to a user.",
+        "operationId": "addUserIdentifier",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "user_id",
+            "in": "path",
+            "description": "The user identifier (usr_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddIdentifierRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "The added identifier",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IdentifierView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request, unknown kind, or an identifier that canonicalizes to nothing",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment is absent or deleted, or the user is absent or in another scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The canonical identifier is already taken within the configured uniqueness scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/sessions/revoke": {
       "post": {
         "tags": [
@@ -16116,6 +16314,28 @@
           "reason": {
             "type": "string",
             "description": "Why this run is being given up on. Required, non-blank, at most\n[`MAX_ABANDON_REASON_CHARS`] characters. It is stored verbatim and served back on\nthe run's operator view, so it must be operator-safe: a sentence about the JOB, not\na record's contents."
+          }
+        }
+      },
+      "AddIdentifierRequest": {
+        "type": "object",
+        "description": "Add a typed login identifier to a user.",
+        "required": [
+          "type",
+          "value"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "description": "The identifier kind: `email`, `username` or `phone`."
+          },
+          "value": {
+            "type": "string",
+            "description": "The raw identifier. Canonicalized once at the store seam, sealed for display and\nblind-indexed for lookup; the plaintext never lands on a column."
+          },
+          "verified": {
+            "type": "boolean",
+            "description": "The initial verification state. Defaults to false, which is the safe answer: M7\nowns the ceremonies that flip it, and an operator asserting a verified identifier\nis making a claim this API cannot check."
           }
         }
       },
@@ -17926,6 +18146,50 @@
           "show_environment_banner": {
             "type": "boolean",
             "description": "Whether a visible environment banner is shown (true for non-production only)."
+          }
+        }
+      },
+      "IdentifierList": {
+        "type": "object",
+        "description": "A user's login identifiers.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/IdentifierView"
+            },
+            "description": "The identifiers, ordered deterministically by `(type, id)`."
+          }
+        }
+      },
+      "IdentifierView": {
+        "type": "object",
+        "description": "One typed login identifier on a user.",
+        "required": [
+          "id",
+          "type",
+          "value",
+          "verified"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "The identifier row id (`uid_...`)."
+          },
+          "type": {
+            "type": "string",
+            "description": "The identifier kind: `email`, `username` or `phone`."
+          },
+          "value": {
+            "type": "string",
+            "description": "The raw value as it was submitted, decrypted for display."
+          },
+          "verified": {
+            "type": "boolean",
+            "description": "Whether this identifier has been verified."
           }
         }
       },

@@ -886,6 +886,7 @@ async fn add_verified_phone(harness: &Harness, subject: &UserId, raw: &str) {
         .add(
             harness.env(),
             ironauth_store::NewUserIdentifier {
+                id: &ironauth_store::UserIdentifierId::generate(harness.env(), &harness.scope()),
                 user_id: subject,
                 identifier_type: ironauth_store::IdentifierType::Phone,
                 raw,
@@ -893,6 +894,7 @@ async fn add_verified_phone(harness: &Harness, subject: &UserId, raw: &str) {
                 mode: ironauth_store::UniquenessMode::EnvironmentWide,
                 org: None,
             },
+            None,
         )
         .await
         .expect("add verified phone");

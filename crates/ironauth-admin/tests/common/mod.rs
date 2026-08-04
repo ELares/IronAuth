@@ -12,7 +12,7 @@ use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode, header};
 use http_body_util::BodyExt;
 use ironauth_admin::{AdminState, DayOneSigningKeys, management_router};
-use ironauth_config::{AdminConfig, Secret, SecretString};
+use ironauth_config::{AdminConfig, IdentifiersConfig, Secret, SecretString};
 use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
@@ -113,6 +113,38 @@ impl Harness {
         let state = AdminState::new(db.control_store().clone(), Env::system(), &config)
             .expect("admin state builds")
             .with_max_group_depth(max_group_depth);
+        let router = management_router(state);
+        Self {
+            db,
+            router,
+            outbound_scope: None,
+        }
+    }
+
+    /// Start a fresh database and router with an explicit `[identifiers]` section
+    /// (issue #54, epic #514), so a test can drive the identifier surface under a
+    /// uniqueness mode other than the shipped environment-wide default.
+    ///
+    /// This constructor is what makes the config seam MEASURABLE rather than asserted.
+    /// The section had no reader at all before the surface landed (issue #459), and the
+    /// failure mode it guards against is precisely a handler that ignores the installed
+    /// mode and passes a constant: such a handler passes every same-mode test and is
+    /// caught only by a test that installs a DIFFERENT mode and observes the behaviour
+    /// change.
+    pub async fn start_with_identifiers(
+        default_page_size: u32,
+        identifiers: &IdentifiersConfig,
+    ) -> Self {
+        let db = TestDatabase::start().await;
+        let config = AdminConfig {
+            bootstrap_operator_token: Some(Secret::Literal(SecretString::new(OPERATOR_TOKEN))),
+            max_page_size: 200,
+            default_page_size,
+            ..AdminConfig::default()
+        };
+        let state = AdminState::new(db.control_store().clone(), Env::system(), &config)
+            .expect("admin state builds")
+            .with_identifiers(identifiers);
         let router = management_router(state);
         Self {
             db,

@@ -17119,6 +17119,12 @@ impl UserIdentifierRepo<'_> {
 /// passed to [`ActingUserIdentifierRepo::add`].
 #[derive(Debug, Clone, Copy)]
 pub struct NewUserIdentifier<'a> {
+    /// The row id, minted by the CALLER. Caller-minted rather than generated inside
+    /// [`ActingUserIdentifierRepo::add`] for the same reason every other idempotent
+    /// create on this surface mints its own: the HTTP response body carries the id, and
+    /// an `Idempotency-Key` record must be written in the SAME transaction as the row,
+    /// so the body has to be knowable BEFORE the write rather than after it.
+    pub id: &'a UserIdentifierId,
     /// The owning user (must be in the acting scope).
     pub user_id: &'a UserId,
     /// The identifier kind, which drives the canonicalization policy.
@@ -17162,8 +17168,10 @@ impl ActingUserIdentifierRepo<'_> {
         &self,
         env: &Env,
         spec: NewUserIdentifier<'_>,
-    ) -> Result<UserIdentifierId, StoreError> {
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
         let NewUserIdentifier {
+            id,
             user_id,
             identifier_type: kind,
             raw,
@@ -17176,7 +17184,6 @@ impl ActingUserIdentifierRepo<'_> {
         }
         let master = self.store.master().ok_or(StoreError::Encryption)?;
         let scope = self.scope;
-        let id = UserIdentifierId::generate(env, &scope);
         // Canonicalize EXACTLY ONCE at this boundary; everything downstream keys on
         // the canonical form.
         let canonical = canonicalize_identifier(kind, raw);
@@ -17199,7 +17206,7 @@ impl ActingUserIdentifierRepo<'_> {
                 acting: &self.acting,
                 env,
                 action: Action::UserIdentifierAdd,
-                target: &id,
+                target: id,
             },
             async move |tx| {
                 let (dek_version, dek) = fetch_active_dek(tx, scope, master).await?;
@@ -17227,19 +17234,25 @@ impl ActingUserIdentifierRepo<'_> {
                 .execute(&mut **tx)
                 .await;
                 match result {
-                    Ok(_) => Ok(()),
+                    Ok(_) => {}
                     // A collision on the partial unique index (the canonical form is
                     // already taken in the configured uniqueness scope) is a
                     // caller-facing conflict, never a persistence fault. The audited
                     // write rolls back, so a rejected add leaves neither row.
-                    Err(error) if is_unique_violation(&error) => Err(StoreError::Conflict),
-                    Err(error) => Err(error.into()),
+                    Err(error) if is_unique_violation(&error) => {
+                        return Err(StoreError::Conflict);
+                    }
+                    Err(error) => return Err(error.into()),
                 }
+                // The `Idempotency-Key` record rides in the SAME transaction as the row
+                // and the audit row, so a replay cannot observe one without the others
+                // and a rolled-back add leaves no key claimed.
+                insert_idempotency(tx, idempotency).await?;
+                Ok(())
             },
             false,
         )
-        .await?;
-        Ok(id)
+        .await
     }
 
     /// Apply a uniqueness-mode change to a populated environment (issue #54): recompute

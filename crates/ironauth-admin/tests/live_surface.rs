@@ -1765,6 +1765,20 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             "GET",
             format!("{base}/users/{user}/traits"),
         ),
+        // The user's typed login identifiers (issue #54, epic #514). The READ answers as
+        // if live in a soft-deleted environment, like every other user-scoped read, and
+        // the POST is a write, so it must refuse one.
+        Case::empty(
+            "users.listUserIdentifiers",
+            "GET",
+            format!("{base}/users/{user}/identifiers"),
+        ),
+        Case::json(
+            "users.addUserIdentifier",
+            "POST",
+            format!("{base}/users/{user}/identifiers"),
+            &serde_json::json!({ "type": "email", "value": "live-surface@example.test" }),
+        ),
         Case::json(
             "users.updateUser",
             "PATCH",

@@ -121,6 +121,7 @@ async fn add_verified_identifier(
         .add(
             harness.env(),
             NewUserIdentifier {
+                id: &ironauth_store::UserIdentifierId::generate(harness.env(), &harness.scope()),
                 user_id: subject,
                 identifier_type: kind,
                 raw,
@@ -128,6 +129,7 @@ async fn add_verified_identifier(
                 mode: UniquenessMode::EnvironmentWide,
                 org: None,
             },
+            None,
         )
         .await
         .expect("add verified identifier");

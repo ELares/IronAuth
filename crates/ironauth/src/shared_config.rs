@@ -630,12 +630,16 @@ mod tests {
         ),
         (
             "identifiers",
-            Reach::UnreadAtBoot {
-                config_type: "IdentifiersConfig",
-            },
-            "inert: no boot path reads it from Config, on either plane. Tracked as issue \
-             #459, which is a decision about what the section should MEAN rather than a \
-             wiring gap.",
+            Reach::OnePlaneOrNoState,
+            "management plane only: the boot path installs it with \
+             `AdminState::with_identifiers`, and the identifier management surface passes \
+             the resolved mode to every write. RECLASSIFIED from UnreadAtBoot by epic \
+             #514, which resolved the identifiers half of issue #459 by wiring the section \
+             up (its option 1) rather than removing or rejecting it. It reaches ONE plane \
+             because the management surface is the only production writer of \
+             `user_identifiers`; a data-plane writer would move it into the shared \
+             carrier, since two planes writing under different modes would corrupt the \
+             uniqueness discriminator the partial index enforces.",
         ),
         (
             "quota",

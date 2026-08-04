@@ -59,6 +59,7 @@ mod export;
 mod flow_versions;
 mod hash;
 mod idempotency;
+mod identifiers;
 mod imports;
 mod input;
 mod invitations;
@@ -724,6 +725,15 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/traits",
             get(users::get_user_traits),
+        )
+        // The user's typed login identifiers (issue #54, epic #514). A static suffix under
+        // `{user_id}`, a sibling of `/traits`, `/state` and `/external-id`. This is the first
+        // production WRITER of `user_identifiers`: before it the table was written only by
+        // tests, so the shipped readers in federation, recovery and account resolution ran
+        // against an empty table in every real deployment.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/identifiers",
+            get(identifiers::list_user_identifiers).post(identifiers::add_user_identifier),
         )
         // Per-environment identity trait-schema versions (issue #53): the append-only registry
         // (create / list / get) plus the two pointers, the ACTIVE read that is also the schema

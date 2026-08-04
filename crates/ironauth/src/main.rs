@@ -588,6 +588,19 @@ async fn build_admin_state(
             // warning; it never refuses a write, and the depth bound caps nothing that
             // is counted.
             let state = shared.install(state);
+            // The login-identifier uniqueness policy (issue #54, epic #514). This is the
+            // first reader the `[identifiers]` section has ever had: migration 0041 named
+            // it as the source of every identifier row's uniqueness discriminator, and the
+            // store enforced whatever mode it was handed, but no boot path read it, so an
+            // operator who set `org_scoped` silently got environment-wide behaviour
+            // (issue #459).
+            //
+            // Installed HERE rather than through `shared_plane_inputs!` because it reaches
+            // ONE plane: the management identifier surface is the only production writer of
+            // `user_identifiers`, so the data plane has nothing to hand it to. When a
+            // data-plane writer lands it moves into the shared carrier, so the two planes
+            // cannot then be handed different modes.
+            let state = state.with_identifiers(&config.identifiers);
             // Share the data-plane issuer registry (issue #93) so the compatibility wizard
             // can resolve an environment's actually signable ID-token algorithms and write
             // the per-client column through the data plane (the only role that can).

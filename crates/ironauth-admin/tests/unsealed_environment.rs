@@ -174,6 +174,25 @@ fn cases(client: &str) -> Vec<Case> {
             expect: Expect::IdempotentNoOp,
         },
         Case {
+            // Both identifier operations (issue #54, epic #514) prove the user row exists
+            // BEFORE they touch anything sealed. That ordering is the whole point here: the
+            // list decrypts each raw value for display and the add seals one, so either
+            // would answer the envelope fault of a key-free environment if it reached the
+            // store first, and a caller would learn from a 500 that the user is real.
+            operation_id: "listUserIdentifiers",
+            method: "GET",
+            suffix: "/identifiers".to_owned(),
+            body: None,
+            expect: Expect::UniformNotFound,
+        },
+        Case {
+            operation_id: "addUserIdentifier",
+            method: "POST",
+            suffix: "/identifiers".to_owned(),
+            body: Some(r#"{"type":"email","value":"sweep@example.test"}"#),
+            expect: Expect::UniformNotFound,
+        },
+        Case {
             operation_id: "linkUserExternalId",
             method: "PUT",
             suffix: "/external-id".to_owned(),
