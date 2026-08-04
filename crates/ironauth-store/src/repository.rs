@@ -17255,6 +17255,67 @@ impl ActingUserIdentifierRepo<'_> {
         .await
     }
 
+    /// Remove a typed login identifier from a user (issue #54, epic #514). A HARD
+    /// delete, in one scope-fenced transaction with its audit row.
+    ///
+    /// Hard rather than tombstoned because the row IS the claim on the uniqueness slot:
+    /// the partial unique index over `uniqueness_key` is what makes one canonical
+    /// identifier resolve to one user, so a tombstoned row would hold that slot forever
+    /// and the identifier could never be re-added, by this user or anyone. Migration
+    /// 0104 grants the DELETE, to `ironauth_control` only.
+    ///
+    /// The statement is keyed on the OWNING USER as well as the row id, so an identifier
+    /// belonging to another user in the same environment is a uniform not-found rather
+    /// than a removable row reachable through the wrong parent's path. Row-level security
+    /// already fences the scope; this fences the PARENT within it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier is absent, out of this scope, or owned
+    /// by a different user; [`StoreError::Database`] on a persistence failure.
+    pub async fn remove(
+        &self,
+        env: &Env,
+        user_id: &UserId,
+        id: &UserIdentifierId,
+    ) -> Result<(), StoreError> {
+        if user_id.scope() != self.scope || id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::UserIdentifierRemove,
+                target: id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "DELETE FROM user_identifiers \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND user_id = $3 AND id = $4",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(user_id.to_string())
+                .bind(id.to_string())
+                .execute(&mut **tx)
+                .await?;
+                // Nothing removed is the uniform not-found, never a silent success: a
+                // caller that asked to remove a row and got a 204 for a row that was
+                // never there learns the wrong thing about what exists.
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
     /// Apply a uniqueness-mode change to a populated environment (issue #54): recompute
     /// every identifier row's `uniqueness_key` under `mode`, in ONE scope-fenced,
     /// audited transaction, AFTER refusing the change while a post-canonicalization

@@ -24,6 +24,13 @@
 //!   as the row, so a replay must return the original response and write nothing.
 //! * The EDGE GRAMMAR: an unknown kind and a value that canonicalizes to nothing are
 //!   the caller's errors, not opaque 500s.
+//! * REMOVAL FREES THE UNIQUENESS SLOT. This is the property that makes the remove a
+//!   hard delete rather than a tombstone, and it is the one a soft-deleting
+//!   implementation would fail while passing every other test here: the row IS the claim
+//!   on the slot, so a tombstoned row would hold it forever and the identifier could
+//!   never be re-added by anyone.
+//! * REMOVAL IS FENCED BY THE OWNING USER, not just by scope, so an identifier cannot be
+//!   removed through another user's path.
 
 mod common;
 
@@ -281,4 +288,132 @@ async fn an_absent_user_is_the_uniform_not_found_on_both_operations() {
         .post(&path, "k-absent", &body("email", "ghost@example.test"))
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "add: {response}");
+}
+
+/// Add one identifier to `user` and return its row id.
+async fn add(
+    h: &Harness,
+    tenant: &str,
+    environment: &str,
+    user: &str,
+    value: &str,
+    key: &str,
+) -> String {
+    let (status, _, response) = h
+        .post(&base(tenant, environment, user), key, &body("email", value))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "add {value}: {response}");
+    let created: Value = serde_json::from_str(&response).expect("json");
+    created["id"].as_str().expect("id").to_owned()
+}
+
+#[tokio::test]
+async fn an_identifier_is_removed_and_removing_it_again_is_the_uniform_not_found() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let ada = user(&h, &tenant, &environment, "ada@example.test", "k-ada").await;
+    let id = add(&h, &tenant, &environment, &ada, "old@example.test", "k-add").await;
+    let path = format!("{}/{id}", base(&tenant, &environment, &ada));
+
+    let (status, _, response) = h.delete(&path).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "remove: {response}");
+
+    let (_, _, response) = h.get(&base(&tenant, &environment, &ada)).await;
+    let list: Value = serde_json::from_str(&response).expect("json");
+    assert!(
+        list["items"].as_array().expect("items").is_empty(),
+        "the removed identifier is gone from the list: {response}"
+    );
+
+    // Removing it again is the uniform not-found, never a silent 204: a caller that got
+    // a success for a row that is not there learns the wrong thing about what exists.
+    let (status, _, response) = h.delete(&path).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "second remove: {response}");
+}
+
+#[tokio::test]
+async fn removing_an_identifier_frees_the_uniqueness_slot() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let ada = user(&h, &tenant, &environment, "ada@example.test", "k-ada").await;
+    let grace = user(&h, &tenant, &environment, "grace@example.test", "k-grace").await;
+
+    let id = add(
+        &h,
+        &tenant,
+        &environment,
+        &ada,
+        "shared@example.test",
+        "k-1",
+    )
+    .await;
+    // While it is held, the canonical identifier is taken environment-wide.
+    let (status, _, response) = h
+        .post(
+            &base(&tenant, &environment, &grace),
+            "k-blocked",
+            &body("email", "shared@example.test"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "still held: {response}");
+
+    let (status, _, _) = h
+        .delete(&format!("{}/{id}", base(&tenant, &environment, &ada)))
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // The slot is now FREE. A tombstoning implementation would keep the partial unique
+    // index populated and answer 409 here forever, with nothing to show the caller why,
+    // which is the whole reason 0104 grants a real DELETE.
+    let (status, _, response) = h
+        .post(
+            &base(&tenant, &environment, &grace),
+            "k-freed",
+            &body("email", "shared@example.test"),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "removal must FREE the uniqueness slot, or an identifier could never be \
+         re-homed after it is given up: {response}"
+    );
+}
+
+#[tokio::test]
+async fn an_identifier_cannot_be_removed_through_another_users_path() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let ada = user(&h, &tenant, &environment, "ada@example.test", "k-ada").await;
+    let grace = user(&h, &tenant, &environment, "grace@example.test", "k-grace").await;
+    let id = add(
+        &h,
+        &tenant,
+        &environment,
+        &ada,
+        "ada-only@example.test",
+        "k-add",
+    )
+    .await;
+
+    // Same tenant, same environment, same well-formed row id, WRONG owning user. The
+    // DELETE is keyed on the user too, so this is the uniform not-found rather than a
+    // successful removal of someone else's login handle.
+    let (status, _, response) = h
+        .delete(&format!("{}/{id}", base(&tenant, &environment, &grace)))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "an identifier must not be removable through another user's path: {response}"
+    );
+
+    // And it is genuinely still there: the refusal removed nothing.
+    let (_, _, response) = h.get(&base(&tenant, &environment, &ada)).await;
+    let list: Value = serde_json::from_str(&response).expect("json");
+    assert_eq!(
+        list["items"].as_array().expect("items").len(),
+        1,
+        "the refused remove left the row intact: {response}"
+    );
 }

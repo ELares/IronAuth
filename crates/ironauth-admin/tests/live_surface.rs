@@ -317,6 +317,13 @@ struct Fixture {
     migration_run: String,
     session: String,
     user: String,
+    /// A seeded login identifier on the primary user (epic #514), so `removeUserIdentifier`
+    /// is driven at a row that EXISTS. Addressed at a fabricated id the route answers the
+    /// uniform not-found at a live environment too, and this sweep refuses such a case: a
+    /// probe that cannot succeed measures nothing about the soft-deleted fence. The live
+    /// pass CONSUMES this row, which is fine, because the soft-deleted pass is refused by
+    /// the liveness fence in `resolve_user` before any store call is reached.
+    user_identifier: String,
     /// A SECOND user, quarantined at signup, for the review-queue routes (the primary user
     /// is not quarantined, and the queue's own addressing read would answer 404).
     quarantined_user: String,
@@ -403,6 +410,21 @@ impl Fixture {
             .await;
         assert_eq!(status, StatusCode::CREATED, "create user: {body}");
         let user = field(&body, "/id", "seed user");
+
+        // A login identifier on that user (epic #514), so `removeUserIdentifier` addresses
+        // a row that EXISTS. Without it the case answers the uniform not-found at a LIVE
+        // environment too, and this sweep rejects such a case outright rather than letting
+        // it look covered: a probe that cannot succeed measures nothing about the fence.
+        let (status, _, body) = h
+            .post(
+                &format!("{base}/users/{user}/identifiers"),
+                "seed-user-identifier",
+                &serde_json::json!({ "type": "email", "value": "sweep-identifier@example.test" })
+                    .to_string(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "seed identifier: {body}");
+        let user_identifier = field(&body, "/id", "seed user identifier");
 
         let (status, _, body) = h
             .post(
@@ -926,6 +948,7 @@ impl Fixture {
             migration_run,
             session,
             user,
+            user_identifier,
             quarantined_user,
             flow_version,
             trait_schema_version,
@@ -962,6 +985,7 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
         migration_run,
         session,
         user,
+        user_identifier,
         quarantined_user,
         second_quarantined_user,
         unenrolled_user,
@@ -1779,6 +1803,11 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             format!("{base}/users/{user}/identifiers"),
             &serde_json::json!({ "type": "email", "value": "live-surface@example.test" }),
         ),
+        Case::empty(
+            "users.removeUserIdentifier",
+            "DELETE",
+            format!("{base}/users/{user}/identifiers/{user_identifier}"),
+        ),
         Case::json(
             "users.updateUser",
             "PATCH",
@@ -1923,6 +1952,7 @@ fn every_documented_operation_is_driven_by_a_case() {
         migration_run: "mgr_0".to_owned(),
         session: "ses_0".to_owned(),
         user: "usr_0".to_owned(),
+        user_identifier: "uid_0".to_owned(),
         quarantined_user: "usr_1".to_owned(),
         second_quarantined_user: "usr_2".to_owned(),
         unenrolled_user: "usr_3".to_owned(),

@@ -914,6 +914,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0103_broker_cutover_and_policy_bounds.sql"),
         },
+        Migration {
+            version: 104,
+            name: "user_identifier_delete_grant",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0104_user_identifier_delete_grant.sql"),
+        },
     ]
 }
 

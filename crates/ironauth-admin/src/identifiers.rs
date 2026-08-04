@@ -46,7 +46,7 @@ use crate::{
     idempotency,
     input::parse_json,
     org_context::{EnvironmentAccess, resolve_scope, resolve_user},
-    response::json,
+    response::{json, no_content},
     state::AdminState,
     sudo,
 };
@@ -270,4 +270,59 @@ pub async fn add_user_identifier(
             other => other.into(),
         })?;
     Ok(json(StatusCode::CREATED, body_string))
+}
+
+/// Remove a login identifier from a user.
+#[utoipa::path(
+    delete,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/identifiers/{identifier_id}",
+    operation_id = "removeUserIdentifier",
+    tag = "users",
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("user_id" = String, Path, description = "The user identifier (usr_...)"),
+        ("identifier_id" = String, Path, description = "The identifier row id (uid_...)")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 204, description = "The identifier was removed"),
+        (status = 401, description = "Missing or invalid credential", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "Not found (absent, in another scope, or owned by a different user). The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody)
+    )
+)]
+pub async fn remove_user_identifier(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, user_id, identifier_id)): Path<(
+        String,
+        String,
+        String,
+        String,
+    )>,
+) -> Result<Response, ApiError> {
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    sudo::require_fresh_privilege(&state, scope, actor).await?;
+    // A WRITE, so `resolve_user` carries the environment liveness fence (issue #451).
+    let id = resolve_user(&state, scope, &user_id, EnvironmentAccess::Write).await?;
+    // Four addressing failures collapse to ONE answer: a malformed id and one minted in
+    // another `(tenant, environment)` fail to parse here, and an absent one or one owned
+    // by a DIFFERENT user is the store's own not-found, because the DELETE is keyed on
+    // the owning user as well as the row. A caller therefore cannot use this route to
+    // learn that some other user holds a given identifier row.
+    let record_id =
+        UserIdentifierId::parse_in_scope(&identifier_id, &scope).map_err(|_| ApiError::NotFound)?;
+    // No parent-existence probe, and that is deliberate rather than an omission: unlike
+    // the add, this statement writes no foreign key and reads no sealed value, so an
+    // absent user simply removes zero rows and lands on the same not-found. A probe here
+    // would be a second query that could only agree with the one below.
+    state
+        .store()
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(state.env()))
+        .user_identifiers()
+        .remove(state.env(), &id, &record_id)
+        .await?;
+    Ok(no_content())
 }
