@@ -112,6 +112,11 @@ path = "tests/idempotency_retention.rs"
 required-features = ["testing"]
 
 [[test]]
+name = "test_db_reclaim"
+path = "tests/test_db_reclaim.rs"
+required-features = ["testing"]
+
+[[test]]
 name = "rls"
 path = "tests/rls.rs"
 required-features = ["testing"]

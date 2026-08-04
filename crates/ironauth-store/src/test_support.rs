@@ -106,7 +106,8 @@ impl TestDatabase {
              isolation tests; scripts/with-test-db.sh starts a throwaway one and exports it",
         );
         let (host, port) = host_port_of(&owner_base);
-        let db_name = format!("ironauth_test_{}", unique_suffix());
+        reclaim_leaked_databases(&owner_base).await;
+        let db_name = fresh_database_name();
 
         // Fresh database per run: no cross-test state, no recycled rows.
         create_database(&owner_base, &db_name).await;
@@ -343,7 +344,8 @@ impl TestDatabase {
             "DATABASE_URL must point at a Postgres superuser/owner connection for the \
              migration tests; scripts/with-test-db.sh starts a throwaway one and exports it",
         );
-        let db_name = format!("ironauth_test_{}", unique_suffix());
+        reclaim_leaked_databases(&owner_base).await;
+        let db_name = fresh_database_name();
         create_database(&owner_base, &db_name).await;
         let owner_url = swap_database(&owner_base, &db_name);
         PgPool::connect(&owner_url)
@@ -505,6 +507,136 @@ async fn provision_role(owner_pool: &PgPool, role: &str) {
     .execute(owner_pool)
     .await
     .unwrap_or_else(|e| panic!("provision low-privilege role {role}: {e}"));
+}
+
+/// The prefix every per-test database carries, so a sweep can identify exactly what
+/// it owns and never touch a database belonging to something else.
+const TEST_DB_PREFIX: &str = "ironauth_test_";
+
+/// How old a leftover per-test database must be before the sweep reclaims it.
+///
+/// This is the CONCURRENCY margin, not a tidiness preference. A run in progress owns
+/// young databases, so the threshold has to exceed the longest run by enough that a
+/// concurrent gate is never robbed of a database it is still using. The full local
+/// gate takes well under an hour; six is a wide margin over that. The sweep ALSO
+/// skips any database with a live connection, so this bound is the second of two
+/// independent protections rather than the only one.
+const RECLAIM_MIN_AGE_SECS: u64 = 6 * 60 * 60;
+
+/// The count of leftovers at which the sweep says so loudly rather than quietly
+/// tidying. A developer whose cluster is filling up should learn it at the START of a
+/// run, not from a run that dies in the middle (issue #445).
+const RECLAIM_NOISY_THRESHOLD: usize = 200;
+
+/// A fresh per-test database name: the prefix, the creation instant, then entropy.
+///
+/// The instant is IN THE NAME because Postgres does not record when a database was
+/// created, and the sweep needs an age it can trust. Reading it back out of the name
+/// is what lets a reclaim distinguish a leftover from an in-flight run's database.
+fn fresh_database_name() -> String {
+    let secs = std::time::UNIX_EPOCH
+        .elapsed()
+        .map_or(0, |since| since.as_secs());
+    format!("{TEST_DB_PREFIX}{secs}_{}", unique_suffix())
+}
+
+/// Parse the creation instant a [`fresh_database_name`] embedded, if this name is one
+/// of ours in the current format.
+fn created_at_secs(datname: &str) -> Option<u64> {
+    datname
+        .strip_prefix(TEST_DB_PREFIX)?
+        .split_once('_')
+        .and_then(|(secs, _)| secs.parse().ok())
+}
+
+/// Drop per-test databases left behind by runs that are over (issue #445).
+///
+/// `scripts/with-test-db.sh` removes the whole cluster it creates, so a throwaway run
+/// cleans itself up. When `DATABASE_URL` points at an EXTERNAL cluster the script uses
+/// it as-is and nothing ever removed these, so they accumulated across every run: 11,533
+/// of them holding 163 GiB were measured on one machine, which exhausted the disk and
+/// killed two gate runs mid-flight. The failure presents as a run that simply vanishes,
+/// which is easy to misread as a harness fault rather than a full disk.
+///
+/// Self-healing rather than shutdown-dependent, which is the whole point: a run killed
+/// by SIGKILL, by ENOSPC, or by a dead parent cannot clean up after itself, so the
+/// reclaim happens on the NEXT run's way in and no abnormal exit can defeat it.
+///
+/// Two independent guards keep a concurrent run safe. A database is reclaimed only if
+/// it is older than [`RECLAIM_MIN_AGE_SECS`] AND has no live connection. Best effort
+/// throughout: every failure here is ignored, because a harness that refuses to run
+/// tests because it could not tidy up would be a worse defect than the one it fixes.
+async fn reclaim_leaked_databases(owner_base: &str) {
+    // Once per PROCESS, not once per database. A gate run builds hundreds of test
+    // databases and sweeping before each would be hundreds of redundant catalog scans.
+    static SWEPT: std::sync::Once = std::sync::Once::new();
+    let mut should_run = false;
+    SWEPT.call_once(|| should_run = true);
+    if !should_run {
+        return;
+    }
+    reclaim_leaked_databases_now(owner_base).await;
+}
+
+/// The reclaim itself, without the once-per-process latch, returning how many
+/// databases it dropped.
+///
+/// Split out so the behaviour is DRIVABLE: through
+/// [`reclaim_leaked_databases`] it can run at most once per process, so a test
+/// could otherwise observe it at most once and never compare the cases it must
+/// distinguish. The count is returned for the same reason, so a test asserts what
+/// was reclaimed rather than that nothing panicked.
+pub async fn reclaim_leaked_databases_now(owner_base: &str) -> usize {
+    let Ok(admin) = PgPool::connect(owner_base).await else {
+        return 0;
+    };
+    // Candidates: ours by prefix, and idle. `pg_stat_activity` is the live-use guard;
+    // the age check below is the second one.
+    let candidates: Vec<String> = sqlx::query_scalar(
+        "SELECT d.datname::text FROM pg_database d \
+         WHERE d.datname LIKE $1 \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM pg_stat_activity a WHERE a.datname = d.datname)",
+    )
+    .bind(format!("{TEST_DB_PREFIX}%"))
+    .fetch_all(&admin)
+    .await
+    .unwrap_or_default();
+
+    let now = std::time::UNIX_EPOCH
+        .elapsed()
+        .map_or(0, |since| since.as_secs());
+    let stale: Vec<String> = candidates
+        .into_iter()
+        .filter(|name| {
+            created_at_secs(name)
+                .is_some_and(|created| now.saturating_sub(created) >= RECLAIM_MIN_AGE_SECS)
+        })
+        .collect();
+
+    if stale.len() >= RECLAIM_NOISY_THRESHOLD {
+        eprintln!(
+            "test-support: reclaiming {} leaked per-test databases (issue #445). If this \
+             number keeps growing, the cluster in DATABASE_URL is being filled by runs \
+             that end abnormally.",
+            stale.len()
+        );
+    }
+    let mut reclaimed = 0;
+    for name in stale {
+        // Not FORCE: the connection guard above already established this database is
+        // idle, and FORCE would terminate a session that appeared in between, which is
+        // exactly the concurrent run this sweep must never disturb.
+        if sqlx::query(&format!("DROP DATABASE IF EXISTS {name}"))
+            .execute(&admin)
+            .await
+            .is_ok()
+        {
+            reclaimed += 1;
+        }
+    }
+    admin.close().await;
+    reclaimed
 }
 
 /// Create `db_name` via a transient connection to the maintenance database.
