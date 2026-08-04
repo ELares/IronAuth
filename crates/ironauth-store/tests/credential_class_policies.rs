@@ -286,3 +286,155 @@ async fn webauthn_user_handle_is_immutable_at_the_storage_layer() {
         "the application role must have no privilege to update webauthn_user_handle"
     );
 }
+
+/// The `target_id` values recorded for `action` in `scope`, oldest first.
+async fn audit_targets(db: &TestDatabase, scope: Scope, action: &str) -> Vec<String> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT target_id FROM audit_log \
+         WHERE tenant_id = $1 AND environment_id = $2 AND action = $3 \
+         ORDER BY occurred_at, id",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(action)
+    .fetch_all(db.owner_pool())
+    .await
+    .expect("read audit targets")
+}
+
+#[tokio::test]
+async fn an_overwriting_upsert_audits_the_row_that_exists_not_a_freshly_minted_id() {
+    // Issue #436. These upserts mint a candidate id, use it as the audit `target_id`, and
+    // then run `ON CONFLICT ... DO UPDATE` whose SET list does not include `id`. On the
+    // overwrite branch the existing row keeps its own id, so the audit row pointed at an
+    // identifier persisted NOWHERE: an investigator pivoting from a `*.set` audit row to
+    // the configuration it changed found no row, and could not tell a first write from an
+    // overwrite. Two of these also handed that phantom id to the operator through the CLI.
+    //
+    // The check is identity across the two calls, which is what a freshly minted id fails.
+    let env = Env::system();
+    let db = TestDatabase::start().await;
+    let scope = db.seed_scope(&env).await;
+    let store = db.store();
+    let acting = || {
+        store
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+    };
+
+    // Each of the four id-returning upserts, driven twice with DIFFERENT values so the
+    // second call genuinely takes the overwrite branch.
+    let first = acting()
+        .scope_step_up_policies()
+        .set(&env, "urn:example:scope", Some("aal2"), Some(300))
+        .await
+        .expect("first step-up policy");
+    let second = acting()
+        .scope_step_up_policies()
+        .set(&env, "urn:example:scope", Some("aal3"), Some(60))
+        .await
+        .expect("overwrite step-up policy");
+    assert_eq!(
+        first, second,
+        "an overwrite keeps the existing row's id, so the caller and the CLI are handed an \
+         identifier that resolves"
+    );
+    assert_eq!(
+        audit_targets(&db, scope, "step_up.scope_policy.set").await,
+        vec![first.to_string(), first.to_string()],
+        "and BOTH audit rows name that same live row"
+    );
+
+    let first = acting()
+        .credential_class_policies()
+        .set(&env, "tenant", None, "passkey")
+        .await
+        .expect("first class policy");
+    let second = acting()
+        .credential_class_policies()
+        .set(&env, "tenant", None, "mfa")
+        .await
+        .expect("overwrite class policy");
+    assert_eq!(first, second, "the class policy keeps its row id");
+    assert_eq!(
+        audit_targets(&db, scope, "credential_class.policy.set").await,
+        vec![first.to_string(), first.to_string()]
+    );
+
+    let first = acting()
+        .attestation_config()
+        .set(&env, "none")
+        .await
+        .expect("first attestation config");
+    let second = acting()
+        .attestation_config()
+        .set(&env, "direct")
+        .await
+        .expect("overwrite attestation config");
+    assert_eq!(first, second, "the attestation config keeps its row id");
+
+    let first = acting()
+        .aaguid_rules()
+        .set(&env, b"0123456789abcdef", "allow")
+        .await
+        .expect("first aaguid rule");
+    let second = acting()
+        .aaguid_rules()
+        .set(&env, b"0123456789abcdef", "deny")
+        .await
+        .expect("overwrite aaguid rule");
+    assert_eq!(first, second, "the aaguid rule keeps its row id");
+}
+
+#[tokio::test]
+async fn a_declined_mds3_refresh_writes_no_audit_row_at_all() {
+    // Issue #436, the half that makes this upsert worse than its siblings. Its
+    // `WHERE EXCLUDED.blob_no > ...` guard can make the statement write NOTHING for a
+    // stale blob, and the audit row landed anyway: the trail recorded a cache refresh that
+    // never happened. `RETURNING id` yields no row when the guard declines, and no row now
+    // means no audit row.
+    let env = Env::system();
+    let db = TestDatabase::start().await;
+    let scope = db.seed_scope(&env).await;
+    let store = db.store();
+    let acting = || {
+        store
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+    };
+    let payload = |no: i64| serde_json::json!({ "no": no, "entries": [] });
+
+    acting()
+        .mds3_blob_cache()
+        .upsert(&env, 5, 1, &payload(5), b"digest-5", 1, 1)
+        .await
+        .expect("seed blob_no 5");
+    let after_seed = audit_targets(&db, scope, "mds3.blob_cache.refresh").await;
+    assert_eq!(after_seed.len(), 1, "the seeding refresh is audited once");
+
+    // The STALE replay writes nothing, so it must audit nothing.
+    acting()
+        .mds3_blob_cache()
+        .upsert(&env, 3, 2, &payload(3), b"digest-3", 2, 2)
+        .await
+        .expect("a stale replay is not an error");
+    assert_eq!(
+        audit_targets(&db, scope, "mds3.blob_cache.refresh").await,
+        after_seed,
+        "a refresh the guard declined writes no audit row: the trail must not claim a \
+         cache advance that did not happen"
+    );
+
+    // And a genuine advance is audited, naming the SAME row the seed created.
+    acting()
+        .mds3_blob_cache()
+        .upsert(&env, 6, 3, &payload(6), b"digest-6", 3, 3)
+        .await
+        .expect("newer blob_no 6");
+    let targets = audit_targets(&db, scope, "mds3.blob_cache.refresh").await;
+    assert_eq!(targets.len(), 2, "the advance is audited");
+    assert_eq!(
+        targets[0], targets[1],
+        "both name the one cache row rather than a fresh id per refresh"
+    );
+}

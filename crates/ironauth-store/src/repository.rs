@@ -3058,46 +3058,50 @@ impl ActingScopeStepUpPolicyRepo<'_> {
         max_auth_age_secs: Option<i64>,
     ) -> Result<ScopeStepUpPolicyId, StoreError> {
         let scope = self.scope;
-        let id = ScopeStepUpPolicyId::generate(env, &scope);
+        let candidate_id = ScopeStepUpPolicyId::generate(env, &scope);
         let now_micros = epoch_micros(env.clock().now_utc());
         let max_age = max_auth_age_secs.map(|secs| i32::try_from(secs).unwrap_or(i32::MAX));
-        write_audited(
-            AuditedWrite {
-                store: self.store,
-                scope,
-                acting: &self.acting,
-                env,
-                action: Action::ScopeStepUpPolicySet,
-                target: &id,
-            },
-            async move |tx| {
-                sqlx::query(
-                    "INSERT INTO scope_step_up_policies \
-                     (id, tenant_id, environment_id, scope, min_acr, max_auth_age_secs, \
-                      created_at, updated_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6, \
-                             TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval, \
-                             TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval) \
-                     ON CONFLICT (tenant_id, environment_id, scope) DO UPDATE \
-                     SET min_acr = EXCLUDED.min_acr, \
-                         max_auth_age_secs = EXCLUDED.max_auth_age_secs, \
-                         updated_at = EXCLUDED.updated_at",
-                )
-                .bind(id.to_string())
-                .bind(scope.tenant().to_string())
-                .bind(scope.environment().to_string())
-                .bind(scope_token)
-                .bind(min_acr)
-                .bind(max_age)
-                .bind(now_micros)
-                .execute(&mut **tx)
-                .await?;
-                Ok(())
-            },
-            false,
+        // The audit target is known only AFTER the upsert (issue #436): the ON CONFLICT
+        // branch keeps the EXISTING row's id, and `id` is not in its SET list, so a locally
+        // minted candidate names a row that is persisted nowhere on every overwrite. This
+        // write therefore inlines its own audited transaction and takes the target from
+        // `RETURNING id`, exactly as the other returning-write paths in this module do. The
+        // audit row is still inserted in the SAME transaction as the data change.
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "INSERT INTO scope_step_up_policies \
+             (id, tenant_id, environment_id, scope, min_acr, max_auth_age_secs, \
+              created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, \
+                     TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval, \
+                     TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval) \
+             ON CONFLICT (tenant_id, environment_id, scope) DO UPDATE \
+             SET min_acr = EXCLUDED.min_acr, \
+                 max_auth_age_secs = EXCLUDED.max_auth_age_secs, \
+                 updated_at = EXCLUDED.updated_at \
+             RETURNING id",
         )
+        .bind(candidate_id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(scope_token)
+        .bind(min_acr)
+        .bind(max_age)
+        .bind(now_micros)
+        .fetch_one(&mut *tx)
         .await?;
-        Ok(id)
+        let live_id = ScopeStepUpPolicyId::parse_in_scope(&row.get::<String, _>("id"), &scope)?;
+        let spec = AuditedWrite {
+            store: self.store,
+            scope,
+            acting: &self.acting,
+            env,
+            action: Action::ScopeStepUpPolicySet,
+            target: &live_id,
+        };
+        insert_audit_row(&mut tx, &spec, None).await?;
+        tx.commit().await?;
+        Ok(live_id)
     }
 
     /// Remove the step-up policy for an OAuth scope token, auditing
@@ -3494,45 +3498,46 @@ impl ActingCredentialClassPolicyRepo<'_> {
         min_class: &str,
     ) -> Result<CredentialClassPolicyId, StoreError> {
         let scope = self.scope;
-        let id = CredentialClassPolicyId::generate(env, &scope);
+        let candidate_id = CredentialClassPolicyId::generate(env, &scope);
         let now_micros = epoch_micros(env.clock().now_utc());
         let detail = format!("subject={subject_kind} min_class={min_class}");
-        write_audited_detailed(
-            AuditedWrite {
-                store: self.store,
-                scope,
-                acting: &self.acting,
-                env,
-                action: Action::CredentialClassPolicySet,
-                target: &id,
-            },
-            async move |tx| {
-                sqlx::query(
-                    "INSERT INTO credential_class_policies \
-                     (id, tenant_id, environment_id, subject_kind, subject_ref, min_class, \
-                      created_at, updated_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6, \
-                             TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval, \
-                             TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval) \
-                     ON CONFLICT (tenant_id, environment_id, subject_kind, COALESCE(subject_ref, '')) \
-                     DO UPDATE SET min_class = EXCLUDED.min_class, updated_at = EXCLUDED.updated_at",
-                )
-                .bind(id.to_string())
-                .bind(scope.tenant().to_string())
-                .bind(scope.environment().to_string())
-                .bind(subject_kind)
-                .bind(subject_ref)
-                .bind(min_class)
-                .bind(now_micros)
-                .execute(&mut **tx)
-                .await?;
-                Ok(())
-            },
-            false,
-            Some(&detail),
+        // The audit target is known only AFTER the upsert (issue #436): the ON CONFLICT
+        // branch keeps the EXISTING row's id, and `id` is not in its SET list, so a locally
+        // minted candidate names a row that is persisted nowhere on every overwrite. Taken
+        // from `RETURNING id` instead, in the SAME transaction as the data change.
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "INSERT INTO credential_class_policies \
+             (id, tenant_id, environment_id, subject_kind, subject_ref, min_class, \
+              created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, \
+                     TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval, \
+                     TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval) \
+             ON CONFLICT (tenant_id, environment_id, subject_kind, COALESCE(subject_ref, '')) \
+             DO UPDATE SET min_class = EXCLUDED.min_class, updated_at = EXCLUDED.updated_at \
+             RETURNING id",
         )
+        .bind(candidate_id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(subject_kind)
+        .bind(subject_ref)
+        .bind(min_class)
+        .bind(now_micros)
+        .fetch_one(&mut *tx)
         .await?;
-        Ok(id)
+        let live_id = CredentialClassPolicyId::parse_in_scope(&row.get::<String, _>("id"), &scope)?;
+        let spec = AuditedWrite {
+            store: self.store,
+            scope,
+            acting: &self.acting,
+            env,
+            action: Action::CredentialClassPolicySet,
+            target: &live_id,
+        };
+        insert_audit_row(&mut tx, &spec, Some(detail.as_str())).await?;
+        tx.commit().await?;
+        Ok(live_id)
     }
 
     /// Remove the credential-class policy for a subject, auditing
@@ -3643,42 +3648,43 @@ impl ActingAttestationConfigRepo<'_> {
     /// which the CHECK refuses).
     pub async fn set(&self, env: &Env, mode: &str) -> Result<AttestationConfigId, StoreError> {
         let scope = self.scope;
-        let id = AttestationConfigId::generate(env, &scope);
+        let candidate_id = AttestationConfigId::generate(env, &scope);
         let now_micros = epoch_micros(env.clock().now_utc());
         let detail = format!("mode={mode}");
-        write_audited_detailed(
-            AuditedWrite {
-                store: self.store,
-                scope,
-                acting: &self.acting,
-                env,
-                action: Action::AttestationConfigSet,
-                target: &id,
-            },
-            async move |tx| {
-                sqlx::query(
-                    "INSERT INTO attestation_config \
-                     (id, tenant_id, environment_id, mode, created_at, updated_at) \
-                     VALUES ($1, $2, $3, $4, \
-                             TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval, \
-                             TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval) \
-                     ON CONFLICT (tenant_id, environment_id) \
-                     DO UPDATE SET mode = EXCLUDED.mode, updated_at = EXCLUDED.updated_at",
-                )
-                .bind(id.to_string())
-                .bind(scope.tenant().to_string())
-                .bind(scope.environment().to_string())
-                .bind(mode)
-                .bind(now_micros)
-                .execute(&mut **tx)
-                .await?;
-                Ok(())
-            },
-            false,
-            Some(&detail),
+        // The audit target is known only AFTER the upsert (issue #436): the ON CONFLICT
+        // branch keeps the EXISTING row's id, and `id` is not in its SET list, so a locally
+        // minted candidate names a row that is persisted nowhere on every overwrite. Taken
+        // from `RETURNING id` instead, in the SAME transaction as the data change.
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "INSERT INTO attestation_config \
+             (id, tenant_id, environment_id, mode, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, \
+                     TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval, \
+                     TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval) \
+             ON CONFLICT (tenant_id, environment_id) \
+             DO UPDATE SET mode = EXCLUDED.mode, updated_at = EXCLUDED.updated_at \
+             RETURNING id",
         )
+        .bind(candidate_id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(mode)
+        .bind(now_micros)
+        .fetch_one(&mut *tx)
         .await?;
-        Ok(id)
+        let live_id = AttestationConfigId::parse_in_scope(&row.get::<String, _>("id"), &scope)?;
+        let spec = AuditedWrite {
+            store: self.store,
+            scope,
+            acting: &self.acting,
+            env,
+            action: Action::AttestationConfigSet,
+            target: &live_id,
+        };
+        insert_audit_row(&mut tx, &spec, Some(detail.as_str())).await?;
+        tx.commit().await?;
+        Ok(live_id)
     }
 }
 
@@ -3793,25 +3799,26 @@ impl ActingMds3BlobCacheRepo<'_> {
         verified_at_unix_micros: i64,
     ) -> Result<(), StoreError> {
         let scope = self.scope;
-        let id = Mds3BlobCacheId::generate(env, &scope);
+        let candidate_id = Mds3BlobCacheId::generate(env, &scope);
         let now_micros = epoch_micros(env.clock().now_utc());
         // A serde_json::Value always serializes; the map mirrors the set_traits precedent.
         let payload_text =
             serde_json::to_string(payload_jsonb).map_err(|_| StoreError::Encryption)?;
         let blob_digest = blob_digest.to_vec();
         let detail = format!("blob_no={blob_no}");
-        write_audited_detailed(
-            AuditedWrite {
-                store: self.store,
-                scope,
-                acting: &self.acting,
-                env,
-                action: Action::Mds3BlobCacheRefresh,
-                target: &id,
-            },
-            async move |tx| {
-                sqlx::query(
-                    "INSERT INTO mds3_blob_cache \
+        // Two defects in one statement here (issue #436), and the second is the reason this
+        // one is worse than its four siblings. The ON CONFLICT branch keeps the EXISTING
+        // row's id and does not SET `id`, so a locally minted candidate named a row that was
+        // never persisted. AND the `WHERE EXCLUDED.blob_no > ...` guard can make the whole
+        // statement write NOTHING for a stale blob, while the audit row landed regardless:
+        // the trail recorded a cache refresh that did not happen.
+        //
+        // `RETURNING id` answers both. A row means the write applied and names the row it
+        // applied to; NO row means the guard declined it, and then no audit row is written,
+        // because there is nothing to audit.
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "INSERT INTO mds3_blob_cache \
                      (id, tenant_id, environment_id, blob_no, next_update, payload_jsonb, \
                       blob_digest, fetched_at, verified_at, updated_at) \
                      VALUES ($1, $2, $3, $4, \
@@ -3825,26 +3832,35 @@ impl ActingMds3BlobCacheRepo<'_> {
                        payload_jsonb = EXCLUDED.payload_jsonb, blob_digest = EXCLUDED.blob_digest, \
                        fetched_at = EXCLUDED.fetched_at, verified_at = EXCLUDED.verified_at, \
                        updated_at = EXCLUDED.updated_at \
-                     WHERE EXCLUDED.blob_no > mds3_blob_cache.blob_no",
-                )
-                .bind(id.to_string())
-                .bind(scope.tenant().to_string())
-                .bind(scope.environment().to_string())
-                .bind(blob_no)
-                .bind(next_update_unix_micros)
-                .bind(payload_text)
-                .bind(&blob_digest)
-                .bind(fetched_at_unix_micros)
-                .bind(verified_at_unix_micros)
-                .bind(now_micros)
-                .execute(&mut **tx)
-                .await?;
-                Ok(())
-            },
-            false,
-            Some(&detail),
+                     WHERE EXCLUDED.blob_no > mds3_blob_cache.blob_no \
+                     RETURNING id",
         )
-        .await
+        .bind(candidate_id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(blob_no)
+        .bind(next_update_unix_micros)
+        .bind(payload_text)
+        .bind(&blob_digest)
+        .bind(fetched_at_unix_micros)
+        .bind(verified_at_unix_micros)
+        .bind(now_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(row) = row {
+            let live_id = Mds3BlobCacheId::parse_in_scope(&row.get::<String, _>("id"), &scope)?;
+            let spec = AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::Mds3BlobCacheRefresh,
+                target: &live_id,
+            };
+            insert_audit_row(&mut tx, &spec, Some(detail.as_str())).await?;
+        }
+        tx.commit().await?;
+        Ok(())
     }
 }
 
@@ -3949,44 +3965,45 @@ impl ActingAaguidRuleRepo<'_> {
         disposition: &str,
     ) -> Result<AaguidRuleId, StoreError> {
         let scope = self.scope;
-        let id = AaguidRuleId::generate(env, &scope);
+        let candidate_id = AaguidRuleId::generate(env, &scope);
         let now_micros = epoch_micros(env.clock().now_utc());
         let aaguid = aaguid.to_vec();
         let detail = format!("disposition={disposition}");
-        write_audited_detailed(
-            AuditedWrite {
-                store: self.store,
-                scope,
-                acting: &self.acting,
-                env,
-                action: Action::AaguidRuleSet,
-                target: &id,
-            },
-            async move |tx| {
-                sqlx::query(
-                    "INSERT INTO aaguid_rules \
-                     (id, tenant_id, environment_id, aaguid, disposition, created_at, updated_at) \
-                     VALUES ($1, $2, $3, $4, $5, \
-                             TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval, \
-                             TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval) \
-                     ON CONFLICT (tenant_id, environment_id, aaguid) \
-                     DO UPDATE SET disposition = EXCLUDED.disposition, updated_at = EXCLUDED.updated_at",
-                )
-                .bind(id.to_string())
-                .bind(scope.tenant().to_string())
-                .bind(scope.environment().to_string())
-                .bind(&aaguid)
-                .bind(disposition)
-                .bind(now_micros)
-                .execute(&mut **tx)
-                .await?;
-                Ok(())
-            },
-            false,
-            Some(&detail),
+        // The audit target is known only AFTER the upsert (issue #436): the ON CONFLICT
+        // branch keeps the EXISTING row's id, and `id` is not in its SET list, so a locally
+        // minted candidate names a row that is persisted nowhere on every overwrite. Taken
+        // from `RETURNING id` instead, in the SAME transaction as the data change.
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "INSERT INTO aaguid_rules \
+             (id, tenant_id, environment_id, aaguid, disposition, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, \
+                     TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval, \
+                     TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval) \
+             ON CONFLICT (tenant_id, environment_id, aaguid) \
+             DO UPDATE SET disposition = EXCLUDED.disposition, updated_at = EXCLUDED.updated_at \
+             RETURNING id",
         )
+        .bind(candidate_id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(&aaguid)
+        .bind(disposition)
+        .bind(now_micros)
+        .fetch_one(&mut *tx)
         .await?;
-        Ok(id)
+        let live_id = AaguidRuleId::parse_in_scope(&row.get::<String, _>("id"), &scope)?;
+        let spec = AuditedWrite {
+            store: self.store,
+            scope,
+            acting: &self.acting,
+            env,
+            action: Action::AaguidRuleSet,
+            target: &live_id,
+        };
+        insert_audit_row(&mut tx, &spec, Some(detail.as_str())).await?;
+        tx.commit().await?;
+        Ok(live_id)
     }
 
     /// Remove the rule for an authenticator model, auditing `aaguid.rule.remove` in the
