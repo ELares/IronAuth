@@ -379,6 +379,9 @@ fn every_post_documents_the_idempotency_key_header() {
         // The organization state toggles, added with their Idempotency-Key handling.
         "disableOrganization",
         "enableOrganization",
+        // The abuse-ban routes, added with their Idempotency-Key handling.
+        "createBan",
+        "liftBan",
     ] {
         let params = find_operation(&doc, op)["parameters"]
             .as_array()

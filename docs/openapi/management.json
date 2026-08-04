@@ -971,6 +971,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying a POST with the same key returns the original response without re-executing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "requestBody": {
@@ -1043,6 +1052,16 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Idempotency-Key reused with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -1073,6 +1092,15 @@
             "name": "environment_id",
             "in": "path",
             "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying a POST with the same key returns the original response without re-executing.",
             "required": true,
             "schema": {
               "type": "string"
@@ -1132,6 +1160,16 @@
           },
           "404": {
             "description": "The environment is absent or deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency-Key reused with a different request",
             "content": {
               "application/json": {
                 "schema": {

@@ -52,6 +52,7 @@ async fn place_ban(
                 expires_at_unix_micros: expires_at,
             },
             now_micros(env),
+            None,
         )
         .await
         .expect("place ban");
@@ -140,7 +141,7 @@ async fn ban_round_trips_lists_and_lifts_idempotently() {
         .scoped(scope)
         .acting(test_actor(), CorrelationId::generate(&env))
         .abuse()
-        .lift(&env, &subject, AuthPath::Password)
+        .lift(&env, &subject, AuthPath::Password, None)
         .await
         .expect("lift");
     assert!(lifted, "the first lift removed the ban");
@@ -149,7 +150,7 @@ async fn ban_round_trips_lists_and_lifts_idempotently() {
         .scoped(scope)
         .acting(test_actor(), CorrelationId::generate(&env))
         .abuse()
-        .lift(&env, &subject, AuthPath::Password)
+        .lift(&env, &subject, AuthPath::Password, None)
         .await
         .expect("second lift");
     assert!(!again, "a repeat lift is idempotent");

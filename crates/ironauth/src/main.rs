@@ -2122,6 +2122,7 @@ async fn place_ban(store: &Store, scope: Scope, env: &Env, parsed: &BanArgs) -> 
                 expires_at_unix_micros: expires,
             },
             now,
+            None,
         )
         .await;
     match result {
@@ -2171,7 +2172,7 @@ async fn lift_ban(store: &Store, scope: Scope, env: &Env, parsed: &BanArgs) -> E
         .scoped(scope)
         .acting(actor, CorrelationId::generate(env))
         .abuse()
-        .lift(env, &subject, path)
+        .lift(env, &subject, path, None)
         .await
     {
         Ok(true) => {

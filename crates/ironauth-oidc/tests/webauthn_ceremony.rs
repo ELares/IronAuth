@@ -1158,6 +1158,7 @@ async fn place_ban(harness: &Harness, subject: &AbuseSubject, path: AuthPath) {
                 expires_at_unix_micros: None,
             },
             now_micros(harness),
+            None,
         )
         .await
         .expect("place ban");
