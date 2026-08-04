@@ -1792,6 +1792,19 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
         // The user's typed login identifiers (issue #54, epic #514). The READ answers as
         // if live in a soft-deleted environment, like every other user-scoped read, and
         // the POST is a write, so it must refuse one.
+        // The environment-level uniqueness mode routes (epic #514). The read evaluates a
+        // candidate mode and answers as if live in a soft-deleted environment, like every
+        // other read; the apply is a write and must refuse one.
+        Case::empty(
+            "identifiers.getIdentifierUniqueness",
+            "GET",
+            format!("{base}/identifier-uniqueness"),
+        ),
+        Case::empty(
+            "identifiers.applyIdentifierUniqueness",
+            "POST",
+            format!("{base}/identifier-uniqueness/apply"),
+        ),
         Case::empty(
             "users.listUserIdentifiers",
             "GET",

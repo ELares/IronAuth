@@ -4884,6 +4884,193 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/identifier-uniqueness": {
+      "get": {
+        "tags": [
+          "identifiers"
+        ],
+        "summary": "Report what an identifier uniqueness mode would enforce in this environment.",
+        "operationId": "getIdentifierUniqueness",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "mode",
+            "in": "query",
+            "description": "`environment_wide`, `org_scoped` or `non_unique`. Omitted means the CONFIGURED\nmode, which is the question an operator asks before an apply.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The configured mode and what the evaluated mode would enforce",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UniquenessView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Unknown mode",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Tenant or environment not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/identifier-uniqueness/apply": {
+      "post": {
+        "tags": [
+          "identifiers"
+        ],
+        "summary": "Recompute this environment's identifier uniqueness keys under the configured mode.",
+        "operationId": "applyIdentifierUniqueness",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Every identifier row now carries the configured mode's discriminator"
+          },
+          "400": {
+            "description": "Missing Idempotency-Key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment is absent or deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A collision the configured mode would enforce still exists; nothing was changed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/imports": {
       "post": {
         "tags": [
@@ -16893,6 +17080,25 @@
           }
         }
       },
+      "CollisionView": {
+        "type": "object",
+        "description": "One post-canonicalization collision a mode would enforce.",
+        "required": [
+          "type",
+          "count"
+        ],
+        "properties": {
+          "count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many identifier rows share this canonical form in the scope."
+          },
+          "type": {
+            "type": "string",
+            "description": "The identifier kind the collision is within."
+          }
+        }
+      },
       "ConnectorCapabilitiesView": {
         "type": "object",
         "description": "The per-connector capability matrix (issue #75), exposed by the management API.\nSECRET-FREE: the upstream client secret is never part of this view.",
@@ -21272,6 +21478,32 @@
             "type": "integer",
             "format": "int32",
             "description": "The per-environment monotonic version number."
+          }
+        }
+      },
+      "UniquenessView": {
+        "type": "object",
+        "description": "What a uniqueness mode would enforce in this environment.",
+        "required": [
+          "configured_mode",
+          "evaluated_mode",
+          "collisions"
+        ],
+        "properties": {
+          "collisions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CollisionView"
+            },
+            "description": "The collisions the evaluated mode would enforce. Empty means an apply is safe.\nReports the kind and a count, never a plaintext identifier."
+          },
+          "configured_mode": {
+            "type": "string",
+            "description": "The mode this deployment is configured with, from `[identifiers] uniqueness`."
+          },
+          "evaluated_mode": {
+            "type": "string",
+            "description": "The mode that was evaluated. Equal to `configured_mode` unless `mode` was given."
           }
         }
       },

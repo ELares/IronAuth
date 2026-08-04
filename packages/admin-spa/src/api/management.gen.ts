@@ -662,6 +662,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/identifier-uniqueness": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Report what an identifier uniqueness mode would enforce in this environment. */
+        get: operations["getIdentifierUniqueness"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/identifier-uniqueness/apply": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Recompute this environment's identifier uniqueness keys under the configured mode. */
+        post: operations["applyIdentifierUniqueness"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/imports": {
         parameters: {
             query?: never;
@@ -2504,6 +2538,16 @@ export interface components {
              *     never verified.
              */
             verified_at_unix_ms?: number | null;
+        };
+        /** @description One post-canonicalization collision a mode would enforce. */
+        CollisionView: {
+            /**
+             * Format: int64
+             * @description How many identifier rows share this canonical form in the scope.
+             */
+            count: number;
+            /** @description The identifier kind the collision is within. */
+            type: string;
         };
         /**
          * @description The per-connector capability matrix (issue #75), exposed by the management API.
@@ -5363,6 +5407,18 @@ export interface components {
              * @description The per-environment monotonic version number.
              */
             version: number;
+        };
+        /** @description What a uniqueness mode would enforce in this environment. */
+        UniquenessView: {
+            /**
+             * @description The collisions the evaluated mode would enforce. Empty means an apply is safe.
+             *     Reports the kind and a count, never a plaintext identifier.
+             */
+            collisions: components["schemas"]["CollisionView"][];
+            /** @description The mode this deployment is configured with, from `[identifiers] uniqueness`. */
+            configured_mode: string;
+            /** @description The mode that was evaluated. Equal to `configured_mode` unless `mode` was given. */
+            evaluated_mode: string;
         };
         /**
          * @description The body to rename a group (RFC 7396 style partial edit: an omitted field is
@@ -9066,6 +9122,141 @@ export interface operations {
             };
             /** @description Environment not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    getIdentifierUniqueness: {
+        parameters: {
+            query?: {
+                /**
+                 * @description `environment_wide`, `org_scoped` or `non_unique`. Omitted means the CONFIGURED
+                 *     mode, which is the question an operator asks before an apply.
+                 */
+                mode?: string | null;
+            };
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The configured mode and what the evaluated mode would enforce */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UniquenessView"];
+                };
+            };
+            /** @description Unknown mode */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Tenant or environment not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    applyIdentifierUniqueness: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Every identifier row now carries the configured mode's discriminator */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing Idempotency-Key */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment is absent or deleted */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description A collision the configured mode would enforce still exists; nothing was changed */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

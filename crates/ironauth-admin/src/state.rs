@@ -212,6 +212,37 @@ struct Inner {
     signing_registry: Option<Arc<IssuerRegistry>>,
 }
 
+/// The ONE place the operator-visible uniqueness setting becomes the store's mode
+/// (issue #54). The two enums are deliberately separate types, because the store must
+/// not depend on the config crate, and this is the single seam that ties them together.
+///
+/// Exhaustive with no wildcard, so a fourth mode added to either enum fails to compile
+/// here rather than silently mapping to the default. A second copy of this match
+/// anywhere would be the shape that rots: one of them gets the new variant and the other
+/// keeps compiling.
+pub(crate) const fn uniqueness_mode(uniqueness: IdentifierUniqueness) -> UniquenessMode {
+    match uniqueness {
+        IdentifierUniqueness::EnvironmentWide => UniquenessMode::EnvironmentWide,
+        IdentifierUniqueness::OrgScoped => UniquenessMode::OrgScoped,
+        IdentifierUniqueness::NonUnique => UniquenessMode::NonUnique,
+    }
+}
+
+/// The reverse of [`uniqueness_mode`], so a route can REPORT the configured mode.
+///
+/// It exists so the wire spelling is never hand written. The management API and the
+/// config file must name these modes identically (an operator reads one and edits the
+/// other), and the config enum already carries `#[serde(rename_all = "snake_case")]`, so
+/// converting back and serializing THAT is what makes the two spellings one spelling by
+/// construction rather than by two authors agreeing.
+pub(crate) const fn uniqueness_setting(mode: UniquenessMode) -> IdentifierUniqueness {
+    match mode {
+        UniquenessMode::EnvironmentWide => IdentifierUniqueness::EnvironmentWide,
+        UniquenessMode::OrgScoped => IdentifierUniqueness::OrgScoped,
+        UniquenessMode::NonUnique => IdentifierUniqueness::NonUnique,
+    }
+}
+
 impl AdminState {
     /// Build the management state from a control-plane store, the environment
     /// seam, and the admin config.
@@ -571,11 +602,7 @@ impl AdminState {
             // enum fails to compile here rather than silently mapping to the default.
             // The two enums are deliberately separate types: the store must not depend
             // on the config crate, so this is the one place they are tied together.
-            inner.identifier_uniqueness = match config.uniqueness {
-                IdentifierUniqueness::EnvironmentWide => UniquenessMode::EnvironmentWide,
-                IdentifierUniqueness::OrgScoped => UniquenessMode::OrgScoped,
-                IdentifierUniqueness::NonUnique => UniquenessMode::NonUnique,
-            };
+            inner.identifier_uniqueness = uniqueness_mode(config.uniqueness);
         }
         self
     }

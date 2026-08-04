@@ -17351,6 +17351,7 @@ impl ActingUserIdentifierRepo<'_> {
         &self,
         env: &Env,
         mode: UniquenessMode,
+        idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
         let scope = self.scope;
         let environment = scope.environment();
@@ -17400,6 +17401,13 @@ impl ActingUserIdentifierRepo<'_> {
                 .bind(scope.environment().to_string())
                 .execute(&mut **tx)
                 .await?;
+                // The `Idempotency-Key` record rides in the SAME transaction as the
+                // recompute and the audit row. A replay therefore cannot observe a
+                // recompute without its key, and a run refused by the collision scan
+                // rolls the key back with everything else, so the operator can fix the
+                // collisions and retry with the same key rather than being told the
+                // request was already made.
+                insert_idempotency(tx, idempotency).await?;
                 Ok(())
             },
             false,
