@@ -15,6 +15,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use common::{CaptureWriter, get, send, server_from};
 use ironauth_config::LogFormat;
+use tracing::Level;
 
 const ZERO_TRUST: &str = "dev_mode = true\n\
     [server]\npublic_url = \"http://id.example.test\"\n\
@@ -67,7 +68,8 @@ where
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
     let writer = CaptureWriter::new();
-    let subscriber = ironauth_server::telemetry::build_subscriber(LogFormat::Json, writer.clone());
+    let subscriber =
+        ironauth_server::telemetry::build_subscriber(LogFormat::Json, writer.clone(), Level::INFO);
     tracing::subscriber::with_default(subscriber, || block_on_current_thread(body));
     writer.contents()
 }
@@ -147,8 +149,11 @@ fn fail_closed_increments_the_rejection_counter() {
     // discarded) so the shared request-logging callsites are never registered
     // against the no-op dispatcher, which would poison the interest cache the
     // log-asserting siblings depend on. See [`REQUEST_TEST_LOCK`].
-    let subscriber =
-        ironauth_server::telemetry::build_subscriber(LogFormat::Json, CaptureWriter::new());
+    let subscriber = ironauth_server::telemetry::build_subscriber(
+        LogFormat::Json,
+        CaptureWriter::new(),
+        Level::INFO,
+    );
     tracing::subscriber::with_default(subscriber, || {
         block_on_current_thread(async {
             let server = server_from(ONE_TRUSTED_HOP);

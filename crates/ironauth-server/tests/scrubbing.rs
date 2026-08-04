@@ -16,6 +16,7 @@ use axum::http::{Request, StatusCode};
 use common::{CaptureWriter, send, server_from};
 use ironauth_config::LogFormat;
 use ironauth_server::Redacted;
+use tracing::Level;
 
 // Distinctive sentinels, unlikely to occur incidentally in any log envelope.
 const Q_TOKEN: &str = "SENTINELtokenQZX1";
@@ -47,7 +48,8 @@ const ALL_SENTINELS: &[&str] = &[
 #[test]
 fn no_sentinel_leaks_through_any_request_log_path() {
     let writer = CaptureWriter::new();
-    let subscriber = ironauth_server::telemetry::build_subscriber(LogFormat::Json, writer.clone());
+    let subscriber =
+        ironauth_server::telemetry::build_subscriber(LogFormat::Json, writer.clone(), Level::INFO);
 
     tracing::subscriber::with_default(subscriber, || {
         tokio::runtime::Builder::new_current_thread()

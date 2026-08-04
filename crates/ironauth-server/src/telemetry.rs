@@ -115,15 +115,31 @@ fn install_panic_hook() {
     }));
 }
 
-/// Build a standalone subscriber writing to `make_writer`, for tests that
-/// capture output. This shares the exact formatter [`init`] installs, so a
+/// Build a standalone subscriber writing to `make_writer`, filtered to `level`, for tests
+/// that capture output. This shares the exact formatter [`init`] installs, so a
 /// leak asserted absent here is absent in production.
+///
+/// The level is a REQUIRED ARGUMENT and this deliberately does not consult `RUST_LOG`
+/// (issue #183). It used to, and that made every capturing test silently dependent on the
+/// ambient environment: a shell or CI runner exporting `RUST_LOG=warn` filtered out the
+/// INFO `request completed` event those tests assert on, so they failed deterministically
+/// for a reason nothing in the test named. Latent rather than live, since `RUST_LOG` is
+/// exported nowhere in `.github/`, which is exactly the kind of coupling that waits.
+///
+/// Taking the level explicitly rather than pinning INFO inside is what stops the coupling
+/// coming back: a future caller has to say what it needs and cannot inherit an answer.
+/// [`init`] still reads `RUST_LOG` through [`level_from_env`], so production log levels are
+/// unchanged; this function has no production caller and exists for the capture tests.
 #[must_use]
-pub fn build_subscriber<W>(format: LogFormat, make_writer: W) -> impl Subscriber + Send + Sync
+pub fn build_subscriber<W>(
+    format: LogFormat,
+    make_writer: W,
+    level: Level,
+) -> impl Subscriber + Send + Sync
 where
     W: for<'w> MakeWriter<'w> + Send + Sync + 'static,
 {
-    Registry::default().with(fmt_layer(format, make_writer, level_from_env()))
+    Registry::default().with(fmt_layer(format, make_writer, level))
 }
 
 /// Construct the formatting layer for the chosen format, filtered to `level`.
