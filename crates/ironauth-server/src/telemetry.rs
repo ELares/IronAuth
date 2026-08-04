@@ -32,7 +32,7 @@ use tracing_subscriber::{Layer, fmt};
 pub struct TelemetryGuard {
     _appender: crate::logwriter::WriterGuard,
     #[cfg(feature = "otlp")]
-    otel: Option<opentelemetry_sdk::trace::TracerProvider>,
+    otel: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
 }
 
 #[cfg(feature = "otlp")]
@@ -188,8 +188,11 @@ mod otlp {
     use ironauth_config::TelemetryConfig;
     use opentelemetry::trace::TracerProvider as _;
     use opentelemetry_otlp::WithExportConfig as _;
-    use opentelemetry_sdk::runtime::Tokio;
-    use opentelemetry_sdk::trace::TracerProvider;
+    // 0.32 renamed the SDK provider to `SdkTracerProvider`, freeing the plain
+    // `TracerProvider` name for the API TRAIT that `.tracer()` comes from, and dropped
+    // the runtime argument from `with_batch_exporter` (the SDK owns its batch worker
+    // now), which is why `opentelemetry_sdk::runtime::Tokio` is gone from this import.
+    use opentelemetry_sdk::trace::SdkTracerProvider;
     use tracing_subscriber::Layer;
     use tracing_subscriber::registry::Registry;
 
@@ -201,7 +204,7 @@ mod otlp {
         telemetry: &TelemetryConfig,
     ) -> (
         Option<Box<dyn Layer<Registry> + Send + Sync>>,
-        Option<TracerProvider>,
+        Option<SdkTracerProvider>,
     ) {
         let Some(endpoint) = telemetry.otlp_endpoint.as_deref() else {
             return (None, None);
@@ -217,8 +220,8 @@ mod otlp {
                 return (None, None);
             }
         };
-        let provider = TracerProvider::builder()
-            .with_batch_exporter(exporter, Tokio)
+        let provider = SdkTracerProvider::builder()
+            .with_batch_exporter(exporter)
             .build();
         let tracer = provider.tracer("ironauth");
         let layer = tracing_opentelemetry::layer().with_tracer(tracer).boxed();
@@ -235,5 +238,53 @@ mod tests {
         // The parser must never widen below info by accident; unknown values
         // clamp to info rather than trace.
         assert_eq!(level_from_env(), Level::INFO);
+    }
+
+    /// The OTLP wiring is behind a NON-DEFAULT feature, so nothing in a default build
+    /// touches it and a break here is invisible until an `--all-features` lane runs.
+    /// Before this, the whole path was compile-verified only: the 0.32 migration renamed
+    /// the provider, dropped the runtime argument from the batch exporter, and changed
+    /// what `shutdown` returns, and a test asserting none of that would not have noticed.
+    #[cfg(feature = "otlp")]
+    mod otlp_wiring {
+        use ironauth_config::{LogFormat, TelemetryConfig};
+
+        fn telemetry(endpoint: Option<&str>) -> TelemetryConfig {
+            TelemetryConfig {
+                log_format: LogFormat::Json,
+                otlp_endpoint: endpoint.map(str::to_owned),
+            }
+        }
+
+        #[test]
+        fn no_endpoint_builds_no_layer_and_no_provider() {
+            // The inert half: an operator who never set an endpoint gets no exporter, no
+            // background batch worker, and no provider to shut down.
+            let (layer, provider) = super::super::otlp::build(&telemetry(None));
+            assert!(layer.is_none(), "no endpoint means no trace layer");
+            assert!(provider.is_none(), "and nothing to shut down");
+        }
+
+        #[tokio::test]
+        async fn an_endpoint_builds_the_provider_and_it_shuts_down() {
+            // The live half, and the one the migration actually changed. This CONSTRUCTS
+            // the exporter, the `SdkTracerProvider`, its batch worker and the
+            // `tracing-opentelemetry` layer, then drives the shutdown path. It needs no
+            // collector listening: the tonic exporter connects lazily, so nothing here
+            // depends on the network.
+            let (layer, provider) =
+                super::super::otlp::build(&telemetry(Some("http://127.0.0.1:4317")));
+            assert!(
+                layer.is_some(),
+                "a configured endpoint yields a trace layer"
+            );
+            let provider = provider.expect("and the provider that owns the batch worker");
+
+            // The third migrated call site: 0.32 changed what `shutdown` returns, and a
+            // best-effort flush that silently stopped flushing would look identical.
+            provider
+                .shutdown()
+                .expect("the provider shuts down cleanly");
+        }
     }
 }
