@@ -122,7 +122,7 @@ async fn apply_mode(
         .scoped(scope)
         .acting(db.test_actor(env), CorrelationId::generate(env))
         .user_identifiers()
-        .apply_uniqueness_mode(env, mode)
+        .apply_uniqueness_mode(env, mode, None)
         .await
 }
 

@@ -725,6 +725,12 @@ fn user_cases(base: &str, ids: &Ids) -> Vec<Case> {
             body: None,
         },
         Case {
+            label: "identifiers.applyIdentifierUniqueness",
+            method: "POST",
+            path: format!("{base}/identifier-uniqueness/apply"),
+            body: None,
+        },
+        Case {
             label: "users.addUserIdentifier",
             method: "POST",
             path: format!("{base}/users/{user}/identifiers"),

@@ -29,13 +29,14 @@
 
 use axum::{
     body::Bytes,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, Uri},
     response::Response,
 };
+use ironauth_config::IdentifierUniqueness;
 use ironauth_store::{
-    CorrelationId, IdempotencyWrite, IdentifierType, NewUserIdentifier, StoreError,
-    UserIdentifierId, UserIdentifierRecord,
+    CorrelationId, IdempotencyWrite, IdentifierCollision, IdentifierType, NewUserIdentifier,
+    StoreError, UserIdentifierId, UserIdentifierRecord,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -45,9 +46,9 @@ use crate::{
     error::{ApiError, ErrorBody},
     idempotency,
     input::parse_json,
-    org_context::{EnvironmentAccess, resolve_scope, resolve_user},
+    org_context::{EnvironmentAccess, require_live_environment, resolve_scope, resolve_user},
     response::{json, no_content},
-    state::AdminState,
+    state::{AdminState, uniqueness_mode, uniqueness_setting},
     sudo,
 };
 
@@ -324,5 +325,171 @@ pub async fn remove_user_identifier(
         .user_identifiers()
         .remove(state.env(), &id, &record_id)
         .await?;
+    Ok(no_content())
+}
+
+/// The uniqueness mode to evaluate, defaulting to the configured one.
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct UniquenessQuery {
+    /// `environment_wide`, `org_scoped` or `non_unique`. Omitted means the CONFIGURED
+    /// mode, which is the question an operator asks before an apply.
+    #[param(value_type = Option<String>)]
+    pub mode: Option<IdentifierUniqueness>,
+}
+
+/// One post-canonicalization collision a mode would enforce.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CollisionView {
+    /// The identifier kind the collision is within.
+    #[serde(rename = "type")]
+    pub identifier_type: String,
+    /// How many identifier rows share this canonical form in the scope.
+    pub count: i64,
+}
+
+impl From<IdentifierCollision> for CollisionView {
+    fn from(collision: IdentifierCollision) -> Self {
+        Self {
+            identifier_type: collision.identifier_type.as_str().to_owned(),
+            count: collision.count,
+        }
+    }
+}
+
+/// What a uniqueness mode would enforce in this environment.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct UniquenessView {
+    /// The mode this deployment is configured with, from `[identifiers] uniqueness`.
+    #[schema(value_type = String)]
+    pub configured_mode: IdentifierUniqueness,
+    /// The mode that was evaluated. Equal to `configured_mode` unless `mode` was given.
+    #[schema(value_type = String)]
+    pub evaluated_mode: IdentifierUniqueness,
+    /// The collisions the evaluated mode would enforce. Empty means an apply is safe.
+    /// Reports the kind and a count, never a plaintext identifier.
+    pub collisions: Vec<CollisionView>,
+}
+
+/// Report what an identifier uniqueness mode would enforce in this environment.
+#[utoipa::path(
+    get,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/identifier-uniqueness",
+    operation_id = "getIdentifierUniqueness",
+    tag = "identifiers",
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        UniquenessQuery
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "The configured mode and what the evaluated mode would enforce", body = UniquenessView),
+        (status = 400, description = "Unknown mode", body = ErrorBody),
+        (status = 401, description = "Missing or invalid credential", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "Tenant or environment not found", body = ErrorBody)
+    )
+)]
+pub async fn get_identifier_uniqueness(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+    Query(query): Query<UniquenessQuery>,
+) -> Result<Response, ApiError> {
+    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let configured = uniqueness_setting(state.identifier_uniqueness());
+    // A READ, so a soft-deleted environment answers as if live, like every other read on
+    // this surface: an operator deciding whether a decommissioned environment can be
+    // resurrected needs to see what its identifiers would collide on.
+    let evaluated = query.mode.unwrap_or(configured);
+    let collisions = state
+        .store()
+        .scoped(scope)
+        .user_identifiers()
+        .collisions_for_mode(uniqueness_mode(evaluated))
+        .await?;
+    let view = UniquenessView {
+        configured_mode: configured,
+        evaluated_mode: evaluated,
+        collisions: collisions.into_iter().map(CollisionView::from).collect(),
+    };
+    let body = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
+    Ok(json(StatusCode::OK, body))
+}
+
+/// Recompute this environment's identifier uniqueness keys under the configured mode.
+#[utoipa::path(
+    post,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/identifier-uniqueness/apply",
+    operation_id = "applyIdentifierUniqueness",
+    tag = "identifiers",
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 204, description = "Every identifier row now carries the configured mode's discriminator"),
+        (status = 400, description = "Missing Idempotency-Key", body = ErrorBody),
+        (status = 401, description = "Missing or invalid credential", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "The environment is absent or deleted", body = ErrorBody),
+        (status = 409, description = "A collision the configured mode would enforce still exists; nothing was changed", body = ErrorBody)
+    )
+)]
+pub async fn apply_identifier_uniqueness(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    sudo::require_fresh_privilege(&state, scope, actor).await?;
+
+    // This request carries NO body: the mode comes from the deployment config and the
+    // environment from the path, so method and path ARE the whole request and the
+    // fingerprint over them is complete rather than partial.
+    let key = idempotency::required_key(&headers)?;
+    let fingerprint = idempotency::fingerprint("POST", uri.path(), &[]);
+    let credential_ref = principal.credential_ref();
+    if let Some(replay) =
+        idempotency::replay_if_stored(&state, &credential_ref, &key, &fingerprint).await?
+    {
+        return Ok(replay);
+    }
+    require_live_environment(&state, &scope).await?;
+
+    // The CONFIGURED mode, never a caller-supplied one, and that is the safety property
+    // of this route rather than a limitation. New writes take their discriminator from
+    // the boot config, so recomputing existing rows under any OTHER mode would leave the
+    // stored rows and the next write disagreeing about what uniqueness means, which is
+    // the exact state migration 0041 describes as producing a "unique" three-way
+    // collision. An operator previews a candidate with `GET ?mode=`, changes the config,
+    // and then applies, so the two halves cannot diverge.
+    let mode = state.identifier_uniqueness();
+    let write = IdempotencyWrite {
+        credential_ref: &credential_ref,
+        key: &key,
+        request_fingerprint: &fingerprint,
+        response_status: 204,
+        response_body: "",
+    };
+    state
+        .store()
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(state.env()))
+        .user_identifiers()
+        .apply_uniqueness_mode(state.env(), mode, Some(write))
+        .await
+        .map_err(|error| match error {
+            StoreError::Conflict => ApiError::Conflict(
+                "a collision the configured mode would enforce still exists; nothing was \
+                 changed. Resolve the collisions this environment's identifier-uniqueness \
+                 read reports, then retry"
+                    .to_owned(),
+            ),
+            other => other.into(),
+        })?;
     Ok(no_content())
 }

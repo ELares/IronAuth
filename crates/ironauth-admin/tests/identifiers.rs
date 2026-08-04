@@ -37,6 +37,11 @@ mod common;
 use axum::http::StatusCode;
 use common::Harness;
 use ironauth_config::{IdentifierUniqueness, IdentifiersConfig};
+use ironauth_env::Env;
+use ironauth_store::{
+    CorrelationId, EnvironmentId, IdentifierType, NewUserIdentifier, Scope, TenantId,
+    UniquenessMode, UserId, UserIdentifierId,
+};
 use serde_json::Value;
 
 /// The identifiers collection path for a user.
@@ -416,4 +421,256 @@ async fn an_identifier_cannot_be_removed_through_another_users_path() {
         1,
         "the refused remove left the row intact: {response}"
     );
+}
+
+/// The environment-level uniqueness mode routes.
+fn uniqueness(tenant: &str, environment: &str) -> String {
+    format!("/v1/tenants/{tenant}/environments/{environment}/identifier-uniqueness")
+}
+
+#[tokio::test]
+async fn the_uniqueness_read_reports_the_configured_mode_and_what_a_candidate_would_enforce() {
+    // Started under NON_UNIQUE so two users can genuinely share one canonical identifier,
+    // which is the only state in which a candidate tightening has anything to report.
+    let h = Harness::start_with_identifiers(
+        50,
+        &IdentifiersConfig {
+            uniqueness: IdentifierUniqueness::NonUnique,
+        },
+    )
+    .await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let ada = user(&h, &tenant, &environment, "ada@example.test", "k-ada").await;
+    let grace = user(&h, &tenant, &environment, "grace@example.test", "k-grace").await;
+    add(
+        &h,
+        &tenant,
+        &environment,
+        &ada,
+        "shared@example.test",
+        "k-1",
+    )
+    .await;
+    add(
+        &h,
+        &tenant,
+        &environment,
+        &grace,
+        "shared@example.test",
+        "k-2",
+    )
+    .await;
+
+    // The configured mode enforces nothing, so it reports nothing.
+    let (status, _, response) = h.get(&uniqueness(&tenant, &environment)).await;
+    assert_eq!(status, StatusCode::OK, "read: {response}");
+    let view: Value = serde_json::from_str(&response).expect("json");
+    assert_eq!(view["configured_mode"], "non_unique");
+    assert_eq!(
+        view["evaluated_mode"], "non_unique",
+        "omitting the query evaluates the CONFIGURED mode"
+    );
+    assert!(
+        view["collisions"]
+            .as_array()
+            .expect("collisions")
+            .is_empty(),
+        "non_unique enforces no uniqueness, so it collides with nothing: {response}"
+    );
+
+    // The CANDIDATE tightening reports the collision it would enforce, with a kind and a
+    // count and no plaintext identifier.
+    let (status, _, response) = h
+        .get(&format!(
+            "{}?mode=environment_wide",
+            uniqueness(&tenant, &environment)
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "candidate read: {response}");
+    let view: Value = serde_json::from_str(&response).expect("json");
+    assert_eq!(
+        view["configured_mode"], "non_unique",
+        "the configured mode is reported as it is, not as the candidate"
+    );
+    assert_eq!(view["evaluated_mode"], "environment_wide");
+    let collisions = view["collisions"].as_array().expect("collisions");
+    assert_eq!(
+        collisions.len(),
+        1,
+        "one colliding canonical form: {response}"
+    );
+    assert_eq!(collisions[0]["type"], "email");
+    assert_eq!(collisions[0]["count"], 2);
+    assert!(
+        !response.contains("shared@example.test"),
+        "a collision report must never carry the plaintext identifier: {response}"
+    );
+}
+
+fn scope_of(tenant: &str, environment: &str) -> Scope {
+    Scope::new(
+        TenantId::parse(tenant).expect("tenant id"),
+        EnvironmentId::parse(environment).expect("environment id"),
+    )
+}
+
+/// Seed an identifier row DIRECTLY through the store under `mode`.
+///
+/// The HTTP surface always writes under the CONFIGURED mode, which is the whole point of
+/// the config seam, so it cannot produce the state this test needs: rows written loosely
+/// while the deployment is configured tightly. That is precisely the state an operator
+/// lands in after editing the config and restarting, and the store is the only way to
+/// construct it here.
+async fn seed_loose(h: &Harness, scope: Scope, user: &str, raw: &str) {
+    let env = Env::system();
+    let subject = UserId::parse_in_scope(user, &scope).expect("user id in scope");
+    h.control_store()
+        .scoped(scope)
+        .acting(h.test_actor(&env), CorrelationId::generate(&env))
+        .user_identifiers()
+        .add(
+            &env,
+            NewUserIdentifier {
+                id: &UserIdentifierId::generate(&env, &scope),
+                user_id: &subject,
+                identifier_type: IdentifierType::Email,
+                raw,
+                verified: false,
+                // NON_UNIQUE leaves `uniqueness_key` NULL, so the row sits OUTSIDE the
+                // partial unique index and a second identical one is accepted.
+                mode: UniquenessMode::NonUnique,
+                org: None,
+            },
+            None,
+        )
+        .await
+        .expect("seed a loosely keyed identifier");
+}
+
+#[tokio::test]
+async fn applying_the_configured_mode_is_refused_while_a_collision_it_would_enforce_exists() {
+    // Configured ENVIRONMENT_WIDE, with rows that were written loosely. This is the state
+    // an operator is in the moment after they tighten the config and restart: new writes
+    // would be refused, but the EXISTING rows still carry NULL discriminators and are
+    // exempt from the index, which is the gap migration 0041 describes as producing a
+    // "unique" three-way collision if a recompute is skipped.
+    let h = Harness::start_with_identifiers(
+        50,
+        &IdentifiersConfig {
+            uniqueness: IdentifierUniqueness::EnvironmentWide,
+        },
+    )
+    .await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let scope = scope_of(&tenant, &environment);
+    let ada = user(&h, &tenant, &environment, "ada@example.test", "k-ada").await;
+    let grace = user(&h, &tenant, &environment, "grace@example.test", "k-grace").await;
+    seed_loose(&h, scope, &ada, "shared@example.test").await;
+    seed_loose(&h, scope, &grace, "shared@example.test").await;
+
+    // The read names the collision before anything is attempted.
+    let (_, _, response) = h.get(&uniqueness(&tenant, &environment)).await;
+    let view: Value = serde_json::from_str(&response).expect("json");
+    assert_eq!(
+        view["collisions"].as_array().expect("collisions").len(),
+        1,
+        "the configured mode has a collision to report: {response}"
+    );
+
+    // The apply REFUSES rather than recomputing into a state the index cannot hold.
+    let (status, _, response) = h
+        .post(
+            &format!("{}/apply", uniqueness(&tenant, &environment)),
+            "k-refused",
+            "",
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "the apply must refuse while a collision the configured mode would enforce still \
+         exists: {response}"
+    );
+
+    // Nothing changed: the collision is still reported, so the refusal rolled the whole
+    // recompute back rather than partially applying it.
+    let (_, _, response) = h.get(&uniqueness(&tenant, &environment)).await;
+    let view: Value = serde_json::from_str(&response).expect("json");
+    assert_eq!(
+        view["collisions"].as_array().expect("collisions").len(),
+        1,
+        "a refused apply changes nothing: {response}"
+    );
+
+    // Removing one side resolves it, and the SAME apply then succeeds. Without this the
+    // refusal above could be a route that always answers 409.
+    let (_, _, listed) = h.get(&base(&tenant, &environment, &grace)).await;
+    let listed: Value = serde_json::from_str(&listed).expect("json");
+    let doomed = listed["items"][0]["id"].as_str().expect("id").to_owned();
+    let (status, _, _) = h
+        .delete(&format!("{}/{doomed}", base(&tenant, &environment, &grace)))
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, _, response) = h
+        .post(
+            &format!("{}/apply", uniqueness(&tenant, &environment)),
+            "k-resolved",
+            "",
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "once the collision is gone the same apply succeeds: {response}"
+    );
+
+    // And the recompute actually took effect: the surviving row now carries the
+    // environment-wide discriminator, so a fresh claim on that canonical form is refused.
+    // Before the apply it was NULL and therefore exempt, which is the bug the recompute
+    // exists to close.
+    let (status, _, response) = h
+        .post(
+            &base(&tenant, &environment, &grace),
+            "k-after",
+            &body("email", "shared@example.test"),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "after the recompute the surviving row is INSIDE the partial unique index: \
+         {response}"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_candidate_mode_is_refused_rather_than_silently_defaulted() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (status, _, response) = h
+        .get(&format!(
+            "{}?mode=whatever",
+            uniqueness(&tenant, &environment)
+        ))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an unknown mode must be refused, not quietly evaluated as the configured one, \
+         which would report an all-clear for a mode the operator never asked about: \
+         {response}"
+    );
+}
+
+#[tokio::test]
+async fn replaying_the_apply_key_returns_the_original_response() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let path = format!("{}/apply", uniqueness(&tenant, &environment));
+
+    let (first, _, _) = h.post(&path, "k-apply", "").await;
+    assert_eq!(first, StatusCode::NO_CONTENT);
+    let (again, _, response) = h.post(&path, "k-apply", "").await;
+    assert_eq!(again, StatusCode::NO_CONTENT, "replay: {response}");
 }

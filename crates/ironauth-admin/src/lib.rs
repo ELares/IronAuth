@@ -742,6 +742,19 @@ pub fn management_router(state: AdminState) -> Router {
             "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/identifiers/{identifier_id}",
             delete(identifiers::remove_user_identifier),
         )
+        // The identifier uniqueness MODE change path (issue #54, epic #514). The store
+        // has carried the two-step preview and apply since #54 and neither had a
+        // production caller, so an operator could pick a mode at boot and had no way to
+        // migrate a populated environment onto it. The read evaluates any candidate mode;
+        // the apply runs the CONFIGURED one only.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/identifier-uniqueness",
+            get(identifiers::get_identifier_uniqueness),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/identifier-uniqueness/apply",
+            post(identifiers::apply_identifier_uniqueness),
+        )
         // Per-environment identity trait-schema versions (issue #53): the append-only registry
         // (create / list / get) plus the two pointers, the ACTIVE read that is also the schema
         // introspection endpoint, and the cutover-gated activate. `/active` is a STATIC segment
