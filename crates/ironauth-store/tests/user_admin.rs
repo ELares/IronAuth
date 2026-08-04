@@ -16,8 +16,9 @@ use ironauth_env::Env;
 use ironauth_store::idor_harness::IdorHarness;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
-    CorrelationId, CursorPosition, NewAdminUser, NewSession, Scope, SessionId, StoreError, UserId,
-    UserListFilter, UserState,
+    CorrelationId, CursorPosition, IdentifierType, NewAdminUser, NewSession, NewUserIdentifier,
+    Scope, SessionId, StoreError, UniquenessMode, UserId, UserIdentifierId, UserListFilter,
+    UserState,
 };
 use sqlx::Row;
 
@@ -960,6 +961,30 @@ async fn idor_harness_denies_cross_scope_user_surfaces_uniformly() {
     )
     .await
     .expect("victim a2");
+    // A login identifier on victim B, so the identifier probes hunt a foreign row of
+    // their OWN key type rather than being vacuous, the same discipline the external-id
+    // and by-identifier probes already follow below.
+    let victim_identifier = UserIdentifierId::generate(&env, &scope_b);
+    db.store()
+        .scoped(scope_b)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .user_identifiers()
+        .add(
+            &env,
+            NewUserIdentifier {
+                id: &victim_identifier,
+                user_id: &victim_b,
+                identifier_type: IdentifierType::Email,
+                raw: "vb-identifier@example.test",
+                verified: false,
+                mode: UniquenessMode::EnvironmentWide,
+                org: None,
+            },
+            None,
+        )
+        .await
+        .expect("seed victim b's login identifier");
+
     // A well-formed but absent id in the caller's OWN scope: the uniformity baseline.
     let absent_in_a = UserId::generate(&env, &scope_a).to_string();
 
@@ -979,9 +1004,12 @@ async fn idor_harness_denies_cross_scope_user_surfaces_uniformly() {
             "users.state_for_subject",
             "users.claims_for_subject",
             "users.by_identifier",
+            "user_identifiers.list_for_user",
+            "user_identifiers.add",
         ],
         "every scope-embedding user surface is registered, the by-subject data-plane \
-         reads included (issue #241)"
+         reads included (issue #241) and the flexible login-identifier surface too \
+         (issue #54, epic #514)"
     );
 
     // The foreign references include victim B's REAL external-id value AND its REAL login
@@ -1008,6 +1036,28 @@ async fn idor_harness_denies_cross_scope_user_surfaces_uniformly() {
     // victim's OWN scope resolves the identical argument that read nothing under the
     // caller's. See the helper for what that does and does not cover.
     assert_every_keyed_read_resolves_in_its_own_scope(&db, scope_b, &victim_b.to_string()).await;
+
+    // The identifier list probe's own positive control: the SAME read that returned
+    // nothing under the caller resolves under the victim's scope. Without it a leak-free
+    // score here would be indistinguishable from a user that simply has no identifiers.
+    let own_scope = db
+        .store()
+        .scoped(scope_b)
+        .user_identifiers()
+        .list_for_user(&victim_b)
+        .await
+        .expect("victim b's own scope lists its identifiers");
+    assert_eq!(
+        own_scope.len(),
+        1,
+        "the identifier the caller could not see is really there in the victim's scope"
+    );
+
+    // And the identifier MUTATION probe changed nothing: exactly one row, the seeded one,
+    // with its value intact, so `user_identifiers.add` planted no handle on the foreign
+    // account.
+    assert_eq!(own_scope[0].id, victim_identifier);
+    assert_eq!(own_scope[0].raw, "vb-identifier@example.test");
 }
 
 /// The non-vacuity half of `idor_harness_denies_cross_scope_user_surfaces_uniformly`.
@@ -1021,11 +1071,20 @@ async fn idor_harness_denies_cross_scope_user_surfaces_uniformly() {
 ///
 /// # What this does NOT control, stated rather than implied
 ///
-/// The harness registers ELEVEN probes. Ten are keyed; `users.list` is the one that is not
-/// (it takes no key, and its foreign row is asserted absent from a page that is otherwise
-/// populated, which is its own non-vacuity argument). Of the ten keyed probes, five are the
-/// reads above and five are MUTATIONS: `users.delete`, `users.set_state`,
-/// `users.update_claims`, `users.external_id.link`, `users.external_id.unlink`.
+/// The harness registers THIRTEEN probes. Twelve are keyed; `users.list` is the one that is
+/// not (it takes no key, and its foreign row is asserted absent from a page that is
+/// otherwise populated, which is its own non-vacuity argument). Of the twelve keyed probes,
+/// six are reads and six are MUTATIONS: `users.delete`, `users.set_state`,
+/// `users.update_claims`, `users.external_id.link`, `users.external_id.unlink` and
+/// `user_identifiers.add`.
+///
+/// The sixth keyed read is `user_identifiers.list_for_user`, and its control is not in this
+/// helper: it lives inline at the end of the test, because it reads a DIFFERENT table and
+/// asserts a row count rather than a resolution. `user_identifiers.add` is also the one
+/// MUTATION in the suite that gets a direct control, for a reason the note below says the
+/// user mutations cannot have: planting a login identifier does not destroy the user row
+/// the read controls depend on, so the seeded identifier is simply re-read afterwards and
+/// asserted to be the only one.
 ///
 /// The five mutations get no control of this shape, and cannot: driving one under the
 /// victim's own scope to prove it "resolves" would DELETE, BLOCK, or REWRITE the very row
