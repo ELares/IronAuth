@@ -16,12 +16,36 @@
 //! equivalent, kept here so the security core does not take a dependency on the
 //! configuration crate (the wrong dependency direction) just to redact bytes.
 //!
-//! This wrapper does not zero the value on drop: `ring`'s key types already own
-//! and protect the live key material, and adding a zeroizing dependency to the
-//! crypto core is out of scope for M1. The guarantee here is "never printed",
-//! not "scrubbed from memory".
+//! [`Redacted`] itself still does not zero on drop, and cannot: it is generic
+//! over `T`, so it has no way to wipe an arbitrary value. Its guarantee remains
+//! "never printed". Scrubbing is the job of the concrete types that OWN secret
+//! bytes, and each of them now does it on drop through [`wipe`] (issue #187):
+//! `ClientSecret` here, `AeadKey` in [`crate::envelope`], the transient Ed25519
+//! seed in [`crate::signing_key`], and outside this crate `SecretString` and the
+//! day-one key material.
+//!
+//! `ring`'s internal key storage is NOT zeroizing and is outside our control, so
+//! a signing key's live material still resides in memory `ring` owns. What is
+//! covered is every secret buffer this workspace allocates itself.
 
 use std::fmt;
+
+/// Best-effort wipe of a buffer that held secret material, so it does not linger
+/// in freed heap or on the stack.
+///
+/// A byte fill the optimizer is discouraged from eliding by a `black_box` read.
+/// No `unsafe` and no extra crate, which is what makes it usable in the crypto
+/// core: `zeroize` would give a stronger volatile write, and that tradeoff is
+/// recorded in the module docs above rather than silently taken.
+///
+/// BEST EFFORT is meant literally. It cannot reach a copy the allocator already
+/// moved (a `Vec` that reallocated as it grew, a value moved between stack
+/// slots), so it shortens the window in which a secret sits in readable memory
+/// rather than closing it.
+pub fn wipe(buf: &mut [u8]) {
+    buf.fill(0);
+    std::hint::black_box(&*buf);
+}
 
 /// A value that must never be printed, logged, or serialized.
 ///
@@ -45,6 +69,11 @@ impl<T> Redacted<T> {
     #[must_use]
     pub fn expose(&self) -> &T {
         &self.0
+    }
+
+    /// Borrow the wrapped secret mutably, so an owner can wipe it on drop.
+    pub(crate) fn expose_mut(&mut self) -> &mut T {
+        &mut self.0
     }
 
     /// Consume the wrapper and return the secret. As with [`Redacted::expose`],
@@ -75,7 +104,7 @@ impl<T> From<T> for Redacted<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::Redacted;
+    use super::{Redacted, wipe};
 
     #[test]
     fn debug_and_display_hide_the_value() {
@@ -91,5 +120,16 @@ mod tests {
         let secret = Redacted::new(String::from("hunter2"));
         assert_eq!(secret.expose(), "hunter2");
         assert_eq!(secret.into_inner(), "hunter2");
+    }
+
+    #[test]
+    fn wipe_zeroes_every_byte_and_keeps_the_buffer_length() {
+        // Issue #187. Length is asserted alongside the zeroing so the helper cannot
+        // satisfy this by truncating: the point is that the bytes the secret
+        // OCCUPIED are overwritten, not that the buffer is made to look empty.
+        let mut buf = [0xAB_u8; 32];
+        wipe(&mut buf);
+        assert_eq!(buf.len(), 32);
+        assert!(buf.iter().all(|&b| b == 0), "got {buf:?}");
     }
 }

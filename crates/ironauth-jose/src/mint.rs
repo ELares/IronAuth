@@ -200,6 +200,14 @@ impl ClientSecret {
     }
 }
 
+impl Drop for ClientSecret {
+    fn drop(&mut self) {
+        // The registered client secret is the HMAC key for `HS*` signing, so the
+        // bytes are live key material for as long as this value exists.
+        crate::redact::wipe(self.0.expose_mut());
+    }
+}
+
 /// The two, and only two, contexts in which IronAuth signs with a client secret.
 ///
 /// This enum is the type-level gate on `HS*` signing: HMAC signing is a method
@@ -408,3 +416,26 @@ impl std::fmt::Display for SignError {
 }
 
 impl std::error::Error for SignError {}
+
+#[cfg(test)]
+mod client_secret_tests {
+    use super::ClientSecret;
+    use crate::redact::wipe;
+
+    #[test]
+    fn a_client_secret_carries_a_drop_that_wipes_its_key_material() {
+        // Issue #187. The wipe on drop is not observable from safe Rust once the
+        // allocation is freed, so what is driven here is the path the destructor
+        // takes: the buffer it reaches is the secret's own bytes, wiped in place
+        // with its length preserved.
+        //
+        // Deliberately NOT `assert!(needs_drop::<ClientSecret>())`: that holds
+        // because the type contains a `Vec`, with or without the `Drop`, so it
+        // could never fail.
+        let mut secret = ClientSecret::new(b"a-registered-client-secret".to_vec());
+        let len = secret.0.expose().len();
+        wipe(secret.0.expose_mut());
+        assert_eq!(secret.0.expose().len(), len);
+        assert!(secret.0.expose().iter().all(|&b| b == 0));
+    }
+}

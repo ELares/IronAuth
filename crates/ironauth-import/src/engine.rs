@@ -256,6 +256,14 @@ struct PreparedCredential {
 /// #58/#69): the DECODED seed (Base32 opened back to raw bytes, ready to re-seal), the
 /// bounds-checked parameters and friendly name, the status, and the single-use step.
 /// The seed is secret material; the redacting `Debug` keeps a dump from spilling it.
+impl Drop for PreparedTotp {
+    fn drop(&mut self) {
+        // The decoded seed is the live TOTP factor, held here between Base32 decode
+        // and re-seal. Best-effort wipe on drop (issue #187).
+        ironauth_jose::wipe(&mut self.seed);
+    }
+}
+
 struct PreparedTotp {
     seed: Vec<u8>,
     friendly_name: String,

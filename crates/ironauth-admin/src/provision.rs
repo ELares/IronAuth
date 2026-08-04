@@ -49,6 +49,18 @@ struct DayOneKey {
     material: Vec<u8>,
 }
 
+impl Drop for DayOneKey {
+    fn drop(&mut self) {
+        // `material` is a raw private key: an Ed25519 seed, an ECDSA PKCS#8
+        // document, or an RSA PKCS#1 document. Best-effort wipe on drop, the same
+        // treatment `ironauth-jose` gives its own owned key buffers. It cannot
+        // reach a copy the allocator already moved, so it shortens the window
+        // rather than closing it.
+        self.material.fill(0);
+        std::hint::black_box(&self.material);
+    }
+}
+
 impl DayOneKey {
     /// Borrow this key as a [`NewSigningKey`] to provision, live (published and
     /// active) from `activate_at_micros`.

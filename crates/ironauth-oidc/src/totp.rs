@@ -572,6 +572,28 @@ pub(crate) async fn has_passkey(state: &OidcState, scope: Scope, subject: &UserI
 /// The provisioning material for a pending TOTP enrollment driven by the headless flow
 /// engine (issue #84): the `tot_` credential id to carry on the flow row, plus the
 /// `otpauth://` URI and grouped Base32 secret to render so the user can add the factor.
+/// Wipe a `String` that held secret material: take its allocation, zero the
+/// bytes, and let the `Vec` free an already-zeroed buffer. `into_bytes` reuses
+/// the SAME allocation, so this reaches the bytes without `unsafe`.
+///
+/// Returns the wiped buffer so the behaviour is observable to a test; a wipe on
+/// drop cannot be inspected from safe Rust once the allocation is freed.
+fn wipe_string(value: &mut String) -> Vec<u8> {
+    let mut bytes = core::mem::take(value).into_bytes();
+    ironauth_jose::wipe(&mut bytes);
+    bytes
+}
+
+impl Drop for FlowEnrollBegin {
+    fn drop(&mut self) {
+        // BOTH fields carry the shared secret: `secret` is the Base32 rendering and
+        // `otpauth_uri` embeds the same value in its query string. Wiping only the
+        // obvious one would leave the factor sitting in the URI (issue #187).
+        drop(wipe_string(&mut self.secret));
+        drop(wipe_string(&mut self.otpauth_uri));
+    }
+}
+
 pub(crate) struct FlowEnrollBegin {
     /// The pending `tot_` credential id.
     pub credential_id: String,
@@ -1488,5 +1510,30 @@ mod tests {
                 },
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod enroll_secret_tests {
+    use super::wipe_string;
+
+    #[test]
+    fn wiping_a_secret_string_zeroes_the_allocation_it_occupied() {
+        // Issue #187. The wiped buffer is the SAME allocation the secret occupied,
+        // so its LENGTH survives while every byte reads zero. Asserting the length
+        // alongside the zeroing is what stops this passing on a truncation.
+        let mut value = String::from("JBSWY3DPEHPK3PXP");
+        let len = value.len();
+        let wiped = wipe_string(&mut value);
+        assert_eq!(
+            wiped.len(),
+            len,
+            "the secret's own allocation is what was wiped"
+        );
+        assert!(
+            wiped.iter().all(|&b| b == 0),
+            "every byte of the shared secret must be zeroed, got {wiped:?}"
+        );
+        assert!(value.is_empty(), "the source no longer holds the secret");
     }
 }
