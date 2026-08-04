@@ -99,6 +99,7 @@ mod sudo;
 mod tenants;
 mod trait_schemas;
 mod users;
+mod variables;
 mod views;
 
 use axum::Router;
@@ -357,6 +358,20 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/permissions",
             post(permissions::create_permission).get(permissions::list_permissions),
+        )
+        // Environment VARIABLE management (issue #235, follow-up to #45). The variable half
+        // only: a variable is non-secret by construction, so the control plane manages it with
+        // no envelope master key, using the grants 0100 already gave `ironauth_control`. The
+        // SECRET half needs a plane and master-key decision and is tracked separately.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/variables",
+            get(variables::list_variables),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/variables/{name}",
+            get(variables::get_variable)
+                .put(variables::set_variable)
+                .delete(variables::delete_variable),
         )
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/permissions/{permission_id}",

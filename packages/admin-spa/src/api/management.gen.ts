@@ -2055,6 +2055,42 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/variables": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List the variables of an environment (cursor paginated). */
+        get: operations["listVariables"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/variables/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get one variable by name. */
+        get: operations["getVariable"];
+        /** Set (create or replace) a variable by name. */
+        put: operations["setVariable"];
+        post?: never;
+        /** Delete a variable by name. */
+        delete: operations["deleteVariable"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/webauthn/mds3/health": {
         parameters: {
             query?: never;
@@ -4964,6 +5000,11 @@ export interface components {
             /** @description The target state. */
             state: components["schemas"]["UserStateView"];
         };
+        /** @description Set (create or replace) a variable. */
+        SetVariableRequest: {
+            /** @description The value to store. */
+            value: string;
+        };
         /** @description One interop-table row as surfaced by the recommendations endpoint. */
         SigningRecommendationView: {
             /** @description The supported minus recommended alternatives (JOSE algorithm names). */
@@ -5551,6 +5592,41 @@ export interface components {
              * @description Last-mutation time, milliseconds since the Unix epoch.
              */
             updated_at_unix_ms: number;
+        };
+        /** @description One page of environment variables. */
+        VariableList: {
+            /** @description The variables in this page. */
+            items: components["schemas"]["VariableView"][];
+            /** @description The cursor for the next page, absent on the last page. */
+            next_cursor?: string | null;
+        };
+        /** @description One environment variable. */
+        VariableView: {
+            /**
+             * Format: int64
+             * @description Creation time in Unix milliseconds.
+             */
+            created_at_unix_ms: number;
+            /** @description The variable identifier (`var_...`). */
+            id: string;
+            /** @description The variable name, unique within the environment. */
+            name: string;
+            /**
+             * Format: int64
+             * @description Last update time in Unix milliseconds.
+             */
+            updated_at_unix_ms: number;
+            /**
+             * @description The variable value. Variables are NON-SECRET by construction, so unlike a secret the
+             *     value is returned on read; anything that must not be readable belongs in a secret.
+             */
+            value: string;
+            /**
+             * Format: int32
+             * @description The revision counter, incremented on every write. Exposed for observability, and
+             *     deliberately NOT accepted as a precondition on write: see the note on `set_variable`.
+             */
+            version: number;
         };
         /** @description One declared verification address (issue #53): the trait name and its kind. */
         VerificationAddressView: {
@@ -15652,6 +15728,246 @@ export interface operations {
             };
             /** @description Not found (absent or in another scope) */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listVariables: {
+        parameters: {
+            query?: {
+                /** @description Page size */
+                limit?: number;
+                /** @description Opaque cursor from a previous page */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description One page of variables */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["VariableList"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    getVariable: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The variable name */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The variable */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["VariableView"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found (absent or in another scope) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    setVariable: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Required. Replaying a PUT with the same key returns the original response. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The variable name */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetVariableRequest"];
+            };
+        };
+        responses: {
+            /** @description Stored. The full record, with its version and timestamps, is available from the GET */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Malformed request or invalid name */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment is absent or not live */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Idempotency-Key reused with a different request */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    deleteVariable: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The variable name */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found (absent or in another scope) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Still referenced by another variable */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

@@ -129,6 +129,7 @@ fn operation_ids_are_the_stable_set() {
             "deleteSignupForm",
             "deleteTenant",
             "deleteUser",
+            "deleteVariable",
             "disableOrganization",
             "elevateAdminSudo",
             "enableOrganization",
@@ -171,6 +172,7 @@ fn operation_ids_are_the_stable_set() {
             "getTraitSchemaVersion",
             "getUser",
             "getUserTraits",
+            "getVariable",
             "liftBan",
             "linkUserExternalId",
             "listBans",
@@ -203,6 +205,7 @@ fn operation_ids_are_the_stable_set() {
             "listTraitSchemaVersions",
             "listUserConsents",
             "listUsers",
+            "listVariables",
             "pinFlowVersion",
             "planConfigPromotion",
             "postFlowDryRun",
@@ -230,6 +233,7 @@ fn operation_ids_are_the_stable_set() {
             "setOutboundVerification",
             "setSignupForm",
             "setUserState",
+            "setVariable",
             "suspendTenant",
             "unassignOrgGroupRole",
             "unassignOrgMembershipRole",
@@ -404,6 +408,7 @@ fn documented_paths_are_the_expected_set() {
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/permissions/{permission_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/external-id",
+            "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/variables/{name}",
             "GET /v1/interop/signing-recommendations",
             "GET /v1/operators",
             "GET /v1/operators/{operator_id}",
@@ -471,6 +476,8 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/consents",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/traits",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/variables",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/variables/{name}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/webauthn/mds3/health",
             "PATCH /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}",
             "PATCH /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}",
@@ -540,6 +547,7 @@ fn documented_paths_are_the_expected_set() {
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/default-role",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/parent",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/external-id",
+            "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/variables/{name}",
         ]
     );
 }
@@ -631,7 +639,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        159,
+        163,
         "the documented route count is pinned"
     );
 
