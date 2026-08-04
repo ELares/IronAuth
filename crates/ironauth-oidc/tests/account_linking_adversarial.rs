@@ -1151,3 +1151,133 @@ async fn remove_linked_identity_audits_and_notifies_and_the_last_method_guard_bl
         "nothing was deleted"
     );
 }
+
+// ===========================================================================
+// The legacy-handle fallback (epic #514): a user who predates `user_identifiers`.
+// ===========================================================================
+
+#[tokio::test]
+async fn a_user_with_only_a_legacy_handle_is_found_and_reaches_the_interstitial_never_a_link() {
+    let harness = Harness::start().await;
+    seed_trait_schema(&harness).await;
+    seed_connector(&harness, "trusted").await;
+    set_env_posture(&harness, Some("verified_to_verified")).await;
+
+    // A PRE-EXISTING user: their login handle lives in `users.identifier` and there is NO
+    // `user_identifiers` row, which is every user who predates that surface. Note the
+    // deliberate absence of an `add_email` call, which is the whole fixture.
+    let legacy = subject_id(
+        &harness,
+        &harness.seed_user("legacy@example.test", "pw").await,
+    );
+
+    // The same person social-logs-in, on a TRUSTED connector asserting email_verified. Every
+    // cell of the decision tuple is green EXCEPT the local verified state, which the legacy
+    // handle cannot supply because no column records it.
+    let mock = start_mock().await;
+    let status = login(
+        &harness,
+        &mock,
+        "legacy-sub",
+        json!({"email": "legacy@example.test", "email_verified": true, "name": "Legacy"}),
+    )
+    .await;
+
+    // Found, so the interstitial asks the human to prove they own both sides. Before the
+    // fallback this answered "no local account" and PROVISIONED a duplicate, which is the
+    // defect: a returning user quietly acquired a second account.
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a legacy local match must reach the interstitial rather than provisioning a second \
+         account for someone who already has one"
+    );
+    assert!(
+        provisioned(&harness, "legacy-sub").await.is_none(),
+        "the interstitial provisions nothing: a duplicate account is the defect this closes"
+    );
+    // And it must NEVER auto-link. The fallback contributes existence only, so the one arm
+    // that auto-links is structurally unreachable through it: `users.identifier` has no
+    // per-handle verified state, and asserting one would be inventing a verification.
+    assert!(
+        links_for(&harness, &legacy).await.is_empty(),
+        "a legacy handle must never be treated as a VERIFIED local account"
+    );
+}
+
+#[tokio::test]
+async fn the_legacy_fallback_does_not_change_the_default_posture() {
+    let harness = Harness::start().await;
+    seed_trait_schema(&harness).await;
+    seed_connector(&harness, "trusted").await;
+    // Posture OFF is the conservative default, and the decision table's `(Off, ..)` arm
+    // ignores the local match entirely. A deployment that has not opted in must therefore
+    // see NO behaviour change from the fallback, which is what makes this safe to land
+    // ahead of any backfill.
+    set_env_posture(&harness, None).await;
+
+    let legacy = subject_id(
+        &harness,
+        &harness.seed_user("legacy@example.test", "pw").await,
+    );
+
+    let mock = start_mock().await;
+    let status = login(
+        &harness,
+        &mock,
+        "legacy-sub",
+        json!({"email": "legacy@example.test", "email_verified": true, "name": "Legacy"}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "posture off completes the login"
+    );
+    assert!(
+        provisioned(&harness, "legacy-sub").await.is_some(),
+        "under posture off a federated identity still provisions its own separate account, \
+         exactly as before the fallback existed"
+    );
+    assert!(
+        links_for(&harness, &legacy).await.is_empty(),
+        "and it is still not linked into the local account"
+    );
+}
+
+#[tokio::test]
+async fn a_flexible_identifier_still_wins_and_can_still_auto_link() {
+    let harness = Harness::start().await;
+    seed_trait_schema(&harness).await;
+    seed_connector(&harness, "trusted").await;
+    set_env_posture(&harness, Some("verified_to_verified")).await;
+
+    // This user has BOTH a legacy handle and a VERIFIED flexible identifier. The flexible
+    // table is authoritative and is consulted first, so the auto-link path is unchanged: the
+    // fallback must not shadow a verified match and turn an auto-link into an interstitial.
+    let user = subject_id(
+        &harness,
+        &harness.seed_user("both@example.test", "pw").await,
+    );
+    add_email(&harness, &user, "both@example.test", true).await;
+
+    let mock = start_mock().await;
+    let status = login(
+        &harness,
+        &mock,
+        "both-sub",
+        json!({"email": "both@example.test", "email_verified": true, "name": "Both"}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "the auto-link establishes a session"
+    );
+    assert_eq!(
+        links_for(&harness, &user).await.len(),
+        1,
+        "a VERIFIED flexible identifier still auto-links; the legacy fallback must not \
+         shadow it into the interstitial"
+    );
+}
