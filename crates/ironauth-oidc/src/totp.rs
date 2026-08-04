@@ -986,9 +986,52 @@ pub async fn recovery_regenerate(
     if !interaction::same_origin_ok(&headers, state.self_origin().as_deref()) {
         return forbidden();
     }
-    let account = match authenticate(&state, &tenant_id, &environment_id, &headers).await {
-        Ok(account) => account,
-        Err(response) => return response,
+    // Resolve the session directly (not the shared `authenticate`) so the downgrade gate
+    // below can read the session's freshness and strength, exactly as TOTP removal does.
+    let Some(scope) = parse_scope(&tenant_id, &environment_id) else {
+        return not_found();
+    };
+    let Some(session) = interaction::resolve_session(&state, scope, &headers).await else {
+        return unauthenticated();
+    };
+    let Ok(subject) = UserId::parse_in_scope(&session.subject, &scope) else {
+        return unauthenticated();
+    };
+    // THE #81 downgrade-invariant gate, whose FIFTH call site this is (issue #275).
+    // Regeneration is not a removal by name, but it is one by effect: it DESTROYS the
+    // existing set (`replace_all` deletes every prior code) and mints a replacement. Run
+    // from a weaker recovered session that is still inside its recovery window, that
+    // invalidates the victim's codes and hands the actor a set only they know, which is a
+    // persistence foothold of exactly the shape the invariant exists to refuse.
+    //
+    // `RecoveryCode` is `mfa`-level, so the gate demands an equal-or-stronger re-verify to
+    // proceed immediately, or the elapsed delay window with its notifications. The other
+    // four factor mutations (TOTP removal, the two in `account`, passkey removal) already
+    // answer this; the recovery-code set was the one that did not.
+    //
+    // BEFORE the proof check below, so a blocked request costs no password hashing, and so
+    // the refusal does not depend on whether the actor's proof happens to verify.
+    let reverify = crate::recovery::fresh_session_reverify_acr(
+        &state,
+        session.auth_time_unix_micros,
+        &session.auth_methods,
+    );
+    if !crate::recovery::gate_factor_removal(
+        &state,
+        scope,
+        &subject,
+        crate::recovery::RecoveryFactor::RecoveryCode,
+        reverify,
+    )
+    .await
+    .is_allowed()
+    {
+        return recovery_downgrade_blocked();
+    }
+    let account = Account {
+        scope,
+        subject,
+        subject_str: session.subject,
     };
     let Json(body) = body.unwrap_or_default();
     // The fresh-auth gate: refuse to regenerate without a verified current credential.
