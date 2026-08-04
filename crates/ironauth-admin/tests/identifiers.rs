@@ -34,8 +34,9 @@
 
 mod common;
 
-use axum::http::StatusCode;
-use common::Harness;
+use axum::body::Body;
+use axum::http::{Request, StatusCode, header};
+use common::{Harness, OPERATOR_TOKEN};
 use ironauth_config::{IdentifierUniqueness, IdentifiersConfig};
 use ironauth_env::Env;
 use ironauth_store::{
@@ -673,4 +674,52 @@ async fn replaying_the_apply_key_returns_the_original_response() {
     assert_eq!(first, StatusCode::NO_CONTENT);
     let (again, _, response) = h.post(&path, "k-apply", "").await;
     assert_eq!(again, StatusCode::NO_CONTENT, "replay: {response}");
+}
+
+/// A POST carrying NO `Idempotency-Key`, which the harness's own helper always sends.
+async fn post_without_key(h: &Harness, path: &str, body: &str) -> StatusCode {
+    let request = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header(header::AUTHORIZATION, format!("Bearer {OPERATOR_TOKEN}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_owned()))
+        .expect("request builds");
+    h.send(request).await.0
+}
+
+#[tokio::test]
+async fn both_identifier_posts_refuse_a_request_with_no_idempotency_key() {
+    // These two routes have called `required_key` all along, and the published OpenAPI
+    // never declared the header. A client generated from that spec omits it and gets a
+    // 400 the contract did not predict; `applyIdentifierUniqueness` even documented a
+    // "Missing Idempotency-Key" 400 while listing no such parameter.
+    //
+    // The annotations now declare it, and this is what stops that from being one more
+    // sentence nothing enforces: it drives both routes with the header ABSENT and
+    // asserts they genuinely refuse. If a future change made the key optional, the
+    // documentation would become false and this would fail.
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let subject = user(&h, &tenant, &environment, "keyless@example.test", "k-user").await;
+
+    let add = base(&tenant, &environment, &subject);
+    assert_eq!(
+        post_without_key(
+            &h,
+            &add,
+            r#"{"kind":"email","value":"second@example.test"}"#
+        )
+        .await,
+        StatusCode::BAD_REQUEST,
+        "addUserIdentifier requires the Idempotency-Key it now documents"
+    );
+
+    let apply =
+        format!("/v1/tenants/{tenant}/environments/{environment}/identifier-uniqueness/apply");
+    assert_eq!(
+        post_without_key(&h, &apply, "").await,
+        StatusCode::BAD_REQUEST,
+        "applyIdentifierUniqueness requires the Idempotency-Key it now documents"
+    );
 }

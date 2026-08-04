@@ -155,7 +155,9 @@ pub async fn list_user_identifiers(
     params(
         ("tenant_id" = String, Path, description = "The tenant identifier"),
         ("environment_id" = String, Path, description = "The environment identifier"),
-        ("user_id" = String, Path, description = "The user identifier (usr_...)")
+        ("user_id" = String, Path, description = "The user identifier (usr_...)"),
+        ("Idempotency-Key" = String, Header, description = "Required. Replaying a POST \
+         with the same key returns the original response without re-executing.")
     ),
     security(("bearer" = [])),
     responses(
@@ -164,7 +166,8 @@ pub async fn list_user_identifiers(
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
         (status = 404, description = "The environment is absent or deleted, or the user is absent or in another scope", body = ErrorBody),
-        (status = 409, description = "The canonical identifier is already taken within the configured uniqueness scope", body = ErrorBody)
+        (status = 409, description = "The canonical identifier is already taken within the configured uniqueness scope", body = ErrorBody),
+        (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
     )
 )]
 pub async fn add_user_identifier(
@@ -425,7 +428,9 @@ pub async fn get_identifier_uniqueness(
     tag = "identifiers",
     params(
         ("tenant_id" = String, Path, description = "The tenant identifier"),
-        ("environment_id" = String, Path, description = "The environment identifier")
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("Idempotency-Key" = String, Header, description = "Required. Replaying a POST \
+         with the same key returns the original response without re-executing.")
     ),
     security(("bearer" = [])),
     responses(
@@ -434,7 +439,8 @@ pub async fn get_identifier_uniqueness(
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
         (status = 404, description = "The environment is absent or deleted", body = ErrorBody),
-        (status = 409, description = "A collision the configured mode would enforce still exists; nothing was changed", body = ErrorBody)
+        (status = 409, description = "A collision the configured mode would enforce still exists; nothing was changed", body = ErrorBody),
+        (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
     )
 )]
 pub async fn apply_identifier_uniqueness(
