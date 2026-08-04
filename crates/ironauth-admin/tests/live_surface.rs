@@ -898,6 +898,7 @@ impl Fixture {
                     expires_at_unix_micros: None,
                 },
                 SEED_MICROS,
+                None,
             )
             .await
             .expect("seed an abuse ban");
@@ -3586,5 +3587,86 @@ async fn every_environment_scoped_write_refuses_a_soft_deleted_environment() {
          ran (a fence quietly reintroduced on the disarm reads exactly that way).\n\nthe \
          whole table:\n{}",
         observed.join("\n")
+    );
+}
+
+#[tokio::test]
+async fn a_retried_ban_and_lift_replay_their_original_responses() {
+    // The two abuse-ban routes gained Idempotency-Key handling. Each has a DIFFERENT
+    // failure without it, and both are asserted here rather than assumed symmetric.
+    let h = Harness::start_fully_armed(50, OUTBOUND_TOKEN).await;
+    let scope = h.outbound_scope();
+    let tenant = scope.tenant().to_string();
+    let environment = scope.environment().to_string();
+    let base = format!("/v1/tenants/{tenant}/environments/{environment}/abuse");
+    let bans = format!("{base}/bans");
+    let lift = format!("{base}/bans/lift");
+    let place = serde_json::json!({
+        "subject_kind": "ip",
+        "subject": "203.0.113.77",
+        "auth_path": "password",
+        "reason": "placed by the operator"
+    })
+    .to_string();
+
+    let (status, _, first) = h.post(&bans, "ban-key", &place).await;
+    assert_eq!(status, StatusCode::CREATED, "{first}");
+    let first_view: serde_json::Value = serde_json::from_str(&first).expect("json");
+
+    // WITHOUT the key handling this retry answers 409 `already banned`, which reads as
+    // somebody else's ban rather than the caller's own. It now replays the 201.
+    let (status, _, replayed) = h.post(&bans, "ban-key", &place).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "a retried place replays: {replayed}"
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&replayed).expect("json"),
+        first_view,
+        "including the ban id, so the caller can address what it created"
+    );
+
+    // A DIFFERENT key genuinely re-executes and hits the real conflict, which is what
+    // shows the replay above was a stored response rather than the route having gone
+    // quietly permissive.
+    let (status, _, conflict) = h.post(&bans, "ban-key-2", &place).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a fresh key still meets the duplicate-ban conflict: {conflict}"
+    );
+
+    let drop_it = serde_json::json!({
+        "subject_kind": "ip",
+        "subject": "203.0.113.77",
+        "auth_path": "password"
+    })
+    .to_string();
+    let (status, _, lifted) = h.post(&lift, "lift-key", &drop_it).await;
+    assert_eq!(status, StatusCode::OK, "{lifted}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&lifted).expect("json")["lifted"],
+        true
+    );
+
+    // The lift's failure mode is the opposite one: re-executing finds the ban already
+    // gone and reports `lifted: false` for the request that lifted it. The replay must
+    // still say true.
+    let (status, _, lift_replay) = h.post(&lift, "lift-key", &drop_it).await;
+    assert_eq!(status, StatusCode::OK, "{lift_replay}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&lift_replay).expect("json")["lifted"],
+        true,
+        "the replay reports what the original lift did, not what a rerun would find"
+    );
+
+    // The control: a fresh key re-executes and truthfully reports nothing left to lift.
+    let (status, _, rerun) = h.post(&lift, "lift-key-2", &drop_it).await;
+    assert_eq!(status, StatusCode::OK, "{rerun}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&rerun).expect("json")["lifted"],
+        false,
+        "so the replay above genuinely differed from a rerun"
     );
 }

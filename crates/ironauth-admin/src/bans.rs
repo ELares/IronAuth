@@ -15,16 +15,18 @@
 //! path checks.
 
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::Response;
 use ironauth_store::{
-    AbuseSubject, AbuseSubjectKind, ActorRef, AuthPath, CorrelationId, NewBan, Scope, StoreError,
+    AbuseSubject, AbuseSubjectKind, ActorRef, AuthPath, CorrelationId, IdempotencyWrite, NewBan,
+    ResolvedIdempotencyWrite, Scope, StoreError,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::auth::Principal;
 use crate::error::{ApiError, ErrorBody};
+use crate::idempotency;
 use crate::org_context::require_live_environment;
 use crate::response::json;
 use crate::state::AdminState;
@@ -150,7 +152,9 @@ fn build_subject(kind: AbuseSubjectKind, raw: &str) -> AbuseSubject {
     request_body = CreateBanRequest,
     params(
         ("tenant_id" = String, Path, description = "The tenant identifier"),
-        ("environment_id" = String, Path, description = "The environment identifier")
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("Idempotency-Key" = String, Header, description = "Required. Replaying a POST \
+         with the same key returns the original response without re-executing.")
     ),
     security(("bearer" = [])),
     responses(
@@ -159,13 +163,16 @@ fn build_subject(kind: AbuseSubjectKind, raw: &str) -> AbuseSubject {
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
         (status = 404, description = "The environment is absent or deleted", body = ErrorBody),
-        (status = 409, description = "The subject is already banned on this path", body = ErrorBody)
+        (status = 409, description = "The subject is already banned on this path", body = ErrorBody),
+        (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
     )
 )]
 pub async fn create_ban(
     State(state): State<AdminState>,
     principal: Principal,
     Path((tenant_id, environment_id)): Path<(String, String)>,
+    uri: Uri,
+    headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
@@ -204,6 +211,32 @@ pub async fn create_ban(
         .filter(|secs| *secs > 0)
         .map(|secs| now.saturating_add(secs.saturating_mul(1_000_000)));
     let id = ironauth_store::AbuseBanId::generate(state.env(), &scope);
+
+    // The Idempotency-Key gate (issue #345's sweep). Placing a ban is a security
+    // mutation an operator performs believing it took effect; a retry after a network
+    // timeout previously answered 409 `already banned` rather than replaying the original
+    // 201, which reads as somebody else's ban rather than the caller's own.
+    let key = idempotency::required_key(&headers)?;
+    let fingerprint = idempotency::fingerprint("POST", uri.path(), &body);
+    let credential_ref = principal.credential_ref();
+    if let Some(replay) =
+        idempotency::replay_if_stored(&state, &credential_ref, &key, &fingerprint).await?
+    {
+        return Ok(replay);
+    }
+
+    // Knowable BEFORE the write: the id is minted here and every other field echoes the
+    // request, so the plain form applies rather than the resolved one.
+    let view = BanView {
+        id: id.to_string(),
+        subject_kind: kind.as_str().to_owned(),
+        subject: subject.value.clone(),
+        auth_path: path.as_str().to_owned(),
+        reason: reason.to_owned(),
+        expires_at_unix_ms: expires.map(|micros| micros / 1000),
+        created_at_unix_ms: now / 1000,
+    };
+    let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
     let result = state
         .store()
         .scoped(scope)
@@ -219,22 +252,17 @@ pub async fn create_ban(
                 expires_at_unix_micros: expires,
             },
             now,
+            Some(IdempotencyWrite {
+                credential_ref: &credential_ref,
+                key: &key,
+                request_fingerprint: &fingerprint,
+                response_status: 201,
+                response_body: &body_string,
+            }),
         )
         .await;
     match result {
-        Ok(id) => {
-            let view = BanView {
-                id: id.to_string(),
-                subject_kind: kind.as_str().to_owned(),
-                subject: subject.value,
-                auth_path: path.as_str().to_owned(),
-                reason: reason.to_owned(),
-                expires_at_unix_ms: expires.map(|micros| micros / 1000),
-                created_at_unix_ms: now / 1000,
-            };
-            let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
-            Ok(json(StatusCode::CREATED, body_string))
-        }
+        Ok(_) => Ok(json(StatusCode::CREATED, body_string)),
         Err(StoreError::Conflict) => Err(ApiError::Conflict(
             "the subject is already banned on this path".to_owned(),
         )),
@@ -251,7 +279,9 @@ pub async fn create_ban(
     request_body = LiftBanRequest,
     params(
         ("tenant_id" = String, Path, description = "The tenant identifier"),
-        ("environment_id" = String, Path, description = "The environment identifier")
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("Idempotency-Key" = String, Header, description = "Required. Replaying a POST \
+         with the same key returns the original response without re-executing.")
     ),
     security(("bearer" = [])),
     responses(
@@ -259,13 +289,16 @@ pub async fn create_ban(
         (status = 400, description = "Malformed request", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "The environment is absent or deleted", body = ErrorBody)
+        (status = 404, description = "The environment is absent or deleted", body = ErrorBody),
+        (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
     )
 )]
 pub async fn lift_ban(
     State(state): State<AdminState>,
     principal: Principal,
     Path((tenant_id, environment_id)): Path<(String, String)>,
+    uri: Uri,
+    headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
@@ -287,12 +320,36 @@ pub async fn lift_ban(
         return Err(ApiError::BadRequest("subject must not be empty".into()));
     }
     let subject = build_subject(kind, request.subject.trim());
+
+    // The Idempotency-Key gate. `lifted` is only knowable after the write, so this is the
+    // resolved form: without it a retry after a successful lift re-executes, finds the
+    // ban already gone, and reports `lifted: false` for the request that lifted it.
+    let key = idempotency::required_key(&headers)?;
+    let fingerprint = idempotency::fingerprint("POST", uri.path(), &body);
+    let credential_ref = principal.credential_ref();
+    if let Some(replay) =
+        idempotency::replay_if_stored(&state, &credential_ref, &key, &fingerprint).await?
+    {
+        return Ok(replay);
+    }
+    let render = |lifted: &bool| serde_json::to_string(&LiftBanView { lifted: *lifted });
     let lifted = state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .abuse()
-        .lift(state.env(), &subject, path)
+        .lift(
+            state.env(),
+            &subject,
+            path,
+            Some(ResolvedIdempotencyWrite {
+                credential_ref: &credential_ref,
+                key: &key,
+                request_fingerprint: &fingerprint,
+                response_status: 200,
+                response_body: &render,
+            }),
+        )
         .await?;
     let view = LiftBanView { lifted };
     let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;

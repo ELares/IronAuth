@@ -6207,6 +6207,7 @@ impl ActingAbuseRepo<'_> {
         env: &Env,
         spec: NewBan<'_>,
         created_at_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<AbuseBanId, StoreError> {
         if spec.id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -6265,6 +6266,11 @@ impl ActingAbuseRepo<'_> {
                     Err(error) if is_unique_violation(&error) => return Err(StoreError::Conflict),
                     Err(error) => return Err(error.into()),
                 }
+                // In the SAME transaction as the ban row and its audit row. The caller's
+                // response is knowable BEFORE this write (the id is minted by the caller
+                // and every other field echoes the request), so this is the plain form
+                // rather than the resolved one.
+                insert_idempotency(tx, idempotency).await?;
                 Ok(())
             },
             false,
@@ -6287,6 +6293,7 @@ impl ActingAbuseRepo<'_> {
         env: &Env,
         subject: &AbuseSubject,
         path: AuthPath,
+        idempotency: Option<ResolvedIdempotencyWrite<'_, bool>>,
     ) -> Result<bool, StoreError> {
         let master = self.store.master().ok_or(StoreError::Encryption)?;
         let scope = self.scope;
@@ -6308,6 +6315,12 @@ impl ActingAbuseRepo<'_> {
         .map(|row| row.get("id"));
         tx.commit().await?;
         let Some(raw_id) = existing else {
+            // Nothing matched: an idempotent no-op. No idempotency row is stored here,
+            // deliberately. There is no write transaction on this path to join, and
+            // storing one would change nothing observable: a retry that re-executes this
+            // branch computes the same `false`. The branch that MUST be stored is the one
+            // below, because a retry after a successful lift would otherwise re-execute,
+            // find the ban already gone, and answer `false` for a request that lifted it.
             return Ok(false);
         };
         let id = AbuseBanId::parse_in_scope(&raw_id, &scope)?;
@@ -6331,6 +6344,7 @@ impl ActingAbuseRepo<'_> {
                 .bind(id.to_string())
                 .execute(&mut **tx)
                 .await?;
+                insert_resolved_idempotency(tx, idempotency, &true).await?;
                 Ok(())
             },
             false,
