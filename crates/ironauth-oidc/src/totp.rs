@@ -532,13 +532,18 @@ pub(crate) async fn verify_second_factor(
 /// #72), the signal the step-up gate uses to decide between challenging a second
 /// factor and prompting enrollment.
 ///
-/// PRE-EXISTING and recorded rather than changed here, filed separately. The `is_ok_and` FAILS
-/// OPEN: a transient store error or a decrypt failure reads as "no active factor", so a subject who
-/// does hold one is routed to ENROLLMENT instead of a challenge. That does not let anyone past a
-/// second factor (the enrollment still has to be completed with a real code), but it does mean a
-/// blip in the credential store turns a challenge into an enroll prompt, and under issue #311 the
-/// enrollment it prompts hits the `AlreadyActive` fold documented at `flow_enroll_verify` below.
-/// The honest three-way (present, absent, unknown) is a signature change through the step-up gate.
+/// The `is_ok_and` FAILS OPEN: a transient store error or a decrypt failure reads as "no active
+/// factor", so a subject who does hold one is routed to ENROLLMENT instead of a challenge. That
+/// does not let anyone past a second factor (the enrollment still has to be completed with a real
+/// code), and since issue #471 the enrollment it prompts no longer DESTROYS that subject's
+/// recovery codes: `flow_enroll_verify` returns `AlreadyEnrolled` without minting or replacing
+/// anything. So the remaining cost of a blip is a wrong prompt rather than data loss.
+///
+/// Fixing the fail-open itself is deliberately NOT done here, and the reason is that the obvious
+/// inversion is worse: failing CLOSED would route a subject who has NO factor into a challenge
+/// they cannot answer, stranding them during exactly the same blip. The honest answer is the
+/// three-way (present, absent, unknown) carried through the step-up gate so the caller can decide,
+/// which is a signature change across that gate rather than a flip here.
 pub(crate) async fn has_active_totp(state: &OidcState, scope: Scope, subject: &UserId) -> bool {
     state
         .store()
@@ -584,6 +589,11 @@ pub(crate) enum FlowEnrollOutcome {
         /// The plaintext recovery codes, shown exactly once.
         recovery_codes: Vec<String>,
     },
+    /// The subject ALREADY holds an active authenticator, so the partial unique index over
+    /// active rows refused the activation and the scanned authenticator was not enrolled
+    /// (issue #471). No recovery codes are minted and, critically, the existing set is left
+    /// alone: the subject keeps the factor and the codes they already had.
+    AlreadyEnrolled,
     /// The presented code did not match (a uniform failure, never an oracle).
     Invalid,
     /// The pending enrollment could not be found (an unknown or already consumed id).
@@ -700,24 +710,20 @@ pub(crate) async fn flow_enroll_verify(
         .totp_credentials()
         .activate(state.env(), subject, &id, matched_step)
         .await;
-    // PRE-EXISTING, recorded rather than changed here, and filed separately. This fold treats
-    // `AlreadyActive` as a success, and it is worth writing down what that means because the
-    // obvious reading (the new factor replaces the live one) is wrong. `AlreadyActive` is the
-    // partial unique index over active rows REFUSING the update, so the pending row stays pending
-    // and the scanned authenticator is NOT enrolled. Execution then falls through to
-    // `generate_and_store_recovery_codes`, whose `replace_all` DELETES every prior code for the
-    // subject. Net, for a subject who already holds an active factor: the existing factor's
-    // recovery codes are destroyed, the new authenticator is not enrolled, and the flow reports
-    // success. The account surface's `enroll_verify` refuses the same case with a 409
-    // `already_enrolled` instead.
+    // `AlreadyActive` is the partial unique index over active rows REFUSING the activation
+    // (issue #471), so the pending row stays pending and the scanned authenticator is NOT
+    // enrolled. It used to fall through with `Activated` into
+    // `generate_and_store_recovery_codes`, whose `replace_all` DELETES every prior code for
+    // the subject. Net, for someone who already held an active factor: their existing
+    // factor's recovery codes were destroyed, the new authenticator was not enrolled, and
+    // the flow reported success.
     //
-    // Issue #311 makes this strictly BETTER and is not the place to change it. Before, the
-    // replacement set was minted and discarded in flow, so the subject was left holding codes that
-    // no longer redeem and no way to see the ones that do; now the replacement set is at least
-    // shown to them once. Correcting the fold itself is a separate behavior change on a shared
-    // ceremony, so it is filed rather than smuggled in here.
+    // It now returns its own outcome BEFORE any code is minted, so the subject keeps both
+    // the factor and the codes they already had. The two states are genuinely different and
+    // collapsing them is what caused the loss: one enrolled something, the other did not.
     match activate {
-        Ok(TotpActivateOutcome::Activated | TotpActivateOutcome::AlreadyActive) => {}
+        Ok(TotpActivateOutcome::Activated) => {}
+        Ok(TotpActivateOutcome::AlreadyActive) => return FlowEnrollOutcome::AlreadyEnrolled,
         Ok(TotpActivateOutcome::NotFound) => return FlowEnrollOutcome::NotFound,
         Err(_) => return FlowEnrollOutcome::Error,
     }

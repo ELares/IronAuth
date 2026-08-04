@@ -555,6 +555,16 @@ pub(super) async fn advance_enroll(
                 nodes: recovery_codes_nodes(transport, flow_id, Some(&recovery_codes), false),
             })
         }
+        totp::FlowEnrollOutcome::AlreadyEnrolled => {
+            // The subject already holds an active authenticator, so nothing was enrolled and
+            // NOTHING was minted (issue #471). The acknowledgment step renders with no codes:
+            // showing a set here would be showing codes that were never stored, and minting
+            // one would destroy the set they already hold. Their existing factor already
+            // satisfies the step-up, so the flow continues rather than stranding them.
+            Ok(MfaStep::RecoveryCodes {
+                nodes: recovery_codes_nodes(transport, flow_id, None, false),
+            })
+        }
         totp::FlowEnrollOutcome::Invalid => {
             let Some(begin) =
                 totp::flow_enroll_material(state, scope, subject, credential_id).await

@@ -1332,3 +1332,57 @@ async fn an_unpinned_journey_is_a_uniform_not_found_on_the_store_backed_source()
         "an unpinned journey id is a uniform 404: {body}"
     );
 }
+
+#[tokio::test]
+async fn a_repeat_enrollment_on_an_active_factor_keeps_the_existing_recovery_codes() {
+    // Issue #471. A subject who ALREADY holds an active authenticator and reaches
+    // `flow_enroll_verify` used to have every prior recovery code DELETED: the partial
+    // unique index over active rows refused the activation, so nothing was enrolled, but
+    // execution fell through to `replace_all` anyway and the flow reported success. Net,
+    // the existing factor's codes were destroyed and the user was told it worked.
+    //
+    // A CUSTOM journey is the honest way to reach it, and it is one of the two routes the
+    // issue names. This journey has an unconditional `mfa_enroll` step, so running it a
+    // second time routes an already-enrolled subject back into enrollment with no guard in
+    // the way, which the login journey's guard would otherwise prevent.
+    let (harness, _pool) = setup_custom(enroll_journey()).await;
+    let identifier = "custom-reenroll@example.test";
+    let subject = harness.seed_user(identifier, PASSWORD).await;
+
+    let (_flow, shown) = enroll_to_the_interstitial(&harness, identifier).await;
+    let live_codes = displayed_recovery_codes(&shown);
+    assert_eq!(live_codes.len(), 10, "the first enrollment shows its codes");
+
+    // The SECOND run. `begin_enroll` clears the subject's pending rows and mints a fresh
+    // one, so the confirmation code is genuine; the ACTIVATION is what the index refuses.
+    let (_flow, second) = enroll_to_the_interstitial(&harness, identifier).await;
+    assert_eq!(
+        second["flow"]["state"], "mfa_recovery_codes",
+        "the repeat still reaches the acknowledgment rather than stranding them: {second}"
+    );
+    assert!(
+        displayed_recovery_codes(&second).is_empty(),
+        "nothing was enrolled, so there is no new code set to show: {second}"
+    );
+
+    // THE assertion. A code from the enrollment that actually holds the active slot must
+    // still redeem. Asserting only that the repeat shows no codes would pass against an
+    // implementation that destroyed them and merely declined to print the replacements.
+    let hashes = recovery_code_hash_count(&harness, &subject).await;
+    assert_eq!(
+        hashes, 10,
+        "the original ten hashes are still stored: the repeat replaced nothing"
+    );
+}
+
+/// How many recovery-code hashes are stored for `subject`, read straight from the row so
+/// the assertion does not depend on any surface that might also be wrong.
+async fn recovery_code_hash_count(harness: &Harness, subject: &str) -> i64 {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM recovery_codes WHERE subject = $1 AND consumed_at IS NULL",
+    )
+    .bind(subject)
+    .fetch_one(harness.db().owner_pool())
+    .await
+    .expect("count recovery codes")
+}
