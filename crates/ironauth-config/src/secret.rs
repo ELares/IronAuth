@@ -269,6 +269,33 @@ impl SecretString {
     }
 }
 
+/// Take the string's allocation and zero every byte of it, returning the wiped
+/// buffer so the caller (and a test) can observe what was done to it.
+///
+/// `String` frees its buffer without clearing it. `into_bytes` reuses the SAME
+/// allocation, which is what lets this reach the bytes the secret actually
+/// occupied without `unsafe`; the returned `Vec` then frees an already-zeroed
+/// buffer.
+///
+/// Split out from [`SecretString`]'s `Drop` because a wipe on drop cannot be
+/// observed from safe Rust once the allocation is freed. Here the behaviour is
+/// directly testable and the `Drop` impl is a one-line delegation.
+fn take_and_wipe(value: &mut String) -> Vec<u8> {
+    let mut bytes = std::mem::take(value).into_bytes();
+    bytes.fill(0);
+    std::hint::black_box(&bytes);
+    bytes
+}
+
+impl Drop for SecretString {
+    fn drop(&mut self) {
+        // Best effort, and `SecretString` is `Clone`: each clone owns a separate
+        // allocation and wipes its own on drop, but a copy taken out through
+        // `expose` is the caller's to manage.
+        drop(take_and_wipe(&mut self.0));
+    }
+}
+
 impl fmt::Debug for SecretString {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "SecretString({REDACTED})")
@@ -444,5 +471,37 @@ mod tests {
     #[derive(Debug, serde::Deserialize, Serialize)]
     struct TestWrap {
         s: Secret,
+    }
+
+    #[test]
+    fn taking_a_secret_zeroes_the_allocation_it_occupied() {
+        // Issue #187. The discriminating part is that the wiped buffer is the SAME
+        // allocation the secret occupied, so its LENGTH is preserved while every
+        // byte reads zero. A wipe that merely dropped the string would leave the
+        // bytes intact in freed heap and this would see a zero-length buffer.
+        let mut value = String::from("correct horse battery staple");
+        let len = value.len();
+        let wiped = take_and_wipe(&mut value);
+        assert_eq!(
+            wiped.len(),
+            len,
+            "the secret's own allocation is what was wiped"
+        );
+        assert!(
+            wiped.iter().all(|&b| b == 0),
+            "every byte of the secret must be zeroed, got {wiped:?}"
+        );
+        assert!(value.is_empty(), "the source no longer holds the secret");
+    }
+
+    #[test]
+    fn wiping_a_secret_string_leaves_nothing_exposed() {
+        // Deliberately NOT `assert!(needs_drop::<SecretString>())`: that holds
+        // because the type contains a `String`, with or without the wiping `Drop`,
+        // so it could never fail. What is checkable is the path the destructor
+        // runs, driven here directly.
+        let mut secret = SecretString::new("hunter2");
+        drop(take_and_wipe(&mut secret.0));
+        assert_eq!(secret.expose(), "");
     }
 }

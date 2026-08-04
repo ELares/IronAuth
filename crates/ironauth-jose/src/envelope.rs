@@ -78,14 +78,7 @@ const MASTER_DERIVE_LABEL: &[u8] = b"ironauth.envelope.master-key.derive.v1";
 /// separated from the AEAD wrapping use of the same master key (key separation).
 const BLIND_INDEX_SUBKEY_LABEL: &[u8] = b"ironauth.envelope.blind-index.subkey.v1";
 
-/// Best-effort wipe of a heap buffer that transiently held key material or a
-/// decrypted plaintext, so it does not linger in freed heap. Mirrors the
-/// `AeadKey` drop wipe: a byte fill the optimizer is discouraged from eliding by
-/// a `black_box` read. No `unsafe`, no extra crate.
-fn wipe(buf: &mut [u8]) {
-    buf.fill(0);
-    std::hint::black_box(&*buf);
-}
+use crate::redact::wipe;
 
 /// A failure in an envelope operation.
 ///
@@ -332,8 +325,7 @@ impl Drop for AeadKey {
         // Best-effort zeroization without the `zeroize` crate and without
         // `unsafe`. `fill(0)` plus a `black_box` read discourages the optimizer
         // from eliding the wipe as a dead store.
-        self.bytes.fill(0);
-        std::hint::black_box(&self.bytes);
+        wipe(&mut self.bytes);
     }
 }
 

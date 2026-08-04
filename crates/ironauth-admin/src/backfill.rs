@@ -142,8 +142,8 @@ async fn backfill_scope(
         if existing.iter().any(|key| key.algorithm == algorithm) {
             continue;
         }
-        let (material_kind, material) = generate_material(env, algorithm)?;
-        provision_one(
+        let (material_kind, mut material) = generate_material(env, algorithm)?;
+        let outcome = provision_one(
             env,
             data_store,
             scope,
@@ -152,7 +152,12 @@ async fn backfill_scope(
             &material,
             activate_at_micros,
         )
-        .await?;
+        .await;
+        // `material` is a raw private key DER. Wipe it as soon as the store has
+        // sealed it, on the FAILURE path too, which is why the result is bound
+        // rather than propagated with `?` here (issue #187).
+        ironauth_jose::wipe(&mut material);
+        outcome?;
         provisioned += 1;
     }
     Ok(provisioned)

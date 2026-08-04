@@ -30558,6 +30558,15 @@ pub struct TotpMaterial {
     pub last_consumed_step: Option<i64>,
 }
 
+impl Drop for TotpMaterial {
+    fn drop(&mut self) {
+        // The opened RFC 6238 shared secret is a live authentication factor: anyone
+        // holding it can mint valid codes forever. Best-effort wipe on drop, the
+        // same treatment `ironauth-jose` gives its own key buffers (issue #187).
+        ironauth_jose::wipe(&mut self.seed);
+    }
+}
+
 impl std::fmt::Debug for TotpMaterial {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TotpMaterial")

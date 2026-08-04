@@ -190,7 +190,7 @@ pub use policy::{
     ExpectedTyp, JwsAlgorithm, KeyError, KeyFamily, PolicyError, TokenTyp, TrustedKey,
     VerificationCaps, VerificationPolicy,
 };
-pub use redact::Redacted;
+pub use redact::{Redacted, wipe};
 pub use rotation::{KeySet, RotationError, RotationParams, includes_downgrade_key};
 pub use signing_key::{
     SigningKey, SigningKeyError, generate_ecdsa_p256_pkcs8_der, generate_rsa_pkcs1_der,

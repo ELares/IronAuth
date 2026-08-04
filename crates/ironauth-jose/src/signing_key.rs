@@ -134,7 +134,12 @@ impl SigningKey {
     ) -> Result<Self, SigningKeyError> {
         let mut seed = [0_u8; ED25519_SEED_LEN];
         entropy.fill_bytes(&mut seed);
-        Self::ed25519_from_seed(kid, &seed)
+        let key = Self::ed25519_from_seed(kid, &seed);
+        // The seed is the whole Ed25519 private key (RFC 8032), so it is wiped as
+        // soon as `ring` has copied it into its own key storage. Wiped on the error
+        // path too, which is why the result is bound rather than returned directly.
+        crate::redact::wipe(&mut seed);
+        key
     }
 
     /// Build an Ed25519 signing key from a raw 32-byte seed (RFC 8032).
