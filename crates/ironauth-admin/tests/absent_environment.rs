@@ -312,6 +312,22 @@ fn client_cases(base: &str, ids: &Ids) -> Vec<Case> {
             path: format!("{base}/applications/{client}/signup-form"),
             body: Some(body_of(&serde_json::json!({ "fields": [] }))),
         },
+        // Environment VARIABLE management (issue #235). Both writes are environment scoped
+        // and neither takes a parent beyond the environment itself, so an absent environment
+        // must be the uniform not-found on each rather than a name-specific answer that would
+        // tell a caller whether the variable exists.
+        Case {
+            label: "variables.setVariable",
+            method: "PUT",
+            path: format!("{base}/variables/ABSENT_ENV_PROBE"),
+            body: Some(body_of(&serde_json::json!({ "value": "x" }))),
+        },
+        Case {
+            label: "variables.deleteVariable",
+            method: "DELETE",
+            path: format!("{base}/variables/ABSENT_ENV_PROBE"),
+            body: None,
+        },
         Case {
             label: "signup_forms.deleteSignupForm",
             method: "DELETE",

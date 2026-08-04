@@ -770,6 +770,20 @@ impl Fixture {
             .await;
         assert!(status.is_success(), "seed signup form: {status} {body}");
 
+        // A variable for the read half of the variable surface (issue #235). `getVariable`
+        // answers the uniform not-found when the name does not exist, so without a seeded row
+        // the read case would be driven at a 404 for an ORDINARY absent-resource reason and
+        // would measure nothing about environment liveness, which is what this sweep exists
+        // to compare.
+        let (status, _, body) = h
+            .put_with_key(
+                &format!("{base}/variables/LIVE_SURFACE_PROBE"),
+                "k-seed-variable",
+                &serde_json::json!({ "value": "seeded" }).to_string(),
+            )
+            .await;
+        assert!(status.is_success(), "seed variable: {status} {body}");
+
         // A DEFAULT brand. The four brand-asset routes address a brand by slug and answer
         // 404 when none exists, and no management route creates one, so without this the
         // whole asset surface is driven at a 404 and measured by nothing.
@@ -1068,6 +1082,26 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             format!("{base}/applications/{client}/signup-form"),
             &serde_json::json!({ "fields": [] }),
         ),
+        // Environment VARIABLE management (issue #235). All four operations are environment
+        // scoped and take no parent beyond the environment, so a soft-deleted environment must
+        // refuse the two writes and the two reads must read exactly like an absent one.
+        Case::json(
+            "variables.setVariable",
+            "PUT",
+            format!("{base}/variables/LIVE_SURFACE_PROBE"),
+            &serde_json::json!({ "value": "x" }),
+        ),
+        Case::empty(
+            "variables.getVariable",
+            "GET",
+            format!("{base}/variables/LIVE_SURFACE_PROBE"),
+        ),
+        Case::empty(
+            "variables.deleteVariable",
+            "DELETE",
+            format!("{base}/variables/LIVE_SURFACE_PROBE"),
+        ),
+        Case::empty("variables.listVariables", "GET", format!("{base}/variables")),
         Case::empty(
             "signup_forms.getSignupForm",
             "GET",

@@ -60,3 +60,4 @@ crates/ironauth-admin/src/trait_schemas.rs:create_trait_schema_version:1
 crates/ironauth-admin/src/users.rs:create_user:1
 crates/ironauth-admin/src/users.rs:set_user_state:1
 crates/ironauth-admin/src/users.rs:validated_traits:0
+crates/ironauth-admin/src/variables.rs:set_variable:1
