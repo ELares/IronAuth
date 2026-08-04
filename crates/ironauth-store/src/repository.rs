@@ -33359,6 +33359,7 @@ impl ActingConsentRepo<'_> {
         subject: &str,
         client_id: &str,
         revoked_at_micros: i64,
+        idempotency: Option<ResolvedIdempotencyWrite<'_, ConsentRevocation>>,
     ) -> Result<ConsentRevocation, StoreError> {
         let scope = self.scope;
         let mut tx = begin_scoped(self.store, scope).await?;
@@ -33381,11 +33382,20 @@ impl ActingConsentRepo<'_> {
             // Absent or already revoked: an idempotent no-op success. Commit the empty
             // transaction and record no audit row and run no cascade for a revocation
             // that did not happen.
-            tx.commit().await?;
-            return Ok(ConsentRevocation {
+            //
+            // The idempotency row IS written on this branch. It is a 200 with a body, so
+            // a retry under the same key must replay THOSE bytes rather than re-decide;
+            // and this is the branch a retry after a network timeout most often lands
+            // on, which is the case issue #345 is about. Storing only on the mutating
+            // branch would leave the common retry answering a freshly computed
+            // `revoked: false` instead of the original result.
+            let resolved = ConsentRevocation {
                 consent_revoked: false,
                 families_revoked: 0,
-            });
+            };
+            insert_resolved_idempotency(&mut tx, idempotency, &resolved).await?;
+            tx.commit().await?;
+            return Ok(resolved);
         };
         let id_text: String = row.get("id");
         let consent_id = ConsentId::parse_in_scope(&id_text, &scope)?;
@@ -33423,11 +33433,15 @@ impl ActingConsentRepo<'_> {
             None,
         )
         .await?;
-        tx.commit().await?;
-        Ok(ConsentRevocation {
+        let resolved = ConsentRevocation {
             consent_revoked: true,
             families_revoked,
-        })
+        };
+        // In the SAME transaction as the consent flip and its cascade, so the stored
+        // response and the state it describes commit together or not at all.
+        insert_resolved_idempotency(&mut tx, idempotency, &resolved).await?;
+        tx.commit().await?;
+        Ok(resolved)
     }
 }
 

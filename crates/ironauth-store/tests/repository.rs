@@ -348,7 +348,7 @@ async fn consent_revoke_makes_a_grant_absent_and_is_idempotent() {
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .consents()
-        .revoke(&env, subject, client_id, REVOKE_AT_MICROS)
+        .revoke(&env, subject, client_id, REVOKE_AT_MICROS, None)
         .await
         .expect("revoke");
     assert!(
@@ -378,14 +378,14 @@ async fn consent_revoke_makes_a_grant_absent_and_is_idempotent() {
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .consents()
-        .revoke(&env, subject, client_id, REVOKE_AT_MICROS)
+        .revoke(&env, subject, client_id, REVOKE_AT_MICROS, None)
         .await
         .expect("revoking an already-revoked grant is a no-op success");
     db.store()
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .consents()
-        .revoke(&env, subject, "cli_never-granted", REVOKE_AT_MICROS)
+        .revoke(&env, subject, "cli_never-granted", REVOKE_AT_MICROS, None)
         .await
         .expect("revoking an absent grant is a no-op success");
 }
@@ -412,7 +412,7 @@ async fn consent_revoke_audits_only_a_real_revocation() {
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .consents()
-        .revoke(&env, subject, client_id, REVOKE_AT_MICROS)
+        .revoke(&env, subject, client_id, REVOKE_AT_MICROS, None)
         .await
         .expect("revoke");
     // A second (already-revoked) revoke must NOT write another audit row.
@@ -420,7 +420,7 @@ async fn consent_revoke_audits_only_a_real_revocation() {
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .consents()
-        .revoke(&env, subject, client_id, REVOKE_AT_MICROS)
+        .revoke(&env, subject, client_id, REVOKE_AT_MICROS, None)
         .await
         .expect("no-op revoke");
 
@@ -484,7 +484,7 @@ async fn re_grant_after_revoke_reactivates_the_same_consent_row() {
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .consents()
-        .revoke(&env, subject, client_id, REVOKE_AT_MICROS)
+        .revoke(&env, subject, client_id, REVOKE_AT_MICROS, None)
         .await
         .expect("revoke");
 
@@ -620,7 +620,7 @@ async fn consent_revoke_and_list_are_cross_scope_isolated() {
         .scoped(scope_b)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .consents()
-        .revoke(&env, subject, client_id, REVOKE_AT_MICROS)
+        .revoke(&env, subject, client_id, REVOKE_AT_MICROS, None)
         .await
         .expect("cross-scope revoke is a no-op success");
 
@@ -841,7 +841,7 @@ async fn consent_revoke_cascades_to_subject_client_families_including_offline() 
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .consents()
-        .revoke(&env, subject, client_id, REVOKE_AT_MICROS)
+        .revoke(&env, subject, client_id, REVOKE_AT_MICROS, None)
         .await
         .expect("revoke");
     assert!(revocation.consent_revoked, "the consent flipped");
@@ -906,7 +906,7 @@ async fn consent_revoke_cascade_is_scope_tight_to_subject_and_client() {
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .consents()
-        .revoke(&env, subject_a, client_a, REVOKE_AT_MICROS)
+        .revoke(&env, subject_a, client_a, REVOKE_AT_MICROS, None)
         .await
         .expect("revoke");
     assert_eq!(
@@ -949,7 +949,7 @@ async fn consent_revoke_no_op_runs_no_cascade_and_writes_no_audit() {
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .consents()
-        .revoke(&env, subject, client_id, REVOKE_AT_MICROS)
+        .revoke(&env, subject, client_id, REVOKE_AT_MICROS, None)
         .await
         .expect("no-op revoke");
     assert!(
@@ -1003,7 +1003,7 @@ async fn consent_revoke_cascade_writes_one_consent_audit_and_no_per_family_audit
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .consents()
-        .revoke(&env, subject, client_id, REVOKE_AT_MICROS)
+        .revoke(&env, subject, client_id, REVOKE_AT_MICROS, None)
         .await
         .expect("revoke");
 

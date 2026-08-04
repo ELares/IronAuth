@@ -451,6 +451,7 @@ pub async fn revoke_consent(
             &account.subject_str,
             &client_id.to_string(),
             epoch_micros(state.now()),
+            None,
         )
         .await;
     match result {

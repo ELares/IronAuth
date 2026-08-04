@@ -16136,7 +16136,10 @@ export interface operations {
     revokeUserConsent: {
         parameters: {
             query?: never;
-            header?: never;
+            header: {
+                /** @description Required. Replaying a POST with the same key returns the original response without re-executing. */
+                "Idempotency-Key": string;
+            };
             path: {
                 /** @description The tenant identifier */
                 tenant_id: string;
@@ -16180,6 +16183,15 @@ export interface operations {
             };
             /** @description The environment is absent or deleted, or the user or client is in another scope */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Idempotency-Key reused with a different request */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

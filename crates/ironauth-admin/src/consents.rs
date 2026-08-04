@@ -27,12 +27,15 @@
 //! is required when sudo mode is on) exactly like a session revoke.
 
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::Response;
-use ironauth_store::{ClientId, CorrelationId, StoreError};
+use ironauth_store::{
+    ClientId, ConsentRevocation, CorrelationId, ResolvedIdempotencyWrite, StoreError,
+};
 
 use crate::auth::Principal;
 use crate::error::{ApiError, ErrorBody};
+use crate::idempotency;
 use crate::org_context::{EnvironmentAccess, resolve_user};
 use crate::response::json;
 use crate::sessions::scope_from_path;
@@ -147,20 +150,25 @@ pub async fn list_user_consents(
         ("tenant_id" = String, Path, description = "The tenant identifier"),
         ("environment_id" = String, Path, description = "The environment identifier"),
         ("user_id" = String, Path, description = "The user identifier (usr_...)"),
-        ("client_id" = String, Path, description = "The client identifier (cli_...)")
+        ("client_id" = String, Path, description = "The client identifier (cli_...)"),
+        ("Idempotency-Key" = String, Header, description = "Required. Replaying a POST \
+         with the same key returns the original response without re-executing.")
     ),
     security(("bearer" = [])),
     responses(
         (status = 200, description = "The consent was revoked", body = ConsentRevocationView),
         (status = 401, description = "Missing or invalid credential, or fresh privilege required", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "The environment is absent or deleted, or the user or client is in another scope", body = ErrorBody)
+        (status = 404, description = "The environment is absent or deleted, or the user or client is in another scope", body = ErrorBody),
+        (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
     )
 )]
 pub async fn revoke_user_consent(
     State(state): State<AdminState>,
     principal: Principal,
     Path((tenant_id, environment_id, user_id, client_id)): Path<(String, String, String, String)>,
+    uri: Uri,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let actor = principal.require_operator()?;
     let (_tenant, scope) = scope_from_path(&state, &tenant_id, &environment_id)?;
@@ -188,8 +196,47 @@ pub async fn revoke_user_consent(
     //
     // Both ids are parsed under the caller's OWN scope: a malformed or cross-scope user
     // id or client id is the uniform not-found BEFORE any mutating repository is reached.
+    // The Idempotency-Key gate, mirroring the sibling revoke routes (issue #345). The
+    // revoke is naturally idempotent, so this is not a data-safety fix: it is what makes
+    // a retry after a network timeout return the ORIGINAL result instead of a freshly
+    // computed `revoked: false`, which is the whole point of the mechanism and the
+    // convention every other admin revoke route already follows.
+    //
+    // There is no request body on this route, so the fingerprint is taken over an empty
+    // one. That still binds the key to the method and PATH, so the same key reused for a
+    // different user or client is the 422 rather than a silent replay of the wrong
+    // answer.
+    let key = idempotency::required_key(&headers)?;
+    let fingerprint = idempotency::fingerprint("POST", uri.path(), &[]);
+    let credential_ref = principal.credential_ref();
+    if let Some(replay) =
+        idempotency::replay_if_stored(&state, &credential_ref, &key, &fingerprint).await?
+    {
+        return Ok(replay);
+    }
+
     let subject = resolve_user(&state, scope, &user_id, EnvironmentAccess::Write).await?;
     let client = ClientId::parse_in_scope(&client_id, &scope).map_err(|_| StoreError::NotFound)?;
+
+    // The body is only knowable AFTER the write resolves (whether a grant was there, and
+    // how many families the cascade took), so this is a ResolvedIdempotencyWrite: the
+    // store calls the builder inside its own transaction and the handler renders its
+    // response from the SAME value, so a response and its replays are the same bytes.
+    // The closure parameter deliberately does NOT share the name of the binding below.
+    // `scripts/idempotent-write-audit.sh` treats a let-binding of an acting chain as a
+    // bound handle and counts every later field access through that name as a further
+    // store write, so a closure parameter of the same name makes its field reads look
+    // like a SECOND write behind one Idempotency-Key. This handler performs one write;
+    // a shared name was all it took to invent the second, and the audit then rightly
+    // demanded a verdict row for a split that does not exist. Note that the audit reads
+    // SOURCE TEXT, so a comment naming its trigger tokens literally inflates the count
+    // too: describe the rule, do not quote it.
+    let render_view = |resolved: &ConsentRevocation| ConsentRevocationView {
+        client_id: client.to_string(),
+        revoked: resolved.consent_revoked,
+        families_revoked: resolved.families_revoked,
+    };
+    let render = |resolved: &ConsentRevocation| serde_json::to_string(&render_view(resolved));
 
     let revocation = state
         .store()
@@ -201,14 +248,16 @@ pub async fn revoke_user_consent(
             &subject.to_string(),
             &client.to_string(),
             state.now_unix_micros(),
+            Some(ResolvedIdempotencyWrite {
+                credential_ref: &credential_ref,
+                key: &key,
+                request_fingerprint: &fingerprint,
+                response_status: 200,
+                response_body: &render,
+            }),
         )
         .await?;
 
-    let view = ConsentRevocationView {
-        client_id: client.to_string(),
-        revoked: revocation.consent_revoked,
-        families_revoked: revocation.families_revoked,
-    };
-    let body = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
+    let body = serde_json::to_string(&render_view(&revocation)).map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body))
 }

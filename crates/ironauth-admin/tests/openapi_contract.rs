@@ -358,6 +358,24 @@ fn every_post_documents_the_idempotency_key_header() {
         "assignOrgMembershipRole",
         "assignOrgRolePermission",
         "createPermission",
+        // Issue #345 added the header to `revokeUserConsent`. The sweep that found it
+        // also found SEVEN operations that already documented the header and were
+        // pinned by nothing, so they are added too: an operation can lose the header
+        // without any test noticing, which is the same defect one step earlier.
+        //
+        // The last five document it as OPTIONAL rather than required, which is a
+        // deliberate per-route choice for operations that are safe to repeat. This
+        // assertion is that the header is DOCUMENTED, not that it is mandatory, so
+        // pinning them here keeps the documentation from silently disappearing without
+        // making any claim about whether a caller must send it.
+        "revokeUserConsent",
+        "createIdentityImport",
+        "createMembership",
+        "applyConfigPromotion",
+        "elevateAdminSudo",
+        "planConfigPromotion",
+        "probePasswordHashing",
+        "resumeIdentityImport",
     ] {
         let params = find_operation(&doc, op)["parameters"]
             .as_array()
