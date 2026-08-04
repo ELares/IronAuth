@@ -398,7 +398,7 @@ async fn set_org_state(
         .management()
         .acting(actor(env), CorrelationId::generate(env))
         .organizations(scope)
-        .set_state(env, org, state)
+        .set_state(env, org, state, None)
         .await
         .expect("set organization state");
 }

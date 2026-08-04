@@ -121,7 +121,7 @@ async fn set_org_state(harness: &Harness, org: &OrganizationId, state: Organizat
         .management()
         .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
         .organizations(scope)
-        .set_state(&env, org, state)
+        .set_state(&env, org, state, None)
         .await
         .expect("set organization state");
 }

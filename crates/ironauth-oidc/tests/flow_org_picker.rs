@@ -112,7 +112,7 @@ async fn disable_org(harness: &Harness, org: &OrganizationId) {
         .management()
         .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
         .organizations(scope)
-        .set_state(&env, org, OrganizationState::Disabled)
+        .set_state(&env, org, OrganizationState::Disabled, None)
         .await
         .expect("disable organization");
 }

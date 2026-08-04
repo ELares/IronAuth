@@ -40932,7 +40932,8 @@ impl ActingOrganizationRepo<'_> {
         env: &Env,
         id: &OrganizationId,
         state: OrganizationState,
-    ) -> Result<(), StoreError> {
+        idempotency: Option<ResolvedIdempotencyWrite<'_, OrganizationRecord>>,
+    ) -> Result<OrganizationRecord, StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -40948,21 +40949,30 @@ impl ActingOrganizationRepo<'_> {
                 target: id,
             },
             async move |tx| {
-                let result = sqlx::query(
+                // RETURNING the row rather than re-reading it after the transaction.
+                // The caller renders its response from this value, so the response
+                // describes the state this transaction committed rather than whatever a
+                // later read happened to see, and the same value feeds the stored
+                // idempotent body below.
+                let row = sqlx::query(
                     "UPDATE organizations SET state = $1 \
                      WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 \
-                     AND deleted_at IS NULL",
+                     AND deleted_at IS NULL \
+                     RETURNING id, display_name, state, \
+                               (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us",
                 )
                 .bind(state.as_str())
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
                 .bind(scope.environment().to_string())
-                .execute(&mut **tx)
+                .fetch_optional(&mut **tx)
                 .await?;
-                if result.rows_affected() == 0 {
+                let Some(row) = row else {
                     return Err(StoreError::NotFound);
-                }
-                Ok(())
+                };
+                let record = organization_from_row(&row, &scope)?;
+                insert_resolved_idempotency(tx, idempotency, &record).await?;
+                Ok(record)
             },
             false,
             Some(&detail),

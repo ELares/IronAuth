@@ -448,3 +448,54 @@ fn fresh_in_scope_user(tenant: &str, environment: &str) -> String {
     ironauth_store::UserId::generate(&ironauth_env::Env::system(), &scope_of(tenant, environment))
         .to_string()
 }
+
+#[tokio::test]
+async fn a_retried_org_toggle_replays_the_original_response() {
+    // The organization toggles are naturally idempotent, so this is not a data-safety
+    // fix: it is what makes a retry after a network timeout return the ORIGINAL response
+    // rather than re-deriving one, which is the convention the other admin state
+    // mutations already follow.
+    let h = Harness::start(50).await;
+    let (tenant, environment) = tenant_env(&h).await;
+    let org = create_org(&h, &tenant, &environment, "k-org").await;
+    let org_path = format!("/v1/tenants/{tenant}/environments/{environment}/organizations/{org}");
+    let disable = format!("{org_path}/disable");
+
+    let (status, _, first) = h.post(&disable, "retry-key", "").await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let first_view: Value = serde_json::from_str(&first).expect("json");
+    assert_eq!(first_view["active"], false);
+
+    // The retry under the same key returns the stored bytes.
+    let (status, _, replayed) = h.post(&disable, "retry-key", "").await;
+    assert_eq!(status, StatusCode::OK, "{replayed}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&replayed).expect("json"),
+        first_view,
+        "a retry under the same key replays the original response verbatim"
+    );
+
+    // THE CONTROL, and it is the sharp one: move the live state on, then retry the ORIGINAL
+    // key again. A stored response must still describe what THAT request did, so it reports
+    // `active: false` while the organization is now active. Anything re-derived at replay
+    // time would report the current state and this would fail.
+    let (status, _, enabled) = h.post(&format!("{org_path}/enable"), "k-enable", "").await;
+    assert_eq!(status, StatusCode::OK, "{enabled}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&enabled).expect("json")["active"],
+        true
+    );
+    let (status, _, replayed_again) = h.post(&disable, "retry-key", "").await;
+    assert_eq!(status, StatusCode::OK, "{replayed_again}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&replayed_again).expect("json")["active"],
+        false,
+        "the replay describes the request it stored, not the organization's state now"
+    );
+    let (_, _, live) = h.get(&org_path).await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&live).expect("json")["active"],
+        true,
+        "and the live organization is genuinely still enabled, so the two really differ"
+    );
+}
