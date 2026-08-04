@@ -87,10 +87,25 @@ range per docs/RELEASING.md.
       --test hundred_k_import -- --ignored --nocapture
   ```
 
+  Every record carries an algorithm-tagged FOREIGN bcrypt hash, and after the run one of
+  those hundred thousand imported users is driven through the whole verify-then-rehash
+  landing. That conjunction is the point: M6's exit criterion reads "100k-user import WITH
+  FOREIGN HASHES completes with verify-then-rehash working", and until now both halves were
+  proven APART, this harness importing hashless records while `engine.rs` proved
+  verify-then-rehash across five schemes at a scale of about thirty. A criterion stated as a
+  conjunction is not met by proving its halves separately. The foreign hash is minted once
+  and reused on every line, which costs the measurement nothing because import stores the
+  tagged hash without verifying it; hashing a hundred thousand distinct bcrypt values would
+  measure bcrypt rather than the importer.
+
   MEASURED on one hundred thousand identities into a real Postgres: 100 000 created,
   100 000 ledger rows WRITTEN and accounted with none deduped, the run completing through
-  the gated transition, in 78.66 seconds, with the process's resident set moving from a
-  12 096 KiB baseline to a 13 056 KiB peak. Just under one megabyte of growth across a
+  the gated transition, in 77.46 seconds, with the process's resident set moving from a
+  12 336 KiB baseline to a 13 424 KiB peak. The middle record of the hundred thousand
+  (`load-50000@example.test`) was then read back carrying its `bcrypt` tag, verified against
+  the original password, rehashed to Argon2id, and re-read with the foreign hash RETIRED and
+  the original password authenticating against Argon2id alone. A second run landed at 83.86
+  seconds with a 12 384 KiB baseline and a 13 360 KiB peak. Just under one megabyte of growth across a
   hundred thousand records, which is the order the streaming claim predicts and roughly an
   order of magnitude below what the collected outcomes ALONE would have cost. Three
   independent runs of this harness landed between 77 and 93 seconds with the peak within

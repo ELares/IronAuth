@@ -23,6 +23,23 @@
 //! resident set alongside its baseline so the memory claim can be read rather than
 //! assumed.
 //!
+//! # The conjunction, which is the part that was missing
+//!
+//! M6's exit criterion reads "100k-user import WITH FOREIGN HASHES completes with
+//! verify-then-rehash working". Both halves were measured, and never together: this
+//! harness imported one hundred thousand records that carried NO password hash at all,
+//! while `engine.rs` proved verify-then-rehash across five schemes at a scale of about
+//! thirty. A criterion stated as a conjunction is not met by proving its halves apart,
+//! so every record here now carries an algorithm-tagged FOREIGN hash, and after the run
+//! one of those hundred thousand imported users is driven through the full
+//! verify-then-rehash landing.
+//!
+//! The foreign hash is minted ONCE, before the run, and the same PHC string is reused on
+//! every line. That is deliberate and costs the measurement nothing: import stores the
+//! tagged hash without verifying it, so per-record cost is unchanged, and the harness's
+//! own memory stays one line. Hashing a hundred thousand distinct bcrypt values would
+//! measure bcrypt, not the importer.
+//!
 //! Resident set is a coarse instrument and is reported as one: it is page granular and
 //! includes the connection pool, the async runtime, and the allocator's own retained
 //! arenas, none of which this code controls. What it can settle is the ORDER of the
@@ -36,17 +53,56 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use argon2::PasswordVerifier;
+use argon2::password_hash::{PasswordHash, PasswordHasher, SaltString};
 use ironauth_env::Env;
-use ironauth_import::{ImportContext, LineSource, import_lines_into_run};
+use ironauth_import::{ForeignHash, ImportContext, LineSource, import_lines_into_run};
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
     CompletionOutcome, CorrelationId, MigrationKind, MigrationState, NewMigrationRun,
 };
 
-/// One hundred thousand records, minted one at a time and never collected.
+/// The password every imported record's foreign hash is over.
+const PASSWORD: &str = "load-harness-password";
+
+/// A cheap bcrypt (cost 4) foreign hash, the same shape `engine.rs` uses. Cost 4 keeps
+/// the ONE mint and the ONE verify in this harness negligible beside the import itself;
+/// the cost BOUNDS are a separate contract with their own tests, and nothing here
+/// measures bcrypt.
+fn bcrypt_hash(password: &str) -> String {
+    bcrypt::hash_with_result(password, 4)
+        .expect("bcrypt hash")
+        .format_for_version(bcrypt::Version::TwoB)
+}
+
+/// Whether the row's NATIVE verifier actually authenticates `password`. Attempting the
+/// verification is stronger than reading a flag: it is what the login path does, so an
+/// unusable sentinel and a wrong hash both answer false for the same reason they would
+/// in production.
+fn native_verify(record: &ironauth_store::UserRecord, password: &str) -> bool {
+    match PasswordHash::new(&record.password_hash) {
+        Ok(parsed) => argon2::Argon2::default()
+            .verify_password(password.as_bytes(), &parsed)
+            .is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// A native Argon2id verifier, the rehash target.
+fn argon2_hash(password: &str) -> String {
+    let salt = SaltString::from_b64("c29tZXNhbHQ").expect("salt");
+    argon2::Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .expect("argon2 hash")
+        .to_string()
+}
+
+/// One hundred thousand records, minted one at a time and never collected. Each carries
+/// the SAME algorithm-tagged foreign hash, minted once by the caller.
 struct Generated {
     next: usize,
     total: usize,
+    foreign_hash: String,
 }
 
 impl LineSource for Generated {
@@ -54,7 +110,10 @@ impl LineSource for Generated {
         if self.next >= self.total {
             return None;
         }
-        let line = format!(r#"{{"identifier":"load-{}@example.test"}}"#, self.next);
+        let line = format!(
+            r#"{{"identifier":"load-{}@example.test","password_hash":"{}"}}"#,
+            self.next, self.foreign_hash
+        );
         self.next += 1;
         Some(line.into_bytes())
     }
@@ -130,6 +189,7 @@ async fn a_hundred_thousand_user_import_completes_as_a_run() {
         })
     };
 
+    let foreign_hash = bcrypt_hash(PASSWORD);
     let context = ImportContext {
         store,
         scope,
@@ -142,6 +202,7 @@ async fn a_hundred_thousand_user_import_completes_as_a_run() {
         Generated {
             next: 0,
             total: TOTAL,
+            foreign_hash: foreign_hash.clone(),
         },
     )
     .await
@@ -189,9 +250,74 @@ async fn a_hundred_thousand_user_import_completes_as_a_run() {
         "a 100k import completes through the gated transition"
     );
 
+    // The second half of the criterion, on a user that came out of the hundred thousand
+    // rather than out of a fixture built for this assertion. Picked from the MIDDLE of the
+    // stream: the first record is the one a partially-working importer is most likely to
+    // get right, and the last is the one an off-by-one is most likely to drop.
+    let identifier = format!("load-{}@example.test", TOTAL / 2);
+    let imported = store
+        .scoped(scope)
+        .users()
+        .by_identifier(&identifier)
+        .await
+        .expect("look the imported user up")
+        .expect("the middle record of the hundred thousand exists");
+    assert_eq!(
+        imported.foreign_password_algo.as_deref(),
+        Some("bcrypt"),
+        "the imported row carries its algorithm TAG, which is what verification \
+         dispatches on"
+    );
+    let stored_foreign = imported
+        .foreign_password_hash
+        .as_deref()
+        .expect("a foreign hash before the first login");
+    assert!(
+        !native_verify(&imported, PASSWORD),
+        "the native verifier is the unusable import sentinel until the first login"
+    );
+    assert!(
+        ForeignHash::parse(stored_foreign)
+            .expect("parse the stored foreign hash")
+            .verify(PASSWORD.as_bytes()),
+        "the original password verifies against the imported foreign hash"
+    );
+
+    // The landing, exactly as the login handler performs it.
+    let upgraded = store
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .users()
+        .upgrade_foreign_password(&env, &imported.id, &argon2_hash(PASSWORD))
+        .await
+        .expect("upgrade the foreign hash");
+    assert!(upgraded, "the first upgrade flips the row");
+
+    let after = store
+        .scoped(scope)
+        .users()
+        .by_identifier(&identifier)
+        .await
+        .expect("re-read")
+        .expect("still present");
+    assert!(
+        after.foreign_password_hash.is_none() && after.foreign_password_algo.is_none(),
+        "the foreign hash is RETIRED once rehashed, so the second login has only \
+         Argon2id to verify against"
+    );
+    assert!(
+        native_verify(&after, PASSWORD),
+        "and the ORIGINAL password now authenticates against Argon2id alone, which is \
+         what makes the migration lossless"
+    );
+
     println!(
         "100k import: baseline rss {:?} KiB, peak rss {} KiB, report {report:?}, tallies {tallies:?}",
         baseline,
         peak.load(Ordering::SeqCst)
+    );
+    println!(
+        "verify-then-rehash: {identifier} imported on a foreign bcrypt hash, verified, \
+         rehashed to Argon2id, foreign hash retired"
     );
 }
