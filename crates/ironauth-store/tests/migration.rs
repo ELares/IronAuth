@@ -52,7 +52,8 @@ const CHAIN_SUBJECTS: &str = "isolation, audit log, \
      transactional outbox, control-plane writes on environment secrets, \
      control-plane writes on the migration-run ledger, outbox retention, \
      broker cutover and policy bounds, user identifier delete grant, \
-     sms otp control grants, column scope consume latches.";
+     sms otp control grants, column scope consume latches, \
+     column scope remaining app updates.";
 
 /// A throwaway migration with the given version, phase, and SQL text.
 fn step(version: i64, phase: Phase, sql: &'static str) -> Migration {
@@ -658,7 +659,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
     );
     assert_eq!(
         report.already_applied(),
-        106,
+        107,
         "a migration was added to or removed from the production chain; this count is a \
          deliberate checkpoint, not a bug, so read the new migration, satisfy yourself that it \
          belongs in the shipped chain, then update this number and CHAIN_SUBJECTS and the \
@@ -694,7 +695,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
             46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67,
             68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89,
-            90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106
+            90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107
         ]
     );
     let phase_of = |version: i64| async move {
@@ -7904,6 +7905,70 @@ async fn the_consume_latches_grant_the_data_plane_only_their_consumption_stamp()
         ("fedcm_assertion_nonces", "nonce"),
         ("federation_login_states", "code_verifier_sealed"),
         ("signing_keys", "key_material"),
+    ] {
+        let mut tx = db.app_pool().begin().await.expect("begin as the app role");
+        let result = sqlx::query(&format!("UPDATE {table} SET {column} = 'forged'"))
+            .execute(&mut *tx)
+            .await;
+        assert_permission_denied(result, &format!("{table}.{column}"));
+    }
+}
+
+#[tokio::test]
+async fn the_data_plane_holds_no_table_wide_update_on_any_table() {
+    // Issue #218's actual acceptance, asked of the CATALOG rather than of the migrations.
+    // 0018 narrowed `clients`, 0106 the consume latches and 0107 the rest; this asserts the
+    // property those three were for, so a future migration that hands ironauth_app a
+    // table-wide UPDATE fails here rather than being noticed in a later audit.
+    //
+    // A table-wide grant appears in `information_schema` as an UPDATE privilege on the
+    // TABLE with no matching per-column rows, which is exactly what this looks for.
+    let db = TestDatabase::start().await;
+    // `information_schema.table_privileges` records a TABLE-wide grant and nothing else: a
+    // column-scoped `GRANT UPDATE (col)` does not appear there, it appears only in
+    // `column_privileges`. So the presence of a row here IS the defect.
+    //
+    // The first draft of this query also excluded tables that had any column-level UPDATE
+    // row, on the assumption those two catalogs were disjoint. They are not: Postgres
+    // expands a table-wide grant into per-column rows as well, so that clause matched every
+    // table and the assertion could never fail. Measured, not reasoned about: with the 0107
+    // statements removed the query returned nothing while the refusal test below went red.
+    let offenders: Vec<String> = sqlx::query_scalar(
+        "SELECT table_name::text FROM information_schema.table_privileges \
+         WHERE grantee = 'ironauth_app' AND privilege_type = 'UPDATE' \
+           AND table_schema = 'public' \
+         ORDER BY table_name",
+    )
+    .fetch_all(db.owner_pool())
+    .await
+    .expect("read the privilege catalog");
+    assert!(
+        offenders.is_empty(),
+        "these tables still grant ironauth_app a TABLE-WIDE UPDATE, which the #31 lesson \
+         forbids: {offenders:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_remaining_tables_grant_the_data_plane_only_their_mutable_columns() {
+    // Issue #218 second tranche. Same reasoning as the consume-latch test above: the
+    // POSITIVE half of each grant is already exercised by the suites that revoke grants,
+    // rotate refresh tokens, count DCR registrations, set step-up policies and advance
+    // flows, so a re-grant that is too NARROW fails those with 42501. Nothing existing
+    // catches a grant that is too WIDE, so the refusals are driven here.
+    //
+    // One transaction per probe: a privilege refusal aborts its transaction, so sharing one
+    // would make every probe after the first report 25P02 instead of the 42501 measured.
+    let db = TestDatabase::start().await;
+    for (table, column) in [
+        // The data plane never updates an organization at all: control-plane only.
+        ("organizations", "state"),
+        ("grants", "subject"),
+        ("refresh_families", "client_id"),
+        ("refresh_tokens", "token_digest"),
+        ("dcr_rate_counters", "rate_key"),
+        ("scope_step_up_policies", "scope"),
+        ("flows", "journey"),
     ] {
         let mut tx = db.app_pool().begin().await.expect("begin as the app role");
         let result = sqlx::query(&format!("UPDATE {table} SET {column} = 'forged'"))
