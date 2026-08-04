@@ -25,18 +25,19 @@
 //! for a non-violating record.
 
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::Response;
 use bytes::Bytes;
 use ironauth_store::{
-    CorrelationId, InvariantEvaluation, InvariantKind, MigrationRun, MigrationRunId,
-    MigrationRunTallies, MigrationState, OffendingRecord, Scope, TenantId,
+    CorrelationId, IdempotencyWrite, InvariantEvaluation, InvariantKind, MigrationRun,
+    MigrationRunId, MigrationRunTallies, MigrationState, OffendingRecord, Scope, TenantId,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
 use crate::auth::Principal;
 use crate::error::{ApiError, ErrorBody};
+use crate::idempotency;
 use crate::input::{parse_json, require_non_empty};
 use crate::pagination::{ListQuery, Pagination};
 use crate::response::json;
@@ -422,7 +423,9 @@ async fn detail_view(
     params(
         ("tenant_id" = String, Path, description = "The tenant identifier"),
         ("environment_id" = String, Path, description = "The environment identifier"),
-        ("run_id" = String, Path, description = "The migration-run identifier")
+        ("run_id" = String, Path, description = "The migration-run identifier"),
+        ("Idempotency-Key" = String, Header, description = "Required. Replaying a POST \
+         with the same key returns the original response without re-executing.")
     ),
     security(("bearer" = [])),
     responses(
@@ -433,13 +436,16 @@ async fn detail_view(
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
         (status = 404, description = "Run or environment not found", body = ErrorBody),
-        (status = 409, description = "The run is COMPLETE; a completed run cannot be abandoned", body = ErrorBody)
+        (status = 409, description = "The run is COMPLETE; a completed run cannot be abandoned", body = ErrorBody),
+        (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
     )
 )]
 pub async fn abandon_migration_run(
     State(state): State<AdminState>,
     principal: Principal,
     Path((tenant_id, environment_id, run_id)): Path<(String, String, String)>,
+    uri: Uri,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (tenant, scope) = scope_from_path(&state, &tenant_id, &environment_id)?;
@@ -458,33 +464,64 @@ pub async fn abandon_migration_run(
         )));
     }
 
-    let run = state
-        .store()
-        .scoped(scope)
-        .migration_runs()
-        .get(&run_id)
-        .await?;
-    match run.state {
+    // The Idempotency-Key gate, the last of the nine POSTs the #345 sweep measured.
+    let key = idempotency::required_key(&headers)?;
+    let fingerprint = idempotency::fingerprint("POST", uri.path(), &body);
+    let credential_ref = principal.credential_ref();
+    if let Some(replay) =
+        idempotency::replay_if_stored(&state, &credential_ref, &key, &fingerprint).await?
+    {
+        return Ok(replay);
+    }
+
+    let mut view = detail_view(&state, scope, &run_id).await?;
+    match MigrationState::from_wire(&view.state) {
         // Already given up on: answer with what is recorded rather than rewriting it.
-        MigrationState::Abandoned => {}
-        MigrationState::Complete => {
+        // No write happens, so there is no transaction to carry an idempotency row and
+        // none is stored. Nothing observable turns on that: a retry re-executes this
+        // branch and renders the same recorded view.
+        Some(MigrationState::Abandoned) => {
+            let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
+            return Ok(json(StatusCode::OK, body_string));
+        }
+        Some(MigrationState::Complete) => {
             return Err(ApiError::Conflict(format!(
                 "run {run_id} is complete and cannot be abandoned"
             )));
         }
-        _ => {
-            state
-                .store()
-                .scoped(scope)
-                .acting(actor, CorrelationId::generate(state.env()))
-                .migration_runs()
-                .abandon(state.env(), &run_id, &reason)
-                .await?;
-        }
+        _ => {}
     }
 
-    let view = detail_view(&state, scope, &run_id).await?;
+    // The response body is KNOWABLE before the write, which is what lets this carry the
+    // plain idempotency form and keeps the handler at ONE store write. `abandon` sets
+    // exactly two of this view's fields, `state` and `abandoned_reason`, both determined
+    // by the request; the counts and invariant evaluations it also renders are untouched
+    // by abandoning a run. So the body is derived here and the SAME bytes are stored and
+    // returned, rather than re-read afterwards and recorded in a second transaction.
+    MigrationState::Abandoned
+        .as_str()
+        .clone_into(&mut view.state);
+    view.abandoned_reason = Some(reason.clone());
     let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
+
+    state
+        .store()
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(state.env()))
+        .migration_runs()
+        .abandon(
+            state.env(),
+            &run_id,
+            &reason,
+            Some(IdempotencyWrite {
+                credential_ref: &credential_ref,
+                key: &key,
+                request_fingerprint: &fingerprint,
+                response_status: 200,
+                response_body: &body_string,
+            }),
+        )
+        .await?;
     Ok(json(StatusCode::OK, body_string))
 }
 

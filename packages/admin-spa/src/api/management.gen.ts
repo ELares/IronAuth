@@ -10881,7 +10881,10 @@ export interface operations {
     abandonMigrationRun: {
         parameters: {
             query?: never;
-            header?: never;
+            header: {
+                /** @description Required. Replaying a POST with the same key returns the original response without re-executing. */
+                "Idempotency-Key": string;
+            };
             path: {
                 /** @description The tenant identifier */
                 tenant_id: string;
@@ -10945,6 +10948,15 @@ export interface operations {
             };
             /** @description The run is COMPLETE; a completed run cannot be abandoned */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Idempotency-Key reused with a different request */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };
