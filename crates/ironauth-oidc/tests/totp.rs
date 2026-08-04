@@ -512,3 +512,80 @@ async fn the_endpoints_fail_closed_when_totp_is_disabled() {
         "a disabled deployment exposes no surface"
     );
 }
+
+/// Issue #275: recovery-code REGENERATION answers the #81 downgrade invariant, like
+/// every other mutation of a sign-in factor already does.
+///
+/// Regeneration is not a removal by name and is one by effect: it destroys the existing
+/// set and mints a replacement. Run from a weaker recovered session while that recovery
+/// is still held, it invalidates the victim's codes and leaves the actor holding a set
+/// only they know. The four other factor mutations consult `gate_factor_removal`; this
+/// pins that the recovery-code set now does too.
+#[tokio::test]
+async fn regeneration_is_refused_while_a_weaker_recovery_is_held() {
+    use ironauth_oidc::ProvenFactor;
+    use ironauth_oidc::recovery::{RecoveryFactor, RecoveryInitiation, initiate_recovery};
+    use ironauth_store::{RecoveryEntryPoint, UserId};
+
+    let harness = Harness::start().await;
+    let subject_raw = harness
+        .seed_user("ivy@example.test", "correct horse battery")
+        .await;
+    let factor = enroll_active(&harness, &subject_raw).await;
+    let cookie = factor.cookie;
+    let base = base(&harness);
+    let subject = UserId::parse_in_scope(&subject_raw, &harness.scope()).expect("subject parses");
+
+    // CONTROL, and the test is worthless without it: with no recovery pending, the same
+    // request with the same proof SUCCEEDS. A gate that refused everything would satisfy
+    // the assertion below and destroy ordinary self-service rotation.
+    let (status, body) = post_json(
+        &harness,
+        &format!("{base}/recovery-codes"),
+        &cookie,
+        &json!({ "password": "correct horse battery" }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "with no recovery pending, regeneration is ordinary self-service: {body:?}"
+    );
+
+    // A WEAKER recovery (email OTP, pwd-strength) is opened against this mfa account, so
+    // it is held for the delay window.
+    let outcome = initiate_recovery(
+        harness.state(),
+        &ProvenFactor::fabricated_for_tests(harness.scope(), subject, RecoveryFactor::EmailOtp),
+        RecoveryEntryPoint::LostPassword,
+        "ivy@example.test",
+        None,
+        ironauth_store::RecoveryMethod::Standard,
+    )
+    .await;
+    assert!(
+        matches!(outcome, RecoveryInitiation::Created { held: true, .. }),
+        "a pwd recovery against an mfa account is held, so a real delay horizon exists"
+    );
+
+    // The SAME request, with the SAME valid password proof, is now refused. The password
+    // is exactly what an actor who completed a recovery would hold, which is why proving
+    // it cannot be what authorizes rotating an mfa-level credential.
+    let (status, body) = post_json(
+        &harness,
+        &format!("{base}/recovery-codes"),
+        &cookie,
+        &json!({ "password": "correct horse battery" }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "regeneration is held while a weaker recovery is: {body:?}"
+    );
+    assert_eq!(body["error"], json!("recovery_downgrade_blocked"));
+
+    // The delay and re-verify branches that UNBLOCK it are the gate's own, already pinned
+    // by the recovery suites against `gate_factor_removal` directly. What could only be
+    // measured here is the WIRING: that this handler consults the gate at all.
+}
