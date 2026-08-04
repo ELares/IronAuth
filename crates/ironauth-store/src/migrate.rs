@@ -950,6 +950,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0109_idempotency_key_retention.sql"),
         },
+        Migration {
+            version: 110,
+            name: "step_up_policy_control_grants",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0110_step_up_policy_control_grants.sql"),
+        },
     ]
 }
 

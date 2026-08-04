@@ -276,6 +276,21 @@ fn abuse_and_sudo_cases(base: &str) -> Vec<Case> {
             body: Some(ban),
         },
         Case {
+            label: "step_up_policies.setStepUpPolicy",
+            method: "POST",
+            path: format!("{base}/step-up-policies"),
+            body: Some(
+                serde_json::json!({ "scope_token": "payments:write", "min_acr": "aal2" })
+                    .to_string(),
+            ),
+        },
+        Case {
+            label: "step_up_policies.removeStepUpPolicy",
+            method: "DELETE",
+            path: format!("{base}/step-up-policies/payments:write"),
+            body: None,
+        },
+        Case {
             label: "sudo.elevateAdminSudo",
             method: "POST",
             path: format!("{base}/admin/sudo/elevate"),

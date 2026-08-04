@@ -1057,6 +1057,23 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             format!("{base}/abuse/bans/lift"),
             &ban,
         ),
+        // ---- per-scope step-up policy (issue #262) ----
+        Case::empty(
+            "step_up_policies.listStepUpPolicies",
+            "GET",
+            format!("{base}/step-up-policies"),
+        ),
+        Case::json(
+            "step_up_policies.setStepUpPolicy",
+            "POST",
+            format!("{base}/step-up-policies"),
+            &serde_json::json!({ "scope_token": "payments:write", "min_acr": "aal2" }),
+        ),
+        Case::empty(
+            "step_up_policies.removeStepUpPolicy",
+            "DELETE",
+            format!("{base}/step-up-policies/payments:write"),
+        ),
         // ---- clients and their per-client configuration ----
         Case::empty(
             "dcr.getDcrClient",

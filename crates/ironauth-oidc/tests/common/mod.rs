@@ -1872,7 +1872,7 @@ impl Harness {
             .scoped(self.scope)
             .acting(actor, corr)
             .scope_step_up_policies()
-            .set(&self.env, scope_token, min_acr, max_auth_age_secs)
+            .set(&self.env, scope_token, min_acr, max_auth_age_secs, None)
             .await
             .expect("set scope step-up policy");
     }

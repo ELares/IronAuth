@@ -1912,6 +1912,41 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/step-up-policies": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List every per-scope step-up policy in the environment. */
+        get: operations["listStepUpPolicies"];
+        put?: never;
+        /** Set the step-up policy for one OAuth scope token. */
+        post: operations["setStepUpPolicy"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/step-up-policies/{scope_token}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Remove the step-up policy for one OAuth scope token. */
+        delete: operations["removeStepUpPolicy"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas": {
         parameters: {
             query?: never;
@@ -5218,6 +5253,18 @@ export interface components {
             /** @description Whether the SMS OTP factor is enabled. */
             enabled: boolean;
         };
+        /** @description Set (create or replace) the policy for one OAuth scope token. */
+        SetStepUpPolicyRequest: {
+            /**
+             * Format: int64
+             * @description The maximum authentication age in seconds. Omit to impose no bound.
+             */
+            max_auth_age_secs?: number | null;
+            /** @description The `acr` floor for this scope. Omit to impose no floor. */
+            min_acr?: string | null;
+            /** @description The OAuth scope token to govern (a single scope value). */
+            scope_token: string;
+        };
         /** @description The body to transition a user's lifecycle state (issue #52). */
         SetUserStateRequest: {
             /**
@@ -5408,6 +5455,25 @@ export interface components {
             outcome: string;
             /** @description The required acr floor, or absent. */
             required_acr?: string | null;
+        };
+        /** @description Every per-scope step-up policy in the environment. */
+        StepUpPolicyList: {
+            /** @description The policies, oldest first. */
+            items: components["schemas"]["StepUpPolicyView"][];
+        };
+        /** @description One per-scope step-up policy. */
+        StepUpPolicyView: {
+            /** @description The `sup_` policy identifier. */
+            id: string;
+            /**
+             * Format: int64
+             * @description The maximum authentication age in seconds for this scope, if any.
+             */
+            max_auth_age_secs?: number | null;
+            /** @description The `acr` floor an authentication must reach for this scope, if any. */
+            min_acr?: string | null;
+            /** @description The OAuth scope token this policy governs. */
+            scope_token: string;
         };
         /** @description The result of a successful admin sudo elevation (issue #73). */
         SudoElevationView: {
@@ -15491,6 +15557,185 @@ export interface operations {
                 };
             };
             /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment is absent or deleted */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listStepUpPolicies: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The environment's step-up policies */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpPolicyList"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment is absent */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    setStepUpPolicy: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Required. Replaying a POST with the same key returns the original response without re-executing. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetStepUpPolicyRequest"];
+            };
+        };
+        responses: {
+            /** @description The policy is set. Read it back through the list endpoint */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Malformed request or a blank scope token */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential, or fresh privilege required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment is absent or deleted */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Idempotency-Key reused with a different request */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    removeStepUpPolicy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The OAuth scope token whose policy is removed */
+                scope_token: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The policy is gone. Removing an absent policy is a no-op success */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing or invalid credential, or fresh privilege required */
             401: {
                 headers: {
                     [name: string]: unknown;
