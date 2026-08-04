@@ -562,7 +562,7 @@ async fn a_revoked_grant_re_prompts_for_the_full_scope() {
             CorrelationId::generate(harness.env()),
         )
         .consents()
-        .revoke(harness.env(), &subject, &client_id, REVOKE_AT_MICROS)
+        .revoke(harness.env(), &subject, &client_id, REVOKE_AT_MICROS, None)
         .await
         .expect("revoke");
 

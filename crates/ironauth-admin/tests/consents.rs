@@ -297,3 +297,69 @@ async fn revoke_requires_fresh_privilege() {
         "the challenged revoke ran no cascade"
     );
 }
+
+#[tokio::test]
+async fn a_retried_revoke_replays_the_original_result_rather_than_re_executing() {
+    // Issue #345. The revoke is naturally idempotent, so this is not a data-safety fix:
+    // it is the difference between a retry after a network timeout receiving the
+    // ORIGINAL answer and receiving a freshly computed `revoked: false` that reads as
+    // "there was nothing to revoke".
+    let h = Harness::start(50).await;
+    let scope = h.seed_scope().await;
+    let subject = Harness::fresh_user_id(scope).to_string();
+    let client = create_client(&h, scope, "Acme Analytics").await;
+    let client_str = client.to_string();
+    grant_consent(&h, scope, &subject, &client_str).await;
+
+    let session = h.seed_session(scope, &subject).await;
+    let _family = h
+        .seed_refresh_family(scope, &subject, &client_str, &session, false)
+        .await;
+
+    let path = revoke_path(scope, &subject, &client_str);
+
+    let (status, _, first) = h.post(&path, "retry-key", "{}").await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let first_view = body_json(&first);
+    assert_eq!(first_view["revoked"], Value::Bool(true));
+    assert_eq!(first_view["families_revoked"], 1);
+
+    // The RETRY, same key: the stored bytes come back, cascade count and all.
+    let (status, _, replayed) = h.post(&path, "retry-key", "{}").await;
+    assert_eq!(status, StatusCode::OK, "{replayed}");
+    assert_eq!(
+        body_json(&replayed),
+        first_view,
+        "a retry under the same key must replay the original response verbatim"
+    );
+
+    // THE CONTROL, and without it the assertion above proves nothing: a DIFFERENT key
+    // re-executes, and re-execution genuinely produces a different answer now that the
+    // grant is gone. That difference is exactly what the replay was hiding, so it is
+    // what shows the replay was a stored response rather than a coincidence.
+    let (status, _, fresh) = h.post(&path, "another-key", "{}").await;
+    assert_eq!(status, StatusCode::OK, "{fresh}");
+    let fresh_view = body_json(&fresh);
+    assert_eq!(fresh_view["revoked"], Value::Bool(false));
+    assert_eq!(fresh_view["families_revoked"], 0);
+    assert_ne!(
+        fresh_view, first_view,
+        "re-execution and replay must differ, or the replay assertion is vacuous"
+    );
+
+    // A key reused for a DIFFERENT target is the fingerprint conflict, not a replay of
+    // the wrong answer: the path is part of what the key is bound to.
+    let other = create_client(&h, scope, "Other App").await;
+    let (status, _, body) = h
+        .post(
+            &revoke_path(scope, &subject, &other.to_string()),
+            "retry-key",
+            "{}",
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "the same key against a different client is a conflict: {body}"
+    );
+}
