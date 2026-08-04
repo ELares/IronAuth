@@ -332,6 +332,7 @@ use crate::views::{
         crate::users::get_user_traits,
         crate::identifiers::list_user_identifiers,
         crate::identifiers::add_user_identifier,
+        crate::identifiers::remove_user_identifier,
         crate::trait_schemas::create_trait_schema_version,
         crate::trait_schemas::list_trait_schema_versions,
         crate::trait_schemas::get_active_trait_schema,

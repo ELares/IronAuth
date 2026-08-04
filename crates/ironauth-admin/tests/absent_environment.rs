@@ -733,6 +733,12 @@ fn user_cases(base: &str, ids: &Ids) -> Vec<Case> {
             )),
         },
         Case {
+            label: "users.removeUserIdentifier",
+            method: "DELETE",
+            path: format!("{base}/users/{user}/identifiers/uid_absentidentifierprobe00000"),
+            body: None,
+        },
+        Case {
             label: "users.linkUserExternalId",
             method: "PUT",
             path: format!("{base}/users/{user}/external-id"),

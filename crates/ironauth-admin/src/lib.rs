@@ -735,6 +735,13 @@ pub fn management_router(state: AdminState) -> Router {
             "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/identifiers",
             get(identifiers::list_user_identifiers).post(identifiers::add_user_identifier),
         )
+        // The remove (epic #514), which is what M6 criterion 2's "end to end" still
+        // lacked. A HARD delete, because the row is the claim on the uniqueness slot;
+        // migration 0104 grants the DELETE to the control role only.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/identifiers/{identifier_id}",
+            delete(identifiers::remove_user_identifier),
+        )
         // Per-environment identity trait-schema versions (issue #53): the append-only registry
         // (create / list / get) plus the two pointers, the ACTIVE read that is also the schema
         // introspection endpoint, and the cutover-gated activate. `/active` is a STATIC segment

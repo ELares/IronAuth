@@ -1,0 +1,38 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+--
+-- Removing a login identifier (issue #54, epic #514).
+--
+-- 0041 granted SELECT, INSERT and a column-scoped UPDATE (verified, uniqueness_key,
+-- updated_at) on user_identifiers, and no DELETE to any role. That was correct while
+-- nothing could remove one: M6's second exit criterion asks for identifiers to be
+-- manageable "end to end via API", and #519 landed the list and the add, so the remove
+-- is what the criterion still lacks and it needs this grant.
+--
+-- Granted to ironauth_control ONLY, not to ironauth_app. The reasoning is #507's: a role
+-- gets a privilege because a path it owns needs it, never for symmetry. The data plane
+-- has NO identifier writer at all (measured before #519: ActingUserIdentifierRepo::add
+-- had zero callers outside tests, and it still has exactly one, on the management
+-- plane), so granting the login plane the ability to erase a login handle it never
+-- creates would widen what a compromised data-plane role can destroy while enabling
+-- nothing. If a self-service "remove my email" flow ever lands on the data plane it
+-- takes its own grant, in its own migration, with its own argument.
+--
+-- A HARD delete rather than a tombstone column, which is a decision worth stating
+-- because most of this schema soft-deletes. An identifier's row IS its claim on the
+-- uniqueness slot: the partial unique index over uniqueness_key is what makes one
+-- canonical identifier resolve to one user. A tombstoned row would keep occupying that
+-- slot, so a user who removed an old email could never have it re-added, and neither
+-- could anyone else, forever, with no way to see why. Removal has to actually free the
+-- slot to mean anything, and that is asserted directly by
+-- `removing_an_identifier_frees_the_uniqueness_slot`.
+--
+-- Losing the row loses no audit trail: the remove writes its audit_log row in the same
+-- transaction as the delete, exactly as the add does, so who removed what and when
+-- survives the row itself.
+--
+-- Migration safety obligation (see migrate.rs): this migration adds a GRANT and nothing
+-- else. It creates no table, so it introduces no row-level-security obligation and no
+-- new entry for scripts/query-audit.sh, and it alters no existing object, so it is an
+-- EXPAND with no contract phase.
+
+GRANT DELETE ON user_identifiers TO ironauth_control;

@@ -1008,3 +1008,87 @@ async fn passkey_only_account_resolves_with_only_the_passkey_method() {
         "a passkey-only account offers exactly the passkey method, no password"
     );
 }
+
+/// The remove is granted to the CONTROL role and to it alone (migration 0104).
+///
+/// This is the negative half of that decision, and it is the half a grant that reads
+/// correctly can still get wrong. `GRANT DELETE ... TO ironauth_control` says nothing
+/// about `ironauth_app` on its own, so what makes the choice real is that the data-plane
+/// role is actually refused. Postgres answers SQLSTATE 42501, and both halves are driven
+/// here against the same row so neither can pass for a reason unrelated to the grant.
+#[tokio::test]
+async fn removing_an_identifier_is_granted_to_the_control_role_and_refused_to_the_app_role() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x5b);
+    let scope = db.seed_scope(&env).await;
+    let user = register_user(&db, &env, scope, "u1").await;
+
+    let id = UserIdentifierId::generate(&env, &scope);
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .user_identifiers()
+        .add(
+            &env,
+            NewUserIdentifier {
+                id: &id,
+                user_id: &user,
+                identifier_type: IdentifierType::Email,
+                raw: "grant-probe@example.test",
+                verified: false,
+                mode: UniquenessMode::EnvironmentWide,
+                org: None,
+            },
+            None,
+        )
+        .await
+        .expect("control role may add");
+
+    // The APP role is refused. Driven through the same repository method the management
+    // surface uses, so this measures the grant rather than a hand-written statement that
+    // could differ from what production runs.
+    let refused = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .user_identifiers()
+        .remove(&env, &user, &id)
+        .await;
+    match refused {
+        Err(StoreError::Database(_)) => {}
+        other => panic!(
+            "the app role must be refused the DELETE (0104 grants it to \
+                         ironauth_control only), got: {other:?}"
+        ),
+    }
+
+    // The row is still there, so the refusal refused rather than partially applying.
+    let remaining = db
+        .control_store()
+        .scoped(scope)
+        .user_identifiers()
+        .list_for_user(&user)
+        .await
+        .expect("list");
+    assert_eq!(remaining.len(), 1, "a refused remove leaves the row");
+
+    // And the CONTROL role removes it, so the positive half is measured on the same row.
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .user_identifiers()
+        .remove(&env, &user, &id)
+        .await
+        .expect("control role may remove");
+    let remaining = db
+        .control_store()
+        .scoped(scope)
+        .user_identifiers()
+        .list_for_user(&user)
+        .await
+        .expect("list");
+    assert!(
+        remaining.is_empty(),
+        "the control role's remove took effect"
+    );
+}

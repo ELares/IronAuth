@@ -514,6 +514,12 @@ pub enum Action {
     /// identifier value is never recorded on the audit row (it is sealed and
     /// blind-indexed on its row); only that the user gained an identifier, and when.
     UserIdentifierAdd,
+    /// A typed login IDENTIFIER was REMOVED from a user (issue #54, epic #514). A hard
+    /// delete, because the row IS the claim on the uniqueness slot and a tombstone would
+    /// hold that slot forever; this audit row is what survives it, so who removed an
+    /// identifier and when is still answerable once the row is gone. The identifier
+    /// value is never recorded here, for the same reason the add does not record it.
+    UserIdentifierRemove,
     /// A per-environment identifier UNIQUENESS mode was APPLIED (issue #54): an
     /// operator switched the environment's mode and the store recomputed every
     /// identifier row's uniqueness discriminator under the new mode, in one
@@ -1314,6 +1320,7 @@ impl Action {
             Action::UserExternalIdUnlink => "user.external_id.unlink",
             Action::UserOffboardingExecute => "user.offboarding.execute",
             Action::UserIdentifierAdd => "user.identifier.add",
+            Action::UserIdentifierRemove => "user.identifier.remove",
             Action::UserIdentifierApplyUniquenessMode => "user.identifier.uniqueness.apply",
             Action::InvitationCreate => "invitation.create",
             Action::InvitationRedeem => "invitation.redeem",

@@ -193,6 +193,13 @@ fn cases(client: &str) -> Vec<Case> {
             expect: Expect::UniformNotFound,
         },
         Case {
+            operation_id: "removeUserIdentifier",
+            method: "DELETE",
+            suffix: "/identifiers/uid_unsealedprobe0000000000000".to_owned(),
+            body: None,
+            expect: Expect::UniformNotFound,
+        },
+        Case {
             operation_id: "linkUserExternalId",
             method: "PUT",
             suffix: "/external-id".to_owned(),
