@@ -338,12 +338,37 @@ async fn a_new_device_login_notifies_and_this_wasnt_me_revokes_and_flags() {
         .nth(1)
         .expect("token in link")
         .to_owned();
+    // The GET offers the button only while the token is LIVE. This is the control for the
+    // spent-token assertion at the end of this test: without it, that assertion would pass
+    // just as well against a handler that refused every token.
+    let (status, page) = disavow_get(&harness, &token).await;
+    assert_eq!(status, StatusCode::OK, "a live token offers the button");
+    assert!(
+        page.contains("Was this you?"),
+        "the confirmation page renders for a live token: {page}"
+    );
+
     let disavow_body = form(&[("token", &token)]);
     let (status, _h, done) = harness
         .post_form("/risk/disavow", &disavow_body, None)
         .await;
     assert_eq!(status, StatusCode::OK, "the disavowal page renders");
     assert!(done.contains("secured"), "a confirmation page is shown");
+
+    // The SAME link is now spent. Offering the button again would invite the user to
+    // "secure" an account a second time and tell them it worked, which for a security
+    // action is worse than an error: they would believe sessions were revoked that were
+    // not.
+    let (status, page) = disavow_get(&harness, &token).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a consumed disavowal link must not offer the button again: {page}"
+    );
+    assert!(
+        !page.contains("Was this you?"),
+        "and must not render the confirmation form: {page}"
+    );
 
     // The credentials are now flagged for review, and the session in question is revoked.
     let scoped = harness.store().scoped(harness.scope());
@@ -683,6 +708,23 @@ async fn repeated_new_device_notifications_are_throttled_within_the_cooldown() {
     );
 }
 
+/// Drive the disavowal confirmation GET for `token` and return its status and body.
+///
+/// The GET resolves the token before offering the button, so this is the read that tells a
+/// live link from a spent, expired or forged one.
+async fn disavow_get(harness: &Harness, token: &str) -> (StatusCode, String) {
+    let (status, _headers, page) = harness
+        .send(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/risk/disavow?token={token}"))
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await;
+    (status, page)
+}
+
 // ---------------------------------------------------------------------------
 // HIGH-1: the disavow GET escapes reflected input and carries the strict CSP
 // ---------------------------------------------------------------------------
@@ -698,15 +740,21 @@ async fn the_disavow_get_escapes_the_token_and_carries_the_strict_csp() {
         .body(Body::empty())
         .expect("request builds");
     let (status, headers, page) = harness.send(request).await;
-    assert_eq!(status, StatusCode::OK, "the confirmation page renders");
-    // The reflected token is neutralized: no raw script tag, no attribute breakout.
-    assert!(
-        !page.contains("<script>"),
-        "the reflected token must not inject a raw script tag: {page}"
+    // The crafted token resolves to no live disavowal, so the page is REFUSED and the
+    // token is not reflected at all. This is stronger than the escaping this test
+    // originally asserted: the reflected-XSS surface is gone rather than neutralized,
+    // because a token that does not resolve never reaches `confirm_page`. The escaping in
+    // `confirm_page` remains as defense in depth for the live-token path, which is the
+    // only path that can now reflect anything, and a live token is a high-entropy value
+    // this endpoint minted rather than caller-supplied text.
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a token that resolves to nothing is refused: {page}"
     );
     assert!(
-        page.contains("&lt;script&gt;"),
-        "the reflected token is HTML-escaped into entities: {page}"
+        !page.contains("<script>") && !page.contains("&lt;script&gt;"),
+        "the crafted token is not reflected at all, escaped or otherwise: {page}"
     );
     // The page carries the SAME strict CSP the other hosted pages do.
     let csp = headers
@@ -715,7 +763,8 @@ async fn the_disavow_get_escapes_the_token_and_carries_the_strict_csp() {
         .unwrap_or_default();
     assert!(
         csp.contains("default-src 'none'") && csp.contains("frame-ancestors 'none'"),
-        "the disavow GET carries the strict CSP, got {csp:?}"
+        "the refusal goes through the same secure_html seam, so it carries the strict \
+         CSP too, got {csp:?}"
     );
     // The frame-deny and nosniff hardening headers are present too.
     assert_eq!(
