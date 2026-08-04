@@ -39217,6 +39217,14 @@ impl ManagementCredentialRepo<'_> {
     }
 }
 
+/// How many expired `idempotency_keys` rows one idempotent write may prune.
+///
+/// The prune rides an existing write transaction, so this bounds what that write
+/// pays: a fixed ceiling rather than a delete proportional to the backlog. A
+/// steady state needs far fewer than this per write, and a large backlog drains
+/// across successive writes instead of stalling one of them (issue #186).
+const IDEMPOTENCY_PRUNE_BATCH: i64 = 100;
+
 /// The idempotency replay store (credential-scoped). See the migration for why
 /// isolation here is by credential rather than tenant row-level security.
 pub struct IdempotencyRepo<'a> {
@@ -39234,10 +39242,15 @@ impl IdempotencyRepo<'_> {
         credential_ref: &str,
         key: &str,
     ) -> Result<Option<StoredIdempotentResponse>, StoreError> {
+        // `expires_at` filters here rather than relying on the prune having run: a
+        // key past its window is treated as FRESH (the caller re-executes), which is
+        // the contract, and making that true the instant the window passes means a
+        // lagging prune can never resurrect a replay (issue #186).
         let row = sqlx::query(
             "SELECT request_fingerprint, response_status, response_body \
              FROM idempotency_keys \
-             WHERE credential_ref = $1 AND idempotency_key = $2",
+             WHERE credential_ref = $1 AND idempotency_key = $2 \
+               AND expires_at > now()",
         )
         .bind(credential_ref)
         .bind(key)
@@ -39279,6 +39292,16 @@ impl IdempotencyRepo<'_> {
         response_status: u16,
         response_body: &str,
     ) -> Result<(), StoreError> {
+        // Same expired-row release as the in-transaction path: an expired row still
+        // holds the primary key, and this write must be able to take it back.
+        sqlx::query(
+            "DELETE FROM idempotency_keys \
+             WHERE credential_ref = $1 AND idempotency_key = $2 AND expires_at <= now()",
+        )
+        .bind(credential_ref)
+        .bind(key)
+        .execute(self.store.pool())
+        .await?;
         let result = sqlx::query(
             "INSERT INTO idempotency_keys \
              (credential_ref, idempotency_key, request_fingerprint, response_status, response_body) \
@@ -45057,6 +45080,45 @@ async fn insert_idempotency(
     let Some(idem) = idempotency else {
         return Ok(());
     };
+    // Prune inline on the write path, the shape five of the other replay tables
+    // already use (`client_assertion_jtis`, `external_assertion_jtis`,
+    // `dpop_proof_replay` and the two diagnostics tables). Doing it HERE rather than
+    // in a sweeper is what makes it reach all 41 call sites without touching one of
+    // them, and it means the table is bounded by its own traffic: a deployment
+    // writing idempotent requests is exactly the one accumulating rows.
+    //
+    // OLDEST FIRST, which is what makes the bound deterministic rather than merely
+    // small: without the ordering, WHICH expired rows a pass removes is unspecified,
+    // so a backlog could starve one row indefinitely and no test could pin the
+    // boundary case the targeted delete below exists for.
+    //
+    // BOUNDED by construction. The inner select walks the `expires_at` index and
+    // stops at a fixed count, so this costs the same whether the backlog is a
+    // hundred rows or a million, and a write is never held behind a large delete.
+    // Only rows already past their window are eligible, so the prune can never
+    // remove a response the lookup above would still have replayed.
+    sqlx::query(
+        "DELETE FROM idempotency_keys \
+         WHERE (credential_ref, idempotency_key) IN ( \
+             SELECT credential_ref, idempotency_key FROM idempotency_keys \
+             WHERE expires_at <= now() ORDER BY expires_at LIMIT $1)",
+    )
+    .bind(IDEMPOTENCY_PRUNE_BATCH)
+    .execute(&mut **tx)
+    .await?;
+    // The batch above is bounded, so it may not reach THIS key's expired row, and an
+    // expired row still occupies the primary key. Without this the insert below would
+    // raise a unique violation and the caller would be told to replay a response the
+    // (expiry-filtered) lookup reports as absent, which is the one way an expiry
+    // window can turn a fresh request into an error. Targeted, and free on the PK.
+    sqlx::query(
+        "DELETE FROM idempotency_keys \
+         WHERE credential_ref = $1 AND idempotency_key = $2 AND expires_at <= now()",
+    )
+    .bind(idem.credential_ref)
+    .bind(idem.key)
+    .execute(&mut **tx)
+    .await?;
     let result = sqlx::query(
         "INSERT INTO idempotency_keys \
          (credential_ref, idempotency_key, request_fingerprint, response_status, response_body) \
