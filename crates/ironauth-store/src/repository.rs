@@ -43544,8 +43544,8 @@ impl ActingOrgRolePermissionRepo<'_> {
         env: &Env,
         spec: NewOrgRolePermission<'_>,
         created_at_micros: i64,
-        idempotency: Option<IdempotencyWrite<'_>>,
-    ) -> Result<(), StoreError> {
+        idempotency: Option<ResolvedIdempotencyWrite<'_, i64>>,
+    ) -> Result<i64, StoreError> {
         if spec.id.scope() != self.scope
             || spec.organization_id.scope() != self.scope
             || spec.role_id.scope() != self.scope
@@ -43595,8 +43595,32 @@ impl ActingOrgRolePermissionRepo<'_> {
                     }
                     Err(error) => return Err(error.into()),
                 }
-                insert_idempotency(tx, idempotency).await?;
-                Ok(())
+                // The role-scoped live count, taken INSIDE this transaction and AFTER the
+                // insert (issue #430). It therefore includes the row just written and
+                // everything committed before this transaction's snapshot, which is the
+                // strongest figure available without serializing the attach.
+                //
+                // It replaces a count the handler took in its OWN earlier transaction and
+                // then incremented by hand. That figure could not see its own insert, so
+                // the `+ 1` was an assumption rather than a measurement, and anything
+                // committed between the two transactions was missed outright.
+                let attached: i64 = sqlx::query(
+                    "SELECT COUNT(*) AS n FROM org_role_permissions \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
+                     AND role_id = $4 AND deleted_at IS NULL",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(organization_id.to_string())
+                .bind(role_id.to_string())
+                .fetch_one(&mut **tx)
+                .await?
+                .get("n");
+                // The stored replay body is rendered from that same count, in this same
+                // transaction, so the response and every replay of it agree with the state
+                // they describe.
+                insert_resolved_idempotency(tx, idempotency, &attached).await?;
+                Ok(attached)
             },
             false,
         )

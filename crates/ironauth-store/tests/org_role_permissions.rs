@@ -243,7 +243,7 @@ async fn attach_at(
             None,
         )
         .await
-        .map(|()| id)
+        .map(|_attached| id)
 }
 
 /// Attach at a fixed instant, for the majority of tests that do not care.

@@ -2849,3 +2849,54 @@ async fn a_maximum_of_zero_is_over_on_the_very_first_attach() {
         "with both verdicts agreeing that the next token withholds the claim: {view}"
     );
 }
+
+#[tokio::test]
+async fn the_attach_verdict_count_is_the_live_set_measured_not_arithmetic() {
+    // Issue #430. The figure used to be counted in its OWN transaction BEFORE the insert
+    // and then incremented by hand, so it could not see the row it was describing. It is
+    // now counted INSIDE the write transaction and AFTER the insert, and the store returns
+    // that number for both the 201 and the stored replay body.
+    //
+    // This ties the reported figure to an INDEPENDENTLY read live set rather than to the
+    // sequence of calls that produced it, so an implementation keeping a running tally
+    // would have to keep it correct against the list endpoint.
+    let h = Harness::start(50).await;
+    let (tenant, environment) = tenant_env(&h).await;
+    let org = create_org(&h, &tenant, &environment, "k-org").await;
+    let roles = roles_base(&tenant, &environment, &org);
+    let vocabulary = permissions_base(&tenant, &environment);
+    let role = create_role(&h, &roles, "auditor", "k-role").await;
+    let base = mapping_base(&tenant, &environment, &org, &role);
+
+    let mut created = None;
+    let mut permissions = Vec::new();
+    for (n, slug) in ["reports.read", "reports.write", "reports.export"]
+        .into_iter()
+        .enumerate()
+    {
+        let permission = create_permission(&h, &vocabulary, slug, &format!("k-v{n}")).await;
+        created = Some(attach_created(&h, &base, &permission, &format!("k-a{n}")).await);
+        permissions.push(permission);
+    }
+    let created = created.expect("three attaches");
+
+    // The verdict on the LAST attach equals the number of live mappings the list endpoint
+    // reports, which is the set the field claims to measure.
+    let live = list_ids(&h, &base).await.len() as u64;
+    assert_eq!(live, 3, "three mappings are live");
+    assert_role_budget(&created, live, false, None);
+
+    // And after a detach the next attach MEASURES the set again rather than continuing a
+    // tally: three live, remove one, attach one, still three.
+    // The detach addresses the PERMISSION, which is the pair's other half, not the
+    // mapping id the list returns.
+    let doomed = permissions.remove(0);
+    let (status, _, response) = h.delete(&format!("{base}/{doomed}")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "detach: {response}");
+
+    let permission = create_permission(&h, &vocabulary, "reports.share", "k-v3").await;
+    let created = attach_created(&h, &base, &permission, "k-a3").await;
+    let live = list_ids(&h, &base).await.len() as u64;
+    assert_eq!(live, 3, "one out, one in");
+    assert_role_budget(&created, live, false, None);
+}

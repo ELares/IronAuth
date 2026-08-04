@@ -127,8 +127,8 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::Response;
 use ironauth_store::{
-    CorrelationId, IdempotencyWrite, NewOrgRolePermission, OrgRolePermissionId,
-    OrgRolePermissionRecord, StoreError,
+    CorrelationId, NewOrgRolePermission, OrgRolePermissionId, OrgRolePermissionRecord,
+    ResolvedIdempotencyWrite, StoreError,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -203,16 +203,22 @@ pub struct OrgRolePermissionView {
     ///
     /// # A SNAPSHOT taken at the write, reproduced exactly on a replay
     ///
-    /// The count is a read taken immediately BEFORE the insert, in its own transaction,
-    /// plus the one row being attached, and nothing is held between the two. So a
-    /// permission attached to the SAME role concurrently leaves the figure SHORT and a
-    /// concurrent DETACH leaves it LONG: the looseness runs BOTH ways, not one. An
-    /// Idempotency-Key REPLAY then reproduces the original snapshot byte for byte by
-    /// design, so a 201 can report a count the role no longer has (measured: a replay
-    /// reported 2 and `approaching` against a live count of 1). No surface on this plane
-    /// claims an instant; the effective-roles read has the same looseness, its two store
-    /// reads being two transactions too. Why the count runs before rather than after is
-    /// recorded on the handler, together with what would be needed to tighten it.
+    /// The count is taken INSIDE the write transaction and AFTER the insert (issue #430),
+    /// so it includes the row being attached and everything committed before that
+    /// transaction's snapshot. The 201 and the stored Idempotency-Key body are rendered
+    /// from that one figure by the same closure, so a response can never disagree with
+    /// its own replay.
+    ///
+    /// It is exact with respect to that SNAPSHOT rather than globally serialized. Under
+    /// READ COMMITTED two attaches racing on one role can each see their own insert and
+    /// not the other's, so both may report the same figure; ruling that out would mean
+    /// serializing every attach on a per-role lock for an ADVISORY number, which the
+    /// covenant above argues against.
+    ///
+    /// An Idempotency-Key REPLAY reproduces the original snapshot byte for byte by
+    /// design, so a 201 can still report a count the role no longer has (measured: a
+    /// replay reported 2 and `approaching` against a live count of 1). That is correct
+    /// behaviour for an idempotent replay and is not staleness this field can fix.
     ///
     /// # Present on the attach 201 ONLY
     ///
@@ -363,73 +369,63 @@ pub async fn assign_org_role_permission(
     // reachable only by a caller who has already proven they can see it.
     let permission = parse_permission_id(&state, scope, &request.permission_id)?;
 
-    // The ROLE-SCOPED budget verdict this response carries (issue #425). Counted BEFORE
-    // the insert and reported as that count plus this one attach, which is forced BY THE
-    // CURRENT `assign()` SIGNATURE rather than by anything intrinsic, and the difference
-    // matters to whoever reads this next. The signature takes a PRE-SERIALIZED body as
-    // the Idempotency-Key REPLAY body, so with today's seam the body has to be complete
-    // before the write runs and a count taken afterwards could not be in it; a 201 that
-    // disagreed with its own replay would be worse than a slightly loose count.
-    // `write_audited`'s closure does already hold the transaction, so a store variant
-    // that counted INSIDE the write would be snapshot exact and still land in the stored
-    // body. Issue #430 tracks that tightening. It would close the concurrent window in
-    // both directions but NOT the replay staleness, which is inherent to a byte
-    // identical replay.
+    // The ROLE-SCOPED budget verdict this response carries (issue #425), counted INSIDE
+    // the write transaction and AFTER the insert (issue #430). The store returns the exact
+    // figure and BOTH the response and the stored replay body are rendered from it by the
+    // same closure, so the two cannot disagree.
     //
-    // One indexed count over ONE role, never a fan-out. The honest verdict for an
-    // operator is the MEMBERSHIP-scoped one, but computing that here would mean
-    // resolving the whole effective member set of this role (direct plus the recursive
-    // group closure) and then a resolved permission set per member, on a WRITE. Issue
-    // #98 avoided exactly that shape everywhere else. So this reports what the write
-    // cheaply knows and the field NAMES the set it measured; see
-    // `OrgRolePermissionView::role_permission_budget` for what that costs a reader and
-    // where the membership-scoped answer lives.
-    let live_mappings = state
-        .store()
-        .management()
-        .org_role_permissions(scope)
-        .count_live_for_role(&org_id, &role.id)
-        .await?;
-    // Widening rather than narrowing, for the reason `PermissionBudgetView::evaluate`
-    // gives: saturating at `usize::MAX` on a target too narrow to hold the count reports
-    // an overflow, which is the safe direction, while a truncating cast could report a
-    // huge set as a small one. `saturating_add` for the same reason at the other end.
-    let attached_count = usize::try_from(live_mappings)
-        .unwrap_or(usize::MAX)
-        .saturating_add(1);
-    // ROLE scoped, and the verdict carries that on the wire so the answer stays
-    // attributable to its set after it leaves this response.
-    let role_permission_budget = PermissionBudgetView::evaluate(
-        PermissionBudgetScope::Role,
-        state.token_claims(),
-        attached_count,
-    );
-
+    // What this closes: the count used to run in its own earlier transaction and be
+    // incremented by hand, so it could not see its own insert and missed anything committed
+    // in the window between the two transactions. What it does NOT close, deliberately, is
+    // the REPLAY snapshot: a replay reproduces the original 201 byte for byte by design, so
+    // its figure is a snapshot of the original write however exact that write was.
+    //
+    // It is exact with respect to the inserting transaction's SNAPSHOT rather than globally
+    // serialized. Under READ COMMITTED two concurrent attaches on one role can each see
+    // their own insert and not the other's, so both may report the same figure; making that
+    // impossible would mean serializing every attach on a per-role lock for an ADVISORY
+    // number, which the covenant on this field argues against (no count may turn the attach
+    // into a 4xx or a 5xx).
+    //
+    // One indexed count over ONE role, never a fan-out. The honest verdict for an operator
+    // is the MEMBERSHIP-scoped one, but computing that here would mean resolving the whole
+    // effective member set of this role (direct plus the recursive group closure) and then a
+    // resolved permission set per member, on a WRITE. Issue #98 avoided exactly that shape
+    // everywhere else. So this reports what the write cheaply knows and the field NAMES the
+    // set it measured.
     let created_at_micros = state.now_unix_micros();
     let mapping_id = OrgRolePermissionId::generate(state.env(), &scope);
-    let view = OrgRolePermissionView {
-        id: mapping_id.to_string(),
-        organization_id: org_id.to_string(),
-        role_id: role.id.to_string(),
-        permission_id: permission.to_string(),
-        created_at_unix_ms: created_at_micros / 1000,
-        updated_at_unix_ms: created_at_micros / 1000,
-        role_permission_budget: Some(role_permission_budget),
+    let render_view = |attached: &i64| {
+        // Widening rather than narrowing, for the reason `PermissionBudgetView::evaluate`
+        // gives: saturating at `usize::MAX` on a target too narrow to hold the count reports
+        // an overflow, which is the safe direction, while a truncating cast could report a
+        // huge set as a small one.
+        let attached_count = usize::try_from(*attached).unwrap_or(usize::MAX);
+        OrgRolePermissionView {
+            id: mapping_id.to_string(),
+            organization_id: org_id.to_string(),
+            role_id: role.id.to_string(),
+            permission_id: permission.to_string(),
+            created_at_unix_ms: created_at_micros / 1000,
+            updated_at_unix_ms: created_at_micros / 1000,
+            // ROLE scoped, and the verdict carries that on the wire so the answer stays
+            // attributable to its set after it leaves this response.
+            role_permission_budget: Some(PermissionBudgetView::evaluate(
+                PermissionBudgetScope::Role,
+                state.token_claims(),
+                attached_count,
+            )),
+        }
     };
-    let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
+    let render = |attached: &i64| serde_json::to_string(&render_view(attached));
 
-    let write = IdempotencyWrite {
+    let write = ResolvedIdempotencyWrite {
         credential_ref: &credential_ref,
         key: &key,
         request_fingerprint: &fingerprint,
         response_status: 201,
-        response_body: &body_string,
+        response_body: &render,
     };
-    // Neither endpoint is resolved here. The store resolves the role as a live role
-    // of THIS organization and the permission as a live permission of THIS scope,
-    // inside the audited write transaction and BEFORE any conflict reasoning, so a
-    // cross pairing is the uniform not-found and the 409 is reachable only by a
-    // caller who can already see both halves.
     let result = state
         .store()
         .management()
@@ -449,7 +445,12 @@ pub async fn assign_org_role_permission(
         .await;
 
     match result {
-        Ok(()) => Ok(json(StatusCode::CREATED, body_string)),
+        Ok(attached) => {
+            // Rendered from the SAME closure and the SAME count the store stored, so the
+            // 201 and every replay of it are the same bytes.
+            let body_string = render(&attached).map_err(|_| ApiError::Internal)?;
+            Ok(json(StatusCode::CREATED, body_string))
+        }
         Err(StoreError::Conflict) => Err(ApiError::Conflict(
             "that permission is already attached to this role".to_owned(),
         )),
