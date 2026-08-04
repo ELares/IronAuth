@@ -291,6 +291,38 @@ pub async fn confirm_get(
         pages::login_html(StatusCode::OK, body, &nonce)
     } else {
         let token = query.token.as_deref();
+        // An INACTIVE link (expired, or already consumed) gets the actionable error page
+        // rather than a confirmation button that can only fail. `token_is_active` was
+        // written for exactly this call and had no caller: the page rendered 200 for any
+        // token, so a user clicking a stale link learned nothing until they had submitted
+        // it, and the failure then arrived from `consume_post` as if they had done
+        // something wrong.
+        //
+        // It is a READ and never consumes, so the scanner-safe invariant is intact: a mail
+        // scanner prefetching this GET still cannot burn the link.
+        //
+        // This is reachable ONLY on the non-fragment branch, and that is a property of
+        // where the token lives rather than a decision. Under `fragment_mode` the token is
+        // in the URL FRAGMENT, which browsers never send to the server, so the handler has
+        // nothing to check and the same-shaped page is the only honest answer there.
+        if let Some(token) = token {
+            let now = epoch_micros(state.now());
+            let active = state
+                .store()
+                .scoped(scope)
+                .magic_links()
+                .token_is_active(&magic_link_token_digest(token), now)
+                .await;
+            // ONLY a definite `false` refuses. A miss renders the SAME page a malformed
+            // link and a disabled factor render, so this adds no signal an attacker could
+            // not already get by sending a syntactically invalid token. A database fault
+            // is deliberately NOT a refusal: it must not turn into "your link is bad", so
+            // it falls through to the POST, which is the behaviour that existed before
+            // this check.
+            if matches!(active, Ok(false)) {
+                return interaction::invalid_link_page();
+            }
+        }
         let body = pages::magic_confirm_page(&consume_action, token, false, "");
         pages::secure_html(StatusCode::OK, body)
     }

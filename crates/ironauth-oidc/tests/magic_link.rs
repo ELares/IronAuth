@@ -685,3 +685,85 @@ async fn the_lifecycle_fence_blocks_the_magic_link_path_for_a_non_authenticatabl
         "an approved account mints a session on the magic-link path"
     );
 }
+
+#[tokio::test]
+async fn a_consumed_link_gets_the_actionable_error_on_the_confirmation_get() {
+    let (harness, sender, recipient) = setup(OidcConfig::default()).await;
+    let base = base(&harness);
+    let (binding, token, _short) = send_link(&harness, &sender, &recipient).await;
+    let confirm = format!("{base}/magic/confirm?token={token}");
+
+    // While the link is ACTIVE the GET renders the confirmation page. This half is the
+    // control: without it, a test asserting the error page below would pass just as well
+    // against a handler that showed the error to everyone.
+    let (status, body) = get(&harness, &confirm, Some(&binding)).await;
+    assert_eq!(status, StatusCode::OK, "an active link confirms");
+    assert!(body.contains("Confirm sign in"));
+
+    // Consume it, exactly as the human would.
+    let (status, _headers, _body) = post_form(
+        &harness,
+        &format!("{base}/magic/consume"),
+        &format!("token={token}"),
+        Some(&binding),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the link consumes once");
+
+    // The SAME GET now answers the actionable error instead of a button that could only
+    // fail. Before this the page rendered 200 for a spent token and the user found out
+    // only after submitting, with the failure arriving as though they had done something
+    // wrong.
+    let (status, body) = get(&harness, &confirm, Some(&binding)).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a spent link must not render a confirmation button: {body}"
+    );
+    assert!(
+        body.contains("Link no longer valid"),
+        "the caller gets the actionable page: {body}"
+    );
+    assert!(
+        !body.contains("Confirm sign in"),
+        "and not the confirmation form: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_forged_token_answers_exactly_as_a_spent_one_on_the_confirmation_get() {
+    let (harness, sender, recipient) = setup(OidcConfig::default()).await;
+    let base = base(&harness);
+    let (binding, token, _short) = send_link(&harness, &sender, &recipient).await;
+
+    // Spend the real link, then read both its GET and a FORGED token's GET.
+    let _ = post_form(
+        &harness,
+        &format!("{base}/magic/consume"),
+        &format!("token={token}"),
+        Some(&binding),
+    )
+    .await;
+    let (spent_status, spent_body) = get(
+        &harness,
+        &format!("{base}/magic/confirm?token={token}"),
+        Some(&binding),
+    )
+    .await;
+    let (forged_status, forged_body) = get(
+        &harness,
+        &format!("{base}/magic/confirm?token=this-token-never-existed"),
+        Some(&binding),
+    )
+    .await;
+
+    // Byte identical. The check added to this GET distinguishes ACTIVE from not-active and
+    // nothing finer, so it tells an attacker holding a guess exactly what a syntactically
+    // invalid token already told them, which is the non-enumerating property the store
+    // method's own documentation asks for.
+    assert_eq!(spent_status, forged_status);
+    assert_eq!(
+        spent_body, forged_body,
+        "a spent token and a forged one must be indistinguishable on the GET"
+    );
+}
