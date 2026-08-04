@@ -3115,6 +3115,18 @@ impl OidcState {
         self.verification_sender.deliver_new_device_notice(message);
     }
 
+    /// Deliver an account-recovery cancellation notice through the verification seam
+    /// (issue #470): the message carries the single-use link that stops a recovery inside
+    /// its delay window. Delivery reuses the same #68 stub as every other notice, so a
+    /// deployment with no transport wired behaves exactly as before.
+    pub(crate) fn deliver_recovery_cancel_notice(
+        &self,
+        message: &crate::verification::RecoveryCancelNotice<'_>,
+    ) {
+        self.verification_sender
+            .deliver_recovery_cancel_notice(message);
+    }
+
     /// Deliver an email-OTP code through the verification seam (issue #68), applying the
     /// closed-registration SUPPRESSION: when `recipient_known` is false the delivery is
     /// silently dropped (recorded only on the observability plane), so the user-visible

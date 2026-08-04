@@ -287,8 +287,8 @@ pub use tokens::{
 };
 pub use verification::{
     EmailOtpMessage, LoggingSmsSender, LoggingVerificationSender, MagicLinkMessage,
-    NewDeviceNotice, NullSmsSender, NullVerificationSender, SmsOtpMessage, SmsSender,
-    VerificationPurpose, VerificationSender,
+    NewDeviceNotice, NullSmsSender, NullVerificationSender, RecoveryCancelNotice, SmsOtpMessage,
+    SmsSender, VerificationPurpose, VerificationSender,
 };
 
 /// Build the OIDC provider router.
@@ -581,12 +581,13 @@ pub fn oidc_router(state: OidcState) -> Router {
         // RFC 9700 endpoint inventory.
         //
         // ONLY the two modes that can COMPLETE are mounted. The TRUSTED-CONTACT initiation is
-        // deliberately NOT here, and neither is a contact-enrollment surface: the notification
-        // layer this repository ships carries a coarse per-channel ALERT with no room for a
-        // link or a token (`notify_all_channels` takes no URL, and the initiation's own
-        // cancellation link binds into `let _link` for the same reason), so a designated
-        // contact can never receive the single-use token
-        // `/recover/trusted-contact/confirm` needs. The mode's library seams stay (the
+        // deliberately NOT here. The reason has CHANGED and is worth stating precisely: it used
+        // to be that the notification layer carried a coarse per-channel alert with no room for
+        // a link or a token. Issue #470 wired a delivery seam that does carry one, so that is no
+        // longer the obstacle. What remains is that nothing DESIGNATES a trusted contact: the
+        // store has `recovery_trusted_contacts`, the published management contract has no path
+        // that mentions a contact at all, and a mode whose confirmation step addresses a contact
+        // nobody can enroll would be a promise the surface cannot keep. The mode's library seams stay (the
         // completion machinery is real and PR 3's suite drives it); mounting a self-service
         // entry point to a mode that cannot reach its own confirmation step would be a
         // promise the surface cannot keep. Issue #295 stays open for it.

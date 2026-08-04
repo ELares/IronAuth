@@ -49,11 +49,20 @@ use sqlx::Row;
 #[derive(Debug, Default)]
 struct RecordingSender {
     notified: Mutex<Vec<String>>,
+    /// Every `(recipient, cancel_link)` pair the cancellation notice was delivered to
+    /// (issue #470), so a test can assert the kill switch actually REACHES the account.
+    cancel_notices: Mutex<Vec<(String, String)>>,
 }
 
 impl RecordingSender {
     fn recipients(&self) -> Vec<String> {
         let mut out = self.notified.lock().expect("lock").clone();
+        out.sort();
+        out
+    }
+
+    fn cancel_notices(&self) -> Vec<(String, String)> {
+        let mut out = self.cancel_notices.lock().expect("lock").clone();
         out.sort();
         out
     }
@@ -67,6 +76,13 @@ impl VerificationSender for RecordingSender {
                 .expect("lock")
                 .push(recipient.to_owned());
         }
+    }
+
+    fn deliver_recovery_cancel_notice(&self, message: &ironauth_oidc::RecoveryCancelNotice<'_>) {
+        self.cancel_notices
+            .lock()
+            .expect("lock")
+            .push((message.recipient.to_owned(), message.cancel_link.to_owned()));
     }
 }
 
@@ -1109,5 +1125,97 @@ async fn a_device_bound_passkey_holder_is_held_at_its_true_rung() {
     assert!(
         held,
         "a phr recovery against a device-bound (phrh) passkey holder must be held"
+    );
+}
+
+#[tokio::test]
+async fn the_cancellation_link_is_delivered_to_every_verified_channel_and_actually_cancels() {
+    // Issue #470. The endpoints and the token machinery shipped with #81 and work; the URL
+    // was built and dropped into `let _link`, so the kill switch that lets the real owner
+    // stop an attacker-initiated recovery existed in the code and not in the product.
+    //
+    // This drives the whole arc: initiate, take the link OUT OF THE DELIVERED NOTICE rather
+    // than out of the return value, and use it. A test reading the token from
+    // `RecoveryInitiation` would prove the token works and say nothing about whether anyone
+    // is ever told it, which is precisely the defect.
+    let mut harness = Harness::start_store_backed().await;
+    let sender = Arc::new(RecordingSender::default());
+    harness.install_verification_sender(sender.clone());
+    let subject = harness
+        .seed_user("dave@example.test", "correct horse battery staple")
+        .await;
+    let subject = subject_id(&harness, &subject);
+    harness.seed_passkey(&subject.to_string(), true).await;
+
+    // TWO verified channels, so the assertion is about every channel rather than one.
+    add_verified_identifier(
+        &harness,
+        &subject,
+        IdentifierType::Email,
+        "dave@example.test",
+    )
+    .await;
+    add_verified_identifier(&harness, &subject, IdentifierType::Phone, "+15550100").await;
+
+    let outcome = initiate_recovery(
+        harness.state(),
+        &proof(&harness, &subject, RecoveryFactor::EmailOtp),
+        RecoveryEntryPoint::LostPassword,
+        "dave@example.test",
+        None,
+        RecoveryMethod::Standard,
+    )
+    .await;
+    let RecoveryInitiation::Created { flow_id, .. } = outcome else {
+        panic!("recovery should have been created");
+    };
+
+    // Every verified channel that got the coarse alert ALSO got the cancellation link, and
+    // the links are the same single-use URL rather than one per channel.
+    let notices = sender.cancel_notices();
+    let recipients: Vec<&str> = notices.iter().map(|(to, _)| to.as_str()).collect();
+    assert_eq!(
+        recipients,
+        vec!["+15550100", "dave@example.test"],
+        "both verified channels are told how to stop it: {notices:?}"
+    );
+    let links: std::collections::BTreeSet<&str> =
+        notices.iter().map(|(_, link)| link.as_str()).collect();
+    assert_eq!(
+        links.len(),
+        1,
+        "one recovery, one cancellation link: {notices:?}"
+    );
+    let link = *links.iter().next().expect("a link");
+    assert!(
+        link.contains("/recover/cancel?token="),
+        "the notice carries the cancellation URL, not just a token: {link}"
+    );
+
+    // The DELIVERED link works: the confirmation page offers the button while the recovery
+    // is pending. This is what ties #470's delivery to the page #528 hardened.
+    let token = link
+        .split("token=")
+        .nth(1)
+        .expect("token in link")
+        .to_owned();
+    let (status, page) = cancel_get(&harness, &token).await;
+    assert_eq!(status, StatusCode::OK, "the delivered link opens: {page}");
+
+    // And following it through actually cancels the recovery.
+    let cancelled = cancel_from_token(harness.state(), &token).await;
+    assert!(cancelled, "the delivered link cancels the recovery");
+    let record = harness
+        .store()
+        .scoped(harness.scope())
+        .recovery_flows()
+        .get(&flow_id)
+        .await
+        .expect("read flow")
+        .expect("flow exists");
+    assert_eq!(
+        record.state,
+        RecoveryState::Cancelled,
+        "the owner stopped it using only what they were sent"
     );
 }
