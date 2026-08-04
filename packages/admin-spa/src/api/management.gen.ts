@@ -11644,7 +11644,10 @@ export interface operations {
     disableOrganization: {
         parameters: {
             query?: never;
-            header?: never;
+            header: {
+                /** @description Required. Replaying a POST with the same key returns the original response without re-executing. */
+                "Idempotency-Key": string;
+            };
             path: {
                 /** @description The tenant identifier */
                 tenant_id: string;
@@ -11693,12 +11696,24 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
+            /** @description Idempotency-Key reused with a different request */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
         };
     };
     enableOrganization: {
         parameters: {
             query?: never;
-            header?: never;
+            header: {
+                /** @description Required. Replaying a POST with the same key returns the original response without re-executing. */
+                "Idempotency-Key": string;
+            };
             path: {
                 /** @description The tenant identifier */
                 tenant_id: string;
@@ -11740,6 +11755,15 @@ export interface operations {
             };
             /** @description Not found. The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Idempotency-Key reused with a different request */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

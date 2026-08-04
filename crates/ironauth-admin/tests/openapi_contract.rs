@@ -376,6 +376,9 @@ fn every_post_documents_the_idempotency_key_header() {
         "planConfigPromotion",
         "probePasswordHashing",
         "resumeIdentityImport",
+        // The organization state toggles, added with their Idempotency-Key handling.
+        "disableOrganization",
+        "enableOrganization",
     ] {
         let params = find_operation(&doc, op)["parameters"]
             .as_array()

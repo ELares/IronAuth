@@ -288,7 +288,7 @@ async fn set_org_state(harness: &Harness, org: &OrganizationId, state: Organizat
     let scope = harness.scope();
     acting!(harness, &env)
         .organizations(scope)
-        .set_state(&env, org, state)
+        .set_state(&env, org, state, None)
         .await
         .expect("set organization state");
 }

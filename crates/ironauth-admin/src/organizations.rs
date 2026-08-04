@@ -36,7 +36,8 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::Response;
 use ironauth_store::{
-    CorrelationId, IdempotencyWrite, OrganizationId, OrganizationState, StoreError,
+    CorrelationId, IdempotencyWrite, OrganizationId, OrganizationRecord, OrganizationState,
+    ResolvedIdempotencyWrite, StoreError,
 };
 
 use crate::auth::Principal;
@@ -292,14 +293,30 @@ pub async fn delete_organization(
 /// Set an organization's lifecycle state (issue #94): the shared body of the enable
 /// and disable actions. Resolves and authorizes the scope, gates on fresh privilege,
 /// parses the organization id in scope, and audits the state change.
+/// The request shape both organization state toggles share, grouped so the helper
+/// stays inside the argument budget as it gained the idempotency extractors.
+struct StateToggle<'a> {
+    tenant_id: &'a str,
+    environment_id: &'a str,
+    organization_id: &'a str,
+    target: OrganizationState,
+    uri: &'a Uri,
+    headers: &'a HeaderMap,
+}
+
 async fn set_organization_state(
     state: &AdminState,
     principal: &Principal,
-    tenant_id: &str,
-    environment_id: &str,
-    organization_id: &str,
-    target: OrganizationState,
+    toggle: StateToggle<'_>,
 ) -> Result<Response, ApiError> {
+    let StateToggle {
+        tenant_id,
+        environment_id,
+        organization_id,
+        target,
+        uri,
+        headers,
+    } = toggle;
     let (scope, actor) = resolve_scope(state, principal, tenant_id, environment_id)?;
     crate::sudo::require_fresh_privilege(state, scope, actor).await?;
     // The same shared resolution the delete above uses (issue #411). It replaces a bare
@@ -307,19 +324,50 @@ async fn set_organization_state(
     // to render the response, so a soft-deleted organization answered the uniform
     // not-found before this line existed and answers it here now.
     let id = resolve_live_org(state, scope, organization_id, EnvironmentAccess::Write).await?;
-    state
+
+    // The Idempotency-Key gate (issue #345's sweep). Both toggles are naturally
+    // idempotent, so this is not a data-safety fix: it is what makes a retry after a
+    // network timeout return the ORIGINAL response rather than re-deriving one, which is
+    // the convention every other admin state mutation follows.
+    //
+    // These routes take no request body, so the fingerprint is over an empty one. That
+    // still binds the key to the method and PATH, so the same key reused against a
+    // different organization, or against the opposite toggle, is the 422 rather than a
+    // replay of the wrong answer.
+    let key = idempotency::required_key(headers)?;
+    let fingerprint = idempotency::fingerprint("POST", uri.path(), &[]);
+    let credential_ref = principal.credential_ref();
+    if let Some(replay) =
+        idempotency::replay_if_stored(state, &credential_ref, &key, &fingerprint).await?
+    {
+        return Ok(replay);
+    }
+
+    // The body is rendered from what the write RESOLVED, inside its own transaction,
+    // rather than from a second read taken afterwards. That read used to be how this
+    // handler learned the new state; taking the row from the UPDATE's RETURNING instead
+    // means the response describes the state this request committed, and the stored
+    // idempotent body is byte-identical to it by construction.
+    let render = |resolved: &OrganizationRecord| {
+        serde_json::to_string(&OrganizationView::from_record(resolved.clone()))
+    };
+    let record = state
         .store()
         .management()
         .acting(actor, CorrelationId::generate(state.env()))
         .organizations(scope)
-        .set_state(state.env(), &id, target)
-        .await?;
-    // Return the now-updated organization so the caller sees the new active flag.
-    let record = state
-        .store()
-        .management()
-        .organizations(scope)
-        .get(&id)
+        .set_state(
+            state.env(),
+            &id,
+            target,
+            Some(ResolvedIdempotencyWrite {
+                credential_ref: &credential_ref,
+                key: &key,
+                request_fingerprint: &fingerprint,
+                response_status: 200,
+                response_body: &render,
+            }),
+        )
         .await?;
     let body = serde_json::to_string(&OrganizationView::from_record(record))
         .map_err(|_| ApiError::Internal)?;
@@ -336,28 +384,37 @@ async fn set_organization_state(
     params(
         ("tenant_id" = String, Path, description = "The tenant identifier"),
         ("environment_id" = String, Path, description = "The environment identifier"),
-        ("organization_id" = String, Path, description = "The organization identifier")
+        ("organization_id" = String, Path, description = "The organization identifier"),
+        ("Idempotency-Key" = String, Header, description = "Required. Replaying a POST \
+         with the same key returns the original response without re-executing.")
     ),
     security(("bearer" = [])),
     responses(
         (status = 200, description = "The disabled organization", body = OrganizationView),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Not found. The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody)
+        (status = 404, description = "Not found. The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody),
+        (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
     )
 )]
 pub async fn disable_organization(
     State(state): State<AdminState>,
     principal: Principal,
     Path((tenant_id, environment_id, organization_id)): Path<(String, String, String)>,
+    uri: Uri,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     set_organization_state(
         &state,
         &principal,
-        &tenant_id,
-        &environment_id,
-        &organization_id,
-        OrganizationState::Disabled,
+        StateToggle {
+            tenant_id: &tenant_id,
+            environment_id: &environment_id,
+            organization_id: &organization_id,
+            target: OrganizationState::Disabled,
+            uri: &uri,
+            headers: &headers,
+        },
     )
     .await
 }
@@ -371,28 +428,37 @@ pub async fn disable_organization(
     params(
         ("tenant_id" = String, Path, description = "The tenant identifier"),
         ("environment_id" = String, Path, description = "The environment identifier"),
-        ("organization_id" = String, Path, description = "The organization identifier")
+        ("organization_id" = String, Path, description = "The organization identifier"),
+        ("Idempotency-Key" = String, Header, description = "Required. Replaying a POST \
+         with the same key returns the original response without re-executing.")
     ),
     security(("bearer" = [])),
     responses(
         (status = 200, description = "The enabled organization", body = OrganizationView),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Not found. The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody)
+        (status = 404, description = "Not found. The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody),
+        (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
     )
 )]
 pub async fn enable_organization(
     State(state): State<AdminState>,
     principal: Principal,
     Path((tenant_id, environment_id, organization_id)): Path<(String, String, String)>,
+    uri: Uri,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     set_organization_state(
         &state,
         &principal,
-        &tenant_id,
-        &environment_id,
-        &organization_id,
-        OrganizationState::Active,
+        StateToggle {
+            tenant_id: &tenant_id,
+            environment_id: &environment_id,
+            organization_id: &organization_id,
+            target: OrganizationState::Active,
+            uri: &uri,
+            headers: &headers,
+        },
     )
     .await
 }

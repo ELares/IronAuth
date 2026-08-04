@@ -44,6 +44,7 @@ crates/ironauth-admin/src/org_role_assignments.rs:assign_org_membership_role:1
 crates/ironauth-admin/src/org_role_permissions.rs:assign_org_role_permission:1
 crates/ironauth-admin/src/org_roles.rs:create_org_role:1
 crates/ironauth-admin/src/organizations.rs:create_organization:1
+crates/ironauth-admin/src/organizations.rs:set_organization_state:1
 crates/ironauth-admin/src/permissions.rs:create_permission:1
 crates/ironauth-admin/src/recovery_approvals.rs:decide:2
 crates/ironauth-admin/src/sessions.rs:bulk_revoke_sessions:1

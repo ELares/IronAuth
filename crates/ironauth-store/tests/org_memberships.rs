@@ -333,7 +333,7 @@ async fn organization_disable_toggles_state_and_audits() {
         .management()
         .acting(actor(&env), CorrelationId::generate(&env))
         .organizations(scope)
-        .set_state(&env, &org, OrganizationState::Disabled)
+        .set_state(&env, &org, OrganizationState::Disabled, None)
         .await
         .expect("disable");
     assert_eq!(
@@ -352,7 +352,7 @@ async fn organization_disable_toggles_state_and_audits() {
         .management()
         .acting(actor(&env), CorrelationId::generate(&env))
         .organizations(scope)
-        .set_state(&env, &org, OrganizationState::Active)
+        .set_state(&env, &org, OrganizationState::Active, None)
         .await
         .expect("enable");
     assert_eq!(
