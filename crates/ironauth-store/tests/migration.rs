@@ -53,7 +53,8 @@ const CHAIN_SUBJECTS: &str = "isolation, audit log, \
      control-plane writes on the migration-run ledger, outbox retention, \
      broker cutover and policy bounds, user identifier delete grant, \
      sms otp control grants, column scope consume latches, \
-     column scope remaining app updates.";
+     column scope remaining app updates, \
+     unused app insert and delete grants.";
 
 /// A throwaway migration with the given version, phase, and SQL text.
 fn step(version: i64, phase: Phase, sql: &'static str) -> Migration {
@@ -659,7 +660,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
     );
     assert_eq!(
         report.already_applied(),
-        107,
+        108,
         "a migration was added to or removed from the production chain; this count is a \
          deliberate checkpoint, not a bug, so read the new migration, satisfy yourself that it \
          belongs in the shipped chain, then update this number and CHAIN_SUBJECTS and the \
@@ -695,7 +696,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
             46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67,
             68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89,
-            90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107
+            90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108
         ]
     );
     let phase_of = |version: i64| async move {
@@ -7975,5 +7976,108 @@ async fn the_remaining_tables_grant_the_data_plane_only_their_mutable_columns() 
             .execute(&mut *tx)
             .await;
         assert_permission_denied(result, &format!("{table}.{column}"));
+    }
+}
+
+#[tokio::test]
+async fn the_retired_queues_grant_the_data_plane_nothing_at_all() {
+    // Issue #218, applied to INSERT and DELETE. `session_ended_events` and
+    // `backchannel_logout_deliveries` were each a dedicated queue until #104 moved delivery
+    // onto the generic outbox, and no statement in the workspace has named either table
+    // since. 0108 revokes every data-plane privilege on both, so what is asserted here is
+    // the ABSENCE of a standing capability, which is the form of the #31 lesson that a
+    // column-scoping sweep cannot reach.
+    //
+    // The UPDATE probes are the discriminating ones. Their grants were COLUMN scoped, and a
+    // table-level REVOKE does not remove a per-column grant, so a migration that revoked
+    // only `UPDATE ON <table>` would leave these two writable and every other probe here
+    // would still pass. One transaction per probe, because a refusal aborts its own.
+    let db = TestDatabase::start().await;
+    for statement in [
+        "SELECT id FROM session_ended_events",
+        "INSERT INTO session_ended_events (id) VALUES (gen_random_uuid())",
+        "UPDATE session_ended_events SET delivered_at = now()",
+        "SELECT id FROM backchannel_logout_deliveries",
+        "INSERT INTO backchannel_logout_deliveries (id) VALUES (gen_random_uuid())",
+        "UPDATE backchannel_logout_deliveries SET delivered_at = now()",
+    ] {
+        let mut tx = db.app_pool().begin().await.expect("begin as the app role");
+        let result = sqlx::query(statement).execute(&mut *tx).await;
+        assert_permission_denied(result, statement);
+    }
+}
+
+#[tokio::test]
+async fn the_data_plane_can_delete_only_where_a_caller_deletes() {
+    // The completeness half, asked of the CATALOG. Four tables carried a DELETE grant that
+    // no `DELETE FROM` in the workspace ever used; 0108 revokes those four, and this pins
+    // the exact set that remains so a future migration handing ironauth_app a DELETE has to
+    // come here and say which caller needs it.
+    //
+    // A pinned set rather than a count: a count moves for two different reasons and cannot
+    // tell them apart, and the failure it produces names no table.
+    let db = TestDatabase::start().await;
+    // DISTINCT because `table_privileges` carries one row per GRANTOR: the same privilege
+    // granted by two roles appears twice and would fail this on a difference that is not a
+    // privilege difference. The 0107 query above needs no such guard, since it asserts the
+    // result is EMPTY and a duplicate cannot make an empty set non-empty.
+    let permitted: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT table_name::text FROM information_schema.table_privileges \
+         WHERE grantee = 'ironauth_app' AND privilege_type = 'DELETE' \
+           AND table_schema = 'public' \
+         ORDER BY table_name",
+    )
+    .fetch_all(db.owner_pool())
+    .await
+    .expect("read the privilege catalog");
+    let expected = [
+        "aaguid_rules",
+        "abuse_bans",
+        "account_credentials",
+        "account_links",
+        "client_assertion_jtis",
+        "client_auth_diagnostics",
+        "clients",
+        "credential_class_policies",
+        "dpop_proof_replay",
+        "email_otp_codes",
+        "environment_secrets",
+        "environment_variables",
+        "external_assertion_jtis",
+        "magic_link_tokens",
+        "policy_decision_traces",
+        "pow_challenges",
+        "recovery_codes",
+        "scope_step_up_policies",
+        "sms_country_allowlist",
+        "sms_otp_codes",
+        "token_size_events",
+        "totp_credentials",
+        "webauthn_credentials",
+    ];
+    assert_eq!(
+        permitted, expected,
+        "the set of tables the data plane may DELETE from changed; if the new grant has a \
+         real caller, name it in the migration and add the table here"
+    );
+}
+
+#[tokio::test]
+async fn the_four_reaperless_tables_refuse_a_data_plane_delete() {
+    // The other direction of the same change, driven directly rather than read from the
+    // catalog: nothing existing attempts these deletes, so nothing existing would notice
+    // the grant coming back. One transaction per probe.
+    let db = TestDatabase::start().await;
+    for table in [
+        "sms_config",
+        "sms_route_stats",
+        "trusted_devices",
+        "webauthn_challenges",
+    ] {
+        let mut tx = db.app_pool().begin().await.expect("begin as the app role");
+        let result = sqlx::query(&format!("DELETE FROM {table}"))
+            .execute(&mut *tx)
+            .await;
+        assert_permission_denied(result, table);
     }
 }

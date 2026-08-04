@@ -938,6 +938,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0107_column_scope_remaining_app_updates.sql"),
         },
+        Migration {
+            version: 108,
+            name: "revoke_unused_app_insert_delete",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0108_revoke_unused_app_insert_delete.sql"),
+        },
     ]
 }
 
