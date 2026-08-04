@@ -81,6 +81,17 @@ const OID_BASIC_CONSTRAINTS: &[u64] = &[2, 5, 29, 19];
 // The keyUsage extension (id-ce-keyUsage).
 const OID_KEY_USAGE: &[u64] = &[2, 5, 29, 15];
 
+/// `id-ce-subjectKeyIdentifier`. Carries no path-validation meaning for a
+/// pinned-root chain, but it is RECOGNIZED so that a certificate marking it
+/// critical is not rejected for an extension whose semantics this verifier has
+/// genuinely accounted for. RFC 5280 4.2.1.2 requires it to be non-critical, so
+/// this is tolerance rather than reliance.
+const OID_SUBJECT_KEY_IDENTIFIER: &[u64] = &[2, 5, 29, 14];
+
+/// `id-ce-authorityKeyIdentifier`. Recognized on the same terms: issuer
+/// selection here is by name and signature, not by key identifier.
+const OID_AUTHORITY_KEY_IDENTIFIER: &[u64] = &[2, 5, 29, 35];
+
 /// The `keyCertSign` bit of an X.509 `KeyUsage` BIT STRING (bit 5, counting from
 /// the most-significant bit of the first octet), taken over the first two octets
 /// as a big-endian `u16`.
@@ -311,9 +322,10 @@ struct ParsedExtensions {
 
 /// Parse the extensions the chain check needs from an X.509 `Extensions`
 /// (`[3] EXPLICIT SEQUENCE OF Extension`): the FIDO AAGUID, `basicConstraints`
-/// (`CA`, `pathLenConstraint`), and `keyUsage`. Unknown extensions are skipped.
-/// Every length read is guarded, so an attacker-supplied certificate can never
-/// panic this parser.
+/// (`CA`, `pathLenConstraint`), and `keyUsage`. An unrecognized extension is
+/// skipped when it is NON-critical and REJECTS the chain when it is critical,
+/// per RFC 5280 6.1.4(f). Every length read is guarded, so an attacker-supplied
+/// certificate can never panic this parser.
 fn parse_extensions(contents: &[u8]) -> Result<ParsedExtensions, X509Error> {
     let mut out = ParsedExtensions::default();
     // [3] EXPLICIT wraps a single SEQUENCE OF Extension.
@@ -324,10 +336,14 @@ fn parse_extensions(contents: &[u8]) -> Result<ParsedExtensions, X509Error> {
         let oid = der::oid_arcs(ext.take_tag(tag::OID)?)?;
         // Optional critical BOOLEAN, then the extnValue OCTET STRING.
         let (next_tag, next) = ext.take_any()?;
-        let ext_value = if next_tag == tag::BOOLEAN {
-            ext.take_tag(tag::OCTET_STRING)?
+        let (critical, ext_value) = if next_tag == tag::BOOLEAN {
+            (parse_der_boolean(next)?, ext.take_tag(tag::OCTET_STRING)?)
         } else if next_tag == tag::OCTET_STRING {
-            next
+            // Absent means FALSE, the ASN.1 DEFAULT. An explicit `critical FALSE`
+            // is a DER violation (the DEFAULT must be omitted) that is tolerated
+            // here rather than rejected, because it is a common encoder bug and
+            // reading it still yields the permissive-direction answer FALSE.
+            (false, next)
         } else {
             return Err(X509Error::Malformed);
         };
@@ -344,9 +360,35 @@ fn parse_extensions(contents: &[u8]) -> Result<ParsedExtensions, X509Error> {
             out.path_len = path_len;
         } else if oid == OID_KEY_USAGE {
             out.key_usage = Some(parse_key_usage(ext_value)?);
+        } else if critical
+            && oid != OID_SUBJECT_KEY_IDENTIFIER
+            && oid != OID_AUTHORITY_KEY_IDENTIFIER
+        {
+            // RFC 5280 6.1.4(f): path validation MUST reject a certificate carrying a
+            // critical extension the verifier does not process. Skipping one makes this
+            // verifier MORE PERMISSIVE than the issuer intended, which is the direction
+            // that matters: the extensions an issuer marks critical are the ones that
+            // RESTRICT the certificate (name constraints, extended key usage).
+            return Err(X509Error::ConstraintViolation);
         }
     }
     Ok(out)
+}
+
+/// Decode a DER BOOLEAN, accepting only the two canonical encodings.
+///
+/// X.690 11.1 fixes TRUE at a single `0xFF` octet and FALSE at a single `0x00`.
+/// BER allows any nonzero octet to mean TRUE, and reading it that way is what
+/// this verifier used to do. The distinction is not academic here: both booleans
+/// this parser reads are PRIVILEGE BITS (`cA`, and whether an extension is
+/// critical), so a lax decode lets an encoding the issuer never wrote assert a
+/// privilege, and lets two implementations disagree about the same bytes.
+fn parse_der_boolean(bytes: &[u8]) -> Result<bool, X509Error> {
+    match bytes {
+        [0x00] => Ok(false),
+        [0xFF] => Ok(true),
+        _ => Err(X509Error::Malformed),
+    }
 }
 
 /// Parse a `basicConstraints` extnValue: an OCTET STRING wrapping
@@ -357,9 +399,7 @@ fn parse_basic_constraints(ext_value: &[u8]) -> Result<(bool, Option<u64>), X509
     let mut bc = wrap.take_sequence()?;
     let mut is_ca = false;
     if bc.peek_tag() == Some(tag::BOOLEAN) {
-        let value = bc.take_tag(tag::BOOLEAN)?;
-        // DER BOOLEAN TRUE is 0xFF, FALSE is 0x00; any nonzero octet reads as TRUE.
-        is_ca = value.iter().any(|&b| b != 0);
+        is_ca = parse_der_boolean(bc.take_tag(tag::BOOLEAN)?)?;
     }
     let mut path_len = None;
     if bc.peek_tag() == Some(tag::INTEGER) {
@@ -530,7 +570,9 @@ fn names_link(child: &Certificate<'_>, parent: &Certificate<'_>) -> Result<(), X
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testpki::{CertSpec, build_cert};
+    use crate::testpki::{
+        CertSpec, basic_constraints_value, build_cert, build_cert_with_extensions, extension,
+    };
 
     const NOW: i64 = 1_700_000_000;
     const FAR: i64 = 4_102_444_800;
@@ -823,6 +865,117 @@ mod tests {
             parse_certificate(&der).err(),
             Some(X509Error::Malformed),
             "a non-ASCII validity time is a clean parse rejection"
+        );
+    }
+
+    // `id-ce-nameConstraints`, chosen because it is exactly the shape the RFC 5280
+    // 6.1.4(f) rule exists for: an extension an issuer marks critical in order to
+    // RESTRICT what the certificate may attest to. This verifier does not process it,
+    // so honouring it is impossible and ignoring it is the permissive answer.
+    const OID_NAME_CONSTRAINTS: &[u64] = &[2, 5, 29, 30];
+
+    fn leaf_with(extra: &[Vec<u8>]) -> Vec<u8> {
+        build_cert_with_extensions(
+            &CertSpec {
+                subject_cn: "Leaf",
+                issuer_cn: "Root",
+                subject_seed: [3; 32],
+                issuer_seed: [1; 32],
+                not_before: 0,
+                not_after: FAR,
+                aaguid: Some([7; 16]),
+                is_ca: false,
+                path_len: None,
+                key_usage: None,
+            },
+            extra,
+        )
+    }
+
+    #[test]
+    fn an_unrecognized_critical_extension_is_refused() {
+        let der = leaf_with(&[extension(OID_NAME_CONSTRAINTS, Some(0xFF), &[0x30, 0x00])]);
+        assert!(
+            matches!(parse_certificate(&der), Err(X509Error::ConstraintViolation)),
+            "RFC 5280 6.1.4(f): a critical extension this verifier cannot process must \
+             reject the certificate rather than be skipped"
+        );
+    }
+
+    #[test]
+    fn the_same_extension_left_noncritical_is_still_skipped() {
+        // The other direction, and the one that makes the test above discriminating
+        // rather than a blanket refusal of anything unfamiliar: an issuer who did NOT
+        // mark the extension critical is saying it is safe to ignore, and RFC 5280
+        // 4.2 says a verifier may. Everything else about the certificate still parses.
+        let der = leaf_with(&[extension(OID_NAME_CONSTRAINTS, None, &[0x30, 0x00])]);
+        let parsed = parse_certificate(&der).expect("a non-critical unknown extension is skipped");
+        assert_eq!(parsed.subject_cn.as_deref(), Some("Leaf"));
+        assert_eq!(parsed.aaguid, Some([7; 16]));
+    }
+
+    #[test]
+    fn a_critical_key_identifier_extension_is_recognized_and_tolerated() {
+        // Both key-identifier extensions are RECOGNIZED as no-ops: issuer selection
+        // here is by name and signature. RFC 5280 4.2.1.2 requires them non-critical,
+        // so a certificate marking one critical is non-conformant, but rejecting it
+        // would be rejecting an extension whose semantics are genuinely accounted for.
+        for arcs in [&[2u64, 5, 29, 14][..], &[2u64, 5, 29, 35][..]] {
+            let der = leaf_with(&[extension(arcs, Some(0xFF), &[0x04, 0x00])]);
+            assert!(
+                parse_certificate(&der).is_ok(),
+                "a critical {arcs:?} must not be treated as unrecognized"
+            );
+        }
+    }
+
+    #[test]
+    fn a_noncanonical_ca_boolean_is_refused() {
+        // X.690 11.1 fixes TRUE at a single 0xFF octet. Under the old any-nonzero read
+        // this certificate asserted CA:TRUE; `cA` is the bit that decides whether a
+        // certificate may issue others, so a BER liberty here is a privilege decision.
+        let der = leaf_with(&[extension(
+            &[2, 5, 29, 19],
+            Some(0xFF),
+            &basic_constraints_value(0x01),
+        )]);
+        assert!(
+            matches!(parse_certificate(&der), Err(X509Error::Malformed)),
+            "cA must decode only from the canonical DER BOOLEAN encodings"
+        );
+    }
+
+    #[test]
+    fn a_canonical_ca_boolean_still_decodes_both_ways() {
+        // Pins that the strictness above did not break the encodings DER does allow,
+        // in both directions, so the rule cannot be satisfied by refusing everything.
+        let ca = leaf_with(&[extension(
+            &[2, 5, 29, 19],
+            Some(0xFF),
+            &basic_constraints_value(0xFF),
+        )]);
+        assert!(parse_certificate(&ca).expect("canonical TRUE parses").is_ca);
+        let not_ca = leaf_with(&[extension(
+            &[2, 5, 29, 19],
+            Some(0xFF),
+            &basic_constraints_value(0x00),
+        )]);
+        assert!(
+            !parse_certificate(&not_ca)
+                .expect("canonical FALSE parses")
+                .is_ca
+        );
+    }
+
+    #[test]
+    fn a_noncanonical_critical_boolean_is_refused() {
+        // The criticality flag is now read as a privilege bit too, so it takes the same
+        // canonical decode. Without this the rule above could be evaded by encoding
+        // `critical` as 0x01, which a lax reader calls TRUE and a strict one rejects.
+        let der = leaf_with(&[extension(OID_NAME_CONSTRAINTS, Some(0x01), &[0x30, 0x00])]);
+        assert!(
+            matches!(parse_certificate(&der), Err(X509Error::Malformed)),
+            "the critical BOOLEAN must decode only from canonical DER"
         );
     }
 }
