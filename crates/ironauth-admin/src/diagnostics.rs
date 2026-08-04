@@ -1276,3 +1276,149 @@ pub async fn post_flow_dry_run(
     let body = serde_json::to_string(&response).map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body))
 }
+
+/// A user's risk posture, for operator reconstruction.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RiskPostureView {
+    /// The `usr_` subject this posture is for.
+    pub subject: String,
+    /// Whether this account has a CONSUMED "this wasn't me" disavowal, which is what
+    /// "credentials flagged for review" means: the user told us a login was not theirs.
+    pub credentials_flagged_for_review: bool,
+    /// The most recent recorded risk decision, or null when the account has never been
+    /// scored.
+    pub latest_decision: Option<RiskDecisionSummary>,
+}
+
+/// One recorded risk decision.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RiskDecisionSummary {
+    /// The `rsk_` decision id.
+    pub id: String,
+    /// The `usr_` subject the login was scored for.
+    pub subject: String,
+    /// The LOW/MED/HIGH score as a wire string.
+    pub score: String,
+    /// The dispatched action verb.
+    pub action: String,
+    /// The enumerated contributing signals as a JSON document.
+    pub signals: serde_json::Value,
+    /// When the decision was recorded, in milliseconds since the epoch.
+    pub created_at_unix_ms: i64,
+}
+
+impl RiskDecisionSummary {
+    /// Render a stored decision, parsing its signals document.
+    ///
+    /// A signals document that does not parse becomes JSON `null` rather than failing the
+    /// read: the column is written by this system and a malformed one is a defect to see in
+    /// a diagnostic, not a reason to deny an operator the rest of the decision.
+    fn from_view(view: &ironauth_store::RiskDecisionView) -> Self {
+        Self {
+            id: view.id.to_string(),
+            subject: view.subject.clone(),
+            score: view.score.clone(),
+            action: view.action.clone(),
+            signals: serde_json::from_str(&view.signals_json).unwrap_or(serde_json::Value::Null),
+            created_at_unix_ms: view.created_at_unix_micros / 1000,
+        }
+    }
+}
+
+/// Read a user's risk posture.
+#[utoipa::path(
+    get,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/risk/users/{user_id}",
+    operation_id = "getUserRiskPosture",
+    tag = "diagnostics",
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("user_id" = String, Path, description = "The user identifier (usr_...)")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "The user's risk posture", body = RiskPostureView),
+        (status = 401, description = "Missing or invalid credential", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "The user is absent or in another scope", body = ErrorBody)
+    )
+)]
+pub async fn get_user_risk_posture(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, user_id)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    let (tenant, scope) = scope_from_path(&state, &tenant_id, &environment_id)?;
+    principal.require_environment(tenant, scope.environment())?;
+    let subject = crate::org_context::resolve_user(
+        &state,
+        scope,
+        &user_id,
+        crate::org_context::EnvironmentAccess::Read,
+    )
+    .await?;
+    // The user must exist, or an unscored account and an ABSENT one would answer alike and
+    // this route would be an existence oracle in the wrong direction.
+    state.store().scoped(scope).users().get(&subject).await?;
+    let risk = state.store().scoped(scope).risk();
+    let view = RiskPostureView {
+        subject: subject.to_string(),
+        // The promise the disavowal page makes to the user is that their credentials are
+        // "flagged for review". Nothing could READ that flag before this route, so the
+        // promise was unreviewable: an operator had no way to find the accounts a user had
+        // told them were compromised.
+        credentials_flagged_for_review: risk.credentials_flagged_for_review(&subject).await?,
+        latest_decision: risk
+            .latest_decision(&subject)
+            .await?
+            .as_ref()
+            .map(RiskDecisionSummary::from_view),
+    };
+    let body = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
+    Ok(json(StatusCode::OK, body))
+}
+
+/// Read one recorded risk decision.
+#[utoipa::path(
+    get,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/risk/decisions/{decision_id}",
+    operation_id = "getRiskDecision",
+    tag = "diagnostics",
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("decision_id" = String, Path, description = "The risk decision identifier (rsk_...)")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "The recorded decision", body = RiskDecisionSummary),
+        (status = 401, description = "Missing or invalid credential", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "The decision is absent or in another scope", body = ErrorBody)
+    )
+)]
+pub async fn get_risk_decision(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, decision_id)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    let (tenant, scope) = scope_from_path(&state, &tenant_id, &environment_id)?;
+    principal.require_environment(tenant, scope.environment())?;
+    // Four addressing failures collapse to ONE answer: a malformed id and one minted in
+    // another `(tenant, environment)` fail to parse in scope, and an absent one is the
+    // store's own not-found, so a caller cannot use this route to learn that a decision id
+    // belongs to some other environment.
+    let id = ironauth_store::RiskDecisionId::parse_in_scope(&decision_id, &scope)
+        .map_err(|_| ApiError::NotFound)?;
+    let decision = state
+        .store()
+        .scoped(scope)
+        .risk()
+        .get_decision(&id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let body = serde_json::to_string(&RiskDecisionSummary::from_view(&decision))
+        .map_err(|_| ApiError::Internal)?;
+    Ok(json(StatusCode::OK, body))
+}

@@ -65,7 +65,7 @@ the failure mode this script exists to catch and which its own first version had
 one tolerated trailing comment took the walk from 8 crates and 214 entries to 7
 and 150, and it still printed clean."""
 MINIMUM_CRATES = 8
-MINIMUM_ENTRIES = 227
+MINIMUM_ENTRIES = 228
 
 
 def autotests_off_narrow(text):

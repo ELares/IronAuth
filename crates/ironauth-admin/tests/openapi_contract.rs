@@ -170,6 +170,7 @@ fn operation_ids_are_the_stable_set() {
             "getPolicyDecisionTraces",
             "getRefreshFamily",
             "getResourceServer",
+            "getRiskDecision",
             "getSession",
             "getSigningRecommendations",
             "getSignupForm",
@@ -177,6 +178,7 @@ fn operation_ids_are_the_stable_set() {
             "getTenant",
             "getTraitSchemaVersion",
             "getUser",
+            "getUserRiskPosture",
             "getUserTraits",
             "getVariable",
             "liftBan",
@@ -445,6 +447,8 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/client-auth",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/flow/{flow_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/policy-traces",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/risk/decisions/{decision_id}",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/risk/users/{user_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/warnings",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/export",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/identifier-uniqueness",
@@ -659,7 +663,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        173,
+        175,
         "the documented route count is pinned"
     );
 

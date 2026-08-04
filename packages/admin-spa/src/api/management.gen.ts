@@ -628,6 +628,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/risk/decisions/{decision_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read one recorded risk decision. */
+        get: operations["getRiskDecision"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/risk/users/{user_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read a user's risk posture. */
+        get: operations["getUserRiskPosture"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/warnings": {
         parameters: {
             query?: never;
@@ -4841,6 +4875,35 @@ export interface components {
             new_device_fired: boolean;
             /** @description The contributing signals, name and level only. */
             signals: components["schemas"]["RiskSignalResponse"][];
+        };
+        /** @description One recorded risk decision. */
+        RiskDecisionSummary: {
+            /** @description The dispatched action verb. */
+            action: string;
+            /**
+             * Format: int64
+             * @description When the decision was recorded, in milliseconds since the epoch.
+             */
+            created_at_unix_ms: number;
+            /** @description The `rsk_` decision id. */
+            id: string;
+            /** @description The LOW/MED/HIGH score as a wire string. */
+            score: string;
+            /** @description The enumerated contributing signals as a JSON document. */
+            signals: unknown;
+            /** @description The `usr_` subject the login was scored for. */
+            subject: string;
+        };
+        /** @description A user's risk posture, for operator reconstruction. */
+        RiskPostureView: {
+            /**
+             * @description Whether this account has a CONSUMED "this wasn't me" disavowal, which is what
+             *     "credentials flagged for review" means: the user told us a login was not theirs.
+             */
+            credentials_flagged_for_review: boolean;
+            latest_decision?: null | components["schemas"]["RiskDecisionSummary"];
+            /** @description The `usr_` subject this posture is for. */
+            subject: string;
         };
         /**
          * @description The risk scenario a flow dry run evaluates (issue #91): the supplied signals plus the
@@ -9100,6 +9163,114 @@ export interface operations {
                 };
             };
             /** @description Environment not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    getRiskDecision: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The risk decision identifier (rsk_...) */
+                decision_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The recorded decision */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RiskDecisionSummary"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The decision is absent or in another scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    getUserRiskPosture: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The user identifier (usr_...) */
+                user_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The user's risk posture */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RiskPostureView"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The user is absent or in another scope */
             404: {
                 headers: {
                     [name: string]: unknown;

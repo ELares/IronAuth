@@ -156,6 +156,11 @@ name = "sms_otp"
 path = "tests/sms_otp.rs"
 required-features = ["testing"]
 
+[[test]]
+name = "risk_diagnostics"
+path = "tests/risk_diagnostics.rs"
+required-features = ["testing"]
+
 # Identity trait schemas over HTTP (issue #53, PR 1): the trait-schema version registry
 # (append-only create idempotent on the Idempotency-Key, list, get, the active-version
 # introspection read, and the CUTOVER-GATED activate that is refused while an identity fails
