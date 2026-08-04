@@ -725,6 +725,14 @@ fn user_cases(base: &str, ids: &Ids) -> Vec<Case> {
             body: None,
         },
         Case {
+            label: "users.addUserIdentifier",
+            method: "POST",
+            path: format!("{base}/users/{user}/identifiers"),
+            body: Some(body_of(
+                &serde_json::json!({ "type": "email", "value": "absent@example.test" }),
+            )),
+        },
+        Case {
             label: "users.linkUserExternalId",
             method: "PUT",
             path: format!("{base}/users/{user}/external-id"),

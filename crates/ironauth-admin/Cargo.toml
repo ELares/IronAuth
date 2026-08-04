@@ -198,6 +198,11 @@ name = "idempotency"
 path = "tests/idempotency.rs"
 required-features = ["testing"]
 
+[[test]]
+name = "identifiers"
+path = "tests/identifiers.rs"
+required-features = ["testing"]
+
 # Credential scoping: uniform not-found for cross-scope resource probes, and the
 # loud wrong-scope error naming expected vs actual scope.
 [[test]]

@@ -1992,6 +1992,24 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/identifiers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List a user's login identifiers. */
+        get: operations["listUserIdentifiers"];
+        put?: never;
+        /** Add a login identifier to a user. */
+        post: operations["addUserIdentifier"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/sessions/revoke": {
         parameters: {
             query?: never;
@@ -2175,6 +2193,22 @@ export interface components {
              *     a record's contents.
              */
             reason: string;
+        };
+        /** @description Add a typed login identifier to a user. */
+        AddIdentifierRequest: {
+            /** @description The identifier kind: `email`, `username` or `phone`. */
+            type: string;
+            /**
+             * @description The raw identifier. Canonicalized once at the store seam, sealed for display and
+             *     blind-indexed for lookup; the plaintext never lands on a column.
+             */
+            value: string;
+            /**
+             * @description The initial verification state. Defaults to false, which is the safe answer: M7
+             *     owns the ceremonies that flip it, and an operator asserting a verified identifier
+             *     is making a claim this API cannot check.
+             */
+            verified?: boolean;
         };
         /** @description The body to bind a membership into a group. */
         AddOrgGroupMemberRequest: {
@@ -3331,6 +3365,22 @@ export interface components {
             require_https_redirect_uris: boolean;
             /** @description Whether a visible environment banner is shown (true for non-production only). */
             show_environment_banner: boolean;
+        };
+        /** @description A user's login identifiers. */
+        IdentifierList: {
+            /** @description The identifiers, ordered deterministically by `(type, id)`. */
+            items: components["schemas"]["IdentifierView"][];
+        };
+        /** @description One typed login identifier on a user. */
+        IdentifierView: {
+            /** @description The identifier row id (`uid_...`). */
+            id: string;
+            /** @description The identifier kind: `email`, `username` or `phone`. */
+            type: string;
+            /** @description The raw value as it was submitted, decrypted for display. */
+            value: string;
+            /** @description Whether this identifier has been verified. */
+            verified: boolean;
         };
         /**
          * @description The handle a bulk-import job answers with (issue #55).
@@ -15507,6 +15557,136 @@ export interface operations {
             };
             /** @description Not found (absent or in another scope). The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listUserIdentifiers: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The user identifier (usr_...) */
+                user_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The user's login identifiers */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IdentifierList"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The user is absent or in another scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    addUserIdentifier: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The user identifier (usr_...) */
+                user_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AddIdentifierRequest"];
+            };
+        };
+        responses: {
+            /** @description The added identifier */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IdentifierView"];
+                };
+            };
+            /** @description Malformed request, unknown kind, or an identifier that canonicalizes to nothing */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment is absent or deleted, or the user is absent or in another scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The canonical identifier is already taken within the configured uniqueness scope */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

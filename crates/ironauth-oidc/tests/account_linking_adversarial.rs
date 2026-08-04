@@ -367,6 +367,7 @@ async fn add_email(harness: &Harness, subject: &UserId, raw: &str, verified: boo
         .add(
             &env,
             NewUserIdentifier {
+                id: &ironauth_store::UserIdentifierId::generate(&env, &harness.scope()),
                 user_id: subject,
                 identifier_type: IdentifierType::Email,
                 raw,
@@ -374,6 +375,7 @@ async fn add_email(harness: &Harness, subject: &UserId, raw: &str, verified: boo
                 mode: UniquenessMode::EnvironmentWide,
                 org: None,
             },
+            None,
         )
         .await
         .expect("add email identifier");

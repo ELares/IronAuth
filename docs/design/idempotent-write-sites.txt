@@ -23,6 +23,7 @@ crates/ironauth-admin/src/flow_versions.rs:create_flow_version:1
 crates/ironauth-admin/src/flow_versions.rs:pin_flow_version:1
 crates/ironauth-admin/src/idempotency.rs:replay_after_conflict:0
 crates/ironauth-admin/src/idempotency.rs:replay_if_stored:1
+crates/ironauth-admin/src/identifiers.rs:add_user_identifier:1
 crates/ironauth-admin/src/imports.rs:create_identity_import:2
 crates/ironauth-admin/src/imports.rs:stream_into_run:2
 crates/ironauth-admin/src/invitations.rs:create_invitation:1

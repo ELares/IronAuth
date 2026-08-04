@@ -16,7 +16,7 @@ use ironauth_store::identifier::{IdentifierType, UniquenessMode};
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
     CorrelationId, CredentialType, LoginMethod, NewAdminUser, NewUserIdentifier, Scope, StoreError,
-    UserId, UserState,
+    UserId, UserIdentifierId, UserState,
 };
 use sqlx::Row;
 
@@ -98,6 +98,7 @@ async fn add_identifier_org(
         .add(
             env,
             NewUserIdentifier {
+                id: &UserIdentifierId::generate(env, &scope),
                 user_id: user,
                 identifier_type: kind,
                 raw,
@@ -105,9 +106,9 @@ async fn add_identifier_org(
                 mode,
                 org,
             },
+            None,
         )
         .await
-        .map(|_| ())
 }
 
 /// Apply a uniqueness-mode change to `scope`.

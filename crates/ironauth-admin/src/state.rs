@@ -19,13 +19,16 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use ironauth_config::{AdminConfig, SecretError, SecretString, TokenClaimsConfig};
+use ironauth_config::{
+    AdminConfig, IdentifierUniqueness, IdentifiersConfig, SecretError, SecretString,
+    TokenClaimsConfig,
+};
 use ironauth_env::Env;
 use ironauth_jose::{ExpectedTyp, JwsAlgorithm, TokenTyp, TrustedKey, VerificationPolicy, verify};
 use ironauth_oidc::IssuerRegistry;
 use ironauth_store::{
     ActorRef, HumanId, MANAGEMENT_LIST_HARD_CAP, ManagementKeyId, OperatorId, Scope, ServiceId,
-    Store,
+    Store, UniquenessMode,
 };
 use serde_json::Value;
 
@@ -157,6 +160,14 @@ struct Inner {
     // behaves like a default deployment. Bounds tree DEPTH only; nothing counted is
     // capped.
     max_group_depth: u32,
+    // The deployment-wide login-identifier uniqueness policy (issue #54), installed by
+    // the boot path from the top-level `[identifiers]` section and passed to every
+    // identifier write so the row's uniqueness discriminator matches the configured
+    // scope. Defaults to the shipped default, so a directly-built state behaves like a
+    // default deployment. Before this the section was operator-visible and read by
+    // nothing (issue #459), which is worse than absent: an operator could set
+    // `org_scoped` and get environment-wide behaviour with no signal.
+    identifier_uniqueness: UniquenessMode,
     // The deployment-wide token claim budget (issue #98), installed by the boot path
     // from the top-level `[token_claims]` config section. The management plane reads it
     // to report the approach warning a write's resolved permission set earns against the
@@ -259,6 +270,7 @@ impl AdminState {
                 migration_hook: None,
                 federation: None,
                 max_group_depth: ironauth_config::ORGANIZATIONS_DEFAULT_MAX_GROUP_DEPTH,
+                identifier_uniqueness: UniquenessMode::EnvironmentWide,
                 token_claims: TokenClaimsConfig::default(),
                 sudo_mode_enabled: config.sudo_mode_enabled,
                 sudo_mode_window_secs: config.sudo_mode_window_secs,
@@ -534,6 +546,47 @@ impl AdminState {
     #[must_use]
     pub fn max_group_depth(&self) -> u32 {
         self.inner.max_group_depth
+    }
+
+    /// Install the deployment-wide login-identifier uniqueness policy (issue #54).
+    ///
+    /// The boot path is the only caller and passes the whole `[identifiers]` section
+    /// straight from the loaded config. A BUILDER rather than an [`AdminConfig`] field
+    /// for the same reason as [`AdminState::with_max_group_depth`]: the setting lives in
+    /// its own top-level section, and repeating it under `[admin]` would give one policy
+    /// two operator-visible names that could disagree.
+    ///
+    /// This is the READER that makes the section mean something. Migration 0041 already
+    /// named `identifiers.uniqueness` as the source of each row's uniqueness
+    /// discriminator, and the store already enforced whatever mode it was handed, but
+    /// nothing on either plane ever read the section, so every write got the
+    /// environment-wide default no matter what the operator wrote (issue #459). The
+    /// management plane installs it here because the identifier management surface is
+    /// currently the only production writer; the data plane has no identifier writer to
+    /// hand it to yet.
+    #[must_use]
+    pub fn with_identifiers(mut self, config: &IdentifiersConfig) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            // An exhaustive match with no wildcard, so a fourth mode added to either
+            // enum fails to compile here rather than silently mapping to the default.
+            // The two enums are deliberately separate types: the store must not depend
+            // on the config crate, so this is the one place they are tied together.
+            inner.identifier_uniqueness = match config.uniqueness {
+                IdentifierUniqueness::EnvironmentWide => UniquenessMode::EnvironmentWide,
+                IdentifierUniqueness::OrgScoped => UniquenessMode::OrgScoped,
+                IdentifierUniqueness::NonUnique => UniquenessMode::NonUnique,
+            };
+        }
+        self
+    }
+
+    /// The configured login-identifier uniqueness policy (issue #54), passed to every
+    /// identifier write so the row's uniqueness discriminator matches the configured
+    /// scope. Defaults to [`UniquenessMode::EnvironmentWide`] when the boot path
+    /// installed nothing, which is both the shipped config default and the safe answer.
+    #[must_use]
+    pub fn identifier_uniqueness(&self) -> UniquenessMode {
+        self.inner.identifier_uniqueness
     }
 
     /// Install the deployment-wide token claim budget (issue #98).
