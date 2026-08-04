@@ -1403,10 +1403,39 @@ pub(crate) struct DisavowForm {
 /// tell a live token from a spent or forged one), so an email-security scanner that
 /// prefetches the link never consumes it and never learns anything.
 pub(crate) async fn disavow_get(
-    axum::extract::State(_state): axum::extract::State<OidcState>,
+    axum::extract::State(state): axum::extract::State<OidcState>,
     axum::extract::Query(query): axum::extract::Query<DisavowQuery>,
 ) -> axum::response::Response {
     let token = query.token.unwrap_or_default();
+    // Resolve the token BEFORE offering the button. `RiskRepo::resolve_disavowal` was
+    // written for exactly this page ("for the confirmation page") and had no caller, so the
+    // page rendered for any token at all: expired, already spent, or forged. A user who
+    // clicked a stale link then pressed "This wasn't me" got the same uniform confirmation
+    // as a real disavowal and walked away believing their sessions were revoked when
+    // nothing had happened. For a security action that is worse than an error.
+    //
+    // It is a pure READ and does NOT consume, so a mail scanner prefetching this GET still
+    // cannot burn the link. That is the same invariant the magic-link confirmation carries.
+    //
+    // The POST's UNIFORM response is deliberately untouched: it must stay uniform because
+    // it is the destructive step. This check only decides whether to offer the button, and
+    // it distinguishes live from not-live and nothing finer, so every non-live token
+    // (malformed, forged, expired, consumed) gets the identical page.
+    let live = match parse_disavowal_token(&token) {
+        Some((scope, digest)) => state
+            .store()
+            .scoped(scope)
+            .risk()
+            .resolve_disavowal(&digest, epoch_micros(state.now()))
+            .await
+            .ok()
+            .flatten()
+            .is_some(),
+        None => false,
+    };
+    if !live {
+        return crate::interaction::invalid_link_page();
+    }
     // Serve the SAME strict hardening header set (`default-src 'none'`, `form-action
     // 'self'`, `frame-ancestors 'none'`, X-Frame-Options DENY, nosniff, no-store,
     // same-origin referrer) every other hosted page carries, via the single `secure_html`
