@@ -95,6 +95,7 @@ mod signing_algorithm;
 mod signing_interop;
 mod signup_forms;
 mod signup_quarantine;
+mod sms_otp;
 mod state;
 mod sudo;
 mod tenants;
@@ -747,6 +748,23 @@ pub fn management_router(state: AdminState) -> Router {
         // production caller, so an operator could pick a mode at boot and had no way to
         // migrate a populated environment onto it. The read evaluates any candidate mode;
         // the apply runs the CONFIGURED one only.
+        // Guarded SMS OTP configuration (issue #70). The store has carried the enable
+        // switch, the downgrade opt-in and the country allowlist since #50 and NONE of the
+        // four management methods had a production caller, so migration 0050's stated
+        // requirement (turn it on AND populate the allowlist) could not be met by any
+        // deployment. Migration 0105 adds the control-plane grants these routes need.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/sms-otp/config",
+            get(sms_otp::get_sms_otp_config).put(sms_otp::set_sms_otp_config),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/sms-otp/allowlist",
+            get(sms_otp::list_sms_allowlist),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/sms-otp/allowlist/{country_code}",
+            put(sms_otp::allow_sms_country).delete(sms_otp::deny_sms_country),
+        )
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/identifier-uniqueness",
             get(identifiers::get_identifier_uniqueness),
