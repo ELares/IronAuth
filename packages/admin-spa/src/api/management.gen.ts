@@ -9479,7 +9479,10 @@ export interface operations {
     applyIdentifierUniqueness: {
         parameters: {
             query?: never;
-            header?: never;
+            header: {
+                /** @description Required. Replaying a POST with the same key returns the original response without re-executing. */
+                "Idempotency-Key": string;
+            };
             path: {
                 /** @description The tenant identifier */
                 tenant_id: string;
@@ -9535,6 +9538,15 @@ export interface operations {
             };
             /** @description A collision the configured mode would enforce still exists; nothing was changed */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Idempotency-Key reused with a different request */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -16436,7 +16448,10 @@ export interface operations {
     addUserIdentifier: {
         parameters: {
             query?: never;
-            header?: never;
+            header: {
+                /** @description Required. Replaying a POST with the same key returns the original response without re-executing. */
+                "Idempotency-Key": string;
+            };
             path: {
                 /** @description The tenant identifier */
                 tenant_id: string;
@@ -16500,6 +16515,15 @@ export interface operations {
             };
             /** @description The canonical identifier is already taken within the configured uniqueness scope */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Idempotency-Key reused with a different request */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

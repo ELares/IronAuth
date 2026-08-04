@@ -382,6 +382,10 @@ fn every_post_documents_the_idempotency_key_header() {
         // The abuse-ban routes, added with their Idempotency-Key handling.
         "createBan",
         "liftBan",
+        // Implemented all along, documented by nothing: both routes call
+        // `required_key`, so the published spec omitted a header they REFUSE without.
+        "addUserIdentifier",
+        "applyIdentifierUniqueness",
     ] {
         let params = find_operation(&doc, op)["parameters"]
             .as_array()
