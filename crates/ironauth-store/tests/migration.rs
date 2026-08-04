@@ -52,7 +52,7 @@ const CHAIN_SUBJECTS: &str = "isolation, audit log, \
      transactional outbox, control-plane writes on environment secrets, \
      control-plane writes on the migration-run ledger, outbox retention, \
      broker cutover and policy bounds, user identifier delete grant, \
-     sms otp control grants.";
+     sms otp control grants, column scope consume latches.";
 
 /// A throwaway migration with the given version, phase, and SQL text.
 fn step(version: i64, phase: Phase, sql: &'static str) -> Migration {
@@ -658,7 +658,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
     );
     assert_eq!(
         report.already_applied(),
-        105,
+        106,
         "a migration was added to or removed from the production chain; this count is a \
          deliberate checkpoint, not a bug, so read the new migration, satisfy yourself that it \
          belongs in the shipped chain, then update this number and CHAIN_SUBJECTS and the \
@@ -694,7 +694,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
             46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67,
             68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89,
-            90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105
+            90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106
         ]
     );
     let phase_of = |version: i64| async move {
@@ -7858,4 +7858,57 @@ async fn the_control_plane_can_drive_a_migration_run_and_nothing_else() {
         "the control plane does not reconcile, so it holds no UPDATE of any shape on \
          migration_run_records"
     );
+}
+
+/// Assert a statement was refused with the PostgreSQL insufficient-privilege error
+/// (SQLSTATE 42501), the signal that a column-level grant blocked the write.
+fn assert_permission_denied(
+    result: Result<sqlx::postgres::PgQueryResult, sqlx::Error>,
+    what: &str,
+) {
+    match result {
+        Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("42501") => {}
+        other => panic!("expected permission denied (42501) for `{what}`, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn the_consume_latches_grant_the_data_plane_only_their_consumption_stamp() {
+    // Issue #218, the #31 lesson applied to five more tables. A table-wide `GRANT UPDATE`
+    // let ironauth_app rewrite ANY column of these tables, including the immutable ones
+    // that carry the lineage the rest of the system trusts. Migration 0106 revokes it and
+    // re-grants exactly the consumption stamp.
+    //
+    // The positive half of every one of these grants is already exercised by the suites
+    // that consume codes, PAR requests, nonces and login states; if the re-grant were too
+    // NARROW those suites would fail with 42501. What nothing else can catch is the grant
+    // being too WIDE, because no test tries a write it is not supposed to make. So this
+    // drives the refusals directly.
+    let db = TestDatabase::start().await;
+
+    // An immutable column on each of the four latches, plus `signing_keys`, which keeps NO
+    // update grant at all: nothing in the workspace issues `UPDATE signing_keys`, and a
+    // standing capability with no caller is the same thing the #31 lesson objects to.
+    //
+    // Each probe runs in its OWN transaction. A privilege refusal ABORTS the transaction it
+    // happened in, so sharing one makes every probe after the first report 25P02
+    // (transaction aborted) instead of the 42501 being measured, and four of the five would
+    // then be passing on the wrong error. Measured: that is exactly what the first draft of
+    // this test did.
+    //
+    // No rows need exist: PostgreSQL checks column privileges before it evaluates the
+    // predicate, so the refusal is about the GRANT and nothing else.
+    for (table, column) in [
+        ("authorization_codes", "subject"),
+        ("pushed_authorization_requests", "request_params"),
+        ("fedcm_assertion_nonces", "nonce"),
+        ("federation_login_states", "code_verifier_sealed"),
+        ("signing_keys", "key_material"),
+    ] {
+        let mut tx = db.app_pool().begin().await.expect("begin as the app role");
+        let result = sqlx::query(&format!("UPDATE {table} SET {column} = 'forged'"))
+            .execute(&mut *tx)
+            .await;
+        assert_permission_denied(result, &format!("{table}.{column}"));
+    }
 }

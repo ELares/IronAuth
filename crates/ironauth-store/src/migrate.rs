@@ -926,6 +926,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0105_sms_otp_control_grants.sql"),
         },
+        Migration {
+            version: 106,
+            name: "column_scope_consume_latches",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0106_column_scope_consume_latches.sql"),
+        },
     ]
 }
 
