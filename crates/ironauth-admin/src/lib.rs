@@ -271,6 +271,22 @@ pub fn management_router(state: AdminState) -> Router {
         // The operational warnings read (issue #91, M9 flow inspector): the connector health
         // and token size (claim bloat) warnings, COMPUTED LIVE from the existing seams.
         // Environment scoped, read only. Static suffix, matched before the parameterized routes.
+        // The risk posture reads (issue #79). `credentials_flagged_for_review`,
+        // `latest_decision` and `get_decision` all had zero production callers, so the
+        // "your credentials are flagged for review" the disavowal page promises a user was
+        // unreviewable: nothing could find the accounts a user had reported. Migration 0054
+        // already granted the control role SELECT on both risk tables, so no new grant is
+        // needed; only the surface was missing. Both static suffixes sit under
+        // `diagnostics/risk/` and neither is parameterized at the same position, so the
+        // ordering carries no ranking hazard.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/risk/users/{user_id}",
+            get(diagnostics::get_user_risk_posture),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/risk/decisions/{decision_id}",
+            get(diagnostics::get_risk_decision),
+        )
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/warnings",
             get(diagnostics::get_diagnostics_warnings),

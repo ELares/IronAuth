@@ -4736,6 +4736,176 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/risk/decisions/{decision_id}": {
+      "get": {
+        "tags": [
+          "diagnostics"
+        ],
+        "summary": "Read one recorded risk decision.",
+        "operationId": "getRiskDecision",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "decision_id",
+            "in": "path",
+            "description": "The risk decision identifier (rsk_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The recorded decision",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RiskDecisionSummary"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The decision is absent or in another scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/risk/users/{user_id}": {
+      "get": {
+        "tags": [
+          "diagnostics"
+        ],
+        "summary": "Read a user's risk posture.",
+        "operationId": "getUserRiskPosture",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "user_id",
+            "in": "path",
+            "description": "The user identifier (usr_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The user's risk posture",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RiskPostureView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The user is absent or in another scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/warnings": {
       "get": {
         "tags": [
@@ -20930,6 +21100,73 @@
               "$ref": "#/components/schemas/RiskSignalResponse"
             },
             "description": "The contributing signals, name and level only."
+          }
+        }
+      },
+      "RiskDecisionSummary": {
+        "type": "object",
+        "description": "One recorded risk decision.",
+        "required": [
+          "id",
+          "subject",
+          "score",
+          "action",
+          "signals",
+          "created_at_unix_ms"
+        ],
+        "properties": {
+          "action": {
+            "type": "string",
+            "description": "The dispatched action verb."
+          },
+          "created_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When the decision was recorded, in milliseconds since the epoch."
+          },
+          "id": {
+            "type": "string",
+            "description": "The `rsk_` decision id."
+          },
+          "score": {
+            "type": "string",
+            "description": "The LOW/MED/HIGH score as a wire string."
+          },
+          "signals": {
+            "description": "The enumerated contributing signals as a JSON document."
+          },
+          "subject": {
+            "type": "string",
+            "description": "The `usr_` subject the login was scored for."
+          }
+        }
+      },
+      "RiskPostureView": {
+        "type": "object",
+        "description": "A user's risk posture, for operator reconstruction.",
+        "required": [
+          "subject",
+          "credentials_flagged_for_review"
+        ],
+        "properties": {
+          "credentials_flagged_for_review": {
+            "type": "boolean",
+            "description": "Whether this account has a CONSUMED \"this wasn't me\" disavowal, which is what\n\"credentials flagged for review\" means: the user told us a login was not theirs."
+          },
+          "latest_decision": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RiskDecisionSummary",
+                "description": "The most recent recorded risk decision, or null when the account has never been\nscored."
+              }
+            ]
+          },
+          "subject": {
+            "type": "string",
+            "description": "The `usr_` subject this posture is for."
           }
         }
       },

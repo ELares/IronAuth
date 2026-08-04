@@ -1797,6 +1797,18 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
         // other read; the apply is a write and must refuse one.
         // Guarded SMS OTP configuration (issue #70). The two reads answer as if live in a
         // soft-deleted environment like every other read; the three writes must refuse one.
+        // The risk posture reads (issue #79). Both are reads, so a soft-deleted environment
+        // answers as if live, like every other read on this surface.
+        Case::empty(
+            "diagnostics.getUserRiskPosture",
+            "GET",
+            format!("{base}/diagnostics/risk/users/{user}"),
+        ),
+        Case::empty(
+            "diagnostics.getRiskDecision",
+            "GET",
+            format!("{base}/diagnostics/risk/decisions/rsk_livesurfaceprobe00000000"),
+        ),
         Case::empty(
             "sms_otp.getSmsOtpConfig",
             "GET",
