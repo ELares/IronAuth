@@ -1242,6 +1242,7 @@ async fn two_records_sharing_a_login_handle_wedge_the_run_and_the_report_says_so
             &env,
             &run,
             "source carried two records for one login handle",
+            None,
         )
         .await
         .expect("abandon");

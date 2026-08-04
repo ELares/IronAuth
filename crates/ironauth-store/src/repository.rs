@@ -53183,6 +53183,7 @@ impl ActingMigrationRunRepo<'_> {
         env: &Env,
         run_id: &MigrationRunId,
         reason: &str,
+        idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
         if run_id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -53219,6 +53220,8 @@ impl ActingMigrationRunRepo<'_> {
                 .bind(scope.environment().to_string())
                 .execute(&mut **tx)
                 .await?;
+                // In the SAME transaction as the state flip and its audit row.
+                insert_idempotency(tx, idempotency).await?;
                 Ok(())
             },
             false,

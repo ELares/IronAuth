@@ -386,6 +386,7 @@ fn every_post_documents_the_idempotency_key_header() {
         // `required_key`, so the published spec omitted a header they REFUSE without.
         "addUserIdentifier",
         "applyIdentifierUniqueness",
+        "abandonMigrationRun",
     ] {
         let params = find_operation(&doc, op)["parameters"]
             .as_array()

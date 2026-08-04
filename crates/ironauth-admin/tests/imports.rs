@@ -843,3 +843,79 @@ async fn a_completed_run_cannot_be_abandoned() {
     assert_eq!(view["state"], "complete", "unchanged: {view}");
     assert!(view["abandoned_reason"].is_null(), "{view}");
 }
+
+#[tokio::test]
+async fn a_reused_abandon_key_replays_and_a_different_reason_under_it_is_refused() {
+    // The last of the nine POSTs the #345 sweep measured. Abandoning is already
+    // idempotent by state machine, so a replay and a re-execution render the same view
+    // and cannot be told apart by their bodies. What CAN be told apart, and what only
+    // works if the response was genuinely stored, is the fingerprint binding: the key is
+    // bound to this request, so reusing it for a DIFFERENT reason must be refused rather
+    // than quietly answered.
+    let h = Harness::start(50).await;
+    let (tenant, environment) = scope(&h, "k-abandon-idem").await;
+    let base = format!("/v1/tenants/{tenant}/environments/{environment}");
+
+    let (status, _, created) = post_ndjson(
+        &h,
+        &format!("{base}/imports?source_total=2"),
+        Some("k-run"),
+        &records(0, 1),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{created}");
+    let run_id = serde_json::from_str::<Value>(&created).expect("json")["run_id"]
+        .as_str()
+        .expect("run id")
+        .to_owned();
+    let abandon = format!("{base}/migration-runs/{run_id}/abandon");
+
+    let reason = "source export was truncated; re-running from a corrected one";
+    let request = serde_json::json!({ "reason": reason }).to_string();
+    let (status, _, first) = h.post(&abandon, "retry-key", &request).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let first_view: Value = serde_json::from_str(&first).expect("json");
+    assert_eq!(first_view["state"], "abandoned");
+    assert_eq!(first_view["abandoned_reason"], reason);
+
+    // The retry: the stored bytes, exactly.
+    let (status, _, replayed) = h.post(&abandon, "retry-key", &request).await;
+    assert_eq!(status, StatusCode::OK, "{replayed}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&replayed).expect("json"),
+        first_view,
+        "a retry under the same key replays the original response verbatim"
+    );
+
+    // THE DISCRIMINATING ONE. Reusing the key for a different reason is a 422, which is
+    // only reachable because the first response was stored under that key. Without the
+    // stored record this re-executes and answers 200, so this assertion is what fails if
+    // the idempotency row is never written.
+    let (status, _, conflict) = h
+        .post(
+            &abandon,
+            "retry-key",
+            &serde_json::json!({ "reason": "an entirely different reason" }).to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "the key is bound to the request it guarded: {conflict}"
+    );
+
+    // And a genuinely fresh key still works, so the route did not simply become rigid.
+    let (status, _, fresh) = h
+        .post(
+            &abandon,
+            "another-key",
+            &serde_json::json!({ "reason": "an entirely different reason" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{fresh}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&fresh).expect("json")["abandoned_reason"],
+        reason,
+        "and history is not rewritten: the FIRST reason still stands"
+    );
+}

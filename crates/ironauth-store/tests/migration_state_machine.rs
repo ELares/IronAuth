@@ -711,6 +711,7 @@ async fn abandonment_is_an_explicit_audited_terminal_transition() {
             &env,
             &run,
             "source export corrupted; restarting from scratch",
+            None,
         )
         .await
         .expect("abandon");
@@ -737,7 +738,10 @@ async fn abandonment_is_an_explicit_audited_terminal_transition() {
         Err(StoreError::IllegalMigrationTransition { .. })
     ));
     assert!(matches!(
-        acting.migration_runs().abandon(&env, &run, "again").await,
+        acting
+            .migration_runs()
+            .abandon(&env, &run, "again", None)
+            .await,
         Err(StoreError::IllegalMigrationTransition { .. })
     ));
 }
