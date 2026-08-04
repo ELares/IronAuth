@@ -185,6 +185,9 @@ impl Server {
             // handler panic becomes an opaque 500 that still flows back through
             // request logging and metrics rather than resetting the connection.
             .layer(CatchPanicLayer::custom(on_panic))
+            // OUTSIDE the panic layer, so the opaque 500 it produces flows back through
+            // this and carries the headers too.
+            .layer(axum::middleware::from_fn(security_header_backstop))
             .layer(axum::middleware::from_fn_with_state(
                 self.state(),
                 observe::observe,
@@ -208,6 +211,7 @@ impl Server {
         }
         router
             .layer(CatchPanicLayer::custom(on_panic))
+            .layer(axum::middleware::from_fn(security_header_backstop))
             .layer(axum::middleware::from_fn_with_state(
                 self.state(),
                 observe::observe,
@@ -298,6 +302,60 @@ impl Server {
 /// reported separately by the scrubbing-safe panic hook (see
 /// `telemetry::install_panic_hook`); here the client only ever sees a generic
 /// error.
+/// The CSP a response gets when it carries NONE of its own: deny everything.
+///
+/// Deliberately not either surface's real policy. The bootstrap pages
+/// (`ironauth-oidc`) and the admin console (`ironauth-admin-ui`) each set their own,
+/// and they DIFFER, so a single global value would be wrong for at least one of them.
+/// This value is only ever reached by a response that set no policy at all: the caught
+/// panic, axum's default 404 and 405, and any future handler that forgets. None of
+/// those carries content that legitimately needs a resource, so denying everything is
+/// both correct and the safe default.
+const BACKSTOP_CONTENT_SECURITY_POLICY: &str =
+    "default-src 'none'; base-uri 'none'; frame-ancestors 'none'";
+
+/// A global response-header backstop (issue #206 item 5).
+///
+/// The hardening headers are applied PER HANDLER today, through `secure_html` in
+/// `ironauth-oidc` and its equivalent in `ironauth-admin-ui`. Every current HTML route
+/// is covered, but the discipline is per handler, so a future page can silently omit
+/// it, and the responses that no handler produces (a caught panic's 500, axum's own
+/// 404 and 405) carry nothing at all.
+///
+/// SET ONLY IF ABSENT, which is the whole design. A handler that chose its own value
+/// keeps it: the admin console needs a far more permissive CSP than a bootstrap page,
+/// so overwriting would break the console rather than harden it. This layer therefore
+/// changes no response that was already correct, and can only add headers to one that
+/// was not.
+///
+/// `Content-Type` and `Cache-Control` are deliberately NOT backstopped even though
+/// `secure_html` sets both. They are properties of the individual response rather than
+/// a security posture: forcing a content type would corrupt every JSON body, and
+/// forcing `no-store` would defeat caching of the console's static assets.
+async fn security_header_backstop(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    use axum::http::{HeaderValue, header};
+
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    for (name, value) in [
+        (
+            header::CONTENT_SECURITY_POLICY,
+            BACKSTOP_CONTENT_SECURITY_POLICY,
+        ),
+        (header::X_FRAME_OPTIONS, "DENY"),
+        (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        (header::REFERRER_POLICY, "same-origin"),
+    ] {
+        if !headers.contains_key(&name) {
+            headers.insert(name, HeaderValue::from_static(value));
+        }
+    }
+    response
+}
+
 fn on_panic(_payload: Box<dyn std::any::Any + Send + 'static>) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
 }
@@ -335,6 +393,9 @@ pub async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
+    use super::{BACKSTOP_CONTENT_SECURITY_POLICY, security_header_backstop};
+    use axum::response::{IntoResponse as _, Response};
+
     use super::on_panic;
     use axum::Router;
     use axum::body::Body;
@@ -369,5 +430,119 @@ mod tests {
             "payload leaked: {text}"
         );
         assert_eq!(text, "internal server error");
+    }
+
+    /// A handler that sets its OWN policy, to prove the backstop never overwrites one.
+    async fn own_policy() -> Response {
+        (
+            StatusCode::OK,
+            [(
+                axum::http::header::CONTENT_SECURITY_POLICY,
+                "script-src 'self'",
+            )],
+            "ok",
+        )
+            .into_response()
+    }
+
+    #[tokio::test]
+    async fn the_backstop_covers_the_responses_no_handler_produces() {
+        // Issue #206 item 5. The hardening headers are applied per handler, so the
+        // responses no handler produces carried none: axum's own 404, its 405, and the
+        // opaque 500 the panic layer returns. Each is driven here.
+        use axum::http::header;
+
+        let app = Router::new()
+            .route("/ok", get(|| async { "fine" }))
+            .route("/boom", get(boom))
+            .layer(CatchPanicLayer::custom(on_panic))
+            .layer(axum::middleware::from_fn(security_header_backstop));
+
+        for (uri, method, expected) in [
+            ("/missing", "GET", StatusCode::NOT_FOUND),
+            ("/ok", "POST", StatusCode::METHOD_NOT_ALLOWED),
+            ("/boom", "GET", StatusCode::INTERNAL_SERVER_ERROR),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .expect("service responds");
+            assert_eq!(response.status(), expected, "{method} {uri}");
+            let headers = response.headers();
+            assert_eq!(
+                headers.get(header::CONTENT_SECURITY_POLICY).unwrap(),
+                BACKSTOP_CONTENT_SECURITY_POLICY,
+                "{method} {uri} carries the backstop policy"
+            );
+            assert_eq!(headers.get(header::X_FRAME_OPTIONS).unwrap(), "DENY");
+            assert_eq!(
+                headers.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(),
+                "nosniff"
+            );
+            assert_eq!(headers.get(header::REFERRER_POLICY).unwrap(), "same-origin");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_backstop_never_overwrites_a_policy_a_handler_chose() {
+        // THE DIRECTION THAT MATTERS. The bootstrap pages and the admin console set
+        // DIFFERENT policies, and the console's is far more permissive because it has to
+        // be. A backstop that overwrote would break the console rather than harden it, so
+        // this is what stops "set if absent" from quietly becoming "set always".
+        use axum::http::header;
+
+        let app = Router::new()
+            .route("/own", get(own_policy))
+            .layer(axum::middleware::from_fn(security_header_backstop));
+
+        let response = app
+            .oneshot(Request::builder().uri("/own").body(Body::empty()).unwrap())
+            .await
+            .expect("service responds");
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_SECURITY_POLICY)
+                .unwrap(),
+            "script-src 'self'",
+            "a handler's own policy survives the backstop"
+        );
+        // The headers it did NOT set are still filled in.
+        assert_eq!(
+            response.headers().get(header::X_FRAME_OPTIONS).unwrap(),
+            "DENY"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_backstop_leaves_content_type_and_cache_control_alone() {
+        // Both are properties of the individual response rather than a security posture:
+        // forcing a content type would corrupt every JSON body, and forcing `no-store`
+        // would defeat caching of the console's static assets.
+        use axum::http::header;
+
+        let app = Router::new()
+            .route("/ok", get(|| async { "fine" }))
+            .layer(axum::middleware::from_fn(security_header_backstop));
+        let response = app
+            .oneshot(Request::builder().uri("/ok").body(Body::empty()).unwrap())
+            .await
+            .expect("service responds");
+        assert!(
+            response.headers().get(header::CACHE_CONTROL).is_none(),
+            "the backstop does not impose a caching posture"
+        );
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/plain; charset=utf-8",
+            "and it does not rewrite the response's own content type"
+        );
     }
 }
