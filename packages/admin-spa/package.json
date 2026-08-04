@@ -21,7 +21,7 @@
     "@preact/preset-vite": "^2.9.4",
     "jsdom": "^30.0.1",
     "openapi-typescript": "^7.5.0",
-    "typescript": "5.6.3",
+    "typescript": "6.0.3",
     "vite": "^8.0.0",
     "vitest": "^4.0.0"
   },
