@@ -123,6 +123,29 @@ pub struct NewDeviceNotice<'a> {
     pub disavowal_link: &'a str,
 }
 
+/// An account-recovery CANCELLATION notice (issue #470): a recovery was initiated on this
+/// account, so every verified channel is told and given the single-use link that stops it
+/// inside the delay window.
+///
+/// This is the kill switch for the case that matters most: account recovery is the path an
+/// attacker takes when they cannot pass the factors, and this link is what lets the real
+/// owner interrupt it. The endpoints and the token machinery shipped with issue #81; the
+/// URL was built and then dropped into `let _link`, so the control existed in the code and
+/// not in the product.
+///
+/// The concrete transport is a documented seam (M11 messaging). The link carries a live
+/// single-use token, so an implementation MUST NOT log it at a level that reaches
+/// production sinks, exactly as [`NewDeviceNotice`] requires of its disavowal link.
+#[derive(Debug, Clone, Copy)]
+pub struct RecoveryCancelNotice<'a> {
+    /// The tenant/environment scope.
+    pub scope: Scope,
+    /// The recipient (a verified email or phone on the account).
+    pub recipient: &'a str,
+    /// The full cancellation-page URL the user opens to stop the recovery.
+    pub cancel_link: &'a str,
+}
+
 /// The SMS delivery seam (issue #70): the provider boundary the guarded SMS-OTP factor
 /// delivers through. The concrete transport (Twilio Verify, Vonage, SNS) is M11 and out
 /// of scope here; this issue ships and tests against a local STUB, exactly like the
@@ -211,6 +234,13 @@ pub trait VerificationSender: Send + Sync + std::fmt::Debug {
     fn deliver_new_device_notice(&self, message: &NewDeviceNotice<'_>) {
         let _ = message;
     }
+
+    /// Deliver an account-recovery cancellation notice (issue #470) carrying the
+    /// single-use link that stops the recovery. The default is a no-op, so a deployment
+    /// with no transport wired behaves as before; a real transport (M11) overrides it.
+    fn deliver_recovery_cancel_notice(&self, message: &RecoveryCancelNotice<'_>) {
+        let _ = message;
+    }
 }
 
 /// The default sender: it performs NO delivery (issue #64). The verification/OTP
@@ -294,6 +324,22 @@ impl VerificationSender for LoggingVerificationSender {
             target: "ironauth.verification",
             disavowal_link = message.disavowal_link,
             "new-device disavowal link (dev transport, debug only)"
+        );
+    }
+
+    fn deliver_recovery_cancel_notice(&self, message: &RecoveryCancelNotice<'_>) {
+        tracing::info!(
+            target: "ironauth.verification",
+            tenant = %message.scope.tenant(),
+            environment = %message.scope.environment(),
+            "recovery cancellation notice delivered (dev transport)"
+        );
+        // The cancellation link carries a live single-use token: only at debug, never
+        // info, for the same reason the disavowal link above is held back.
+        tracing::debug!(
+            target: "ironauth.verification",
+            cancel_link = message.cancel_link,
+            "recovery cancellation link (dev transport, debug only)"
         );
     }
 }

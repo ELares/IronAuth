@@ -527,7 +527,18 @@ pub async fn gate_factor_removal(
 /// event (issue #81), through the #68 verification seam. Returns how many channels were
 /// notified. A channel notification is the coarse alert (never an OTP), so the real M11
 /// transport renders it; the send seam records it for tests.
-async fn notify_all_channels(state: &OidcState, scope: Scope, subject: &UserId) -> usize {
+///
+/// `cancel_link` is the single-use URL that STOPS a recovery inside its delay window
+/// (issue #470). It is `Some` on the INITIATION alone: that is the only event a user can
+/// still interrupt, and the only one that has a token. Every other recovery event this
+/// function alerts on has already happened, so offering a cancellation link there would
+/// promise a control that cannot act.
+async fn notify_all_channels(
+    state: &OidcState,
+    scope: Scope,
+    subject: &UserId,
+    cancel_link: Option<&str>,
+) -> usize {
     let identifiers = state
         .store()
         .scoped(scope)
@@ -552,6 +563,17 @@ async fn notify_all_channels(state: &OidcState, scope: Scope, subject: &UserId) 
                 &identifier.raw,
                 true,
             );
+            // The cancellation link rides to the SAME verified channels the coarse alert
+            // went to, and only there. A channel good enough to be told a recovery started
+            // is exactly the channel entitled to stop it, and one that is not verified is
+            // entitled to neither.
+            if let Some(link) = cancel_link {
+                state.deliver_recovery_cancel_notice(&crate::verification::RecoveryCancelNotice {
+                    scope,
+                    recipient: &identifier.raw,
+                    cancel_link: link,
+                });
+            }
             count += 1;
         }
     }
@@ -563,7 +585,7 @@ async fn notify_all_channels(state: &OidcState, scope: Scope, subject: &UserId) 
 /// mode progression alerts the account owner, exactly like the standard recovery path.
 /// Returns how many channels were notified.
 pub async fn notify_owner_channels(state: &OidcState, scope: Scope, subject: &UserId) -> usize {
-    notify_all_channels(state, scope, subject).await
+    notify_all_channels(state, scope, subject, None).await
 }
 
 /// INITIATE a recovery for a resolved subject (issue #81): risk-score the event, enforce
@@ -660,19 +682,12 @@ pub async fn initiate_recovery(
     let token = generate_cancel_token(state, &flow_id);
     let digest = cancel_token_digest(&token);
 
-    // Notify EVERY verified channel immediately. PRE-EXISTING and recorded rather than changed
-    // here, filed separately: the cancellation link is UNREACHABLE ON BOTH SURFACES. This is
-    // `cancel_link`'s only call site and it binds into `let _link`, and `notify_all_channels`
-    // below has no parameter a URL could ride, so the "this was not me" path that stops an
-    // attacker-initiated recovery inside its delay window is never delivered to anyone. The
-    // endpoint and the token machinery are real and work; only the delivery is missing.
-    //
-    // Wiring it is a genuine piece of work rather than a one line change, which is why it is filed:
-    // it needs a notice struct, a delivery seam method following the `NewDeviceNotice` precedent,
-    // a state wrapper, test doubles for both channels, and a new parameter threaded through
-    // `notify_all_channels`.
-    let _link = cancel_link(state, &token);
-    let channels_notified = notify_all_channels(state, scope, subject).await;
+    // Notify EVERY verified channel immediately, and give each one the link that STOPS this
+    // recovery (issue #470). The endpoint and the token machinery shipped with issue #81 and
+    // work; what was missing was the delivery, so the URL was built here and dropped into
+    // `let _link`. The kill switch existed in the code and not in the product.
+    let link = cancel_link(state, &token);
+    let channels_notified = notify_all_channels(state, scope, subject, Some(&link)).await;
 
     let spec = NewRecoveryFlow {
         id: &flow_id,
@@ -858,7 +873,7 @@ pub async fn cancel_from_token(state: &OidcState, token: &str) -> bool {
         .unwrap_or(false);
     if cancelled {
         // Completion and cancellation notify AGAIN, so the owner sees the flow closed.
-        notify_all_channels(state, scope, &subject).await;
+        notify_all_channels(state, scope, &subject, None).await;
     }
     cancelled
 }
@@ -946,7 +961,7 @@ async fn record_factor_change_against(
         decision,
         FactorChangeDecision::AllowedByDelay | FactorChangeDecision::AllowedByReverify
     ) {
-        notify_all_channels(state, scope, &subject).await;
+        notify_all_channels(state, scope, &subject, None).await;
     }
     decision
 }
