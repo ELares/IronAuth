@@ -779,6 +779,35 @@ pub async fn decoy_recovery_work(
     state.dispatch_verification(scope, VerificationPurpose::Recovery, recipient, false);
 }
 
+/// Whether `token` names a recovery that is still PENDING, without cancelling it.
+///
+/// The read-only half of [`cancel_from_token`], for the confirmation page. It performs the
+/// SAME four steps the cancel does (parse the handle, parse the declared scope, digest the
+/// token, resolve by digest) and then applies the SAME `is_pending` predicate, so the page
+/// cannot offer a button the POST would refuse, nor refuse one the POST would honour.
+///
+/// It resolves and does not mutate, so a mail scanner prefetching the notification link
+/// still cannot cancel a recovery: the destructive step remains the POST alone.
+pub async fn cancel_token_is_live(state: &OidcState, token: &str) -> bool {
+    let Some(handle) = flow_id_from_cancel_token(token) else {
+        return false;
+    };
+    let Ok(flow_id) = RecoveryFlowId::parse_declared_scope(handle) else {
+        return false;
+    };
+    let digest = cancel_token_digest(token);
+    let Ok(Some(record)) = state
+        .store()
+        .scoped(flow_id.scope())
+        .recovery_flows()
+        .by_cancel_digest(&digest)
+        .await
+    else {
+        return false;
+    };
+    record.state.is_pending()
+}
+
 /// CANCEL a recovery from a presented cancellation token (issue #81): resolve the flow by
 /// its token digest under the token's own scope, cancel it (revoking the pending
 /// recovery), and notify every channel of the cancellation. Returns whether a pending

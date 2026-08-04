@@ -338,6 +338,23 @@ async fn initiating_recovery_notifies_every_verified_channel() {
 // Delay window: cancellation revokes the pending recovery.
 // ===========================================================================
 
+/// Drive the cancellation confirmation GET for `token` and return its status and body.
+///
+/// The GET resolves the token before offering the button, so this read is what tells a live
+/// cancellation link from a spent or forged one.
+async fn cancel_get(harness: &Harness, token: &str) -> (StatusCode, String) {
+    let (status, _headers, page) = harness
+        .send(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/recover/cancel?token={token}"))
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await;
+    (status, page)
+}
+
 #[tokio::test]
 async fn a_held_recovery_is_cancellable_from_its_notification_token_and_cancellation_revokes_it() {
     let mut harness = Harness::start_store_backed().await;
@@ -381,9 +398,29 @@ async fn a_held_recovery_is_cancellable_from_its_notification_token_and_cancella
         .expect("flow exists");
     assert_eq!(record.state, RecoveryState::Held);
 
+    // The confirmation GET offers the button while the recovery is PENDING. This is the
+    // control for the spent-token assertion below: without it that assertion would pass
+    // just as well against a handler that refused every token.
+    let (status, page) = cancel_get(&harness, &cancel_token).await;
+    assert_eq!(status, StatusCode::OK, "a live token offers the button");
+    assert!(
+        page.contains("/recover/cancel"),
+        "the confirmation form is rendered for a live token: {page}"
+    );
+
     // Cancel from the notification-link token: the pending recovery is REVOKED.
     let cancelled = cancel_from_token(harness.state(), &cancel_token).await;
     assert!(cancelled, "a held recovery is cancellable from its token");
+
+    // The SAME link is now spent. Offering the button again would take the click and answer
+    // the uniform "we have cancelled it", telling someone who suspects an attacker is
+    // resetting their password that they had stopped it when they had not.
+    let (status, page) = cancel_get(&harness, &cancel_token).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a spent cancellation link must not offer the button again: {page}"
+    );
 
     let record = harness
         .store()

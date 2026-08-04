@@ -199,10 +199,26 @@ pub async fn recover_cancel_get(
     State(state): State<OidcState>,
     Query(query): Query<CancelTokenQuery>,
 ) -> Response {
-    let _ = &state;
     let Some(token) = query.token.as_deref().filter(|token| !token.is_empty()) else {
         return interaction::invalid_link_page();
     };
+    // Resolve the token BEFORE offering the button. The POST is deliberately UNIFORM,
+    // because it is the destructive step and that uniformity is its anti-enumeration
+    // property, so without this check a user following a STALE cancellation link pressed
+    // the button and got the identical "we have cancelled it" acknowledgment as a real
+    // cancellation. They would then believe they had stopped an account-recovery attempt
+    // that was in fact still running, which is the worst thing this page can tell someone
+    // who suspects an attacker is resetting their password.
+    //
+    // A pure read that shares the cancel's own predicate, so the page cannot offer a button
+    // the POST would refuse. It does not cancel, so a mail scanner prefetching the link
+    // still cannot stop a legitimate recovery.
+    //
+    // The POST is untouched and stays uniform: this decides whether to OFFER the action,
+    // not whether to perform it.
+    if !crate::recovery::cancel_token_is_live(&state, token).await {
+        return interaction::invalid_link_page();
+    }
     pages::secure_html(
         StatusCode::OK,
         pages::recover_cancel_page("/recover/cancel", token),
