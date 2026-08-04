@@ -46,12 +46,13 @@ use ironauth_env::Env;
 use crate::audit::ActorRef;
 use crate::id::{
     ConnectorId, CorrelationId, CredentialId, GrantId, IssuedTokenId, OrganizationId, ServiceId,
-    SessionId, SigningKeyId, UserId,
+    SessionId, SigningKeyId, UserId, UserIdentifierId,
 };
+use crate::identifier::{IdentifierType, UniquenessMode};
 use crate::org_policy::{AuthPolicy, ORG_POLICY_MAX_SESSION_TTL_SECS};
 use crate::repository::{
-    CredentialRemoveOutcome, RedeemOutcome, RefreshFamilyFleetFilter, SessionEndCause,
-    SessionFleetFilter, TokenStatus, UserListFilter, UserState,
+    CredentialRemoveOutcome, NewUserIdentifier, RedeemOutcome, RefreshFamilyFleetFilter,
+    SessionEndCause, SessionFleetFilter, TokenStatus, UserListFilter, UserState,
 };
 use crate::scope::Scope;
 use crate::store::Store;
@@ -290,6 +291,29 @@ impl IdorHarness {
         self.register(Box::new(UserStateForSubjectProbe));
         self.register(Box::new(UserClaimsForSubjectProbe));
         self.register(Box::new(UserByIdentifierProbe));
+        // The flexible login-identifier surface (issue #54, epic #514). Its three
+        // operations each address a scoped resource by identifier, so the harness's own
+        // mandate covers them: the two user-addressed ones take a foreign `usr_`, and the
+        // remove takes a foreign `uid_`, which is why the caller seeds a real victim
+        // identifier rather than relying on the user ids alone.
+        self.register(Box::new(UserIdentifierListProbe));
+        self.register(Box::new(UserIdentifierAddProbe));
+        // `ActingUserIdentifierRepo::remove` is deliberately NOT registered, and the
+        // reason is measured rather than assumed. It is keyed on the OWNING USER as well
+        // as the `uid_`, and a probe receives one identifier at a time, so it cannot
+        // supply the owner and must invent one. Every call therefore removes zero rows
+        // and answers `Denied` whatever scope the `uid_` came from: driven with a
+        // CALLER-SCOPE identifier it still reports no leak, which is the definition of a
+        // probe that cannot fail. Registering it would raise the probe count without
+        // raising the coverage, which is worse than the gap because the count is what
+        // the pinned name list makes people trust.
+        //
+        // Its isolation is not unmeasured. The scope half is the same `parse_in_scope`
+        // plus scope-predicate plus row-level-security stack every probe above exercises,
+        // and the OWNER half has its own end-to-end test on the management surface,
+        // `an_identifier_cannot_be_removed_through_another_users_path`, which is
+        // mutation-proven: replacing the `user_id` predicate with a tautology turns it
+        // red.
         self
     }
 
@@ -396,6 +420,93 @@ impl IdorHarness {
             }
         }
         leaks
+    }
+}
+
+/// Built-in probe for `UserIdentifierRepo::list_for_user` (issue #54).
+///
+/// A foreign user's login identifiers must never be listable under the caller's scope.
+/// `list_for_user` answers an EMPTY vector for an out-of-scope user rather than an error,
+/// so this probe reads a non-empty result as the leak: an empty answer is exactly what a
+/// genuinely absent user produces, which is the uniformity this harness is about.
+struct UserIdentifierListProbe;
+
+impl IsolationProbe for UserIdentifierListProbe {
+    fn name(&self) -> &'static str {
+        "user_identifiers.list_for_user"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            let Ok(id) = UserId::parse_in_scope(foreign_id, &caller) else {
+                return ProbeOutcome::Denied;
+            };
+            match store
+                .scoped(caller)
+                .user_identifiers()
+                .list_for_user(&id)
+                .await
+            {
+                Ok(rows) if rows.is_empty() => ProbeOutcome::Denied,
+                Ok(_) => ProbeOutcome::Leaked,
+                Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `ActingUserIdentifierRepo::add` (issue #54).
+///
+/// Adding a login identifier to a FOREIGN user would plant a login handle on an account
+/// in another scope, which is a write-side takeover rather than a read leak.
+struct UserIdentifierAddProbe;
+
+impl IsolationProbe for UserIdentifierAddProbe {
+    fn name(&self) -> &'static str {
+        "user_identifiers.add"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            let env = Env::system();
+            let Ok(user) = UserId::parse_in_scope(foreign_id, &caller) else {
+                return ProbeOutcome::Denied;
+            };
+            let actor = ActorRef::service(ServiceId::generate(&env));
+            let correlation = CorrelationId::generate(&env);
+            match store
+                .scoped(caller)
+                .acting(actor, correlation)
+                .user_identifiers()
+                .add(
+                    &env,
+                    NewUserIdentifier {
+                        id: &UserIdentifierId::generate(&env, &caller),
+                        user_id: &user,
+                        identifier_type: IdentifierType::Email,
+                        raw: "idor-probe@example.test",
+                        verified: false,
+                        mode: UniquenessMode::EnvironmentWide,
+                        org: None,
+                    },
+                    None,
+                )
+                .await
+            {
+                Ok(()) => ProbeOutcome::Leaked,
+                Err(_) => ProbeOutcome::Denied,
+            }
+        })
     }
 }
 
