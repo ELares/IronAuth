@@ -662,8 +662,12 @@ mod tests {
             Reach::UnreadAtBoot {
                 config_type: "ByokConfig",
             },
-            "inert: no boot path reads it from Config, on either plane. Tracked as issue \
-             #459, alongside identifiers and for the same reason.",
+            "inert: no boot path INSTALLS it into either plane's state. Still tracked as \
+             issue #459, whose identifiers half was wired by #519. The one read that \
+             now exists is a refusal, not an installation: `Config::validate` REFUSES \
+             to boot when any field here is set away from its default, so the section \
+             being unconsumed can no longer be mistaken for it being configured. That \
+             is the general treatment for a section that ships ahead of its consumer.",
         ),
         (
             "outbox",
