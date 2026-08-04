@@ -179,9 +179,47 @@ pub struct CertSpec<'a> {
     pub key_usage: Option<u16>,
 }
 
+/// Build a signed DER certificate from a [`CertSpec`], appending extra
+/// already-encoded `Extension` SEQUENCEs verbatim.
+///
+/// A separate entry point rather than a field on [`CertSpec`]: the struct is
+/// built by exhaustive literal at 28 sites, so a new field would edit all of
+/// them to express something only the extension tests need. Use [`extension`]
+/// to build the elements.
+#[must_use]
+pub fn build_cert_with_extensions(spec: &CertSpec<'_>, extra: &[Vec<u8>]) -> Vec<u8> {
+    build_cert_inner(spec, extra)
+}
+
+/// Encode one `Extension` SEQUENCE: an OID, the `critical` BOOLEAN when it is
+/// TRUE, and the `extnValue` OCTET STRING wrapping `value`.
+///
+/// `critical_octet` is written into the BOOLEAN verbatim rather than as a
+/// `bool`, so a test can emit the non-canonical encodings DER forbids.
+#[must_use]
+pub fn extension(arcs: &[u64], critical_octet: Option<u8>, value: &[u8]) -> Vec<u8> {
+    let mut elements = vec![oid(arcs)];
+    if let Some(octet) = critical_octet {
+        elements.push(tlv(tag::BOOLEAN, &[octet]));
+    }
+    elements.push(tlv(tag::OCTET_STRING, value));
+    seq(&elements)
+}
+
+/// A `basicConstraints` extnValue asserting `cA` with the given BOOLEAN octet,
+/// so a test can present the non-canonical `TRUE` encodings DER forbids.
+#[must_use]
+pub fn basic_constraints_value(ca_octet: u8) -> Vec<u8> {
+    seq(&[tlv(tag::BOOLEAN, &[ca_octet])])
+}
+
 /// Build a signed DER certificate from a [`CertSpec`].
 #[must_use]
 pub fn build_cert(spec: &CertSpec<'_>) -> Vec<u8> {
+    build_cert_inner(spec, &[])
+}
+
+fn build_cert_inner(spec: &CertSpec<'_>, extra: &[Vec<u8>]) -> Vec<u8> {
     let subject_pub = test_util::ed25519_public_key_from_seed(&spec.subject_seed);
     let mut tbs_elements = vec![
         // [0] version = v3 (INTEGER 2).
@@ -213,6 +251,7 @@ pub fn build_cert(spec: &CertSpec<'_>) -> Vec<u8> {
     if let Some(aaguid) = spec.aaguid {
         extensions.push(aaguid_extension(&aaguid));
     }
+    extensions.extend_from_slice(extra);
     if !extensions.is_empty() {
         tbs_elements.push(tlv(tag::CONTEXT_CONSTRUCTED | 3, &seq(&extensions)));
     }
