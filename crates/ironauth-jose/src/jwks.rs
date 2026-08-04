@@ -37,17 +37,22 @@ impl Jwk {
         Self(object)
     }
 
-    /// Build the public JWK for a signing key.
-    fn from_signing_key(key: &SigningKey) -> Result<Self, SigningKeyError> {
+    /// Build the public JWK for a signing key, WITHOUT a `kid`.
+    ///
+    /// This is the form the RFC 7638 thumbprint is taken over, and it must stay
+    /// free of any member derived from the thumbprint itself: [`Jwk::
+    /// from_signing_key`] fills an absent `kid` by calling
+    /// [`SigningKey::derive_kid`], which comes back here, so building the members
+    /// and adding the `kid` have to be separate steps or the two recurse without
+    /// end. Measured, not reasoned about: the first draft had them as one function
+    /// and every kid-less key overflowed the stack.
+    pub(crate) fn public_members_of(key: &SigningKey) -> Result<Self, SigningKeyError> {
         let mut jwk = Map::new();
         jwk.insert("use".to_owned(), Value::String("sig".to_owned()));
         jwk.insert(
             "alg".to_owned(),
             Value::String(key.algorithm().as_jose_name().to_owned()),
         );
-        if let Some(kid) = key.kid() {
-            jwk.insert("kid".to_owned(), Value::String(kid.to_owned()));
-        }
         match key.public_components()? {
             PublicComponents::Okp { x } => {
                 jwk.insert("kty".to_owned(), Value::String("OKP".to_owned()));
@@ -67,6 +72,29 @@ impl Jwk {
             }
         }
         Ok(Self(jwk))
+    }
+
+    /// Build the public JWK a signing key PUBLISHES, which always carries a `kid`.
+    ///
+    /// An external verifier selects by `kid`, so two keys published without one are
+    /// ambiguous to every consumer of the document (issue #188). When the caller
+    /// supplied none, the RFC 7638 thumbprint of the key's own public half is used:
+    /// set-unique by construction and stable for the life of the key.
+    ///
+    /// Deliberately NOT defaulted in the `SigningKey` constructors, which is where
+    /// this started. A kid-less key must stay CONSTRUCTIBLE: the RFC 8037 A.4
+    /// Ed25519 vector's protected header is exactly `{"alg":"EdDSA"}`, so forcing a
+    /// `kid` onto every key makes that vector impossible to reproduce. The
+    /// ambiguity this issue is about is a property of the PUBLISHED document, so
+    /// that is where it is fixed.
+    pub(crate) fn from_signing_key(key: &SigningKey) -> Result<Self, SigningKeyError> {
+        let mut jwk = Self::public_members_of(key)?;
+        let kid = match key.kid() {
+            Some(kid) => kid.to_owned(),
+            None => key.derive_kid()?,
+        };
+        jwk.0.insert("kid".to_owned(), Value::String(kid));
+        Ok(jwk)
     }
 
     /// The `kid` member, if present.

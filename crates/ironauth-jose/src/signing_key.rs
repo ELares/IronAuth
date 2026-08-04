@@ -254,7 +254,30 @@ impl SigningKey {
         self.algorithm
     }
 
+    /// The RFC 7638 JWK thumbprint of this key's PUBLIC half, base64url-encoded:
+    /// the `kid` a caller gets when they do not supply one.
+    ///
+    /// Computed through the very same [`crate::dpop::jwk_thumbprint`] that
+    /// produces a `DPoP` proof key's `jkt`, so there is ONE canonicalization in
+    /// the crate rather than two that could disagree about member ordering or
+    /// whitespace. The thumbprint covers only the RFC 7638 required members, so it
+    /// is stable across anything else the published JWK carries (`use`, `alg`, and
+    /// the `kid` itself).
+    ///
+    /// # Errors
+    ///
+    /// [`SigningKeyError::InvalidKeyMaterial`] if the public components cannot be
+    /// read, which does not happen for a key `ring` has already accepted.
+    pub fn derive_kid(&self) -> Result<String, SigningKeyError> {
+        let jwk = crate::jwks::Jwk::public_members_of(self)?;
+        crate::dpop::jwk_thumbprint(&jwk).map_err(|_| SigningKeyError::InvalidKeyMaterial)
+    }
+
     /// The `kid` this key answers to, if any.
+    ///
+    /// `None` is legitimate and stays constructible: the RFC 8037 A.4 vector's
+    /// protected header carries no `kid`. What always has one is the PUBLISHED
+    /// JWK, which falls back to [`SigningKey::derive_kid`] (issue #188).
     #[must_use]
     pub fn kid(&self) -> Option<&str> {
         self.kid.as_deref()

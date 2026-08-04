@@ -659,3 +659,99 @@ impl TokenBindingMethod for MtlsBinding {
         Confirmation::X5tS256(thumbprint.to_owned())
     }
 }
+
+/// Issue #188: a published JWK always carries a set-unique `kid`.
+mod thumbprint_kid {
+    use super::{JwkSet, JwsAlgorithm, SigningKey, signing_keys};
+
+    fn keyless(alg: JwsAlgorithm) -> SigningKey {
+        match alg {
+            JwsAlgorithm::EdDsa => SigningKey::ed25519_from_seed(None, &[5_u8; 32]),
+            JwsAlgorithm::Es256 => {
+                SigningKey::ecdsa_p256_from_pkcs8(None, signing_keys::ES256_PKCS8)
+            }
+            _ => SigningKey::rsa_from_pkcs1_der(None, alg, signing_keys::RSA_PKCS1),
+        }
+        .expect("key material")
+    }
+
+    #[test]
+    fn a_key_published_without_a_kid_carries_its_thumbprint() {
+        // The key itself stays kid-less, which is what keeps the RFC 8037 A.4
+        // vector reproducible; the PUBLISHED document is where the ambiguity was.
+        let key = keyless(JwsAlgorithm::EdDsa);
+        assert_eq!(key.kid(), None, "the key itself is untouched");
+
+        let set = JwkSet::from_signing_keys([&key]).expect("jwk set");
+        let published = set.keys()[0]
+            .kid()
+            .expect("a published JWK always has a kid");
+        assert_eq!(
+            published,
+            key.derive_kid().expect("thumbprint"),
+            "the published kid is the key's own RFC 7638 thumbprint"
+        );
+    }
+
+    #[test]
+    fn an_explicit_kid_is_never_overwritten() {
+        // The other direction: deriving must not clobber what a caller chose, or
+        // every existing deployment's published kids would change under it.
+        let key =
+            SigningKey::ed25519_from_seed(Some("chosen".to_owned()), &[5_u8; 32]).expect("ed25519");
+        let set = JwkSet::from_signing_keys([&key]).expect("jwk set");
+        assert_eq!(set.keys()[0].kid(), Some("chosen"));
+    }
+
+    #[test]
+    fn the_day_one_algorithms_get_distinct_and_stable_thumbprint_kids() {
+        // The issue's own acceptance. DISTINCT is the collision property; STABLE is
+        // what makes a kid usable for selection at all, since a kid that changed
+        // per process would strand every cached JWKS.
+        let algs = [
+            JwsAlgorithm::EdDsa,
+            JwsAlgorithm::Es256,
+            JwsAlgorithm::Rs256,
+        ];
+        let kids: Vec<String> = algs
+            .iter()
+            .map(|alg| keyless(*alg).derive_kid().expect("thumbprint"))
+            .collect();
+
+        let mut unique = kids.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), 3, "the three day-one kids collide: {kids:?}");
+
+        for (alg, kid) in algs.iter().zip(&kids) {
+            assert_eq!(
+                &keyless(*alg).derive_kid().expect("thumbprint"),
+                kid,
+                "a thumbprint kid must be stable across constructions"
+            );
+        }
+    }
+
+    #[test]
+    fn a_published_kid_is_that_documents_own_rfc7638_thumbprint() {
+        // There is ONE RFC 7638 canonicalization in this crate, the same routine that
+        // produces a DPoP proof key's `jkt`. Running the PUBLISHED document back
+        // through it closes the loop: if a second canonicalization were introduced
+        // for kids, the two could disagree about member ordering or whitespace and
+        // nothing else would notice.
+        for alg in [
+            JwsAlgorithm::EdDsa,
+            JwsAlgorithm::Es256,
+            JwsAlgorithm::Rs256,
+        ] {
+            let key = keyless(alg);
+            let set = JwkSet::from_signing_keys([&key]).expect("jwk set");
+            let published = &set.keys()[0];
+            assert_eq!(
+                published.kid().expect("a published JWK always has a kid"),
+                ironauth_jose::jwk_thumbprint(published).expect("thumbprint"),
+                "the published kid must be this JWK's own thumbprint for {alg:?}"
+            );
+        }
+    }
+}
