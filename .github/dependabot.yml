@@ -62,18 +62,3 @@ updates:
         update-types:
           - minor
           - patch
-    ignore:
-      # jsdom 30 cannot run on the Node this repo builds and tests on.
-      #
-      # Measured 2026-08-02 with `npm view jsdom@<v> engines`:
-      #   jsdom 29.1.1  ->  { node: '^20.19.0 || ^22.13.0 || >=24.0.0' }
-      #   jsdom 30.0.1  ->  { node: '^22.22.2 || ^24.15.0 || >=26.0.0' }
-      # CI pins `node-version: "20"` for the admin-spa and reference-app jobs in
-      # .github/workflows/ci.yml, and packages/admin-spa/package.json declares
-      # `"engines": {"node": ">=20"}`. jsdom 30 excludes the whole 20.x line.
-      #
-      # This is a Node floor, not a jsdom defect: delete this entry when CI and
-      # the package engines move off Node 20, not before. jsdom 29.x patch and
-      # minor updates are unaffected and still flow.
-      - dependency-name: jsdom
-        versions: [">=30"]
