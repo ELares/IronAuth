@@ -107,6 +107,11 @@ ironauth-kms.workspace = true
 # rows even with the app-layer filter bypassed. Needs a real database
 # (DATABASE_URL); see the crate docs and scripts/with-test-db.sh.
 [[test]]
+name = "idempotency_retention"
+path = "tests/idempotency_retention.rs"
+required-features = ["testing"]
+
+[[test]]
 name = "rls"
 path = "tests/rls.rs"
 required-features = ["testing"]

@@ -944,6 +944,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0108_revoke_unused_app_insert_delete.sql"),
         },
+        Migration {
+            version: 109,
+            name: "idempotency_key_retention",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0109_idempotency_key_retention.sql"),
+        },
     ]
 }
 

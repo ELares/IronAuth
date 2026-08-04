@@ -53,9 +53,31 @@ when writes stop.
 | `policy_decision_traces` | 0073 | inline in `record` |
 | `token_size_events` | 0073 | inline in `record` |
 | `dpop_proof_replay` | 0083 | inline in `check_and_record` |
+| `idempotency_keys` | 0003, retention added in 0109 | inline in `insert_idempotency` |
 
 `pow_challenges` is the one 0102 cites as its model, specifically for its
-bounded subselect (Postgres `DELETE` takes no `LIMIT`).
+bounded subselect (Postgres `DELETE` takes no `LIMIT`). 0109 follows the same
+bounded subselect for `idempotency_keys`, and adds an ORDER BY so the drain is
+oldest first: without it, WHICH expired rows a pass removes is unspecified.
+
+`idempotency_keys` differs from every other row in this table in one way worth
+naming. For the replay caches, a missing row means REJECT (an unknown `jti` was
+never seen, so nothing is replayed). Here a missing row means EXECUTE: the
+caller re-runs its mutation. That is the documented contract for a key older
+than the window, but it is why the window is stamped per row and honoured by the
+lookup rather than left to whenever the prune next runs.
+
+### Still unpruned, measured 2026-08-04
+
+Nine tables have no delete path anywhere in the workspace and grow without
+bound: `acme_challenges`, `authorization_codes`, `device_codes`,
+`environment_states`, `fedcm_assertion_nonces`, `federation_login_states`,
+`pushed_authorization_requests`, `signup_quarantines` and
+`webauthn_challenges`. They are NOT one batch of work. Each is a single-use
+latch whose safe window is its own question, and for the consume-latch tables a
+row that is deleted while still referencable changes an authorization decision,
+so each needs its retention floor argued from that table's replay semantics
+rather than from a shared default.
 
 ### `outbox_messages` (migration 0099, retention added in 0102)
 
