@@ -172,13 +172,14 @@ the reaper removes ZERO rows there, on every pass, forever.
   healthy idle reaper and a dead one are distinguishable; and a failed pass logs
   at warn, naming the missing 0102 grant as the likely cause.
 - `OutboxDepth::completed`, the reapable backlog, is the counter the depth gauge
-  gained for this. **It has no reader yet.** `OutboxRepo::depth` has no
-  production caller in this tree, so nothing exports it and no deployment can
-  read it. Wiring the depth gauge to the metrics exporter is the remaining
-  observability gap for this table. It is deliberately not done from inside the
-  sweep: `depth` is an unbounded `count(*)` over the scope, and a pass whose
-  whole story is boundedness must not grow a second unbounded read to produce a
-  number nothing consumes.
+  gained for this, and it now has two readers: the queues management API reads
+  `depth` for one scope, and the metrics sampler reads it across scopes to set
+  `ironauth_outbox_depth`. Neither reader lives inside the sweep, and that is
+  still deliberate: `depth` is an unbounded `count(*)` over the scope, and a pass
+  whose whole story is boundedness must not grow a second unbounded read. The
+  sampler is a separate task on its own configurable interval
+  (`outbox.metrics_sample_interval_secs`), so the reaper's cost stays a function
+  of what it deletes rather than of how much it left behind.
 - A deployment with no control-plane DSN gets NO reaping at all. That is logged
   at error on boot, and both halves of it are pinned by a suite that boots the
   real binary (`crates/ironauth/tests/serve_retention_boot.rs`). It is a real

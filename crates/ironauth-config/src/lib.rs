@@ -431,6 +431,29 @@ pub struct OutboxConfig {
     /// window. The default (one hour) with the default batch removes up to 1000 rows per
     /// consumer per scope per hour. Must be at least 1 and at most `OIDC_MAX_LIFETIME_SECS`.
     pub reap_interval_secs: u64,
+
+    /// How often, in seconds, the metrics sampler reads queue depth and consumer lag into
+    /// the `ironauth_outbox_depth` and `ironauth_outbox_oldest_ready_age_seconds` gauges.
+    ///
+    /// It trades the freshness of two gauges against database load, and the load is the
+    /// part worth stating plainly, because "it queries every scope" reads alarming without
+    /// the comparison: the drain ALREADY issues a claim per scope per consumer every
+    /// `poll_interval_secs`, which defaults to 5. A sample every 15 seconds adds one read
+    /// per scope per consumer at a third of a cadence the deployment is already paying,
+    /// over the same index. A deployment that finds it too expensive lengthens it and
+    /// loses only gauge resolution: the counters come from the drain itself and are
+    /// unaffected.
+    ///
+    /// It is deliberately NOT folded into the retention sweep or the drain. `depth` is an
+    /// unbounded `count(*)` over the scope, and both of those passes have bounded cost by
+    /// design; giving either of them a second unbounded read would trade a property they
+    /// are built around for a number that does not need to be that fresh.
+    ///
+    /// Must be at least 1 and at most `OIDC_MAX_LIFETIME_SECS`. There is no "disabled"
+    /// value: a deployment that wants less sampling sets a long interval and still gets a
+    /// series, rather than an absent one that looks exactly like a dead process to
+    /// whatever alerts on it.
+    pub metrics_sample_interval_secs: u64,
 }
 
 /// Outbound webhook delivery settings (issue #105).
@@ -588,6 +611,7 @@ impl Default for OutboxConfig {
             dead_letter_retention_secs: 0,
             reap_batch: 1_000,
             reap_interval_secs: 60 * 60,
+            metrics_sample_interval_secs: 15,
         }
     }
 }
@@ -5067,6 +5091,10 @@ fn validate_outbox(outbox: &OutboxConfig) -> Result<(), ConfigError> {
         ("outbox.poll_interval_secs", outbox.poll_interval_secs),
         ("outbox.retry_base_secs", outbox.retry_base_secs),
         ("outbox.reap_interval_secs", outbox.reap_interval_secs),
+        (
+            "outbox.metrics_sample_interval_secs",
+            outbox.metrics_sample_interval_secs,
+        ),
     ] {
         if value < 1 {
             return Err(ConfigError::Invalid {

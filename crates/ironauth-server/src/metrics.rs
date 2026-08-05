@@ -23,6 +23,39 @@ pub const UP: &str = "ironauth_up";
 /// labeled by reason.
 pub const PROXY_FORWARDING_REJECTED_TOTAL: &str = "ironauth_proxy_forwarding_rejected_total";
 
+/// Outbox messages leased by a worker, labeled by `consumer` (issue #104).
+///
+/// This and every other `ironauth_outbox_*` series is labeled by CONSUMER ONLY, never by
+/// tenant or environment. A per-tenant label on a multi-tenant deployment is an unbounded
+/// cardinality time series, which is the standard way to bring down a Prometheus instance;
+/// bounded by the consumer registry, these stay at a handful of series no matter how many
+/// tenants exist. The per-scope numbers are not lost: they are already available,
+/// authenticated, on the queues management API, which is the surface that can afford them.
+pub const OUTBOX_MESSAGES_CLAIMED_TOTAL: &str = "ironauth_outbox_messages_claimed_total";
+/// Outbox messages that reached an outcome, labeled by `consumer` and `outcome`
+/// (`completed`, `retried`, `dead_lettered`, `lease_lost`).
+pub const OUTBOX_MESSAGES_TOTAL: &str = "ironauth_outbox_messages_total";
+/// Outbox drain passes that could not run, labeled by `consumer` and `kind` (`drain` for a
+/// persistence fault draining one scope, `scopes` for a sweep that could not enumerate its
+/// scopes at all and therefore drained NOTHING).
+pub const OUTBOX_PASS_FAILURES_TOTAL: &str = "ironauth_outbox_pass_failures_total";
+/// Outbox queue depth, labeled by `consumer` and `state` (`ready`, `in_flight`, `scheduled`,
+/// `dead_lettered`), summed across every scope the sampler swept.
+pub const OUTBOX_DEPTH: &str = "ironauth_outbox_depth";
+/// Consumer lag in seconds: how long the OLDEST ready message has been waiting past the
+/// moment it became due, labeled by `consumer`, taken as the worst case across scopes.
+///
+/// Zero means nothing is overdue. A message still waiting out its retry backoff is not lag
+/// and is not counted here, because it is waiting by design rather than for want of a worker.
+pub const OUTBOX_OLDEST_READY_AGE_SECONDS: &str = "ironauth_outbox_oldest_ready_age_seconds";
+
+/// The `outcome` label values of [`OUTBOX_MESSAGES_TOTAL`], which together partition every
+/// message a drain pass finished with.
+pub const OUTBOX_OUTCOMES: [&str; 4] = ["completed", "retried", "dead_lettered", "lease_lost"];
+/// The `state` label values of [`OUTBOX_DEPTH`], which together partition every non-terminal
+/// message plus the dead-lettered tail.
+pub const OUTBOX_DEPTH_STATES: [&str; 4] = ["ready", "in_flight", "scheduled", "dead_lettered"];
+
 /// Latency histogram buckets in seconds, from sub-millisecond to ten seconds.
 const DURATION_BUCKETS: [f64; 12] = [
     0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
@@ -69,6 +102,27 @@ fn describe() {
     metrics::describe_counter!(
         PROXY_FORWARDING_REJECTED_TOTAL,
         "Requests whose forwarding headers were ambiguous and failed closed"
+    );
+    metrics::describe_counter!(
+        OUTBOX_MESSAGES_CLAIMED_TOTAL,
+        "Outbox messages leased by a worker, by consumer"
+    );
+    metrics::describe_counter!(
+        OUTBOX_MESSAGES_TOTAL,
+        "Outbox messages that reached an outcome, by consumer and outcome"
+    );
+    metrics::describe_counter!(
+        OUTBOX_PASS_FAILURES_TOTAL,
+        "Outbox drain passes that could not run, by consumer and kind"
+    );
+    metrics::describe_gauge!(
+        OUTBOX_DEPTH,
+        "Outbox queue depth summed across scopes, by consumer and state"
+    );
+    metrics::describe_gauge!(
+        OUTBOX_OLDEST_READY_AGE_SECONDS,
+        metrics::Unit::Seconds,
+        "How long the oldest ready outbox message has been overdue, by consumer"
     );
 }
 
