@@ -152,6 +152,37 @@ fn parse_user_id(scope: Scope, raw: &str) -> Result<UserId, ApiError> {
     UserId::parse_in_scope(raw, &scope).map_err(|_| ApiError::NotFound)
 }
 
+/// Mint the `user.created` event this create announces (issues #105, #108).
+///
+/// The id is minted ONCE, before the write, and travels through the fan-out to become the
+/// `webhook-id` header of every delivery. Minting it inside a retry would present a
+/// receiver the same event twice under two ids, which is exactly what that header exists to
+/// prevent.
+fn user_created_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    user_id: &ironauth_store::UserId,
+    user_state: ironauth_store::UserState,
+    created_at_micros: i64,
+) -> crate::events::PendingEvent {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let envelope = crate::events::envelope(
+        &id,
+        crate::events::USER_CREATED,
+        scope,
+        created_at_micros / 1000,
+        &serde_json::json!({
+            "user_id": user_id.to_string(),
+            "state": user_state.as_str(),
+        }),
+    );
+    crate::events::PendingEvent {
+        id,
+        subject: user_id.to_string(),
+        envelope,
+    }
+}
+
 /// Create a user under an environment.
 #[utoipa::path(
     post,
@@ -264,12 +295,13 @@ pub async fn create_user(
         response_status: 201,
         response_body: &body_string,
     };
+    let event = user_created_event(&state, scope, &user_id, user_state, created_at_micros);
     let result = state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .users()
-        .admin_create(
+        .admin_create_emitting(
             state.env(),
             NewAdminUser {
                 id: Some(&user_id),
@@ -296,6 +328,7 @@ pub async fn create_user(
             },
             created_at_micros,
             Some(write),
+            Some(&event.domain_event()),
         )
         .await;
 

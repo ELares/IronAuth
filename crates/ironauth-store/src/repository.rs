@@ -15675,6 +15675,35 @@ impl ActingUserRepo<'_> {
         created_at_micros: i64,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<UserId, StoreError> {
+        self.admin_create_emitting(env, spec, created_at_micros, idempotency, None)
+            .await
+    }
+
+    /// Create a user and, when `event` is given, emit it on the webhook event queue in the
+    /// SAME transaction (issues #105, #108).
+    ///
+    /// The emission is transactional for the reason the outbox exists: a create that
+    /// committed while its event was lost would leave an integrator permanently out of
+    /// step with a user who exists, and a create that rolled back after emitting would
+    /// announce a user who does not.
+    ///
+    /// It is opt IN rather than automatic, and that is the whole reason this is a separate
+    /// method. `insert_admin_user_row` is shared with the streaming bulk import (#55), so
+    /// emitting there would enqueue one event per imported identity and turn a 100k-user
+    /// import into a 100k-message fan-out. An import is a migration, not a hundred
+    /// thousand separate things happening to a hundred thousand users, so it stays silent.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::admin_create`].
+    pub async fn admin_create_emitting(
+        &self,
+        env: &Env,
+        spec: NewAdminUser<'_>,
+        created_at_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<UserId, StoreError> {
         let master = self.store.master().ok_or(StoreError::Encryption)?;
         self.ensure_scope_keys(env, master).await?;
         let scope = self.scope;
@@ -15710,6 +15739,26 @@ impl ActingUserRepo<'_> {
                 )
                 .await?;
                 insert_idempotency(tx, idempotency).await?;
+                // The domain event, in the SAME transaction as the row it announces.
+                if let Some(event) = event {
+                    enqueue_outbox_in_tx(
+                        tx,
+                        env,
+                        scope,
+                        &NewOutboxMessage {
+                            consumer: WEBHOOK_EVENT_CONSUMER,
+                            // The event's own id: minted once by the producer and carried
+                            // through the fan-out, so a redelivery of any resulting
+                            // delivery presents the same `webhook-id` to its receiver.
+                            idempotency_key: event.id,
+                            // The SUBJECT, so two events about one user are exploded in
+                            // the order they happened rather than concurrently.
+                            ordering_key: event.subject,
+                            payload: event.envelope.clone(),
+                        },
+                    )
+                    .await?;
+                }
                 Ok(())
             },
             false,
@@ -18910,6 +18959,19 @@ pub const TRAIT_MIGRATION_CONSUMER: &str = "traits.migration";
 /// same transaction as the state change, delayed to the scheduled instant, and drained by
 /// a worker that executes whatever has come due.
 pub const OFFBOARDING_CONSUMER: &str = "users.offboarding";
+
+/// The registered consumer name a DOMAIN EVENT is fanned out under (issues #105, #108).
+///
+/// The webhook chain had every stage but its first: endpoints could be registered, secrets
+/// rotated, deliveries signed, dead letters listed and replayed, and NOTHING ever enqueued
+/// a delivery. This is the queue a domain write emits ONE message onto, which the fan-out
+/// consumer explodes into one delivery per active endpoint.
+///
+/// Two stages rather than one, for the reason the back-channel logout fan-out is two
+/// (#104): a domain write must not enqueue a message per endpoint inside its own
+/// transaction, or the cost of creating a user grows with how many webhooks an operator
+/// happens to have registered.
+pub const WEBHOOK_EVENT_CONSUMER: &str = "webhook.event";
 
 /// The largest exponential-backoff delay, in seconds, a retry schedule may reach
 /// (issue #104). The doubling is capped here rather than left to overflow, so a
@@ -51689,6 +51751,24 @@ pub struct TraitMigrationJob {
     pub failure_count: i64,
     /// The per-record failure report.
     pub failures: Vec<RecordFailure>,
+}
+
+/// A domain event a write emits onto the webhook event queue (issues #105, #108).
+///
+/// Grouped so an emitting write stays inside the argument budget, and because the three
+/// fields are meaningless apart: the envelope is what a receiver is sent, the id is what
+/// it deduplicates on, and the subject is what orders one subject's events against each
+/// other.
+pub struct DomainEvent<'a> {
+    /// The event's stable id, minted ONCE by the producer. It becomes the `webhook-id`
+    /// header of every delivery this event fans out to, so it must not be re-minted on a
+    /// retry or a receiver would see one event twice under two ids.
+    pub id: &'a str,
+    /// The entity the event is about. Two events about one subject are exploded in order.
+    pub subject: &'a str,
+    /// The envelope a receiver is sent, built by the producer to the shape issue #108
+    /// specifies.
+    pub envelope: &'a serde_json::Value,
 }
 
 /// The scheduled-offboarding half of a user state change (issue #52).

@@ -1159,3 +1159,153 @@ async fn queue_depth_reports_the_backlog_a_dead_letter_leaves_behind() {
         "only queues with rows are listed: {body}"
     );
 }
+
+#[tokio::test]
+async fn creating_a_user_delivers_a_signed_event_to_every_active_endpoint() {
+    // THE CHAIN, end to end, for the first time. Every stage of the webhook subsystem
+    // shipped across #554 to #561 and NOTHING ever enqueued a delivery: an operator could
+    // register endpoints, rotate secrets, watch dead letters and replay them, and no event
+    // would ever arrive. This is the producer, and this test is the proof that a real
+    // domain write reaches a real receiver.
+    //
+    // Domain write -> event queue -> fan-out -> delivery -> signature the registered
+    // consumer verifies. A test that drove any single stage would have passed for the last
+    // eight PRs while the chain stayed broken.
+    use ironauth_admin::events::WebhookFanoutConsumer;
+    use ironauth_store::{WEBHOOK_DELIVERY_CONSUMER, WEBHOOK_EVENT_CONSUMER};
+    use std::time::Duration;
+
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (first, first_secret, base) = register(&h, &tenant, &environment).await;
+    let (second, second_secret, _) = register_as(&h, &tenant, &environment, "k-register-2").await;
+    // A PAUSED endpoint receives nothing: an operator turned it off, so an event arriving
+    // while it is off was never promised to it.
+    let (paused, _, _) = register_as(&h, &tenant, &environment, "k-register-3").await;
+    let (status, _, body) = h
+        .post(&format!("{base}/{paused}/pause"), "k-pause", "")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let scope = scope_of(&tenant, &environment);
+    let env = Env::system();
+    let store = h.store().clone();
+
+    // THE DOMAIN WRITE, over the real management surface.
+    let (status, _, created) = h
+        .post(
+            &format!("/v1/tenants/{tenant}/environments/{environment}/users"),
+            "k-user",
+            &serde_json::json!({ "identifier": "new@example.test" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let user_id = serde_json::from_str::<Value>(&created).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    // LINK ONE: the create emitted ONE event, in its own transaction.
+    let events = store
+        .scoped(scope)
+        .outbox()
+        .claim(&env, WEBHOOK_EVENT_CONSUMER, Duration::from_secs(30), 10)
+        .await
+        .expect("claim the event");
+    assert_eq!(events.len(), 1, "creating a user emits exactly one event");
+    let envelope = &events[0].payload;
+    assert_eq!(envelope["type"], "user.created", "{envelope}");
+    assert_eq!(envelope["payload_schema_version"], 1, "{envelope}");
+    assert_eq!(envelope["tenant_id"], tenant, "{envelope}");
+    assert_eq!(envelope["environment_id"], environment, "{envelope}");
+    assert_eq!(envelope["payload"]["user_id"], user_id, "{envelope}");
+    let event_id = envelope["id"].as_str().expect("event id").to_owned();
+
+    // LINK TWO: the fan-out explodes it to the ACTIVE endpoints only.
+    WebhookFanoutConsumer::new(store.clone())
+        .handle(&env, scope, &events[0])
+        .await
+        .expect("the fan-out runs");
+
+    let deliveries = store
+        .scoped(scope)
+        .outbox()
+        .claim(&env, WEBHOOK_DELIVERY_CONSUMER, Duration::from_secs(30), 10)
+        .await
+        .expect("claim the deliveries");
+    assert_eq!(
+        deliveries.len(),
+        2,
+        "one delivery per ACTIVE endpoint, and none for the paused one"
+    );
+    let mut targets: Vec<String> = deliveries.iter().map(|d| d.ordering_key.clone()).collect();
+    targets.sort();
+    let mut expected = vec![first.clone(), second.clone()];
+    expected.sort();
+    assert_eq!(
+        targets, expected,
+        "the two live endpoints, keyed for replay"
+    );
+
+    // Each carries its OWN webhook-id, so a receiver that saw one does not deduplicate the
+    // other away, and both are derived from the one event id.
+    for delivery in &deliveries {
+        assert!(
+            delivery
+                .idempotency_key
+                .starts_with(&format!("{event_id}:")),
+            "the delivery id derives from the event id: {}",
+            delivery.idempotency_key
+        );
+    }
+    assert_ne!(
+        deliveries[0].idempotency_key, deliveries[1].idempotency_key,
+        "two endpoints receiving one event are two distinct deliveries"
+    );
+
+    // LINK THREE: each delivery signs and verifies under the SECRET THAT ENDPOINT was
+    // issued, and the BODY a receiver parses is the envelope #108 specifies.
+    for (endpoint, secret) in [(&first, &first_secret), (&second, &second_secret)] {
+        let message = deliveries
+            .iter()
+            .find(|d| &d.ordering_key == endpoint)
+            .expect("a delivery for this endpoint");
+        let body = deliver_and_verify(&store, &env, scope, message, secret).await;
+        assert_eq!(body["type"], "user.created", "{body}");
+        assert_eq!(body["id"], event_id, "{body}");
+    }
+}
+
+/// Deliver one queued message and verify its signature under `secret`, returning the body
+/// the receiver was sent.
+///
+/// Extracted so the chain test stays inside the readable-length lint, and because this is
+/// the assertion worth naming: a delivery must verify under the secret THAT endpoint was
+/// issued, which is what makes an event usable by the consumer that registered for it.
+async fn deliver_and_verify(
+    store: &ironauth_store::Store,
+    env: &Env,
+    scope: Scope,
+    message: &OutboxMessage,
+    secret: &str,
+) -> Value {
+    let sender = RecordingSender::accepting();
+    WebhookDeliveryConsumer::new(store.clone(), sender.clone())
+        .handle(env, scope, message)
+        .await
+        .expect("the delivery is made");
+    let sent = sender.recorded();
+    assert_eq!(sent.len(), 1, "one message, one POST");
+    let now: i64 = sent[0].headers.timestamp.parse().expect("unix seconds");
+    verify_delivery(
+        &[WebhookSecret::parse(secret).expect("parses")],
+        &sent[0].headers.id,
+        &sent[0].headers.timestamp,
+        sent[0].body.as_bytes(),
+        &sent[0].headers.signature,
+        300,
+        now,
+    )
+    .expect("the endpoint that registered verifies its own delivery");
+    serde_json::from_str(&sent[0].body).expect("the body is the envelope")
+}
