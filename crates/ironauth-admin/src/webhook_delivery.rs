@@ -25,14 +25,14 @@ use ironauth_env::Env;
 use ironauth_jose::webhooks::{WebhookSecret, sign_delivery};
 use ironauth_oidc::SendFailure;
 use ironauth_store::outbox::{ConsumerError, OutboxConsumer};
-use ironauth_store::{OutboxMessage, Scope, Store};
-
-/// The registered consumer name. It is also the discriminator a producer writes, so it is
-/// a wire constant: changing it strands every message already enqueued under the old one.
-pub const WEBHOOK_DELIVERY_CONSUMER: &str = "webhook.delivery";
+use ironauth_store::{
+    OutboxMessage, Scope, Store, WEBHOOK_DELIVERY_CONSUMER, WEBHOOK_REPLAY_CONSUMER,
+};
 
 /// The payload key naming the endpoint this message is destined for.
 const PAYLOAD_ENDPOINT_ID: &str = "endpoint_id";
+/// The payload key bounding a replay command to messages enqueued at or after an instant.
+const PAYLOAD_SINCE: &str = "since_unix_micros";
 /// The payload key carrying the JSON body to POST.
 const PAYLOAD_BODY: &str = "body";
 
@@ -267,6 +267,82 @@ impl<S: WebhookSender> OutboxConsumer for WebhookDeliveryConsumer<S> {
         message: &'a OutboxMessage,
     ) -> Pin<Box<dyn Future<Output = Result<(), ConsumerError>> + Send + 'a>> {
         Box::pin(async move { self.deliver_one(env, scope, message).await })
+    }
+}
+
+/// The consumer that executes an operator's dead-letter REPLAY command (issue #106).
+///
+/// It exists because the plane that may ask for a replay and the plane that may perform
+/// one are deliberately different. The management API holds INSERT on the queue and no
+/// UPDATE (migration 0099, so that the role holding the retention DELETE can never have
+/// been the role that marked a message terminal), while the drain holds the lifecycle
+/// columns. An operator's request therefore travels as a message, and this is what picks
+/// it up on the data plane and does the revive with grants that already existed.
+pub struct WebhookReplayConsumer {
+    store: Store,
+}
+
+impl WebhookReplayConsumer {
+    /// Build the consumer over a DATA-plane store.
+    #[must_use]
+    pub fn new(store: Store) -> Self {
+        Self { store }
+    }
+
+    /// Execute ONE replay command.
+    async fn replay_one(
+        &self,
+        env: &Env,
+        scope: Scope,
+        message: &OutboxMessage,
+    ) -> Result<(), ConsumerError> {
+        let endpoint = message
+            .payload
+            .get(PAYLOAD_ENDPOINT_ID)
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                ConsumerError::permanent(format!("payload_missing_{PAYLOAD_ENDPOINT_ID}"))
+            })?;
+        // Absent means "everything", which is a legitimate command rather than a malformed
+        // one, so only a present-but-not-a-number value is refused.
+        let since = match message.payload.get(PAYLOAD_SINCE) {
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) => Some(
+                value
+                    .as_i64()
+                    .ok_or_else(|| ConsumerError::permanent("payload_since_not_an_integer"))?,
+            ),
+        };
+        let revived = self
+            .store
+            .scoped(scope)
+            .outbox()
+            .revive_dead_lettered(env, WEBHOOK_DELIVERY_CONSUMER, Some(endpoint), since)
+            .await
+            // A failed revive can succeed later, so this retries rather than dropping the
+            // operator's request; the substrate's attempt budget is what bounds it.
+            .map_err(|_| ConsumerError::retryable("replay_failed"))?;
+        tracing::info!(
+            endpoint,
+            revived,
+            "replayed dead-lettered webhook deliveries"
+        );
+        Ok(())
+    }
+}
+
+impl OutboxConsumer for WebhookReplayConsumer {
+    fn name(&self) -> &str {
+        WEBHOOK_REPLAY_CONSUMER
+    }
+
+    fn handle<'a>(
+        &'a self,
+        env: &'a Env,
+        scope: Scope,
+        message: &'a OutboxMessage,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ConsumerError>> + Send + 'a>> {
+        Box::pin(async move { self.replay_one(env, scope, message).await })
     }
 }
 

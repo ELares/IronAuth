@@ -292,7 +292,8 @@ pub use repository::{
     opaque_access_token_digest, refresh_token_digest, user_code_hash,
 };
 pub use repository::{
-    ActingWebhookEndpointRepo, NewWebhookEndpoint, WebhookEndpointRecord, WebhookEndpointRepo,
+    ActingWebhookEndpointRepo, NewWebhookEndpoint, WEBHOOK_DELIVERY_CONSUMER,
+    WEBHOOK_REPLAY_CONSUMER, WebhookDeliveryTarget, WebhookEndpointRecord, WebhookEndpointRepo,
 };
 /// The testing-only atomicity probes (issue #247): the seams at which a test can force
 /// the joined invitation create and the joined recovery approve to fail INSIDE their one

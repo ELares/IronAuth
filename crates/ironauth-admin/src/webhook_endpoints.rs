@@ -382,6 +382,218 @@ pub async fn delete_webhook_endpoint(
     Ok(no_content())
 }
 
+/// One dead-lettered delivery, with the attempt history an operator debugs from.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DeadLetteredDelivery {
+    /// The queue message id.
+    pub id: String,
+    /// The `webhook-id` this delivery carried, and will carry again if replayed. Stable
+    /// across every attempt, which is what lets a receiver deduplicate a redelivery.
+    pub webhook_id: String,
+    /// How many delivery attempts were made before it was given up on.
+    pub attempts: i32,
+    /// The last failure reason, a bounded non-secret token.
+    pub last_error: Option<String>,
+    /// When it was enqueued, milliseconds since the Unix epoch. This is the value a
+    /// recover-from-timestamp replay is bounded by.
+    pub enqueued_at_unix_ms: i64,
+    /// When it was given up on, milliseconds since the Unix epoch.
+    pub dead_lettered_at_unix_ms: Option<i64>,
+}
+
+/// An endpoint's dead-lettered deliveries, oldest first.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DeadLetterList {
+    /// The deliveries, in the order a replay would redeliver them.
+    pub items: Vec<DeadLetteredDelivery>,
+}
+
+/// Replay an endpoint's dead-lettered deliveries.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ReplayDeadLettersRequest {
+    /// Replay only deliveries enqueued at or after this instant, milliseconds since the
+    /// Unix epoch. Omitted means every dead letter this endpoint has.
+    #[serde(default)]
+    pub since_unix_ms: Option<i64>,
+}
+
+/// The acknowledgement that a replay was QUEUED.
+///
+/// Deliberately not a count. The management plane enqueues a command and the delivery
+/// worker executes it, so no number this response could carry would be true by the time a
+/// caller read it. What the caller can rely on is that the request is durable: it is a
+/// queue row committed in the same transaction as its audit row.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ReplayAccepted {
+    /// The bound the replay was requested with, echoed back. `null` means every dead
+    /// letter this endpoint has.
+    pub since_unix_ms: Option<i64>,
+}
+
+/// How many dead letters one listing returns at most.
+///
+/// A fixed cap rather than a cursor, because this list is a debugging tail rather than a
+/// data-sync surface: the operation an operator performs on it is REPLAY, which acts on
+/// the whole backlog by timestamp and never has to page through it.
+const DEAD_LETTER_LIMIT: i64 = 200;
+
+/// List an endpoint's dead-lettered deliveries.
+#[utoipa::path(
+    get,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/dead-letters",
+    operation_id = "listWebhookDeadLetters",
+    tag = "webhooks",
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("endpoint_id" = String, Path, description = "The endpoint identifier (whe_...)")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "The dead-lettered deliveries, oldest first", body = DeadLetterList),
+        (status = 401, description = "Missing or invalid credential", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "The environment is absent, or the endpoint is in another scope", body = ErrorBody)
+    )
+)]
+pub async fn list_webhook_dead_letters(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, endpoint_id)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    // No liveness fence on a READ, matching the endpoint listing: a soft-deleted
+    // environment stays readable across this surface and only writes refuse it.
+    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let id = state
+        .store()
+        .scoped(scope)
+        .webhook_endpoints()
+        .parse_id(&endpoint_id)?;
+    // The deliverer's ordering key IS the endpoint id, so narrowing the generic queue read
+    // by ordering key is what makes this a PER-ENDPOINT view without the queue knowing
+    // anything about webhooks.
+    let messages = state
+        .store()
+        .scoped(scope)
+        .outbox()
+        .dead_lettered(
+            ironauth_store::WEBHOOK_DELIVERY_CONSUMER,
+            Some(&id.to_string()),
+            DEAD_LETTER_LIMIT,
+        )
+        .await?;
+    let view = DeadLetterList {
+        items: messages
+            .into_iter()
+            .map(|message| DeadLetteredDelivery {
+                id: message.id,
+                webhook_id: message.idempotency_key,
+                attempts: message.attempts,
+                last_error: message.last_error,
+                enqueued_at_unix_ms: message.enqueued_at_unix_micros / 1000,
+                dead_lettered_at_unix_ms: message
+                    .dead_lettered_at_unix_micros
+                    .map(|micros| micros / 1000),
+            })
+            .collect(),
+    };
+    let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
+    Ok(json(StatusCode::OK, body_string))
+}
+
+/// Replay an endpoint's dead-lettered deliveries.
+#[utoipa::path(
+    post,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/replay",
+    operation_id = "replayWebhookDeadLetters",
+    tag = "webhooks",
+    request_body = ReplayDeadLettersRequest,
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("endpoint_id" = String, Path, description = "The endpoint identifier (whe_...)"),
+        ("Idempotency-Key" = String, Header, description = "Required. Replaying a POST \
+         with the same key returns the original response without re-executing.")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 202, description = "The replay was queued. A worker performs it; poll the dead-letter listing to watch it drain", body = ReplayAccepted),
+        (status = 400, description = "Malformed request", body = ErrorBody),
+        (status = 401, description = "Missing or invalid credential, or fresh privilege required", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "The environment is absent or deleted, or the endpoint is in another scope", body = ErrorBody),
+        (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
+    )
+)]
+pub async fn replay_webhook_dead_letters(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, endpoint_id)): Path<(String, String, String)>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Response, ApiError> {
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    crate::sudo::require_fresh_privilege(&state, scope, principal.actor()).await?;
+    require_live_environment(&state, &scope).await?;
+    let id = state
+        .store()
+        .scoped(scope)
+        .webhook_endpoints()
+        .parse_id(&endpoint_id)?;
+    // An empty body is the "replay everything" form, so it is accepted rather than
+    // rejected as malformed. A caller that sends nothing means the same as one that sends
+    // `{}`, and refusing one of those would be a distinction with no meaning behind it.
+    let request: ReplayDeadLettersRequest = if body.is_empty() {
+        ReplayDeadLettersRequest {
+            since_unix_ms: None,
+        }
+    } else {
+        parse_json(&body)?
+    };
+
+    // The key is fingerprinted over the BODY as well as the path, so replaying "everything"
+    // and replaying "since noon" are different requests under one key rather than one
+    // replaying as the other.
+    let key = idempotency::required_key(&headers)?;
+    let fingerprint = idempotency::fingerprint("POST", uri.path(), &body);
+    let credential_ref = principal.credential_ref();
+    if let Some(replay) =
+        idempotency::replay_if_stored(&state, &credential_ref, &key, &fingerprint).await?
+    {
+        return Ok(replay);
+    }
+
+    // The response is knowable BEFORE the write, because a replay request is now a
+    // command rather than the revive itself: what this call produces is "accepted", not a
+    // count. That is the honest shape as well as the required one. The count could only
+    // ever have described the instant the statement ran, and a retry of the same request
+    // would have reported zero because the first call had already revived everything.
+    let view = ReplayAccepted {
+        since_unix_ms: request.since_unix_ms,
+    };
+    let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
+    state
+        .store()
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(state.env()))
+        .webhook_endpoints()
+        .request_dead_letter_replay(
+            state.env(),
+            &id,
+            request.since_unix_ms.map(|ms| ms.saturating_mul(1000)),
+            Some(IdempotencyWrite {
+                credential_ref: &credential_ref,
+                key: &key,
+                request_fingerprint: &fingerprint,
+                response_status: 202,
+                response_body: &body_string,
+            }),
+        )
+        .await?;
+    Ok(json(StatusCode::ACCEPTED, body_string))
+}
+
 /// The request shape both endpoint state toggles share, grouped so the shared body stays
 /// inside the argument budget.
 struct StateToggle<'a> {

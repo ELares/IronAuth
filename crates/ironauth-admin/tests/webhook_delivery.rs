@@ -22,13 +22,13 @@ use std::sync::{Arc, Mutex};
 use axum::http::StatusCode;
 use common::Harness;
 use ironauth_admin::webhook_delivery::{
-    DeliveryHeaders, WEBHOOK_DELIVERY_CONSUMER, WebhookDeliveryConsumer, WebhookSender,
+    DeliveryHeaders, WebhookDeliveryConsumer, WebhookReplayConsumer, WebhookSender,
 };
 use ironauth_env::Env;
 use ironauth_jose::webhooks::{WebhookSecret, verify_delivery};
 use ironauth_oidc::SendFailure;
 use ironauth_store::outbox::OutboxConsumer;
-use ironauth_store::{EnvironmentId, OutboxMessage, Scope, TenantId};
+use ironauth_store::{EnvironmentId, OutboxMessage, Scope, TenantId, WEBHOOK_DELIVERY_CONSUMER};
 use serde_json::Value;
 
 /// One captured delivery: everything the consumer decided, and nothing about the socket.
@@ -121,11 +121,22 @@ fn scope_of(tenant: &str, environment: &str) -> Scope {
 /// seal the secret its own way, and then this file would prove the deliverer agrees with
 /// the test rather than with the API an operator actually uses.
 async fn register(h: &Harness, tenant: &str, environment: &str) -> (String, String, String) {
+    register_as(h, tenant, environment, "k-register").await
+}
+
+/// Register an endpoint under a caller-chosen idempotency key, so one test can register
+/// more than one without the second replaying the first's response.
+async fn register_as(
+    h: &Harness,
+    tenant: &str,
+    environment: &str,
+    key: &str,
+) -> (String, String, String) {
     let base = format!("/v1/tenants/{tenant}/environments/{environment}/webhook-endpoints");
     let (status, _, body) = h
         .post(
             &base,
-            "k-register",
+            key,
             &serde_json::json!({ "url": "https://example.test/hook" }).to_string(),
         )
         .await;
@@ -136,6 +147,67 @@ async fn register(h: &Harness, tenant: &str, environment: &str) -> (String, Stri
         created["secret"].as_str().expect("secret").to_owned(),
         base,
     )
+}
+
+/// Drive ONE delivery for `endpoint` to a dead letter through the REAL failure path:
+/// enqueue it, claim it, then fail it under a one-attempt budget. Nothing is written into
+/// a terminal state by hand, so what a test then reads is what the substrate produced.
+async fn dead_letter_one(
+    store: &ironauth_store::Store,
+    env: &Env,
+    scope: Scope,
+    endpoint: &str,
+    webhook_id: &str,
+) {
+    use std::time::Duration;
+
+    use ironauth_store::{FailureOutcome, NewOutboxMessage, RetryPolicy};
+
+    store
+        .scoped(scope)
+        .outbox()
+        .enqueue(
+            env,
+            &NewOutboxMessage {
+                consumer: WEBHOOK_DELIVERY_CONSUMER,
+                idempotency_key: webhook_id,
+                ordering_key: endpoint,
+                payload: serde_json::json!({
+                    "endpoint_id": endpoint,
+                    "body": { "type": "user.created" },
+                }),
+            },
+        )
+        .await
+        .expect("enqueue the delivery");
+    let claimed = store
+        .scoped(scope)
+        .outbox()
+        .claim(env, WEBHOOK_DELIVERY_CONSUMER, Duration::from_secs(30), 10)
+        .await
+        .expect("claim it");
+    let message = claimed
+        .iter()
+        .find(|m| m.idempotency_key == webhook_id)
+        .expect("the delivery is claimable");
+    let outcome = store
+        .scoped(scope)
+        .outbox()
+        .fail(
+            env,
+            message,
+            "http_status_500",
+            RetryPolicy {
+                max_attempts: 1,
+                retry_base: Duration::from_secs(1),
+            },
+        )
+        .await
+        .expect("record the failure");
+    assert!(
+        matches!(outcome, FailureOutcome::DeadLettered { .. }),
+        "a one-attempt budget dead-letters on the first failure: {outcome:?}"
+    );
 }
 
 #[tokio::test]
@@ -372,6 +444,138 @@ async fn a_paused_endpoint_receives_nothing_and_resuming_restores_its_original_s
         now,
     )
     .expect("the secret issued before the pause still signs after the resume");
+}
+
+#[tokio::test]
+async fn a_dead_letter_is_listed_replayed_across_planes_and_redelivered_under_its_original_id() {
+    // The whole of #106's first slice, driven end to end, because every interesting part of
+    // it is a JOIN between pieces that are individually unremarkable.
+    //
+    // The design worth proving is the cross-plane hop. The management plane may INSERT on
+    // the queue and holds no UPDATE (migration 0099, so the role that also holds the
+    // retention DELETE can never have been the role that marked a message terminal), so an
+    // operator's replay travels as a COMMAND and the drain executes it. This test uses the
+    // real control-plane HTTP surface to ask and the real data-plane store to execute, so
+    // a grant missing on either side fails it rather than being discovered in production.
+    use std::time::Duration;
+
+    use ironauth_store::WEBHOOK_REPLAY_CONSUMER;
+
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (id, secret, base) = register(&h, &tenant, &environment).await;
+    let scope = scope_of(&tenant, &environment);
+    let env = Env::system();
+    let store = h.store().clone();
+
+    // A SECOND endpoint with its own dead letter, so every per-endpoint claim below is
+    // measured rather than trivially true. With one endpoint, a listing that ignored its
+    // ordering key and a replay that revived the whole environment would both pass.
+    let (other, _, _) = register_as(&h, &tenant, &environment, "k-register-2").await;
+    dead_letter_one(&store, &env, scope, &other, "evt_other").await;
+
+    dead_letter_one(&store, &env, scope, &id, "evt_dead").await;
+
+    // THE LISTING, over the real management surface.
+    let (status, _, body) = h.get(&format!("{base}/{id}/dead-letters")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let listed: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(
+        listed["items"].as_array().expect("items").len(),
+        1,
+        "exactly this endpoint's dead letter, not the other endpoint's too: {body}"
+    );
+    assert_eq!(
+        listed["items"][0]["webhook_id"], "evt_dead",
+        "the listing shows the id the delivery carried, which is what a receiver \
+         deduplicated on: {body}"
+    );
+    assert_eq!(listed["items"][0]["attempts"], 1, "{body}");
+    assert_eq!(
+        listed["items"][0]["last_error"], "http_status_500",
+        "{body}"
+    );
+
+    // THE REQUEST, which only enqueues. A 202 rather than a count is the honest answer:
+    // the management plane cannot perform the revive and no number it returned would be
+    // true by the time a caller read it.
+    let (status, _, body) = h.post(&format!("{base}/{id}/replay"), "k-replay", "").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+
+    // THE EXECUTION, on the data plane, through the real consumer and the real queue.
+    let commands = store
+        .scoped(scope)
+        .outbox()
+        .claim(&env, WEBHOOK_REPLAY_CONSUMER, Duration::from_secs(30), 10)
+        .await
+        .expect("claim the replay command");
+    assert_eq!(
+        commands.len(),
+        1,
+        "the management plane's INSERT reached the queue the drain reads"
+    );
+    WebhookReplayConsumer::new(store.clone())
+        .handle(&env, scope, &commands[0])
+        .await
+        .expect("the replay executes");
+
+    // The dead letter is gone from the listing because the row went back on the queue,
+    // rather than because a copy of it was made somewhere else.
+    let (status, _, body) = h.get(&format!("{base}/{id}/dead-letters")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        serde_json::from_str::<Value>(&body).expect("json")["items"]
+            .as_array()
+            .expect("items")
+            .is_empty(),
+        "the replayed delivery is no longer dead-lettered: {body}"
+    );
+
+    // ...and the OTHER endpoint's dead letter is still there, which is what proves the
+    // replay acted on one aggregate rather than on the environment.
+    let (status, _, body) = h.get(&format!("{base}/{other}/dead-letters")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let others: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(
+        others["items"].as_array().expect("items").len(),
+        1,
+        "another endpoint's dead letter is neither listed under the first nor replayed          by it: {body}"
+    );
+    assert_eq!(others["items"][0]["webhook_id"], "evt_other", "{body}");
+
+    // AND IT REDELIVERS UNDER THE ORIGINAL webhook-id, which is the acceptance criterion
+    // the in-place revive exists to satisfy. A re-enqueued copy could not have done this:
+    // the unique index would have forced a new idempotency key, and the receiver's
+    // deduplication would treat the replay as a brand new event.
+    let revived = store
+        .scoped(scope)
+        .outbox()
+        .claim(&env, WEBHOOK_DELIVERY_CONSUMER, Duration::from_secs(30), 10)
+        .await
+        .expect("claim the revived delivery");
+    assert_eq!(revived.len(), 1, "the revived message is claimable again");
+    let sender = RecordingSender::accepting();
+    WebhookDeliveryConsumer::new(store.clone(), sender.clone())
+        .handle(&env, scope, &revived[0])
+        .await
+        .expect("the replayed delivery is made");
+    let sent = sender.recorded();
+    assert_eq!(sent.len(), 1, "one replay, one POST");
+    assert_eq!(
+        sent[0].headers.id, "evt_dead",
+        "the replay carries the ORIGINAL webhook-id, so consumer-side dedupe still works"
+    );
+    let now: i64 = sent[0].headers.timestamp.parse().expect("unix seconds");
+    verify_delivery(
+        &[WebhookSecret::parse(&secret).expect("parses")],
+        &sent[0].headers.id,
+        &sent[0].headers.timestamp,
+        sent[0].body.as_bytes(),
+        &sent[0].headers.signature,
+        300,
+        now,
+    )
+    .expect("and it verifies under the endpoint's current secret");
 }
 
 #[tokio::test]

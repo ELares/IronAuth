@@ -288,6 +288,12 @@ fn abuse_and_sudo_cases(base: &str) -> Vec<Case> {
             body: None,
         },
         Case {
+            label: "webhook_endpoints.replayWebhookDeadLetters",
+            method: "POST",
+            path: format!("{base}/webhook-endpoints/whe_absent/replay"),
+            body: Some(serde_json::json!({}).to_string()),
+        },
+        Case {
             label: "webhook_endpoints.pauseWebhookEndpoint",
             method: "POST",
             path: format!("{base}/webhook-endpoints/whe_absent/pause"),

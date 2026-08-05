@@ -1083,6 +1083,11 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             "GET",
             format!("{base}/webhook-endpoints"),
         ),
+        Case::empty(
+            "webhook_endpoints.listWebhookDeadLetters",
+            "GET",
+            format!("{base}/webhook-endpoints/{webhook_endpoint}/dead-letters"),
+        ),
         Case::json(
             "webhook_endpoints.createWebhookEndpoint",
             "POST",
@@ -1093,6 +1098,12 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             "webhook_endpoints.rotateWebhookEndpointSecret",
             "POST",
             format!("{base}/webhook-endpoints/{webhook_endpoint}/rotate-secret"),
+        ),
+        Case::json(
+            "webhook_endpoints.replayWebhookDeadLetters",
+            "POST",
+            format!("{base}/webhook-endpoints/{webhook_endpoint}/replay"),
+            &serde_json::json!({}),
         ),
         Case::empty(
             "webhook_endpoints.pauseWebhookEndpoint",

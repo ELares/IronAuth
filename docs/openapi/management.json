@@ -17556,6 +17556,91 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/dead-letters": {
+      "get": {
+        "tags": [
+          "webhooks"
+        ],
+        "summary": "List an endpoint's dead-lettered deliveries.",
+        "operationId": "listWebhookDeadLetters",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "endpoint_id",
+            "in": "path",
+            "description": "The endpoint identifier (whe_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The dead-lettered deliveries, oldest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeadLetterList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment is absent, or the endpoint is in another scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/pause": {
       "post": {
         "tags": [
@@ -17608,6 +17693,130 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/WebhookEndpointView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential, or fresh privilege required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment is absent or deleted, or the endpoint is in another scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency-Key reused with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/replay": {
+      "post": {
+        "tags": [
+          "webhooks"
+        ],
+        "summary": "Replay an endpoint's dead-lettered deliveries.",
+        "operationId": "replayWebhookDeadLetters",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "endpoint_id",
+            "in": "path",
+            "description": "The endpoint identifier (whe_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying a POST with the same key returns the original response without re-executing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReplayDeadLettersRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "The replay was queued. A worker performs it; poll the dead-letter listing to watch it drain",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReplayAccepted"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
                 }
               }
             }
@@ -19427,6 +19636,67 @@
             "type": "array",
             "items": {},
             "description": "The ordered primitive list (as stored)."
+          }
+        }
+      },
+      "DeadLetterList": {
+        "type": "object",
+        "description": "An endpoint's dead-lettered deliveries, oldest first.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DeadLetteredDelivery"
+            },
+            "description": "The deliveries, in the order a replay would redeliver them."
+          }
+        }
+      },
+      "DeadLetteredDelivery": {
+        "type": "object",
+        "description": "One dead-lettered delivery, with the attempt history an operator debugs from.",
+        "required": [
+          "id",
+          "webhook_id",
+          "attempts",
+          "enqueued_at_unix_ms"
+        ],
+        "properties": {
+          "attempts": {
+            "type": "integer",
+            "format": "int32",
+            "description": "How many delivery attempts were made before it was given up on."
+          },
+          "dead_lettered_at_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When it was given up on, milliseconds since the Unix epoch."
+          },
+          "enqueued_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When it was enqueued, milliseconds since the Unix epoch. This is the value a\nrecover-from-timestamp replay is bounded by."
+          },
+          "id": {
+            "type": "string",
+            "description": "The queue message id."
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The last failure reason, a bounded non-secret token."
+          },
+          "webhook_id": {
+            "type": "string",
+            "description": "The `webhook-id` this delivery carried, and will carry again if replayed. Stable\nacross every attempt, which is what lets a receiver deduplicate a redelivery."
           }
         }
       },
@@ -21964,6 +22234,34 @@
           "subject": {
             "type": "string",
             "description": "The authenticated end-user subject the family's tokens are minted for."
+          }
+        }
+      },
+      "ReplayAccepted": {
+        "type": "object",
+        "description": "The acknowledgement that a replay was QUEUED.\n\nDeliberately not a count. The management plane enqueues a command and the delivery\nworker executes it, so no number this response could carry would be true by the time a\ncaller read it. What the caller can rely on is that the request is durable: it is a\nqueue row committed in the same transaction as its audit row.",
+        "properties": {
+          "since_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The bound the replay was requested with, echoed back. `null` means every dead\nletter this endpoint has."
+          }
+        }
+      },
+      "ReplayDeadLettersRequest": {
+        "type": "object",
+        "description": "Replay an endpoint's dead-lettered deliveries.",
+        "properties": {
+          "since_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Replay only deliveries enqueued at or after this instant, milliseconds since the\nUnix epoch. Omitted means every dead letter this endpoint has."
           }
         }
       },
