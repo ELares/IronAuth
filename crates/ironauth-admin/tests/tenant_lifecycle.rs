@@ -361,3 +361,105 @@ async fn environment_create_is_refused_under_a_suspended_tenant() {
         "a resumed tenant can add environments again: {response}"
     );
 }
+
+#[tokio::test]
+async fn the_grace_window_gates_the_purge_and_the_purge_is_terminal() {
+    // `TenantRepo::hard_delete` shipped with the offboarding pipeline and NOTHING called
+    // it: measured with `grep -rn hard_delete crates/ironauth-admin crates/ironauth/src
+    // crates/ironauth-oidc crates/ironauth-server`, which returned nothing. So a
+    // soft-deleted tenant sat in grace forever, its platform KEK was never destroyed, and
+    // the erasure half of the exit covenant could not happen at all. This is the caller.
+    //
+    // Two properties, and the first is what makes the second safe: the window GATES the
+    // purge, and past the window the purge is terminal.
+    let harness = Harness::start_with_offboarding_retention(50, 0).await;
+    let (tenant_id, _env) = harness.create_tenant("Acme", "k-create").await;
+
+    // A LIVE tenant cannot be purged. Purge acts only on a tenant already in grace, so
+    // this is the uniform not-found rather than a 409: nothing was ever offboarded.
+    let (status, _, response) = harness
+        .post(&format!("/v1/tenants/{tenant_id}/purge"), "k-p0", "")
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a live tenant is not purgeable: {response}"
+    );
+
+    let (status, _, _) = harness.delete(&format!("/v1/tenants/{tenant_id}")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "grace delete");
+
+    // Past the window (zero here, chosen by this harness rather than bypassed), the purge
+    // is accepted and is TERMINAL: the tenant can no longer be restored.
+    let (status, _, response) = harness
+        .post(&format!("/v1/tenants/{tenant_id}/purge"), "k-p1", "")
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "purge past window: {response}"
+    );
+
+    let (status, _, response) = harness
+        .post(&format!("/v1/tenants/{tenant_id}/restore"), "k-r1", "")
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a purged tenant cannot be restored: {response}"
+    );
+
+    // REPLAYING the purge key returns the original 204, not a 404. This is what the
+    // Idempotency-Key is for on an irreversible operation: an operator whose response was
+    // lost to a network timeout must be able to retry and learn that it succeeded, rather
+    // than being told the tenant is absent and left unable to tell "I purged it" from
+    // "someone else did" or "it never existed".
+    let (status, _, response) = harness
+        .post(&format!("/v1/tenants/{tenant_id}/purge"), "k-p1", "")
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "the same key replays the original success: {response}"
+    );
+
+    // A DIFFERENT key is the uniform not-found, not a second destruction.
+    let (status, _, response) = harness
+        .post(&format!("/v1/tenants/{tenant_id}/purge"), "k-p2", "")
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "an already-purged tenant is absent: {response}"
+    );
+}
+
+#[tokio::test]
+async fn a_purge_inside_the_retention_window_is_refused_loudly() {
+    // The gate itself, on its own, because the test above runs with a ZERO window and so
+    // could never see it. With the shipped default the grace period must run first, and
+    // the refusal is a loud 409 rather than the anti-oracle 404: the caller is an
+    // authenticated operator acting on a tenant they can already see, and "not yet" is the
+    // entire point of a retention window.
+    //
+    // Without this, a purge that ignored the window would pass the test above unchanged.
+    let harness = Harness::start(50).await;
+    let (tenant_id, _env) = harness.create_tenant("Acme", "k-create").await;
+    let (status, _, _) = harness.delete(&format!("/v1/tenants/{tenant_id}")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "grace delete");
+
+    let (status, _, response) = harness
+        .post(&format!("/v1/tenants/{tenant_id}/purge"), "k-early", "")
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "the grace period must run first: {response}"
+    );
+
+    // And the tenant is still restorable, which is what the window is FOR.
+    let (status, _, response) = harness
+        .post(&format!("/v1/tenants/{tenant_id}/restore"), "k-r", "")
+        .await;
+    assert_eq!(status, StatusCode::OK, "still restorable: {response}");
+}

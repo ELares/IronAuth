@@ -62,6 +62,7 @@ crates/ironauth-admin/src/signup_quarantine.rs:reject_signup_quarantine:1
 crates/ironauth-admin/src/step_up_policies.rs:set_step_up_policy:1
 crates/ironauth-admin/src/sudo.rs:require_fresh_privilege:1
 crates/ironauth-admin/src/tenants.rs:create_tenant:1
+crates/ironauth-admin/src/tenants.rs:purge_tenant:1
 crates/ironauth-admin/src/tenants.rs:restore_tenant:1
 crates/ironauth-admin/src/tenants.rs:transition_tenant:1
 crates/ironauth-admin/src/trait_schemas.rs:activate_trait_schema_version:1

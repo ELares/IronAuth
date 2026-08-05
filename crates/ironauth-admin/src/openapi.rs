@@ -214,6 +214,7 @@ use crate::views::{
         crate::tenants::delete_tenant,
         crate::tenants::suspend_tenant,
         crate::tenants::resume_tenant,
+        crate::tenants::purge_tenant,
         crate::tenants::restore_tenant,
         crate::environments::list_environments,
         crate::environments::create_environment,
