@@ -104,6 +104,7 @@ mod trait_schemas;
 mod users;
 mod variables;
 mod views;
+mod webhook_endpoints;
 
 use axum::Router;
 use axum::http::StatusCode;
@@ -898,6 +899,16 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/step-up-policies/{scope_token}",
             axum::routing::delete(step_up_policies::remove_step_up_policy),
+        )
+        // Standard Webhooks endpoint registration (issue #105).
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints",
+            post(webhook_endpoints::create_webhook_endpoint)
+                .get(webhook_endpoints::list_webhook_endpoints),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}",
+            axum::routing::delete(webhook_endpoints::delete_webhook_endpoint),
         )
         // Admin session privilege separation (sudo mode, issue #73): the
         // re-authentication endpoint that records a fresh elevation, opening the

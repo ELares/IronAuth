@@ -579,3 +579,101 @@ async fn step_up_policies_round_trip_through_the_management_surface() {
     let (status, _, body) = h.delete(&format!("{base}/payments:write")).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
 }
+
+#[tokio::test]
+async fn webhook_endpoints_round_trip_and_reveal_the_secret_exactly_once() {
+    // Issue #105, the slice after the signing contract. The secret is SEALED rather than
+    // hashed, because the deliverer must recover it to MAC every delivery, so the thing
+    // worth pinning is that no READ path ever returns it again.
+    let h = Harness::start(50).await;
+    let (tenant, environment) = tenant_env(&h).await;
+    let base = format!("/v1/tenants/{tenant}/environments/{environment}/webhook-endpoints");
+
+    let (status, _, body) = h.get(&base).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        serde_json::from_str::<Value>(&body).expect("json")["items"]
+            .as_array()
+            .expect("items")
+            .is_empty(),
+        "a fresh environment has no endpoints: {body}"
+    );
+
+    let create = serde_json::json!({
+        "url": "https://example.test/hooks/ironauth",
+        "description": "billing"
+    })
+    .to_string();
+    let (status, _, body) = h.post(&base, "k-create", &create).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let created: Value = serde_json::from_str(&body).expect("json");
+    let id = created["id"].as_str().expect("id").to_owned();
+    assert!(id.starts_with("whe_"), "scoped id: {id}");
+    let secret = created["secret"]
+        .as_str()
+        .expect("secret shown once")
+        .to_owned();
+    assert!(
+        secret.starts_with("whsec_"),
+        "Standard Webhooks form: {secret}"
+    );
+
+    // THE REVEAL-ONCE PROPERTY. The listing must not carry it, and the listing query does
+    // not even select the sealed column, so this fails loudly if either changes.
+    let (status, list) = {
+        let (status, _, body) = h.get(&base).await;
+        (status, body)
+    };
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert!(
+        !list.contains("whsec_") && !list.contains(&secret),
+        "no read path returns the signing secret: {list}"
+    );
+    let items = serde_json::from_str::<Value>(&list).expect("json");
+    let items = items["items"].as_array().expect("items");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["url"], "https://example.test/hooks/ironauth");
+    assert_eq!(items[0]["description"], "billing");
+    assert_eq!(items[0]["active"], true);
+
+    // A retry under the SAME key replays rather than registering a second endpoint. For a
+    // reveal-once response that also means the caller can recover the secret from a lost
+    // reply, which is the whole reason this route is idempotent.
+    let (status, _, replayed) = h.post(&base, "k-create", &create).await;
+    assert_eq!(status, StatusCode::CREATED, "{replayed}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&replayed).expect("json"),
+        created,
+        "the retry replays the original response, secret included"
+    );
+    let (_, _, list) = h.get(&base).await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&list).expect("json")["items"]
+            .as_array()
+            .expect("items")
+            .len(),
+        1,
+        "and registered no second endpoint"
+    );
+
+    // A non-https destination is refused before anything is written.
+    let (status, _, body) = h
+        .post(
+            &base,
+            "k-plain",
+            &serde_json::json!({ "url": "http://example.test/hook" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    let (status, _, body) = h.delete(&format!("{base}/{id}")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (_, _, list) = h.get(&base).await;
+    assert!(
+        serde_json::from_str::<Value>(&list).expect("json")["items"]
+            .as_array()
+            .expect("items")
+            .is_empty(),
+        "the endpoint is gone: {list}"
+    );
+}

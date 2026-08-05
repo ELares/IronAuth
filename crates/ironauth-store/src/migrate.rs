@@ -956,6 +956,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0110_step_up_policy_control_grants.sql"),
         },
+        Migration {
+            version: 111,
+            name: "webhook_endpoints",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0111_webhook_endpoints.sql"),
+        },
     ]
 }
 

@@ -276,6 +276,18 @@ fn abuse_and_sudo_cases(base: &str) -> Vec<Case> {
             body: Some(ban),
         },
         Case {
+            label: "webhook_endpoints.createWebhookEndpoint",
+            method: "POST",
+            path: format!("{base}/webhook-endpoints"),
+            body: Some(serde_json::json!({ "url": "https://example.test/hook" }).to_string()),
+        },
+        Case {
+            label: "webhook_endpoints.deleteWebhookEndpoint",
+            method: "DELETE",
+            path: format!("{base}/webhook-endpoints/whe_absent"),
+            body: None,
+        },
+        Case {
             label: "step_up_policies.setStepUpPolicy",
             method: "POST",
             path: format!("{base}/step-up-policies"),
