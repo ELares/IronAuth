@@ -18203,6 +18203,111 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/event-types": {
+      "put": {
+        "tags": [
+          "webhooks"
+        ],
+        "summary": "Subscribe an endpoint to a set of event types.",
+        "operationId": "setWebhookEventTypes",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "endpoint_id",
+            "in": "path",
+            "description": "The endpoint identifier (whe_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetEventTypesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The endpoint, with the subscription it committed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookEndpointView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request, a body omitting event_types, or an empty list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential, or fresh privilege required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment is absent or deleted, or the endpoint is in another scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/pause": {
       "post": {
         "tags": [
@@ -23687,6 +23792,22 @@
           }
         }
       },
+      "SetEventTypesRequest": {
+        "type": "object",
+        "description": "Set or clear an endpoint's event-type subscription.",
+        "properties": {
+          "event_types": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The event types to receive, or an explicit `null` to receive EVERY type. The field\nis required so that \"everything\" is stated rather than inferred from an omission."
+          }
+        }
+      },
       "SetLocaleRequest": {
         "type": "object",
         "description": "The body to set (create or overwrite) a per-environment locale bundle (issue #86, PR 2).\n\nThe entries map keys on the STABLE NUMERIC message id (as a string) and values are the\nPLAIN TEXT render. On write, every key must be a REGISTERED message id and every\n`{placeholder}` in a value must be one the id declares, so a translator cannot invent an\ninterpolation that leaks unintended context or reword a string to reference a variable the\nid does not carry; a violation is a loud 400 and nothing is stored. A bundle string is\nplain text, escaped on render exactly like the compiled default, never markup.",
@@ -25152,6 +25273,16 @@
               "null"
             ],
             "description": "Why the system disabled it: a bounded internal label, never anything derived from a\nreceiver's response."
+          },
+          "event_types": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The event types this endpoint receives, or `null` for every type."
           },
           "id": {
             "type": "string",

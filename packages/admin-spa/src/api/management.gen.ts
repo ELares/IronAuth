@@ -2453,6 +2453,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/event-types": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Subscribe an endpoint to a set of event types. */
+        put: operations["setWebhookEventTypes"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/pause": {
         parameters: {
             query?: never;
@@ -5612,6 +5629,14 @@ export interface components {
              */
             algorithm: string;
         };
+        /** @description Set or clear an endpoint's event-type subscription. */
+        SetEventTypesRequest: {
+            /**
+             * @description The event types to receive, or an explicit `null` to receive EVERY type. The field
+             *     is required so that "everything" is stated rather than inferred from an omission.
+             */
+            event_types?: string[] | null;
+        };
         /**
          * @description The body to set (create or overwrite) a per-environment locale bundle (issue #86, PR 2).
          *
@@ -6558,6 +6583,8 @@ export interface components {
              *     receiver's response.
              */
             disabled_reason?: string | null;
+            /** @description The event types this endpoint receives, or `null` for every type. */
+            event_types?: string[] | null;
             /** @description The `whe_` identifier. */
             id: string;
             /** @description The HTTPS destination deliveries POST to. */
@@ -18486,6 +18513,73 @@ export interface operations {
                 };
             };
             /** @description The environment is absent, or the endpoint is in another scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    setWebhookEventTypes: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The endpoint identifier (whe_...) */
+                endpoint_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetEventTypesRequest"];
+            };
+        };
+        responses: {
+            /** @description The endpoint, with the subscription it committed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WebhookEndpointView"];
+                };
+            };
+            /** @description Malformed request, a body omitting event_types, or an empty list */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential, or fresh privilege required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment is absent or deleted, or the endpoint is in another scope */
             404: {
                 headers: {
                     [name: string]: unknown;

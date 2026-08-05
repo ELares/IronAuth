@@ -1309,3 +1309,109 @@ async fn deliver_and_verify(
     .expect("the endpoint that registered verifies its own delivery");
     serde_json::from_str(&sent[0].body).expect("the body is the envelope")
 }
+
+#[tokio::test]
+async fn an_endpoint_receives_only_the_event_types_it_subscribed_to() {
+    // Issue #106 requires that "an endpoint subscribes to a set of event types;
+    // non-matching events are excluded before a delivery attempt is ever created". The
+    // "before" is the part worth pinning: filtering at DELIVERY would still queue the
+    // message, still consume its retry budget, and still surface in that endpoint's dead
+    // letters as work its operator never asked for.
+    //
+    // So this asserts on the QUEUE after fan-out, not on what was POSTed.
+    use ironauth_admin::events::WebhookFanoutConsumer;
+    use ironauth_store::{WEBHOOK_DELIVERY_CONSUMER, WEBHOOK_EVENT_CONSUMER};
+    use std::time::Duration;
+
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (subscribed, _, base) = register(&h, &tenant, &environment).await;
+    let (other, _, _) = register_as(&h, &tenant, &environment, "k-register-2").await;
+    let (unfiltered, _, _) = register_as(&h, &tenant, &environment, "k-register-3").await;
+
+    // One endpoint asks for the type we are about to emit, one asks for a DIFFERENT type,
+    // and one asks for nothing in particular and must therefore keep receiving everything.
+    for (endpoint, types) in [
+        (&subscribed, serde_json::json!(["user.created"])),
+        (&other, serde_json::json!(["user.deleted"])),
+    ] {
+        let (status, _, body) = h
+            .put(
+                &format!("{base}/{endpoint}/event-types"),
+                &serde_json::json!({ "event_types": types }).to_string(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).expect("json")["event_types"],
+            types,
+            "the response reports the subscription it committed: {body}"
+        );
+    }
+
+    let scope = scope_of(&tenant, &environment);
+    let env = Env::system();
+    let store = h.store().clone();
+
+    let (status, _, created) = h
+        .post(
+            &format!("/v1/tenants/{tenant}/environments/{environment}/users"),
+            "k-user",
+            &serde_json::json!({ "identifier": "filtered@example.test" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+
+    let events = store
+        .scoped(scope)
+        .outbox()
+        .claim(&env, WEBHOOK_EVENT_CONSUMER, Duration::from_secs(30), 10)
+        .await
+        .expect("claim the event");
+    WebhookFanoutConsumer::new(store.clone())
+        .handle(&env, scope, &events[0])
+        .await
+        .expect("the fan-out runs");
+
+    let deliveries = store
+        .scoped(scope)
+        .outbox()
+        .claim(&env, WEBHOOK_DELIVERY_CONSUMER, Duration::from_secs(30), 10)
+        .await
+        .expect("claim");
+    let mut targets: Vec<String> = deliveries.iter().map(|d| d.ordering_key.clone()).collect();
+    targets.sort();
+    let mut expected = vec![subscribed.clone(), unfiltered.clone()];
+    expected.sort();
+    assert_eq!(
+        targets, expected,
+        "the subscriber and the unfiltered endpoint receive it; the one subscribed to a \
+         different type gets NO delivery queued at all"
+    );
+
+    // Clearing the subscription puts the endpoint back to receiving everything, so this is
+    // a filter rather than a one-way narrowing.
+    let (status, _, body) = h
+        .put(
+            &format!("{base}/{other}/event-types"),
+            &serde_json::json!({ "event_types": null }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).expect("json")["event_types"],
+        Value::Null,
+        "{body}"
+    );
+
+    // An EMPTY list is refused at the edge: "subscribed to nothing" is nearly always a
+    // client that serialized an empty list by accident, and the database CHECK would
+    // otherwise surface as a fault.
+    let (status, _, body) = h
+        .put(
+            &format!("{base}/{other}/event-types"),
+            &serde_json::json!({ "event_types": [] }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}

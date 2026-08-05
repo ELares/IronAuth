@@ -57,6 +57,8 @@ pub struct WebhookEndpointView {
     /// Why the system disabled it: a bounded internal label, never anything derived from a
     /// receiver's response.
     pub disabled_reason: Option<String>,
+    /// The event types this endpoint receives, or `null` for every type.
+    pub event_types: Option<Vec<String>>,
     /// Creation time, milliseconds since the Unix epoch.
     pub created_at_unix_ms: i64,
 }
@@ -203,6 +205,9 @@ pub async fn create_webhook_endpoint(
             active: true,
             auto_disabled_at_unix_ms: None,
             disabled_reason: None,
+            // A newly registered endpoint subscribes to everything, which is the only
+            // default that cannot silently drop events an operator expected.
+            event_types: None,
             created_at_unix_ms: created_at_micros / 1000,
         },
         secret: secret.to_transport_string(),
@@ -689,6 +694,83 @@ pub async fn replay_webhook_dead_letters(
     Ok(json(StatusCode::ACCEPTED, body_string))
 }
 
+/// Set or clear an endpoint's event-type subscription.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetEventTypesRequest {
+    /// The event types to receive, or an explicit `null` to receive EVERY type. The field
+    /// is required so that "everything" is stated rather than inferred from an omission.
+    pub event_types: Option<Vec<String>>,
+}
+
+/// Subscribe an endpoint to a set of event types.
+#[utoipa::path(
+    put,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/event-types",
+    operation_id = "setWebhookEventTypes",
+    tag = "webhooks",
+    request_body = SetEventTypesRequest,
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("endpoint_id" = String, Path, description = "The endpoint identifier (whe_...)")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "The endpoint, with the subscription it committed", body = WebhookEndpointView),
+        (status = 400, description = "Malformed request, a body omitting event_types, or an empty list", body = ErrorBody),
+        (status = 401, description = "Missing or invalid credential, or fresh privilege required", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "The environment is absent or deleted, or the endpoint is in another scope", body = ErrorBody)
+    )
+)]
+pub async fn set_webhook_event_types(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, endpoint_id)): Path<(String, String, String)>,
+    body: axum::body::Bytes,
+) -> Result<Response, ApiError> {
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    crate::sudo::require_fresh_privilege(&state, scope, principal.actor()).await?;
+    require_live_environment(&state, &scope).await?;
+    let id = state
+        .store()
+        .scoped(scope)
+        .webhook_endpoints()
+        .parse_id(&endpoint_id)?;
+
+    let request: SetEventTypesRequest = parse_json(&body)?;
+    // An empty list is refused at the EDGE with a precise message rather than reaching the
+    // 0116 CHECK, which would surface as a fault. "Subscribed to nothing" is nearly always
+    // a client that serialized an empty list by accident.
+    if request.event_types.as_ref().is_some_and(Vec::is_empty) {
+        return Err(ApiError::BadRequest(
+            "event_types must name at least one type, or be null to receive every type".to_owned(),
+        ));
+    }
+
+    state
+        .store()
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(state.env()))
+        .webhook_endpoints()
+        .set_event_types(state.env(), &id, request.event_types.as_deref())
+        .await?;
+
+    // Re-read through the SAME address so the response reports what was stored.
+    let endpoints = state
+        .store()
+        .scoped(scope)
+        .webhook_endpoints()
+        .list()
+        .await?;
+    let record = endpoints
+        .into_iter()
+        .find(|record| record.id == id)
+        .ok_or(ApiError::NotFound)?;
+    let body_string = serde_json::to_string(&into_view(record)).map_err(|_| ApiError::Internal)?;
+    Ok(json(StatusCode::OK, body_string))
+}
+
 /// The request shape both endpoint state toggles share, grouped so the shared body stays
 /// inside the argument budget.
 struct StateToggle<'a> {
@@ -865,6 +947,7 @@ fn into_view(record: ironauth_store::WebhookEndpointRecord) -> WebhookEndpointVi
             .auto_disabled_at_unix_micros
             .map(|micros| micros / 1000),
         disabled_reason: record.disabled_reason,
+        event_types: record.event_types,
         created_at_unix_ms: record.created_at_unix_micros / 1000,
     }
 }

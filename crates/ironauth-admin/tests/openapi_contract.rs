@@ -264,6 +264,7 @@ fn operation_ids_are_the_stable_set() {
             "setStepUpPolicy",
             "setUserState",
             "setVariable",
+            "setWebhookEventTypes",
             "suspendTenant",
             "unassignOrgGroupRole",
             "unassignOrgMembershipRole",
@@ -641,6 +642,7 @@ fn documented_paths_are_the_expected_set() {
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/sms-otp/config",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/external-id",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/variables/{name}",
+            "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/event-types",
         ]
     );
 }
@@ -732,7 +734,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        193,
+        194,
         "the documented route count is pinned"
     );
 

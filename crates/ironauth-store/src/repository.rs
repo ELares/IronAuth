@@ -24780,6 +24780,13 @@ pub struct WebhookEndpointRecord {
     /// Why the system disabled it: a bounded internal label, never anything derived from
     /// a receiver's response.
     pub disabled_reason: Option<String>,
+    /// The event types this endpoint subscribes to, or `None` for EVERY type (issue #106).
+    ///
+    /// `None` and an empty list are different things and only one of them is reachable:
+    /// the 0116 CHECK refuses an empty array, because "subscribed to nothing" is far more
+    /// likely a client that serialized an empty list by accident than an operator asking
+    /// for an endpoint that can never receive anything.
+    pub event_types: Option<Vec<String>>,
     /// Creation time in microseconds since the Unix epoch.
     pub created_at_unix_micros: i64,
 }
@@ -24828,7 +24835,7 @@ impl WebhookEndpointRepo<'_> {
         let scope = self.scope;
         let mut tx = begin_scoped(self.store, scope).await?;
         let rows = sqlx::query(
-            "SELECT id, url, description, active, \
+            "SELECT id, url, description, active, event_types, \
                     (EXTRACT(EPOCH FROM auto_disabled_at) * 1000000)::bigint AS disabled_us, \
                     disabled_reason, \
                     (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us \
@@ -24851,6 +24858,7 @@ impl WebhookEndpointRepo<'_> {
                     active: row.get("active"),
                     auto_disabled_at_unix_micros: row.get("disabled_us"),
                     disabled_reason: row.get("disabled_reason"),
+                    event_types: row.get("event_types"),
                     created_at_unix_micros: row.get("created_us"),
                 })
             })
@@ -25525,6 +25533,67 @@ impl ActingWebhookEndpointRepo<'_> {
         .await
     }
 
+    /// SUBSCRIBE this endpoint to a set of event types, or clear the subscription so it
+    /// receives every type (issue #106).
+    ///
+    /// `None` clears the filter. A `Some` list must be non-empty; the 0116 CHECK refuses an
+    /// empty array and this returns [`StoreError::Conflict`] rather than letting the
+    /// database error surface, so the caller sees a decision rather than a fault.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no endpoint matched in this scope;
+    /// [`StoreError::Conflict`] if the list is present and empty;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn set_event_types(
+        &self,
+        env: &Env,
+        id: &WebhookEndpointId,
+        event_types: Option<&[String]>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        if event_types.is_some_and(<[String]>::is_empty) {
+            return Err(StoreError::Conflict);
+        }
+        let scope = self.scope;
+        let owned: Option<Vec<String>> = event_types.map(<[String]>::to_vec);
+        let detail = match &owned {
+            Some(types) => format!("event_types={}", types.join(",")),
+            None => "event_types=all".to_owned(),
+        };
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::WebhookEndpointSetEventTypes,
+                target: id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "UPDATE webhook_endpoints SET event_types = $1, updated_at = now() \
+                     WHERE id = $2 AND tenant_id = $3 AND environment_id = $4",
+                )
+                .bind(owned.as_deref())
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+            Some(&detail),
+        )
+        .await
+    }
+
     /// PAUSE or RESUME an endpoint, returning the row this write committed.
     ///
     /// Distinct from [`Self::delete`] on purpose. Deleting destroys the signing secret,
@@ -25580,8 +25649,8 @@ impl ActingWebhookEndpointRepo<'_> {
                      SET active = $1, auto_disabled_at = NULL, disabled_reason = NULL, \
                          updated_at = now() \
                      WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 \
-                     RETURNING id, url, description, active, auto_disabled_at IS NOT NULL \
-                               AS auto_disabled, disabled_reason, \
+                     RETURNING id, url, description, active, event_types, \
+                               auto_disabled_at IS NOT NULL AS auto_disabled, disabled_reason, \
                                (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us",
                 )
                 .bind(active)
@@ -25603,6 +25672,7 @@ impl ActingWebhookEndpointRepo<'_> {
                     // committed rather than the one it replaced.
                     auto_disabled_at_unix_micros: None,
                     disabled_reason: row.get("disabled_reason"),
+                    event_types: row.get("event_types"),
                     created_at_unix_micros: row.get("created_us"),
                 };
                 insert_resolved_idempotency(tx, idempotency, &record).await?;

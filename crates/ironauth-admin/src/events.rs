@@ -110,6 +110,8 @@ impl PendingEvent {
 
 /// The key under which the fan-out reads the event's own id off its envelope.
 const ENVELOPE_ID: &str = "id";
+/// The key under which the fan-out reads the event's type off its envelope.
+const ENVELOPE_TYPE: &str = "type";
 
 /// The consumer that explodes one domain event into one delivery per active endpoint.
 pub struct WebhookFanoutConsumer {
@@ -137,6 +139,12 @@ impl WebhookFanoutConsumer {
             // Permanent: no retry adds a field to a row that is already written.
             .ok_or_else(|| ConsumerError::permanent("envelope_missing_id"))?
             .to_owned();
+        let event_type = message
+            .payload
+            .get(ENVELOPE_TYPE)
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| ConsumerError::permanent("envelope_missing_type"))?
+            .to_owned();
 
         let scoped = self.store.scoped(scope);
         let endpoints = scoped
@@ -148,7 +156,25 @@ impl WebhookFanoutConsumer {
         // A paused endpoint is one an operator turned off, so an event that arrives while
         // it is off was never promised to it; this differs from an endpoint that pauses
         // AFTER a delivery is queued, which dead-letters and stays replayable (#561).
-        let live: Vec<_> = endpoints.into_iter().filter(|e| e.active).collect();
+        // ACTIVE, and SUBSCRIBED to this type. The subscription is applied HERE rather
+        // than at delivery, because #106 requires that a non-matching event never has a
+        // delivery attempt created for it at all: filtering later would still queue the
+        // message, still consume its retry budget, and still show up in that endpoint's
+        // dead letters as work an operator never asked for.
+        //
+        // `None` is no filter and receives everything, which is what every endpoint
+        // registered before 0116 already did. Matching is EXACT: a wildcard grammar
+        // without the catalogue (#108) to validate against would let a typo match nothing
+        // and look identical to a filter that works.
+        let live: Vec<_> = endpoints
+            .into_iter()
+            .filter(|e| e.active)
+            .filter(|e| {
+                e.event_types
+                    .as_ref()
+                    .is_none_or(|types| types.iter().any(|t| t == &event_type))
+            })
+            .collect();
         if live.is_empty() {
             // Nothing to deliver to is a completed event, not a failure. An environment
             // with no endpoints is the common case and must not accumulate dead letters.

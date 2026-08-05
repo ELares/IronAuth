@@ -294,6 +294,14 @@ fn abuse_and_sudo_cases(base: &str) -> Vec<Case> {
             body: Some(serde_json::json!({}).to_string()),
         },
         Case {
+            label: "webhook_endpoints.setWebhookEventTypes",
+            method: "PUT",
+            path: format!("{base}/webhook-endpoints/whe_absent/event-types"),
+            body: Some(body_of(
+                &serde_json::json!({ "event_types": ["user.created"] }),
+            )),
+        },
+        Case {
             label: "webhook_endpoints.pauseWebhookEndpoint",
             method: "POST",
             path: format!("{base}/webhook-endpoints/whe_absent/pause"),
