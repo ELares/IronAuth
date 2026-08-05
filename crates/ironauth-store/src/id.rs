@@ -674,6 +674,18 @@ impl ScopedKind for WebhookEndpointKind {
     const PREFIX: &'static str = "whe";
 }
 
+/// Marker for ONE recorded webhook delivery attempt (`wha_`), issue #106: what a receiver
+/// answered, how long it took, and which attempt of its message it was. A tenant-scoped
+/// resource whose lifetime is tied to the queue message it describes, so it is NOT
+/// promotable and never appears in a config snapshot: it is a record of something that
+/// happened in one environment rather than configuration that could be promoted to
+/// another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WebhookDeliveryAttemptKind;
+impl ScopedKind for WebhookDeliveryAttemptKind {
+    const PREFIX: &'static str = "wha";
+}
+
 /// Marker for a per-environment brand (`brd_`), one named branding definition (design
 /// tokens, dark-mode variants, the product wordmark, and the sanitized rich-text slots)
 /// per environment (issue #86). A tenant-scoped resource: the id embeds its (tenant,
@@ -1590,6 +1602,9 @@ pub type ConnectorId = ScopedId<ConnectorKind>;
 
 /// A registered webhook delivery endpoint (issue #105).
 pub type WebhookEndpointId = ScopedId<WebhookEndpointKind>;
+
+/// One recorded webhook delivery attempt (issue #106).
+pub type WebhookDeliveryAttemptId = ScopedId<WebhookDeliveryAttemptKind>;
 /// A per-environment brand identifier (`brd_...`), one named branding definition per
 /// environment (issue #86). Promotable.
 pub type BrandId = ScopedId<BrandKind>;

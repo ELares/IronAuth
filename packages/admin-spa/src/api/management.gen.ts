@@ -2334,6 +2334,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/attempts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List an endpoint's delivery attempt history. */
+        get: operations["listWebhookDeliveryAttempts"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/dead-letters": {
         parameters: {
             query?: never;
@@ -3341,6 +3358,41 @@ export interface components {
              * @description The `webhook-id` this delivery carried, and will carry again if replayed. Stable
              *     across every attempt, which is what lets a receiver deduplicate a redelivery.
              */
+            webhook_id: string;
+        };
+        /** @description An endpoint's delivery attempt history, newest first. */
+        DeliveryAttemptList: {
+            /** @description The attempts, most recent first. */
+            items: components["schemas"]["DeliveryAttemptView"][];
+        };
+        /** @description One recorded delivery attempt. */
+        DeliveryAttemptView: {
+            /**
+             * Format: int32
+             * @description Which attempt of its delivery this was, starting at 1.
+             */
+            attempt_number: number;
+            /**
+             * Format: int64
+             * @description When it was made, milliseconds since the Unix epoch.
+             */
+            attempted_at_unix_ms: number;
+            /** @description `null` on a success; otherwise a bounded, non-secret failure label. */
+            error?: string | null;
+            /** @description The `wha_` identifier. */
+            id: string;
+            /**
+             * Format: int64
+             * @description The round trip in milliseconds.
+             */
+            latency_ms: number;
+            /**
+             * Format: int32
+             * @description The status the receiver returned. `null` means it never answered: the destination
+             *     was refused, the attempt timed out, or the transport failed. `error` says which.
+             */
+            status_code?: number | null;
+            /** @description The `webhook-id` the attempt carried, which is what a receiver deduplicated on. */
             webhook_id: string;
         };
         /**
@@ -17756,6 +17808,60 @@ export interface operations {
                 };
             };
             /** @description The environment is absent or deleted, or the endpoint is in another scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listWebhookDeliveryAttempts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The endpoint identifier (whe_...) */
+                endpoint_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The delivery attempts, newest first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeliveryAttemptList"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment is absent, or the endpoint is in another scope */
             404: {
                 headers: {
                     [name: string]: unknown;

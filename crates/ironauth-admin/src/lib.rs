@@ -918,6 +918,10 @@ pub fn management_router(state: AdminState) -> Router {
         // so the deliveries that exhausted their retry schedule stay listable and an
         // operator can put them back on the queue once the endpoint is healthy.
         .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/attempts",
+            axum::routing::get(webhook_endpoints::list_webhook_delivery_attempts),
+        )
+        .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/dead-letters",
             axum::routing::get(webhook_endpoints::list_webhook_dead_letters),
         )

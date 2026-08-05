@@ -437,6 +437,92 @@ pub struct ReplayAccepted {
 /// the whole backlog by timestamp and never has to page through it.
 const DEAD_LETTER_LIMIT: i64 = 200;
 
+/// One recorded delivery attempt.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DeliveryAttemptView {
+    /// The `wha_` identifier.
+    pub id: String,
+    /// The `webhook-id` the attempt carried, which is what a receiver deduplicated on.
+    pub webhook_id: String,
+    /// Which attempt of its delivery this was, starting at 1.
+    pub attempt_number: i32,
+    /// When it was made, milliseconds since the Unix epoch.
+    pub attempted_at_unix_ms: i64,
+    /// The status the receiver returned. `null` means it never answered: the destination
+    /// was refused, the attempt timed out, or the transport failed. `error` says which.
+    pub status_code: Option<i32>,
+    /// The round trip in milliseconds.
+    pub latency_ms: i64,
+    /// `null` on a success; otherwise a bounded, non-secret failure label.
+    pub error: Option<String>,
+}
+
+/// An endpoint's delivery attempt history, newest first.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DeliveryAttemptList {
+    /// The attempts, most recent first.
+    pub items: Vec<DeliveryAttemptView>,
+}
+
+/// How many attempts one listing returns at most. A debugging tail, like the dead-letter
+/// view, so it is a fixed cap rather than a cursor.
+const ATTEMPT_LIMIT: i64 = 200;
+
+/// List an endpoint's delivery attempt history.
+#[utoipa::path(
+    get,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/attempts",
+    operation_id = "listWebhookDeliveryAttempts",
+    tag = "webhooks",
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("endpoint_id" = String, Path, description = "The endpoint identifier (whe_...)")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "The delivery attempts, newest first", body = DeliveryAttemptList),
+        (status = 401, description = "Missing or invalid credential", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "The environment is absent, or the endpoint is in another scope", body = ErrorBody)
+    )
+)]
+pub async fn list_webhook_delivery_attempts(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, endpoint_id)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    // No liveness fence on a READ, matching every other read across this surface.
+    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let id = state
+        .store()
+        .scoped(scope)
+        .webhook_endpoints()
+        .parse_id(&endpoint_id)?;
+    let attempts = state
+        .store()
+        .scoped(scope)
+        .webhook_delivery_attempts()
+        .for_endpoint(&id, ATTEMPT_LIMIT)
+        .await?;
+    let view = DeliveryAttemptList {
+        items: attempts
+            .into_iter()
+            .map(|attempt| DeliveryAttemptView {
+                id: attempt.id.to_string(),
+                webhook_id: attempt.webhook_id,
+                attempt_number: attempt.attempt_number,
+                attempted_at_unix_ms: attempt.attempted_at_unix_micros / 1000,
+                status_code: attempt.status_code,
+                latency_ms: attempt.latency_ms,
+                error: attempt.error,
+            })
+            .collect(),
+    };
+    let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
+    Ok(json(StatusCode::OK, body_string))
+}
+
 /// List an endpoint's dead-lettered deliveries.
 #[utoipa::path(
     get,

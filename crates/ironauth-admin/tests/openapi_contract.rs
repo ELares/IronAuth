@@ -220,6 +220,7 @@ fn operation_ids_are_the_stable_set() {
             "listUsers",
             "listVariables",
             "listWebhookDeadLetters",
+            "listWebhookDeliveryAttempts",
             "listWebhookEndpoints",
             "pauseWebhookEndpoint",
             "pinFlowVersion",
@@ -547,6 +548,7 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/variables/{name}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/webauthn/mds3/health",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/attempts",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/dead-letters",
             "PATCH /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}",
             "PATCH /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}",
@@ -718,7 +720,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        186,
+        187,
         "the documented route count is pinned"
     );
 

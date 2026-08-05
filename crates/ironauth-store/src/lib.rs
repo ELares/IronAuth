@@ -164,7 +164,8 @@ pub use id::{
     TraitSchemaId, TraitSchemaKind, TrustedDeviceId, TrustedDeviceKind, UpstreamTokenGrantId,
     UpstreamTokenGrantKind, UpstreamTokenId, UpstreamTokenKind, UserId, UserIdentifierId,
     UserIdentifierKind, UserKind, VariableId, VariableKind, WebauthnChallengeId,
-    WebauthnChallengeKind, WebauthnCredentialId, WebauthnCredentialKind, WebhookEndpointId,
+    WebauthnChallengeKind, WebauthnCredentialId, WebauthnCredentialKind, WebhookDeliveryAttemptId,
+    WebhookDeliveryAttemptKind, WebhookEndpointId,
 };
 pub use identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
@@ -292,8 +293,9 @@ pub use repository::{
     opaque_access_token_digest, refresh_token_digest, user_code_hash,
 };
 pub use repository::{
-    ActingWebhookEndpointRepo, NewWebhookEndpoint, WEBHOOK_DELIVERY_CONSUMER,
-    WEBHOOK_REPLAY_CONSUMER, WebhookDeliveryTarget, WebhookEndpointRecord, WebhookEndpointRepo,
+    ActingWebhookEndpointRepo, DeliveryAttemptRecord, NewDeliveryAttempt, NewWebhookEndpoint,
+    WEBHOOK_DELIVERY_CONSUMER, WEBHOOK_REPLAY_CONSUMER, WebhookDeliveryAttemptRepo,
+    WebhookDeliveryTarget, WebhookEndpointRecord, WebhookEndpointRepo,
 };
 /// The testing-only atomicity probes (issue #247): the seams at which a test can force
 /// the joined invitation create and the joined recovery approve to fail INSIDE their one
