@@ -223,6 +223,115 @@ pub async fn create_webhook_endpoint(
     Ok(json(StatusCode::CREATED, body_string))
 }
 
+/// The rotation response, which carries the incoming secret exactly once.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct WebhookSecretRotated {
+    /// The endpoint whose secret rotated.
+    pub id: String,
+    /// The NEW signing secret, in `whsec_` form. Shown once, like the original.
+    pub secret: String,
+    /// When the outgoing secret stops being accepted, milliseconds since the Unix epoch.
+    /// Until then a delivery carries a signature under both, so a consumer holding either
+    /// verifies.
+    pub previous_expires_at_unix_ms: i64,
+}
+
+/// How long the outgoing secret keeps verifying after a rotation.
+///
+/// Twenty four hours: long enough for a consumer to pick up the new secret through an
+/// ordinary deploy cycle, short enough that a rotation prompted by a suspected leak
+/// actually shortens exposure. A fixed window rather than a setting for now, and the
+/// EXPIRY is stored on the row rather than derived, so making it configurable later
+/// cannot retroactively strand a rotation already in flight.
+const ROTATION_OVERLAP_SECS: i64 = 24 * 60 * 60;
+
+/// Rotate an endpoint's signing secret, opening the overlap window.
+#[utoipa::path(
+    post,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/rotate-secret",
+    operation_id = "rotateWebhookEndpointSecret",
+    tag = "webhooks",
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("endpoint_id" = String, Path, description = "The endpoint identifier (whe_...)"),
+        ("Idempotency-Key" = String, Header, description = "Required. Replaying a POST \
+         with the same key returns the original response without re-executing.")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "The new signing secret, shown once, and when the old one stops verifying", body = WebhookSecretRotated),
+        (status = 401, description = "Missing or invalid credential, or fresh privilege required", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "The environment is absent or deleted, or the endpoint is in another scope", body = ErrorBody),
+        (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
+    )
+)]
+pub async fn rotate_webhook_endpoint_secret(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, endpoint_id)): Path<(String, String, String)>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    crate::sudo::require_fresh_privilege(&state, scope, principal.actor()).await?;
+    require_live_environment(&state, &scope).await?;
+    let id = state
+        .store()
+        .scoped(scope)
+        .webhook_endpoints()
+        .parse_id(&endpoint_id)?;
+
+    // This route carries no request body, so the fingerprint is over an empty one. That
+    // still binds the key to the method and PATH, so the same key reused against a
+    // DIFFERENT endpoint is the 422 rather than a replay of another endpoint's secret,
+    // which would be the worst possible thing to replay.
+    let key = idempotency::required_key(&headers)?;
+    let fingerprint = idempotency::fingerprint("POST", uri.path(), &[]);
+    let credential_ref = principal.credential_ref();
+    if let Some(replay) =
+        idempotency::replay_if_stored(&state, &credential_ref, &key, &fingerprint).await?
+    {
+        return Ok(replay);
+    }
+
+    let mut secret_bytes = vec![0_u8; SECRET_BYTES];
+    state.env().entropy().fill_bytes(&mut secret_bytes);
+    let secret = WebhookSecret::from_bytes(secret_bytes.clone());
+    let previous_expires_at_micros = state
+        .now_unix_micros()
+        .saturating_add(ROTATION_OVERLAP_SECS.saturating_mul(1_000_000));
+
+    let view = WebhookSecretRotated {
+        id: id.to_string(),
+        secret: secret.to_transport_string(),
+        previous_expires_at_unix_ms: previous_expires_at_micros / 1000,
+    };
+    let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
+
+    state
+        .store()
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(state.env()))
+        .webhook_endpoints()
+        .rotate_secret(
+            state.env(),
+            &id,
+            &secret_bytes,
+            previous_expires_at_micros,
+            Some(IdempotencyWrite {
+                credential_ref: &credential_ref,
+                key: &key,
+                request_fingerprint: &fingerprint,
+                response_status: 200,
+                response_body: &body_string,
+            }),
+        )
+        .await?;
+    Ok(json(StatusCode::OK, body_string))
+}
+
 /// Remove a delivery endpoint.
 #[utoipa::path(
     delete,

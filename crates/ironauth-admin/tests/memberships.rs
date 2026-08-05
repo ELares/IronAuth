@@ -677,3 +677,106 @@ async fn webhook_endpoints_round_trip_and_reveal_the_secret_exactly_once() {
         "the endpoint is gone: {list}"
     );
 }
+
+#[tokio::test]
+async fn rotating_a_webhook_secret_opens_an_overlap_window_both_secrets_verify_in() {
+    // Issue #105 slice 3. The point of the overlap window is that rotation is a CONFIG
+    // change rather than a coordinated deploy, so the property worth pinning is not that
+    // a new secret appears but that the OLD one still verifies while the window is open.
+    use ironauth_jose::webhooks::{WebhookSecret, sign_delivery, verify_delivery};
+
+    let h = Harness::start(50).await;
+    let (tenant, environment) = tenant_env(&h).await;
+    let base = format!("/v1/tenants/{tenant}/environments/{environment}/webhook-endpoints");
+
+    let (status, _, body) = h
+        .post(
+            &base,
+            "k-create",
+            &serde_json::json!({ "url": "https://example.test/hook" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let created: Value = serde_json::from_str(&body).expect("json");
+    let id = created["id"].as_str().expect("id").to_owned();
+    let old_secret = created["secret"].as_str().expect("secret").to_owned();
+
+    let rotate = format!("{base}/{id}/rotate-secret");
+    let (status, _, body) = h.post(&rotate, "k-rotate", "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rotated: Value = serde_json::from_str(&body).expect("json");
+    let new_secret = rotated["secret"].as_str().expect("new secret").to_owned();
+    assert_ne!(new_secret, old_secret, "rotation mints a different secret");
+    assert!(
+        rotated["previous_expires_at_unix_ms"]
+            .as_i64()
+            .expect("expiry")
+            > 0,
+        "the window has an end the operator can see: {body}"
+    );
+
+    // THE STORE HALF, asserted directly rather than inferred. The signing check below
+    // uses the secrets the API returned, so it exercises the SIGNER (already covered in
+    // #554) and would pass even if the row had dropped the outgoing secret entirely. What
+    // the deliverer will actually read is the row, so the row is what is checked: the
+    // previous slot holds something, it differs from the current secret, and the window
+    // has an end.
+    let (previous_present, differs, has_expiry): (bool, bool, bool) = sqlx::query_as(
+        "SELECT previous_secret_sealed IS NOT NULL, \
+                previous_secret_sealed IS DISTINCT FROM secret_sealed, \
+                previous_expires_at IS NOT NULL \
+         FROM webhook_endpoints WHERE id = $1",
+    )
+    .bind(&id)
+    .fetch_one(h.db().owner_pool())
+    .await
+    .expect("read the rotated row");
+    assert!(
+        previous_present,
+        "the outgoing secret is kept for the window"
+    );
+    assert!(differs, "and it is not simply a copy of the incoming one");
+    assert!(has_expiry, "and the window has an end");
+
+    // THE OVERLAP PROPERTY, driven through the real signer: a delivery signed under BOTH
+    // secrets verifies for a consumer holding EITHER. Without the previous slot, the
+    // consumer that has not yet redeployed would start failing the moment we rotated.
+    let old = WebhookSecret::parse(&old_secret).expect("old parses");
+    let new = WebhookSecret::parse(&new_secret).expect("new parses");
+    let header = sign_delivery(&[new, old], "msg_1", 1_700_000_000, b"{}");
+    assert_eq!(
+        header.split(' ').count(),
+        2,
+        "one signature per live secret"
+    );
+    for (label, raw) in [("outgoing", &old_secret), ("incoming", &new_secret)] {
+        let held = WebhookSecret::parse(raw).expect("parses");
+        verify_delivery(
+            &[held],
+            "msg_1",
+            "1700000000",
+            b"{}",
+            &header,
+            300,
+            1_700_000_000,
+        )
+        .unwrap_or_else(|e| panic!("a consumer holding the {label} secret verifies: {e:?}"));
+    }
+
+    // The secret is still never readable afterwards: rotation reveals once, like creation.
+    let (_, _, list) = h.get(&base).await;
+    assert!(
+        !list.contains("whsec_") && !list.contains(&new_secret) && !list.contains(&old_secret),
+        "no read path returns either secret: {list}"
+    );
+
+    // A retry under the same key replays rather than rotating AGAIN, which would strand
+    // the consumer that just adopted the secret this call returned.
+    let (status, _, replayed) = h.post(&rotate, "k-rotate", "").await;
+    assert_eq!(status, StatusCode::OK, "{replayed}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&replayed).expect("json"),
+        rotated,
+        "the retry replays the original rotation"
+    );
+}

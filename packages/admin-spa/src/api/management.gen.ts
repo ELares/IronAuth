@@ -2334,6 +2334,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/rotate-secret": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Rotate an endpoint's signing secret, opening the overlap window. */
+        post: operations["rotateWebhookEndpointSecret"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/restore": {
         parameters: {
             query?: never;
@@ -6112,6 +6129,20 @@ export interface components {
             id: string;
             /** @description The HTTPS destination deliveries POST to. */
             url: string;
+        };
+        /** @description The rotation response, which carries the incoming secret exactly once. */
+        WebhookSecretRotated: {
+            /** @description The endpoint whose secret rotated. */
+            id: string;
+            /**
+             * Format: int64
+             * @description When the outgoing secret stops being accepted, milliseconds since the Unix epoch.
+             *     Until then a delivery carries a signature under both, so a consumer holding either
+             *     verifies.
+             */
+            previous_expires_at_unix_ms: number;
+            /** @description The NEW signing secret, in `whsec_` form. Shown once, like the original. */
+            secret: string;
         };
     };
     responses: never;
@@ -17600,6 +17631,72 @@ export interface operations {
             };
             /** @description The environment is absent or deleted, or the endpoint is in another scope */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    rotateWebhookEndpointSecret: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Required. Replaying a POST with the same key returns the original response without re-executing. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The endpoint identifier (whe_...) */
+                endpoint_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The new signing secret, shown once, and when the old one stops verifying */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WebhookSecretRotated"];
+                };
+            };
+            /** @description Missing or invalid credential, or fresh privilege required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment is absent or deleted, or the endpoint is in another scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Idempotency-Key reused with a different request */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

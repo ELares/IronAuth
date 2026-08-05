@@ -1090,6 +1090,11 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             &serde_json::json!({ "url": "https://example.test/hook" }),
         ),
         Case::empty(
+            "webhook_endpoints.rotateWebhookEndpointSecret",
+            "POST",
+            format!("{base}/webhook-endpoints/{webhook_endpoint}/rotate-secret"),
+        ),
+        Case::empty(
             "webhook_endpoints.deleteWebhookEndpoint",
             "DELETE",
             format!("{base}/webhook-endpoints/{webhook_endpoint}"),
