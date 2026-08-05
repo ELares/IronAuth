@@ -795,3 +795,163 @@ async fn traits_cannot_be_written_where_no_schema_is_active_and_reads_are_scope_
         "another environment's registry is empty, not the first one's: {foreign_list}"
     );
 }
+
+/// Drive a migration job to completion the way the worker pool does: handle one batch,
+/// complete its message, then claim whatever the worker queued next. Returns how many
+/// batches ran, which is what proves the worker queued its own follow-ups.
+async fn drain_migration_batches(
+    store: &ironauth_store::Store,
+    env: &Env,
+    scope: Scope,
+    first: ironauth_store::OutboxMessage,
+) -> usize {
+    use ironauth_admin::trait_migration_worker::TraitMigrationConsumer;
+    use ironauth_store::TRAIT_MIGRATION_CONSUMER;
+    use ironauth_store::outbox::OutboxConsumer;
+    use std::time::Duration;
+
+    let consumer = TraitMigrationConsumer::new(store.clone(), 1);
+    let mut message = first;
+    let mut batches = 0;
+    loop {
+        consumer
+            .handle(env, scope, &message)
+            .await
+            .expect("the batch advances");
+        batches += 1;
+        assert!(batches < 20, "the job should finish long before this");
+        store
+            .scoped(scope)
+            .outbox()
+            .complete(env, &message)
+            .await
+            .expect("complete the batch");
+        let next = store
+            .scoped(scope)
+            .outbox()
+            .claim(env, TRAIT_MIGRATION_CONSUMER, Duration::from_secs(30), 10)
+            .await
+            .expect("claim");
+        match next.into_iter().next() {
+            Some(m) => message = m,
+            None => return batches,
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_migration_job_runs_to_completion_through_the_worker_it_queues_itself() {
+    // The store shipped `create`, `get` and `advance` and NOTHING called them (issue #53).
+    // This is the test that makes that layer live, so the property it pins is not that the
+    // repository works, which it already did, but that an operator can start a job over
+    // HTTP and it FINISHES without anything polling for it.
+    //
+    // The chain has three links and each one has failed silently in this codebase before:
+    // the create must enqueue a batch in its own transaction, the worker must be registered
+    // under the name the producer wrote, and the worker must queue the NEXT batch or the
+    // job stalls after the first.
+    use ironauth_store::{TRAIT_MIGRATION_CONSUMER, WEBHOOK_DELIVERY_CONSUMER};
+    use std::time::Duration;
+
+    let harness = Harness::start(50).await;
+    let (tenant, env_name) = harness.create_tenant("Acme", "k1").await;
+    let scope = scope_of(&tenant, &env_name);
+    let env = Env::system();
+    let store = harness.store().clone();
+
+    // A schema everything satisfies, then identities on it. THREE, with a batch size of
+    // one, so the job cannot finish in a single batch and the self-queuing link is
+    // exercised rather than assumed.
+    let v1 = register_active_schema(
+        &harness,
+        &tenant,
+        &env_name,
+        &json!({"type": "object", "properties": {"nickname": {"type": "string"}}}),
+        "s1",
+    )
+    .await;
+    for n in 0..3 {
+        let (status, body) = create_user_with_traits(
+            &harness,
+            &tenant,
+            &env_name,
+            &format!("u{n}@example.test"),
+            &json!({"nickname": format!("n{n}")}),
+            &format!("u{n}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    // START one, over the real management surface.
+    let migrations = format!("{}/migrations", schemas_path(&tenant, &env_name));
+    let (status, _, created) = harness
+        .post(
+            &migrations,
+            "k-job",
+            &json!({ "kind": "dry_run", "from_version": v1, "to_version": v1 }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{created}");
+    let job_id = parse(&created)["id"].as_str().expect("id").to_owned();
+    assert_eq!(parse(&created)["status"], json!("pending"), "{created}");
+
+    // The create queued its first batch IN ITS OWN TRANSACTION. Without that the job would
+    // exist at `pending` forever, since nothing polls for new jobs, which is the dormant
+    // shape this whole change exists to remove.
+    let claimed = store
+        .scoped(scope)
+        .outbox()
+        .claim(&env, TRAIT_MIGRATION_CONSUMER, Duration::from_secs(30), 10)
+        .await
+        .expect("claim");
+    assert_eq!(
+        claimed.len(),
+        1,
+        "creating a job queues exactly one first batch"
+    );
+    // And it is on the migration queue alone: a producer writing the wrong discriminator
+    // would leave this drained by nothing at all, silently.
+    assert!(
+        store
+            .scoped(scope)
+            .outbox()
+            .claim(&env, WEBHOOK_DELIVERY_CONSUMER, Duration::from_secs(30), 10)
+            .await
+            .expect("claim")
+            .is_empty(),
+        "the batch is not on another consumer's queue"
+    );
+
+    // Drive the worker to completion, one batch per message, exactly as the pool would.
+    let batches = drain_migration_batches(
+        &store,
+        &env,
+        scope,
+        claimed.into_iter().next().expect("first batch"),
+    )
+    .await;
+    assert!(
+        batches >= 3,
+        "three identities at a batch size of one takes at least three batches, so the \
+         worker queued its own follow-ups rather than stopping after the first: {batches}"
+    );
+
+    // The job reports itself finished through the real GET.
+    let (status, _, body) = harness.get(&format!("{migrations}/{job_id}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let job = parse(&body);
+    assert_eq!(job["status"], json!("completed"), "{body}");
+    assert_eq!(job["total_count"], json!(3), "{body}");
+    assert_eq!(job["processed_count"], json!(3), "{body}");
+    assert_eq!(
+        job["failure_count"],
+        json!(0),
+        "every identity satisfies the target schema: {body}"
+    );
+    assert_eq!(
+        job["migrated_count"],
+        json!(0),
+        "a dry run writes nothing: {body}"
+    );
+}

@@ -18854,6 +18854,14 @@ pub const WEBHOOK_DELIVERY_CONSUMER: &str = "webhook.delivery";
 /// head of an ordering group must not block the deliveries it is about to revive.
 pub const WEBHOOK_REPLAY_CONSUMER: &str = "webhook.replay";
 
+/// The consumer name ONE batch of a trait MIGRATION JOB drains under (issue #53).
+///
+/// #104 named "migration jobs" as one of the async paths the outbox exists to carry, and
+/// this is that path. A batch rather than a whole job per message: `advance` is resumable
+/// and bounded, so one message moves the job forward by one batch and enqueues the next,
+/// which keeps every handler inside the visibility lease no matter how large the job is.
+pub const TRAIT_MIGRATION_CONSUMER: &str = "traits.migration";
+
 /// The largest exponential-backoff delay, in seconds, a retry schedule may reach
 /// (issue #104). The doubling is capped here rather than left to overflow, so a
 /// long-lived poison message's next attempt stays a number an operator can reason about
@@ -51612,6 +51620,21 @@ pub struct NewTraitMigrationJob<'a> {
     pub transform_json: Option<&'a str>,
 }
 
+/// What starting a migration job needs beyond the job's own definition (issue #53).
+///
+/// Grouped so [`ActingTraitMigrationJobRepo::create`] stays inside the argument budget,
+/// and because both fields exist for the same reason: the create has to be ONE atomic
+/// write. The job row, the message that will advance it, and the stored idempotent
+/// response all commit together or not at all.
+pub struct TraitMigrationStart<'a> {
+    /// The payload the first batch message carries. Built by the WORKER's own helper, so
+    /// the producer and the consumer cannot disagree about its shape.
+    pub first_batch_payload: &'a serde_json::Value,
+    /// The management idempotency record, so a retried create replays its response rather
+    /// than starting a second job over the same identities.
+    pub idempotency: Option<IdempotencyWrite<'a>>,
+}
+
 /// Build a [`TraitSchemaVersion`] from a selected registry row.
 fn trait_schema_version_from_row(
     scope: Scope,
@@ -52253,12 +52276,42 @@ impl ActingTraitMigrationJobRepo<'_> {
         env: &Env,
         spec: NewTraitMigrationJob<'_>,
         created_at_micros: i64,
+        start: TraitMigrationStart<'_>,
     ) -> Result<TraitMigrationJobId, StoreError> {
+        let id = TraitMigrationJobId::generate(env, &self.scope);
+        self.create_with_id(env, &id, spec, created_at_micros, start)
+            .await?;
+        Ok(id)
+    }
+
+    /// Create a queued job under an id the CALLER minted.
+    ///
+    /// The caller needs the id before the write whenever the response it stores under an
+    /// Idempotency-Key mentions it, and the first batch's payload names it too. Minting it
+    /// outside is what lets the job row, its first queue message and the idempotent
+    /// response all commit in ONE transaction.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the target version does not exist in this scope, or the
+    /// id is from another scope; [`StoreError::SchemaMalformed`] if the transform program
+    /// is malformed; [`StoreError::Database`] on a persistence failure.
+    pub async fn create_with_id(
+        &self,
+        env: &Env,
+        id: &TraitMigrationJobId,
+        spec: NewTraitMigrationJob<'_>,
+        created_at_micros: i64,
+        start: TraitMigrationStart<'_>,
+    ) -> Result<(), StoreError> {
         let scope = self.scope;
+        if id.scope() != scope {
+            return Err(StoreError::NotFound);
+        }
         // The transform program must parse (a dry-run leaves it empty).
         let transform_json = spec.transform_json.unwrap_or("[]");
         crate::trait_schema::parse_transform(transform_json)?;
-        let id = TraitMigrationJobId::generate(env, &scope);
+        let id = *id;
         let transform_owned = transform_json.to_string();
         write_audited(
             AuditedWrite {
@@ -52327,12 +52380,32 @@ impl ActingTraitMigrationJobRepo<'_> {
                 .bind(created_at_micros)
                 .execute(&mut **tx)
                 .await?;
+                // The FIRST batch is queued in the SAME transaction as the job row, which
+                // is the whole point of a transactional outbox: a job that exists always
+                // has a message that will advance it, and a rolled back create leaves no
+                // message pointing at a job that was never written.
+                //
+                // Nothing polls for pending jobs, so without this a created job would sit
+                // at `pending` forever, which is the dormant shape mounting this layer
+                // exists to remove.
+                enqueue_outbox_in_tx(
+                    tx,
+                    env,
+                    scope,
+                    &NewOutboxMessage {
+                        consumer: TRAIT_MIGRATION_CONSUMER,
+                        idempotency_key: &format!("job:{id}"),
+                        ordering_key: &id.to_string(),
+                        payload: start.first_batch_payload.clone(),
+                    },
+                )
+                .await?;
+                insert_idempotency(tx, start.idempotency).await?;
                 Ok(())
             },
             false,
         )
-        .await?;
-        Ok(id)
+        .await
     }
 
     /// Advance a job by ONE bounded batch and return its refreshed state (issue #53).

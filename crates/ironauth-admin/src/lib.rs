@@ -100,6 +100,7 @@ mod state;
 mod step_up_policies;
 mod sudo;
 mod tenants;
+pub mod trait_migration_worker;
 mod trait_schemas;
 mod users;
 mod variables;
@@ -814,6 +815,16 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas/{version}/activate",
             post(trait_schemas::activate_trait_schema_version),
+        )
+        // Trait MIGRATION jobs (issue #53): the store shipped create/get/advance with no
+        // caller, so this is where an operator starts one and watches it.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas/migrations",
+            post(trait_schemas::create_trait_migration_job),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas/migrations/{job_id}",
+            axum::routing::get(trait_schemas::get_trait_migration_job),
         )
         // Admin user-invitation CRUD (issue #60): create (provisioning a
         // pending_verification user and a single-use, expiring, unguessable token),

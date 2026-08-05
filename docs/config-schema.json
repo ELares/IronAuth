@@ -2446,6 +2446,25 @@
         }
       ]
     },
+    "TraitsConfig": {
+      "additionalProperties": false,
+      "description": "Schema-driven identity trait settings (issue #53).\n\nOne knob so far: whether this process runs the worker that advances trait MIGRATION\njobs. The job itself is created over the management API and its progress is durable, so\na deployment that never opens this section can still create jobs; they simply wait\nuntil a process that runs the worker picks them up.",
+      "properties": {
+        "migration_batch_size": {
+          "default": 500,
+          "description": "How many identities ONE batch of a migration job processes before the worker\nyields and re-queues the next batch.\n\nBatching is what keeps a 100k-identity migration off a single long transaction and\ninside the outbox visibility lease. The default (500) is chosen so a batch finishes\nwell within the default 30 second lease; raising it past what one batch can do in\nthat window causes the message to be redelivered mid-batch, which is safe (advance\nis resumable and idempotent) but wasteful. Must be at least 1.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "migration_worker_enabled": {
+          "default": false,
+          "description": "Whether THIS process drains the `traits.migration` queue and advances migration\njobs in batches. OFF by default, like every other background worker here.\n\nOff does not mean a job is lost: `trait_migration_jobs` records progress per batch,\nso a job created with no worker running is picked up unchanged whenever one starts.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "WaitlistConfig": {
       "additionalProperties": false,
       "description": "The waitlist gate (issue #80). OFF by default. When on, a self-service registration\nlands in a PENDING (`waitlisted`) lifecycle state that CANNOT authenticate until an\nadmin approves it (transition to active) or rejects it (transition to disabled) through\nthe user-lifecycle management API.",
@@ -2907,6 +2926,14 @@
         "permission_claim_warn_count": 192
       },
       "description": "Token claim budget settings (issue #98): the SIZE bounds an access token\ncarrying a permissions claim is held to. The budget is a\nsize bound on a TOKEN, never a cap on how many permissions or roles may be\nSTORED; every key is named for the CLAIM it bounds rather than for the model,\nso `permission_claim_max_count` bounds what one claim carries, and there is\nno `max_permissions_per_role` and there never will be.\n\nA top-level section rather than a field on `[oidc]` deliberately, because\nthe budget is consumed on BOTH planes: the mint enforces it and the\nmanagement API reports the approach warning against it, so one bound has one\noperator-visible name."
+    },
+    "traits": {
+      "$ref": "#/$defs/TraitsConfig",
+      "default": {
+        "migration_batch_size": 500,
+        "migration_worker_enabled": false
+      },
+      "description": "Schema-driven identity traits (issue #53): whether this process advances trait\nmigration jobs, and how large one batch is."
     },
     "webhooks": {
       "$ref": "#/$defs/WebhooksConfig",

@@ -21,7 +21,7 @@ use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
     CorrelationId, NewAdminUser, NewTraitMigrationJob, NewUserTraits, Scope, StoreError,
-    TraitJobKind, TraitJobStatus, TraitWriteVisibility, UserId, UserState,
+    TraitJobKind, TraitJobStatus, TraitMigrationStart, TraitWriteVisibility, UserId, UserState,
 };
 use serde_json::json;
 use sqlx::Row;
@@ -394,6 +394,13 @@ async fn versioning_is_immutable_and_a_dry_run_reports_and_blocks_the_cutover() 
                 transform_json: None,
             },
             NOW_MICROS,
+            // These tests drive `advance` by hand, so the first batch message this write
+            // also enqueues is never claimed. It is still written, which is the point:
+            // the create is ONE transaction covering the job row and its first batch.
+            TraitMigrationStart {
+                first_batch_payload: &serde_json::json!({}),
+                idempotency: None,
+            },
         )
         .await
         .expect("create dry-run");
@@ -496,6 +503,13 @@ async fn a_migration_job_transforms_deterministically_idempotently_and_unblocks_
                 transform_json: Some(&transform),
             },
             NOW_MICROS,
+            // These tests drive `advance` by hand, so the first batch message this write
+            // also enqueues is never claimed. It is still written, which is the point:
+            // the create is ONE transaction covering the job row and its first batch.
+            TraitMigrationStart {
+                first_batch_payload: &serde_json::json!({}),
+                idempotency: None,
+            },
         )
         .await
         .expect("create migrate");
@@ -574,6 +588,13 @@ async fn a_migration_job_transforms_deterministically_idempotently_and_unblocks_
                 transform_json: Some(&transform),
             },
             NOW_MICROS,
+            // These tests drive `advance` by hand, so the first batch message this write
+            // also enqueues is never claimed. It is still written, which is the point:
+            // the create is ONE transaction covering the job row and its first batch.
+            TraitMigrationStart {
+                first_batch_payload: &serde_json::json!({}),
+                idempotency: None,
+            },
         )
         .await
         .expect("fresh job");
@@ -660,6 +681,13 @@ async fn a_migration_job_is_scoped_and_never_touches_another_tenant() {
                 transform_json: Some(&transform),
             },
             NOW_MICROS,
+            // These tests drive `advance` by hand, so the first batch message this write
+            // also enqueues is never claimed. It is still written, which is the point:
+            // the create is ONE transaction covering the job row and its first batch.
+            TraitMigrationStart {
+                first_batch_payload: &serde_json::json!({}),
+                idempotency: None,
+            },
         )
         .await
         .expect("create job");

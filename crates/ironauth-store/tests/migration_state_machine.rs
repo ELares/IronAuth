@@ -23,7 +23,7 @@ use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
     CompletionOutcome, CorrelationId, InvariantKind, MigrationKind, MigrationRecordOutcome,
     MigrationRunId, MigrationState, NewAdminUser, NewMigrationRun, NewTraitMigrationJob,
-    RecordOutcomeInput, Scope, Store, StoreError, TraitJobKind, UserState,
+    RecordOutcomeInput, Scope, Store, StoreError, TraitJobKind, TraitMigrationStart, UserState,
 };
 use serde_json::json;
 use sqlx::Row;
@@ -832,6 +832,13 @@ async fn a_schema_migration_job_wrapped_in_the_machine_blocks_on_failed_identiti
                 transform_json: None,
             },
             NOW_MICROS,
+            // This test drives `advance` directly, so the first batch message the create
+            // also writes is never claimed; it is still written, which is what makes the
+            // create one transaction over the job row and its first batch.
+            TraitMigrationStart {
+                first_batch_payload: &serde_json::json!({}),
+                idempotency: None,
+            },
         )
         .await
         .expect("create job");

@@ -113,6 +113,7 @@ fn operation_ids_are_the_stable_set() {
             "createOrganization",
             "createPermission",
             "createTenant",
+            "createTraitMigrationJob",
             "createTraitSchemaVersion",
             "createUser",
             "createWebhookEndpoint",
@@ -178,6 +179,7 @@ fn operation_ids_are_the_stable_set() {
             "getSignupForm",
             "getSmsOtpConfig",
             "getTenant",
+            "getTraitMigrationJob",
             "getTraitSchemaVersion",
             "getUser",
             "getUserRiskPosture",
@@ -538,6 +540,7 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/step-up-policies",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas/active",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas/migrations/{job_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas/{version}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/users",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}",
@@ -599,6 +602,7 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/signup-quarantine/{user_id}/reject",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/step-up-policies",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas/migrations",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas/{version}/activate",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/users",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/consents/{client_id}/revoke",
@@ -720,7 +724,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        187,
+        189,
         "the documented route count is pinned"
     );
 
