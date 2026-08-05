@@ -19160,18 +19160,26 @@ pub struct OutboxDepth {
     /// rows and `dead_lettered` counts the tail retention deliberately keeps forever by
     /// default, so none of the four could ever have shown the reapable backlog.
     ///
-    /// What this is NOT, stated because the obvious reading is wrong and this crate was
-    /// caught making it: it is not an operator-facing surface today.
-    /// [`depth`](OutboxRepo::depth) has NO production caller in this tree, so nothing
-    /// exports this number and no deployment can read it. What actually leaves the process
-    /// are the [`RetentionObserver`](crate::outbox::RetentionObserver) reports the binary
-    /// logs, and the SATURATED flag on them is the signal that distinguishes "keeping up"
-    /// from "falling behind forever". Exporting the depth gauge, this field included, is
-    /// recorded as the remaining gap in `docs/design/RETENTION.md`. It is deliberately NOT
-    /// done from inside the sweep: `depth` is an unbounded `count(*)` over the scope, and
-    /// a pass whose whole story is boundedness must not grow a second unbounded read to
-    /// produce a number nothing reads.
+    /// This field's doc used to say `depth` had no production caller and that nothing
+    /// exported it. Both statements have since expired: the queues management API reads
+    /// `depth` per scope, and the metrics sampler reads it across scopes to set the
+    /// `ironauth_outbox_depth` gauge. What has NOT changed is why neither reader lives
+    /// inside the retention sweep: `depth` is an unbounded `count(*)` over the scope, and
+    /// a pass whose whole story is boundedness must not grow a second unbounded read. The
+    /// sampler is a separate task on its own interval for exactly that reason.
     pub completed: i64,
+
+    /// When the OLDEST message that is ready RIGHT NOW became due, in microseconds since
+    /// the Unix epoch, or [`None`] when nothing is ready.
+    ///
+    /// Subtracting it from the current time gives consumer lag: how long the queue's head
+    /// has been waiting for a worker that has not come. It filters on exactly the rows
+    /// `ready` counts, so the two can never disagree about what "ready" means, and a
+    /// message still waiting out its retry backoff is deliberately excluded. That message
+    /// is waiting BY DESIGN, and counting it would make a healthy queue with a long
+    /// backoff indistinguishable from a stalled one, which is the whole distinction the
+    /// number exists to draw.
+    pub oldest_ready_at_unix_micros: Option<i64>,
 }
 
 /// The columns every outbox read selects, in one place so the claim, the pending peek,
@@ -19823,7 +19831,12 @@ impl OutboxRepo<'_> {
                  AND next_attempt_at > bounds.now_at \
                  AND (claimed_at IS NULL OR claimed_at < bounds.lease_at)) AS scheduled, \
                count(*) FILTER (WHERE dead_lettered_at IS NOT NULL) AS dead_lettered, \
-               count(*) FILTER (WHERE completed_at IS NOT NULL) AS completed \
+               count(*) FILTER (WHERE completed_at IS NOT NULL) AS completed, \
+               (EXTRACT(EPOCH FROM min(next_attempt_at) FILTER ( \
+                 WHERE completed_at IS NULL AND dead_lettered_at IS NULL \
+                 AND next_attempt_at <= bounds.now_at \
+                 AND (claimed_at IS NULL OR claimed_at < bounds.lease_at))) \
+                 * 1000000)::bigint AS oldest_ready_us \
              FROM outbox_messages, bounds \
              WHERE tenant_id = $1 AND environment_id = $2 AND consumer = $3",
         )
@@ -19841,6 +19854,7 @@ impl OutboxRepo<'_> {
             scheduled: row.get("scheduled"),
             dead_lettered: row.get("dead_lettered"),
             completed: row.get("completed"),
+            oldest_ready_at_unix_micros: row.get("oldest_ready_us"),
         })
     }
 

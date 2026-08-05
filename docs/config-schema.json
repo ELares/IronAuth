@@ -1525,6 +1525,13 @@
           "minimum": 0,
           "type": "integer"
         },
+        "metrics_sample_interval_secs": {
+          "default": 15,
+          "description": "How often, in seconds, the metrics sampler reads queue depth and consumer lag into\nthe `ironauth_outbox_depth` and `ironauth_outbox_oldest_ready_age_seconds` gauges.\n\nIt trades the freshness of two gauges against database load, and the load is the\npart worth stating plainly, because \"it queries every scope\" reads alarming without\nthe comparison: the drain ALREADY issues a claim per scope per consumer every\n`poll_interval_secs`, which defaults to 5. A sample every 15 seconds adds one read\nper scope per consumer at a third of a cadence the deployment is already paying,\nover the same index. A deployment that finds it too expensive lengthens it and\nloses only gauge resolution: the counters come from the drain itself and are\nunaffected.\n\nIt is deliberately NOT folded into the retention sweep or the drain. `depth` is an\nunbounded `count(*)` over the scope, and both of those passes have bounded cost by\ndesign; giving either of them a second unbounded read would trade a property they\nare built around for a number that does not need to be that fresh.\n\nMust be at least 1 and at most `OIDC_MAX_LIFETIME_SECS`. There is no \"disabled\"\nvalue: a deployment that wants less sampling sets a long interval and still gets a\nseries, rather than an absent one that looks exactly like a dead process to\nwhatever alerts on it.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "poll_interval_secs": {
           "default": 5,
           "description": "How often, in seconds, an idle worker polls for due work. It bounds the latency\nbetween a message being enqueued and being picked up, and it is a straight trade\nagainst database load: every worker of every consumer issues one claim per\ninterval per scope even when the queue is empty.\n\nThe default (5) matches the cadence the back-channel logout worker already runs\nat. Must be at least 1 and at most `OIDC_MAX_LIFETIME_SECS`.",
@@ -2828,6 +2835,7 @@
         "completed_retention_secs": 604800,
         "dead_letter_retention_secs": 0,
         "max_attempts": 14,
+        "metrics_sample_interval_secs": 15,
         "poll_interval_secs": 5,
         "reap_batch": 1000,
         "reap_enabled": true,

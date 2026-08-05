@@ -563,6 +563,8 @@ async fn a_failing_message_backs_off_and_the_attempts_bound_dead_letters_it() {
             scheduled: 0,
             dead_lettered: 1,
             completed: 0,
+            // Nothing is ready, so there is no head of the queue and therefore no lag.
+            oldest_ready_at_unix_micros: None,
         },
         "the dead letter is the number an alert fires on"
     );
@@ -2185,6 +2187,10 @@ async fn depth_reports_ready_in_flight_scheduled_dead_lettered_and_completed_sep
     let queue = store.scoped(scope);
     let queue = queue.outbox();
 
+    // Every message below is enqueued at THIS instant and becomes due immediately, so it is
+    // also the due time of whichever of them is the oldest ready one, which is what the lag
+    // reading must return in both assertions.
+    let enqueued_at = epoch_micros_of(&env);
     // Fifteen messages in fifteen groups, so none of them blocks another and the state each
     // ends in is the state this test put it in.
     for n in 0..15 {
@@ -2255,6 +2261,9 @@ async fn depth_reports_ready_in_flight_scheduled_dead_lettered_and_completed_sep
             scheduled: 3,
             dead_lettered: 4,
             completed: 5,
+            // The one never-claimed message is the head of the queue, and it came due the
+            // moment it was enqueued.
+            oldest_ready_at_unix_micros: Some(enqueued_at),
         },
         "every counter is separately measured, and no two of them are the same number"
     );
@@ -2272,6 +2281,11 @@ async fn depth_reports_ready_in_flight_scheduled_dead_lettered_and_completed_sep
             scheduled: 0,
             dead_lettered: 4,
             completed: 5,
+            // Six messages are ready now, and the oldest is still the one that was never
+            // claimed: the two lapsed leases never moved their gate, and the three retries
+            // pushed theirs LATER. So the head of the queue did not change when the clock
+            // jumped, only the size of the queue behind it.
+            oldest_ready_at_unix_micros: Some(enqueued_at),
         },
         "in flight and scheduled are readings of the clock against the row, not stored \
          states; the dead letters and the completions are the two permanent ones"
@@ -3354,4 +3368,116 @@ async fn the_shipped_retry_defaults_span_a_real_outage_and_still_terminate() {
             delays.iter().map(|d| d / 1_000_000).collect::<Vec<_>>()
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// 9. Consumer lag: the head of the queue, and what does NOT count as waiting.
+
+#[tokio::test]
+async fn lag_measures_the_oldest_due_message_and_ignores_one_waiting_out_its_backoff() {
+    // `ready` says HOW MANY are waiting; this says HOW LONG the oldest of them has waited.
+    // The two answer different questions and only together distinguish the case that
+    // matters: a queue holding a steady ten messages because ten arrive as ten drain is
+    // healthy, and a queue holding a steady ten because nothing has drained since Tuesday
+    // is not. The counts are identical in both.
+    //
+    // The distinction this pins is the one an implementation gets wrong: a message inside
+    // its retry backoff is NOT lag. It is waiting by design, and counting it would make a
+    // long backoff (the default schedule runs to 37 hours, issue #106) look like a stalled
+    // consumer forever.
+    let db = TestDatabase::start().await;
+    let (env, clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 73);
+    let scope = db.seed_scope(&env).await;
+    let lease = Duration::from_secs(30);
+    let store = db.store();
+    let queue = store.scoped(scope);
+    let queue = queue.outbox();
+
+    let empty = queue.depth(&env, CONSUMER, lease).await.expect("depth");
+    assert_eq!(
+        empty.oldest_ready_at_unix_micros, None,
+        "an empty queue has no head, and therefore no lag to report"
+    );
+
+    let first_at = epoch_micros_of(&env);
+    enqueue(&db, &env, scope, "old", "agg-old").await;
+    clock.advance(Duration::from_secs(600));
+    enqueue(&db, &env, scope, "new", "agg-new").await;
+
+    let both = queue.depth(&env, CONSUMER, lease).await.expect("depth");
+    assert_eq!(both.ready, 2, "both messages are due and unclaimed");
+    assert_eq!(
+        both.oldest_ready_at_unix_micros,
+        Some(first_at),
+        "lag is the OLDEST due message, not the newest and not an average: the newer \
+         message arriving must not make the queue look ten minutes healthier"
+    );
+
+    // Take the older one out of `ready` by failing it retryably, which releases its lease
+    // and pushes its gate into the future. It is still in the queue and still undelivered.
+    let claimed = queue.claim(&env, CONSUMER, lease, 1).await.expect("claim");
+    assert_eq!(
+        claimed.len(),
+        1,
+        "the batch limit claims exactly the oldest"
+    );
+    assert_eq!(
+        claimed[0].idempotency_key, "old",
+        "the claim takes the oldest first, which is what makes the next assertion about \
+         the message this test intends"
+    );
+    assert!(matches!(
+        queue
+            .fail(&env, &claimed[0], "http_status_503", RetryPolicy::default())
+            .await
+            .expect("retryable failure"),
+        FailureOutcome::Retrying { .. }
+    ));
+
+    let after = queue.depth(&env, CONSUMER, lease).await.expect("depth");
+    assert_eq!(
+        after.ready, 1,
+        "the retried message left `ready` for `scheduled`"
+    );
+    assert_eq!(after.scheduled, 1, "and it is waiting out its backoff");
+    assert_eq!(
+        after.oldest_ready_at_unix_micros,
+        Some(first_at + 600 * 1_000_000),
+        "the head of the queue is now the SECOND message: the retried one is waiting by \
+         design and must not be counted as lag, or a healthy queue with a long backoff \
+         would be indistinguishable from a stalled one"
+    );
+
+    // Now drain the only ready message, leaving JUST the one waiting out its backoff.
+    //
+    // This is the state that actually tests the due gate, and the assertion above does not
+    // reach it. A retry always pushes its gate LATER than the moment it failed, and a ready
+    // message's gate is by definition already past, so while anything is ready the oldest
+    // gate in the table belongs to a ready message either way. Measured: deleting the due
+    // gate from the lag filter leaves the assertion above passing. Only with nothing ready
+    // does the difference become observable, and it is the difference between "no lag" and
+    // a reading taken from a message that is not waiting for a worker at all.
+    let last = queue.claim(&env, CONSUMER, lease, 1).await.expect("claim");
+    assert_eq!(
+        last.len(),
+        1,
+        "the second message is the only one claimable"
+    );
+    assert!(
+        queue.complete(&env, &last[0]).await.expect("completion"),
+        "the lease is still ours, so the completion lands"
+    );
+
+    let only_scheduled = queue.depth(&env, CONSUMER, lease).await.expect("depth");
+    assert_eq!(only_scheduled.ready, 0, "nothing is due");
+    assert_eq!(
+        only_scheduled.scheduled, 1,
+        "one message is inside its backoff"
+    );
+    assert_eq!(
+        only_scheduled.oldest_ready_at_unix_micros, None,
+        "a queue whose only remaining message is inside its retry backoff has NO lag: it \
+         is waiting on a clock, not on a worker. Reporting its future gate here would put \
+         a permanent non-zero reading on a consumer that is behaving exactly as designed"
+    );
 }

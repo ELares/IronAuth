@@ -35,6 +35,8 @@ use ironauth_oidc::{
 };
 use ironauth_quota::QuotaEnforcer;
 use ironauth_server::{Server, ServerError};
+use std::collections::{BTreeMap, BTreeSet};
+
 use ironauth_store::{
     AbuseBanId, AbuseSubject, AbuseSubjectKind, ActorRef, AuthPath, ClientId, CorrelationId,
     EnvironmentId, NewBan, RetryPolicy, SESSION_ENDED_CONSUMER, Scope, ServiceId, Store,
@@ -282,6 +284,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // gated on the consumer switch would be missing from the deployment where the table
         // grows fastest. The only switch is `outbox.reap_enabled`, which defaults ON.
         let retention_inputs = retention_sweeper_inputs(&config, &env);
+        let metrics_sampler_inputs_captured = metrics_sampler_inputs(&config, &env);
         let webhook_inputs = webhook_delivery_inputs(&config, &env);
         let trait_migration = trait_migration_inputs(&config, &env);
         let offboarding = offboarding_inputs(&config, &env);
@@ -412,6 +415,12 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             None
         };
 
+        // The depth and lag gauges (issue #104), started beside the reaper and for the same
+        // reason: the outbox is a GENERIC substrate, so its observability must not sit
+        // behind any one consumer's switch. It has no switch of its own; see
+        // `metrics_sampler_inputs`.
+        let metrics_sampler = start_metrics_sampler(metrics_sampler_inputs_captured).await;
+
         tracing::info!(base_url = %server.base_url(), "starting ironauth");
 
         let outcome = match server.run(ironauth_server::shutdown_signal()).await {
@@ -440,6 +449,11 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // reach are still there for the next boot.
         if let Some(sweeper) = retention_sweeper {
             sweeper.shutdown().await;
+        }
+        // Stopped last: it reads the same table the pools and the reaper write, and a
+        // sample racing their shutdown would publish a reading of a queue mid-drain.
+        if let Some(sampler) = metrics_sampler {
+            sampler.shutdown().await;
         }
         outcome
     })
@@ -1373,7 +1387,7 @@ async fn spawn_offboarding_pools(inputs: OffboardingInputs) -> Vec<OutboxWorkerP
     }
 
     let scopes: Arc<dyn ScopeSource> = Arc::new(ControlPlaneScopes::new(control_store));
-    let observer: Arc<dyn OutboxObserver> = Arc::new(TracingOutboxObserver);
+    let observer = outbox_observer();
     let pools = spawn_consumer_pools(&consumers, &data_store, &env, &outbox, &scopes, &observer);
 
     tracing::info!(
@@ -1610,6 +1624,127 @@ fn outbox_worker_settings(outbox: &OutboxConfig, consumer: &str) -> WorkerSettin
             max_attempts,
             retry_base: std::time::Duration::from_secs(outbox.retry_base_secs),
         },
+    }
+}
+
+/// The observer EVERY outbox pool in this binary reports through (issue #104).
+///
+/// It exists because there are four separate boot seams that spawn pools (session ended and
+/// offboarding, back-channel logout, webhook delivery, trait migration), and each one used to
+/// construct its own observer. Four copies of a wiring decision is four places to forget it,
+/// and forgetting it in one is not visible as an error: the pool runs, the dashboard has
+/// series on it, and only the consumers nobody thought about are missing. One constructor
+/// makes "every pool reports the same way" a property of the code rather than of four edits
+/// staying in agreement.
+///
+/// Logging and metrics are composed here rather than merged into one type because their
+/// policies genuinely differ. [`TracingOutboxObserver`] is deliberately SILENT on a healthy
+/// pass, since one line per pool per scope per poll interval would bury the lines that
+/// matter. The metrics observer must count every pass including the healthy ones, because a
+/// counter that skips the healthy case cannot express a rate. Entangling the two would force
+/// one of those policies to give.
+fn outbox_observer() -> Arc<dyn OutboxObserver> {
+    Arc::new(PairObserver::new(
+        TracingOutboxObserver,
+        MetricsOutboxObserver,
+    ))
+}
+
+/// Fan every observer hook out to two observers (issue #104).
+///
+/// Deliberately a pair rather than a `Vec<Arc<dyn OutboxObserver>>`: the composition this
+/// binary needs is exactly two, and a list would invite an empty one, which is silence that
+/// reads as configuration.
+struct PairObserver<A, B> {
+    first: A,
+    second: B,
+}
+
+impl<A, B> PairObserver<A, B> {
+    /// Report to `first`, then `second`, for every hook.
+    const fn new(first: A, second: B) -> Self {
+        Self { first, second }
+    }
+}
+
+impl<A, B> OutboxObserver for PairObserver<A, B>
+where
+    A: OutboxObserver,
+    B: OutboxObserver,
+{
+    fn pass_finished(&self, consumer: &str, scope: Scope, stats: &DrainStats) {
+        self.first.pass_finished(consumer, scope, stats);
+        self.second.pass_finished(consumer, scope, stats);
+    }
+
+    fn pass_failed(&self, consumer: &str, scope: Scope, error: &StoreError) {
+        self.first.pass_failed(consumer, scope, error);
+        self.second.pass_failed(consumer, scope, error);
+    }
+
+    fn scopes_unavailable(&self, consumer: &str, error: &StoreError) {
+        self.first.scopes_unavailable(consumer, error);
+        self.second.scopes_unavailable(consumer, error);
+    }
+}
+
+/// Count what the outbox pools are doing into the Prometheus registry (issue #104).
+///
+/// Every series here is labeled by CONSUMER ONLY. The scope is deliberately dropped: a label
+/// per tenant on a multi-tenant deployment is an unbounded cardinality time series, which is
+/// the standard way to take down a Prometheus instance, and the per-scope numbers already
+/// have a home on the authenticated queues API where they can be afforded. The cost of that
+/// choice, stated so nobody has to rediscover it: these counters can tell an operator that a
+/// consumer is dead-lettering, and cannot tell them which tenant it is dead-lettering for.
+/// The log line from [`TracingOutboxObserver`] carries the scope, and is the intended next
+/// stop when a counter moves.
+struct MetricsOutboxObserver;
+
+impl OutboxObserver for MetricsOutboxObserver {
+    fn pass_finished(&self, consumer: &str, _scope: Scope, stats: &DrainStats) {
+        let consumer = consumer.to_owned();
+        metrics::counter!(
+            ironauth_server::metrics::OUTBOX_MESSAGES_CLAIMED_TOTAL,
+            "consumer" => consumer.clone()
+        )
+        .increment(stats.claimed);
+        // Emitted even when the count is zero, so the series EXISTS from the first pass. A
+        // counter that appears only once it has something to say is indistinguishable from a
+        // pool that was never started, which is precisely the condition an operator wants to
+        // tell apart.
+        for (outcome, count) in [
+            ("completed", stats.completed),
+            ("retried", stats.retried),
+            ("dead_lettered", stats.dead_lettered),
+            ("lease_lost", stats.lease_lost),
+        ] {
+            metrics::counter!(
+                ironauth_server::metrics::OUTBOX_MESSAGES_TOTAL,
+                "consumer" => consumer.clone(),
+                "outcome" => outcome
+            )
+            .increment(count);
+        }
+    }
+
+    fn pass_failed(&self, consumer: &str, _scope: Scope, _error: &StoreError) {
+        metrics::counter!(
+            ironauth_server::metrics::OUTBOX_PASS_FAILURES_TOTAL,
+            "consumer" => consumer.to_owned(),
+            "kind" => "drain"
+        )
+        .increment(1);
+    }
+
+    fn scopes_unavailable(&self, consumer: &str, _error: &StoreError) {
+        // A separate `kind` rather than the same counter, because the two failures are not
+        // the same size: a drain failure lost one scope's pass, and this lost EVERY scope's.
+        metrics::counter!(
+            ironauth_server::metrics::OUTBOX_PASS_FAILURES_TOTAL,
+            "consumer" => consumer.to_owned(),
+            "kind" => "scopes"
+        )
+        .increment(1);
     }
 }
 
@@ -1940,6 +2075,241 @@ async fn start_retention_sweeper(inputs: RetentionSweeperInputs) -> Option<Reten
     Some(sweeper)
 }
 
+/// A running outbox metrics sampler (issue #104), and the means to stop it.
+struct MetricsSampler {
+    /// Flipped to stop the loop at its next wake or mid-sleep, whichever comes first.
+    stop: tokio::sync::watch::Sender<bool>,
+    /// The sampling task, awaited by [`shutdown`](MetricsSampler::shutdown).
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl MetricsSampler {
+    /// Stop sampling and wait for the in-flight pass.
+    ///
+    /// Nothing is lost by stopping part way through a pass: a gauge holds its last written
+    /// value, and the process is going away regardless.
+    async fn shutdown(self) {
+        let _ = self.stop.send(true);
+        let _ = self.task.await;
+    }
+}
+
+/// What the outbox metrics sampler needs to run, captured before `config` moves into the
+/// server.
+struct MetricsSamplerInputs {
+    /// The shared `[outbox]` section, for the sampling interval and the lease width the
+    /// depth read needs to tell an in-flight message from a reclaimable one.
+    outbox: OutboxConfig,
+    /// The control-plane DSN. As with the reaper, ONE store serves both halves: scope
+    /// enumeration reads `environments`, which only the control role may read, and 0099
+    /// grants that same role SELECT on `outbox_messages`. [`None`] means no gauges.
+    control_dsn: Option<String>,
+    /// The environment seam, whose clock turns a due time into an age.
+    env: Env,
+}
+
+/// Capture the metrics sampler's inputs from config (issue #104).
+///
+/// There is no switch to consult. Unlike the reaper beside it, this has no `enabled` flag:
+/// sampling costs a bounded read and produces the only queue-depth signal that leaves the
+/// process, and an operator who wants less of it lengthens
+/// `outbox.metrics_sample_interval_secs`. A boolean would add a state in which the gauges
+/// are absent, and an absent gauge is indistinguishable from a dead process to whatever
+/// alerts on it.
+fn metrics_sampler_inputs(config: &Config, env: &Env) -> MetricsSamplerInputs {
+    MetricsSamplerInputs {
+        outbox: config.outbox.clone(),
+        control_dsn: select_control_dsn(config),
+        env: env.clone(),
+    }
+}
+
+/// Start the outbox metrics sampler (issue #104), or return [`None`] with the reason logged.
+///
+/// This is the reader that `OutboxDepth` was built for and did not have. The counters on
+/// [`MetricsOutboxObserver`] say what the workers DID; these gauges say what is still
+/// waiting, which is the half no amount of counting can reconstruct: a queue being drained
+/// steadily and a queue falling behind produce identical completion counts.
+async fn start_metrics_sampler(inputs: MetricsSamplerInputs) -> Option<MetricsSampler> {
+    let MetricsSamplerInputs {
+        outbox,
+        control_dsn,
+        env,
+    } = inputs;
+
+    let Some(control_dsn) = control_dsn else {
+        tracing::warn!(
+            "outbox depth and lag gauges NOT running: no control-plane DSN (set \
+             admin.control_database_url, or run in dev_mode). Scope enumeration reads \
+             `environments`, which only the ironauth_control role may read. The outbox \
+             itself is unaffected and nothing is lost; what is missing is the only signal \
+             that distinguishes a queue being drained from a queue falling behind."
+        );
+        return None;
+    };
+    let control_store = match Store::connect(&control_dsn).await {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "outbox depth and lag gauges NOT running: control-plane connect failed"
+            );
+            return None;
+        }
+    };
+
+    let scopes: Arc<dyn ScopeSource> = Arc::new(ControlPlaneScopes::new(control_store.clone()));
+    let interval = std::time::Duration::from_secs(outbox.metrics_sample_interval_secs);
+    let lease = std::time::Duration::from_secs(outbox.visibility_timeout_secs);
+    let (stop, mut stopped) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(async move {
+        // Every consumer name this process has EVER seen carrying a message. It only grows,
+        // and that is the point: a consumer that drains to empty keeps reporting zero
+        // instead of dropping off the exposition. `consumers_in_scope` answers "who has rows
+        // here", so without this set an idle consumer and an unstarted one look identical to
+        // an alert, which is the exact confusion the gauge exists to prevent.
+        //
+        // What it cannot do, stated because the ceiling is real: a consumer that has never
+        // enqueued a single message in any scope has no name to learn, so it reports nothing
+        // until its first message. The queue is the only source of names here, deliberately,
+        // because the four pool seams register their consumers separately and a registry
+        // threaded through all of them would be a fifth thing to keep in agreement.
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        loop {
+            let sampled = sample_outbox_depth(&control_store, &env, &scopes, lease).await;
+            match sampled {
+                Ok(totals) => {
+                    seen.extend(totals.keys().cloned());
+                    publish_outbox_depth(&seen, &totals);
+                }
+                Err(error) => tracing::warn!(
+                    %error,
+                    "outbox depth sample failed; the gauges hold their previous values"
+                ),
+            }
+            tokio::select! {
+                () = tokio::time::sleep(interval) => {}
+                _ = stopped.changed() => break,
+            }
+            if *stopped.borrow() {
+                break;
+            }
+        }
+    });
+
+    tracing::info!(
+        metrics_sample_interval_secs = outbox.metrics_sample_interval_secs,
+        "outbox depth and lag gauges started"
+    );
+    Some(MetricsSampler { stop, task })
+}
+
+/// The application clock as microseconds since the Unix epoch.
+///
+/// Time comes from the SEAM, never from the system clock directly, so the age this sampler
+/// reports is measured against the same clock that stamped the due time it subtracts.
+fn epoch_micros(at: std::time::SystemTime) -> i64 {
+    i64::try_from(
+        at.duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros(),
+    )
+    .unwrap_or(i64::MAX)
+}
+
+/// One consumer's queue position, summed across every scope in one sampling pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DepthTotals {
+    /// Messages due and unleased: the backlog a worker would claim right now.
+    ready: i64,
+    /// Messages held under an unexpired lease.
+    in_flight: i64,
+    /// Messages whose retry gate is still in the future.
+    scheduled: i64,
+    /// Messages given up on, which no worker will retry.
+    dead_lettered: i64,
+    /// The WORST lag across scopes, in seconds, rather than a sum or a mean.
+    ///
+    /// A sum would grow with the number of tenants and mean nothing; a mean would let one
+    /// badly stuck scope disappear behind a thousand healthy ones. The worst case is the
+    /// number an operator would act on, and it is the only one of the three that keeps its
+    /// meaning as scopes are added.
+    oldest_ready_age_secs: i64,
+}
+
+/// Read every scope's depth for every consumer with rows in it, folded per consumer.
+///
+/// Errors from ONE scope abort the pass rather than being skipped, so a partial reading is
+/// never published as a whole one: a gauge that silently dropped half the fleet would read
+/// as a queue that had drained.
+async fn sample_outbox_depth(
+    store: &Store,
+    env: &Env,
+    scopes: &Arc<dyn ScopeSource>,
+    lease: std::time::Duration,
+) -> Result<BTreeMap<String, DepthTotals>, StoreError> {
+    let now_micros = epoch_micros(env.clock().now_utc());
+    let mut totals: BTreeMap<String, DepthTotals> = BTreeMap::new();
+    for scope in scopes.scopes().await? {
+        let queue = store.scoped(scope);
+        let queue = queue.outbox();
+        for consumer in queue.consumers_in_scope().await? {
+            let depth = queue.depth(env, &consumer, lease).await?;
+            let entry = totals.entry(consumer).or_default();
+            entry.ready += depth.ready;
+            entry.in_flight += depth.in_flight;
+            entry.scheduled += depth.scheduled;
+            entry.dead_lettered += depth.dead_lettered;
+            // Saturating and floored at zero: a due time in the FUTURE would be a clock
+            // going backwards between the read and this subtraction, and a negative lag is
+            // not a thing an operator can act on.
+            let age_secs = depth
+                .oldest_ready_at_unix_micros
+                .map_or(0, |due| (now_micros.saturating_sub(due) / 1_000_000).max(0));
+            entry.oldest_ready_age_secs = entry.oldest_ready_age_secs.max(age_secs);
+        }
+    }
+    Ok(totals)
+}
+
+/// Write one sampling pass into the gauges, reporting zero for every consumer seen before
+/// and absent now.
+fn publish_outbox_depth(seen: &BTreeSet<String>, totals: &BTreeMap<String, DepthTotals>) {
+    for consumer in seen {
+        let totals = totals.get(consumer).copied().unwrap_or_default();
+        for (state, value) in [
+            ("ready", totals.ready),
+            ("in_flight", totals.in_flight),
+            ("scheduled", totals.scheduled),
+            ("dead_lettered", totals.dead_lettered),
+        ] {
+            metrics::gauge!(
+                ironauth_server::metrics::OUTBOX_DEPTH,
+                "consumer" => consumer.clone(),
+                "state" => state
+            )
+            .set(as_gauge(value));
+        }
+        metrics::gauge!(
+            ironauth_server::metrics::OUTBOX_OLDEST_READY_AGE_SECONDS,
+            "consumer" => consumer.clone()
+        )
+        .set(as_gauge(totals.oldest_ready_age_secs));
+    }
+}
+
+/// A queue count as a gauge value.
+///
+/// Prometheus gauges are `f64`, and every value here is a row count or a whole number of
+/// seconds, so the conversion is exact far past any depth a database will hold.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "row counts and second counts are exact in f64 well past any real queue depth"
+)]
+fn as_gauge(value: i64) -> f64 {
+    value as f64
+}
+
 /// Start the OIDC Back-Channel Logout consumers (issue #34) on the generic outbox worker
 /// pool (issue #104), returning the RUNNING pools so the caller can shut them down.
 ///
@@ -2038,7 +2408,7 @@ async fn spawn_backchannel_logout_pools(
     // ONE mapping of the `[outbox]` section for every pool, in `outbox_worker_settings`,
     // so two pools can never be handed different leases from one configuration.
     let scopes: Arc<dyn ScopeSource> = Arc::new(ControlPlaneScopes::new(control_store));
-    let observer: Arc<dyn OutboxObserver> = Arc::new(TracingOutboxObserver);
+    let observer = outbox_observer();
     let pools = spawn_consumer_pools(&consumers, &data_store, &env, &outbox, &scopes, &observer);
 
     tracing::info!(
@@ -2144,7 +2514,7 @@ async fn spawn_webhook_delivery_pools(inputs: WebhookDeliveryInputs) -> Vec<Outb
     }
 
     let scopes: Arc<dyn ScopeSource> = Arc::new(ControlPlaneScopes::new(control_store));
-    let observer: Arc<dyn OutboxObserver> = Arc::new(TracingOutboxObserver);
+    let observer = outbox_observer();
     let pools = spawn_consumer_pools(&consumers, &data_store, &env, &outbox, &scopes, &observer);
 
     tracing::info!(
@@ -2220,7 +2590,7 @@ async fn spawn_trait_migration_pools(inputs: TraitMigrationInputs) -> Vec<Outbox
     }
 
     let scopes: Arc<dyn ScopeSource> = Arc::new(ControlPlaneScopes::new(control_store));
-    let observer: Arc<dyn OutboxObserver> = Arc::new(TracingOutboxObserver);
+    let observer = outbox_observer();
     let pools = spawn_consumer_pools(&consumers, &data_store, &env, &outbox, &scopes, &observer);
 
     tracing::info!(
@@ -3533,5 +3903,82 @@ mod tests {
         };
         validate_idv_provider_jwks(&disabled)
             .expect("a disabled provider's JWKS is not parsed at boot");
+    }
+
+    /// A finished pass writes every outcome into the registry, including the ZERO ones.
+    ///
+    /// This drives the observer rather than a pool, because the thing at risk is the
+    /// translation: `DrainStats` already carried all five numbers and the pool already
+    /// reported them, and what did not exist was anything turning them into a series. A
+    /// test that spun up a pool would exercise the queue and prove nothing about that.
+    ///
+    /// The consumer name is unique to this test because the recorder is process-global and
+    /// shared with every other test in this binary.
+    #[test]
+    fn a_finished_pass_counts_every_outcome_including_the_zero_ones() {
+        let handle = ironauth_server::metrics::recorder_handle();
+        // The scope is DISCARDED by this observer by design (labels are consumer-only), so
+        // any well formed one will do; it is generated rather than written out because ids
+        // carry a checksum and a literal would only ever pin the literal.
+        let env = Env::system();
+        let scope = Scope::new(TenantId::generate(&env), EnvironmentId::generate(&env));
+        MetricsOutboxObserver.pass_finished(
+            "metrics.pin.finished",
+            scope,
+            &DrainStats {
+                claimed: 7,
+                completed: 4,
+                retried: 2,
+                dead_lettered: 1,
+                lease_lost: 0,
+            },
+        );
+        let text = ironauth_server::metrics::render(&handle);
+        let series = |needle: &str| {
+            text.lines()
+                .find(|line| line.contains("metrics.pin.finished") && line.contains(needle))
+                .unwrap_or_else(|| panic!("no {needle} series for the pass; exposition:\n{text}"))
+                .to_owned()
+        };
+        assert!(
+            series("ironauth_outbox_messages_claimed_total").ends_with(" 7"),
+            "the claim count is what says work was PICKED UP at all, and a pool that \
+             claims nothing looks exactly like a pool with nothing to do"
+        );
+        assert!(series("outcome=\"completed\"").ends_with(" 4"), "completed");
+        assert!(series("outcome=\"retried\"").ends_with(" 2"), "retried");
+        assert!(
+            series("outcome=\"dead_lettered\"").ends_with(" 1"),
+            "the dead-letter count is the one an alert fires on"
+        );
+        assert!(
+            series("outcome=\"lease_lost\"").ends_with(" 0"),
+            "a zero outcome must still EXIST as a series: a counter that appears only once \
+             it has something to say cannot be told apart from a pool that never started, \
+             which is the exact question an operator asks it"
+        );
+    }
+
+    /// The two failure hooks are separate `kind` labels, because they are not the same size.
+    #[test]
+    fn a_failed_pass_and_an_unavailable_scope_sweep_count_separately() {
+        let handle = ironauth_server::metrics::recorder_handle();
+        // The scope is DISCARDED by this observer by design (labels are consumer-only), so
+        // any well formed one will do; it is generated rather than written out because ids
+        // carry a checksum and a literal would only ever pin the literal.
+        let env = Env::system();
+        let scope = Scope::new(TenantId::generate(&env), EnvironmentId::generate(&env));
+        MetricsOutboxObserver.pass_failed("metrics.pin.failed", scope, &StoreError::NotFound);
+        MetricsOutboxObserver.scopes_unavailable("metrics.pin.failed", &StoreError::NotFound);
+        let text = ironauth_server::metrics::render(&handle);
+        for kind in ["drain", "scopes"] {
+            let needle = format!("kind=\"{kind}\"");
+            assert!(
+                text.lines()
+                    .any(|line| line.contains("metrics.pin.failed") && line.contains(&needle)),
+                "a {kind} failure went uncounted; losing one scope's pass and losing EVERY \
+                 scope's pass are different sizes of outage and must not share a series"
+            );
+        }
     }
 }
