@@ -1765,8 +1765,12 @@ export async function deleteOrganization(
 // Disable an organization (operationId disableOrganization): the org stays
 // readable (this is NOT a soft delete) but is marked disabled. The returned
 // OrganizationView states the post-condition (`active: false`). The contract marks
-// this idempotent IN EFFECT (re-disabling is a no-op) and takes no Idempotency-Key
-// header, mirroring the tenant suspend lifecycle shape.
+// this idempotent IN EFFECT (re-disabling is a no-op), but the server REQUIRES an
+// Idempotency-Key on it regardless: `set_organization_state` calls
+// `idempotency::required_key` and the published spec marks the header required. This
+// comment previously claimed the opposite and the call omitted the header, so every
+// disable from the console was refused before it reached the toggle. TypeScript 6 is
+// what surfaced it, because the generated bindings had said so all along.
 export async function disableOrganization(
   tenantId: string,
   environmentId: string,
@@ -1777,6 +1781,7 @@ export async function disableOrganization(
     "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/disable",
     {
       params: {
+        header: { "Idempotency-Key": idempotencyKey() },
         path: {
           tenant_id: tenantId,
           environment_id: environmentId,
@@ -1793,8 +1798,9 @@ export async function disableOrganization(
 
 // Re-enable a disabled organization (operationId enableOrganization). The
 // returned OrganizationView states the post-condition (`active: true`). Idempotent
-// in effect (re-enabling is a no-op) and takes no Idempotency-Key header,
-// mirroring the tenant resume lifecycle shape.
+// in effect (re-enabling is a no-op), and the server REQUIRES an Idempotency-Key
+// exactly as the disable above does; the same false comment and the same omitted
+// header were here too, so both halves of the toggle were broken.
 export async function enableOrganization(
   tenantId: string,
   environmentId: string,
@@ -1805,6 +1811,7 @@ export async function enableOrganization(
     "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/enable",
     {
       params: {
+        header: { "Idempotency-Key": idempotencyKey() },
         path: {
           tenant_id: tenantId,
           environment_id: environmentId,
