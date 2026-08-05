@@ -678,11 +678,17 @@ mod tests {
              that maps it however many consumers are registered, and hands the result to \
              one worker pool per registered consumer. It reaches NEITHER plane state. The \
              pools run beside the server on their own data-plane and control-plane stores, \
-             and nothing on OidcState or AdminState holds these knobs, so there is no \
-             shared value here to install; that stays true as consumers are added, because \
-             a pool is not plane state. The reclassification is not a formality: the check \
-             went RED on this key the moment the boot path read it, which is exactly the \
-             rot-detection PR 1 was buying.",
+             and the tuning it hands them is not plane state. The reclassification is not \
+             a formality: the check went RED on this key the moment the boot path read it, \
+             which is exactly the rot-detection PR 1 was buying.\n\n\
+             ONE value from this section now reaches ONE plane, and the earlier claim that \
+             nothing on AdminState holds any of these knobs is no longer true. \
+             `visibility_timeout_secs` is installed with \
+             `AdminState::with_outbox_visibility_timeout` so the queue-depth read can say \
+             what \"in flight\" means, since nothing about a claimed row records how long \
+             its lease was for. It reaches ONE plane because the data plane DRAINS the \
+             queue and never reports on it. It is installed from the same `Config` the \
+             pools are built from, so the report and the drain cannot disagree.",
         ),
         (
             "users",

@@ -86,6 +86,7 @@ mod password_hashing;
 mod permissions;
 mod promotion;
 mod provision;
+mod queues;
 mod ratelimit;
 mod recovery_approvals;
 mod resource_servers;
@@ -912,6 +913,12 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/step-up-policies/{scope_token}",
             axum::routing::delete(step_up_policies::remove_step_up_policy),
+        )
+        // Queue depth for every async consumer in the environment (issue #104): the
+        // reader its `depth` primitive shipped without.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/queues",
+            axum::routing::get(queues::list_queue_depths),
         )
         // Standard Webhooks endpoint registration (issue #105).
         .route(

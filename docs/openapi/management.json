@@ -12444,6 +12444,82 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/queues": {
+      "get": {
+        "tags": [
+          "diagnostics"
+        ],
+        "summary": "Report queue depth for every consumer in the environment.",
+        "operationId": "listQueueDepths",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Queue depth per consumer, by consumer name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QueueDepthList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment is absent",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/recovery-approvals": {
       "get": {
         "tags": [
@@ -22413,6 +22489,65 @@
           "truncated": {
             "type": "boolean",
             "description": "True when the result hit the limit and older matching traces were left out."
+          }
+        }
+      },
+      "QueueDepthList": {
+        "type": "object",
+        "description": "Every consumer's queue depth in this environment.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/QueueDepthView"
+            },
+            "description": "One entry per consumer that has messages in this environment, by name."
+          }
+        }
+      },
+      "QueueDepthView": {
+        "type": "object",
+        "description": "One consumer's queue depth.",
+        "required": [
+          "consumer",
+          "ready",
+          "in_flight",
+          "scheduled",
+          "dead_lettered",
+          "completed"
+        ],
+        "properties": {
+          "completed": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Delivered and retired messages still awaiting retention."
+          },
+          "consumer": {
+            "type": "string",
+            "description": "The registered consumer name this queue belongs to."
+          },
+          "dead_lettered": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Messages given up on. The number to alert on: a dead letter is work that will never\nhappen unless an operator replays it."
+          },
+          "in_flight": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Messages currently held under an unexpired lease, so being worked on."
+          },
+          "ready": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Messages DUE and not currently leased: the backlog a worker would claim right now.\nThis is consumer lag."
+          },
+          "scheduled": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Messages whose retry backoff has not elapsed yet."
           }
         }
       },

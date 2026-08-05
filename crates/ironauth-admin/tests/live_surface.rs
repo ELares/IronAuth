@@ -1078,6 +1078,12 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             &ban,
         ),
         // ---- Standard Webhooks endpoint registration (issue #105) ----
+        // ---- async queue depth (issue #104) ----
+        Case::empty(
+            "queues.listQueueDepths",
+            "GET",
+            format!("{base}/queues"),
+        ),
         Case::empty(
             "webhook_endpoints.listWebhookEndpoints",
             "GET",

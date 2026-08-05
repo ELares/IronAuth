@@ -160,6 +160,7 @@ struct Inner {
     // behaves like a default deployment. Bounds tree DEPTH only; nothing counted is
     // capped.
     max_group_depth: u32,
+    outbox_visibility_timeout_secs: u64,
     // The deployment-wide login-identifier uniqueness policy (issue #54), installed by
     // the boot path from the top-level `[identifiers]` section and passed to every
     // identifier write so the row's uniqueness discriminator matches the configured
@@ -301,6 +302,8 @@ impl AdminState {
                 migration_hook: None,
                 federation: None,
                 max_group_depth: ironauth_config::ORGANIZATIONS_DEFAULT_MAX_GROUP_DEPTH,
+                outbox_visibility_timeout_secs: ironauth_config::OutboxConfig::default()
+                    .visibility_timeout_secs,
                 identifier_uniqueness: UniquenessMode::EnvironmentWide,
                 token_claims: TokenClaimsConfig::default(),
                 sudo_mode_enabled: config.sudo_mode_enabled,
@@ -543,6 +546,32 @@ impl AdminState {
     #[must_use]
     pub fn advanced_recovery_enabled(&self) -> bool {
         self.inner.advanced_recovery_enabled
+    }
+
+    /// The visibility lease the outbox drains under, needed to report queue depth
+    /// (issue #104).
+    ///
+    /// It comes from `[outbox]` rather than `[admin]`, so it is installed here rather than
+    /// read off [`ironauth_config::AdminConfig`]. The depth read needs it because "in
+    /// flight" means "leased and the lease has not lapsed", and nothing about a row says
+    /// how long its lease was for; a state built without it reports depth against the
+    /// shipped default, which is what a test or a boot path that installed nothing gets.
+    ///
+    /// Getting it WRONG misreports rather than breaks: a lease shorter than the drain's
+    /// counts live work as ready, and a longer one counts lapsed work as in flight. The
+    /// boot path installs the same value the pools are built from, so the two agree.
+    #[must_use]
+    pub fn with_outbox_visibility_timeout(mut self, secs: u64) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.outbox_visibility_timeout_secs = secs;
+        }
+        self
+    }
+
+    /// The visibility lease queue depth is reported against.
+    #[must_use]
+    pub fn outbox_visibility_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.inner.outbox_visibility_timeout_secs)
     }
 
     /// Install the deployment-wide organization group nesting bound (issue #97).

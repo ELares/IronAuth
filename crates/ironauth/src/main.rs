@@ -638,6 +638,16 @@ async fn build_admin_state(
             // data-plane writer lands it moves into the shared carrier, so the two planes
             // cannot then be handed different modes.
             let state = state.with_identifiers(&config.identifiers);
+            // The outbox visibility lease (issue #104), so the queue-depth read can say
+            // what "in flight" means. Installed HERE for the same reason `[identifiers]`
+            // is: it reaches ONE plane. The data plane drains the queue and never reports
+            // on it, so it has nothing to hand this to.
+            //
+            // It is the SAME value the worker pools are built from, which is what makes
+            // the report agree with the drain: a lease shorter than the drain's would
+            // count live work as ready, and a longer one would count lapsed work as in
+            // flight.
+            let state = state.with_outbox_visibility_timeout(config.outbox.visibility_timeout_secs);
             // Share the data-plane issuer registry (issue #93) so the compatibility wizard
             // can resolve an environment's actually signable ID-token algorithms and write
             // the per-client column through the data plane (the only role that can).

@@ -1581,6 +1581,23 @@ export interface paths {
         patch: operations["updatePermission"];
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/queues": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Report queue depth for every consumer in the environment. */
+        get: operations["listQueueDepths"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/recovery-approvals": {
         parameters: {
             query?: never;
@@ -4978,6 +4995,43 @@ export interface components {
             items: components["schemas"]["PolicyTraceView"][];
             /** @description True when the result hit the limit and older matching traces were left out. */
             truncated: boolean;
+        };
+        /** @description Every consumer's queue depth in this environment. */
+        QueueDepthList: {
+            /** @description One entry per consumer that has messages in this environment, by name. */
+            items: components["schemas"]["QueueDepthView"][];
+        };
+        /** @description One consumer's queue depth. */
+        QueueDepthView: {
+            /**
+             * Format: int64
+             * @description Delivered and retired messages still awaiting retention.
+             */
+            completed: number;
+            /** @description The registered consumer name this queue belongs to. */
+            consumer: string;
+            /**
+             * Format: int64
+             * @description Messages given up on. The number to alert on: a dead letter is work that will never
+             *     happen unless an operator replays it.
+             */
+            dead_lettered: number;
+            /**
+             * Format: int64
+             * @description Messages currently held under an unexpired lease, so being worked on.
+             */
+            in_flight: number;
+            /**
+             * Format: int64
+             * @description Messages DUE and not currently leased: the backlog a worker would claim right now.
+             *     This is consumer lag.
+             */
+            ready: number;
+            /**
+             * Format: int64
+             * @description Messages whose retry backoff has not elapsed yet.
+             */
+            scheduled: number;
         };
         /** @description One identity that failed validation, with the fields that failed. */
         RecordFailureView: {
@@ -14594,6 +14648,58 @@ export interface operations {
                 };
             };
             /** @description Not found (absent, deleted, malformed, or another scope's). The environment must be live too: an absent or soft-deleted one answers this same not-found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listQueueDepths: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Queue depth per consumer, by consumer name */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QueueDepthList"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment is absent */
             404: {
                 headers: {
                     [name: string]: unknown;
