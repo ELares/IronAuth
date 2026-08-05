@@ -219,6 +219,7 @@ fn operation_ids_are_the_stable_set() {
             "listUserIdentifiers",
             "listUsers",
             "listVariables",
+            "listWebhookDeadLetters",
             "listWebhookEndpoints",
             "pauseWebhookEndpoint",
             "pinFlowVersion",
@@ -230,6 +231,7 @@ fn operation_ids_are_the_stable_set() {
             "removeOrgGroupMember",
             "removeStepUpPolicy",
             "removeUserIdentifier",
+            "replayWebhookDeadLetters",
             "resendInvitation",
             "restoreTenant",
             "resumeIdentityImport",
@@ -545,6 +547,7 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/variables/{name}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/webauthn/mds3/health",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/dead-letters",
             "PATCH /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}",
             "PATCH /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}",
             "PATCH /v1/tenants/{tenant_id}/environments/{environment_id}/permissions/{permission_id}",
@@ -602,6 +605,7 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/state",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/pause",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/replay",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/resume",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/rotate-secret",
             "POST /v1/tenants/{tenant_id}/restore",
@@ -714,7 +718,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        184,
+        186,
         "the documented route count is pinned"
     );
 

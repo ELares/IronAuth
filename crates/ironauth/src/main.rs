@@ -11,7 +11,9 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use axum::Router;
-use ironauth_admin::webhook_delivery::{FetchWebhookSender, WebhookDeliveryConsumer};
+use ironauth_admin::webhook_delivery::{
+    FetchWebhookSender, WebhookDeliveryConsumer, WebhookReplayConsumer,
+};
 use ironauth_admin::{AdminOidcBridge, AdminState};
 use ironauth_config::{
     ADVANCED_RECOVERY_FEATURE, Config, FEDCM_FEATURE, FIRST_PARTY_CHALLENGE_FEATURE,
@@ -1968,14 +1970,21 @@ async fn spawn_webhook_delivery_pools(inputs: WebhookDeliveryInputs) -> Vec<Outb
         }
     };
 
+    // TWO consumers, and the split is a privilege property rather than a decomposition
+    // preference. Delivery signs and POSTs; replay revives dead letters an operator asked
+    // for. The second exists at all because the management plane holds no UPDATE on the
+    // queue (migration 0099), so its replay request has to be EXECUTED by the plane that
+    // does, which is this one.
     let mut consumers = ConsumerRegistry::new();
-    if let Err(error) = consumers.register(Arc::new(WebhookDeliveryConsumer::new(
-        data_store.clone(),
-        sender,
-    )) as Arc<dyn OutboxConsumer>)
-    {
-        tracing::error!(%error, "webhook delivery worker not started: duplicate consumer name");
-        return Vec::new();
+    for consumer in [
+        Arc::new(WebhookDeliveryConsumer::new(data_store.clone(), sender))
+            as Arc<dyn OutboxConsumer>,
+        Arc::new(WebhookReplayConsumer::new(data_store.clone())) as Arc<dyn OutboxConsumer>,
+    ] {
+        if let Err(error) = consumers.register(consumer) {
+            tracing::error!(%error, "webhook delivery worker not started: duplicate consumer name");
+            return Vec::new();
+        }
     }
 
     let scopes: Arc<dyn ScopeSource> = Arc::new(ControlPlaneScopes::new(control_store));

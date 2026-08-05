@@ -1219,6 +1219,12 @@ pub enum Action {
     /// signing secret survive, so resuming needs no re-registration and no consumer has
     /// to adopt a new secret.
     WebhookEndpointSetActive,
+    /// An operator REPLAYED a webhook endpoint's dead-lettered deliveries (issue #106):
+    /// messages that already failed their whole retry schedule were revived so they are
+    /// delivered again. Audited because it causes outbound requests to a customer's
+    /// endpoint, which is an operator decision rather than queue bookkeeping; the `detail`
+    /// records the recover-from-timestamp bound.
+    WebhookEndpointReplayDeadLetters,
     /// A Standard Webhooks delivery endpoint was removed (issue #105).
     WebhookEndpointDelete,
     /// A federation connector was UPDATED (issue #75): its definition, sealed secret,
@@ -1488,6 +1494,7 @@ impl Action {
             Action::WebhookEndpointCreate => "webhook.endpoint.create",
             Action::WebhookEndpointRotateSecret => "webhook.endpoint.rotate_secret",
             Action::WebhookEndpointSetActive => "webhook.endpoint.set_active",
+            Action::WebhookEndpointReplayDeadLetters => "webhook.endpoint.replay_dead_letters",
             Action::WebhookEndpointDelete => "webhook.endpoint.delete",
             Action::ConnectorCreate => "connector.create",
             Action::ConnectorUpdate => "connector.update",

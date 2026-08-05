@@ -2334,6 +2334,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/dead-letters": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List an endpoint's dead-lettered deliveries. */
+        get: operations["listWebhookDeadLetters"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/pause": {
         parameters: {
             query?: never;
@@ -2345,6 +2362,23 @@ export interface paths {
         put?: never;
         /** Pause deliveries to an endpoint without destroying it or its signing secret. */
         post: operations["pauseWebhookEndpoint"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/replay": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Replay an endpoint's dead-lettered deliveries. */
+        post: operations["replayWebhookDeadLetters"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3275,6 +3309,39 @@ export interface components {
             name: string;
             /** @description The ordered primitive list (as stored). */
             primitives: unknown[];
+        };
+        /** @description An endpoint's dead-lettered deliveries, oldest first. */
+        DeadLetterList: {
+            /** @description The deliveries, in the order a replay would redeliver them. */
+            items: components["schemas"]["DeadLetteredDelivery"][];
+        };
+        /** @description One dead-lettered delivery, with the attempt history an operator debugs from. */
+        DeadLetteredDelivery: {
+            /**
+             * Format: int32
+             * @description How many delivery attempts were made before it was given up on.
+             */
+            attempts: number;
+            /**
+             * Format: int64
+             * @description When it was given up on, milliseconds since the Unix epoch.
+             */
+            dead_lettered_at_unix_ms?: number | null;
+            /**
+             * Format: int64
+             * @description When it was enqueued, milliseconds since the Unix epoch. This is the value a
+             *     recover-from-timestamp replay is bounded by.
+             */
+            enqueued_at_unix_ms: number;
+            /** @description The queue message id. */
+            id: string;
+            /** @description The last failure reason, a bounded non-secret token. */
+            last_error?: string | null;
+            /**
+             * @description The `webhook-id` this delivery carried, and will carry again if replayed. Stable
+             *     across every attempt, which is what lets a receiver deduplicate a redelivery.
+             */
+            webhook_id: string;
         };
         /**
          * @description The environment's operational warnings (issue #91), COMPUTED LIVE from the existing
@@ -4903,6 +4970,31 @@ export interface components {
             session_ref?: string | null;
             /** @description The authenticated end-user subject the family's tokens are minted for. */
             subject: string;
+        };
+        /**
+         * @description The acknowledgement that a replay was QUEUED.
+         *
+         *     Deliberately not a count. The management plane enqueues a command and the delivery
+         *     worker executes it, so no number this response could carry would be true by the time a
+         *     caller read it. What the caller can rely on is that the request is durable: it is a
+         *     queue row committed in the same transaction as its audit row.
+         */
+        ReplayAccepted: {
+            /**
+             * Format: int64
+             * @description The bound the replay was requested with, echoed back. `null` means every dead
+             *     letter this endpoint has.
+             */
+            since_unix_ms?: number | null;
+        };
+        /** @description Replay an endpoint's dead-lettered deliveries. */
+        ReplayDeadLettersRequest: {
+            /**
+             * Format: int64
+             * @description Replay only deliveries enqueued at or after this instant, milliseconds since the
+             *     Unix epoch. Omitted means every dead letter this endpoint has.
+             */
+            since_unix_ms?: number | null;
         };
         /** @description A page of resource servers. */
         ResourceServerList: {
@@ -17674,6 +17766,60 @@ export interface operations {
             };
         };
     };
+    listWebhookDeadLetters: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The endpoint identifier (whe_...) */
+                endpoint_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The dead-lettered deliveries, oldest first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeadLetterList"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment is absent, or the endpoint is in another scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     pauseWebhookEndpoint: {
         parameters: {
             query?: never;
@@ -17700,6 +17846,85 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["WebhookEndpointView"];
+                };
+            };
+            /** @description Missing or invalid credential, or fresh privilege required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment is absent or deleted, or the endpoint is in another scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Idempotency-Key reused with a different request */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    replayWebhookDeadLetters: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Required. Replaying a POST with the same key returns the original response without re-executing. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The endpoint identifier (whe_...) */
+                endpoint_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ReplayDeadLettersRequest"];
+            };
+        };
+        responses: {
+            /** @description The replay was queued. A worker performs it; poll the dead-letter listing to watch it drain */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReplayAccepted"];
+                };
+            };
+            /** @description Malformed request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
                 };
             };
             /** @description Missing or invalid credential, or fresh privilege required */

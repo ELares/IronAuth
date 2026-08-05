@@ -18828,6 +18828,22 @@ pub const SESSION_ENDED_CONSUMER: &str = "session_ended";
 /// and the only visible symptom is logouts that never arrive.
 pub const BACKCHANNEL_LOGOUT_CONSUMER: &str = "backchannel_logout";
 
+/// The registered consumer name ONE outbound webhook delivery drains under (issue #105).
+///
+/// Exported for the SAME reason [`BACKCHANNEL_LOGOUT_CONSUMER`] is, and it now has a
+/// second reader: the dead-letter view and replay (issue #106) are management operations
+/// that have to name the queue they act on, and a management surface reading a different
+/// literal from the one the consumer registers would list and replay NOTHING, silently.
+pub const WEBHOOK_DELIVERY_CONSUMER: &str = "webhook.delivery";
+
+/// The registered consumer name a dead-letter REPLAY COMMAND drains under (issue #106).
+///
+/// A separate consumer from [`WEBHOOK_DELIVERY_CONSUMER`] rather than a special message on
+/// it, because the two do entirely different things and share only a subject. A command
+/// that failed should not consume a delivery's retry budget, and a command sitting at the
+/// head of an ordering group must not block the deliveries it is about to revive.
+pub const WEBHOOK_REPLAY_CONSUMER: &str = "webhook.replay";
+
 /// The largest exponential-backoff delay, in seconds, a retry schedule may reach
 /// (issue #104). The doubling is capped here rather than left to overflow, so a
 /// long-lived poison message's next attempt stays a number an operator can reason about
@@ -19480,6 +19496,116 @@ impl OutboxRepo<'_> {
             .await?;
         tx.commit().await?;
         Ok(rows.iter().map(outbox_message_from_row).collect())
+    }
+
+    /// The DEAD-LETTERED messages of one consumer in this scope, oldest first, optionally
+    /// narrowed to a single ordering key (issue #106).
+    ///
+    /// Oldest first, and that is not a display preference. This is the list an operator
+    /// replays, so it has to be read in the order the replay will redeliver in; a
+    /// newest-first tail would show the last failure and hide the backlog behind it.
+    ///
+    /// `ordering_key` narrows to one aggregate. The webhook consumer sets its ordering key
+    /// to the endpoint id, so passing one is how a per-endpoint dead-letter view is
+    /// expressed without this method knowing anything about webhooks.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault.
+    pub async fn dead_lettered(
+        &self,
+        consumer: &str,
+        ordering_key: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<OutboxMessage>, StoreError> {
+        let scope = self.scope;
+        // One statement for both shapes: `$4 IS NULL OR ordering_key = $4` rather than two
+        // query strings, so the filtered and unfiltered reads cannot drift apart.
+        let sql = format!(
+            "SELECT {OUTBOX_COLUMNS} FROM outbox_messages \
+             WHERE tenant_id = $1 AND environment_id = $2 AND consumer = $3 \
+             AND dead_lettered_at IS NOT NULL \
+             AND ($4::text IS NULL OR ordering_key = $4) \
+             ORDER BY sequence ASC LIMIT $5"
+        );
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let rows = sqlx::query(&sql)
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .bind(consumer)
+            .bind(ordering_key)
+            .bind(limit)
+            .fetch_all(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(rows.iter().map(outbox_message_from_row).collect())
+    }
+
+    /// REVIVE dead-lettered messages of `consumer` so they drain again, returning how
+    /// many were revived (issue #106).
+    ///
+    /// A DATA-plane operation, and that placement is the design rather than an accident of
+    /// where it was convenient to write. Migration 0099 grants the lifecycle columns to
+    /// the drain alone and withholds every UPDATE from the control plane, because control
+    /// also holds the retention DELETE and the pair would let one role mark another
+    /// plane's message terminal and then erase the evidence. So an operator's replay
+    /// arrives here as a command on [`WEBHOOK_REPLAY_CONSUMER`] and the drain executes it
+    /// with the grants it already has. Nothing is widened.
+    ///
+    /// The row is revived IN PLACE rather than re-enqueued as a copy, and that is what
+    /// makes a replay safe for receivers. A message's `idempotency_key` is what the
+    /// deliverer sends as its `webhook-id`, so reviving preserves it and consumer-side
+    /// deduplication keeps working across a replay exactly as it does across a retry. A
+    /// copy would need a NEW key, since the unique index refuses a second row under the
+    /// same one, which is precisely the property #106 requires a replay not to break.
+    ///
+    /// ORDER is preserved for free rather than by anything written here. A claim already
+    /// refuses a message that has an earlier unfinished sibling under the same ordering
+    /// key, so a revived batch drains in `sequence` order however this statement wrote it.
+    ///
+    /// `since_unix_micros` bounds the revive to messages ENQUEUED at or after an instant,
+    /// which is the recover-from-timestamp shape: an operator who knows when an endpoint
+    /// went dark replays from there rather than replaying all of history.
+    ///
+    /// `completed_at` is untouched, and the predicate requires a dead letter, so this can
+    /// never resurrect a COMPLETED message into a second delivery.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault.
+    pub async fn revive_dead_lettered(
+        &self,
+        env: &Env,
+        consumer: &str,
+        ordering_key: Option<&str>,
+        since_unix_micros: Option<i64>,
+    ) -> Result<u64, StoreError> {
+        let scope = self.scope;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let result = sqlx::query(
+            "UPDATE outbox_messages \
+             SET dead_lettered_at = NULL, \
+                 attempts = 0, \
+                 last_error = NULL, \
+                 next_attempt_at = TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval \
+             WHERE tenant_id = $1 AND environment_id = $2 AND consumer = $3 \
+             AND dead_lettered_at IS NOT NULL \
+             AND ($4::text IS NULL OR ordering_key = $4) \
+             AND ($6::bigint IS NULL \
+                  OR enqueued_at >= TIMESTAMPTZ 'epoch' \
+                                    + ($6::text || ' microseconds')::interval)",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(consumer)
+        .bind(ordering_key)
+        .bind(now_micros)
+        .bind(since_unix_micros)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(result.rows_affected())
     }
 
     /// The per-consumer queue depth in this scope (issue #104): ready, in flight,
@@ -24850,6 +24976,90 @@ impl ActingWebhookEndpointRepo<'_> {
                 Ok(())
             },
             false,
+        )
+        .await
+    }
+
+    /// REQUEST a replay of this endpoint's dead-lettered deliveries (issue #106).
+    ///
+    /// This ENQUEUES a command rather than performing the revive, and the reason is a
+    /// grant, not a preference. Migration 0099 gives the control plane SELECT and INSERT
+    /// on `outbox_messages` and deliberately NO UPDATE, because control also holds the
+    /// retention DELETE (0102) and the two together would let one role mark another
+    /// plane's message terminal and then erase the record of having done so. Reviving a
+    /// dead letter is an UPDATE, so doing it here would mean widening exactly the grant
+    /// that separation depends on.
+    ///
+    /// So the operator's request travels as a message on the queue it acts on, and the
+    /// DATA plane, which already holds the lifecycle columns for the obvious reason that
+    /// it is the plane that drains, executes it. No grant moves, and the property 0099
+    /// states survives verbatim.
+    ///
+    /// What is audited is what the operator DID, which is ask. The revive itself is
+    /// queue bookkeeping performed by the drain, and the durable record of the decision is
+    /// this row, written in the same transaction as the command.
+    ///
+    /// The command's `idempotency_key` is derived from the endpoint and the instant of the
+    /// request, because two replays of one endpoint at different times are two distinct
+    /// domain facts. Retrying the HTTP call does not reach this method at all: the
+    /// management idempotency layer replays the stored response first.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the endpoint is from another scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn request_dead_letter_replay(
+        &self,
+        env: &Env,
+        id: &WebhookEndpointId,
+        since_unix_micros: Option<i64>,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let requested_at = epoch_micros(env.clock().now_utc());
+        let endpoint = id.to_string();
+        let detail = match since_unix_micros {
+            Some(since) => format!("since_unix_micros={since}"),
+            None => "since_unix_micros=all".to_owned(),
+        };
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::WebhookEndpointReplayDeadLetters,
+                target: id,
+            },
+            async move |tx| {
+                let key = format!("replay:{endpoint}:{requested_at}");
+                enqueue_outbox_in_tx(
+                    tx,
+                    env,
+                    scope,
+                    &NewOutboxMessage {
+                        consumer: WEBHOOK_REPLAY_CONSUMER,
+                        idempotency_key: &key,
+                        // The endpoint, so two replay commands for ONE endpoint execute in
+                        // the order they were asked for. They share no ordering group with
+                        // the deliveries themselves, because a group is per (consumer,
+                        // ordering key) and this is a different consumer.
+                        ordering_key: &endpoint,
+                        payload: serde_json::json!({
+                            "endpoint_id": endpoint,
+                            "since_unix_micros": since_unix_micros,
+                        }),
+                    },
+                )
+                .await?;
+                insert_idempotency(tx, idempotency).await?;
+                Ok(())
+            },
+            false,
+            Some(&detail),
         )
         .await
     }

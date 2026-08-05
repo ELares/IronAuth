@@ -914,6 +914,17 @@ pub fn management_router(state: AdminState) -> Router {
         // Pause and resume, distinct from delete: the endpoint and its sealed signing
         // secret survive, so resuming needs no re-registration and no consumer has to
         // adopt a new secret. `active` is what the deliverer's own read filters on.
+        // The dead-letter view and replay (issue #106): nothing is ever silently dropped,
+        // so the deliveries that exhausted their retry schedule stay listable and an
+        // operator can put them back on the queue once the endpoint is healthy.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/dead-letters",
+            axum::routing::get(webhook_endpoints::list_webhook_dead_letters),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/replay",
+            post(webhook_endpoints::replay_webhook_dead_letters),
+        )
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/pause",
             post(webhook_endpoints::pause_webhook_endpoint),
