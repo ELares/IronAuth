@@ -34,14 +34,26 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 
+use crate::crypto::verify_signature;
 use crate::mint::MacAlgorithm;
-use crate::sign::sign_hmac;
+use crate::policy::JwsAlgorithm;
+use crate::policy::KeyMaterial;
+use crate::sign::{sign_asymmetric, sign_hmac};
+use crate::signing_key::SigningKey;
 
 /// The prefix every Standard Webhooks symmetric secret carries.
 const SECRET_PREFIX: &str = "whsec_";
 
 /// The version tag of the symmetric (HMAC-SHA256) scheme.
 const SYMMETRIC_VERSION: &str = "v1";
+
+/// The version tag of the asymmetric (Ed25519) scheme.
+///
+/// A consumer of the asymmetric scheme verifies with a PUBLIC key, so the producer's
+/// signing key never leaves this process. That is the difference that matters: with the
+/// symmetric scheme a leaked consumer secret lets an attacker FORGE deliveries, and with
+/// this one it lets them verify, which is what they could already do.
+const ASYMMETRIC_VERSION: &str = "v1a";
 
 /// Why a webhook signature was refused.
 ///
@@ -58,6 +70,8 @@ pub enum WebhookError {
     TimestampOutOfTolerance,
     /// No signature in the header verified under any supplied secret.
     NoMatchingSignature,
+    /// An Ed25519 key could not produce a signature.
+    SigningFailed,
 }
 
 /// A parsed Standard Webhooks symmetric secret.
@@ -112,6 +126,27 @@ impl Drop for WebhookSecret {
     fn drop(&mut self) {
         crate::redact::wipe(&mut self.0);
     }
+}
+
+/// Parse and range-check the `webhook-timestamp` header, shared by both verifiers so the
+/// tolerance rule cannot drift between schemes.
+///
+/// BOTH directions. A delivery held and replayed later is the obvious case; a future-dated
+/// one is refused too, because accepting it would let a captured delivery stay valid for
+/// as long as the sender's clock skew allowed.
+fn parse_timestamp(
+    timestamp_header: &str,
+    tolerance_secs: i64,
+    now_secs: i64,
+) -> Result<i64, WebhookError> {
+    let timestamp: i64 = timestamp_header
+        .trim()
+        .parse()
+        .map_err(|_| WebhookError::MalformedTimestamp)?;
+    if (now_secs - timestamp).abs() > tolerance_secs {
+        return Err(WebhookError::TimestampOutOfTolerance);
+    }
+    Ok(timestamp)
 }
 
 /// The exact bytes a signature is computed over: `{id}.{timestamp}.{payload}`.
@@ -173,17 +208,7 @@ pub fn verify_delivery(
     tolerance_secs: i64,
     now_secs: i64,
 ) -> Result<(), WebhookError> {
-    let timestamp: i64 = timestamp_header
-        .trim()
-        .parse()
-        .map_err(|_| WebhookError::MalformedTimestamp)?;
-    // BOTH directions. A delivery held and replayed later is the obvious case; a
-    // future-dated one is refused too, because accepting it would let a captured
-    // delivery stay valid for as long as the sender's clock skew allowed.
-    if (now_secs - timestamp).abs() > tolerance_secs {
-        return Err(WebhookError::TimestampOutOfTolerance);
-    }
-
+    let timestamp = parse_timestamp(timestamp_header, tolerance_secs, now_secs)?;
     let input = signing_input(id, timestamp, payload);
     let mut matched = false;
     for entry in signature_header.split(' ').filter(|e| !e.is_empty()) {
@@ -202,6 +227,86 @@ pub fn verify_delivery(
             // verifier that returned on the first match would leak, through timing, which
             // secret in a rotation pair matched and how far down the header it was.
             matched |= constant_time_eq(&expected, &presented);
+        }
+    }
+    if matched {
+        Ok(())
+    } else {
+        Err(WebhookError::NoMatchingSignature)
+    }
+}
+
+/// Build the `webhook-signature` header value under the ASYMMETRIC scheme.
+///
+/// Signs the same `{id}.{timestamp}.{payload}` input the symmetric scheme does, so the
+/// replay properties are identical and a verifier's construction does not change with the
+/// scheme. `keys` is a slice for the same rotation reason `sign_delivery` takes one.
+///
+/// # Errors
+///
+/// [`WebhookError::SigningFailed`] if a key cannot sign, which does not happen for an
+/// Ed25519 key `ring` has already accepted.
+pub fn sign_delivery_ed25519(
+    keys: &[SigningKey],
+    id: &str,
+    timestamp_secs: i64,
+    payload: &[u8],
+) -> Result<String, WebhookError> {
+    let input = signing_input(id, timestamp_secs, payload);
+    let mut entries = Vec::with_capacity(keys.len());
+    for key in keys {
+        let signature = sign_asymmetric(key, &input).map_err(|()| WebhookError::SigningFailed)?;
+        entries.push(format!(
+            "{ASYMMETRIC_VERSION},{}",
+            BASE64_STANDARD.encode(signature)
+        ));
+    }
+    Ok(entries.join(" "))
+}
+
+/// Verify a `webhook-signature` header under the ASYMMETRIC scheme.
+///
+/// `public_keys` are raw Ed25519 public keys, the form a per-endpoint published key takes.
+/// Entries whose version prefix is not `v1a` are SKIPPED, exactly as the symmetric
+/// verifier skips what it does not know, so a header carrying both schemes verifies under
+/// either verifier.
+///
+/// # Errors
+///
+/// The same three as [`verify_delivery`], for the same reasons.
+pub fn verify_delivery_ed25519(
+    public_keys: &[Vec<u8>],
+    id: &str,
+    timestamp_header: &str,
+    payload: &[u8],
+    signature_header: &str,
+    tolerance_secs: i64,
+    now_secs: i64,
+) -> Result<(), WebhookError> {
+    let timestamp = parse_timestamp(timestamp_header, tolerance_secs, now_secs)?;
+    let input = signing_input(id, timestamp, payload);
+    let mut matched = false;
+    for entry in signature_header.split(' ').filter(|e| !e.is_empty()) {
+        let Some((version, encoded)) = entry.split_once(',') else {
+            continue;
+        };
+        // NOT load bearing for safety, and measured rather than assumed: with this check
+        // removed, a `v1` entry still fails because Ed25519 verification refuses HMAC
+        // bytes, and no test changes. It stays because it keeps the two verifiers
+        // symmetric and skips pointless signature work, not because it is the thing
+        // refusing the other scheme.
+        if version != ASYMMETRIC_VERSION {
+            continue;
+        }
+        let Ok(presented) = BASE64_STANDARD.decode(encoded) else {
+            continue;
+        };
+        for public_key in public_keys {
+            // `verify_signature` is the ONE ring-backed primitive this crate exposes, so
+            // the asymmetric webhook check and every JWS check share a verifier rather
+            // than this path growing its own.
+            let key = KeyMaterial::Ed25519(public_key.clone());
+            matched |= verify_signature(JwsAlgorithm::EdDsa, &key, &input, &presented).is_ok();
         }
     }
     if matched {
@@ -422,6 +527,131 @@ mod tests {
         assert_eq!(
             verify_delivery(&[], ID, &TS.to_string(), PAYLOAD, "", 300, TS),
             Err(WebhookError::NoMatchingSignature)
+        );
+    }
+
+    fn ed25519(seed: u8) -> (SigningKey, Vec<u8>) {
+        let key = SigningKey::ed25519_from_seed(None, &[seed; 32]).expect("ed25519 key");
+        // The RAW public key, which is the form a per-endpoint published key takes.
+        let crate::signing_key::PublicComponents::Okp { x: bytes } =
+            key.public_components().expect("public components")
+        else {
+            panic!("an Ed25519 key has OKP public components")
+        };
+        (key, bytes)
+    }
+
+    #[test]
+    fn the_asymmetric_scheme_signs_the_same_input_and_round_trips() {
+        // The construction MUST match the symmetric scheme byte for byte: a verifier that
+        // had to build a different input per scheme is a verifier that will get one wrong.
+        let (key, public) = ed25519(0x41);
+        let header = sign_delivery_ed25519(&[key], ID, TS, PAYLOAD).expect("signs");
+        assert!(header.starts_with("v1a,"), "version prefixed: {header}");
+        verify_delivery_ed25519(&[public], ID, &TS.to_string(), PAYLOAD, &header, 300, TS)
+            .expect("a fresh delivery verifies");
+    }
+
+    #[test]
+    fn an_asymmetric_signature_is_refused_under_a_different_public_key() {
+        let (key, _) = ed25519(0x41);
+        let (_, other_public) = ed25519(0x42);
+        let header = sign_delivery_ed25519(&[key], ID, TS, PAYLOAD).expect("signs");
+        assert_eq!(
+            verify_delivery_ed25519(
+                &[other_public],
+                ID,
+                &TS.to_string(),
+                PAYLOAD,
+                &header,
+                300,
+                TS
+            ),
+            Err(WebhookError::NoMatchingSignature)
+        );
+    }
+
+    #[test]
+    fn the_asymmetric_scheme_binds_id_timestamp_and_body_too() {
+        // Same replay properties as v1, driven separately rather than assumed to follow
+        // from sharing a helper.
+        let (key, public) = ed25519(0x41);
+        let header = sign_delivery_ed25519(&[key], ID, TS, PAYLOAD).expect("signs");
+        for (label, id, ts, payload) in [
+            ("a fresh timestamp", ID, TS + 10, PAYLOAD),
+            (
+                "a different body",
+                ID,
+                TS,
+                br#"{"type":"user.deleted"}"#.as_slice(),
+            ),
+            ("a different id", "msg_other", TS, PAYLOAD),
+        ] {
+            assert_eq!(
+                verify_delivery_ed25519(
+                    std::slice::from_ref(&public),
+                    id,
+                    &ts.to_string(),
+                    payload,
+                    &header,
+                    300,
+                    ts
+                ),
+                Err(WebhookError::NoMatchingSignature),
+                "{label} must not verify"
+            );
+        }
+    }
+
+    #[test]
+    fn a_header_carrying_both_schemes_verifies_under_either_verifier() {
+        // THE forward-compatibility payoff of skipping unknown prefixes, now that a
+        // second scheme actually exists. A producer may emit both during a migration
+        // between schemes, and neither verifier may choke on the other's entry.
+        let symmetric = [secret(0x11)];
+        let (key, public) = ed25519(0x41);
+        let v1 = sign_delivery(&symmetric, ID, TS, PAYLOAD);
+        let v1a = sign_delivery_ed25519(&[key], ID, TS, PAYLOAD).expect("signs");
+        let both = format!("{v1} {v1a}");
+
+        verify_delivery(&symmetric, ID, &TS.to_string(), PAYLOAD, &both, 300, TS)
+            .expect("the symmetric verifier finds its entry");
+        verify_delivery_ed25519(&[public], ID, &TS.to_string(), PAYLOAD, &both, 300, TS)
+            .expect("the asymmetric verifier finds its entry");
+
+        // And neither accepts the OTHER scheme's entry on its own, in BOTH directions,
+        // which is what stops "skip what you do not know" from becoming "accept anything".
+        assert_eq!(
+            verify_delivery(&symmetric, ID, &TS.to_string(), PAYLOAD, &v1a, 300, TS),
+            Err(WebhookError::NoMatchingSignature)
+        );
+        let (_, public2) = ed25519(0x41);
+        assert_eq!(
+            verify_delivery_ed25519(&[public2], ID, &TS.to_string(), PAYLOAD, &v1, 300, TS),
+            Err(WebhookError::NoMatchingSignature)
+        );
+    }
+
+    #[test]
+    fn the_asymmetric_verifier_applies_the_same_timestamp_tolerance() {
+        let (key, public) = ed25519(0x41);
+        let header = sign_delivery_ed25519(&[key], ID, TS, PAYLOAD).expect("signs");
+        let stamp = TS.to_string();
+        assert_eq!(
+            verify_delivery_ed25519(
+                std::slice::from_ref(&public),
+                ID,
+                &stamp,
+                PAYLOAD,
+                &header,
+                300,
+                TS + 301
+            ),
+            Err(WebhookError::TimestampOutOfTolerance)
+        );
+        assert_eq!(
+            verify_delivery_ed25519(&[public], ID, "nope", PAYLOAD, &header, 300, TS),
+            Err(WebhookError::MalformedTimestamp)
         );
     }
 }
