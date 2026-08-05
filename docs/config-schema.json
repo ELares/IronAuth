@@ -2465,6 +2465,18 @@
       },
       "type": "object"
     },
+    "UsersConfig": {
+      "additionalProperties": false,
+      "description": "User lifecycle settings (issue #52).\n\nScheduling an offboarding is a management write the API already accepts; this section\ngates the worker that EXECUTES one when its instant arrives.",
+      "properties": {
+        "offboarding_worker_enabled": {
+          "default": true,
+          "description": "Whether THIS process drains the `users.offboarding` queue and executes scheduled\noffboardings that have come due (issue #52).\n\nON by default, which is deliberately unlike every other worker here, and the reason\nis the difference between a feature and a PROMISE. Webhook delivery is an\nintegration a deployment may simply not use; a scheduled offboarding is something\nthe management API already accepts and answers 200 to, on every deployment. Shipping\nthe executor off by default would mean the default deployment keeps taking those\nrequests and silently never honouring them, which is the exact defect this exists to\nremove.\n\nTurning it off is still available, for a deployment that runs its workers on\ndedicated nodes. Nothing is lost when it is off: the wake-up is a durable queue row,\nso it is executed whenever a process that runs the worker next drains it.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "WaitlistConfig": {
       "additionalProperties": false,
       "description": "The waitlist gate (issue #80). OFF by default. When on, a self-service registration\nlands in a PENDING (`waitlisted`) lifecycle state that CANNOT authenticate until an\nadmin approves it (transition to active) or rejects it (transition to disabled) through\nthe user-lifecycle management API.",
@@ -2934,6 +2946,13 @@
         "migration_worker_enabled": false
       },
       "description": "Schema-driven identity traits (issue #53): whether this process advances trait\nmigration jobs, and how large one batch is."
+    },
+    "users": {
+      "$ref": "#/$defs/UsersConfig",
+      "default": {
+        "offboarding_worker_enabled": true
+      },
+      "description": "User lifecycle (issue #52): whether this process executes scheduled offboardings\nthat have come due."
     },
     "webhooks": {
       "$ref": "#/$defs/WebhooksConfig",

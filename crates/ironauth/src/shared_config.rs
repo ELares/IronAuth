@@ -685,6 +685,16 @@ mod tests {
              rot-detection PR 1 was buying.",
         ),
         (
+            "users",
+            Reach::OnePlaneOrNoState,
+            "the user lifecycle settings (issue #52): whether this process executes \
+             scheduled offboardings that have come due. Read once at boot by \
+             offboarding_inputs, which builds the consumer and hands it to a worker pool. \
+             It reaches NEITHER plane state, for the same reason `outbox`, `webhooks` and \
+             `traits` do not: a pool is not plane state. The user management surface that \
+             SCHEDULES an offboarding lives on AdminState and holds no knob from here.",
+        ),
+        (
             "traits",
             Reach::OnePlaneOrNoState,
             "the schema-driven identity trait settings (issue #53): whether this process \

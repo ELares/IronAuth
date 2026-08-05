@@ -186,6 +186,10 @@ pub struct Config {
     /// the implementation it selects.
     pub outbox: OutboxConfig,
 
+    /// User lifecycle (issue #52): whether this process executes scheduled offboardings
+    /// that have come due.
+    pub users: UsersConfig,
+
     /// Schema-driven identity traits (issue #53): whether this process advances trait
     /// migration jobs, and how large one batch is.
     pub traits: TraitsConfig,
@@ -471,6 +475,38 @@ pub struct WebhooksConfig {
 /// permitted to run longer than any sane lease would simply be redelivered underneath
 /// itself.
 pub const WEBHOOK_MAX_DELIVERY_TIMEOUT_SECS: u64 = 300;
+
+/// User lifecycle settings (issue #52).
+///
+/// Scheduling an offboarding is a management write the API already accepts; this section
+/// gates the worker that EXECUTES one when its instant arrives.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct UsersConfig {
+    /// Whether THIS process drains the `users.offboarding` queue and executes scheduled
+    /// offboardings that have come due (issue #52).
+    ///
+    /// ON by default, which is deliberately unlike every other worker here, and the reason
+    /// is the difference between a feature and a PROMISE. Webhook delivery is an
+    /// integration a deployment may simply not use; a scheduled offboarding is something
+    /// the management API already accepts and answers 200 to, on every deployment. Shipping
+    /// the executor off by default would mean the default deployment keeps taking those
+    /// requests and silently never honouring them, which is the exact defect this exists to
+    /// remove.
+    ///
+    /// Turning it off is still available, for a deployment that runs its workers on
+    /// dedicated nodes. Nothing is lost when it is off: the wake-up is a durable queue row,
+    /// so it is executed whenever a process that runs the worker next drains it.
+    pub offboarding_worker_enabled: bool,
+}
+
+impl Default for UsersConfig {
+    fn default() -> Self {
+        Self {
+            offboarding_worker_enabled: true,
+        }
+    }
+}
 
 /// Schema-driven identity trait settings (issue #53).
 ///

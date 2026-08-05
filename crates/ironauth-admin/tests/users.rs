@@ -353,3 +353,157 @@ async fn cross_tenant_access_is_the_uniform_not_found() {
     let (status, _, _) = h.get(&via_a).await;
     assert_eq!(status, StatusCode::OK, "the user resolves in its own scope");
 }
+
+#[tokio::test]
+async fn a_scheduled_offboarding_is_actually_executed_when_its_wake_up_comes_due() {
+    // `execute_scheduled_offboardings` shipped with issue #52 and NOTHING called it, while
+    // the management API happily accepted a scheduled offboarding and answered 200. So an
+    // operator could schedule a deletion and have it silently never happen, which is worse
+    // than a missing feature: it is a promise the API makes and does not keep.
+    //
+    // The three links, each of which fails silently on its own: scheduling must enqueue a
+    // wake-up in the same transaction, the wake-up must be DELAYED to the scheduled
+    // instant rather than eligible at once, and the worker must actually execute what is
+    // due when it fires.
+    use ironauth_admin::offboarding_worker::OffboardingConsumer;
+    use ironauth_store::outbox::OutboxConsumer;
+    use ironauth_store::{OFFBOARDING_CONSUMER, UserState};
+    use std::time::Duration;
+
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let users_path = format!("/v1/tenants/{tenant}/environments/{environment}/users");
+    let (status, _, created) = h
+        .post(
+            &users_path,
+            "k-user",
+            &serde_json::json!({ "identifier": "leaver@example.test" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let user_id = serde_json::from_str::<Value>(&created).unwrap()["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    let scope = parse_scope(&user_id);
+    let env = ironauth_env::Env::system();
+    let store = h.store().clone();
+
+    // Schedule it for an instant that has ALREADY passed, so the wake-up is due the moment
+    // it is written and the test never waits on a clock.
+    let (status, _, body) = h
+        .post(
+            &format!("{users_path}/{user_id}/state"),
+            "k-sched",
+            &serde_json::json!({
+                "state": "scheduled_offboarding",
+                "scheduled_offboarding_at_unix_ms": 1_000
+            })
+            .to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // LINK ONE: scheduling enqueued a wake-up, in the same transaction as the state change.
+    // Without it the scheduled instant is a column nothing ever reads again.
+    let claimed = store
+        .scoped(scope)
+        .outbox()
+        .claim(&env, OFFBOARDING_CONSUMER, Duration::from_secs(30), 10)
+        .await
+        .expect("claim");
+    assert_eq!(
+        claimed.len(),
+        1,
+        "scheduling an offboarding queues exactly one wake-up"
+    );
+
+    // LINK TWO: the worker executes what is due, attributed to the operator who scheduled
+    // it rather than to an invented system actor.
+    OffboardingConsumer::new(store.clone())
+        .handle(&env, scope, &claimed[0])
+        .await
+        .expect("the wake-up executes");
+
+    let user = store
+        .scoped(scope)
+        .users()
+        .get(&ironauth_store::UserId::parse_in_scope(&user_id, &scope).expect("id"))
+        .await
+        .expect("read the user");
+    assert_eq!(
+        user.state,
+        UserState::Disabled,
+        "the scheduled offboarding actually happened"
+    );
+}
+
+#[tokio::test]
+async fn a_wake_up_for_a_future_instant_is_not_yet_claimable() {
+    // LINK THREE, on its own because it is an independent claim: the wake-up must be
+    // DELAYED. If the enqueue ignored the scheduled instant, the message would be eligible
+    // immediately and the worker would offboard the user the moment it was scheduled,
+    // which is the opposite of scheduling.
+    use ironauth_store::OFFBOARDING_CONSUMER;
+    use std::time::Duration;
+
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let users_path = format!("/v1/tenants/{tenant}/environments/{environment}/users");
+    let (status, _, created) = h
+        .post(
+            &users_path,
+            "k-user",
+            &serde_json::json!({ "identifier": "future@example.test" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let user_id = serde_json::from_str::<Value>(&created).unwrap()["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    let scope = parse_scope(&user_id);
+    let env = ironauth_env::Env::system();
+
+    // Far enough ahead that no plausible clock skew makes it due.
+    let far_future_ms = 4_000_000_000_000_i64;
+    let (status, _, body) = h
+        .post(
+            &format!("{users_path}/{user_id}/state"),
+            "k-sched",
+            &serde_json::json!({
+                "state": "scheduled_offboarding",
+                "scheduled_offboarding_at_unix_ms": far_future_ms
+            })
+            .to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let claimed = h
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(&env, OFFBOARDING_CONSUMER, Duration::from_secs(30), 10)
+        .await
+        .expect("claim");
+    assert!(
+        claimed.is_empty(),
+        "a wake-up scheduled for the future is not yet eligible, so the offboarding does \
+         not happen the instant it is scheduled"
+    );
+    // It IS on the queue, though: absent and not-yet-due must not look the same, or this
+    // test would pass just as well against an enqueue that never happened.
+    let pending = h
+        .store()
+        .scoped(scope)
+        .outbox()
+        .list(OFFBOARDING_CONSUMER, 10)
+        .await
+        .expect("list");
+    assert_eq!(
+        pending.len(),
+        1,
+        "the wake-up is queued, merely not yet due"
+    );
+}

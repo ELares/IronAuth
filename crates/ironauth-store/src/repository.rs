@@ -15971,10 +15971,14 @@ impl ActingUserRepo<'_> {
         env: &Env,
         id: &UserId,
         to: UserState,
-        scheduled_at: Option<i64>,
+        schedule: OffboardingSchedule<'_>,
         hard_kill: bool,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        let OffboardingSchedule {
+            at_unix_micros: scheduled_at,
+            wake_payload,
+        } = schedule;
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -16019,6 +16023,42 @@ impl ActingUserRepo<'_> {
             },
             async move |tx| {
                 insert_idempotency(tx, idempotency).await?;
+                // The WAKE-UP, enqueued in the SAME transaction as the state change and
+                // delayed to the scheduled instant. Without it a scheduled offboarding is
+                // a row nothing ever looks at again: `execute_scheduled_offboardings`
+                // existed with no caller, so an operator's scheduled deletion silently
+                // never happened.
+                //
+                // The message carries the acting operator, because executing an
+                // offboarding writes an audit row and a worker has no actor of its own. A
+                // scheduled execution is a continuation of THIS request, so it is
+                // attributed to whoever made it.
+                //
+                // Rescheduling or cancelling leaves the old message in place, which is
+                // safe rather than merely tolerable: the executor acts only on users still
+                // in the scheduled state whose instant has arrived, so a stale wake-up
+                // finds nothing due and completes.
+                if let (Some(due), Some(payload)) = (scheduled_at, wake_payload) {
+                    enqueue_outbox_in_tx_at(
+                        tx,
+                        env,
+                        scope,
+                        &NewOutboxMessage {
+                            consumer: OFFBOARDING_CONSUMER,
+                            // The subject and the instant: rescheduling the same user to a
+                            // new time is a new domain fact and gets its own wake-up,
+                            // while re-issuing the identical schedule collides, which is
+                            // exactly the duplicate an enqueue should refuse.
+                            idempotency_key: &format!("offboard:{subject_text}:{due}"),
+                            // The USER, so two wake-ups for one subject are never in
+                            // flight at once.
+                            ordering_key: &subject_text,
+                            payload: payload.clone(),
+                        },
+                        Some(due),
+                    )
+                    .await?;
+                }
                 let result = sqlx::query(
                     "UPDATE users SET state = $1, \
                          scheduled_offboarding_at = CASE WHEN $2::bigint IS NULL THEN NULL ELSE \
@@ -18862,6 +18902,15 @@ pub const WEBHOOK_REPLAY_CONSUMER: &str = "webhook.replay";
 /// which keeps every handler inside the visibility lease no matter how large the job is.
 pub const TRAIT_MIGRATION_CONSUMER: &str = "traits.migration";
 
+/// The consumer name a DUE scheduled offboarding drains under (issue #52).
+///
+/// Scheduling one is a management write; EXECUTING it at the scheduled instant is what
+/// `execute_scheduled_offboardings` does, and nothing called it. The message that carries
+/// the operator's request forward in time is what mounts that layer: it is enqueued in the
+/// same transaction as the state change, delayed to the scheduled instant, and drained by
+/// a worker that executes whatever has come due.
+pub const OFFBOARDING_CONSUMER: &str = "users.offboarding";
+
 /// The largest exponential-backoff delay, in seconds, a retry schedule may reach
 /// (issue #104). The doubling is capped here rather than left to overflow, so a
 /// long-lived poison message's next attempt stays a number an operator can reason about
@@ -19112,15 +19161,45 @@ pub(crate) async fn enqueue_outbox_in_tx(
     scope: Scope,
     message: &NewOutboxMessage<'_>,
 ) -> Result<OutboxMessageId, StoreError> {
+    enqueue_outbox_in_tx_at(tx, env, scope, message, None).await
+}
+
+/// Enqueue ONE message that does not become eligible until `not_before_unix_micros`.
+///
+/// The queue already carries `next_attempt_at` as its backoff gate, and a claim refuses a
+/// message whose instant has not arrived. Setting it at ENQUEUE time rather than only
+/// after a failure is what turns the same column into a delayed-job schedule, which is the
+/// "job queue" half of what #104 set out to be.
+///
+/// Nothing else changes: a delayed message is claimed, retried, ordered and dead-lettered
+/// exactly like any other once it is due, so a consumer cannot tell the difference and
+/// none of the substrate's guarantees are special-cased.
+///
+/// `None` means "eligible now", which is what every existing producer wants and gets
+/// through [`enqueue_outbox_in_tx`]. `enqueued_at` is always the real instant, so a
+/// delayed message still reports when it was created rather than when it comes due.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] on a persistence fault, including the unique violation a
+/// second enqueue under the same `(consumer, idempotency_key)` raises.
+pub(crate) async fn enqueue_outbox_in_tx_at(
+    tx: &mut Transaction<'_, Postgres>,
+    env: &Env,
+    scope: Scope,
+    message: &NewOutboxMessage<'_>,
+    not_before_unix_micros: Option<i64>,
+) -> Result<OutboxMessageId, StoreError> {
     let id = OutboxMessageId::generate(env, &scope);
     let now_micros = epoch_micros(env.clock().now_utc());
+    let due_micros = not_before_unix_micros.unwrap_or(now_micros);
     sqlx::query(
         "INSERT INTO outbox_messages \
          (id, tenant_id, environment_id, consumer, idempotency_key, ordering_key, \
           payload, next_attempt_at, enqueued_at) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, \
                  TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval, \
-                 TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval)",
+                 TIMESTAMPTZ 'epoch' + ($9::text || ' microseconds')::interval)",
     )
     .bind(id.to_string())
     .bind(scope.tenant().to_string())
@@ -19129,6 +19208,7 @@ pub(crate) async fn enqueue_outbox_in_tx(
     .bind(message.idempotency_key)
     .bind(message.ordering_key)
     .bind(&message.payload)
+    .bind(due_micros)
     .bind(now_micros)
     .execute(&mut **tx)
     .await?;
@@ -51603,6 +51683,22 @@ pub struct TraitMigrationJob {
     pub failure_count: i64,
     /// The per-record failure report.
     pub failures: Vec<RecordFailure>,
+}
+
+/// The scheduled-offboarding half of a user state change (issue #52).
+///
+/// Bundled rather than passed as two more parameters so the state change stays inside the
+/// argument budget, and because the two belong together: an instant with no wake-up
+/// payload is a schedule nothing will ever execute, which is the exact defect this pair
+/// removes.
+pub struct OffboardingSchedule<'a> {
+    /// When the offboarding is due, in microseconds since the Unix epoch. `None` for every
+    /// state change that is not a scheduled offboarding.
+    pub at_unix_micros: Option<i64>,
+    /// The payload the delayed wake-up message carries, built by the WORKER's own helper
+    /// so the producer and the consumer cannot disagree about its shape. `None` skips the
+    /// wake-up, which only a caller that runs the executor some other way should do.
+    pub wake_payload: Option<&'a serde_json::Value>,
 }
 
 /// Everything the migration-job create needs, bundled to keep the repository method

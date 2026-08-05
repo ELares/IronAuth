@@ -11,6 +11,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use axum::Router;
+use ironauth_admin::offboarding_worker::OffboardingConsumer;
 use ironauth_admin::trait_migration_worker::TraitMigrationConsumer;
 use ironauth_admin::webhook_delivery::{
     FetchWebhookSender, WebhookDeliveryConsumer, WebhookReplayConsumer,
@@ -282,6 +283,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         let retention_inputs = retention_sweeper_inputs(&config, &env);
         let webhook_inputs = webhook_delivery_inputs(&config, &env);
         let trait_migration = trait_migration_inputs(&config, &env);
+        let offboarding = offboarding_inputs(&config, &env);
         // Capture what the one-shot signing-algorithm backfill (issue #93) needs before
         // config moves into the server (only when its switch is on). Runs before serving.
         let signing_backfill_inputs = signing_backfill_inputs(&config, &env);
@@ -384,6 +386,13 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             Some(inputs) => spawn_trait_migration_pools(inputs).await,
             None => Vec::new(),
         };
+        // The scheduled-offboarding worker (issue #52). ON by default, unlike the others,
+        // because the management API already accepts a scheduled offboarding on every
+        // deployment; without this the request is taken and silently never honoured.
+        let offboarding_pools = match offboarding {
+            Some(inputs) => spawn_offboarding_pools(inputs).await,
+            None => Vec::new(),
+        };
         // The outbox retention sweeper (issue #104, PR 3), started here and not inside the
         // block above: the outbox is a GENERIC substrate whose next consumer will run
         // behind a different switch, so the reaper must not share the back-channel logout
@@ -421,6 +430,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             .into_iter()
             .chain(webhook_pools)
             .chain(trait_migration_pools)
+            .chain(offboarding_pools)
         {
             pool.shutdown().await;
         }
@@ -1279,6 +1289,88 @@ struct WebhookDeliveryInputs {
     master: Option<Arc<MasterKey>>,
     /// The environment seam (deterministic clock and entropy).
     env: Env,
+}
+
+/// What the scheduled-offboarding worker (issue #52) needs, captured before `config` moves.
+struct OffboardingInputs {
+    /// The shared `[outbox]` tuning the pool is built from.
+    outbox: OutboxConfig,
+    /// The data-plane DSN the worker drains and offboards through.
+    data_plane_dsn: String,
+    /// The control-plane DSN the worker enumerates scopes on; [`None`] disables it.
+    control_dsn: Option<String>,
+    /// The environment seam.
+    env: Env,
+}
+
+/// Capture the offboarding worker inputs from config (issue #52), or `None` when it is off.
+fn offboarding_inputs(config: &Config, env: &Env) -> Option<OffboardingInputs> {
+    if !config.users.offboarding_worker_enabled {
+        return None;
+    }
+    Some(OffboardingInputs {
+        outbox: config.outbox.clone(),
+        data_plane_dsn: config.database.url.expose().to_owned(),
+        control_dsn: select_control_dsn(config),
+        env: env.clone(),
+    })
+}
+
+/// Start the scheduled-offboarding worker (issue #52) on the generic outbox worker pool.
+///
+/// The FOURTH production consumer of the #104 framework, extending the generic parts
+/// rather than copying them. No master key is needed: executing an offboarding flips state
+/// and cascades sessions, and reads no sealed value.
+async fn spawn_offboarding_pools(inputs: OffboardingInputs) -> Vec<OutboxWorkerPool> {
+    let OffboardingInputs {
+        outbox,
+        data_plane_dsn,
+        control_dsn,
+        env,
+    } = inputs;
+
+    let Some(control_dsn) = control_dsn else {
+        tracing::error!(
+            "scheduled offboarding worker not started: no control-plane DSN to enumerate \
+             scopes (set admin.control_database_url, or run in dev_mode). Scheduled \
+             offboardings are durable queue rows, so none is lost; enable the control \
+             plane to execute them."
+        );
+        return Vec::new();
+    };
+    let data_store = match Store::connect(&data_plane_dsn).await {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::error!(%error, "scheduled offboarding worker not started: data-plane connect failed");
+            return Vec::new();
+        }
+    };
+    let control_store = match Store::connect(&control_dsn).await {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::error!(%error, "scheduled offboarding worker not started: control-plane connect failed");
+            return Vec::new();
+        }
+    };
+
+    let mut consumers = ConsumerRegistry::new();
+    if let Err(error) = consumers
+        .register(Arc::new(OffboardingConsumer::new(data_store.clone())) as Arc<dyn OutboxConsumer>)
+    {
+        tracing::error!(%error, "scheduled offboarding worker not started: duplicate consumer name");
+        return Vec::new();
+    }
+
+    let scopes: Arc<dyn ScopeSource> = Arc::new(ControlPlaneScopes::new(control_store));
+    let observer: Arc<dyn OutboxObserver> = Arc::new(TracingOutboxObserver);
+    let pools = spawn_consumer_pools(&consumers, &data_store, &env, &outbox, &scopes, &observer);
+
+    tracing::info!(
+        consumers = ?consumers.names(),
+        pools = pools.len(),
+        "scheduled offboarding execution started on the outbox consumer pools"
+    );
+    pools
 }
 
 /// What the trait migration worker (issue #53) needs, captured before `config` moves.

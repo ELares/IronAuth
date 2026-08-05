@@ -9,8 +9,8 @@
 use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
-    ActorRef, CorrelationId, HumanId, Scope, SignupQuarantineReason, SignupQuarantineState,
-    StoreError, UserId, UserState,
+    ActorRef, CorrelationId, HumanId, OffboardingSchedule, Scope, SignupQuarantineReason,
+    SignupQuarantineState, StoreError, UserId, UserState,
 };
 
 /// The admin actor a review action is attributed to (a human operator), distinct from the
@@ -62,6 +62,18 @@ async fn audited_by(db: &TestDatabase, scope: Scope, action: &str, actor_id: &st
     .fetch_one(db.owner_pool())
     .await
     .expect("count audit rows")
+}
+
+/// A state change carrying no offboarding wake-up.
+///
+/// These tests drive the state machine directly, so the delayed message a production
+/// schedule also enqueues is deliberately absent: what is under test here is the
+/// transition, not the wake-up that a scheduled one queues.
+fn sched(at_unix_micros: Option<i64>) -> OffboardingSchedule<'static> {
+    OffboardingSchedule {
+        at_unix_micros,
+        wake_payload: None,
+    }
 }
 
 #[tokio::test]
@@ -187,7 +199,7 @@ async fn reject_disables_the_account_and_extend_bumps_the_window() {
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .users()
-        .set_state(&env, &rejected, UserState::Active, None, false, None)
+        .set_state(&env, &rejected, UserState::Active, sched(None), false, None)
         .await
         .expect("reactivate the rejected account");
     let (reactivated_state, reactivated_quarantined) = user_row(&db, scope, &rejected).await;

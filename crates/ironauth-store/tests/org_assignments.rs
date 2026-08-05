@@ -50,9 +50,10 @@ use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
     ActorRef, CorrelationId, InvitationCredentialType, MintedInvitationToken, NewAdminUser,
     NewInvitation, NewMembership, NewOrgGroup, NewOrgGroupMember, NewOrgGroupRole,
-    NewOrgMembershipRole, NewOrgRole, ORG_GROUP_MAX_DEPTH_CEILING, OrgGroupId, OrgGroupMemberId,
-    OrgGroupRoleId, OrgMembershipId, OrgMembershipRoleId, OrgRoleId, OrganizationId,
-    OrganizationState, Scope, ServiceId, StoreError, UserId, UserState, mint_invitation_token,
+    NewOrgMembershipRole, NewOrgRole, ORG_GROUP_MAX_DEPTH_CEILING, OffboardingSchedule, OrgGroupId,
+    OrgGroupMemberId, OrgGroupRoleId, OrgMembershipId, OrgMembershipRoleId, OrgRoleId,
+    OrganizationId, OrganizationState, Scope, ServiceId, StoreError, UserId, UserState,
+    mint_invitation_token,
 };
 use sqlx::Row;
 
@@ -599,6 +600,18 @@ async fn kill_membership_row(db: &TestDatabase, scope: Scope, membership: &OrgMe
     .execute(db.owner_pool())
     .await
     .expect("soft-delete the membership row out of band");
+}
+
+/// A state change carrying no offboarding wake-up.
+///
+/// These tests drive the state machine directly, so the delayed message a production
+/// schedule also enqueues is deliberately absent: what is under test here is the
+/// transition, not the wake-up that a scheduled one queues.
+fn sched(at_unix_micros: Option<i64>) -> OffboardingSchedule<'static> {
+    OffboardingSchedule {
+        at_unix_micros,
+        wake_payload: None,
+    }
 }
 
 #[tokio::test]
@@ -1942,7 +1955,7 @@ async fn a_user_who_cannot_authenticate_still_resolves_their_roles() {
         .scoped(scope)
         .acting(actor(&env), CorrelationId::generate(&env))
         .users()
-        .set_state(&env, &blocked, UserState::Blocked, None, false, None)
+        .set_state(&env, &blocked, UserState::Blocked, sched(None), false, None)
         .await
         .expect("block the user");
     assert_eq!(

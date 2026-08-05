@@ -70,6 +70,7 @@ mod memberships;
 mod migration;
 mod migration_runs;
 mod migration_status;
+pub mod offboarding_worker;
 mod openapi;
 mod operators;
 mod org_context;

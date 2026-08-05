@@ -1596,7 +1596,19 @@ impl Harness {
         scoped
             .acting(actor, corr)
             .users()
-            .set_state(&self.env, &id, state, None, false, None)
+            .set_state(
+                &self.env,
+                &id,
+                state,
+                // No wake-up: these fixtures set a state directly and never schedule an
+                // offboarding, so there is nothing for a delayed message to execute.
+                ironauth_store::OffboardingSchedule {
+                    at_unix_micros: None,
+                    wake_payload: None,
+                },
+                false,
+                None,
+            )
             .await
             .expect("set user state");
     }

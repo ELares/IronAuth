@@ -2259,7 +2259,17 @@ impl IsolationProbe for UserAdminStateChangeProbe {
                 .scoped(caller)
                 .acting(actor, correlation)
                 .users()
-                .set_state(&env, &id, UserState::Blocked, None, false, None)
+                .set_state(
+                    &env,
+                    &id,
+                    UserState::Blocked,
+                    crate::OffboardingSchedule {
+                        at_unix_micros: None,
+                        wake_payload: None,
+                    },
+                    false,
+                    None,
+                )
                 .await
             {
                 Ok(()) => ProbeOutcome::Leaked,
