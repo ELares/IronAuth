@@ -1093,3 +1093,69 @@ async fn a_refused_delivery_is_retryable_and_a_malformed_payload_is_not() {
         error.label()
     );
 }
+
+#[tokio::test]
+async fn queue_depth_reports_the_backlog_a_dead_letter_leaves_behind() {
+    // `OutboxRepo::depth` shipped with the outbox and its own documentation recorded that
+    // it had no production caller, so the observability #104 and #106 both ask for was a
+    // method nobody could reach. This is that reader.
+    //
+    // The number that matters is `dead_lettered`: it is the one an operator alerts on,
+    // because a dead letter is work that will never happen unless somebody replays it. So
+    // this drives a real delivery to a real dead letter and asserts the depth moves,
+    // rather than asserting that an empty environment reports zeros, which would pass
+    // against a handler that returned a constant.
+    use ironauth_store::WEBHOOK_DELIVERY_CONSUMER;
+
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (id, _, _) = register(&h, &tenant, &environment).await;
+    let scope = scope_of(&tenant, &environment);
+    let env = Env::system();
+    let store = h.store().clone();
+    let queues = format!("/v1/tenants/{tenant}/environments/{environment}/queues");
+
+    // Before: the webhook queue either is absent or reports nothing dead-lettered.
+    let (status, _, body) = h.get(&queues).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let before: Value = serde_json::from_str(&body).expect("json");
+    let dead_before = before["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|item| item["consumer"] == WEBHOOK_DELIVERY_CONSUMER)
+        .map_or(0, |item| item["dead_lettered"].as_i64().expect("count"));
+    assert_eq!(dead_before, 0, "nothing is dead-lettered yet: {body}");
+
+    dead_letter_one(&store, &env, scope, &id, "evt_depth").await;
+
+    let (status, _, body) = h.get(&queues).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let after: Value = serde_json::from_str(&body).expect("json");
+    let webhook = after["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|item| item["consumer"] == WEBHOOK_DELIVERY_CONSUMER)
+        .expect("the webhook delivery queue is reported once it has rows");
+    assert_eq!(
+        webhook["dead_lettered"], 1,
+        "the dead letter shows up in the depth an operator alerts on: {body}"
+    );
+    // And it is NOT double counted as still pending: a dead letter is terminal, so the
+    // backlog a worker would claim is unchanged by it.
+    assert_eq!(webhook["ready"], 0, "{body}");
+    assert_eq!(webhook["in_flight"], 0, "{body}");
+
+    // The listing enumerates the consumers that HAVE rows rather than a hard-coded list,
+    // so a queue this binary does not run still shows its backlog. Nothing has enqueued
+    // for the replay consumer, so it is absent rather than reported as an empty row.
+    assert!(
+        after["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .all(|item| item["consumer"] == WEBHOOK_DELIVERY_CONSUMER),
+        "only queues with rows are listed: {body}"
+    );
+}
