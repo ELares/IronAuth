@@ -586,3 +586,11 @@ required-features = ["testing"]
 name = "webhook_delivery"
 path = "tests/webhook_delivery.rs"
 required-features = ["testing"]
+
+# The two per-client / per-environment security postures the data plane enforced and
+# nothing could set (issues #27, #78): the PAR requirement and the account-linking
+# posture. Needs a real database.
+[[test]]
+name = "postures"
+path = "tests/postures.rs"
+required-features = ["testing"]

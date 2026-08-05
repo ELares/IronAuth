@@ -244,6 +244,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/auto-link-posture": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Set an environment's account-linking posture (issue #78). */
+        put: operations["setAutoLinkPosture"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/brands": {
         parameters: {
             query?: never;
@@ -344,6 +361,23 @@ export interface paths {
         get: operations["getClientAllowedScopes"];
         /** Set (or clear) one client's scope allowlist. */
         put: operations["setClientAllowedScopes"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/par-requirement": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Set a client's Pushed Authorization Request requirement (RFC 9126). */
+        put: operations["setClientParRequirement"];
         post?: never;
         delete?: never;
         options?: never;
@@ -2645,6 +2679,14 @@ export interface components {
              */
             permission_id: string;
         };
+        /** @description An environment's stored account-linking posture. */
+        AutoLinkPostureView: {
+            /**
+             * @description The stored override, or `null` when the environment inherits the deployment
+             *     default.
+             */
+            posture?: string | null;
+        };
         /** @description A page of bans. */
         BanList: {
             /** @description The active bans, newest first. */
@@ -2836,6 +2878,13 @@ export interface components {
              *     the operator should narrow the client or time window (never a silent truncation).
              */
             truncated: boolean;
+        };
+        /** @description A client's PAR requirement as stored. */
+        ClientParRequirementView: {
+            /** @description The client this describes. */
+            client_id: string;
+            /** @description Whether PAR is required for this client specifically. */
+            require_pushed_authorization_requests: boolean;
         };
         /** @description The updated per-client signing-algorithm state. */
         ClientSigningAlgorithmView: {
@@ -5454,6 +5503,15 @@ export interface components {
             /** @description The recorded user agent (only when the device binding knob is on). */
             user_agent?: string | null;
         };
+        /** @description Set or clear an environment's account-linking posture override. */
+        SetAutoLinkPostureRequest: {
+            /**
+             * @description `off` or `verified_to_verified`, or an explicit `null` to CLEAR the override so the
+             *     environment inherits the deployment default. The field is required so that "clear
+             *     it" is stated rather than inferred from an omission.
+             */
+            posture?: string | null;
+        };
         /**
          * @description The body to set (create or overwrite) a per-environment brand (issues #86, #475).
          *
@@ -5536,6 +5594,15 @@ export interface components {
              *     omitting the key is a 400, and it is NOT the same as sending `null`.
              */
             allowed_scopes: string[] | null;
+        };
+        /** @description Require (or stop requiring) Pushed Authorization Requests for one client. */
+        SetClientParRequirementRequest: {
+            /**
+             * @description Whether this client must use PAR. `true` requires it for this client even when the
+             *     deployment does not; `false` leaves the client to the deployment-wide setting,
+             *     which can still require it.
+             */
+            required: boolean;
         };
         /** @description The body of a set-signing-algorithm request. */
         SetClientSigningAlgorithmRequest: {
@@ -7776,6 +7843,71 @@ export interface operations {
             };
         };
     };
+    setAutoLinkPosture: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetAutoLinkPostureRequest"];
+            };
+        };
+        responses: {
+            /** @description The stored posture, or null when the deployment default is inherited */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AutoLinkPostureView"];
+                };
+            };
+            /** @description Malformed request, a body omitting `posture`, or a token outside the closed set */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential, or a lapsed sudo elevation */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment is absent or soft-deleted */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     listBrands: {
         parameters: {
             query?: never;
@@ -8397,6 +8529,73 @@ export interface operations {
                 };
             };
             /** @description Missing or invalid credential, or a lapsed sudo elevation (the RFC 9470 insufficient_user_authentication challenge) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found (absent, malformed, or another scope's). The environment must be live too: an absent or soft-deleted one answers this same not-found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    setClientParRequirement: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The client identifier */
+                client_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetClientParRequirementRequest"];
+            };
+        };
+        responses: {
+            /** @description The stored requirement */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ClientParRequirementView"];
+                };
+            };
+            /** @description Malformed request or a body omitting `required` */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential, or a lapsed sudo elevation */
             401: {
                 headers: {
                     [name: string]: unknown;

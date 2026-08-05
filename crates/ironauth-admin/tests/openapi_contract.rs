@@ -247,11 +247,13 @@ fn operation_ids_are_the_stable_set() {
             "revokeUserConsent",
             "revokeUserSessions",
             "rotateWebhookEndpointSecret",
+            "setAutoLinkPosture",
             "setBrand",
             "setBrandFavicon",
             "setBrandLogo",
             "setClientAdminConsent",
             "setClientAllowedScopes",
+            "setClientParRequirement",
             "setClientSigningAlgorithm",
             "setLocale",
             "setOrgDefaultRole",
@@ -623,10 +625,12 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/suspend",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/admin-consent",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/signup-form",
+            "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/auto-link-posture",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}/favicon",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}/logo",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/allowed-scopes",
+            "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/par-requirement",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/signing-algorithm",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/connectors/{connector_id}",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/locales/{locale}",
@@ -728,7 +732,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        191,
+        193,
         "the documented route count is pinned"
     );
 

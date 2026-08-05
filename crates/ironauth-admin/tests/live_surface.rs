@@ -1166,6 +1166,18 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             &serde_json::json!({ "allowed_scopes": ["openid"] }),
         ),
         Case::json(
+            "postures.setClientParRequirement",
+            "PUT",
+            format!("{base}/clients/{client}/par-requirement"),
+            &serde_json::json!({ "required": true }),
+        ),
+        Case::json(
+            "postures.setAutoLinkPosture",
+            "PUT",
+            format!("{base}/auto-link-posture"),
+            &serde_json::json!({ "posture": "off" }),
+        ),
+        Case::json(
             "signing_algorithm.setClientSigningAlgorithm",
             "PUT",
             format!("{base}/clients/{client}/signing-algorithm"),

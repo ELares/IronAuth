@@ -1,0 +1,27 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+--
+-- Let the CONTROL plane set a client's PAR requirement (issue #27, RFC 9126).
+--
+-- `clients.require_pushed_authorization_requests` arrived in 0015 with a column and a
+-- reader and no writer of any kind: no role has ever held UPDATE on it. `authorize.rs`
+-- gates on `deployment_default OR client.require_pushed_authorization_requests`, so the
+-- deployment-wide switch worked and the per-client half sat at its `false` default
+-- permanently, for every client, on every deployment.
+--
+-- `ActingClientRepo::set_require_pushed_authorization_requests` exists and writes exactly
+-- this column. It had no production caller, and it could not have had one: the statement
+-- would have been refused for want of a grant. The only callers were tests running through
+-- the superuser pool, which is why nothing surfaced it.
+--
+-- ## Why the control plane rather than the data plane
+--
+-- Requiring PAR for a client is a management decision an operator makes, like the scope
+-- allowlist (0031) and the signing algorithm pin (issue #93), not something the
+-- authorization path decides while serving a request. The data plane READS the flag on
+-- every authorize and never needs to write it.
+--
+-- Column scoped, as every grant on this table is (the #31 lesson): the control role may
+-- flip this one boolean and nothing else. It notably cannot touch `redirect_uris`,
+-- `client_secret_hash` or `grant_types`, so a management-plane compromise cannot redirect
+-- an authorization code or widen what a client may do.
+GRANT UPDATE (require_pushed_authorization_requests) ON clients TO ironauth_control;

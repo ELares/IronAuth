@@ -84,6 +84,7 @@ mod organizations;
 mod pagination;
 mod password_hashing;
 mod permissions;
+mod postures;
 mod promotion;
 mod provision;
 mod queues;
@@ -585,6 +586,18 @@ pub fn management_router(state: AdminState) -> Router {
         // The compatibility wizard (issue #93): pin a client's ID-token signing
         // algorithm, validated against the wizard set and the environment's actually
         // signable set. A static `.../signing-algorithm` suffix under the client.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/par-requirement",
+            axum::routing::put(postures::set_client_par_requirement),
+        )
+        // The per-environment account-linking posture (issue #78, FORK B): the store
+        // write and its audit action shipped with no caller.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/auto-link-posture",
+            axum::routing::put(postures::set_auto_link_posture),
+        )
+        // The per-client PAR requirement (issue #27, RFC 9126): enforced at
+        // authorize.rs:509 and settable by nothing until now.
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/signing-algorithm",
             put(signing_algorithm::set_client_signing_algorithm),
