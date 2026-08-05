@@ -191,6 +191,15 @@ pub fn management_router(state: AdminState) -> Router {
         )
         // Restore a soft-deleted (offboarded) tenant inside its retention window
         // (issue #46). A static suffix, matched before the parameterized routes.
+        // The TERMINAL offboarding stage (issues #46, #49): crypto-shred a grace tenant
+        // whose window has elapsed. `hard_delete` shipped with no caller, so a
+        // soft-deleted tenant stayed in grace forever and its sealed data was never
+        // erased. Operator-triggered rather than automatic: irreversible destruction is a
+        // deliberate act, and nothing here fires on a timer.
+        .route(
+            "/v1/tenants/{tenant_id}/purge",
+            post(tenants::purge_tenant),
+        )
         .route(
             "/v1/tenants/{tenant_id}/restore",
             post(tenants::restore_tenant),

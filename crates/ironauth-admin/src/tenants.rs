@@ -489,6 +489,85 @@ pub async fn restore_tenant(
     }
 }
 
+/// Terminally PURGE a grace tenant: crypto-shred it and erase what the grace period kept.
+#[utoipa::path(
+    post,
+    path = "/v1/tenants/{tenant_id}/purge",
+    operation_id = "purgeTenant",
+    tag = "tenants",
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("Idempotency-Key" = String, Header, description = "Required. Replaying a POST \
+         with the same key returns the original response without re-executing.")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 204, description = "Purged. The platform KEK is destroyed and any BYOK binding severed, so the tenant's sealed data is unrecoverable by either path"),
+        (status = 401, description = "Missing or invalid credential", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "Not found (never offboarded, already restored, or already purged)", body = ErrorBody),
+        (status = 409, description = "The retention window has not elapsed yet; the grace period must run first", body = ErrorBody),
+        (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
+    )
+)]
+pub async fn purge_tenant(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path(tenant_id): Path<String>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let actor = principal.require_operator()?;
+    let key = idempotency::required_key(&headers)?;
+    let fingerprint = idempotency::fingerprint("POST", uri.path(), &[]);
+    let credential_ref = principal.credential_ref();
+    if let Some(replay) =
+        idempotency::replay_if_stored(&state, &credential_ref, &key, &fingerprint).await?
+    {
+        return Ok(replay);
+    }
+
+    let id = state
+        .store()
+        .management()
+        .tenants(state.bootstrap_operator_id())
+        .parse_id(&tenant_id)?;
+
+    let result = state
+        .store()
+        .management()
+        .acting(actor, CorrelationId::generate(state.env()))
+        .tenants(state.bootstrap_operator_id())
+        .hard_delete(
+            state.env(),
+            &id,
+            state.offboarding_retention(),
+            Some(IdempotencyWrite {
+                credential_ref: &credential_ref,
+                key: &key,
+                request_fingerprint: &fingerprint,
+                response_status: 204,
+                response_body: "",
+            }),
+        )
+        .await;
+
+    match result {
+        Ok(()) => Ok(no_content()),
+        Err(StoreError::IdempotencyConflict) => {
+            idempotency::replay_after_conflict(&state, &credential_ref, &key, &fingerprint).await
+        }
+        // The grace period has NOT run yet. A loud 409 rather than the anti-oracle 404,
+        // mirroring the restore above: the caller is an authenticated operator acting on
+        // a tenant they can already see, so the distinction leaks nothing and telling
+        // them "not yet" is the whole point of the window.
+        Err(StoreError::Conflict) => Err(ApiError::Conflict(
+            "tenant retention window has not elapsed; the grace period must run first".to_owned(),
+        )),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// The shared body of the suspend and resume handlers: enforce the operator plane,
 /// honor the Idempotency-Key replay, run the state-machine transition, and map an
 /// invalid transition to a loud 409 (distinct from the anti-oracle 404). `suspend`

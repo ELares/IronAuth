@@ -2044,6 +2044,15 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             "DELETE",
             format!("/v1/tenants/{doomed_tenant}"),
         ),
+        // Between the delete and the restore, so the tenant is in GRACE when this runs and
+        // the purge exercises its retention gate (a 409 under the default window) rather
+        // than the bare not-found it would answer on a live tenant. It leaves the tenant in
+        // grace, so the restore below still has something to restore.
+        Case::empty(
+            "tenants.purgeTenant",
+            "POST",
+            format!("/v1/tenants/{doomed_tenant}/purge"),
+        ),
         Case::empty(
             "tenants.restoreTenant",
             "POST",

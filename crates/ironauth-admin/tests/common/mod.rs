@@ -71,6 +71,35 @@ impl Harness {
         }
     }
 
+    /// Start a fresh database and router with a caller-chosen tenant-offboarding
+    /// retention window, in seconds.
+    ///
+    /// The terminal purge is refused until the window has elapsed, so a test that wants to
+    /// drive the purge itself has to get past a default that is thirty DAYS. Shortening the
+    /// window is the honest way: the production predicate still runs, against a window this
+    /// test chose, rather than being bypassed.
+    pub async fn start_with_offboarding_retention(
+        default_page_size: u32,
+        offboarding_retention_secs: u64,
+    ) -> Self {
+        let db = TestDatabase::start().await;
+        let config = AdminConfig {
+            bootstrap_operator_token: Some(Secret::Literal(SecretString::new(OPERATOR_TOKEN))),
+            max_page_size: 200,
+            default_page_size,
+            offboarding_retention_secs,
+            ..AdminConfig::default()
+        };
+        let state = AdminState::new(db.control_store().clone(), Env::system(), &config)
+            .expect("admin state builds");
+        let router = management_router(state);
+        Self {
+            db,
+            router,
+            outbound_scope: None,
+        }
+    }
+
     /// Start a fresh database and router over a CALLER-SUPPLIED environment seam, so a
     /// test can install its own clock or entropy double and drive what the handlers mint.
     ///

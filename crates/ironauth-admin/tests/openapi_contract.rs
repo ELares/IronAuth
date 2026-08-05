@@ -230,6 +230,7 @@ fn operation_ids_are_the_stable_set() {
             "planConfigPromotion",
             "postFlowDryRun",
             "probePasswordHashing",
+            "purgeTenant",
             "rejectRecoveryApproval",
             "rejectSignupQuarantine",
             "removeOrgGroupMember",
@@ -616,6 +617,7 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/replay",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/resume",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/rotate-secret",
+            "POST /v1/tenants/{tenant_id}/purge",
             "POST /v1/tenants/{tenant_id}/restore",
             "POST /v1/tenants/{tenant_id}/resume",
             "POST /v1/tenants/{tenant_id}/suspend",
@@ -726,7 +728,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        190,
+        191,
         "the documented route count is pinned"
     );
 
