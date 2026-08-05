@@ -1214,6 +1214,11 @@ pub enum Action {
     /// A Standard Webhooks delivery endpoint's signing secret was ROTATED (issue #105),
     /// opening the overlap window during which both secrets verify.
     WebhookEndpointRotateSecret,
+    /// A Standard Webhooks delivery endpoint was PAUSED or RESUMED (issue #105): its
+    /// `active` flag was flipped. Distinct from a delete, because the endpoint and its
+    /// signing secret survive, so resuming needs no re-registration and no consumer has
+    /// to adopt a new secret.
+    WebhookEndpointSetActive,
     /// A Standard Webhooks delivery endpoint was removed (issue #105).
     WebhookEndpointDelete,
     /// A federation connector was UPDATED (issue #75): its definition, sealed secret,
@@ -1482,6 +1487,7 @@ impl Action {
             Action::RiskDisavow => "risk.disavow",
             Action::WebhookEndpointCreate => "webhook.endpoint.create",
             Action::WebhookEndpointRotateSecret => "webhook.endpoint.rotate_secret",
+            Action::WebhookEndpointSetActive => "webhook.endpoint.set_active",
             Action::WebhookEndpointDelete => "webhook.endpoint.delete",
             Action::ConnectorCreate => "connector.create",
             Action::ConnectorUpdate => "connector.update",

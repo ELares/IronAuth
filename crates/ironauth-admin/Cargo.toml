@@ -37,6 +37,15 @@ ironauth-oidc.workspace = true
 # parsing. Already in the tree (a transitive dep via ironauth-oidc); named here so
 # the arm can reach the verify entry point directly.
 ironauth-jose.workspace = true
+# The ONE sanctioned outbound HTTP path (issue #34, invariant: outbound HTTP only via
+# ironauth-fetch). The webhook deliverer (issue #105) POSTs to an operator-supplied URL,
+# which is an SSRF vector, so it rides the same resolve-once-pin, deny-internal,
+# no-redirect, capped fetcher. Already in the tree (a transitive dep via ironauth-oidc);
+# named here so the deliverer reaches it directly rather than through an OIDC re-export.
+# This entry also covers what used to be a dev-dependency: the per-connector health-read
+# test (issue #76) builds a real FederationRuntime, which needs a hardened fetcher (no
+# network is touched, only the in-memory health registry).
+ironauth-fetch.workspace = true
 # The full identity export (issue #58) SERIALIZES the same line-delimited record
 # format the streaming bulk import consumes, so export-to-import round-trips by
 # construction; the outbound credential-verification endpoint reuses the same
@@ -92,11 +101,6 @@ tower = { workspace = true, features = ["util"] }
 # credential and an imported foreign one. Both crates are already in the tree.
 argon2.workspace = true
 bcrypt = "0.19"
-# The per-connector health-read test (issue #76) builds a real FederationRuntime (which
-# needs an SSRF-hardened fetcher; no network is touched, only the in-memory health registry)
-# and installs it on the AdminState to prove the mgmt read reflects an induced outage.
-# Already in the tree; no fetch is ever performed by the test.
-ironauth-fetch.workspace = true
 # Database-FREE test support only: builds a LAZY pool (parses the URL, never
 # connects) so the unit tests and the router/spec contract test can construct an
 # AdminState without a database. No connection is ever opened (auth rejects at the
@@ -571,4 +575,14 @@ required-features = ["testing"]
 [[test]]
 name = "outbound_timing_probe"
 path = "tests/outbound_timing_probe.rs"
+required-features = ["testing"]
+
+# Webhook DISPATCH (issue #105, slice 4): the outbox consumer that signs a queued delivery
+# and hands it to the outbound sender. Registered as its own target because it is the only
+# place the three halves of the webhook subsystem are exercised TOGETHER: the API issues a
+# secret, the store opens its sealed copy, and the signing contract has to agree with both.
+# Needs a real database.
+[[test]]
+name = "webhook_delivery"
+path = "tests/webhook_delivery.rs"
 required-features = ["testing"]

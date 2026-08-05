@@ -72,3 +72,4 @@ crates/ironauth-admin/src/users.rs:validated_traits:0
 crates/ironauth-admin/src/variables.rs:set_variable:1
 crates/ironauth-admin/src/webhook_endpoints.rs:create_webhook_endpoint:1
 crates/ironauth-admin/src/webhook_endpoints.rs:rotate_webhook_endpoint_secret:1
+crates/ironauth-admin/src/webhook_endpoints.rs:set_endpoint_state:1

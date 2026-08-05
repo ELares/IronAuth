@@ -186,6 +186,15 @@ pub struct Config {
     /// the implementation it selects.
     pub outbox: OutboxConfig,
 
+    /// Outbound webhook delivery (issue #105): whether this process drains the
+    /// `webhook.delivery` queue, and the per-delivery time budget.
+    ///
+    /// Separate from `[outbox]` on purpose. That section tunes the shared QUEUE for every
+    /// consumer at once; this one gates the webhook consumer specifically, which is the
+    /// per-consumer switch `outbox.reap_enabled`'s documentation already anticipated the
+    /// next consumer needing.
+    pub webhooks: WebhooksConfig,
+
     /// Feature toggles keyed by registered feature name. Enabling an
     /// experimental feature additionally requires `ack` equal to the
     /// feature's exact current version; see the feature reference in the
@@ -400,6 +409,54 @@ pub struct OutboxConfig {
     /// window. The default (one hour) with the default batch removes up to 1000 rows per
     /// consumer per scope per hour. Must be at least 1 and at most `OIDC_MAX_LIFETIME_SECS`.
     pub reap_interval_secs: u64,
+}
+
+/// Outbound webhook delivery settings (issue #105).
+///
+/// These belong to the webhook CONSUMER, not to the queue: how the queue itself is
+/// drained (concurrency, lease, backoff, retention) is `[outbox]`, and an operator tunes
+/// that once for every consumer rather than per subsystem.
+///
+/// The consumer is OFF by default, which is the same covenant every other background
+/// worker here is held to: no mandatory background infrastructure. A deployment that never
+/// opens this section runs no delivery worker, and its queued deliveries wait durably
+/// rather than being lost.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct WebhooksConfig {
+    /// Whether THIS process drains the `webhook.delivery` queue and POSTs to registered
+    /// endpoints. OFF by default.
+    ///
+    /// Turning it off does not stop endpoints being registered or messages being
+    /// enqueued; it stops them being DELIVERED by this process. That separation is what
+    /// lets a deployment run its delivery workers on dedicated nodes: the API tier
+    /// registers endpoints with this off, and the worker tier turns it on.
+    pub delivery_enabled: bool,
+
+    /// The total per-delivery time budget in seconds, enforced by the SSRF-hardened
+    /// outbound fetcher, so one slow receiver cannot occupy a worker indefinitely.
+    ///
+    /// The default (10) matches the back-channel logout budget, and it must stay
+    /// comfortably below `outbox.visibility_timeout_secs` (30 by default) or a delivery
+    /// still in flight can have its lease lapse and be redelivered by another worker.
+    /// Must be at least 1 and at most [`WEBHOOK_MAX_DELIVERY_TIMEOUT_SECS`].
+    pub delivery_timeout_secs: u64,
+}
+
+/// The hard ceiling on `webhooks.delivery_timeout_secs` (issue #105). A budget longer
+/// than this cannot be honoured usefully: the outbox visibility lease is what stops a
+/// crashed worker's messages being stranded, and its own ceiling is lower, so a delivery
+/// permitted to run longer than any sane lease would simply be redelivered underneath
+/// itself.
+pub const WEBHOOK_MAX_DELIVERY_TIMEOUT_SECS: u64 = 300;
+
+impl Default for WebhooksConfig {
+    fn default() -> Self {
+        Self {
+            delivery_enabled: false,
+            delivery_timeout_secs: 10,
+        }
+    }
 }
 
 impl Default for OutboxConfig {
@@ -4753,9 +4810,11 @@ impl Config {
         validate_organizations(&self.organizations)?;
         validate_token_claims(&self.token_claims)?;
         validate_outbox(&self.outbox)?;
+        validate_webhooks(&self.webhooks)?;
         // Last, and after both halves have been checked on their own, so a cross-section
         // report is never produced from a value that is independently out of range.
         validate_backchannel_logout_lease(&self.oidc, &self.outbox)?;
+        validate_webhook_delivery_lease(&self.webhooks, &self.outbox)?;
         Ok(())
     }
 }
@@ -6383,6 +6442,67 @@ fn validate_backchannel_logout_lease(
                  outbox.visibility_timeout_secs ({}): a logout POST allowed to outrun its \
                  visibility lease is re-claimed mid-flight and delivered twice",
                 oidc.backchannel_logout_request_timeout_secs, outbox.visibility_timeout_secs
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Bound the webhook delivery budget (issue #105).
+///
+/// A zero-second budget is a delivery that cannot complete, and a budget past the ceiling
+/// cannot be honoured by any lease the outbox will grant.
+fn validate_webhooks(webhooks: &WebhooksConfig) -> Result<(), ConfigError> {
+    if webhooks.delivery_timeout_secs < 1 {
+        return Err(ConfigError::Invalid {
+            message: "webhooks.delivery_timeout_secs must be at least 1".to_owned(),
+        });
+    }
+    if webhooks.delivery_timeout_secs > WEBHOOK_MAX_DELIVERY_TIMEOUT_SECS {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "webhooks.delivery_timeout_secs ({}) must not exceed \
+                 {WEBHOOK_MAX_DELIVERY_TIMEOUT_SECS}",
+                webhooks.delivery_timeout_secs
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Refuse a webhook delivery budget that its outbox LEASE cannot cover (issue #105).
+///
+/// The SAME cross-section defect [`validate_backchannel_logout_lease`] exists for, found
+/// by asking which other consumers have the shape rather than waiting for one to be
+/// reported: a POST allowed to outrun `outbox.visibility_timeout_secs` is re-claimed while
+/// it is still in flight, so the receiver gets the delivery twice and nothing reports it.
+///
+/// It matters MORE here than for back-channel logout. A duplicate logout is idempotent by
+/// nature (the session is ended either way), while a duplicate webhook is a duplicate
+/// business event; the receiver deduplicates on `webhook-id`, which is stable across
+/// redelivery precisely so it can, but that puts the burden on every receiver rather than
+/// on the one operator who set these two numbers.
+///
+/// `>=` rather than `>`, for the same reason: a delivery that takes exactly its whole
+/// budget finishes at the instant the lease expires, and the completion write is fenced on
+/// a lease another worker may already hold.
+///
+/// Gated on the same predicate the boot path spawns the pool under, so a deployment that
+/// runs no delivery worker is never refused a boot over an inert number.
+fn validate_webhook_delivery_lease(
+    webhooks: &WebhooksConfig,
+    outbox: &OutboxConfig,
+) -> Result<(), ConfigError> {
+    if !webhooks.delivery_enabled {
+        return Ok(());
+    }
+    if webhooks.delivery_timeout_secs >= outbox.visibility_timeout_secs {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "webhooks.delivery_timeout_secs ({}) must be less than \
+                 outbox.visibility_timeout_secs ({}): a webhook POST allowed to outrun its \
+                 visibility lease is re-claimed mid-flight and delivered twice",
+                webhooks.delivery_timeout_secs, outbox.visibility_timeout_secs
             ),
         });
     }

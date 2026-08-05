@@ -1095,6 +1095,16 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             format!("{base}/webhook-endpoints/{webhook_endpoint}/rotate-secret"),
         ),
         Case::empty(
+            "webhook_endpoints.pauseWebhookEndpoint",
+            "POST",
+            format!("{base}/webhook-endpoints/{webhook_endpoint}/pause"),
+        ),
+        Case::empty(
+            "webhook_endpoints.resumeWebhookEndpoint",
+            "POST",
+            format!("{base}/webhook-endpoints/{webhook_endpoint}/resume"),
+        ),
+        Case::empty(
             "webhook_endpoints.deleteWebhookEndpoint",
             "DELETE",
             format!("{base}/webhook-endpoints/{webhook_endpoint}"),

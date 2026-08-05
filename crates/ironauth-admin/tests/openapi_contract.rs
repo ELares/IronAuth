@@ -220,6 +220,7 @@ fn operation_ids_are_the_stable_set() {
             "listUsers",
             "listVariables",
             "listWebhookEndpoints",
+            "pauseWebhookEndpoint",
             "pinFlowVersion",
             "planConfigPromotion",
             "postFlowDryRun",
@@ -233,6 +234,7 @@ fn operation_ids_are_the_stable_set() {
             "restoreTenant",
             "resumeIdentityImport",
             "resumeTenant",
+            "resumeWebhookEndpoint",
             "revokeInvitation",
             "revokeSession",
             "revokeUserConsent",
@@ -395,6 +397,8 @@ fn every_post_documents_the_idempotency_key_header() {
         "applyIdentifierUniqueness",
         "abandonMigrationRun",
         "rotateWebhookEndpointSecret",
+        "pauseWebhookEndpoint",
+        "resumeWebhookEndpoint",
         "createWebhookEndpoint",
     ] {
         let params = find_operation(&doc, op)["parameters"]
@@ -597,6 +601,8 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/sessions/revoke",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/state",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/pause",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/resume",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/rotate-secret",
             "POST /v1/tenants/{tenant_id}/restore",
             "POST /v1/tenants/{tenant_id}/resume",
@@ -708,7 +714,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        182,
+        184,
         "the documented route count is pinned"
     );
 

@@ -2457,6 +2457,25 @@
         }
       },
       "type": "object"
+    },
+    "WebhooksConfig": {
+      "additionalProperties": false,
+      "description": "Outbound webhook delivery settings (issue #105).\n\nThese belong to the webhook CONSUMER, not to the queue: how the queue itself is\ndrained (concurrency, lease, backoff, retention) is `[outbox]`, and an operator tunes\nthat once for every consumer rather than per subsystem.\n\nThe consumer is OFF by default, which is the same covenant every other background\nworker here is held to: no mandatory background infrastructure. A deployment that never\nopens this section runs no delivery worker, and its queued deliveries wait durably\nrather than being lost.",
+      "properties": {
+        "delivery_enabled": {
+          "default": false,
+          "description": "Whether THIS process drains the `webhook.delivery` queue and POSTs to registered\nendpoints. OFF by default.\n\nTurning it off does not stop endpoints being registered or messages being\nenqueued; it stops them being DELIVERED by this process. That separation is what\nlets a deployment run its delivery workers on dedicated nodes: the API tier\nregisters endpoints with this off, and the worker tier turns it on.",
+          "type": "boolean"
+        },
+        "delivery_timeout_secs": {
+          "default": 10,
+          "description": "The total per-delivery time budget in seconds, enforced by the SSRF-hardened\noutbound fetcher, so one slow receiver cannot occupy a worker indefinitely.\n\nThe default (10) matches the back-channel logout budget, and it must stay\ncomfortably below `outbox.visibility_timeout_secs` (30 by default) or a delivery\nstill in flight can have its lease lapse and be redelivered by another worker.\nMust be at least 1 and at most [`WEBHOOK_MAX_DELIVERY_TIMEOUT_SECS`].",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2881,6 +2900,14 @@
         "permission_claim_warn_count": 192
       },
       "description": "Token claim budget settings (issue #98): the SIZE bounds an access token\ncarrying a permissions claim is held to. The budget is a\nsize bound on a TOKEN, never a cap on how many permissions or roles may be\nSTORED; every key is named for the CLAIM it bounds rather than for the model,\nso `permission_claim_max_count` bounds what one claim carries, and there is\nno `max_permissions_per_role` and there never will be.\n\nA top-level section rather than a field on `[oidc]` deliberately, because\nthe budget is consumed on BOTH planes: the mint enforces it and the\nmanagement API reports the approach warning against it, so one bound has one\noperator-visible name."
+    },
+    "webhooks": {
+      "$ref": "#/$defs/WebhooksConfig",
+      "default": {
+        "delivery_enabled": false,
+        "delivery_timeout_secs": 10
+      },
+      "description": "Outbound webhook delivery (issue #105): whether this process drains the\n`webhook.delivery` queue, and the per-delivery time budget.\n\nSeparate from `[outbox]` on purpose. That section tunes the shared QUEUE for every\nconsumer at once; this one gates the webhook consumer specifically, which is the\nper-consumer switch `outbox.reap_enabled`'s documentation already anticipated the\nnext consumer needing."
     }
   },
   "title": "Config",
