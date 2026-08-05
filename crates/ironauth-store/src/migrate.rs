@@ -968,6 +968,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0112_webhook_secret_rotation.sql"),
         },
+        Migration {
+            version: 113,
+            name: "webhook_delivery_attempts",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0113_webhook_delivery_attempts.sql"),
+        },
     ]
 }
 

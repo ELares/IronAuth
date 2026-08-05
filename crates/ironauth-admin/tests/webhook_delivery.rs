@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use axum::http::StatusCode;
 use common::Harness;
 use ironauth_admin::webhook_delivery::{
-    DeliveryHeaders, WebhookDeliveryConsumer, WebhookReplayConsumer, WebhookSender,
+    DeliveryHeaders, DeliveryOutcome, WebhookDeliveryConsumer, WebhookReplayConsumer, WebhookSender,
 };
 use ironauth_env::Env;
 use ironauth_jose::webhooks::{WebhookSecret, verify_delivery};
@@ -72,7 +72,7 @@ impl WebhookSender for RecordingSender {
         url: &str,
         headers: &DeliveryHeaders,
         body: &str,
-    ) -> impl Future<Output = Result<(), SendFailure>> + Send {
+    ) -> impl Future<Output = DeliveryOutcome> + Send {
         self.sent.lock().expect("recorder lock").push(Recorded {
             url: url.to_owned(),
             headers: headers.clone(),
@@ -81,8 +81,13 @@ impl WebhookSender for RecordingSender {
         let outcome = self.outcome;
         async move {
             match outcome {
-                Some(failure) => Err(failure),
-                None => Ok(()),
+                // A programmed status is echoed back as the receiver's answer, so a test
+                // asserting on the recorded history reads the code it asked for.
+                Some(failure @ SendFailure::Status(status)) => {
+                    DeliveryOutcome::failed(Some(status), failure)
+                }
+                Some(failure) => DeliveryOutcome::failed(None, failure),
+                None => DeliveryOutcome::success(200),
             }
         }
     }
@@ -576,6 +581,230 @@ async fn a_dead_letter_is_listed_replayed_across_planes_and_redelivered_under_it
         now,
     )
     .expect("and it verifies under the endpoint's current secret");
+}
+
+#[tokio::test]
+async fn every_attempt_is_recorded_with_what_the_receiver_actually_answered() {
+    // The debugging surface #106 asks for: what the endpoint actually answered, and when.
+    //
+    // The case that matters is the RETRIED failure. A history that recorded only terminal
+    // outcomes would omit precisely the attempts an operator opens it to see, and it would
+    // still look correct on a delivery that succeeded first time. So this drives a failure
+    // and then a success on the same message and asserts both are there, with the status
+    // the receiver returned rather than merely that each one failed or did not.
+    use std::time::Duration;
+
+    use ironauth_store::{NewOutboxMessage, RetryPolicy, WEBHOOK_DELIVERY_CONSUMER};
+
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (id, _, base) = register(&h, &tenant, &environment).await;
+    let scope = scope_of(&tenant, &environment);
+    // A MANUAL clock, because this test has to cross a retry backoff and the alternative
+    // is sleeping for it. Advancing the seam is also what makes the recorded latency and
+    // the attempt ordering deterministic rather than dependent on how fast the machine is.
+    let (env, clock) = Env::deterministic(
+        std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+        7,
+    );
+    let store = h.store().clone();
+
+    store
+        .scoped(scope)
+        .outbox()
+        .enqueue(
+            &env,
+            &NewOutboxMessage {
+                consumer: WEBHOOK_DELIVERY_CONSUMER,
+                idempotency_key: "evt_hist",
+                ordering_key: &id,
+                payload: serde_json::json!({
+                    "endpoint_id": id,
+                    "body": { "type": "user.created" },
+                }),
+            },
+        )
+        .await
+        .expect("enqueue");
+
+    // A FAILED attempt first. It is retried rather than terminal, which is precisely the
+    // case a history that only recorded final outcomes would lose.
+    let claimed = store
+        .scoped(scope)
+        .outbox()
+        .claim(&env, WEBHOOK_DELIVERY_CONSUMER, Duration::from_secs(30), 10)
+        .await
+        .expect("claim");
+    WebhookDeliveryConsumer::new(
+        store.clone(),
+        RecordingSender::failing(SendFailure::Status(503)),
+    )
+    .handle(&env, scope, &claimed[0])
+    .await
+    .expect_err("a 503 is a failed delivery");
+    let outcome = store
+        .scoped(scope)
+        .outbox()
+        .fail(
+            &env,
+            &claimed[0],
+            "http_status_503",
+            RetryPolicy {
+                max_attempts: 5,
+                retry_base: Duration::from_secs(0),
+            },
+        )
+        .await
+        .expect("record the failure");
+    assert!(
+        matches!(outcome, ironauth_store::FailureOutcome::Retrying { .. }),
+        "five attempts remain, so this is a retry rather than a dead letter: {outcome:?}"
+    );
+
+    // Past the backoff the failure just scheduled, through the seam rather than by
+    // waiting. A retry that is not yet due is not claimable, which is the substrate
+    // working; stepping the clock is how a test crosses it.
+    clock.advance(Duration::from_secs(600));
+
+    // Then a SUCCESS on the retry, so the history holds one of each.
+    let claimed = store
+        .scoped(scope)
+        .outbox()
+        .claim(&env, WEBHOOK_DELIVERY_CONSUMER, Duration::from_secs(30), 10)
+        .await
+        .expect("re-claim");
+    assert_eq!(claimed.len(), 1, "the retry is claimable");
+    WebhookDeliveryConsumer::new(store.clone(), RecordingSender::accepting())
+        .handle(&env, scope, &claimed[0])
+        .await
+        .expect("the retry succeeds");
+
+    let (status, _, body) = h.get(&format!("{base}/{id}/attempts")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let listed: Value = serde_json::from_str(&body).expect("json");
+    let items = listed["items"].as_array().expect("items");
+    assert_eq!(items.len(), 2, "both attempts are recorded: {body}");
+
+    // Newest first, so the SUCCESS leads.
+    assert_eq!(items[0]["status_code"], 200, "{body}");
+    assert_eq!(
+        items[0]["error"],
+        Value::Null,
+        "a success carries no error: {body}"
+    );
+    assert_eq!(items[0]["attempt_number"], 2, "{body}");
+    assert_eq!(
+        items[1]["status_code"], 503,
+        "the failed attempt records what the RECEIVER said, not merely that it failed: \
+         {body}"
+    );
+    assert_eq!(items[1]["error"], "http_status_503", "{body}");
+    assert_eq!(items[1]["attempt_number"], 1, "{body}");
+    for item in items {
+        assert_eq!(
+            item["webhook_id"], "evt_hist",
+            "every attempt is correlatable by the id the receiver deduplicated on: {body}"
+        );
+        assert!(item["latency_ms"].as_i64().expect("latency") >= 0, "{body}");
+    }
+}
+
+#[tokio::test]
+async fn a_reaped_message_takes_its_attempt_history_with_it() {
+    // The retention half, kept separate because it is an independent claim: a history that
+    // records the right things and a history that is bounded are two different properties,
+    // and a test asserting both at once reports one failure for either.
+    //
+    // This table has NO reaper of its own, deliberately. Migration 0099 shipped the queue
+    // with no retention and 0102 had to add a sweeper afterwards; a per-ATTEMPT table grows
+    // faster than the messages it describes, so the bound here is structural. If the
+    // cascade were dropped, nothing else in the tree would ever delete one of these rows.
+    use std::time::Duration;
+
+    use ironauth_store::{NewOutboxMessage, WEBHOOK_DELIVERY_CONSUMER};
+
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (id, _, base) = register(&h, &tenant, &environment).await;
+    let scope = scope_of(&tenant, &environment);
+    let env = Env::system();
+    let store = h.store().clone();
+
+    store
+        .scoped(scope)
+        .outbox()
+        .enqueue(
+            &env,
+            &NewOutboxMessage {
+                consumer: WEBHOOK_DELIVERY_CONSUMER,
+                idempotency_key: "evt_reap",
+                ordering_key: &id,
+                payload: serde_json::json!({
+                    "endpoint_id": id,
+                    "body": { "type": "user.created" },
+                }),
+            },
+        )
+        .await
+        .expect("enqueue");
+    let claimed = store
+        .scoped(scope)
+        .outbox()
+        .claim(&env, WEBHOOK_DELIVERY_CONSUMER, Duration::from_secs(30), 10)
+        .await
+        .expect("claim");
+    WebhookDeliveryConsumer::new(store.clone(), RecordingSender::accepting())
+        .handle(&env, scope, &claimed[0])
+        .await
+        .expect("the delivery is made");
+
+    let (_, _, body) = h.get(&format!("{base}/{id}/attempts")).await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).expect("json")["items"]
+            .as_array()
+            .expect("items")
+            .len(),
+        1,
+        "the attempt is recorded before retention has any reason to run: {body}"
+    );
+
+    // Completing it is the WORKER's step, not the consumer's, so the test does it here:
+    // without it the message is not terminal and retention would find nothing to reap,
+    // which would make the assertion below pass for the wrong reason.
+    assert!(
+        store
+            .scoped(scope)
+            .outbox()
+            .complete(&env, &claimed[0])
+            .await
+            .expect("complete the delivered message"),
+        "the completion is accepted under the lease this claim holds"
+    );
+
+    // RETENTION, which is the whole reason this table has a foreign key rather than a
+    // second reaper. Reaping the message must take its history with it; nothing else in
+    // the tree deletes these rows, so without the cascade they would accumulate forever.
+    // Through the CONTROL store, because 0102 gave the retention DELETE to that role
+    // alone. Reaping from the data plane would fail on the grant, so this also measures
+    // that the cascade works for the role that actually performs retention.
+    let deleted = h
+        .control_store()
+        .scoped(scope)
+        .outbox()
+        .reap_completed(WEBHOOK_DELIVERY_CONSUMER, i64::MAX, 100)
+        .await
+        .expect("reap the completed message");
+    assert_eq!(deleted, 1, "the completed message is reaped");
+    let (status, _, body) = h.get(&format!("{base}/{id}/attempts")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        serde_json::from_str::<Value>(&body).expect("json")["items"]
+            .as_array()
+            .expect("items")
+            .is_empty(),
+        "the attempts went with the message they describe, under the outbox's own \
+         retention rather than a second one: {body}"
+    );
 }
 
 #[tokio::test]

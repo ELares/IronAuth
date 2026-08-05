@@ -17556,6 +17556,91 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/attempts": {
+      "get": {
+        "tags": [
+          "webhooks"
+        ],
+        "summary": "List an endpoint's delivery attempt history.",
+        "operationId": "listWebhookDeliveryAttempts",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "endpoint_id",
+            "in": "path",
+            "description": "The endpoint identifier (whe_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The delivery attempts, newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeliveryAttemptList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment is absent, or the endpoint is in another scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/dead-letters": {
       "get": {
         "tags": [
@@ -19697,6 +19782,73 @@
           "webhook_id": {
             "type": "string",
             "description": "The `webhook-id` this delivery carried, and will carry again if replayed. Stable\nacross every attempt, which is what lets a receiver deduplicate a redelivery."
+          }
+        }
+      },
+      "DeliveryAttemptList": {
+        "type": "object",
+        "description": "An endpoint's delivery attempt history, newest first.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DeliveryAttemptView"
+            },
+            "description": "The attempts, most recent first."
+          }
+        }
+      },
+      "DeliveryAttemptView": {
+        "type": "object",
+        "description": "One recorded delivery attempt.",
+        "required": [
+          "id",
+          "webhook_id",
+          "attempt_number",
+          "attempted_at_unix_ms",
+          "latency_ms"
+        ],
+        "properties": {
+          "attempt_number": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Which attempt of its delivery this was, starting at 1."
+          },
+          "attempted_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When it was made, milliseconds since the Unix epoch."
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`null` on a success; otherwise a bounded, non-secret failure label."
+          },
+          "id": {
+            "type": "string",
+            "description": "The `wha_` identifier."
+          },
+          "latency_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The round trip in milliseconds."
+          },
+          "status_code": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The status the receiver returned. `null` means it never answered: the destination\nwas refused, the attempt timed out, or the transport failed. `error` says which."
+          },
+          "webhook_id": {
+            "type": "string",
+            "description": "The `webhook-id` the attempt carried, which is what a receiver deduplicated on."
           }
         }
       },

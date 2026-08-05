@@ -26,7 +26,8 @@ use ironauth_jose::webhooks::{WebhookSecret, sign_delivery};
 use ironauth_oidc::SendFailure;
 use ironauth_store::outbox::{ConsumerError, OutboxConsumer};
 use ironauth_store::{
-    OutboxMessage, Scope, Store, WEBHOOK_DELIVERY_CONSUMER, WEBHOOK_REPLAY_CONSUMER,
+    NewDeliveryAttempt, OutboxMessage, Scope, Store, WEBHOOK_DELIVERY_CONSUMER,
+    WEBHOOK_REPLAY_CONSUMER,
 };
 
 /// The payload key naming the endpoint this message is destined for.
@@ -54,15 +55,52 @@ const HEADER_SIGNATURE: &str = "webhook-signature";
 /// The returned future is declared `Send` so a worker built on this seam stays spawnable
 /// on a multi-threaded runtime.
 pub trait WebhookSender: Send + Sync {
-    /// POST `body` to `url` under the three Standard Webhooks headers, returning `Ok(())`
-    /// on a 2xx and a [`SendFailure`] otherwise. This is the ONLY outbound path the
-    /// consumer has.
+    /// POST `body` to `url` under the three Standard Webhooks headers. This is the ONLY
+    /// outbound path the consumer has.
+    ///
+    /// It returns what the RECEIVER said rather than merely whether the call worked,
+    /// because the attempt history (#106) records the status code on a success as well as
+    /// on a failure. A boolean outcome would have left "it returned 204" and "it returned
+    /// 200" indistinguishable in the record an operator debugs from.
     fn deliver(
         &self,
         url: &str,
         headers: &DeliveryHeaders,
         body: &str,
-    ) -> impl Future<Output = Result<(), SendFailure>> + Send;
+    ) -> impl Future<Output = DeliveryOutcome> + Send;
+}
+
+/// What ONE delivery attempt produced.
+///
+/// `status` is `None` when the attempt never reached a response at all: a destination the
+/// SSRF policy refused, a timeout, a transport fault. That absence is itself the useful
+/// fact in a history, and `failure` names which of those it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryOutcome {
+    /// The HTTP status the receiver returned, if it returned one.
+    pub status: Option<u16>,
+    /// `None` on success; otherwise why the attempt did not succeed.
+    pub failure: Option<SendFailure>,
+}
+
+impl DeliveryOutcome {
+    /// A 2xx.
+    #[must_use]
+    pub fn success(status: u16) -> Self {
+        Self {
+            status: Some(status),
+            failure: None,
+        }
+    }
+
+    /// A failure, carrying the receiver's status when there was one.
+    #[must_use]
+    pub fn failed(status: Option<u16>, failure: SendFailure) -> Self {
+        Self {
+            status,
+            failure: Some(failure),
+        }
+    }
 }
 
 /// The three Standard Webhooks headers one delivery carries.
@@ -115,7 +153,7 @@ impl WebhookSender for FetchWebhookSender {
         url: &str,
         headers: &DeliveryHeaders,
         body: &str,
-    ) -> impl Future<Output = Result<(), SendFailure>> + Send {
+    ) -> impl Future<Output = DeliveryOutcome> + Send {
         let fetcher = Arc::clone(&self.fetcher);
         let url = url.to_owned();
         let body = body.to_owned();
@@ -143,16 +181,25 @@ impl WebhookSender for FetchWebhookSender {
                     http::HeaderName::from_bytes(name.as_bytes()),
                     http::HeaderValue::from_str(value),
                 ) else {
-                    return Err(SendFailure::Transport);
+                    return DeliveryOutcome::failed(None, SendFailure::Transport);
                 };
                 request = request.header(name, value);
             }
             match fetcher.fetch(request).await {
-                Ok(response) if response.status().is_success() => Ok(()),
-                Ok(response) => Err(SendFailure::Status(response.status().as_u16())),
-                Err(ironauth_fetch::FetchError::Blocked) => Err(SendFailure::Blocked),
-                Err(ironauth_fetch::FetchError::Timeout) => Err(SendFailure::Timeout),
-                Err(_) => Err(SendFailure::Transport),
+                Ok(response) if response.status().is_success() => {
+                    DeliveryOutcome::success(response.status().as_u16())
+                }
+                Ok(response) => {
+                    let status = response.status().as_u16();
+                    DeliveryOutcome::failed(Some(status), SendFailure::Status(status))
+                }
+                Err(ironauth_fetch::FetchError::Blocked) => {
+                    DeliveryOutcome::failed(None, SendFailure::Blocked)
+                }
+                Err(ironauth_fetch::FetchError::Timeout) => {
+                    DeliveryOutcome::failed(None, SendFailure::Timeout)
+                }
+                Err(_) => DeliveryOutcome::failed(None, SendFailure::Transport),
             }
         }
     }
@@ -245,13 +292,60 @@ impl<S: WebhookSender> WebhookDeliveryConsumer<S> {
             ),
         };
 
-        self.sender
-            .deliver(&target.url, &headers, &body)
+        // Latency is measured across the send through the CLOCK SEAM rather than a
+        // monotonic timer, for the same reason every other instant in this tree comes from
+        // the seam: a test drives it deterministically instead of asserting on real
+        // elapsed time. It is a wall clock, so it can in principle step; the subtraction
+        // saturates at zero rather than recording a negative duration, which the column's
+        // CHECK would refuse anyway.
+        let started_micros = unix_micros(now);
+        let outcome = self.sender.deliver(&target.url, &headers, &body).await;
+        let finished_micros = unix_micros(env.clock().now_utc());
+        let latency_ms = finished_micros.saturating_sub(started_micros) / 1000;
+
+        // The attempt is recorded BEFORE the outcome is turned into a retry, so a failure
+        // that will be retried still leaves its record behind. Recording only terminal
+        // outcomes would produce a history that omits precisely the attempts an operator
+        // opens it to see.
+        //
+        // A history write that fails does NOT fail the delivery. The delivery either
+        // reached the receiver or did not, and turning a bookkeeping fault into a retry
+        // would resend a webhook that already arrived. The loss is logged, which is the
+        // honest trade: history is best effort, delivery is not.
+        let attempt = NewDeliveryAttempt {
+            message_id: &message.id,
+            endpoint: &target.id,
+            webhook_id: &message.idempotency_key,
+            // `attempts` counts the failures RECORDED so far, so this attempt is the next
+            // one; a message on its first pass has zero and this is attempt 1.
+            attempt_number: message.attempts.saturating_add(1),
+            attempted_at_unix_micros: started_micros,
+            status_code: outcome.status,
+            latency_ms,
+            error: outcome.failure.map(SendFailure::label),
+        };
+        if let Err(error) = self
+            .store
+            .scoped(scope)
+            .webhook_delivery_attempts()
+            .record(env, &attempt)
             .await
+        {
+            tracing::warn!(
+                %error,
+                webhook_id = %message.idempotency_key,
+                "the webhook delivery attempt history could not be written; the delivery \
+                 itself is unaffected"
+            );
+        }
+
+        match outcome.failure {
             // A refused destination, a timeout, a non-2xx and a transport fault are all
             // retryable: the attempts cap is what turns a persistently dead receiver into
             // a dead letter, so nothing here needs a second way to give up.
-            .map_err(|failure| ConsumerError::retryable(failure.label()))
+            Some(failure) => Err(ConsumerError::retryable(failure.label())),
+            None => Ok(()),
+        }
     }
 }
 
@@ -343,6 +437,14 @@ impl OutboxConsumer for WebhookReplayConsumer {
         message: &'a OutboxMessage,
     ) -> Pin<Box<dyn Future<Output = Result<(), ConsumerError>> + Send + 'a>> {
         Box::pin(async move { self.replay_one(env, scope, message).await })
+    }
+}
+
+/// Microseconds since the Unix epoch for a wall-clock instant (saturating).
+fn unix_micros(at: std::time::SystemTime) -> i64 {
+    match at.duration_since(std::time::UNIX_EPOCH) {
+        Ok(delta) => i64::try_from(delta.as_micros()).unwrap_or(i64::MAX),
+        Err(_) => 0,
     }
 }
 

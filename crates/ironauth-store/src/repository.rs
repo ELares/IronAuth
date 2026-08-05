@@ -95,7 +95,7 @@ use crate::id::{
     ServiceAccountId, SessionId, SigningKeyId, SignupFormId, SignupQuarantineId, SmsOtpCodeId,
     SmsRouteStatId, TenantId, TotpCredentialId, TraitMigrationJobId, TraitSchemaId,
     TrustedDeviceId, UpstreamTokenGrantId, UpstreamTokenId, UserId, UserIdentifierId, VariableId,
-    WebauthnChallengeId, WebauthnCredentialId, WebhookEndpointId,
+    WebauthnChallengeId, WebauthnCredentialId, WebhookDeliveryAttemptId, WebhookEndpointId,
 };
 use crate::identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
@@ -679,6 +679,16 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn connectors(&self) -> ConnectorRepo<'a> {
         ConnectorRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The webhook delivery attempt history for this scope (issue #106): what each
+    /// attempt's receiver answered, how long it took, and which attempt it was.
+    #[must_use]
+    pub fn webhook_delivery_attempts(&self) -> WebhookDeliveryAttemptRepo<'a> {
+        WebhookDeliveryAttemptRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -24757,6 +24767,156 @@ impl WebhookEndpointRepo<'_> {
             url: row.get("url"),
             secrets,
         }))
+    }
+}
+
+/// One recorded webhook delivery attempt (issue #106).
+pub struct DeliveryAttemptRecord {
+    /// The `wha_` identifier.
+    pub id: WebhookDeliveryAttemptId,
+    /// The `webhook-id` the attempt carried, which is what a receiver deduplicated on.
+    pub webhook_id: String,
+    /// Which attempt of its message this was, starting at 1.
+    pub attempt_number: i32,
+    /// When it was made, in microseconds since the Unix epoch.
+    pub attempted_at_unix_micros: i64,
+    /// The status the receiver returned, or `None` if it never answered.
+    pub status_code: Option<i32>,
+    /// The round trip in milliseconds.
+    pub latency_ms: i64,
+    /// `None` on a success; otherwise the bounded, non-secret failure label.
+    pub error: Option<String>,
+}
+
+/// The fields one recorded attempt carries, grouped so the write stays inside the
+/// argument budget.
+pub struct NewDeliveryAttempt<'a> {
+    /// The queue message this attempt was for. The row is deleted with it (0113's
+    /// cascade), which is the whole of this table's retention.
+    pub message_id: &'a str,
+    /// The endpoint the attempt was made against.
+    pub endpoint: &'a WebhookEndpointId,
+    /// The `webhook-id` header the attempt carried.
+    pub webhook_id: &'a str,
+    /// Which attempt of its message this was, starting at 1.
+    pub attempt_number: i32,
+    /// When it was made, in microseconds since the Unix epoch.
+    pub attempted_at_unix_micros: i64,
+    /// The status the receiver returned, if it answered.
+    pub status_code: Option<u16>,
+    /// The round trip in milliseconds.
+    pub latency_ms: i64,
+    /// `None` on a success; otherwise the bounded, non-secret failure label.
+    pub error: Option<String>,
+}
+
+/// The webhook delivery attempt history (issue #106).
+///
+/// Off the audited path deliberately. An attempt is a record of something the SYSTEM did
+/// while draining a queue, not of something an operator decided, and the operator
+/// decisions in this subsystem (register, rotate, pause, replay) carry their own audit
+/// rows already. Auditing every delivery attempt would bury those under machine traffic.
+pub struct WebhookDeliveryAttemptRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl WebhookDeliveryAttemptRepo<'_> {
+    /// RECORD one attempt.
+    ///
+    /// A DATA-plane write: the plane that makes the attempt is the plane that records it.
+    /// Migration 0113 grants this role INSERT and SELECT and nothing else, so a recorded
+    /// attempt can never be edited afterwards by the role that made it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault, including the foreign key
+    /// violation a `message_id` that is not on the queue raises.
+    pub async fn record(
+        &self,
+        env: &Env,
+        attempt: &NewDeliveryAttempt<'_>,
+    ) -> Result<(), StoreError> {
+        let scope = self.scope;
+        if attempt.endpoint.scope() != scope {
+            return Err(StoreError::NotFound);
+        }
+        let id = WebhookDeliveryAttemptId::generate(env, &scope);
+        let mut tx = begin_scoped(self.store, scope).await?;
+        sqlx::query(
+            "INSERT INTO webhook_delivery_attempts \
+             (id, tenant_id, environment_id, endpoint_id, message_id, webhook_id, \
+              attempt_number, attempted_at, status_code, latency_ms, error) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, \
+                     TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval, \
+                     $9, $10, $11)",
+        )
+        .bind(id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(attempt.endpoint.to_string())
+        .bind(attempt.message_id)
+        .bind(attempt.webhook_id)
+        .bind(attempt.attempt_number)
+        .bind(attempt.attempted_at_unix_micros)
+        .bind(attempt.status_code.map(i32::from))
+        .bind(attempt.latency_ms)
+        .bind(attempt.error.as_deref())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// One endpoint's attempt history, NEWEST first.
+    ///
+    /// Newest first here and oldest first for the dead-letter listing, and the difference
+    /// is not an inconsistency. A dead-letter list is read in the order a replay will
+    /// redeliver in; a history is read to answer "what happened most recently", which is
+    /// the opposite end.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault.
+    pub async fn for_endpoint(
+        &self,
+        endpoint: &WebhookEndpointId,
+        limit: i64,
+    ) -> Result<Vec<DeliveryAttemptRecord>, StoreError> {
+        let scope = self.scope;
+        if endpoint.scope() != scope {
+            return Ok(Vec::new());
+        }
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, webhook_id, attempt_number, \
+                    (EXTRACT(EPOCH FROM attempted_at) * 1000000)::bigint AS attempted_us, \
+                    status_code, latency_ms, error \
+             FROM webhook_delivery_attempts \
+             WHERE tenant_id = $1 AND environment_id = $2 AND endpoint_id = $3 \
+             ORDER BY attempted_at DESC, attempt_number DESC LIMIT $4",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(endpoint.to_string())
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| {
+                let raw: String = row.get("id");
+                Ok(DeliveryAttemptRecord {
+                    id: WebhookDeliveryAttemptId::parse_in_scope(&raw, &scope)?,
+                    webhook_id: row.get("webhook_id"),
+                    attempt_number: row.get("attempt_number"),
+                    attempted_at_unix_micros: row.get("attempted_us"),
+                    status_code: row.get("status_code"),
+                    latency_ms: row.get("latency_ms"),
+                    error: row.get("error"),
+                })
+            })
+            .collect()
     }
 }
 

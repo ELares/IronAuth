@@ -1084,6 +1084,11 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             format!("{base}/webhook-endpoints"),
         ),
         Case::empty(
+            "webhook_endpoints.listWebhookDeliveryAttempts",
+            "GET",
+            format!("{base}/webhook-endpoints/{webhook_endpoint}/attempts"),
+        ),
+        Case::empty(
             "webhook_endpoints.listWebhookDeadLetters",
             "GET",
             format!("{base}/webhook-endpoints/{webhook_endpoint}/dead-letters"),
