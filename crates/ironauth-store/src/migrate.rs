@@ -980,6 +980,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0114_webhook_auto_disable.sql"),
         },
+        Migration {
+            version: 115,
+            name: "client_par_requirement_control_grant",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0115_client_par_requirement_control_grant.sql"),
+        },
     ]
 }
 

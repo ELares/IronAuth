@@ -342,6 +342,28 @@ fn abuse_and_sudo_cases(base: &str) -> Vec<Case> {
 const RASTER_UPLOAD: &str = "RIFF\0\0\0\0WEBP";
 
 /// The environment-scoped writes that address a CLIENT.
+/// The two security postures the data plane enforces (issues #27, #78), in their own
+/// builder because they belong to no existing group: one is per client and one is per
+/// environment, and folding them into `client_cases` pushed it past the readable-length
+/// lint.
+fn posture_cases(base: &str, ids: &Ids) -> Vec<Case> {
+    let client = &ids.client;
+    vec![
+        Case {
+            label: "postures.setClientParRequirement",
+            method: "PUT",
+            path: format!("{base}/clients/{client}/par-requirement"),
+            body: Some(body_of(&serde_json::json!({ "required": true }))),
+        },
+        Case {
+            label: "postures.setAutoLinkPosture",
+            method: "PUT",
+            path: format!("{base}/auto-link-posture"),
+            body: Some(body_of(&serde_json::json!({ "posture": "off" }))),
+        },
+    ]
+}
+
 fn client_cases(base: &str, ids: &Ids) -> Vec<Case> {
     let Ids { client, .. } = ids;
     vec![
@@ -1041,6 +1063,7 @@ fn all_cases(tenant: &str, environment: &str) -> Vec<Case> {
     let ids = Ids::mint(tenant, environment);
     let mut cases = abuse_and_sudo_cases(&base);
     cases.extend(client_cases(&base, &ids));
+    cases.extend(posture_cases(&base, &ids));
     cases.extend(config_and_connector_cases(&base, &ids));
     cases.extend(environment_child_cases(&base, &ids));
     cases.extend(resource_cases(&base, &ids));

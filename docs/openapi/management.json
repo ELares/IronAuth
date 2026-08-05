@@ -1803,6 +1803,102 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/auto-link-posture": {
+      "put": {
+        "tags": [
+          "environments"
+        ],
+        "summary": "Set an environment's account-linking posture (issue #78).",
+        "operationId": "setAutoLinkPosture",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetAutoLinkPostureRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The stored posture, or null when the deployment default is inherited",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AutoLinkPostureView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request, a body omitting `posture`, or a token outside the closed set",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential, or a lapsed sudo elevation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment is absent or soft-deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/brands": {
       "get": {
         "tags": [
@@ -2764,6 +2860,111 @@
           },
           "401": {
             "description": "Missing or invalid credential, or a lapsed sudo elevation (the RFC 9470 insufficient_user_authentication challenge)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (absent, malformed, or another scope's). The environment must be live too: an absent or soft-deleted one answers this same not-found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/par-requirement": {
+      "put": {
+        "tags": [
+          "clients"
+        ],
+        "summary": "Set a client's Pushed Authorization Request requirement (RFC 9126).",
+        "operationId": "setClientParRequirement",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "client_id",
+            "in": "path",
+            "description": "The client identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetClientParRequirementRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The stored requirement",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientParRequirementView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request or a body omitting `required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential, or a lapsed sudo elevation",
             "content": {
               "application/json": {
                 "schema": {
@@ -18927,6 +19128,19 @@
           }
         }
       },
+      "AutoLinkPostureView": {
+        "type": "object",
+        "description": "An environment's stored account-linking posture.",
+        "properties": {
+          "posture": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The stored override, or `null` when the environment inherits the deployment\ndefault."
+          }
+        }
+      },
       "BanList": {
         "type": "object",
         "description": "A page of bans.",
@@ -19267,6 +19481,24 @@
           "truncated": {
             "type": "boolean",
             "description": "True when the result hit the limit and older matching failures were left out;\nthe operator should narrow the client or time window (never a silent truncation)."
+          }
+        }
+      },
+      "ClientParRequirementView": {
+        "type": "object",
+        "description": "A client's PAR requirement as stored.",
+        "required": [
+          "client_id",
+          "require_pushed_authorization_requests"
+        ],
+        "properties": {
+          "client_id": {
+            "type": "string",
+            "description": "The client this describes."
+          },
+          "require_pushed_authorization_requests": {
+            "type": "boolean",
+            "description": "Whether PAR is required for this client specifically."
           }
         }
       },
@@ -23323,6 +23555,19 @@
           }
         }
       },
+      "SetAutoLinkPostureRequest": {
+        "type": "object",
+        "description": "Set or clear an environment's account-linking posture override.",
+        "properties": {
+          "posture": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`off` or `verified_to_verified`, or an explicit `null` to CLEAR the override so the\nenvironment inherits the deployment default. The field is required so that \"clear\nit\" is stated rather than inferred from an omission."
+          }
+        }
+      },
       "SetBrandRequest": {
         "type": "object",
         "description": "The body to set (create or overwrite) a per-environment brand (issues #86, #475).\n\nA brand is expressible ONLY through data that cannot become script, and this request shape\nis where that rule is enforced at ingest. `tokens` and `tokens_dark` must deserialize into\nthe CLOSED typed design-token grammar (hex-only colors, an allowlist font enum, clamped\nnumerics); a malformed or hostile token blob is a loud 400 and nothing is stored. `slots`\nvalues pass the ONE allowlist sanitizer and are stored as sanitizer output, never as the\nsubmitted markup. The plain wordmark fields are stored as plain text and escaped on render.",
@@ -23412,6 +23657,19 @@
               "type": "string"
             },
             "description": "The scope tokens this client may request, or `null` to clear the allowlist\n(after which every scope passes the machine-grant denylist floor). An empty\narray is a real value: the client may then request no scope at all. REQUIRED:\nomitting the key is a 400, and it is NOT the same as sending `null`."
+          }
+        }
+      },
+      "SetClientParRequirementRequest": {
+        "type": "object",
+        "description": "Require (or stop requiring) Pushed Authorization Requests for one client.",
+        "required": [
+          "required"
+        ],
+        "properties": {
+          "required": {
+            "type": "boolean",
+            "description": "Whether this client must use PAR. `true` requires it for this client even when the\ndeployment does not; `false` leaves the client to the deployment-wide setting,\nwhich can still require it."
           }
         }
       },
