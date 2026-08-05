@@ -294,9 +294,9 @@ pub use repository::{
 };
 pub use repository::{
     ActingWebhookEndpointRepo, DeliveryAttemptRecord, DeliveryTargetLookup, NewDeliveryAttempt,
-    NewWebhookEndpoint, TRAIT_MIGRATION_CONSUMER, TraitMigrationStart, WEBHOOK_DELIVERY_CONSUMER,
-    WEBHOOK_REPLAY_CONSUMER, WebhookDeliveryAttemptRepo, WebhookDeliveryTarget,
-    WebhookEndpointRecord, WebhookEndpointRepo,
+    NewWebhookEndpoint, OFFBOARDING_CONSUMER, OffboardingSchedule, TRAIT_MIGRATION_CONSUMER,
+    TraitMigrationStart, WEBHOOK_DELIVERY_CONSUMER, WEBHOOK_REPLAY_CONSUMER,
+    WebhookDeliveryAttemptRepo, WebhookDeliveryTarget, WebhookEndpointRecord, WebhookEndpointRepo,
 };
 /// The testing-only atomicity probes (issue #247): the seams at which a test can force
 /// the joined invitation create and the joined recovery approve to fail INSIDE their one

@@ -303,6 +303,8 @@ at the top of the file, or map it in `.taplo.toml`).
 | `traits` | table | see fields | Schema-driven identity traits (issue #53): whether this process advances trait migration jobs, and how large one batch is. |
 | `traits.migration_batch_size` | integer | `500` | How many identities ONE batch of a migration job processes before the worker yields and re-queues the next batch. |
 | `traits.migration_worker_enabled` | boolean | `false` | Whether THIS process drains the `traits.migration` queue and advances migration jobs in batches. OFF by default, like every other background worker here. |
+| `users` | table | see fields | User lifecycle (issue #52): whether this process executes scheduled offboardings that have come due. |
+| `users.offboarding_worker_enabled` | boolean | `true` | Whether THIS process drains the `users.offboarding` queue and executes scheduled offboardings that have come due (issue #52). |
 | `webhooks` | table | see fields | Outbound webhook delivery (issue #105): whether this process drains the `webhook.delivery` queue, and the per-delivery time budget. |
 | `webhooks.auto_disable_after_consecutive_failures` | integer | `50` | Disable an endpoint automatically after this many CONSECUTIVE failed delivery attempts with no success in between. `0` turns the behaviour off entirely. |
 | `webhooks.delivery_enabled` | boolean | `false` | Whether THIS process drains the `webhook.delivery` queue and POSTs to registered endpoints. OFF by default. |

@@ -17,8 +17,8 @@ use ironauth_store::idor_harness::IdorHarness;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
     CorrelationId, CursorPosition, IdentifierType, NewAdminUser, NewSession, NewUserIdentifier,
-    Scope, SessionId, StoreError, UniquenessMode, UserId, UserIdentifierId, UserListFilter,
-    UserState,
+    OffboardingSchedule, Scope, SessionId, StoreError, UniquenessMode, UserId, UserIdentifierId,
+    UserListFilter, UserState,
 };
 use sqlx::Row;
 
@@ -111,6 +111,18 @@ async fn pending_events(db: &TestDatabase, scope: Scope) -> usize {
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// A state change carrying no offboarding wake-up.
+///
+/// These tests drive `execute_scheduled_offboardings` by hand, so the delayed message a
+/// production schedule also enqueues is deliberately absent here; the executor is what is
+/// under test, not the wake-up that triggers it.
+fn sched(at_unix_micros: Option<i64>) -> OffboardingSchedule<'static> {
+    OffboardingSchedule {
+        at_unix_micros,
+        wake_payload: None,
+    }
 }
 
 #[tokio::test]
@@ -334,7 +346,7 @@ async fn the_lifecycle_state_machine_accepts_valid_transitions_and_refuses_inval
     // active -> blocked (valid).
     acting
         .users()
-        .set_state(&env, &id, UserState::Blocked, None, false, None)
+        .set_state(&env, &id, UserState::Blocked, sched(None), false, None)
         .await
         .expect("block");
     assert_eq!(
@@ -351,14 +363,14 @@ async fn the_lifecycle_state_machine_accepts_valid_transitions_and_refuses_inval
     // blocked -> active (valid).
     acting
         .users()
-        .set_state(&env, &id, UserState::Active, None, false, None)
+        .set_state(&env, &id, UserState::Active, sched(None), false, None)
         .await
         .expect("reactivate");
 
     // A no-op transition (active -> active) is refused fail closed.
     let noop = acting
         .users()
-        .set_state(&env, &id, UserState::Active, None, false, None)
+        .set_state(&env, &id, UserState::Active, sched(None), false, None)
         .await;
     assert!(
         matches!(noop, Err(StoreError::Conflict)),
@@ -368,7 +380,14 @@ async fn the_lifecycle_state_machine_accepts_valid_transitions_and_refuses_inval
     // A move INTO pending_verification is refused (a creation-only state).
     let into_pending = acting
         .users()
-        .set_state(&env, &id, UserState::PendingVerification, None, false, None)
+        .set_state(
+            &env,
+            &id,
+            UserState::PendingVerification,
+            sched(None),
+            false,
+            None,
+        )
         .await;
     assert!(
         matches!(into_pending, Err(StoreError::Conflict)),
@@ -382,7 +401,7 @@ async fn the_lifecycle_state_machine_accepts_valid_transitions_and_refuses_inval
             &env,
             &id,
             UserState::ScheduledOffboarding,
-            None,
+            sched(None),
             false,
             None,
         )
@@ -395,7 +414,7 @@ async fn the_lifecycle_state_machine_accepts_valid_transitions_and_refuses_inval
     // A non-scheduled target must NOT carry a timestamp.
     let stray_ts = acting
         .users()
-        .set_state(&env, &id, UserState::Disabled, Some(10), false, None)
+        .set_state(&env, &id, UserState::Disabled, sched(Some(10)), false, None)
         .await;
     assert!(
         matches!(stray_ts, Err(StoreError::Conflict)),
@@ -406,7 +425,7 @@ async fn the_lifecycle_state_machine_accepts_valid_transitions_and_refuses_inval
     let ghost = UserId::generate(&env, &scope);
     let absent = acting
         .users()
-        .set_state(&env, &ghost, UserState::Blocked, None, false, None)
+        .set_state(&env, &ghost, UserState::Blocked, sched(None), false, None)
         .await;
     assert!(
         matches!(absent, Err(StoreError::NotFound)),
@@ -451,7 +470,7 @@ async fn a_suspended_user_cannot_authenticate() {
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .users()
-        .set_state(&env, &id, UserState::Blocked, None, false, None)
+        .set_state(&env, &id, UserState::Blocked, sched(None), false, None)
         .await
         .expect("block");
     let blocked = db
@@ -502,7 +521,14 @@ async fn disabling_and_deleting_a_user_cascades_the_users_sessions() {
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .users()
-        .set_state(&env, &disabled_user, UserState::Disabled, None, false, None)
+        .set_state(
+            &env,
+            &disabled_user,
+            UserState::Disabled,
+            sched(None),
+            false,
+            None,
+        )
         .await
         .expect("disable");
     assert!(
@@ -621,7 +647,7 @@ async fn state_for_subject_reports_the_live_state_and_fails_closed_after_delete(
             .scoped(scope)
             .acting(db.test_actor(&env), CorrelationId::generate(&env))
             .users()
-            .set_state(&env, &user, fenced, None, false, None)
+            .set_state(&env, &user, fenced, sched(None), false, None)
             .await
             .expect("transition");
         let state = db
@@ -862,7 +888,7 @@ async fn scheduled_offboarding_executes_at_its_timestamp_and_is_idempotent() {
             &env,
             &id,
             UserState::ScheduledOffboarding,
-            Some(10),
+            sched(Some(10)),
             false,
             None,
         )

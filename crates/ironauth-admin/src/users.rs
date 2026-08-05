@@ -682,6 +682,7 @@ pub async fn set_user_state(
         hard_kill: request.hard_kill,
     };
     let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
+    let wake = crate::offboarding_worker::wake_payload(&id.to_string(), &actor);
     let result = state
         .store()
         .scoped(scope)
@@ -691,7 +692,14 @@ pub async fn set_user_state(
             state.env(),
             &id,
             target,
-            scheduled_micros,
+            ironauth_store::OffboardingSchedule {
+                at_unix_micros: scheduled_micros,
+                // The wake-up that will EXECUTE this schedule, enqueued in the same
+                // transaction as the state change. Without it the scheduled instant is a
+                // column nothing ever reads again, which is what it was: the executor
+                // existed and had no caller anywhere in the tree.
+                wake_payload: Some(&wake),
+            },
             request.hard_kill,
             Some(IdempotencyWrite {
                 credential_ref: &credential_ref,
