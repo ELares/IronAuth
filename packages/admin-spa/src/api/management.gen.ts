@@ -6298,11 +6298,23 @@ export interface components {
             active: boolean;
             /**
              * Format: int64
+             * @description When the SYSTEM disabled this endpoint after sustained failure, milliseconds since
+             *     the Unix epoch. `null` on a live endpoint and on one an operator paused by hand, so
+             *     an operator can tell which happened.
+             */
+            auto_disabled_at_unix_ms?: number | null;
+            /**
+             * Format: int64
              * @description Creation time, milliseconds since the Unix epoch.
              */
             created_at_unix_ms: number;
             /** @description The operator's label for this endpoint. */
             description: string;
+            /**
+             * @description Why the system disabled it: a bounded internal label, never anything derived from a
+             *     receiver's response.
+             */
+            disabled_reason?: string | null;
             /** @description The `whe_` identifier. */
             id: string;
             /** @description The HTTPS destination deliveries POST to. */

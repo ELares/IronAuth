@@ -1977,8 +1977,11 @@ async fn spawn_webhook_delivery_pools(inputs: WebhookDeliveryInputs) -> Vec<Outb
     // does, which is this one.
     let mut consumers = ConsumerRegistry::new();
     for consumer in [
-        Arc::new(WebhookDeliveryConsumer::new(data_store.clone(), sender))
-            as Arc<dyn OutboxConsumer>,
+        Arc::new(WebhookDeliveryConsumer::with_auto_disable(
+            data_store.clone(),
+            sender,
+            webhooks.auto_disable_after_consecutive_failures,
+        )) as Arc<dyn OutboxConsumer>,
         Arc::new(WebhookReplayConsumer::new(data_store.clone())) as Arc<dyn OutboxConsumer>,
     ] {
         if let Err(error) = consumers.register(consumer) {

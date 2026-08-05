@@ -24333,6 +24333,14 @@
             "type": "boolean",
             "description": "Whether deliveries are dispatched."
           },
+          "auto_disabled_at_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the SYSTEM disabled this endpoint after sustained failure, milliseconds since\nthe Unix epoch. `null` on a live endpoint and on one an operator paused by hand, so\nan operator can tell which happened."
+          },
           "created_at_unix_ms": {
             "type": "integer",
             "format": "int64",
@@ -24341,6 +24349,13 @@
           "description": {
             "type": "string",
             "description": "The operator's label for this endpoint."
+          },
+          "disabled_reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the system disabled it: a bounded internal label, never anything derived from a\nreceiver's response."
           },
           "id": {
             "type": "string",
