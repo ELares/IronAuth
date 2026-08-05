@@ -24617,6 +24617,13 @@ pub struct WebhookEndpointRecord {
     pub description: String,
     /// Whether deliveries are dispatched.
     pub active: bool,
+    /// When the SYSTEM disabled this endpoint after sustained failure, in microseconds
+    /// since the Unix epoch. `None` on a live endpoint and on one an operator paused by
+    /// hand, so it distinguishes the two.
+    pub auto_disabled_at_unix_micros: Option<i64>,
+    /// Why the system disabled it: a bounded internal label, never anything derived from
+    /// a receiver's response.
+    pub disabled_reason: Option<String>,
     /// Creation time in microseconds since the Unix epoch.
     pub created_at_unix_micros: i64,
 }
@@ -24666,6 +24673,8 @@ impl WebhookEndpointRepo<'_> {
         let mut tx = begin_scoped(self.store, scope).await?;
         let rows = sqlx::query(
             "SELECT id, url, description, active, \
+                    (EXTRACT(EPOCH FROM auto_disabled_at) * 1000000)::bigint AS disabled_us, \
+                    disabled_reason, \
                     (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us \
              FROM webhook_endpoints \
              WHERE tenant_id = $1 AND environment_id = $2 \
@@ -24684,22 +24693,81 @@ impl WebhookEndpointRepo<'_> {
                     url: row.get("url"),
                     description: row.get("description"),
                     active: row.get("active"),
+                    auto_disabled_at_unix_micros: row.get("disabled_us"),
+                    disabled_reason: row.get("disabled_reason"),
                     created_at_unix_micros: row.get("created_us"),
                 })
             })
             .collect()
     }
 
+    /// AUTOMATICALLY disable this endpoint after sustained failure, recording when and
+    /// why (issue #106). Returns whether this call was the one that disabled it.
+    ///
+    /// A DATA-plane write, and the only one this repository has. It is here because the
+    /// deliverer is the only part of the system that knows an endpoint has stopped
+    /// answering; migration 0114 grants exactly the three columns that turn deliveries off
+    /// and say so, and nothing that could alter a url or a secret.
+    ///
+    /// UNAUDITED, deliberately. An automatic disable has no actor, and inventing one would
+    /// put machine traffic among the operator decisions the audit log exists to attribute.
+    /// The fact is recorded on the row instead, where the management surface renders it.
+    ///
+    /// The `active` predicate makes this idempotent AND makes it lose safely: a
+    /// concurrent worker that got there first leaves this call reporting `false`, and an
+    /// endpoint an operator resumed in between is not silently re-disabled by a worker
+    /// still holding an older view. `auto_disabled_at` is only ever set alongside a
+    /// reason, which the 0114 CHECK also enforces.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn auto_disable(
+        &self,
+        env: &Env,
+        id: &WebhookEndpointId,
+        reason: &str,
+    ) -> Result<bool, StoreError> {
+        let scope = self.scope;
+        if id.scope() != scope {
+            return Ok(false);
+        }
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let result = sqlx::query(
+            "UPDATE webhook_endpoints \
+             SET active = false, \
+                 auto_disabled_at = \
+                     TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval, \
+                 disabled_reason = $5, \
+                 updated_at = TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND active",
+        )
+        .bind(id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(now_micros)
+        .bind(reason)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     /// Everything ONE delivery to `id` needs: the destination and the opened signing
-    /// secrets. `None` when no such endpoint exists in this scope or it is INACTIVE.
+    /// secrets, or which of the two reasons there is nothing to deliver to.
     ///
-    /// Folding "is it active" into this read rather than leaving it to the caller is
-    /// deliberate: `active` exists to stop deliveries, and a deliverer that has to
-    /// remember to consult it separately is a deliverer that will one day forget. There
-    /// is no way to obtain signing material for a deactivated endpoint through this API.
+    /// The `active` check lives in this read rather than at the caller, because `active`
+    /// exists to stop deliveries and a deliverer that has to remember to consult a flag
+    /// separately is a deliverer that will one day forget. There is no way to obtain
+    /// signing material for a paused endpoint through this API: the paused arm returns
+    /// before any secret is opened.
     ///
-    /// This is a DATA-plane read (migration 0111 grants the app role SELECT and nothing
-    /// else), so a deliverer can sign but can never mutate an endpoint.
+    /// It returns [`DeliveryTargetLookup`] rather than an [`Option`] because paused and
+    /// absent are not the same fact and the caller must not treat them alike. A message
+    /// for an absent endpoint has nowhere to go; a message for a paused one has to be
+    /// KEPT, since pausing is reversible and dropping it would lose an event with no
+    /// dead letter behind it (issue #106).
     ///
     /// The outgoing secret is included only while `previous_expires_at` is still in the
     /// future relative to `now_unix_micros`; the window is read from the ROW rather than
@@ -24714,19 +24782,19 @@ impl WebhookEndpointRepo<'_> {
         &self,
         id: &WebhookEndpointId,
         now_unix_micros: i64,
-    ) -> Result<Option<WebhookDeliveryTarget>, StoreError> {
+    ) -> Result<DeliveryTargetLookup, StoreError> {
         if id.scope() != self.scope {
-            return Ok(None);
+            return Ok(DeliveryTargetLookup::Absent);
         }
         let scope = self.scope;
         let master = self.store.master().ok_or(StoreError::Encryption)?;
         let mut tx = begin_scoped(self.store, scope).await?;
         let row = sqlx::query(
-            "SELECT url, secret_sealed, secret_dek_version, \
+            "SELECT url, active, secret_sealed, secret_dek_version, \
                     previous_secret_sealed, previous_secret_dek_version, \
                     (EXTRACT(EPOCH FROM previous_expires_at) * 1000000)::bigint AS previous_us \
              FROM webhook_endpoints \
-             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND active",
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
         )
         .bind(id.to_string())
         .bind(scope.tenant().to_string())
@@ -24735,8 +24803,16 @@ impl WebhookEndpointRepo<'_> {
         .await?;
         let Some(row) = row else {
             tx.commit().await?;
-            return Ok(None);
+            return Ok(DeliveryTargetLookup::Absent);
         };
+        // The `active` gate moved out of the WHERE clause and into this arm so a paused
+        // endpoint is DISTINGUISHABLE from an absent one. The property it was folded in
+        // for is unchanged and is enforced here instead: this returns before any secret is
+        // opened, so a paused endpoint still yields no signing material at all.
+        if !row.get::<bool, _>("active") {
+            tx.commit().await?;
+            return Ok(DeliveryTargetLookup::Paused);
+        }
         let purpose = webhook_endpoint_secret_purpose(id);
         let current_version: i32 = row.get("secret_dek_version");
         let current_sealed: Vec<u8> = row.get("secret_sealed");
@@ -24762,7 +24838,7 @@ impl WebhookEndpointRepo<'_> {
             }
         }
         tx.commit().await?;
-        Ok(Some(WebhookDeliveryTarget {
+        Ok(DeliveryTargetLookup::Deliverable(WebhookDeliveryTarget {
             id: *id,
             url: row.get("url"),
             secrets,
@@ -24868,6 +24944,58 @@ impl WebhookDeliveryAttemptRepo<'_> {
         Ok(())
     }
 
+    /// Whether this endpoint's `run` most recent delivery attempts ALL failed (issue
+    /// #106), which is the same thing as an unbroken run of `run` failures ending now.
+    ///
+    /// Stated as "the last N all failed" rather than counted as a run over a longer
+    /// history, because the two are the same rule and only one of them is obvious from the
+    /// code. A mutation made the point: with a window of exactly N, walking the leading
+    /// failures and simply COUNTING the failures in the window give identical answers, so
+    /// the walk was carrying an intent the code did not actually enforce. This says what
+    /// it means instead.
+    ///
+    /// The consequence worth naming is the one a rate-based rule would not have: ONE
+    /// success anywhere in the last N resets it, so an endpoint that fails often but still
+    /// works is never disabled, and an endpoint that recovers on its own clears itself with
+    /// no separate counter to reset.
+    ///
+    /// Returns `false` when there are FEWER than `run` attempts on record at all. A fresh
+    /// endpoint whose first two deliveries failed has not met a threshold of three, and
+    /// without this it would: an "all of them failed" test over a short list is vacuously
+    /// true.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault.
+    pub async fn last_attempts_all_failed(
+        &self,
+        endpoint: &WebhookEndpointId,
+        run: i64,
+    ) -> Result<bool, StoreError> {
+        let scope = self.scope;
+        if endpoint.scope() != scope || run <= 0 {
+            return Ok(false);
+        }
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let rows = sqlx::query(
+            "SELECT error FROM webhook_delivery_attempts \
+             WHERE tenant_id = $1 AND environment_id = $2 AND endpoint_id = $3 \
+             ORDER BY attempted_at DESC, attempt_number DESC LIMIT $4",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(endpoint.to_string())
+        .bind(run)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let enough = i64::try_from(rows.len()).unwrap_or(i64::MAX) >= run;
+        Ok(enough
+            && rows
+                .iter()
+                .all(|row| row.get::<Option<String>, _>("error").is_some()))
+    }
+
     /// One endpoint's attempt history, NEWEST first.
     ///
     /// Newest first here and oldest first for the dead-letter listing, and the difference
@@ -24942,6 +25070,23 @@ pub struct WebhookDeliveryTarget {
     /// open. A consumer holding EITHER verifies, which is what makes a rotation a
     /// configuration change rather than a coordinated deploy.
     pub secrets: Vec<Vec<u8>>,
+}
+
+/// What a delivery lookup found (issue #106).
+///
+/// Three answers rather than an [`Option`], because the caller must treat two of them
+/// differently and an `Option` forced them together. A message for an ABSENT endpoint has
+/// nowhere to go and is dropped; a message for a PAUSED one must be KEPT, because pausing
+/// is reversible and the whole promise of #106 is that nothing is dropped without landing
+/// somewhere an operator can replay it from.
+pub enum DeliveryTargetLookup {
+    /// The endpoint is live: deliver, under these secrets.
+    Deliverable(WebhookDeliveryTarget),
+    /// The endpoint exists but deliveries are turned off. NO signing material is carried
+    /// on this arm, so a paused endpoint yields none however the caller handles it.
+    Paused,
+    /// No such endpoint in this scope.
+    Absent,
 }
 
 impl Drop for WebhookDeliveryTarget {
@@ -25265,10 +25410,22 @@ impl ActingWebhookEndpointRepo<'_> {
                 // state this transaction committed and the stored idempotent body is
                 // byte-identical to it by construction. The sealed columns are NOT
                 // selected, exactly as the listing does not select them.
+                // Resuming CLEARS the auto-disable record, because those columns describe
+                // the current disabled state rather than a history: an endpoint an
+                // operator has turned back on is not auto-disabled, and leaving the stamp
+                // behind would report it as such forever. The record of what actually
+                // failed lives in `webhook_delivery_attempts`, which is the table for it.
+                //
+                // Pausing clears it too, and that is deliberate rather than incidental: a
+                // manual pause and an automatic one are different facts, so an endpoint an
+                // operator paused must not claim the system disabled it.
                 let row = sqlx::query(
-                    "UPDATE webhook_endpoints SET active = $1, updated_at = now() \
+                    "UPDATE webhook_endpoints \
+                     SET active = $1, auto_disabled_at = NULL, disabled_reason = NULL, \
+                         updated_at = now() \
                      WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 \
-                     RETURNING id, url, description, active, \
+                     RETURNING id, url, description, active, auto_disabled_at IS NOT NULL \
+                               AS auto_disabled, disabled_reason, \
                                (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us",
                 )
                 .bind(active)
@@ -25286,6 +25443,10 @@ impl ActingWebhookEndpointRepo<'_> {
                     url: row.get("url"),
                     description: row.get("description"),
                     active: row.get("active"),
+                    // Always cleared by this write, so the response describes the state it
+                    // committed rather than the one it replaced.
+                    auto_disabled_at_unix_micros: None,
+                    disabled_reason: row.get("disabled_reason"),
                     created_at_unix_micros: row.get("created_us"),
                 };
                 insert_resolved_idempotency(tx, idempotency, &record).await?;

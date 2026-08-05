@@ -2462,6 +2462,13 @@
       "additionalProperties": false,
       "description": "Outbound webhook delivery settings (issue #105).\n\nThese belong to the webhook CONSUMER, not to the queue: how the queue itself is\ndrained (concurrency, lease, backoff, retention) is `[outbox]`, and an operator tunes\nthat once for every consumer rather than per subsystem.\n\nThe consumer is OFF by default, which is the same covenant every other background\nworker here is held to: no mandatory background infrastructure. A deployment that never\nopens this section runs no delivery worker, and its queued deliveries wait durably\nrather than being lost.",
       "properties": {
+        "auto_disable_after_consecutive_failures": {
+          "default": 50,
+          "description": "Disable an endpoint automatically after this many CONSECUTIVE failed delivery\nattempts with no success in between. `0` turns the behaviour off entirely.\n\nA consecutive run rather than a rate, because the two mean different things: a busy\nendpoint that fails a fraction of the time is working, and only an unbroken run\nending now says it has stopped answering. One success resets the run, so an\nendpoint that recovers on its own is never disabled.\n\nThe default (50) is deliberately not small. Disabling is disruptive and the cost of\nbeing slow to do it is bounded: nothing is dropped meanwhile, because every\nexhausted delivery lands in the dead-letter queue and stays replayable. With the\ndefault retry budget of five attempts per message, fifty is roughly ten consecutive\nmessages that never got through, which no transient outage produces.\n\nTurning it off is a legitimate choice for a deployment that watches the dead-letter\ndepth itself and would rather keep trying.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
         "delivery_enabled": {
           "default": false,
           "description": "Whether THIS process drains the `webhook.delivery` queue and POSTs to registered\nendpoints. OFF by default.\n\nTurning it off does not stop endpoints being registered or messages being\nenqueued; it stops them being DELIVERED by this process. That separation is what\nlets a deployment run its delivery workers on dedicated nodes: the API tier\nregisters endpoints with this off, and the worker tier turns it on.",
@@ -2904,6 +2911,7 @@
     "webhooks": {
       "$ref": "#/$defs/WebhooksConfig",
       "default": {
+        "auto_disable_after_consecutive_failures": 50,
         "delivery_enabled": false,
         "delivery_timeout_secs": 10
       },

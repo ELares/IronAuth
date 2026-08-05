@@ -50,6 +50,13 @@ pub struct WebhookEndpointView {
     pub description: String,
     /// Whether deliveries are dispatched.
     pub active: bool,
+    /// When the SYSTEM disabled this endpoint after sustained failure, milliseconds since
+    /// the Unix epoch. `null` on a live endpoint and on one an operator paused by hand, so
+    /// an operator can tell which happened.
+    pub auto_disabled_at_unix_ms: Option<i64>,
+    /// Why the system disabled it: a bounded internal label, never anything derived from a
+    /// receiver's response.
+    pub disabled_reason: Option<String>,
     /// Creation time, milliseconds since the Unix epoch.
     pub created_at_unix_ms: i64,
 }
@@ -194,6 +201,8 @@ pub async fn create_webhook_endpoint(
             url: url.clone(),
             description: description.clone(),
             active: true,
+            auto_disabled_at_unix_ms: None,
+            disabled_reason: None,
             created_at_unix_ms: created_at_micros / 1000,
         },
         secret: secret.to_transport_string(),
@@ -852,6 +861,10 @@ fn into_view(record: ironauth_store::WebhookEndpointRecord) -> WebhookEndpointVi
         url: record.url,
         description: record.description,
         active: record.active,
+        auto_disabled_at_unix_ms: record
+            .auto_disabled_at_unix_micros
+            .map(|micros| micros / 1000),
+        disabled_reason: record.disabled_reason,
         created_at_unix_ms: record.created_at_unix_micros / 1000,
     }
 }

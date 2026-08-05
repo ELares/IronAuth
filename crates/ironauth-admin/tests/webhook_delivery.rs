@@ -396,7 +396,7 @@ async fn a_paused_endpoint_receives_nothing_and_resuming_restores_its_original_s
 
     let paused = RecordingSender::accepting();
     let consumer = WebhookDeliveryConsumer::new(h.store().clone(), paused.clone());
-    consumer
+    let error = consumer
         .handle(
             &env,
             scope,
@@ -407,7 +407,18 @@ async fn a_paused_endpoint_receives_nothing_and_resuming_restores_its_original_s
             ),
         )
         .await
-        .expect("the message is completed rather than left to retry");
+        .expect_err("a paused endpoint does not accept the delivery");
+    // DEAD-LETTERED rather than completed, which is the difference between "held for you"
+    // and "silently dropped". Pausing is reversible, so a message queued for a paused
+    // endpoint has somewhere to come back to, and #106's rule is that nothing is dropped
+    // without landing where an operator can replay it from. Retrying instead would burn
+    // the attempt budget waiting for a human to act.
+    assert!(
+        !error.is_retryable(),
+        "a paused endpoint dead-letters immediately rather than retrying: {}",
+        error.label()
+    );
+    assert_eq!(error.label(), "endpoint_paused");
     assert!(
         paused.recorded().is_empty(),
         "a paused endpoint is POSTed nothing at all"
@@ -805,6 +816,232 @@ async fn a_reaped_message_takes_its_attempt_history_with_it() {
         "the attempts went with the message they describe, under the outbox's own \
          retention rather than a second one: {body}"
     );
+}
+
+#[tokio::test]
+async fn sustained_failure_disables_an_endpoint_and_one_success_resets_the_run() {
+    // Auto-disable, and the property that keeps it from firing on a working endpoint.
+    //
+    // The rule is a CONSECUTIVE run rather than a rate, because a busy endpoint that fails
+    // a fraction of the time is working and must not be turned off. So this drives the
+    // threshold to within one, lands a SUCCESS, and asserts the endpoint is still live:
+    // one success anywhere in the run resets it, which is what makes the rule
+    // self-clearing with no separate counter to reset.
+    use std::time::Duration;
+
+    use ironauth_store::{NewOutboxMessage, WEBHOOK_DELIVERY_CONSUMER};
+
+    const THRESHOLD: u32 = 3;
+
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (id, _, base) = register(&h, &tenant, &environment).await;
+    let scope = scope_of(&tenant, &environment);
+    let env = Env::system();
+    let store = h.store().clone();
+
+    // Each pass is its own message, because a single message's retry budget would
+    // dead-letter before the threshold and stop producing attempts.
+    let deliver = async |key: &str, sender: RecordingSender| {
+        store
+            .scoped(scope)
+            .outbox()
+            .enqueue(
+                &env,
+                &NewOutboxMessage {
+                    consumer: WEBHOOK_DELIVERY_CONSUMER,
+                    idempotency_key: key,
+                    ordering_key: key,
+                    payload: serde_json::json!({
+                        "endpoint_id": id,
+                        "body": { "type": "user.created" },
+                    }),
+                },
+            )
+            .await
+            .expect("enqueue");
+        let claimed = store
+            .scoped(scope)
+            .outbox()
+            .claim(&env, WEBHOOK_DELIVERY_CONSUMER, Duration::from_secs(30), 10)
+            .await
+            .expect("claim");
+        let message = claimed
+            .iter()
+            .find(|m| m.idempotency_key == key)
+            .expect("claimable");
+        WebhookDeliveryConsumer::with_auto_disable(store.clone(), sender, THRESHOLD)
+            .handle(&env, scope, message)
+            .await
+    };
+
+    // One short of the threshold.
+    for pass in 0..THRESHOLD - 1 {
+        deliver(
+            &format!("evt_fail_{pass}"),
+            RecordingSender::failing(SendFailure::Status(500)),
+        )
+        .await
+        .expect_err("a 500 is a failed delivery");
+    }
+    let (_, _, body) = h.get(&base).await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).expect("json")["items"][0]["active"],
+        Value::Bool(true),
+        "below the threshold the endpoint stays live: {body}"
+    );
+
+    // A SUCCESS resets the run, so the next failures start counting from zero.
+    deliver("evt_ok", RecordingSender::accepting())
+        .await
+        .expect("the delivery succeeds");
+    for pass in 0..THRESHOLD - 1 {
+        deliver(
+            &format!("evt_after_{pass}"),
+            RecordingSender::failing(SendFailure::Status(500)),
+        )
+        .await
+        .expect_err("a 500 is a failed delivery");
+    }
+    let (_, _, body) = h.get(&base).await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).expect("json")["items"][0]["active"],
+        Value::Bool(true),
+        "a success in between resets the run, so these failures did not reach the \
+         threshold either: {body}"
+    );
+
+    // One more failure completes an unbroken run of THRESHOLD.
+    deliver(
+        "evt_last",
+        RecordingSender::failing(SendFailure::Status(500)),
+    )
+    .await
+    .expect_err("a 500 is a failed delivery");
+    let (_, _, body) = h.get(&base).await;
+    let endpoint = &serde_json::from_str::<Value>(&body).expect("json")["items"][0];
+    assert_eq!(
+        endpoint["active"],
+        Value::Bool(false),
+        "an unbroken run of {THRESHOLD} disables the endpoint: {body}"
+    );
+    // Recorded ON THE ROW rather than as an audit row, because an automatic disable has no
+    // actor. The operator can tell this apart from a pause they performed themselves.
+    assert_eq!(
+        endpoint["disabled_reason"], "consecutive_delivery_failures",
+        "{body}"
+    );
+    assert!(
+        endpoint["auto_disabled_at_unix_ms"]
+            .as_i64()
+            .expect("stamp")
+            > 0,
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn a_delivery_queued_for_a_disabled_endpoint_is_recoverable_rather_than_dropped() {
+    // The property that makes automatic disabling SAFE, and the reason it is a separate
+    // test: auto-disable turns an endpoint off underneath messages that are already
+    // queued, so if those were dropped the feature would silently discard exactly the
+    // events an operator most wants back. #106 forbids that in absolute terms.
+    //
+    // Driven through the same paused arm the manual pause uses, since an auto-disabled
+    // endpoint is simply a paused one that the system paused.
+    use std::time::Duration;
+
+    use ironauth_store::{NewOutboxMessage, WEBHOOK_DELIVERY_CONSUMER};
+
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (id, _, base) = register(&h, &tenant, &environment).await;
+    let scope = scope_of(&tenant, &environment);
+    let env = Env::system();
+    let store = h.store().clone();
+
+    let (status, _, body) = h.post(&format!("{base}/{id}/pause"), "k-pause", "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // The message has to stay in hand rather than go through a helper, because reporting
+    // its failure needs the lease stamp the claim handed out.
+    store
+        .scoped(scope)
+        .outbox()
+        .enqueue(
+            &env,
+            &NewOutboxMessage {
+                consumer: WEBHOOK_DELIVERY_CONSUMER,
+                idempotency_key: "evt_after_disable",
+                // The ENDPOINT id, as the real producer uses, because that is what the
+                // per-endpoint dead-letter listing narrows by.
+                ordering_key: &id,
+                payload: serde_json::json!({
+                    "endpoint_id": id,
+                    "body": { "type": "user.created" },
+                }),
+            },
+        )
+        .await
+        .expect("enqueue");
+    let claimed = store
+        .scoped(scope)
+        .outbox()
+        .claim(&env, WEBHOOK_DELIVERY_CONSUMER, Duration::from_secs(30), 10)
+        .await
+        .expect("claim");
+    let message = claimed
+        .iter()
+        .find(|m| m.idempotency_key == "evt_after_disable")
+        .expect("claimable");
+    let error = WebhookDeliveryConsumer::new(store.clone(), RecordingSender::accepting())
+        .handle(&env, scope, message)
+        .await
+        .expect_err("a disabled endpoint does not accept the delivery");
+    assert!(!error.is_retryable(), "{}", error.label());
+    // Reporting the failure is the WORKER's step, and it maps a permanent error to a
+    // one-attempt policy so the queue stays the single place that decides what terminal
+    // means. Mirrored here, or this would assert on a dead letter nothing had written yet.
+    let outcome = store
+        .scoped(scope)
+        .outbox()
+        .fail(
+            &env,
+            message,
+            error.label(),
+            ironauth_store::RetryPolicy {
+                max_attempts: 1,
+                retry_base: Duration::from_secs(1),
+            },
+        )
+        .await
+        .expect("report the failure");
+    assert!(
+        matches!(outcome, ironauth_store::FailureOutcome::DeadLettered { .. }),
+        "a permanent failure is terminal on the first report: {outcome:?}"
+    );
+
+    let (_, _, body) = h.get(&format!("{base}/{id}/dead-letters")).await;
+    let dead: Vec<String> = serde_json::from_str::<Value>(&body).expect("json")["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|item| item["webhook_id"].as_str().expect("id").to_owned())
+        .collect();
+    assert!(
+        dead.contains(&"evt_after_disable".to_owned()),
+        "the event queued after the endpoint was disabled is recoverable, not dropped: \
+         {body}"
+    );
+
+    // And RESUMING clears the auto-disable record, so the endpoint does not keep reporting
+    // itself system-disabled after an operator has turned it back on.
+    let (status, _, body) = h.post(&format!("{base}/{id}/resume"), "k-resume", "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let resumed: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(resumed["active"], Value::Bool(true), "{body}");
+    assert_eq!(resumed["auto_disabled_at_unix_ms"], Value::Null, "{body}");
+    assert_eq!(resumed["disabled_reason"], Value::Null, "{body}");
 }
 
 #[tokio::test]

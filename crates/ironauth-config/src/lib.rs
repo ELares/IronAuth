@@ -433,6 +433,24 @@ pub struct WebhooksConfig {
     /// registers endpoints with this off, and the worker tier turns it on.
     pub delivery_enabled: bool,
 
+    /// Disable an endpoint automatically after this many CONSECUTIVE failed delivery
+    /// attempts with no success in between. `0` turns the behaviour off entirely.
+    ///
+    /// A consecutive run rather than a rate, because the two mean different things: a busy
+    /// endpoint that fails a fraction of the time is working, and only an unbroken run
+    /// ending now says it has stopped answering. One success resets the run, so an
+    /// endpoint that recovers on its own is never disabled.
+    ///
+    /// The default (50) is deliberately not small. Disabling is disruptive and the cost of
+    /// being slow to do it is bounded: nothing is dropped meanwhile, because every
+    /// exhausted delivery lands in the dead-letter queue and stays replayable. With the
+    /// default retry budget of five attempts per message, fifty is roughly ten consecutive
+    /// messages that never got through, which no transient outage produces.
+    ///
+    /// Turning it off is a legitimate choice for a deployment that watches the dead-letter
+    /// depth itself and would rather keep trying.
+    pub auto_disable_after_consecutive_failures: u32,
+
     /// The total per-delivery time budget in seconds, enforced by the SSRF-hardened
     /// outbound fetcher, so one slow receiver cannot occupy a worker indefinitely.
     ///
@@ -454,6 +472,7 @@ impl Default for WebhooksConfig {
     fn default() -> Self {
         Self {
             delivery_enabled: false,
+            auto_disable_after_consecutive_failures: 50,
             delivery_timeout_secs: 10,
         }
     }

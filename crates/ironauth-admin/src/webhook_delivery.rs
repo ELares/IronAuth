@@ -26,8 +26,8 @@ use ironauth_jose::webhooks::{WebhookSecret, sign_delivery};
 use ironauth_oidc::SendFailure;
 use ironauth_store::outbox::{ConsumerError, OutboxConsumer};
 use ironauth_store::{
-    NewDeliveryAttempt, OutboxMessage, Scope, Store, WEBHOOK_DELIVERY_CONSUMER,
-    WEBHOOK_REPLAY_CONSUMER,
+    DeliveryTargetLookup, NewDeliveryAttempt, OutboxMessage, Scope, Store,
+    WEBHOOK_DELIVERY_CONSUMER, WEBHOOK_REPLAY_CONSUMER, WebhookEndpointId,
 };
 
 /// The payload key naming the endpoint this message is destined for.
@@ -209,6 +209,7 @@ impl WebhookSender for FetchWebhookSender {
 pub struct WebhookDeliveryConsumer<S> {
     store: Store,
     sender: S,
+    auto_disable_after: u32,
 }
 
 impl<S: WebhookSender> WebhookDeliveryConsumer<S> {
@@ -219,7 +220,22 @@ impl<S: WebhookSender> WebhookDeliveryConsumer<S> {
     /// rather than silently going out unsigned.
     #[must_use]
     pub fn new(store: Store, sender: S) -> Self {
-        Self { store, sender }
+        Self::with_auto_disable(store, sender, 0)
+    }
+
+    /// Build the consumer with automatic endpoint disabling after `auto_disable_after`
+    /// consecutive failed attempts. `0` turns the behaviour off.
+    ///
+    /// A separate constructor rather than a fourth argument on [`Self::new`], so the
+    /// existing callers that do not want it read as deliberately opting out rather than
+    /// passing a magic zero.
+    #[must_use]
+    pub fn with_auto_disable(store: Store, sender: S, auto_disable_after: u32) -> Self {
+        Self {
+            store,
+            sender,
+            auto_disable_after,
+        }
     }
 
     /// Read a required string off the message payload.
@@ -231,6 +247,54 @@ impl<S: WebhookSender> WebhookDeliveryConsumer<S> {
             // A malformed payload is PERMANENT: no number of retries will add a field to
             // a row that is already written, so retrying only delays the dead letter.
             .ok_or_else(|| ConsumerError::permanent(format!("payload_missing_{key}")))
+    }
+
+    /// Disable `endpoint` if its last `auto_disable_after` attempts ALL failed.
+    ///
+    /// Nothing is lost by disabling, which is what makes it safe to do automatically: the
+    /// messages already queued for the endpoint dead-letter on the paused arm of
+    /// [`Self::deliver_one`] rather than being dropped, so an operator resumes and replays
+    /// them. Without that, auto-disable would silently discard every event in flight.
+    ///
+    /// Every failure here is swallowed. The delivery has already happened and its outcome
+    /// is the caller's to report; not disabling on this pass is harmless, because the next
+    /// failure asks the same question again.
+    async fn maybe_auto_disable(&self, env: &Env, scope: Scope, endpoint: &WebhookEndpointId) {
+        if self.auto_disable_after == 0 {
+            return;
+        }
+        let exhausted = self
+            .store
+            .scoped(scope)
+            .webhook_delivery_attempts()
+            .last_attempts_all_failed(endpoint, i64::from(self.auto_disable_after))
+            .await
+            .unwrap_or(false);
+        if !exhausted {
+            return;
+        }
+        match self
+            .store
+            .scoped(scope)
+            .webhook_endpoints()
+            .auto_disable(env, endpoint, "consecutive_delivery_failures")
+            .await
+        {
+            Ok(true) => tracing::warn!(
+                %endpoint,
+                consecutive_failures = self.auto_disable_after,
+                "webhook endpoint auto-disabled after sustained delivery failure; queued \
+                 deliveries dead-letter and are replayable once it is resumed"
+            ),
+            // Already disabled, or resumed by an operator in between. Neither is an error
+            // and neither should be reported as one.
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
+                %error,
+                %endpoint,
+                "webhook endpoint could not be auto-disabled; deliveries continue"
+            ),
+        }
     }
 
     /// Deliver ONE message: resolve the endpoint, sign, POST.
@@ -264,13 +328,26 @@ impl<S: WebhookSender> WebhookDeliveryConsumer<S> {
             // envelope key not provisioned yet), so this is retryable. The substrate's
             // finite attempt budget is what turns a persistent failure into a dead letter.
             .map_err(|_| ConsumerError::retryable("endpoint_read_failed"))?;
-        // No target means the endpoint was DELETED or DEACTIVATED after this message was
-        // enqueued. Both are an operator saying "stop delivering here", so the message is
-        // completed rather than retried: retrying would burn the attempt budget to reach
-        // a destination that has been withdrawn, and dead-lettering would report an
-        // operator's own deliberate action as a delivery failure.
-        let Some(target) = target else {
-            return Ok(());
+        // The two ways there is nothing to deliver to are handled DIFFERENTLY, and the
+        // difference is the whole of #106's rule that nothing is dropped without landing
+        // somewhere replayable.
+        //
+        // ABSENT: the endpoint was deleted. There is nowhere to deliver, nothing to
+        // resume, and its signing secret is gone, so the message is completed. Retrying
+        // would burn the attempt budget reaching a destination that no longer exists.
+        //
+        // PAUSED: deliveries are turned off, but the endpoint and its secret survive and
+        // an operator can turn it back on. Completing here would DROP a real event with no
+        // dead letter behind it, and once auto-disable exists that is not a rare corner:
+        // it is what happens to every message in flight the moment an endpoint is
+        // disabled. So it dead-letters instead, which is the state the replay surface
+        // (#559) recovers from.
+        let target = match target {
+            DeliveryTargetLookup::Deliverable(target) => target,
+            DeliveryTargetLookup::Absent => return Ok(()),
+            DeliveryTargetLookup::Paused => {
+                return Err(ConsumerError::permanent("endpoint_paused"));
+            }
         };
 
         let secrets: Vec<WebhookSecret> = target
@@ -339,13 +416,18 @@ impl<S: WebhookSender> WebhookDeliveryConsumer<S> {
             );
         }
 
-        match outcome.failure {
-            // A refused destination, a timeout, a non-2xx and a transport fault are all
-            // retryable: the attempts cap is what turns a persistently dead receiver into
-            // a dead letter, so nothing here needs a second way to give up.
-            Some(failure) => Err(ConsumerError::retryable(failure.label())),
-            None => Ok(()),
-        }
+        let Some(failure) = outcome.failure else {
+            return Ok(());
+        };
+
+        // Sustained failure disables the endpoint. Evaluated after the attempt is
+        // recorded, so the run it reads includes the attempt that just failed.
+        self.maybe_auto_disable(env, scope, &target.id).await;
+
+        // A refused destination, a timeout, a non-2xx and a transport fault are all
+        // retryable: the attempts cap is what turns a persistently dead receiver into a
+        // dead letter, so nothing here needs a second way to give up.
+        Err(ConsumerError::retryable(failure.label()))
     }
 }
 

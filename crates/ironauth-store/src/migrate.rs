@@ -974,6 +974,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0113_webhook_delivery_attempts.sql"),
         },
+        Migration {
+            version: 114,
+            name: "webhook_auto_disable",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0114_webhook_auto_disable.sql"),
+        },
     ]
 }
 
