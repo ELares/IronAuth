@@ -17556,6 +17556,110 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/rotate-secret": {
+      "post": {
+        "tags": [
+          "webhooks"
+        ],
+        "summary": "Rotate an endpoint's signing secret, opening the overlap window.",
+        "operationId": "rotateWebhookEndpointSecret",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "endpoint_id",
+            "in": "path",
+            "description": "The endpoint identifier (whe_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying a POST with the same key returns the original response without re-executing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The new signing secret, shown once, and when the old one stops verifying",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookSecretRotated"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential, or fresh privilege required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment is absent or deleted, or the endpoint is in another scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency-Key reused with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/restore": {
       "post": {
         "tags": [
@@ -23587,6 +23691,30 @@
           "url": {
             "type": "string",
             "description": "The HTTPS destination deliveries POST to."
+          }
+        }
+      },
+      "WebhookSecretRotated": {
+        "type": "object",
+        "description": "The rotation response, which carries the incoming secret exactly once.",
+        "required": [
+          "id",
+          "secret",
+          "previous_expires_at_unix_ms"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "The endpoint whose secret rotated."
+          },
+          "previous_expires_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When the outgoing secret stops being accepted, milliseconds since the Unix epoch.\nUntil then a delivery carries a signature under both, so a consumer holding either\nverifies."
+          },
+          "secret": {
+            "type": "string",
+            "description": "The NEW signing secret, in `whsec_` form. Shown once, like the original."
           }
         }
       }

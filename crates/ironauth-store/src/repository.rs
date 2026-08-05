@@ -24658,6 +24658,89 @@ impl ActingWebhookEndpointRepo<'_> {
         .await
     }
 
+    /// Rotate an endpoint's signing secret, opening an overlap window.
+    ///
+    /// The outgoing secret moves to the PREVIOUS slot with an expiry, and the incoming
+    /// one becomes current. Until that expiry a delivery is signed under both, so a
+    /// consumer holding either verifies; that is what makes rotation a configuration
+    /// change rather than a coordinated deploy.
+    ///
+    /// A rotation while a window is already open DISCARDS the older previous secret
+    /// rather than keeping a chain. Standard Webhooks carries a list, so a chain is
+    /// expressible, but every secret still accepted is one more that can verify a forged
+    /// delivery, and an operator rotating twice in a window is nearly always responding
+    /// to a suspected leak. Dropping the oldest is the answer that shrinks exposure.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no endpoint matched in this scope;
+    /// [`StoreError::Encryption`] if no master key is configured;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn rotate_secret(
+        &self,
+        env: &Env,
+        id: &WebhookEndpointId,
+        secret: &[u8],
+        previous_expires_at_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let scope = self.scope;
+        let purpose = Self::secret_purpose(id);
+        let secret = secret.to_vec();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::WebhookEndpointRotateSecret,
+                target: id,
+            },
+            async move |tx| {
+                let (dek_version, dek) = fetch_active_dek(tx, scope, master).await?;
+                let sealed = dek.seal(
+                    env.entropy(),
+                    &secret_seal_aad(scope, &purpose, dek_version),
+                    &secret,
+                );
+                // The outgoing secret is carried across from the row itself, so the
+                // rotation is one statement and cannot interleave with a concurrent one:
+                // whichever commits second moves the other's secret to the previous slot
+                // rather than resurrecting a stale one read beforehand.
+                let result = sqlx::query(
+                    "UPDATE webhook_endpoints \
+                     SET previous_secret_sealed = secret_sealed, \
+                         previous_secret_dek_version = secret_dek_version, \
+                         previous_expires_at = \
+                             TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval, \
+                         secret_sealed = $5, \
+                         secret_dek_version = $6, \
+                         updated_at = now() \
+                     WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(previous_expires_at_micros)
+                .bind(sealed.into_bytes())
+                .bind(dek_version)
+                .execute(&mut **tx)
+                .await?;
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                insert_idempotency(tx, idempotency).await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
     /// Remove an endpoint. Removing one that is absent is an idempotent no-op success,
     /// and the audit row is written either way because the action was attempted.
     ///

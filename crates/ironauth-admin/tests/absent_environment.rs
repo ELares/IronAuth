@@ -282,6 +282,12 @@ fn abuse_and_sudo_cases(base: &str) -> Vec<Case> {
             body: Some(serde_json::json!({ "url": "https://example.test/hook" }).to_string()),
         },
         Case {
+            label: "webhook_endpoints.rotateWebhookEndpointSecret",
+            method: "POST",
+            path: format!("{base}/webhook-endpoints/whe_absent/rotate-secret"),
+            body: None,
+        },
+        Case {
             label: "webhook_endpoints.deleteWebhookEndpoint",
             method: "DELETE",
             path: format!("{base}/webhook-endpoints/whe_absent"),

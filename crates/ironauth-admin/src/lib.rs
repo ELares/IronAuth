@@ -907,6 +907,10 @@ pub fn management_router(state: AdminState) -> Router {
                 .get(webhook_endpoints::list_webhook_endpoints),
         )
         .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/rotate-secret",
+            post(webhook_endpoints::rotate_webhook_endpoint_secret),
+        )
+        .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}",
             axum::routing::delete(webhook_endpoints::delete_webhook_endpoint),
         )

@@ -1211,6 +1211,9 @@ pub enum Action {
     /// A Standard Webhooks delivery endpoint was registered (issue #105): a POST target
     /// and its sealed signing secret. The row targets the `whe_` endpoint.
     WebhookEndpointCreate,
+    /// A Standard Webhooks delivery endpoint's signing secret was ROTATED (issue #105),
+    /// opening the overlap window during which both secrets verify.
+    WebhookEndpointRotateSecret,
     /// A Standard Webhooks delivery endpoint was removed (issue #105).
     WebhookEndpointDelete,
     /// A federation connector was UPDATED (issue #75): its definition, sealed secret,
@@ -1478,6 +1481,7 @@ impl Action {
             Action::RecoveryIdvCallback => "recovery.idv.callback",
             Action::RiskDisavow => "risk.disavow",
             Action::WebhookEndpointCreate => "webhook.endpoint.create",
+            Action::WebhookEndpointRotateSecret => "webhook.endpoint.rotate_secret",
             Action::WebhookEndpointDelete => "webhook.endpoint.delete",
             Action::ConnectorCreate => "connector.create",
             Action::ConnectorUpdate => "connector.update",
