@@ -115,6 +115,7 @@ fn operation_ids_are_the_stable_set() {
             "createTenant",
             "createTraitSchemaVersion",
             "createUser",
+            "createWebhookEndpoint",
             "deleteBrand",
             "deleteBrandFavicon",
             "deleteBrandLogo",
@@ -133,6 +134,7 @@ fn operation_ids_are_the_stable_set() {
             "deleteTenant",
             "deleteUser",
             "deleteVariable",
+            "deleteWebhookEndpoint",
             "denySmsCountry",
             "disableOrganization",
             "elevateAdminSudo",
@@ -217,6 +219,7 @@ fn operation_ids_are_the_stable_set() {
             "listUserIdentifiers",
             "listUsers",
             "listVariables",
+            "listWebhookEndpoints",
             "pinFlowVersion",
             "planConfigPromotion",
             "postFlowDryRun",
@@ -390,6 +393,7 @@ fn every_post_documents_the_idempotency_key_header() {
         "addUserIdentifier",
         "applyIdentifierUniqueness",
         "abandonMigrationRun",
+        "createWebhookEndpoint",
     ] {
         let params = find_operation(&doc, op)["parameters"]
             .as_array()
@@ -456,6 +460,7 @@ fn documented_paths_are_the_expected_set() {
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/external-id",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/identifiers/{identifier_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/variables/{name}",
+            "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}",
             "GET /v1/interop/signing-recommendations",
             "GET /v1/operators",
             "GET /v1/operators/{operator_id}",
@@ -533,6 +538,7 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/variables",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/variables/{name}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/webauthn/mds3/health",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints",
             "PATCH /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}",
             "PATCH /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}",
             "PATCH /v1/tenants/{tenant_id}/environments/{environment_id}/permissions/{permission_id}",
@@ -588,6 +594,7 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/identifiers",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/sessions/revoke",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/state",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints",
             "POST /v1/tenants/{tenant_id}/restore",
             "POST /v1/tenants/{tenant_id}/resume",
             "POST /v1/tenants/{tenant_id}/suspend",
@@ -698,7 +705,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        178,
+        181,
         "the documented route count is pinned"
     );
 

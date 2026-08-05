@@ -663,6 +663,17 @@ impl ScopedKind for ConnectorKind {
     const PREFIX: &'static str = "cnr";
 }
 
+/// Marker for a registered Standard Webhooks delivery endpoint (`whe_`), one POST target
+/// per environment (issue #105). A tenant-scoped resource: the id embeds its (tenant,
+/// environment), so an endpoint registered in one scope parses as a uniform not-found
+/// under another. NOT promotable: an endpoint carries a sealed signing secret, and a
+/// config snapshot never travels secret material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WebhookEndpointKind;
+impl ScopedKind for WebhookEndpointKind {
+    const PREFIX: &'static str = "whe";
+}
+
 /// Marker for a per-environment brand (`brd_`), one named branding definition (design
 /// tokens, dark-mode variants, the product wordmark, and the sanitized rich-text slots)
 /// per environment (issue #86). A tenant-scoped resource: the id embeds its (tenant,
@@ -1576,6 +1587,9 @@ pub type ConsentId = ScopedId<ConsentKind>;
 /// inbound-federation upstream definition per environment (issue #75). The prefix
 /// is `cnr` (distinct from consent's `con`).
 pub type ConnectorId = ScopedId<ConnectorKind>;
+
+/// A registered webhook delivery endpoint (issue #105).
+pub type WebhookEndpointId = ScopedId<WebhookEndpointKind>;
 /// A per-environment brand identifier (`brd_...`), one named branding definition per
 /// environment (issue #86). Promotable.
 pub type BrandId = ScopedId<BrandKind>;

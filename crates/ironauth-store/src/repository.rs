@@ -95,7 +95,7 @@ use crate::id::{
     ServiceAccountId, SessionId, SigningKeyId, SignupFormId, SignupQuarantineId, SmsOtpCodeId,
     SmsRouteStatId, TenantId, TotpCredentialId, TraitMigrationJobId, TraitSchemaId,
     TrustedDeviceId, UpstreamTokenGrantId, UpstreamTokenId, UserId, UserIdentifierId, VariableId,
-    WebauthnChallengeId, WebauthnCredentialId,
+    WebauthnChallengeId, WebauthnCredentialId, WebhookEndpointId,
 };
 use crate::identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
@@ -679,6 +679,17 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn connectors(&self) -> ConnectorRepo<'a> {
         ConnectorRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only webhook endpoint repository for this scope (issue #105). Listing is
+    /// SECRET FREE: the sealed signing secret column is never selected by a read, so an
+    /// endpoint listing cannot leak it however it is rendered.
+    #[must_use]
+    pub fn webhook_endpoints(&self) -> WebhookEndpointRepo<'a> {
+        WebhookEndpointRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -1724,6 +1735,18 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn connectors(&self) -> ActingConnectorRepo<'a> {
         ActingConnectorRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating webhook endpoint repository for this scope (issue #105): register an
+    /// endpoint (sealing its signing secret) and remove one, each writing its audit row
+    /// in the same transaction.
+    #[must_use]
+    pub fn webhook_endpoints(&self) -> ActingWebhookEndpointRepo<'a> {
+        ActingWebhookEndpointRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -24446,6 +24469,233 @@ impl ActingRiskRepo<'_> {
 /// Binding the AAD to the id keeps a resealed secret decryptable across any future
 /// definition edit, so a reader that reconstructs the AAD from the persisted id
 /// always authenticates.
+/// A registered webhook endpoint, SECRET FREE. The sealed signing secret is never part
+/// of this record: it is opened only by the deliverer, which is a later slice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebhookEndpointRecord {
+    /// The `whe_` identifier.
+    pub id: WebhookEndpointId,
+    /// The HTTPS destination a delivery POSTs to.
+    pub url: String,
+    /// The operator's label for this endpoint.
+    pub description: String,
+    /// Whether deliveries are dispatched.
+    pub active: bool,
+    /// Creation time in microseconds since the Unix epoch.
+    pub created_at_unix_micros: i64,
+}
+
+/// The fields a webhook endpoint registration carries, grouped so the creation call
+/// stays inside the argument budget.
+pub struct NewWebhookEndpoint<'a> {
+    /// The `whe_` identifier minted by the caller.
+    pub id: &'a WebhookEndpointId,
+    /// The HTTPS destination deliveries POST to.
+    pub url: &'a str,
+    /// The operator's label.
+    pub description: &'a str,
+    /// The raw signing secret, sealed by this write and never stored in the clear.
+    pub secret: &'a [u8],
+    /// Creation instant in microseconds since the Unix epoch.
+    pub created_at_micros: i64,
+}
+
+/// The read-only webhook endpoint repository (issue #105).
+pub struct WebhookEndpointRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl WebhookEndpointRepo<'_> {
+    /// Parse an endpoint id, confirming it is in this scope. A malformed or foreign id is
+    /// the uniform not-found, like every other scoped-resource parse.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id is malformed or from another scope.
+    pub fn parse_id(&self, raw: &str) -> Result<WebhookEndpointId, StoreError> {
+        WebhookEndpointId::parse_in_scope(raw, &self.scope).map_err(|_| StoreError::NotFound)
+    }
+
+    /// Every registered endpoint in this scope, oldest first.
+    ///
+    /// The sealed secret column is deliberately NOT selected, so this read is secret free
+    /// by construction rather than by the caller remembering to drop a field.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list(&self) -> Result<Vec<WebhookEndpointRecord>, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, url, description, active, \
+                    (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us \
+             FROM webhook_endpoints \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+             ORDER BY created_at, id",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| {
+                let raw: String = row.get("id");
+                Ok(WebhookEndpointRecord {
+                    id: WebhookEndpointId::parse_in_scope(&raw, &scope)?,
+                    url: row.get("url"),
+                    description: row.get("description"),
+                    active: row.get("active"),
+                    created_at_unix_micros: row.get("created_us"),
+                })
+            })
+            .collect()
+    }
+}
+
+/// The mutating webhook endpoint repository (issue #105).
+pub struct ActingWebhookEndpointRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingWebhookEndpointRepo<'_> {
+    /// The associated data a webhook signing secret is sealed under.
+    fn secret_purpose(id: &WebhookEndpointId) -> String {
+        format!("webhook_endpoint_secret:{id}")
+    }
+
+    /// Register an endpoint, sealing its signing secret under the scope's active DEK.
+    ///
+    /// The secret is SEALED rather than hashed because the deliverer must recover it to
+    /// compute an HMAC over every delivery; a hash could only ever be compared.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] if no master key is configured;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn create(
+        &self,
+        env: &Env,
+        spec: NewWebhookEndpoint<'_>,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        let NewWebhookEndpoint {
+            id,
+            url,
+            description,
+            secret,
+            created_at_micros,
+        } = spec;
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        // Provision the scope's KEK/DEK lazily on first use, so a first endpoint in a
+        // fresh scope seals rather than failing on a missing key. A concurrent
+        // provisioning losing the race is a Conflict and is not an error here, which is
+        // the same handling every other sealing path uses.
+        let envelope = ActingEnvelopeRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        };
+        match envelope.provision_kek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        match envelope.provision_dek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        let scope = self.scope;
+        let purpose = Self::secret_purpose(id);
+        let secret = secret.to_vec();
+        let url_owned = url.to_owned();
+        let description_owned = description.to_owned();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::WebhookEndpointCreate,
+                target: id,
+            },
+            async move |tx| {
+                let (dek_version, dek) = fetch_active_dek(tx, scope, master).await?;
+                let sealed = dek.seal(
+                    env.entropy(),
+                    &secret_seal_aad(scope, &purpose, dek_version),
+                    &secret,
+                );
+                sqlx::query(
+                    "INSERT INTO webhook_endpoints \
+                     (id, tenant_id, environment_id, url, description, active, \
+                      secret_sealed, secret_dek_version, created_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5, true, $6, $7, \
+                             TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&url_owned)
+                .bind(&description_owned)
+                .bind(sealed.into_bytes())
+                .bind(dek_version)
+                .bind(created_at_micros)
+                .execute(&mut **tx)
+                .await?;
+                insert_idempotency(tx, idempotency).await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Remove an endpoint. Removing one that is absent is an idempotent no-op success,
+    /// and the audit row is written either way because the action was attempted.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn delete(&self, env: &Env, id: &WebhookEndpointId) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::WebhookEndpointDelete,
+                target: id,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "DELETE FROM webhook_endpoints \
+                     WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+}
+
 fn connector_secret_purpose(id: &ConnectorId) -> String {
     format!("connector_client_secret:{id}")
 }

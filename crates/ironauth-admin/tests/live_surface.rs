@@ -304,6 +304,7 @@ struct Fixture {
     operator: String,
     client: String,
     connector: String,
+    webhook_endpoint: String,
     family: String,
     recovery_flow: String,
     group: String,
@@ -504,6 +505,23 @@ impl Fixture {
             .await;
         assert_eq!(status, StatusCode::CREATED, "create connector: {body}");
         let connector = field(&body, "/id", "seed connector");
+
+        // A real endpoint, so the delete case addresses an id that PARSES in this scope.
+        // A synthetic one is the uniform not-found at a live environment too, which would
+        // make driving it at a soft-deleted one measure nothing about the fence.
+        let (status, _, body) = h
+            .post(
+                &format!("{base}/webhook-endpoints"),
+                "seed-webhook",
+                &serde_json::json!({ "url": "https://example.test/hook" }).to_string(),
+            )
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "create webhook endpoint: {body}"
+        );
+        let webhook_endpoint = field(&body, "/id", "seed webhook endpoint");
 
         let (status, _, body) = h
             .post(
@@ -929,6 +947,7 @@ impl Fixture {
             operator,
             client,
             connector,
+            webhook_endpoint,
             family,
             recovery_flow,
             recovery_flow_to_reject,
@@ -973,6 +992,7 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
         operator,
         client,
         connector,
+        webhook_endpoint,
         family,
         recovery_flow,
         group,
@@ -1056,6 +1076,23 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             "POST",
             format!("{base}/abuse/bans/lift"),
             &ban,
+        ),
+        // ---- Standard Webhooks endpoint registration (issue #105) ----
+        Case::empty(
+            "webhook_endpoints.listWebhookEndpoints",
+            "GET",
+            format!("{base}/webhook-endpoints"),
+        ),
+        Case::json(
+            "webhook_endpoints.createWebhookEndpoint",
+            "POST",
+            format!("{base}/webhook-endpoints"),
+            &serde_json::json!({ "url": "https://example.test/hook" }),
+        ),
+        Case::empty(
+            "webhook_endpoints.deleteWebhookEndpoint",
+            "DELETE",
+            format!("{base}/webhook-endpoints/{webhook_endpoint}"),
         ),
         // ---- per-scope step-up policy (issue #262) ----
         Case::empty(
@@ -2010,6 +2047,7 @@ fn every_documented_operation_is_driven_by_a_case() {
         operator: "opr_0".to_owned(),
         client: "cli_0".to_owned(),
         connector: "con_0".to_owned(),
+        webhook_endpoint: "whe_0".to_owned(),
         family: "rfm_0".to_owned(),
         recovery_flow: "rcf_0".to_owned(),
         group: "grp_0".to_owned(),

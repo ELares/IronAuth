@@ -1,0 +1,282 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! Standard Webhooks endpoint registration under an environment (issue #105).
+//!
+//! The management surface over the endpoints the deliverer will POST to. The signing
+//! contract itself is `ironauth_jose::webhooks` (shipped in #554); this is where the
+//! secret that contract signs with is minted, sealed and listed.
+//!
+//! ## Reveal once, and only once
+//!
+//! Creation returns the `whsec_` secret in the response and NEVER again. The stored form
+//! is sealed under the scope's DEK, not hashed, because the deliverer has to recover it
+//! to compute an HMAC over every delivery; but no read path returns it, and the listing
+//! query does not even select the column. That is the `mak_` management-key lesson from
+//! #11 applied to a secret that cannot be hashed.
+
+use axum::extract::{Path, State};
+use axum::http::{HeaderMap, StatusCode, Uri};
+use axum::response::Response;
+use ironauth_jose::webhooks::WebhookSecret;
+use ironauth_store::{CorrelationId, IdempotencyWrite, NewWebhookEndpoint, WebhookEndpointId};
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
+
+use crate::auth::Principal;
+use crate::error::{ApiError, ErrorBody};
+use crate::idempotency;
+use crate::input::{parse_json, require_non_empty};
+use crate::org_context::{require_live_environment, resolve_scope};
+use crate::response::{json, no_content};
+use crate::state::AdminState;
+
+/// How many bytes of entropy a generated signing secret carries.
+///
+/// Thirty two, matching the HMAC-SHA256 block the `v1` scheme signs with: a shorter
+/// secret would weaken the MAC and a longer one buys nothing against it.
+const SECRET_BYTES: usize = 32;
+
+/// A registered endpoint, without its secret.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct WebhookEndpointView {
+    /// The `whe_` identifier.
+    pub id: String,
+    /// The HTTPS destination deliveries POST to.
+    pub url: String,
+    /// The operator's label for this endpoint.
+    pub description: String,
+    /// Whether deliveries are dispatched.
+    pub active: bool,
+    /// Creation time, milliseconds since the Unix epoch.
+    pub created_at_unix_ms: i64,
+}
+
+/// Every registered endpoint in the environment.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct WebhookEndpointList {
+    /// The endpoints, oldest first.
+    pub items: Vec<WebhookEndpointView>,
+}
+
+/// The creation response, which carries the signing secret exactly once.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct WebhookEndpointCreated {
+    /// The registered endpoint.
+    #[serde(flatten)]
+    pub endpoint: WebhookEndpointView,
+    /// The Standard Webhooks signing secret, in `whsec_` form. Shown ONCE: it is sealed
+    /// at rest and no read path returns it again.
+    pub secret: String,
+}
+
+/// Register a delivery endpoint.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CreateWebhookEndpointRequest {
+    /// The HTTPS destination deliveries POST to.
+    pub url: String,
+    /// An optional human label.
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// List the environment's registered webhook endpoints.
+#[utoipa::path(
+    get,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints",
+    operation_id = "listWebhookEndpoints",
+    tag = "webhooks",
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "The environment's webhook endpoints", body = WebhookEndpointList),
+        (status = 401, description = "Missing or invalid credential", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "The environment is absent", body = ErrorBody)
+    )
+)]
+pub async fn list_webhook_endpoints(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    // No liveness fence on a READ: a soft-deleted environment stays readable across this
+    // surface and only writes refuse it, which the whole-surface sweep enforces.
+    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let endpoints = state
+        .store()
+        .scoped(scope)
+        .webhook_endpoints()
+        .list()
+        .await?;
+    let view = WebhookEndpointList {
+        items: endpoints.into_iter().map(into_view).collect(),
+    };
+    let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
+    Ok(json(StatusCode::OK, body_string))
+}
+
+/// Register a delivery endpoint and mint its signing secret.
+#[utoipa::path(
+    post,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints",
+    operation_id = "createWebhookEndpoint",
+    tag = "webhooks",
+    request_body = CreateWebhookEndpointRequest,
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("Idempotency-Key" = String, Header, description = "Required. Replaying a POST \
+         with the same key returns the original response without re-executing.")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 201, description = "The endpoint, with its signing secret shown once", body = WebhookEndpointCreated),
+        (status = 400, description = "Malformed request, or a url that is not https", body = ErrorBody),
+        (status = 401, description = "Missing or invalid credential, or fresh privilege required", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "The environment is absent or deleted", body = ErrorBody),
+        (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
+    )
+)]
+pub async fn create_webhook_endpoint(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Response, ApiError> {
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    crate::sudo::require_fresh_privilege(&state, scope, principal.actor()).await?;
+    require_live_environment(&state, &scope).await?;
+
+    let request: CreateWebhookEndpointRequest = parse_json(&body)?;
+    let url = require_non_empty(&request.url, "url")?;
+    // HTTPS only, refused HERE rather than by a CHECK constraint: the same judgement has
+    // to reject a loopback or otherwise internal destination, and that belongs to the
+    // SSRF-hardened fetcher the deliverer rides, not to the schema.
+    if !url.starts_with("https://") {
+        return Err(ApiError::BadRequest(
+            "url must be an https:// destination".to_owned(),
+        ));
+    }
+    let description = request.description.unwrap_or_default();
+
+    let key = idempotency::required_key(&headers)?;
+    let fingerprint = idempotency::fingerprint("POST", uri.path(), &body);
+    let credential_ref = principal.credential_ref();
+    if let Some(replay) =
+        idempotency::replay_if_stored(&state, &credential_ref, &key, &fingerprint).await?
+    {
+        return Ok(replay);
+    }
+
+    let id = WebhookEndpointId::generate(state.env(), &scope);
+    let mut secret_bytes = vec![0_u8; SECRET_BYTES];
+    state.env().entropy().fill_bytes(&mut secret_bytes);
+    let secret = WebhookSecret::from_bytes(secret_bytes.clone());
+    let created_at_micros = state.now_unix_micros();
+
+    // Knowable BEFORE the write: the id is minted here and every other field either
+    // echoes the request or is fixed at creation, so this carries the plain idempotency
+    // form and the SAME bytes are stored and returned. A retry therefore replays the
+    // secret rather than minting a second endpoint, which is the whole reason a
+    // reveal-once response must be idempotent.
+    let view = WebhookEndpointCreated {
+        endpoint: WebhookEndpointView {
+            id: id.to_string(),
+            url: url.clone(),
+            description: description.clone(),
+            active: true,
+            created_at_unix_ms: created_at_micros / 1000,
+        },
+        secret: secret.to_transport_string(),
+    };
+    let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
+
+    state
+        .store()
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(state.env()))
+        .webhook_endpoints()
+        .create(
+            state.env(),
+            NewWebhookEndpoint {
+                id: &id,
+                url: &url,
+                description: &description,
+                secret: &secret_bytes,
+                created_at_micros,
+            },
+            Some(IdempotencyWrite {
+                credential_ref: &credential_ref,
+                key: &key,
+                request_fingerprint: &fingerprint,
+                response_status: 201,
+                response_body: &body_string,
+            }),
+        )
+        .await?;
+    Ok(json(StatusCode::CREATED, body_string))
+}
+
+/// Remove a delivery endpoint.
+#[utoipa::path(
+    delete,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}",
+    operation_id = "deleteWebhookEndpoint",
+    tag = "webhooks",
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("endpoint_id" = String, Path, description = "The endpoint identifier (whe_...)")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 204, description = "The endpoint is gone. Removing an absent one is a no-op success"),
+        (status = 401, description = "Missing or invalid credential, or fresh privilege required", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "The environment is absent or deleted, or the endpoint is in another scope", body = ErrorBody)
+    )
+)]
+pub async fn delete_webhook_endpoint(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, endpoint_id)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    crate::sudo::require_fresh_privilege(&state, scope, principal.actor()).await?;
+    require_live_environment(&state, &scope).await?;
+    // Parsed under the CALLER's scope, so an endpoint id from another environment is the
+    // uniform not-found before any mutating repository is reached.
+    let id = state
+        .store()
+        .scoped(scope)
+        .webhook_endpoints()
+        .parse_id(&endpoint_id)?;
+
+    // No Idempotency-Key: DELETE is the idempotent removal here as everywhere else, and
+    // removing an absent endpoint is a no-op success.
+    state
+        .store()
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(state.env()))
+        .webhook_endpoints()
+        .delete(state.env(), &id)
+        .await?;
+    Ok(no_content())
+}
+
+/// Project a stored endpoint into its wire view.
+fn into_view(record: ironauth_store::WebhookEndpointRecord) -> WebhookEndpointView {
+    WebhookEndpointView {
+        id: record.id.to_string(),
+        url: record.url,
+        description: record.description,
+        active: record.active,
+        created_at_unix_ms: record.created_at_unix_micros / 1000,
+    }
+}

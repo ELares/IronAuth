@@ -1208,6 +1208,11 @@ pub enum Action {
     /// is validated before it lands, and the upstream client secret is sealed inline
     /// under the scope DEK.
     ConnectorCreate,
+    /// A Standard Webhooks delivery endpoint was registered (issue #105): a POST target
+    /// and its sealed signing secret. The row targets the `whe_` endpoint.
+    WebhookEndpointCreate,
+    /// A Standard Webhooks delivery endpoint was removed (issue #105).
+    WebhookEndpointDelete,
     /// A federation connector was UPDATED (issue #75): its definition, sealed secret,
     /// capability matrix, or enabled flag was replaced through the management API. The
     /// row targets the `cnr_` connector; the `detail` records the connector slug.
@@ -1472,6 +1477,8 @@ impl Action {
             Action::RecoveryContactConfirmed => "recovery.contact.confirmed",
             Action::RecoveryIdvCallback => "recovery.idv.callback",
             Action::RiskDisavow => "risk.disavow",
+            Action::WebhookEndpointCreate => "webhook.endpoint.create",
+            Action::WebhookEndpointDelete => "webhook.endpoint.delete",
             Action::ConnectorCreate => "connector.create",
             Action::ConnectorUpdate => "connector.update",
             Action::ConnectorDelete => "connector.delete",
