@@ -971,6 +971,13 @@ pub fn management_router(state: AdminState) -> Router {
             "/v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/replay",
             post(webhook_endpoints::replay_webhook_dead_letters),
         )
+        // The per-endpoint event-type subscription (issue #106): which events this
+        // endpoint receives. Applied at fan-out, so a non-matching event never has a
+        // delivery attempt created for it.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/event-types",
+            axum::routing::put(webhook_endpoints::set_webhook_event_types),
+        )
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/pause",
             post(webhook_endpoints::pause_webhook_endpoint),

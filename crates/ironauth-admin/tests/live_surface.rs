@@ -1116,6 +1116,12 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             format!("{base}/webhook-endpoints/{webhook_endpoint}/replay"),
             &serde_json::json!({}),
         ),
+        Case::json(
+            "webhook_endpoints.setWebhookEventTypes",
+            "PUT",
+            format!("{base}/webhook-endpoints/{webhook_endpoint}/event-types"),
+            &serde_json::json!({ "event_types": ["user.created"] }),
+        ),
         Case::empty(
             "webhook_endpoints.pauseWebhookEndpoint",
             "POST",

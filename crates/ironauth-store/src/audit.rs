@@ -1225,6 +1225,10 @@ pub enum Action {
     /// endpoint, which is an operator decision rather than queue bookkeeping; the `detail`
     /// records the recover-from-timestamp bound.
     WebhookEndpointReplayDeadLetters,
+    /// A Standard Webhooks delivery endpoint's event-type SUBSCRIPTION changed (issue
+    /// #106): which event types it receives, or a clear back to receiving every type. The
+    /// `detail` records the subscription the write committed.
+    WebhookEndpointSetEventTypes,
     /// A Standard Webhooks delivery endpoint was removed (issue #105).
     WebhookEndpointDelete,
     /// A federation connector was UPDATED (issue #75): its definition, sealed secret,
@@ -1494,6 +1498,7 @@ impl Action {
             Action::WebhookEndpointCreate => "webhook.endpoint.create",
             Action::WebhookEndpointRotateSecret => "webhook.endpoint.rotate_secret",
             Action::WebhookEndpointSetActive => "webhook.endpoint.set_active",
+            Action::WebhookEndpointSetEventTypes => "webhook.endpoint.set_event_types",
             Action::WebhookEndpointReplayDeadLetters => "webhook.endpoint.replay_dead_letters",
             Action::WebhookEndpointDelete => "webhook.endpoint.delete",
             Action::ConnectorCreate => "connector.create",
