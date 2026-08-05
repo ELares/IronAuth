@@ -1457,6 +1457,17 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             format!("{base}/trait-schemas"),
             &serde_json::json!({ "schema": {"type": "object", "properties": {}} }),
         ),
+        Case::json(
+            "trait_schemas.createTraitMigrationJob",
+            "POST",
+            format!("{base}/trait-schemas/migrations"),
+            &serde_json::json!({ "kind": "dry_run", "from_version": 1, "to_version": 1 }),
+        ),
+        Case::empty(
+            "trait_schemas.getTraitMigrationJob",
+            "GET",
+            format!("{base}/trait-schemas/migrations/tmj_absent"),
+        ),
         Case::empty(
             "trait_schemas.getActiveTraitSchema",
             "GET",

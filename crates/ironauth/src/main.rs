@@ -11,6 +11,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use axum::Router;
+use ironauth_admin::trait_migration_worker::TraitMigrationConsumer;
 use ironauth_admin::webhook_delivery::{
     FetchWebhookSender, WebhookDeliveryConsumer, WebhookReplayConsumer,
 };
@@ -280,6 +281,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // grows fastest. The only switch is `outbox.reap_enabled`, which defaults ON.
         let retention_inputs = retention_sweeper_inputs(&config, &env);
         let webhook_inputs = webhook_delivery_inputs(&config, &env);
+        let trait_migration = trait_migration_inputs(&config, &env);
         // Capture what the one-shot signing-algorithm backfill (issue #93) needs before
         // config moves into the server (only when its switch is on). Runs before serving.
         let signing_backfill_inputs = signing_backfill_inputs(&config, &env);
@@ -375,6 +377,13 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             Some(inputs) => spawn_webhook_delivery_pools(inputs).await,
             None => Vec::new(),
         };
+        // The trait migration worker (issue #53), behind its own switch for the same
+        // reason webhook delivery is: it is a different subsystem and must not require
+        // another one's configuration to run. BOUND so the shutdown below can await it.
+        let trait_migration_pools = match trait_migration {
+            Some(inputs) => spawn_trait_migration_pools(inputs).await,
+            None => Vec::new(),
+        };
         // The outbox retention sweeper (issue #104, PR 3), started here and not inside the
         // block above: the outbox is a GENERIC substrate whose next consumer will run
         // behind a different switch, so the reaper must not share the back-channel logout
@@ -408,7 +417,11 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // Stop the outbox pools and WAIT for their in-flight passes. A claimed message
         // that is not completed is not lost: its lease lapses and the next boot re-claims
         // it, which is the same path a crash takes.
-        for pool in logout_pools.into_iter().chain(webhook_pools) {
+        for pool in logout_pools
+            .into_iter()
+            .chain(webhook_pools)
+            .chain(trait_migration_pools)
+        {
             pool.shutdown().await;
         }
         // Stopped alongside the pools. Nothing is lost by stopping a retention pass part
@@ -1268,6 +1281,39 @@ struct WebhookDeliveryInputs {
     env: Env,
 }
 
+/// What the trait migration worker (issue #53) needs, captured before `config` moves.
+struct TraitMigrationInputs {
+    /// How many identities ONE batch processes.
+    batch_size: u32,
+    /// The shared `[outbox]` tuning the pool is built from.
+    outbox: OutboxConfig,
+    /// The data-plane DSN the worker drains and migrates through.
+    data_plane_dsn: String,
+    /// The control-plane DSN the worker enumerates scopes on; [`None`] disables it.
+    control_dsn: Option<String>,
+    /// The master key: a migration reads and re-seals every identity's traits, so without
+    /// one every batch fails at the unseal.
+    master: Option<Arc<MasterKey>>,
+    /// The environment seam.
+    env: Env,
+}
+
+/// Capture the trait migration worker inputs from config (issue #53), or `None` when the
+/// worker is switched off.
+fn trait_migration_inputs(config: &Config, env: &Env) -> Option<TraitMigrationInputs> {
+    if !config.traits.migration_worker_enabled {
+        return None;
+    }
+    Some(TraitMigrationInputs {
+        batch_size: config.traits.migration_batch_size,
+        outbox: config.outbox.clone(),
+        data_plane_dsn: config.database.url.expose().to_owned(),
+        control_dsn: select_control_dsn(config),
+        master: resolve_master_key(config),
+        env: env.clone(),
+    })
+}
+
 /// Capture the webhook delivery worker inputs from config (issue #105), or `None` when the
 /// consumer is switched off.
 ///
@@ -1998,6 +2044,83 @@ async fn spawn_webhook_delivery_pools(inputs: WebhookDeliveryInputs) -> Vec<Outb
         consumers = ?consumers.names(),
         pools = pools.len(),
         "webhook delivery started on the outbox consumer pools"
+    );
+    pools
+}
+
+/// Start the trait migration worker (issue #53) on the generic outbox worker pool.
+///
+/// The THIRD production consumer of the #104 framework, and the one that issue named
+/// explicitly ("migration jobs"). It extends the generic parts rather than copying them:
+/// [`spawn_consumer_pools`], [`ControlPlaneScopes`] and [`TracingOutboxObserver`] are
+/// shared, and only the consumer and its batch size are trait specific.
+///
+/// Every early return is logged and starts NOTHING. A job's progress lives in its own row
+/// and its next batch lives on a durable queue, so a job created while no worker runs is
+/// picked up unchanged whenever one starts.
+async fn spawn_trait_migration_pools(inputs: TraitMigrationInputs) -> Vec<OutboxWorkerPool> {
+    let TraitMigrationInputs {
+        batch_size,
+        outbox,
+        data_plane_dsn,
+        control_dsn,
+        master,
+        env,
+    } = inputs;
+
+    let Some(control_dsn) = control_dsn else {
+        tracing::error!(
+            "trait migration worker not started: no control-plane DSN to enumerate scopes \
+             (set admin.control_database_url, or run in dev_mode). Jobs and their batches \
+             are durable, so nothing is lost; enable the control plane to run them."
+        );
+        return Vec::new();
+    };
+    // Refusing to start beats starting a worker that cannot read a trait. Without a master
+    // key every batch fails at the unseal, so each message would burn its attempt budget
+    // and dead-letter, turning a missing configuration value into a job that can never run.
+    let Some(master) = master else {
+        tracing::error!(
+            "trait migration worker not started: database.master_key is unset, so sealed \
+             identity traits cannot be read. Jobs are durable; set database.master_key."
+        );
+        return Vec::new();
+    };
+
+    let data_store = match Store::connect(&data_plane_dsn).await {
+        Ok(store) => store.with_master_key(master),
+        Err(error) => {
+            tracing::error!(%error, "trait migration worker not started: data-plane connect failed");
+            return Vec::new();
+        }
+    };
+    let control_store = match Store::connect(&control_dsn).await {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::error!(%error, "trait migration worker not started: control-plane connect failed");
+            return Vec::new();
+        }
+    };
+
+    let mut consumers = ConsumerRegistry::new();
+    if let Err(error) = consumers.register(Arc::new(TraitMigrationConsumer::new(
+        data_store.clone(),
+        batch_size,
+    )) as Arc<dyn OutboxConsumer>)
+    {
+        tracing::error!(%error, "trait migration worker not started: duplicate consumer name");
+        return Vec::new();
+    }
+
+    let scopes: Arc<dyn ScopeSource> = Arc::new(ControlPlaneScopes::new(control_store));
+    let observer: Arc<dyn OutboxObserver> = Arc::new(TracingOutboxObserver);
+    let pools = spawn_consumer_pools(&consumers, &data_store, &env, &outbox, &scopes, &observer);
+
+    tracing::info!(
+        consumers = ?consumers.names(),
+        pools = pools.len(),
+        batch_size,
+        "trait migration jobs started on the outbox consumer pools"
     );
     pools
 }

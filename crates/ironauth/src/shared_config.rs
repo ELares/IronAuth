@@ -685,6 +685,16 @@ mod tests {
              rot-detection PR 1 was buying.",
         ),
         (
+            "traits",
+            Reach::OnePlaneOrNoState,
+            "the schema-driven identity trait settings (issue #53): whether this process \
+             runs the migration-job worker, and how large one batch is. Read once at boot \
+             by trait_migration_inputs, which builds the consumer and hands it to a worker \
+             pool. It reaches NEITHER plane state, for the same reason `outbox` and \
+             `webhooks` do not: a pool is not plane state. The trait SCHEMA surface that \
+             validates identities lives on AdminState and holds none of these knobs.",
+        ),
+        (
             "webhooks",
             Reach::OnePlaneOrNoState,
             "the outbound webhook delivery consumer's own settings (issue #105): whether \

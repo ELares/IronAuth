@@ -65,6 +65,7 @@ crates/ironauth-admin/src/tenants.rs:create_tenant:1
 crates/ironauth-admin/src/tenants.rs:restore_tenant:1
 crates/ironauth-admin/src/tenants.rs:transition_tenant:1
 crates/ironauth-admin/src/trait_schemas.rs:activate_trait_schema_version:1
+crates/ironauth-admin/src/trait_schemas.rs:create_trait_migration_job:1
 crates/ironauth-admin/src/trait_schemas.rs:create_trait_schema_version:1
 crates/ironauth-admin/src/users.rs:create_user:1
 crates/ironauth-admin/src/users.rs:set_user_state:1

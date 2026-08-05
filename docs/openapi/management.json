@@ -15087,6 +15087,206 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas/migrations": {
+      "post": {
+        "tags": [
+          "trait-schemas"
+        ],
+        "summary": "Start a trait migration or dry-run job.",
+        "operationId": "createTraitMigrationJob",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying a POST with the same key returns the original response without re-executing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTraitMigrationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "The job was created and its first batch queued",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TraitMigrationJobView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request, an unknown kind, or a transform program that does not parse",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential, or fresh privilege required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment is absent or deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency-Key reused with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas/migrations/{job_id}": {
+      "get": {
+        "tags": [
+          "trait-schemas"
+        ],
+        "summary": "Read a trait migration job's progress and failure report.",
+        "operationId": "getTraitMigrationJob",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "job_id",
+            "in": "path",
+            "description": "The job identifier (tmj_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The job's progress and failure report",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TraitMigrationJobView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such job in this scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas/{version}": {
       "get": {
         "tags": [
@@ -19584,6 +19784,34 @@
           }
         }
       },
+      "CreateTraitMigrationRequest": {
+        "type": "object",
+        "description": "Start a trait migration or dry-run job.",
+        "required": [
+          "kind",
+          "from_version",
+          "to_version"
+        ],
+        "properties": {
+          "from_version": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The schema version identities are migrated or validated FROM."
+          },
+          "kind": {
+            "type": "string",
+            "description": "`dry_run` validates every identity against the target version and writes nothing;\n`migrate` transforms and writes."
+          },
+          "to_version": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The candidate schema version identities are migrated or validated TO."
+          },
+          "transform": {
+            "description": "The declarative transform program, a JSON array. Omitted means the empty program,\nwhich is what a dry-run uses and what a migrate that only re-validates uses."
+          }
+        }
+      },
       "CreateTraitSchemaRequest": {
         "type": "object",
         "description": "The body to create a new immutable trait-schema version (issue #53).\n\nThe `schema` is a JSON Schema (draft 2020-12, the supported profile vocabulary)\ncarrying the inline `x-ironauth` behavior annotations. It is COMPILED before the\nwrite; a malformed schema is a 400 naming the offending RFC 6901 location in the\nschema document and nothing is stored. A schema document carries no secret and no\nPII (it declares field SHAPES, never values).",
@@ -22188,6 +22416,25 @@
           }
         }
       },
+      "RecordFailureView": {
+        "type": "object",
+        "description": "One identity that failed validation, with the fields that failed.",
+        "required": [
+          "subject",
+          "failures"
+        ],
+        "properties": {
+          "failures": {
+            "type": "array",
+            "items": {},
+            "description": "The per-field failures, each an RFC 6901 JSON Pointer and a reason."
+          },
+          "subject": {
+            "type": "string",
+            "description": "The failing identity's subject (a `usr_` id)."
+          }
+        }
+      },
       "RecoveryApprovalCaseView": {
         "type": "object",
         "description": "An admin-approved recovery approval (issue #82, PR 3), as the management API returns it.\nCarries no secret and no raw PII: the subject is the opaque `usr_` id.",
@@ -23684,6 +23931,73 @@
             "type": "string",
             "description": "An RFC 6901 JSON Pointer to the failing location in the submitted document (the\nempty string points at the document root).",
             "example": "/address/zip"
+          }
+        }
+      },
+      "TraitMigrationJobView": {
+        "type": "object",
+        "description": "A migration job's definition, progress and failure report.",
+        "required": [
+          "id",
+          "kind",
+          "from_version",
+          "to_version",
+          "status",
+          "total_count",
+          "processed_count",
+          "migrated_count",
+          "failure_count",
+          "failures"
+        ],
+        "properties": {
+          "failure_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many failed validation."
+          },
+          "failures": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RecordFailureView"
+            },
+            "description": "The per-record failure report."
+          },
+          "from_version": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The version migrated FROM."
+          },
+          "id": {
+            "type": "string",
+            "description": "The `tmj_` identifier."
+          },
+          "kind": {
+            "type": "string",
+            "description": "`dry_run` or `migrate`."
+          },
+          "migrated_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many were migrated. Always zero for a dry-run, which writes nothing."
+          },
+          "processed_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many have been processed so far."
+          },
+          "status": {
+            "type": "string",
+            "description": "`pending`, `running`, `completed` or `failed`."
+          },
+          "to_version": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The version migrated TO."
+          },
+          "total_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many identities the job set out to process."
           }
         }
       },

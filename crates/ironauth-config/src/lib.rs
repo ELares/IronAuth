@@ -186,6 +186,10 @@ pub struct Config {
     /// the implementation it selects.
     pub outbox: OutboxConfig,
 
+    /// Schema-driven identity traits (issue #53): whether this process advances trait
+    /// migration jobs, and how large one batch is.
+    pub traits: TraitsConfig,
+
     /// Outbound webhook delivery (issue #105): whether this process drains the
     /// `webhook.delivery` queue, and the per-delivery time budget.
     ///
@@ -467,6 +471,42 @@ pub struct WebhooksConfig {
 /// permitted to run longer than any sane lease would simply be redelivered underneath
 /// itself.
 pub const WEBHOOK_MAX_DELIVERY_TIMEOUT_SECS: u64 = 300;
+
+/// Schema-driven identity trait settings (issue #53).
+///
+/// One knob so far: whether this process runs the worker that advances trait MIGRATION
+/// jobs. The job itself is created over the management API and its progress is durable, so
+/// a deployment that never opens this section can still create jobs; they simply wait
+/// until a process that runs the worker picks them up.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct TraitsConfig {
+    /// Whether THIS process drains the `traits.migration` queue and advances migration
+    /// jobs in batches. OFF by default, like every other background worker here.
+    ///
+    /// Off does not mean a job is lost: `trait_migration_jobs` records progress per batch,
+    /// so a job created with no worker running is picked up unchanged whenever one starts.
+    pub migration_worker_enabled: bool,
+
+    /// How many identities ONE batch of a migration job processes before the worker
+    /// yields and re-queues the next batch.
+    ///
+    /// Batching is what keeps a 100k-identity migration off a single long transaction and
+    /// inside the outbox visibility lease. The default (500) is chosen so a batch finishes
+    /// well within the default 30 second lease; raising it past what one batch can do in
+    /// that window causes the message to be redelivered mid-batch, which is safe (advance
+    /// is resumable and idempotent) but wasteful. Must be at least 1.
+    pub migration_batch_size: u32,
+}
+
+impl Default for TraitsConfig {
+    fn default() -> Self {
+        Self {
+            migration_worker_enabled: false,
+            migration_batch_size: 500,
+        }
+    }
+}
 
 impl Default for WebhooksConfig {
     fn default() -> Self {
@@ -4830,6 +4870,7 @@ impl Config {
         validate_token_claims(&self.token_claims)?;
         validate_outbox(&self.outbox)?;
         validate_webhooks(&self.webhooks)?;
+        validate_traits(&self.traits)?;
         // Last, and after both halves have been checked on their own, so a cross-section
         // report is never produced from a value that is independently out of range.
         validate_backchannel_logout_lease(&self.oidc, &self.outbox)?;
@@ -6461,6 +6502,30 @@ fn validate_backchannel_logout_lease(
                  outbox.visibility_timeout_secs ({}): a logout POST allowed to outrun its \
                  visibility lease is re-claimed mid-flight and delivered twice",
                 oidc.backchannel_logout_request_timeout_secs, outbox.visibility_timeout_secs
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Bound the trait migration batch size (issue #53).
+///
+/// A zero batch is a worker that claims a job and processes nothing, which looks healthy
+/// while the job never finishes; the ceiling is the same one every batch knob in this file
+/// has, because a batch far larger than one visibility lease can clear buys nothing.
+fn validate_traits(traits: &TraitsConfig) -> Result<(), ConfigError> {
+    if traits.migration_batch_size < 1 {
+        return Err(ConfigError::Invalid {
+            message: "traits.migration_batch_size must be at least 1: a zero batch is a \
+                      worker that advances nothing while reporting itself healthy"
+                .to_owned(),
+        });
+    }
+    if traits.migration_batch_size > OUTBOX_MAX_CLAIM_BATCH {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "traits.migration_batch_size ({}) must not exceed {OUTBOX_MAX_CLAIM_BATCH}",
+                traits.migration_batch_size
             ),
         });
     }

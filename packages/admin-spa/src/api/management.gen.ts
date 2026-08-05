@@ -1997,6 +1997,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas/migrations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Start a trait migration or dry-run job. */
+        post: operations["createTraitMigrationJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas/migrations/{job_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read a trait migration job's progress and failure report. */
+        get: operations["getTraitMigrationJob"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas/{version}": {
         parameters: {
             query?: never;
@@ -3253,6 +3287,29 @@ export interface components {
              * @example eu-west
              */
             home_region?: string | null;
+        };
+        /** @description Start a trait migration or dry-run job. */
+        CreateTraitMigrationRequest: {
+            /**
+             * Format: int32
+             * @description The schema version identities are migrated or validated FROM.
+             */
+            from_version: number;
+            /**
+             * @description `dry_run` validates every identity against the target version and writes nothing;
+             *     `migrate` transforms and writes.
+             */
+            kind: string;
+            /**
+             * Format: int32
+             * @description The candidate schema version identities are migrated or validated TO.
+             */
+            to_version: number;
+            /**
+             * @description The declarative transform program, a JSON array. Omitted means the empty program,
+             *     which is what a dry-run uses and what a migrate that only re-validates uses.
+             */
+            transform?: unknown;
         };
         /**
          * @description The body to create a new immutable trait-schema version (issue #53).
@@ -4922,6 +4979,13 @@ export interface components {
             /** @description True when the result hit the limit and older matching traces were left out. */
             truncated: boolean;
         };
+        /** @description One identity that failed validation, with the fields that failed. */
+        RecordFailureView: {
+            /** @description The per-field failures, each an RFC 6901 JSON Pointer and a reason. */
+            failures: unknown[];
+            /** @description The failing identity's subject (a `usr_` id). */
+            subject: string;
+        };
         /**
          * @description An admin-approved recovery approval (issue #82, PR 3), as the management API returns it.
          *     Carries no secret and no raw PII: the subject is the opaque `usr_` id.
@@ -5827,6 +5891,47 @@ export interface components {
              * @example /address/zip
              */
             pointer: string;
+        };
+        /** @description A migration job's definition, progress and failure report. */
+        TraitMigrationJobView: {
+            /**
+             * Format: int64
+             * @description How many failed validation.
+             */
+            failure_count: number;
+            /** @description The per-record failure report. */
+            failures: components["schemas"]["RecordFailureView"][];
+            /**
+             * Format: int32
+             * @description The version migrated FROM.
+             */
+            from_version: number;
+            /** @description The `tmj_` identifier. */
+            id: string;
+            /** @description `dry_run` or `migrate`. */
+            kind: string;
+            /**
+             * Format: int64
+             * @description How many were migrated. Always zero for a dry-run, which writes nothing.
+             */
+            migrated_count: number;
+            /**
+             * Format: int64
+             * @description How many have been processed so far.
+             */
+            processed_count: number;
+            /** @description `pending`, `running`, `completed` or `failed`. */
+            status: string;
+            /**
+             * Format: int32
+             * @description The version migrated TO.
+             */
+            to_version: number;
+            /**
+             * Format: int64
+             * @description How many identities the job set out to process.
+             */
+            total_count: number;
         };
         /**
          * @description One immutable trait-schema version, as returned by the management API (issue #53).
@@ -16227,6 +16332,137 @@ export interface operations {
                 };
             };
             /** @description The environment has no active trait schema */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    createTraitMigrationJob: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Required. Replaying a POST with the same key returns the original response without re-executing. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateTraitMigrationRequest"];
+            };
+        };
+        responses: {
+            /** @description The job was created and its first batch queued */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TraitMigrationJobView"];
+                };
+            };
+            /** @description Malformed request, an unknown kind, or a transform program that does not parse */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential, or fresh privilege required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment is absent or deleted */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Idempotency-Key reused with a different request */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    getTraitMigrationJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The job identifier (tmj_...) */
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The job's progress and failure report */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TraitMigrationJobView"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such job in this scope */
             404: {
                 headers: {
                     [name: string]: unknown;

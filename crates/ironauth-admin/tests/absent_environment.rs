@@ -590,6 +590,16 @@ fn environment_child_cases(base: &str, ids: &Ids) -> Vec<Case> {
             body: None,
         },
         Case {
+            label: "trait_schemas.createTraitMigrationJob",
+            method: "POST",
+            path: format!("{base}/trait-schemas/migrations"),
+            body: Some(body_of(&serde_json::json!({
+                "kind": "dry_run",
+                "from_version": 1,
+                "to_version": 1
+            }))),
+        },
+        Case {
             label: "trait_schemas.createTraitSchemaVersion",
             method: "POST",
             path: format!("{base}/trait-schemas"),

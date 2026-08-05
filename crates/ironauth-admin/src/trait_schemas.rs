@@ -59,6 +59,9 @@ use ironauth_store::{
     TraitSchemaVersion,
 };
 
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
+
 use crate::auth::Principal;
 use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
@@ -483,4 +486,246 @@ mod tests {
         // uniform not-found here rather than a 500 or a version-0 read.
         assert!(matches!(parse_version("active"), Err(ApiError::NotFound)));
     }
+}
+
+/// Start a trait migration or dry-run job.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CreateTraitMigrationRequest {
+    /// `dry_run` validates every identity against the target version and writes nothing;
+    /// `migrate` transforms and writes.
+    pub kind: String,
+    /// The schema version identities are migrated or validated FROM.
+    pub from_version: i32,
+    /// The candidate schema version identities are migrated or validated TO.
+    pub to_version: i32,
+    /// The declarative transform program, a JSON array. Omitted means the empty program,
+    /// which is what a dry-run uses and what a migrate that only re-validates uses.
+    #[serde(default)]
+    pub transform: Option<serde_json::Value>,
+}
+
+/// One identity that failed validation, with the fields that failed.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RecordFailureView {
+    /// The failing identity's subject (a `usr_` id).
+    pub subject: String,
+    /// The per-field failures, each an RFC 6901 JSON Pointer and a reason.
+    pub failures: Vec<serde_json::Value>,
+}
+
+/// A migration job's definition, progress and failure report.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TraitMigrationJobView {
+    /// The `tmj_` identifier.
+    pub id: String,
+    /// `dry_run` or `migrate`.
+    pub kind: String,
+    /// The version migrated FROM.
+    pub from_version: i32,
+    /// The version migrated TO.
+    pub to_version: i32,
+    /// `pending`, `running`, `completed` or `failed`.
+    pub status: String,
+    /// How many identities the job set out to process.
+    pub total_count: i64,
+    /// How many have been processed so far.
+    pub processed_count: i64,
+    /// How many were migrated. Always zero for a dry-run, which writes nothing.
+    pub migrated_count: i64,
+    /// How many failed validation.
+    pub failure_count: i64,
+    /// The per-record failure report.
+    pub failures: Vec<RecordFailureView>,
+}
+
+/// Project a stored job into its wire view.
+fn job_view(job: &ironauth_store::TraitMigrationJob) -> Result<TraitMigrationJobView, ApiError> {
+    let failures = job
+        .failures
+        .iter()
+        .map(|failure| {
+            Ok(RecordFailureView {
+                subject: failure.subject.clone(),
+                failures: failure
+                    .failures
+                    .iter()
+                    .map(serde_json::to_value)
+                    .collect::<Result<_, _>>()
+                    .map_err(|_| ApiError::Internal)?,
+            })
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    Ok(TraitMigrationJobView {
+        id: job.id.to_string(),
+        kind: job.kind.as_str().to_owned(),
+        from_version: job.from_version,
+        to_version: job.to_version,
+        status: job.status.as_str().to_owned(),
+        total_count: job.total_count,
+        processed_count: job.processed_count,
+        migrated_count: job.migrated_count,
+        failure_count: job.failure_count,
+        failures,
+    })
+}
+
+/// Start a trait migration or dry-run job.
+#[utoipa::path(
+    post,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas/migrations",
+    operation_id = "createTraitMigrationJob",
+    tag = "trait-schemas",
+    request_body = CreateTraitMigrationRequest,
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("Idempotency-Key" = String, Header, description = "Required. Replaying a POST \
+         with the same key returns the original response without re-executing.")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 202, description = "The job was created and its first batch queued", body = TraitMigrationJobView),
+        (status = 400, description = "Malformed request, an unknown kind, or a transform program that does not parse", body = ErrorBody),
+        (status = 401, description = "Missing or invalid credential, or fresh privilege required", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "The environment is absent or deleted", body = ErrorBody),
+        (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
+    )
+)]
+pub async fn create_trait_migration_job(
+    State(state): State<AdminState>,
+    principal: Principal,
+    uri: Uri,
+    headers: HeaderMap,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // A migrate job REWRITES every identity's traits, which is the largest data mutation
+    // this surface offers, so it demands fresh privilege exactly as a cutover does.
+    crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
+
+    let key = idempotency::required_key(&headers)?;
+    let fingerprint = idempotency::fingerprint("POST", uri.path(), &body);
+    let credential_ref = principal.credential_ref();
+    if let Some(replay) =
+        idempotency::replay_if_stored(&state, &credential_ref, &key, &fingerprint).await?
+    {
+        return Ok(replay);
+    }
+    // AFTER the replay, for the reason every other write on this surface records: a
+    // genuine replay must still return its original response even if the environment went
+    // away in between. And BEFORE the body is parsed, which the whole-surface sweep
+    // enforces: validating the body first makes a malformed request answer 400 at a
+    // soft-deleted environment, which tells an unauthorized caller the environment is
+    // there. The uniform not-found has to come first.
+    crate::org_context::require_live_environment(&state, &scope).await?;
+
+    let request: CreateTraitMigrationRequest = parse_json(&body)?;
+    let kind = ironauth_store::TraitJobKind::from_wire(&request.kind)
+        .ok_or_else(|| ApiError::BadRequest("kind must be one of dry_run | migrate".to_owned()))?;
+    // Serialized here rather than passed through, so a transform that is not a JSON ARRAY
+    // is refused at the edge with a precise message instead of reaching the store's parse.
+    let transform = match &request.transform {
+        None => None,
+        Some(value) if value.is_array() => {
+            Some(serde_json::to_string(value).map_err(|_| ApiError::Internal)?)
+        }
+        Some(_) => {
+            return Err(ApiError::BadRequest(
+                "transform must be a JSON array".to_owned(),
+            ));
+        }
+    };
+
+    // The id is minted HERE so the first batch's payload, the job row and the stored
+    // idempotent response are all knowable before the single write that commits them.
+    let job_id = ironauth_store::TraitMigrationJobId::generate(state.env(), &scope);
+    let payload = crate::trait_migration_worker::batch_payload(&job_id, &actor);
+
+    // The response describes the job as CREATED: pending, nothing processed. A count would
+    // be a lie, since the first batch has not run, so this answers 202 and the caller polls
+    // the GET below. Knowing it up front is also what lets the whole create be one write.
+    let view = TraitMigrationJobView {
+        id: job_id.to_string(),
+        kind: kind.as_str().to_owned(),
+        from_version: request.from_version,
+        to_version: request.to_version,
+        status: ironauth_store::TraitJobStatus::Pending.as_str().to_owned(),
+        // Unknown until the write counts the population, and deliberately reported as zero
+        // rather than guessed: the GET returns the real denominator once the row exists.
+        total_count: 0,
+        processed_count: 0,
+        migrated_count: 0,
+        failure_count: 0,
+        failures: Vec::new(),
+    };
+    let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
+
+    state
+        .store()
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(state.env()))
+        .trait_migration_jobs()
+        .create_with_id(
+            state.env(),
+            &job_id,
+            ironauth_store::NewTraitMigrationJob {
+                kind,
+                from_version: request.from_version,
+                to_version: request.to_version,
+                transform_json: transform.as_deref(),
+            },
+            state.now_unix_micros(),
+            ironauth_store::TraitMigrationStart {
+                first_batch_payload: &payload,
+                idempotency: Some(IdempotencyWrite {
+                    credential_ref: &credential_ref,
+                    key: &key,
+                    request_fingerprint: &fingerprint,
+                    response_status: 202,
+                    response_body: &body_string,
+                }),
+            },
+        )
+        .await?;
+    Ok(json(StatusCode::ACCEPTED, body_string))
+}
+
+/// Read a trait migration job's progress and failure report.
+#[utoipa::path(
+    get,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas/migrations/{job_id}",
+    operation_id = "getTraitMigrationJob",
+    tag = "trait-schemas",
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("job_id" = String, Path, description = "The job identifier (tmj_...)")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "The job's progress and failure report", body = TraitMigrationJobView),
+        (status = 401, description = "Missing or invalid credential", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "No such job in this scope", body = ErrorBody)
+    )
+)]
+pub async fn get_trait_migration_job(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, job_id)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    // No liveness fence on a READ, matching every other read across this surface.
+    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let id = ironauth_store::TraitMigrationJobId::parse_in_scope(&job_id, &scope)
+        .map_err(|_| ApiError::NotFound)?;
+    let job = state
+        .store()
+        .scoped(scope)
+        .trait_migration_jobs()
+        .get(&id)
+        .await?;
+    let body_string = serde_json::to_string(&job_view(&job)?).map_err(|_| ApiError::Internal)?;
+    Ok(json(StatusCode::OK, body_string))
 }
