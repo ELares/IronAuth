@@ -18914,8 +18914,14 @@ pub const OFFBOARDING_CONSUMER: &str = "users.offboarding";
 /// The largest exponential-backoff delay, in seconds, a retry schedule may reach
 /// (issue #104). The doubling is capped here rather than left to overflow, so a
 /// long-lived poison message's next attempt stays a number an operator can reason about
-/// (an hour) instead of drifting to a date past the heat death of the queue.
-const OUTBOX_MAX_BACKOFF_SECS: u64 = 3_600;
+/// instead of drifting to a date past the heat death of the queue.
+///
+/// TEN HOURS, raised from one (issue #106). At an hour the cap bound after the seventh
+/// retry, so no configuration could produce a schedule spanning more than a working day,
+/// and #106 requires surviving a receiver that is dead for far longer than that. Ten hours
+/// is the largest step in the Svix reference sequence this issue names, which is the
+/// interval that makes the total span a day and a half rather than an afternoon.
+pub const OUTBOX_MAX_BACKOFF_SECS: u64 = 36_000;
 
 /// One message on the generic outbox (issue #104): the typed row a consumer receives.
 ///
@@ -19036,8 +19042,8 @@ pub struct RetryPolicy {
 impl Default for RetryPolicy {
     fn default() -> Self {
         Self {
-            max_attempts: 5,
-            retry_base: Duration::from_secs(10),
+            max_attempts: 14,
+            retry_base: Duration::from_secs(30),
         }
     }
 }

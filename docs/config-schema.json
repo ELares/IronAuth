@@ -1519,8 +1519,8 @@
           "type": "integer"
         },
         "max_attempts": {
-          "default": 5,
-          "description": "The total number of attempts a message gets before it is DEAD-LETTERED. `1` means\nno retry at all: the first failure is terminal.\n\nThis bound is not only a politeness to a failing endpoint. A message that shares\nan ordering key with others BLOCKS them until it reaches a terminal state, so the\ndead letter is what releases the aggregate; an unbounded retry would wedge that\naggregate forever, which is why there is no \"unlimited\" value here and never will\nbe. The default (5) is conservative. Must be at least 1.\n\nThe wedge argument does not reach a consumer whose producers give every message its\nOWN ordering key, because each of its groups is a singleton with nothing behind it\nto block. Such a consumer may be given a larger budget IN CODE, where the singleton\nproperty can be argued for that consumer specifically; the back-channel logout\nfan-out is the one that is. It stays out of this knob deliberately: this value\napplies to EVERY consumer at once, and most of them do have aggregates.",
+          "default": 14,
+          "description": "The total number of attempts a message gets before it is DEAD-LETTERED. `1` means\nno retry at all: the first failure is terminal.\n\nThis bound is not only a politeness to a failing endpoint. A message that shares\nan ordering key with others BLOCKS them until it reaches a terminal state, so the\ndead letter is what releases the aggregate; an unbounded retry would wedge that\naggregate forever, which is why there is no \"unlimited\" value here and never will\nbe. Must be at least 1.\n\nThe default is 14, raised from 5 (issue #106). At five attempts on the old ten\nsecond base a message exhausted its whole budget in about two and a half MINUTES,\nso a receiver that was down for five dead-lettered every delivery in the window and\nan operator had to replay by hand after a blip. #106 asks for the opposite: a\nconsumer whose endpoint died over a weekend should recover. Fourteen attempts on\nthe thirty second base below span roughly 37 hours, which is a real outage rather\nthan a hiccup, and the schedule still TERMINATES, which is what the wedge argument\nabove requires.\n\nThe wedge argument does not reach a consumer whose producers give every message its\nOWN ordering key, because each of its groups is a singleton with nothing behind it\nto block. Such a consumer may be given a larger budget IN CODE, where the singleton\nproperty can be argued for that consumer specifically; the back-channel logout\nfan-out is the one that is. It stays out of this knob deliberately: this value\napplies to EVERY consumer at once, and most of them do have aggregates.",
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
@@ -1552,8 +1552,8 @@
           "type": "integer"
         },
         "retry_base_secs": {
-          "default": 10,
-          "description": "The base delay in seconds of the exponential backoff between retries. The nth\nretry waits about `base * 2^(n-1)` seconds plus a jitter of up to `base`, both\ndrawn from the deterministic clock and entropy seams, capped at one hour.\n\nThe default (10) is conservative. Must be at least 1 and at most\n`OIDC_MAX_LIFETIME_SECS`.",
+          "default": 30,
+          "description": "The base delay in seconds of the exponential backoff between retries. The nth\nretry waits about `base * 2^(n-1)` seconds plus a jitter of up to `base`, both\ndrawn from the deterministic clock and entropy seams, capped at ten hours.\n\nThe default is 30, raised from 10 (issue #106), which with the attempt bound above\nproduces 30s, 1m, 2m, 4m, 8m, 16m, 32m, 64m, 2.1h, 4.3h, 8.5h and then the ten hour\nceiling. That approximates the Svix reference sequence #106 names, without a second\nknob: an explicit step table would be more literal and would also be a list an\noperator can make non-monotonic, which the doubling cannot.\n\nMust be at least 1 and at most `OIDC_MAX_LIFETIME_SECS`.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -2494,8 +2494,8 @@
       "description": "Outbound webhook delivery settings (issue #105).\n\nThese belong to the webhook CONSUMER, not to the queue: how the queue itself is\ndrained (concurrency, lease, backoff, retention) is `[outbox]`, and an operator tunes\nthat once for every consumer rather than per subsystem.\n\nThe consumer is OFF by default, which is the same covenant every other background\nworker here is held to: no mandatory background infrastructure. A deployment that never\nopens this section runs no delivery worker, and its queued deliveries wait durably\nrather than being lost.",
       "properties": {
         "auto_disable_after_consecutive_failures": {
-          "default": 50,
-          "description": "Disable an endpoint automatically after this many CONSECUTIVE failed delivery\nattempts with no success in between. `0` turns the behaviour off entirely.\n\nA consecutive run rather than a rate, because the two mean different things: a busy\nendpoint that fails a fraction of the time is working, and only an unbroken run\nending now says it has stopped answering. One success resets the run, so an\nendpoint that recovers on its own is never disabled.\n\nThe default (50) is deliberately not small. Disabling is disruptive and the cost of\nbeing slow to do it is bounded: nothing is dropped meanwhile, because every\nexhausted delivery lands in the dead-letter queue and stays replayable. With the\ndefault retry budget of five attempts per message, fifty is roughly ten consecutive\nmessages that never got through, which no transient outage produces.\n\nTurning it off is a legitimate choice for a deployment that watches the dead-letter\ndepth itself and would rather keep trying.",
+          "default": 140,
+          "description": "Disable an endpoint automatically after this many CONSECUTIVE failed delivery\nattempts with no success in between. `0` turns the behaviour off entirely.\n\nA consecutive run rather than a rate, because the two mean different things: a busy\nendpoint that fails a fraction of the time is working, and only an unbroken run\nending now says it has stopped answering. One success resets the run, so an\nendpoint that recovers on its own is never disabled.\n\nThe default is 140, and it MOVED WITH the retry budget rather than being tuned on\nits own (issue #106). This counts ATTEMPTS, not messages, so raising\n`outbox.max_attempts` from 5 to 14 would have made the old default of 50 fire after\nabout three and a half consecutive messages instead of ten. The intent is unchanged\nand the number is what preserves it: 140 is ten consecutive messages that never got\nthrough at 14 attempts each.\n\nDisabling is disruptive and the cost of being slow to do it is bounded: nothing is\ndropped meanwhile, because every exhausted delivery lands in the dead-letter queue\nand stays replayable.\n\nTurning it off is a legitimate choice for a deployment that watches the dead-letter\ndepth itself and would rather keep trying.",
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
@@ -2827,12 +2827,12 @@
         "claim_batch": 64,
         "completed_retention_secs": 604800,
         "dead_letter_retention_secs": 0,
-        "max_attempts": 5,
+        "max_attempts": 14,
         "poll_interval_secs": 5,
         "reap_batch": 1000,
         "reap_enabled": true,
         "reap_interval_secs": 3600,
-        "retry_base_secs": 10,
+        "retry_base_secs": 30,
         "visibility_timeout_secs": 30,
         "worker_concurrency": 2
       },
@@ -2957,7 +2957,7 @@
     "webhooks": {
       "$ref": "#/$defs/WebhooksConfig",
       "default": {
-        "auto_disable_after_consecutive_failures": 50,
+        "auto_disable_after_consecutive_failures": 140,
         "delivery_enabled": false,
         "delivery_timeout_secs": 10
       },
