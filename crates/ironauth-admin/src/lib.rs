@@ -55,6 +55,7 @@ mod dcr;
 mod diagnostics;
 mod environments;
 mod error;
+pub mod events;
 mod export;
 mod flow_versions;
 mod hash;

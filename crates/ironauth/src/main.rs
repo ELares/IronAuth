@@ -11,6 +11,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use axum::Router;
+use ironauth_admin::events::WebhookFanoutConsumer;
 use ironauth_admin::offboarding_worker::OffboardingConsumer;
 use ironauth_admin::trait_migration_worker::TraitMigrationConsumer;
 use ironauth_admin::webhook_delivery::{
@@ -2131,6 +2132,10 @@ async fn spawn_webhook_delivery_pools(inputs: WebhookDeliveryInputs) -> Vec<Outb
             webhooks.auto_disable_after_consecutive_failures,
         )) as Arc<dyn OutboxConsumer>,
         Arc::new(WebhookReplayConsumer::new(data_store.clone())) as Arc<dyn OutboxConsumer>,
+        // The FAN-OUT (issues #105, #108): one domain event becomes one delivery per
+        // active endpoint. It runs behind the same switch as delivery because a fan-out
+        // with nothing to drain its output would only build a backlog.
+        Arc::new(WebhookFanoutConsumer::new(data_store.clone())) as Arc<dyn OutboxConsumer>,
     ] {
         if let Err(error) = consumers.register(consumer) {
             tracing::error!(%error, "webhook delivery worker not started: duplicate consumer name");
