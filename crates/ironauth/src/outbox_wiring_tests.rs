@@ -259,8 +259,15 @@ async fn a_store_fault_does_not_dead_letter_a_whole_sessions_fan_out() {
     enqueue(&db, &env, scope, SESSION_ENDED_CONSUMER).await;
     enqueue(&db, &env, scope, BACKCHANNEL_LOGOUT_CONSUMER).await;
 
-    // Fail both, in lockstep, well past the shared cap. The clock jump clears the backoff
-    // gate, which is capped at an hour, so every pass claims.
+    // Fail both, in lockstep, well past the shared cap. Every pass must CLAIM, so the clock
+    // jump has to clear whatever gate the last failure scheduled.
+    //
+    // That jump is taken from `OUTBOX_MAX_BACKOFF_SECS` rather than written as a number.
+    // It used to be a literal two hours, correct only because the ceiling was one; raising
+    // the ceiling to ten hours for issue #106 made this test claim nothing after the
+    // seventh retry and fail on the control assertion below. A test that hard-codes a
+    // value the source already owns is the same shape as a hand-written list beside an
+    // exhaustive match, and it rots the same way.
     let passes = shared_cap + 4;
     let mut fanout_dead = 0;
     let mut delivery_dead = 0;
@@ -275,7 +282,9 @@ async fn a_store_fault_does_not_dead_letter_a_whole_sessions_fan_out() {
             .await
             .expect("pass")
             .dead_lettered;
-        clock.advance(Duration::from_secs(7_200));
+        clock.advance(Duration::from_secs(
+            ironauth_store::OUTBOX_MAX_BACKOFF_SECS + 60,
+        ));
     }
 
     assert_eq!(

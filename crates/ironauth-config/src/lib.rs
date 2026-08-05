@@ -282,7 +282,16 @@ pub struct OutboxConfig {
     /// an ordering key with others BLOCKS them until it reaches a terminal state, so the
     /// dead letter is what releases the aggregate; an unbounded retry would wedge that
     /// aggregate forever, which is why there is no "unlimited" value here and never will
-    /// be. The default (5) is conservative. Must be at least 1.
+    /// be. Must be at least 1.
+    ///
+    /// The default is 14, raised from 5 (issue #106). At five attempts on the old ten
+    /// second base a message exhausted its whole budget in about two and a half MINUTES,
+    /// so a receiver that was down for five dead-lettered every delivery in the window and
+    /// an operator had to replay by hand after a blip. #106 asks for the opposite: a
+    /// consumer whose endpoint died over a weekend should recover. Fourteen attempts on
+    /// the thirty second base below span roughly 37 hours, which is a real outage rather
+    /// than a hiccup, and the schedule still TERMINATES, which is what the wedge argument
+    /// above requires.
     ///
     /// The wedge argument does not reach a consumer whose producers give every message its
     /// OWN ordering key, because each of its groups is a singleton with nothing behind it
@@ -294,10 +303,15 @@ pub struct OutboxConfig {
 
     /// The base delay in seconds of the exponential backoff between retries. The nth
     /// retry waits about `base * 2^(n-1)` seconds plus a jitter of up to `base`, both
-    /// drawn from the deterministic clock and entropy seams, capped at one hour.
+    /// drawn from the deterministic clock and entropy seams, capped at ten hours.
     ///
-    /// The default (10) is conservative. Must be at least 1 and at most
-    /// `OIDC_MAX_LIFETIME_SECS`.
+    /// The default is 30, raised from 10 (issue #106), which with the attempt bound above
+    /// produces 30s, 1m, 2m, 4m, 8m, 16m, 32m, 64m, 2.1h, 4.3h, 8.5h and then the ten hour
+    /// ceiling. That approximates the Svix reference sequence #106 names, without a second
+    /// knob: an explicit step table would be more literal and would also be a list an
+    /// operator can make non-monotonic, which the doubling cannot.
+    ///
+    /// Must be at least 1 and at most `OIDC_MAX_LIFETIME_SECS`.
     pub retry_base_secs: u64,
 
     /// Whether the periodic retention sweeper runs at all (issue #104, PR 3). ON by
@@ -449,11 +463,16 @@ pub struct WebhooksConfig {
     /// ending now says it has stopped answering. One success resets the run, so an
     /// endpoint that recovers on its own is never disabled.
     ///
-    /// The default (50) is deliberately not small. Disabling is disruptive and the cost of
-    /// being slow to do it is bounded: nothing is dropped meanwhile, because every
-    /// exhausted delivery lands in the dead-letter queue and stays replayable. With the
-    /// default retry budget of five attempts per message, fifty is roughly ten consecutive
-    /// messages that never got through, which no transient outage produces.
+    /// The default is 140, and it MOVED WITH the retry budget rather than being tuned on
+    /// its own (issue #106). This counts ATTEMPTS, not messages, so raising
+    /// `outbox.max_attempts` from 5 to 14 would have made the old default of 50 fire after
+    /// about three and a half consecutive messages instead of ten. The intent is unchanged
+    /// and the number is what preserves it: 140 is ten consecutive messages that never got
+    /// through at 14 attempts each.
+    ///
+    /// Disabling is disruptive and the cost of being slow to do it is bounded: nothing is
+    /// dropped meanwhile, because every exhausted delivery lands in the dead-letter queue
+    /// and stays replayable.
     ///
     /// Turning it off is a legitimate choice for a deployment that watches the dead-letter
     /// depth itself and would rather keep trying.
@@ -548,7 +567,7 @@ impl Default for WebhooksConfig {
     fn default() -> Self {
         Self {
             delivery_enabled: false,
-            auto_disable_after_consecutive_failures: 50,
+            auto_disable_after_consecutive_failures: 140,
             delivery_timeout_secs: 10,
         }
     }
@@ -561,8 +580,8 @@ impl Default for OutboxConfig {
             visibility_timeout_secs: 30,
             poll_interval_secs: 5,
             claim_batch: 64,
-            max_attempts: 5,
-            retry_base_secs: 10,
+            max_attempts: 14,
+            retry_base_secs: 30,
             reap_enabled: true,
             completed_retention_secs: DIAGNOSTICS_DEFAULT_RETENTION_SECS,
             // NEVER, not "immediately". See the field documentation.
@@ -7243,10 +7262,17 @@ mod tests {
         assert_eq!(config.outbox.poll_interval_secs, 5);
         assert_eq!(config.outbox.claim_batch, 64);
         assert_eq!(
-            config.outbox.max_attempts, 5,
-            "the attempts bound is finite: it is what releases a blocked ordering group"
+            config.outbox.max_attempts, 14,
+            "the attempts bound is finite: it is what releases a blocked ordering group. \
+             Raised from 5 for issue #106, because five attempts on the old ten second base \
+             exhausted the whole budget in two and a half MINUTES, so any receiver down for \
+             five dead-lettered every delivery in the window"
         );
-        assert_eq!(config.outbox.retry_base_secs, 10);
+        assert_eq!(
+            config.outbox.retry_base_secs, 30,
+            "with the attempts bound above this spans roughly 37 hours, which is the \
+             outage #106 requires surviving rather than a hiccup"
+        );
 
         // Every refusal, each with the failure it prevents. A zero worker count runs no
         // workers while the queue fills; a zero attempts bound leaves a message that can

@@ -3268,3 +3268,90 @@ async fn bind_scope(
         .await
         .expect("bind environment scope");
 }
+
+#[tokio::test]
+async fn the_shipped_retry_defaults_span_a_real_outage_and_still_terminate() {
+    // Issue #106 requires that a consumer whose endpoint died recover on its own rather
+    // than through an operator replay. The shipped defaults used to make that impossible:
+    // five attempts on a ten second base exhausted the whole budget in about two and a
+    // half MINUTES, so any receiver down for five dead-lettered every delivery.
+    //
+    // This pins the SPAN of the shipped schedule, not a formula, because the span is the
+    // property #106 actually asks for and it is what a well-meaning tuning of either knob
+    // would silently destroy. It drives the real `fail` path under a manual clock and adds
+    // up the gates the queue itself scheduled.
+    let db = TestDatabase::start().await;
+    let (env, clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 29);
+    let scope = db.seed_scope(&env).await;
+    // The SHIPPED defaults, deliberately: a policy written here would pin nothing about
+    // what a deployment actually gets.
+    let policy = RetryPolicy::default();
+    let lease = Duration::from_secs(30);
+    enqueue(&db, &env, scope, "fact-span", "agg-span").await;
+
+    let store = db.store();
+    let queue = store.scoped(scope);
+    let queue = queue.outbox();
+
+    let mut delays = Vec::new();
+    let mut dead_lettered = false;
+    for _ in 0..policy.max_attempts {
+        let claimed = queue
+            .claim(&env, CONSUMER, lease, 100)
+            .await
+            .expect("claim");
+        assert_eq!(
+            claimed.len(),
+            1,
+            "the message is claimable while non-terminal"
+        );
+        let before = epoch_micros_of(&env);
+        match queue
+            .fail(&env, &claimed[0], "http_status_503", policy)
+            .await
+            .expect("fail")
+        {
+            FailureOutcome::Retrying {
+                next_attempt_at_unix_micros,
+                ..
+            } => {
+                let delay = next_attempt_at_unix_micros - before;
+                assert!(delay > 0, "a retry is scheduled into the future");
+                delays.push(delay);
+                // Step the clock past the gate so the next claim sees the message due.
+                clock.advance(Duration::from_micros(
+                    u64::try_from(delay).expect("positive") + 1_000_000,
+                ));
+            }
+            FailureOutcome::DeadLettered { .. } => {
+                dead_lettered = true;
+                break;
+            }
+            FailureOutcome::NotFound => panic!("the lease token was rejected"),
+        }
+    }
+
+    assert!(
+        dead_lettered,
+        "the schedule TERMINATES: an unbounded retry would wedge the ordering group forever"
+    );
+
+    let total_secs: i64 = delays.iter().sum::<i64>() / 1_000_000;
+    assert!(
+        total_secs >= 24 * 3600,
+        "the shipped retry schedule must outlast a real outage, not a hiccup: it spans \
+         {total_secs}s ({}h) across {} retries",
+        total_secs / 3600,
+        delays.len()
+    );
+
+    // Non-decreasing, so the backoff never gets SHORTER as a receiver stays down. The
+    // ceiling flattens the tail rather than reversing it.
+    for pair in delays.windows(2) {
+        assert!(
+            pair[1] >= pair[0],
+            "the backoff never shrinks: {:?}",
+            delays.iter().map(|d| d / 1_000_000).collect::<Vec<_>>()
+        );
+    }
+}
