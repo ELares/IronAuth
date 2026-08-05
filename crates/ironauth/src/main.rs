@@ -11,11 +11,13 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use axum::Router;
+use ironauth_admin::webhook_delivery::{FetchWebhookSender, WebhookDeliveryConsumer};
 use ironauth_admin::{AdminOidcBridge, AdminState};
 use ironauth_config::{
     ADVANCED_RECOVERY_FEATURE, Config, FEDCM_FEATURE, FIRST_PARTY_CHALLENGE_FEATURE,
     FeatureRegistry, GLOBAL_TOKEN_REVOCATION_FEATURE, Loaded, OidcConfig, OutboxConfig,
     PasswordPolicyConfig, RISK_SIGNALS_FEATURE, ScreeningFailurePolicy, ScreeningProvider,
+    WebhooksConfig,
 };
 use ironauth_env::Env;
 use ironauth_jose::MasterKey;
@@ -275,6 +277,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // gated on the consumer switch would be missing from the deployment where the table
         // grows fastest. The only switch is `outbox.reap_enabled`, which defaults ON.
         let retention_inputs = retention_sweeper_inputs(&config, &env);
+        let webhook_inputs = webhook_delivery_inputs(&config, &env);
         // Capture what the one-shot signing-algorithm backfill (issue #93) needs before
         // config moves into the server (only when its switch is on). Runs before serving.
         let signing_backfill_inputs = signing_backfill_inputs(&config, &env);
@@ -361,6 +364,15 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             Some(inputs) => spawn_backchannel_logout_pools(inputs, server.base_url()).await,
             None => Vec::new(),
         };
+        // The webhook delivery worker (issue #105), behind its OWN switch. It is spawned
+        // here rather than inside the block above because webhook delivery is not an OIDC
+        // feature: gating it on the logout switches would make a deployment that uses no
+        // OIDC unable to deliver webhooks it can already register endpoints for.
+        // BOUND rather than detached, so the shutdown below can await it.
+        let webhook_pools = match webhook_inputs {
+            Some(inputs) => spawn_webhook_delivery_pools(inputs).await,
+            None => Vec::new(),
+        };
         // The outbox retention sweeper (issue #104, PR 3), started here and not inside the
         // block above: the outbox is a GENERIC substrate whose next consumer will run
         // behind a different switch, so the reaper must not share the back-channel logout
@@ -394,7 +406,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // Stop the outbox pools and WAIT for their in-flight passes. A claimed message
         // that is not completed is not lost: its lease lapses and the next boot re-claims
         // it, which is the same path a crash takes.
-        for pool in logout_pools {
+        for pool in logout_pools.into_iter().chain(webhook_pools) {
             pool.shutdown().await;
         }
         // Stopped alongside the pools. Nothing is lost by stopping a retention pass part
@@ -1233,6 +1245,47 @@ struct BackChannelWorkerInputs {
     env: Env,
 }
 
+/// What the webhook delivery worker (issue #105) needs, captured before `config` moves
+/// into the server.
+struct WebhookDeliveryInputs {
+    /// The webhook consumer's own settings (the per-delivery HTTP budget).
+    webhooks: WebhooksConfig,
+    /// The shared `[outbox]` tuning the pool is built from, exactly as every other
+    /// consumer's pool is.
+    outbox: OutboxConfig,
+    /// The data-plane DSN the worker drains and reads endpoints through.
+    data_plane_dsn: String,
+    /// The control-plane DSN the worker enumerates `(tenant, environment)` scopes on;
+    /// [`None`] disables the worker, since without it there are no scopes to drain.
+    control_dsn: Option<String>,
+    /// The master key the sealed signing secret is opened under. [`None`] disables the
+    /// worker: a deliverer that cannot open a secret cannot sign, and the alternative to
+    /// refusing to start would be a worker that burns every message's attempt budget.
+    master: Option<Arc<MasterKey>>,
+    /// The environment seam (deterministic clock and entropy).
+    env: Env,
+}
+
+/// Capture the webhook delivery worker inputs from config (issue #105), or `None` when the
+/// consumer is switched off.
+///
+/// Gated on `webhooks.delivery_enabled` ALONE, deliberately. Webhook delivery is not an
+/// OIDC feature and must not inherit `oidc.enabled`: a deployment using IronAuth purely as
+/// a user store still registers endpoints and still expects them delivered.
+fn webhook_delivery_inputs(config: &Config, env: &Env) -> Option<WebhookDeliveryInputs> {
+    if !config.webhooks.delivery_enabled {
+        return None;
+    }
+    Some(WebhookDeliveryInputs {
+        webhooks: config.webhooks.clone(),
+        outbox: config.outbox.clone(),
+        data_plane_dsn: config.database.url.expose().to_owned(),
+        control_dsn: select_control_dsn(config),
+        master: resolve_master_key(config),
+        env: env.clone(),
+    })
+}
+
 /// Capture the Back-Channel Logout worker inputs from config (issue #34), or `None` when
 /// the OIDC provider is not mounted or the posture switch is off. Pulled out of `serve` so
 /// that function stays within the readable-length lint. The control-plane DSN is resolved
@@ -1841,6 +1894,98 @@ async fn spawn_backchannel_logout_pools(
         consumers = ?consumers.names(),
         pools = pools.len(),
         "back-channel logout delivery started on the outbox consumer pools"
+    );
+    pools
+}
+
+/// Start the webhook delivery consumer (issue #105) on the generic outbox worker pool,
+/// returning the RUNNING pools so the caller can shut them down.
+///
+/// The SECOND production wiring of the consumer framework, and it deliberately extends the
+/// generic parts rather than copying them: [`spawn_consumer_pools`], [`ControlPlaneScopes`]
+/// and [`TracingOutboxObserver`] are shared with back-channel logout, and only the
+/// consumer, its sender and its master key are webhook specific.
+///
+/// It is a SEPARATE function from [`spawn_backchannel_logout_pools`] rather than another
+/// registration inside it, because the two run behind different switches. Registering the
+/// webhook consumer there would have made webhook delivery require the OIDC provider and
+/// its logout posture switch, which are unrelated to it.
+///
+/// Every early return is logged and starts NOTHING; the rest of the server runs unaffected
+/// and the queue is durable, so the work waits rather than being lost.
+async fn spawn_webhook_delivery_pools(inputs: WebhookDeliveryInputs) -> Vec<OutboxWorkerPool> {
+    let WebhookDeliveryInputs {
+        webhooks,
+        outbox,
+        data_plane_dsn,
+        control_dsn,
+        master,
+        env,
+    } = inputs;
+
+    let Some(control_dsn) = control_dsn else {
+        tracing::error!(
+            "webhook delivery worker not started: no control-plane DSN to enumerate scopes \
+             (set admin.control_database_url, or run in dev_mode). The delivery queue is \
+             durable, so nothing is lost; enable the control plane to drain it."
+        );
+        return Vec::new();
+    };
+    // Refusing to start beats starting a worker that cannot sign. Without a master key
+    // every endpoint read fails at the unseal, so each message would burn its whole
+    // attempt budget and dead-letter, turning a missing configuration value into
+    // permanently discarded deliveries.
+    let Some(master) = master else {
+        tracing::error!(
+            "webhook delivery worker not started: database.master_key is unset, so an \
+             endpoint's sealed signing secret cannot be opened and no delivery could be \
+             signed. The queue is durable; set database.master_key to drain it."
+        );
+        return Vec::new();
+    };
+
+    let data_store = match Store::connect(&data_plane_dsn).await {
+        Ok(store) => store.with_master_key(master),
+        Err(error) => {
+            tracing::error!(%error, "webhook delivery worker not started: data-plane connect failed");
+            return Vec::new();
+        }
+    };
+    let control_store = match Store::connect(&control_dsn).await {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::error!(%error, "webhook delivery worker not started: control-plane connect failed");
+            return Vec::new();
+        }
+    };
+
+    let timeout = std::time::Duration::from_secs(webhooks.delivery_timeout_secs);
+    let sender = match FetchWebhookSender::with_timeout(timeout) {
+        Ok(sender) => sender,
+        Err(error) => {
+            tracing::error!(%error, "webhook delivery worker not started: fetcher setup failed");
+            return Vec::new();
+        }
+    };
+
+    let mut consumers = ConsumerRegistry::new();
+    if let Err(error) = consumers.register(Arc::new(WebhookDeliveryConsumer::new(
+        data_store.clone(),
+        sender,
+    )) as Arc<dyn OutboxConsumer>)
+    {
+        tracing::error!(%error, "webhook delivery worker not started: duplicate consumer name");
+        return Vec::new();
+    }
+
+    let scopes: Arc<dyn ScopeSource> = Arc::new(ControlPlaneScopes::new(control_store));
+    let observer: Arc<dyn OutboxObserver> = Arc::new(TracingOutboxObserver);
+    let pools = spawn_consumer_pools(&consumers, &data_store, &env, &outbox, &scopes, &observer);
+
+    tracing::info!(
+        consumers = ?consumers.names(),
+        pools = pools.len(),
+        "webhook delivery started on the outbox consumer pools"
     );
     pools
 }

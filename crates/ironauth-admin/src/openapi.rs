@@ -387,6 +387,8 @@ use crate::views::{
         crate::webhook_endpoints::list_webhook_endpoints,
         crate::webhook_endpoints::create_webhook_endpoint,
         crate::webhook_endpoints::rotate_webhook_endpoint_secret,
+        crate::webhook_endpoints::pause_webhook_endpoint,
+        crate::webhook_endpoints::resume_webhook_endpoint,
         crate::webhook_endpoints::delete_webhook_endpoint,
         crate::sudo::elevate_sudo,
     ),

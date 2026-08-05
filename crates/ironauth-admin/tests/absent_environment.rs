@@ -288,6 +288,18 @@ fn abuse_and_sudo_cases(base: &str) -> Vec<Case> {
             body: None,
         },
         Case {
+            label: "webhook_endpoints.pauseWebhookEndpoint",
+            method: "POST",
+            path: format!("{base}/webhook-endpoints/whe_absent/pause"),
+            body: None,
+        },
+        Case {
+            label: "webhook_endpoints.resumeWebhookEndpoint",
+            method: "POST",
+            path: format!("{base}/webhook-endpoints/whe_absent/resume"),
+            body: None,
+        },
+        Case {
             label: "webhook_endpoints.deleteWebhookEndpoint",
             method: "DELETE",
             path: format!("{base}/webhook-endpoints/whe_absent"),

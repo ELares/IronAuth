@@ -104,6 +104,7 @@ mod trait_schemas;
 mod users;
 mod variables;
 mod views;
+pub mod webhook_delivery;
 mod webhook_endpoints;
 
 use axum::Router;
@@ -909,6 +910,17 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/rotate-secret",
             post(webhook_endpoints::rotate_webhook_endpoint_secret),
+        )
+        // Pause and resume, distinct from delete: the endpoint and its sealed signing
+        // secret survive, so resuming needs no re-registration and no consumer has to
+        // adopt a new secret. `active` is what the deliverer's own read filters on.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/pause",
+            post(webhook_endpoints::pause_webhook_endpoint),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/resume",
+            post(webhook_endpoints::resume_webhook_endpoint),
         )
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}",

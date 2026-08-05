@@ -24553,6 +24553,124 @@ impl WebhookEndpointRepo<'_> {
             })
             .collect()
     }
+
+    /// Everything ONE delivery to `id` needs: the destination and the opened signing
+    /// secrets. `None` when no such endpoint exists in this scope or it is INACTIVE.
+    ///
+    /// Folding "is it active" into this read rather than leaving it to the caller is
+    /// deliberate: `active` exists to stop deliveries, and a deliverer that has to
+    /// remember to consult it separately is a deliverer that will one day forget. There
+    /// is no way to obtain signing material for a deactivated endpoint through this API.
+    ///
+    /// This is a DATA-plane read (migration 0111 grants the app role SELECT and nothing
+    /// else), so a deliverer can sign but can never mutate an endpoint.
+    ///
+    /// The outgoing secret is included only while `previous_expires_at` is still in the
+    /// future relative to `now_unix_micros`; the window is read from the ROW rather than
+    /// recomputed from a configured duration, so shortening the deployment default later
+    /// cannot retroactively strand a consumer mid-adoption.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] if no master key is configured or a sealed secret does
+    /// not open; [`StoreError::Database`] on a persistence failure.
+    pub async fn delivery_target(
+        &self,
+        id: &WebhookEndpointId,
+        now_unix_micros: i64,
+    ) -> Result<Option<WebhookDeliveryTarget>, StoreError> {
+        if id.scope() != self.scope {
+            return Ok(None);
+        }
+        let scope = self.scope;
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "SELECT url, secret_sealed, secret_dek_version, \
+                    previous_secret_sealed, previous_secret_dek_version, \
+                    (EXTRACT(EPOCH FROM previous_expires_at) * 1000000)::bigint AS previous_us \
+             FROM webhook_endpoints \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND active",
+        )
+        .bind(id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let purpose = webhook_endpoint_secret_purpose(id);
+        let current_version: i32 = row.get("secret_dek_version");
+        let current_sealed: Vec<u8> = row.get("secret_sealed");
+        let dek = fetch_dek_by_version(&mut tx, scope, master, current_version).await?;
+        let mut secrets = vec![dek.open(
+            &secret_seal_aad(scope, &purpose, current_version),
+            &Sealed::from_bytes(current_sealed)?,
+        )?];
+        let previous_sealed: Option<Vec<u8>> = row.get("previous_secret_sealed");
+        let previous_version: Option<i32> = row.get("previous_secret_dek_version");
+        let previous_expires: Option<i64> = row.get("previous_us");
+        // All three columns move together under 0112's CHECK, so this either matches on
+        // every part or on none; a half-set rotation cannot reach here.
+        if let (Some(sealed), Some(version), Some(expires)) =
+            (previous_sealed, previous_version, previous_expires)
+        {
+            if expires > now_unix_micros {
+                let previous_dek = fetch_dek_by_version(&mut tx, scope, master, version).await?;
+                secrets.push(previous_dek.open(
+                    &secret_seal_aad(scope, &purpose, version),
+                    &Sealed::from_bytes(sealed)?,
+                )?);
+            }
+        }
+        tx.commit().await?;
+        Ok(Some(WebhookDeliveryTarget {
+            id: *id,
+            url: row.get("url"),
+            secrets,
+        }))
+    }
+}
+
+/// The associated data a webhook signing secret is sealed under (issue #105).
+///
+/// A free function rather than a method on the mutating repository, because the SEALING
+/// side and the OPENING side must agree on it exactly and they live on different types.
+/// Binding the endpoint id means a sealed secret lifted into another endpoint's row does
+/// not open, so the AAD carries the same "this belongs here" property the row does.
+fn webhook_endpoint_secret_purpose(id: &WebhookEndpointId) -> String {
+    format!("webhook_endpoint_secret:{id}")
+}
+
+/// One endpoint's delivery instructions: where to POST, and the secrets to sign under
+/// (issue #105).
+pub struct WebhookDeliveryTarget {
+    /// The endpoint this delivery is for.
+    pub id: WebhookEndpointId,
+    /// The HTTPS destination.
+    pub url: String,
+    /// The signing secrets in the order they belong in the `webhook-signature` header:
+    /// the current one first, then the outgoing one while its rotation window is still
+    /// open. A consumer holding EITHER verifies, which is what makes a rotation a
+    /// configuration change rather than a coordinated deploy.
+    pub secrets: Vec<Vec<u8>>,
+}
+
+impl Drop for WebhookDeliveryTarget {
+    /// Wipe the opened secrets when the delivery is over.
+    ///
+    /// These are LIVE signing keys held in the clear for as long as this value exists,
+    /// which is exactly why [`ironauth_jose::webhooks::WebhookSecret`] wipes on drop.
+    /// Handing them out through a plain `Vec` without this would leave the bytes in
+    /// whatever heap page the allocator reuses next, quietly undoing the wiping the
+    /// signing type does one call later.
+    fn drop(&mut self) {
+        for secret in &mut self.secrets {
+            ironauth_jose::wipe(secret);
+        }
+    }
 }
 
 /// The mutating webhook endpoint repository (issue #105).
@@ -24563,11 +24681,6 @@ pub struct ActingWebhookEndpointRepo<'a> {
 }
 
 impl ActingWebhookEndpointRepo<'_> {
-    /// The associated data a webhook signing secret is sealed under.
-    fn secret_purpose(id: &WebhookEndpointId) -> String {
-        format!("webhook_endpoint_secret:{id}")
-    }
-
     /// Register an endpoint, sealing its signing secret under the scope's active DEK.
     ///
     /// The secret is SEALED rather than hashed because the deliverer must recover it to
@@ -24612,7 +24725,7 @@ impl ActingWebhookEndpointRepo<'_> {
             Err(error) => return Err(error),
         }
         let scope = self.scope;
-        let purpose = Self::secret_purpose(id);
+        let purpose = webhook_endpoint_secret_purpose(id);
         let secret = secret.to_vec();
         let url_owned = url.to_owned();
         let description_owned = description.to_owned();
@@ -24689,7 +24802,7 @@ impl ActingWebhookEndpointRepo<'_> {
         }
         let master = self.store.master().ok_or(StoreError::Encryption)?;
         let scope = self.scope;
-        let purpose = Self::secret_purpose(id);
+        let purpose = webhook_endpoint_secret_purpose(id);
         let secret = secret.to_vec();
         write_audited(
             AuditedWrite {
@@ -24737,6 +24850,79 @@ impl ActingWebhookEndpointRepo<'_> {
                 Ok(())
             },
             false,
+        )
+        .await
+    }
+
+    /// PAUSE or RESUME an endpoint, returning the row this write committed.
+    ///
+    /// Distinct from [`Self::delete`] on purpose. Deleting destroys the signing secret,
+    /// so resuming afterwards means re-registering AND every consumer adopting a new
+    /// secret; pausing keeps both, so an operator can stop a misbehaving destination and
+    /// turn it back on without any consumer noticing.
+    ///
+    /// It has a MEASURED consequence rather than a documented intent: `active` is what
+    /// [`WebhookEndpointRepo::delivery_target`] filters on, so a paused endpoint yields no
+    /// signing material at all and nothing downstream has to remember to check a flag.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no endpoint matched in this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn set_active(
+        &self,
+        env: &Env,
+        id: &WebhookEndpointId,
+        active: bool,
+        idempotency: Option<ResolvedIdempotencyWrite<'_, WebhookEndpointRecord>>,
+    ) -> Result<WebhookEndpointRecord, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let detail = format!("active={active}");
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::WebhookEndpointSetActive,
+                target: id,
+            },
+            async move |tx| {
+                // RETURNING rather than a read afterwards, so the response describes the
+                // state this transaction committed and the stored idempotent body is
+                // byte-identical to it by construction. The sealed columns are NOT
+                // selected, exactly as the listing does not select them.
+                let row = sqlx::query(
+                    "UPDATE webhook_endpoints SET active = $1, updated_at = now() \
+                     WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 \
+                     RETURNING id, url, description, active, \
+                               (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us",
+                )
+                .bind(active)
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .fetch_optional(&mut **tx)
+                .await?;
+                let Some(row) = row else {
+                    return Err(StoreError::NotFound);
+                };
+                let raw: String = row.get("id");
+                let record = WebhookEndpointRecord {
+                    id: WebhookEndpointId::parse_in_scope(&raw, &scope)?,
+                    url: row.get("url"),
+                    description: row.get("description"),
+                    active: row.get("active"),
+                    created_at_unix_micros: row.get("created_us"),
+                };
+                insert_resolved_idempotency(tx, idempotency, &record).await?;
+                Ok(record)
+            },
+            false,
+            Some(&detail),
         )
         .await
     }

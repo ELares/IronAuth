@@ -18,7 +18,10 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::Response;
 use ironauth_jose::webhooks::WebhookSecret;
-use ironauth_store::{CorrelationId, IdempotencyWrite, NewWebhookEndpoint, WebhookEndpointId};
+use ironauth_store::{
+    CorrelationId, IdempotencyWrite, NewWebhookEndpoint, ResolvedIdempotencyWrite,
+    WebhookEndpointId,
+};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -377,6 +380,171 @@ pub async fn delete_webhook_endpoint(
         .delete(state.env(), &id)
         .await?;
     Ok(no_content())
+}
+
+/// The request shape both endpoint state toggles share, grouped so the shared body stays
+/// inside the argument budget.
+struct StateToggle<'a> {
+    tenant_id: &'a str,
+    environment_id: &'a str,
+    endpoint_id: &'a str,
+    active: bool,
+    uri: &'a Uri,
+    headers: &'a HeaderMap,
+}
+
+/// Set an endpoint's delivery state: the shared body of the pause and resume actions.
+///
+/// Pausing is NOT a delete. The endpoint and its sealed signing secret survive, so
+/// resuming needs no re-registration and no consumer has to adopt a new secret. That is
+/// the difference an operator wants when a destination is misbehaving rather than gone.
+async fn set_endpoint_state(
+    state: &AdminState,
+    principal: &Principal,
+    toggle: StateToggle<'_>,
+) -> Result<Response, ApiError> {
+    let StateToggle {
+        tenant_id,
+        environment_id,
+        endpoint_id,
+        active,
+        uri,
+        headers,
+    } = toggle;
+    let (scope, actor) = resolve_scope(state, principal, tenant_id, environment_id)?;
+    crate::sudo::require_fresh_privilege(state, scope, principal.actor()).await?;
+    require_live_environment(state, &scope).await?;
+    let id = state
+        .store()
+        .scoped(scope)
+        .webhook_endpoints()
+        .parse_id(endpoint_id)?;
+
+    // No request body, so the fingerprint is over an empty one. It still binds the key to
+    // the method and PATH, so the same key reused against a different endpoint, or against
+    // the OPPOSITE toggle, is a 422 rather than a replay of the wrong answer.
+    let key = idempotency::required_key(headers)?;
+    let fingerprint = idempotency::fingerprint("POST", uri.path(), &[]);
+    let credential_ref = principal.credential_ref();
+    if let Some(replay) =
+        idempotency::replay_if_stored(state, &credential_ref, &key, &fingerprint).await?
+    {
+        return Ok(replay);
+    }
+
+    // Rendered from what the write RESOLVED, inside its own transaction, so the response
+    // describes the state this request committed rather than whatever a later read saw.
+    let render = |resolved: &ironauth_store::WebhookEndpointRecord| {
+        serde_json::to_string(&into_view(resolved.clone()))
+    };
+    let record = state
+        .store()
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(state.env()))
+        .webhook_endpoints()
+        .set_active(
+            state.env(),
+            &id,
+            active,
+            Some(ResolvedIdempotencyWrite {
+                credential_ref: &credential_ref,
+                key: &key,
+                request_fingerprint: &fingerprint,
+                response_status: 200,
+                response_body: &render,
+            }),
+        )
+        .await?;
+    let body = serde_json::to_string(&into_view(record)).map_err(|_| ApiError::Internal)?;
+    Ok(json(StatusCode::OK, body))
+}
+
+/// Pause deliveries to an endpoint without destroying it or its signing secret.
+#[utoipa::path(
+    post,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/pause",
+    operation_id = "pauseWebhookEndpoint",
+    tag = "webhooks",
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("endpoint_id" = String, Path, description = "The endpoint identifier (whe_...)"),
+        ("Idempotency-Key" = String, Header, description = "Required. Replaying a POST \
+         with the same key returns the original response without re-executing.")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "The paused endpoint", body = WebhookEndpointView),
+        (status = 401, description = "Missing or invalid credential, or fresh privilege required", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "The environment is absent or deleted, or the endpoint is in another scope", body = ErrorBody),
+        (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
+    )
+)]
+pub async fn pause_webhook_endpoint(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, endpoint_id)): Path<(String, String, String)>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    set_endpoint_state(
+        &state,
+        &principal,
+        StateToggle {
+            tenant_id: &tenant_id,
+            environment_id: &environment_id,
+            endpoint_id: &endpoint_id,
+            active: false,
+            uri: &uri,
+            headers: &headers,
+        },
+    )
+    .await
+}
+
+/// Resume deliveries to a paused endpoint, under the secret it already had.
+#[utoipa::path(
+    post,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/resume",
+    operation_id = "resumeWebhookEndpoint",
+    tag = "webhooks",
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("endpoint_id" = String, Path, description = "The endpoint identifier (whe_...)"),
+        ("Idempotency-Key" = String, Header, description = "Required. Replaying a POST \
+         with the same key returns the original response without re-executing.")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "The resumed endpoint", body = WebhookEndpointView),
+        (status = 401, description = "Missing or invalid credential, or fresh privilege required", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "The environment is absent or deleted, or the endpoint is in another scope", body = ErrorBody),
+        (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
+    )
+)]
+pub async fn resume_webhook_endpoint(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, endpoint_id)): Path<(String, String, String)>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    set_endpoint_state(
+        &state,
+        &principal,
+        StateToggle {
+            tenant_id: &tenant_id,
+            environment_id: &environment_id,
+            endpoint_id: &endpoint_id,
+            active: true,
+            uri: &uri,
+            headers: &headers,
+        },
+    )
+    .await
 }
 
 /// Project a stored endpoint into its wire view.

@@ -685,6 +685,17 @@ mod tests {
              rot-detection PR 1 was buying.",
         ),
         (
+            "webhooks",
+            Reach::OnePlaneOrNoState,
+            "the outbound webhook delivery consumer's own settings (issue #105): whether \
+             this process drains the queue, and the per-delivery time budget. Read once at \
+             boot by webhook_delivery_inputs, which builds the consumer and its sender and \
+             hands them to a worker pool. It reaches NEITHER plane state, for the same \
+             reason `outbox` does not: a pool is not plane state. The HTTP surface that \
+             registers endpoints lives on AdminState and holds none of these knobs, so \
+             there is no shared value here to install.",
+        ),
+        (
             "features",
             Reach::OnePlaneOrNoState,
             "the maturity ladder, resolved at boot into per-feature verdicts rather \
