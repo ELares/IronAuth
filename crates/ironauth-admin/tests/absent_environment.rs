@@ -372,6 +372,31 @@ fn posture_cases(base: &str, ids: &Ids) -> Vec<Case> {
     ]
 }
 
+/// The environment SECRET writes (issue #235), lifted out of [`client_cases`] because adding
+/// them inline pushed that function past the readable-length lint. They are their own frame in
+/// any case: every other case there hangs off a CLIENT, and these hang off the environment.
+fn secret_cases(base: &str) -> Vec<Case> {
+    vec![
+        // Environment SECRET management (issue #235), the same two shapes as the variable
+        // writes above. The uniform not-found matters more here: an answer that distinguished
+        // "no such environment" from "no such secret" would let an unauthenticated-for-this-
+        // scope caller enumerate secret NAMES, which is metadata this surface otherwise only
+        // gives to a credential holding the scope.
+        Case {
+            label: "secrets.setSecret",
+            method: "PUT",
+            path: format!("{base}/secrets/ABSENT_ENV_PROBE"),
+            body: Some(body_of(&serde_json::json!({ "value": "x" }))),
+        },
+        Case {
+            label: "secrets.deleteSecret",
+            method: "DELETE",
+            path: format!("{base}/secrets/ABSENT_ENV_PROBE"),
+            body: None,
+        },
+    ]
+}
+
 fn client_cases(base: &str, ids: &Ids) -> Vec<Case> {
     let Ids { client, .. } = ids;
     vec![
@@ -1071,6 +1096,7 @@ fn all_cases(tenant: &str, environment: &str) -> Vec<Case> {
     let ids = Ids::mint(tenant, environment);
     let mut cases = abuse_and_sudo_cases(&base);
     cases.extend(client_cases(&base, &ids));
+    cases.extend(secret_cases(&base));
     cases.extend(posture_cases(&base, &ids));
     cases.extend(config_and_connector_cases(&base, &ids));
     cases.extend(environment_child_cases(&base, &ids));

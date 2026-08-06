@@ -824,6 +824,19 @@ impl Fixture {
             .await;
         assert!(status.is_success(), "seed variable: {status} {body}");
 
+        // A secret, for the same reason and through the same surface (issue #235). The seed
+        // goes through the API rather than the store so it exercises the cross-role write
+        // path: if the data-plane seam this module depends on were not installed, this seed
+        // would fail here rather than leaving the read cases quietly driven at a 404.
+        let (status, _, body) = h
+            .put_with_key(
+                &format!("{base}/secrets/LIVE_SURFACE_PROBE"),
+                "k-seed-secret",
+                &serde_json::json!({ "value": "seeded" }).to_string(),
+            )
+            .await;
+        assert!(status.is_success(), "seed secret: {status} {body}");
+
         // A DEFAULT brand. The four brand-asset routes address a brand by slug and answer
         // 404 when none exists, and no management route creates one, so without this the
         // whole asset surface is driven at a 404 and measured by nothing.
@@ -1236,6 +1249,28 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             format!("{base}/variables/LIVE_SURFACE_PROBE"),
         ),
         Case::empty("variables.listVariables", "GET", format!("{base}/variables")),
+        // Environment SECRET management (issue #235), the same four shapes. These handlers
+        // run against the DATA-plane store, which this harness installs no registry for, so
+        // they answer the fail-closed 422 rather than reaching the table. That is exactly
+        // what these sweeps are asserting about: not a server error, and a soft-deleted
+        // environment still refuses the writes.
+        Case::json(
+            "secrets.setSecret",
+            "PUT",
+            format!("{base}/secrets/LIVE_SURFACE_PROBE"),
+            &serde_json::json!({ "value": "x" }),
+        ),
+        Case::empty(
+            "secrets.getSecret",
+            "GET",
+            format!("{base}/secrets/LIVE_SURFACE_PROBE"),
+        ),
+        Case::empty(
+            "secrets.deleteSecret",
+            "DELETE",
+            format!("{base}/secrets/LIVE_SURFACE_PROBE"),
+        ),
+        Case::empty("secrets.listSecrets", "GET", format!("{base}/secrets")),
         Case::empty(
             "signup_forms.getSignupForm",
             "GET",
