@@ -292,6 +292,11 @@ path = "tests/permission_vocabulary.rs"
 required-features = ["testing"]
 
 [[test]]
+name = "secrets"
+path = "tests/secrets.rs"
+required-features = ["testing"]
+
+[[test]]
 name = "variables"
 path = "tests/variables.rs"
 required-features = ["testing"]

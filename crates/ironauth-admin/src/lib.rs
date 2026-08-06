@@ -94,6 +94,7 @@ mod recovery_approvals;
 mod resource_servers;
 mod resource_types;
 mod response;
+mod secrets;
 mod sessions;
 mod signing_algorithm;
 mod signing_interop;
@@ -398,6 +399,16 @@ pub fn management_router(state: AdminState) -> Router {
         // only: a variable is non-secret by construction, so the control plane manages it with
         // no envelope master key, using the grants 0100 already gave `ironauth_control`. The
         // SECRET half needs a plane and master-key decision and is tracked separately.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/secrets",
+            get(secrets::list_secrets),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/secrets/{name}",
+            get(secrets::get_secret)
+                .put(secrets::set_secret)
+                .delete(secrets::delete_secret),
+        )
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/variables",
             get(variables::list_variables),

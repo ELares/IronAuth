@@ -236,6 +236,10 @@ use crate::views::{
         crate::permissions::delete_permission,
         // Environment VARIABLE management (issue #235). The variable half only; the secret
         // half needs a plane and master-key decision and is tracked on that issue.
+        crate::secrets::list_secrets,
+        crate::secrets::get_secret,
+        crate::secrets::set_secret,
+        crate::secrets::delete_secret,
         crate::variables::list_variables,
         crate::variables::get_variable,
         crate::variables::set_variable,
@@ -424,6 +428,9 @@ use crate::views::{
         crate::permissions::PermissionView,
         crate::permissions::PermissionList,
         crate::permissions::CreatePermissionRequest,
+        crate::secrets::SecretView,
+        crate::secrets::SecretList,
+        crate::secrets::SetSecretRequest,
         crate::variables::VariableView,
         crate::variables::VariableList,
         crate::variables::SetVariableRequest,

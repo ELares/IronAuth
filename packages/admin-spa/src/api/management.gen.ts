@@ -1761,6 +1761,42 @@ export interface paths {
         patch: operations["updateResourceServerPermissionClaims"];
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/secrets": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List the secrets of an environment (metadata only, cursor paginated). */
+        get: operations["listSecrets"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/secrets/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get one secret's metadata by name. The value is NEVER returned. */
+        get: operations["getSecret"];
+        /** Set (create or replace) a secret by name. */
+        put: operations["setSecret"];
+        post?: never;
+        /** Delete a secret by name. */
+        delete: operations["deleteSecret"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/sessions": {
         parameters: {
             query?: never;
@@ -5417,6 +5453,39 @@ export interface components {
             /** @description The signal name. */
             name: string;
         };
+        /** @description One page of environment secret metadata. */
+        SecretList: {
+            /** @description The secrets in this page, as metadata only. */
+            items: components["schemas"]["SecretView"][];
+            /** @description The cursor for the next page, absent on the last page. */
+            next_cursor?: string | null;
+        };
+        /** @description One environment secret's METADATA. The sealed value is never part of this shape. */
+        SecretView: {
+            /**
+             * Format: int64
+             * @description Creation time in Unix milliseconds.
+             */
+            created_at_unix_ms: number;
+            /** @description The secret identifier (`esec_...`). */
+            id: string;
+            /**
+             * @description The secret name, unique within the environment, and the key a `${secret:NAME}`
+             *     reference resolves against. The NAME is metadata and is not itself sensitive.
+             */
+            name: string;
+            /**
+             * Format: int64
+             * @description Last update time in Unix milliseconds.
+             */
+            updated_at_unix_ms: number;
+            /**
+             * Format: int32
+             * @description The revision counter, incremented on every write. It is how an operator confirms a
+             *     rotation actually landed without ever reading the value back.
+             */
+            version: number;
+        };
         /** @description A page of sessions. */
         SessionList: {
             /** @description The sessions in this page. */
@@ -5698,6 +5767,14 @@ export interface components {
              *     key and is never readable back through any endpoint.
              */
             token: string;
+        };
+        /** @description Set (create or replace) a secret. */
+        SetSecretRequest: {
+            /**
+             * @description The value to seal. It is sealed under the environment's DEK before it reaches the
+             *     table and is never readable through this API afterwards.
+             */
+            value: string;
         };
         /**
          * @description The body to set (create or overwrite) a per-environment, per-client signup form (issue #87).
@@ -15471,6 +15548,246 @@ export interface operations {
             };
             /** @description Cannot enable permission claims on an opaque resource server */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listSecrets: {
+        parameters: {
+            query?: {
+                /** @description Page size */
+                limit?: number;
+                /** @description Opaque cursor from a previous page */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description One page of secret metadata. Values are never included */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SecretList"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    getSecret: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The secret name */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The secret's metadata. The value is never returned by any endpoint */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SecretView"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found (absent or in another scope) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    setSecret: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Required. Replaying a PUT with the same key returns the original response. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The secret name */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetSecretRequest"];
+            };
+        };
+        responses: {
+            /** @description Sealed and stored. The metadata, with its version and timestamps, is available from the GET */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Malformed request or invalid name */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment is absent or not live */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Idempotency-Key reused with a different request */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    deleteSecret: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The secret name */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found (absent or in another scope) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Still referenced by a variable or another secret */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

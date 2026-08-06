@@ -11,13 +11,16 @@
 //!
 //! # Why this half lives on the CONTROL plane
 //!
-//! Secrets and variables are deliberately split. A secret is sealed through the #48 envelope
-//! substrate and needs the master key, which the control plane does not hold and is not given
-//! here; the secret surface is a separate design decision recorded on issue #235. A VARIABLE is
-//! non-secret by construction, so the control plane can manage it with no envelope access at
-//! all, and migration 0100 already granted `ironauth_control` exactly what that needs:
-//! `SELECT`, `INSERT`, `DELETE`, and a COLUMN-SCOPED `UPDATE (value, version, updated_at)`.
-//! Nothing here widens a grant.
+//! Secrets and variables are deliberately split. A VARIABLE is non-secret by construction, so
+//! the control plane can manage it with no envelope access at all, and migration 0100 already
+//! granted `ironauth_control` exactly what that needs: `SELECT`, `INSERT`, `DELETE`, and a
+//! COLUMN-SCOPED `UPDATE (value, version, updated_at)`. Nothing here widens a grant.
+//!
+//! This paragraph used to add that the secret half could not live here because the control
+//! plane holds no master key. That stopped being true and the secret surface now sits beside
+//! this one in `secrets.rs`; what remains true, and is the reason the two are still separate
+//! modules with different response shapes, is that a variable's VALUE is returned on read and a
+//! secret's never is.
 //!
 //! # Delete consults the references
 //!

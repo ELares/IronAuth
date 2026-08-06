@@ -131,6 +131,7 @@ fn operation_ids_are_the_stable_set() {
             "deleteOrganization",
             "deleteOutboundVerification",
             "deletePermission",
+            "deleteSecret",
             "deleteSignupForm",
             "deleteTenant",
             "deleteUser",
@@ -174,6 +175,7 @@ fn operation_ids_are_the_stable_set() {
             "getRefreshFamily",
             "getResourceServer",
             "getRiskDecision",
+            "getSecret",
             "getSession",
             "getSigningRecommendations",
             "getSignupForm",
@@ -212,6 +214,7 @@ fn operation_ids_are_the_stable_set() {
             "listRefreshFamilies",
             "listResourceServers",
             "listResourceTypes",
+            "listSecrets",
             "listSessions",
             "listSignupQuarantines",
             "listSmsAllowlist",
@@ -259,6 +262,7 @@ fn operation_ids_are_the_stable_set() {
             "setOrgDefaultRole",
             "setOrgGroupParent",
             "setOutboundVerification",
+            "setSecret",
             "setSignupForm",
             "setSmsOtpConfig",
             "setStepUpPolicy",
@@ -470,6 +474,7 @@ fn documented_paths_are_the_expected_set() {
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}/permissions/{permission_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/permissions/{permission_id}",
+            "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/secrets/{name}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/sms-otp/allowlist/{country_code}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/step-up-policies/{scope_token}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}",
@@ -538,6 +543,8 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/refresh-families/{family_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/resource-servers",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/resource-servers/{resource_server_id}",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/secrets",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/secrets/{name}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/sessions",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/sessions/{session_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/signup-quarantine",
@@ -638,6 +645,7 @@ fn documented_paths_are_the_expected_set() {
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/migration/outbound-verification",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/default-role",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/parent",
+            "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/secrets/{name}",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/sms-otp/allowlist/{country_code}",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/sms-otp/config",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/external-id",
@@ -734,7 +742,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        194,
+        198,
         "the documented route count is pinned"
     );
 
