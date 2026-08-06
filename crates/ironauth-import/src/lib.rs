@@ -35,7 +35,14 @@
 pub mod engine;
 pub mod record;
 pub mod run;
-pub mod scheme;
+/// The foreign hash-scheme layer, extracted to its own crate (issue #55) and re-exported
+/// here so every existing `ironauth_import::scheme::` path keeps working.
+///
+/// It lives apart because it is the one part of this crate that depends on NO ironauth
+/// crate and is therefore the only part that can be published on its own, which is what
+/// #55 asks for. The re-export is not a deprecation: this is still the natural place to
+/// reach it from inside the import path.
+pub use ironauth_hash_scheme as scheme;
 
 pub use engine::{
     CollectOutcomes, DiscardOutcomes, ImportContext, ImportReport, IterLines, LineSource,

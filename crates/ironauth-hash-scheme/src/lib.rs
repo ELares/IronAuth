@@ -609,3 +609,52 @@ mod tests {
         assert_eq!(Scheme::from_tag("md5"), None);
     }
 }
+
+#[cfg(test)]
+mod independence {
+    /// This crate's own manifest, read at COMPILE time so the assertion below cannot be
+    /// fooled by a working tree that differs from what was built.
+    const MANIFEST: &str = include_str!("../Cargo.toml");
+
+    /// This crate depends on NO ironauth crate, which is the property that lets it publish
+    /// (issue #55).
+    ///
+    /// It is pinned rather than trusted because the failure is silent and one line long. A
+    /// single `ironauth-store.workspace = true` added here for convenience compiles, tests,
+    /// and passes every other gate, and the only symptom is that `cargo package` starts
+    /// failing with `no matching package named ironauth-store found` at the moment somebody
+    /// tries to release it, which is the worst time to discover it. That is exactly the
+    /// failure `ironauth-import` has today and the reason this crate was split out of it.
+    ///
+    /// The scan is a TEXT scan and its ceiling is worth stating: it reads the `[dependencies]`
+    /// section of this manifest only, so an ironauth crate reached through a renamed
+    /// dependency (`foo = { package = "ironauth-store" }`) would slip past the prefix check.
+    /// It catches the ordinary way this breaks, which is somebody adding the obvious line.
+    #[test]
+    fn this_crate_depends_on_no_ironauth_crate() {
+        // Scoped to the dependency tables, which is what the doc above claims and what the
+        // first version of this test did NOT do: it scanned the whole file and matched this
+        // crate's own `name = "ironauth-hash-scheme"`, so it failed on a manifest that was
+        // correct. A guard that cannot pass on a correct input teaches people to delete it.
+        let offenders: Vec<&str> = MANIFEST
+            .lines()
+            .map(str::trim)
+            .scan(false, |in_deps, line| {
+                if line.starts_with('[') {
+                    *in_deps = line.contains("dependencies");
+                    return Some(("", false));
+                }
+                Some((line, *in_deps))
+            })
+            .filter(|(line, in_deps)| {
+                *in_deps && !line.starts_with('#') && line.starts_with("ironauth-")
+            })
+            .map(|(line, _)| line)
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "this crate gained an ironauth dependency, which makes it unpublishable on its \
+             own and undoes the split issue #55 asked for: {offenders:?}"
+        );
+    }
+}
