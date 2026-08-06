@@ -1243,6 +1243,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironauth-hash-scheme"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "argon2",
+ "base64 0.22.1",
+ "bcrypt",
+ "cipher 0.4.4",
+ "ctr",
+ "password-hash",
+ "pbkdf2",
+ "scrypt",
+ "sha2 0.11.0",
+ "subtle",
+]
+
+[[package]]
 name = "ironauth-import"
 version = "0.1.0"
 dependencies = [
@@ -1252,6 +1269,7 @@ dependencies = [
  "bcrypt",
  "ctr",
  "ironauth-env",
+ "ironauth-hash-scheme",
  "ironauth-jose",
  "ironauth-store",
  "password-hash",

@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "ironauth-hash-scheme"
+version = "0.1.0"
+description = "Algorithm-tagged foreign password-hash verification and rehash decisions (bcrypt, Argon2, scrypt, PBKDF2, Firebase modified scrypt), with import-time cost bounds"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# This crate depends on NO ironauth-* crate, deliberately, and that is the whole point
+# of it existing separately (issue #55): it is the one layer of the import path that is
+# useful to somebody who is not running IronAuth, and it is the only one that can be
+# published on its own. Adding an ironauth-* dependency here would silently revoke that,
+# so the absence of a `[dependencies]` entry naming one is load-bearing.
+[dependencies]
+aes = "0.8"
+argon2.workspace = true
+base64.workspace = true
+bcrypt = "0.19"
+cipher = "0.4"
+ctr = "0.9"
+password-hash = "0.5"
+pbkdf2 = { version = "0.12", features = ["simple", "sha2"] }
+scrypt = "0.11"
+sha2.workspace = true
+subtle = "2"

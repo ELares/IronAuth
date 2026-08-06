@@ -18,6 +18,7 @@ autotests = false
 # import clock read from env.clock(), never a raw RNG or SystemTime, so the
 # engine stays reproducible under a fixed test env and the invariant lints hold.
 ironauth-env.workspace = true
+ironauth-hash-scheme.workspace = true
 # The engine creates every imported user THROUGH the audited, isolation-scoped
 # ActingUserRepo (issue #52), so it depends on the store; the store does NOT
 # depend back on this crate (the hash-scheme layer stays a leaf), keeping the
