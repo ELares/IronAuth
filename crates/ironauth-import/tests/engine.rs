@@ -1258,3 +1258,98 @@ async fn two_records_sharing_a_login_handle_wedge_the_run_and_the_report_says_so
         Some("source carried two records for one login handle")
     );
 }
+
+/// An import record carrying one ACTIVE TOTP enrollment for `identifier`.
+fn totp_record_line(
+    identifier: &str,
+    seed_base32: &str,
+    last_consumed_step: Option<i64>,
+) -> String {
+    let consumed = match last_consumed_step {
+        Some(step) => step.to_string(),
+        None => "null".to_owned(),
+    };
+    format!(
+        r#"{{"identifier":"{identifier}","password_hash":"{}","totp":[{{"seed_base32":"{seed_base32}","algorithm":"SHA1","digits":6,"period_secs":30,"friendly_name":"Authenticator","status":"active","last_consumed_step":{consumed}}}]}}"#,
+        argon2_hash("pw")
+    )
+}
+
+#[tokio::test]
+async fn an_imported_totp_enrollment_verifies_against_the_original_authenticator() {
+    // Issue #55 asks that imported TOTP enrollments WORK for MFA after import, and the write
+    // path alone cannot show that. `restore_totp` re-seals the seed under the DESTINATION
+    // environment's DEK and re-mints the row's id, subject and key version, so the enrollment
+    // can be written, listed and reported healthy while the seed it restored is not the one the
+    // user's authenticator holds. Every symptom of that lands on the END USER at their next
+    // sign-in, which is the worst place to discover it and the reason this asserts on a CODE
+    // rather than on the row.
+    //
+    // A TOTP seed is a portable shared secret, unlike a passkey, which is exactly why the
+    // export carries it and why this round trip has to hold.
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x7a);
+    let scope = db.seed_scope(&env).await;
+
+    // The seed the user's authenticator app holds. Base32 is the form the export emits.
+    let seed_bytes: Vec<u8> = b"imported-totp-seed".to_vec();
+    let seed_base32 = ironauth_jose::base32_encode(&seed_bytes);
+
+    let (report, outcomes) = run_import(
+        &db,
+        &env,
+        scope,
+        vec![totp_record_line("totp@x.test", &seed_base32, Some(41))],
+    )
+    .await;
+    assert_eq!(report.succeeded, 1, "the record imported: {outcomes:?}");
+
+    let user = db
+        .store()
+        .scoped(scope)
+        .users()
+        .list(UserListFilter::default(), 10, None)
+        .await
+        .expect("list users")
+        .into_iter()
+        .next()
+        .expect("the imported user");
+
+    let material = db
+        .store()
+        .scoped(scope)
+        .totp_credentials()
+        .open_active_material(&user.id)
+        .await
+        .expect("open the restored factor")
+        .expect("the import restored an ACTIVE factor, so one is resolvable");
+
+    // The parameters must survive, because a code is a function of all of them: a factor
+    // restored at the wrong period or digit count produces a well-formed code that never
+    // matches, which reads to an operator exactly like a user typing it wrong.
+    assert_eq!(material.algorithm, "SHA1");
+    assert_eq!(material.digits, 6);
+    assert_eq!(material.period_secs, 30);
+    assert_eq!(material.status, "active");
+
+    // THE PROPERTY. A code computed from the ORIGINAL seed, as the user's authenticator would
+    // compute it, must equal the code computed from what the destination actually stored.
+    let params = ironauth_jose::TotpParams::authenticator_default();
+    let at_step = 60 * 60;
+    assert_eq!(
+        ironauth_jose::code_at(&material.seed, params, at_step),
+        ironauth_jose::code_at(&seed_bytes, params, at_step),
+        "the restored seed does not agree with the authenticator's: the enrollment survived \
+         import as a ROW but not as a working factor, so every imported user would be locked \
+         out of a second factor they can still see listed"
+    );
+
+    // The single-use step comes across too. Without it a replay of the last code the user
+    // entered before the migration is accepted once more on the destination, which is the one
+    // guarantee a TOTP step counter exists to give.
+    assert_eq!(
+        material.last_consumed_step,
+        Some(41),
+        "the consumed step was not restored, so the last pre-migration code is replayable"
+    );
+}
