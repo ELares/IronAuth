@@ -133,7 +133,7 @@ use ironauth_store::{
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::auth::Principal;
+use crate::auth::{ManagementPermission, Principal};
 use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
 use crate::input::parse_json;
@@ -320,6 +320,9 @@ pub async fn assign_org_role_permission(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_organizations`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteOrganizations)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
 
     let key = idempotency::required_key(&headers)?;
@@ -495,6 +498,9 @@ pub async fn list_org_role_permissions(
     Query(query): Query<ListQuery>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::Read)?;
     let org_id = resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Read).await?;
     // The role is resolved as a live role of THIS organization first, so a role of a
     // sibling organization is the same 404 that reading the role itself gives, rather
@@ -556,6 +562,9 @@ pub async fn unassign_org_role_permission(
     )>,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_organizations`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteOrganizations)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     let org_id =
         resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Write).await?;

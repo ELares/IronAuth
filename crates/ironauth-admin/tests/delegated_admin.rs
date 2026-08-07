@@ -252,3 +252,80 @@ async fn a_user_granted_credential_cannot_write_a_secret() {
         "the refusal does not name the permission required: {body}"
     );
 }
+
+#[tokio::test]
+async fn a_user_granted_credential_cannot_change_who_belongs_to_an_organization() {
+    // Membership is the quiet escalation path. A credential that may create USERS but not
+    // touch organizations must not be able to put a user INTO one: doing so grants that user
+    // whatever the organization confers (its roles, its policies, its connections), which is
+    // organizational authority exercised through a user-shaped API.
+    //
+    // This is why membership writes are classified `write_organizations` and not
+    // `write_users`, even though the resource reads like a property of a user.
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "k-mint").await;
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.read", "management.write_users"],
+    )
+    .await;
+
+    // The operator sets up an organization and a user for the restricted key to try to join.
+    let orgs = format!("/v1/tenants/{tenant}/environments/{environment}/organizations");
+    let (status, _, created) = h
+        .post(
+            &orgs,
+            "k-org",
+            &serde_json::json!({ "display_name": "Target" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "seed org: {created}");
+    let org_id = serde_json::from_str::<Value>(&created).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    // The credential CAN create a user: that is its grant.
+    let users = format!("/v1/tenants/{tenant}/environments/{environment}/users");
+    let (status, _, user_body) = h
+        .post_as(
+            &users,
+            &secret,
+            "k-user",
+            &serde_json::json!({ "identifier": "joiner@example.test" }).to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "the credential was refused the write it HOLDS: {user_body}"
+    );
+    let user_id = serde_json::from_str::<Value>(&user_body).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    // It cannot put that user into the organization.
+    let (status, _, body) = h
+        .post_as(
+            &format!("{orgs}/{org_id}/memberships"),
+            &secret,
+            "k-join",
+            &serde_json::json!({ "user_id": user_id }).to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a write_users credential added a member to an organization, granting that user \
+         everything the organization confers: {body}"
+    );
+    assert!(
+        body.contains("management.write_organizations"),
+        "the refusal does not name the permission required: {body}"
+    );
+}

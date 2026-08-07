@@ -114,6 +114,26 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     ("deleteSecret", ManagementPermission::WriteConfig),
     ("listSecrets", ManagementPermission::Read),
     ("getSecret", ManagementPermission::Read),
+    // The organization SUB-surfaces: roles, memberships and the permission vocabulary. All
+    // `WriteOrganizations` for the writes, because each is a way to change who holds what
+    // inside an organization, which is the same authority as changing the organization.
+    (
+        "assignOrgRolePermission",
+        ManagementPermission::WriteOrganizations,
+    ),
+    (
+        "unassignOrgRolePermission",
+        ManagementPermission::WriteOrganizations,
+    ),
+    ("listOrgRolePermissions", ManagementPermission::Read),
+    ("createMembership", ManagementPermission::WriteOrganizations),
+    ("deleteMembership", ManagementPermission::WriteOrganizations),
+    ("listMemberships", ManagementPermission::Read),
+    ("createPermission", ManagementPermission::WriteOrganizations),
+    ("updatePermission", ManagementPermission::WriteOrganizations),
+    ("deletePermission", ManagementPermission::WriteOrganizations),
+    ("listPermissions", ManagementPermission::Read),
+    ("getPermission", ManagementPermission::Read),
 ];
 
 /// Operations not yet classified. This list is DEBT and is meant to shrink to nothing.
@@ -133,7 +153,6 @@ const UNCLASSIFIED: &[&str] = &[
     "approveSignupQuarantine",
     "assignOrgGroupRole",
     "assignOrgMembershipRole",
-    "assignOrgRolePermission",
     "bulkRevokeSessions",
     "clearOrgDefaultRole",
     "createBan",
@@ -144,10 +163,8 @@ const UNCLASSIFIED: &[&str] = &[
     "createFlowVersion",
     "createIdentityImport",
     "createInvitation",
-    "createMembership",
     "createOrgGroup",
     "createOrgRole",
-    "createPermission",
     "createTenant",
     "createTraitMigrationJob",
     "createTraitSchemaVersion",
@@ -159,11 +176,9 @@ const UNCLASSIFIED: &[&str] = &[
     "deleteConnector",
     "deleteEnvironment",
     "deleteLocale",
-    "deleteMembership",
     "deleteOrgGroup",
     "deleteOrgRole",
     "deleteOutboundVerification",
-    "deletePermission",
     "deleteSignupForm",
     "deleteTenant",
     "deleteWebhookEndpoint",
@@ -196,7 +211,6 @@ const UNCLASSIFIED: &[&str] = &[
     "getOrgMembershipEffectiveRoles",
     "getOrgRole",
     "getOutboundVerification",
-    "getPermission",
     "getPolicyDecisionTraces",
     "getRefreshFamily",
     "getResourceServer",
@@ -219,7 +233,6 @@ const UNCLASSIFIED: &[&str] = &[
     "listEnvironments",
     "listFlowVersions",
     "listInvitations",
-    "listMemberships",
     "listMigrationRunViolations",
     "listMigrationRuns",
     "listOperators",
@@ -227,9 +240,7 @@ const UNCLASSIFIED: &[&str] = &[
     "listOrgGroupRoles",
     "listOrgGroups",
     "listOrgMembershipRoles",
-    "listOrgRolePermissions",
     "listOrgRoles",
-    "listPermissions",
     "listQueueDepths",
     "listRecoveryApprovals",
     "listRefreshFamilies",
@@ -288,12 +299,10 @@ const UNCLASSIFIED: &[&str] = &[
     "suspendTenant",
     "unassignOrgGroupRole",
     "unassignOrgMembershipRole",
-    "unassignOrgRolePermission",
     "unlinkUserExternalId",
     "updateConnector",
     "updateOrgGroup",
     "updateOrgRole",
-    "updatePermission",
     "updateResourceServerPermissionClaims",
     "updateUser",
     "verifyDcrClient",
@@ -360,7 +369,7 @@ fn the_unclassified_debt_is_counted_so_it_cannot_grow_unnoticed() {
     // route is a new decision, not a new deferral.
     assert_eq!(
         UNCLASSIFIED.len(),
-        176,
+        165,
         "the unclassified list changed size. It may only SHRINK: an operation added to it is \
          an operation somebody chose not to decide about"
     );

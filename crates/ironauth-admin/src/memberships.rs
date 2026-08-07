@@ -40,7 +40,7 @@ use ironauth_store::{
     StoreError, UserId,
 };
 
-use crate::auth::Principal;
+use crate::auth::{ManagementPermission, Principal};
 use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
 use crate::input::parse_json;
@@ -84,6 +84,9 @@ pub async fn create_membership(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_organizations`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteOrganizations)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
 
     let key = idempotency::required_key(&headers)?;
@@ -199,6 +202,9 @@ pub async fn list_memberships(
     Query(query): Query<ListQuery>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::Read)?;
     let org_id = resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Read).await?;
     let page = Pagination::resolve(&query, state.default_page_size(), state.max_page_size())?;
     let rows = state
@@ -249,6 +255,9 @@ pub async fn delete_membership(
     )>,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_organizations`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteOrganizations)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     // The parent organization must resolve in scope (a cross-scope org path segment is
     // the uniform not-found), keeping the nested resource consistent.
