@@ -15,8 +15,8 @@ use ironauth_env::Env;
 use ironauth_store::identifier::{IdentifierType, UniquenessMode};
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
-    CorrelationId, CredentialType, LoginMethod, NewAdminUser, NewUserIdentifier, Scope, StoreError,
-    UserId, UserIdentifierId, UserState,
+    CorrelationId, CredentialType, LoginMethod, NewAdminUser, NewMembership, NewUserIdentifier,
+    OrgMembershipId, OrganizationId, Scope, StoreError, UserId, UserIdentifierId, UserState,
 };
 use sqlx::Row;
 
@@ -848,6 +848,13 @@ async fn org_scoped_different_orgs_are_allowed_and_not_reported_as_a_collision()
     let a = register_user(&db, &env, scope, "a").await;
     let b = register_user(&db, &env, scope, "b").await;
 
+    // REAL organizations with REAL memberships. Since issue #249 the discriminator has to
+    // name an organization the user actually belongs to, so the free-form "org_a"/"org_b"
+    // strings this test used to pass are no longer sufficient: that was the spoofable shape
+    // the binding closes.
+    let org_a = org_with_member(&db, &env, scope, "Org A", &a).await;
+    let org_b = org_with_member(&db, &env, scope, "Org B", &b).await;
+
     // Two users in DIFFERENT orgs share one canonical identifier: under org-scoped
     // uniqueness this is legitimate, so BOTH adds succeed.
     add_identifier_org(
@@ -858,7 +865,7 @@ async fn org_scoped_different_orgs_are_allowed_and_not_reported_as_a_collision()
         IdentifierType::Email,
         "team@example.com",
         UniquenessMode::OrgScoped,
-        Some("org_a"),
+        Some(&org_a.to_string()),
     )
     .await
     .expect("org_a add");
@@ -870,7 +877,7 @@ async fn org_scoped_different_orgs_are_allowed_and_not_reported_as_a_collision()
         IdentifierType::Email,
         "TEAM@example.com",
         UniquenessMode::OrgScoped,
-        Some("org_b"),
+        Some(&org_b.to_string()),
     )
     .await
     .expect("org_b add is allowed (different org)");
@@ -1090,5 +1097,108 @@ async fn removing_an_identifier_is_granted_to_the_control_role_and_refused_to_th
     assert!(
         remaining.is_empty(),
         "the control role's remove took effect"
+    );
+}
+
+/// Create an organization and put `user` in it, returning the organization id.
+async fn org_with_member(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    display_name: &str,
+    user: &UserId,
+) -> OrganizationId {
+    let org = OrganizationId::generate(env, &scope);
+    let now = i64::try_from(
+        env.clock()
+            .now_utc()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .expect("after epoch")
+            .as_micros(),
+    )
+    .expect("fits i64");
+    db.control_store()
+        .management()
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .organizations(scope)
+        .create(env, &org, now, display_name, None)
+        .await
+        .expect("create organization");
+    db.control_store()
+        .management()
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .org_memberships(scope)
+        .create(
+            env,
+            NewMembership {
+                id: &OrgMembershipId::generate(env, &scope),
+                organization_id: &org,
+                user_id: user,
+                metadata: None,
+            },
+            now,
+            None,
+        )
+        .await
+        .expect("add the member");
+    org
+}
+
+#[tokio::test]
+async fn an_org_scoped_discriminator_must_name_an_organization_the_user_belongs_to() {
+    // Issue #249. The org-scoped uniqueness key is `org:<id>` built from a CALLER-SUPPLIED
+    // org, with nothing tying that id to real membership.
+    //
+    // The escape is not naming the SAME organization (that yields the same key and collides
+    // normally). It is naming a DIFFERENT one: a distinct key collides with nothing, so the
+    // partial unique index sees no conflict and the identifier gets a SECOND live claim in
+    // the environment. Whoever then signs in with it resolves to whichever row is found,
+    // which is precisely the guarantee uniqueness exists to provide.
+    //
+    // Inert while the shipped default is environment-wide (which ignores `org` entirely),
+    // and live the moment an environment selects org-scoped mode.
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x24);
+    let scope = db.seed_scope(&env).await;
+    let insider = register_user(&db, &env, scope, "insider").await;
+    let attacker = register_user(&db, &env, scope, "attacker").await;
+
+    let acme = org_with_member(&db, &env, scope, "Acme", &insider).await;
+    // A second organization the attacker does NOT belong to. It is real, so the refusal is
+    // about MEMBERSHIP and not about the organization being absent.
+    let other = org_with_member(&db, &env, scope, "Other", &insider).await;
+
+    // A member scopes the identifier to their own organization.
+    add_identifier_org(
+        &db,
+        &env,
+        scope,
+        &insider,
+        IdentifierType::Email,
+        "shared@example.com",
+        UniquenessMode::OrgScoped,
+        Some(&acme.to_string()),
+    )
+    .await
+    .expect("a member may scope the identifier to their own organization");
+
+    // The attacker claims the SAME identifier under a DIFFERENT organization's
+    // discriminator, which they have no membership in. Without the binding this succeeds
+    // and leaves two live claims on one canonical identifier.
+    let spoofed = add_identifier_org(
+        &db,
+        &env,
+        scope,
+        &attacker,
+        IdentifierType::Email,
+        "shared@example.com",
+        UniquenessMode::OrgScoped,
+        Some(&other.to_string()),
+    )
+    .await;
+    assert!(
+        matches!(spoofed, Err(StoreError::InvalidIdentifier)),
+        "a non-member used another organization as the discriminator and escaped the \
+         uniqueness collision, got {spoofed:?}"
     );
 }
