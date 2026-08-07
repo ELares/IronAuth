@@ -86,6 +86,7 @@ mod pagination;
 mod password_hashing;
 mod permissions;
 mod postures;
+mod project_grants;
 mod promotion;
 mod provision;
 mod queues;
@@ -488,6 +489,17 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships/{membership_id}/effective-roles",
             get(org_effective_roles::get_org_membership_effective_roles),
+        )
+        // Project grants (issue #102): the bound on what a DELEGATED administrator of
+        // this organization may assign. Vendor-managed; see the module header for why a
+        // confined credential is refused on every one of these.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/project-grants",
+            post(project_grants::create_project_grant).get(project_grants::list_project_grants),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/project-grants/{grant_id}",
+            delete(project_grants::withdraw_project_grant),
         )
         // Organization roles (issue #97): first-class, per-organization named roles.
         // A role in M10 is a NAME only; what it grants is issue #98. There is no cap

@@ -303,6 +303,9 @@ struct Fixture {
     doomed_environment: String,
     operator: String,
     client: String,
+    /// A LIVE grant, so the withdrawal case measures the environment fence rather than
+    /// an id that never resolved (issue #102).
+    project_grant: String,
     connector: String,
     webhook_endpoint: String,
     family: String,
@@ -612,6 +615,20 @@ impl Fixture {
         // The data-plane rows the management surface can read and revoke but never mint:
         // a dynamically registered client, a live session, and its refresh family.
         let client = h.seed_quarantined_dcr_client(scope).await.to_string();
+
+        // A LIVE project grant (issue #102). The withdrawal case must address a grant
+        // that really resolves: with an unresolvable id it answers the uniform not-found
+        // at a LIVE environment too, and driving that at a soft-deleted one measures
+        // nothing about the environment fence. This harness caught exactly that.
+        let (status, _, body) = h
+            .post(
+                &format!("{base}/organizations/{organization}/project-grants"),
+                "seed-project-grant",
+                &serde_json::json!({ "client_id": client, "role_ids": [&role] }).to_string(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "create project grant: {body}");
+        let project_grant = field(&body, "/id", "seed project grant");
         let session = h.seed_session(scope, &user).await;
         let family = h
             .seed_refresh_family(scope, &user, &client, &session, false)
@@ -955,6 +972,7 @@ impl Fixture {
         Self {
             tenant,
             environment,
+            project_grant,
             doomed_tenant,
             doomed_environment,
             operator,
@@ -1004,6 +1022,7 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
         doomed_environment,
         operator,
         client,
+        project_grant,
         connector,
         webhook_endpoint,
         family,
@@ -1765,6 +1784,26 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             "DELETE",
             format!("{org_base}/memberships/{membership}/roles/{role}"),
         ),
+        // Project grants (issue #102). The create names an EMPTY role subset, which is
+        // valid and means this organization's delegated administrators may assign
+        // nothing. It also uses a DIFFERENT application from the seeded grant's, because
+        // migration 0120 permits at most one live grant per (client, organization) pair.
+        Case::empty(
+            "project_grants.listProjectGrants",
+            "GET",
+            format!("{org_base}/project-grants"),
+        ),
+        Case::json(
+            "project_grants.createProjectGrant",
+            "POST",
+            format!("{org_base}/project-grants"),
+            &serde_json::json!({ "client_id": client, "role_ids": [] }),
+        ),
+        Case::empty(
+            "project_grants.withdrawProjectGrant",
+            "DELETE",
+            format!("{org_base}/project-grants/{project_grant}"),
+        ),
         Case::empty(
             "memberships.deleteMembership",
             "DELETE",
@@ -2156,6 +2195,7 @@ fn every_documented_operation_is_driven_by_a_case() {
         doomed_environment: "env_1".to_owned(),
         operator: "opr_0".to_owned(),
         client: "cli_0".to_owned(),
+        project_grant: "pgt_0".to_owned(),
         connector: "con_0".to_owned(),
         webhook_endpoint: "whe_0".to_owned(),
         family: "rfm_0".to_owned(),

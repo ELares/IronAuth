@@ -88,14 +88,15 @@ use crate::id::{
     ManagementKeyId, Mds3BlobCacheId, MigrationRunId, MigrationRunRecordId, OperatorId,
     OrgAuthPolicyId, OrgConnectionId, OrgGroupId, OrgGroupMemberId, OrgGroupRoleId,
     OrgMembershipId, OrgMembershipRoleId, OrgRoleId, OrgRolePermissionId, OrganizationId,
-    OutboxMessageId, PermissionId, PowChallengeId, PushedRequestId, RecoveryApprovalId,
-    RecoveryCodeId, RecoveryContactConfirmationId, RecoveryFlowId, RecoveryIdvSessionId,
-    RecoveryTrustedContactId, RefreshFamilyId, RefreshTokenId, ResourceServerId, RiskDecisionId,
-    RiskDisavowalId, RiskLoginGeoId, RiskSignalId, RoutingRuleId, ScopeStepUpPolicyId,
-    ServiceAccountId, SessionId, SigningKeyId, SignupFormId, SignupQuarantineId, SmsOtpCodeId,
-    SmsRouteStatId, TenantId, TotpCredentialId, TraitMigrationJobId, TraitSchemaId,
-    TrustedDeviceId, UpstreamTokenGrantId, UpstreamTokenId, UserId, UserIdentifierId, VariableId,
-    WebauthnChallengeId, WebauthnCredentialId, WebhookDeliveryAttemptId, WebhookEndpointId,
+    OutboxMessageId, PermissionId, PowChallengeId, ProjectGrantId, ProjectGrantRoleId,
+    PushedRequestId, RecoveryApprovalId, RecoveryCodeId, RecoveryContactConfirmationId,
+    RecoveryFlowId, RecoveryIdvSessionId, RecoveryTrustedContactId, RefreshFamilyId,
+    RefreshTokenId, ResourceServerId, RiskDecisionId, RiskDisavowalId, RiskLoginGeoId,
+    RiskSignalId, RoutingRuleId, ScopeStepUpPolicyId, ServiceAccountId, SessionId, SigningKeyId,
+    SignupFormId, SignupQuarantineId, SmsOtpCodeId, SmsRouteStatId, TenantId, TotpCredentialId,
+    TraitMigrationJobId, TraitSchemaId, TrustedDeviceId, UpstreamTokenGrantId, UpstreamTokenId,
+    UserId, UserIdentifierId, VariableId, WebauthnChallengeId, WebauthnCredentialId,
+    WebhookDeliveryAttemptId, WebhookEndpointId,
 };
 use crate::identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
@@ -37141,6 +37142,17 @@ impl<'a> ActingManagementStore<'a> {
         }
     }
 
+    /// The mutating project-grant repository for `scope` (issue #102): create and
+    /// withdraw the bound on what a delegated administrator may assign.
+    #[must_use]
+    pub fn project_grants(&self, scope: Scope) -> ActingProjectGrantRepo<'a> {
+        ActingProjectGrantRepo {
+            store: self.store,
+            acting: self.acting,
+            scope,
+        }
+    }
+
     /// The mutating permission-vocabulary repository for `scope` (issue #98): define
     /// a permission in an environment, relabel it, and delete it, each audited.
     ///
@@ -55013,6 +55025,224 @@ impl<'a> ActingStore<'a> {
     }
 }
 
+/// A project grant to create (issue #102), with the role subset it names.
+///
+/// The subset is supplied WITH the grant rather than through a second call, because a
+/// grant that exists for a moment with no subset is not a neutral intermediate state: an
+/// empty subset denies everything, so a two-call create would flicker through "this
+/// organization's administrators may assign nothing" and a concurrent assignment landing
+/// in that window would be refused for a reason no operator asked for. One transaction,
+/// one audit record, no window.
+pub struct NewProjectGrant<'a> {
+    /// The grant id (minted by the caller, embeds this scope).
+    pub id: &'a ProjectGrantId,
+    /// The application the grant is about.
+    pub client_id: &'a ClientId,
+    /// The customer organization whose delegated administrators this bounds.
+    pub organization_id: &'a OrganizationId,
+    /// The roles a delegated administrator may assign. MAY be empty, which means they
+    /// may assign nothing; that is a real contract and is not the same as no grant.
+    pub role_ids: &'a [OrgRoleId],
+}
+
+/// Mutations of the project-grant tables (issue #102), each audited in the same
+/// transaction as the write.
+pub struct ActingProjectGrantRepo<'a> {
+    store: &'a Store,
+    acting: ActingContext,
+    scope: Scope,
+}
+
+impl ActingProjectGrantRepo<'_> {
+    /// Create a grant and its role subset, auditing `project_grant.create` in the same
+    /// transaction.
+    ///
+    /// Containment is structural: every typed id embeds this scope, the forced
+    /// row-level-security WITH CHECK rejects any row whose scope is not the bound one,
+    /// and the foreign keys reject a nonexistent client, organization or role.
+    ///
+    /// SAME-ORGANIZATION containment between the grant and each granted role is the one
+    /// invariant no layer below can express, exactly as migration 0089 records for an
+    /// assignment's three endpoints: `org_roles` has its own `organization_id` and the
+    /// foreign key only proves the role EXISTS. It is checked here, in the transaction,
+    /// against the live role rows.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if any id is out of scope, or a named role is not a live
+    /// role OF THIS ORGANIZATION; [`StoreError::Conflict`] if a live grant already binds
+    /// this (client, organization) pair.
+    pub async fn create(
+        &self,
+        env: &Env,
+        spec: NewProjectGrant<'_>,
+        created_at_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        if spec.id.scope() != self.scope
+            || spec.client_id.scope() != self.scope
+            || spec.organization_id.scope() != self.scope
+        {
+            return Err(StoreError::NotFound);
+        }
+        if spec.role_ids.iter().any(|role| role.scope() != self.scope) {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let id = *spec.id;
+        let client_id = *spec.client_id;
+        let organization_id = *spec.organization_id;
+        let roles: Vec<String> = spec.role_ids.iter().map(ToString::to_string).collect();
+        let role_row_ids: Vec<String> = spec
+            .role_ids
+            .iter()
+            .map(|_| ProjectGrantRoleId::generate(env, &scope).to_string())
+            .collect();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ProjectGrantCreate,
+                target: &id,
+            },
+            async move |tx| {
+                // Every named role must be a LIVE role of THIS organization. Counted in
+                // the transaction rather than trusted from the caller: the foreign key
+                // proves existence and says nothing about which organization owns it, so
+                // without this a grant could name a sibling organization's role and make
+                // it assignable to people who were never in it.
+                let live: i64 = sqlx::query_scalar(
+                    "SELECT count(DISTINCT id) FROM org_roles \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
+                       AND deleted_at IS NULL AND id = ANY($4)",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(organization_id.to_string())
+                .bind(&roles)
+                .fetch_one(&mut **tx)
+                .await?;
+                let distinct = roles
+                    .iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len();
+                if usize::try_from(live).unwrap_or(usize::MAX) != distinct {
+                    return Err(StoreError::NotFound);
+                }
+
+                let result = sqlx::query(
+                    "INSERT INTO project_grants \
+                     (id, tenant_id, environment_id, client_id, organization_id, \
+                      created_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5, \
+                             TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(client_id.to_string())
+                .bind(organization_id.to_string())
+                .bind(created_at_micros)
+                .execute(&mut **tx)
+                .await;
+                match result {
+                    Ok(_) => {}
+                    // A live grant already binds this (client, organization) pair.
+                    Err(error) if is_unique_violation(&error) => {
+                        return Err(StoreError::Conflict);
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+
+                for (row_id, role) in role_row_ids.iter().zip(roles.iter()) {
+                    sqlx::query(
+                        "INSERT INTO project_grant_roles \
+                         (id, tenant_id, environment_id, grant_id, organization_id, \
+                          role_id, created_at, updated_at) \
+                         VALUES ($1, $2, $3, $4, $5, $6, \
+                                 TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval, \
+                                 TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval)",
+                    )
+                    .bind(row_id)
+                    .bind(scope.tenant().to_string())
+                    .bind(scope.environment().to_string())
+                    .bind(id.to_string())
+                    .bind(organization_id.to_string())
+                    .bind(role)
+                    .bind(created_at_micros)
+                    .execute(&mut **tx)
+                    .await?;
+                }
+                insert_idempotency(tx, idempotency).await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Withdraw a live grant, auditing `project_grant.withdraw` in the same transaction.
+    ///
+    /// A COLUMN-scoped UPDATE of exactly the soft-delete pair, guarded on the row being
+    /// live, so a withdrawn or foreign grant is the uniform not-found. The role subset is
+    /// deliberately NOT walked: [`ProjectGrantRepo::assignable_role_ids`] filters on the
+    /// GRANT's liveness, so one write is the whole withdrawal and the record of what was
+    /// once assignable survives.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id is not in this scope or no live grant matched.
+    pub async fn withdraw(
+        &self,
+        env: &Env,
+        id: &ProjectGrantId,
+        now_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let id = *id;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ProjectGrantWithdraw,
+                target: &id,
+            },
+            async move |tx| {
+                let affected = sqlx::query(
+                    "UPDATE project_grants SET \
+                       deleted_at = TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval, \
+                       updated_at = TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+                     WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
+                       AND deleted_at IS NULL",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(now_micros)
+                .execute(&mut **tx)
+                .await?
+                .rows_affected();
+                if affected == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                insert_idempotency(tx, idempotency).await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+}
+
 /// Reads of the project-grant tables (issue #102, migration 0120): the bound on what a
 /// DELEGATED administrator of one organization may assign.
 ///
@@ -55024,7 +55254,79 @@ pub struct ProjectGrantRepo<'a> {
     scope: Scope,
 }
 
+/// One live project grant, with the role subset it names (issue #102).
+pub struct ProjectGrantRecord {
+    /// The grant id.
+    pub id: String,
+    /// The application the grant is about.
+    pub client_id: String,
+    /// The customer organization it bounds.
+    pub organization_id: String,
+    /// The roles a delegated administrator may assign under it. MAY be empty.
+    pub role_ids: Vec<String>,
+    /// When the grant was created, in microseconds since the epoch.
+    pub created_at_unix_micros: i64,
+}
+
 impl ProjectGrantRepo<'_> {
+    /// Parse an untrusted grant identifier under this scope. A malformed id and one
+    /// minted in another scope both return the uniform not-found.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if malformed or out of scope.
+    pub fn parse_id(&self, raw: &str) -> Result<ProjectGrantId, StoreError> {
+        Ok(ProjectGrantId::parse_in_scope(raw, &self.scope)?)
+    }
+
+    /// Every live grant of `organization`, oldest first, each with its role subset.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] if the scoped transaction or any statement fails.
+    pub async fn list_in_org(
+        &self,
+        organization: &OrganizationId,
+    ) -> Result<Vec<ProjectGrantRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows: Vec<(String, String, i64)> = sqlx::query_as(
+            "SELECT id::text, client_id::text, \
+                    (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint \
+             FROM project_grants \
+             WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
+               AND deleted_at IS NULL \
+             ORDER BY created_at, id",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(organization.to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (id, client_id, created) in rows {
+            let roles: Vec<String> = sqlx::query_scalar(
+                "SELECT role_id::text FROM project_grant_roles \
+                 WHERE tenant_id = $1 AND environment_id = $2 AND grant_id = $3 \
+                   AND deleted_at IS NULL \
+                 ORDER BY created_at, id",
+            )
+            .bind(self.scope.tenant().to_string())
+            .bind(self.scope.environment().to_string())
+            .bind(&id)
+            .fetch_all(&mut *tx)
+            .await?;
+            out.push(ProjectGrantRecord {
+                id,
+                client_id,
+                organization_id: organization.to_string(),
+                role_ids: roles,
+                created_at_unix_micros: created,
+            });
+        }
+        tx.commit().await?;
+        Ok(out)
+    }
+
     /// The set of role ids a delegated administrator of `organization` may assign, or
     /// `None` when that organization is under NO live grant and is therefore
     /// unrestricted.

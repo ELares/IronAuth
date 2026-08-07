@@ -260,6 +260,20 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
         "assignOrgGroupRole",
         ManagementPermission::WriteOrganizations,
     ),
+    // Project grants (issue #102). The permission is the same one that governs the rest
+    // of organization administration; what keeps a confined credential away from the
+    // grant that BOUNDS it is a separate confinement fence in the handlers, not this
+    // classification. A permission alone could not express it: the confined credential
+    // legitimately holds `write_organizations` for its own organization.
+    (
+        "createProjectGrant",
+        ManagementPermission::WriteOrganizations,
+    ),
+    ("listProjectGrants", ManagementPermission::Read),
+    (
+        "withdrawProjectGrant",
+        ManagementPermission::WriteOrganizations,
+    ),
     (
         "unassignOrgGroupRole",
         ManagementPermission::WriteOrganizations,

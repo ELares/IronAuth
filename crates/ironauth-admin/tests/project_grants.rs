@@ -487,3 +487,176 @@ async fn a_withdrawn_grant_stops_contributing_while_a_live_one_remains() {
          unless it happens to be the last grant"
     );
 }
+
+// ------------------------------------------------- the management surface ------
+
+/// The `.../project-grants` collection path.
+fn grants_base(w: &World) -> String {
+    format!(
+        "{}/project-grants",
+        org_base(&w.tenant, &w.environment, &w.org)
+    )
+}
+
+/// Create a grant over the HTTP surface, returning `(status, body)`.
+async fn create_grant_api(
+    h: &Harness,
+    w: &World,
+    secret: &str,
+    idem: &str,
+    roles: &[&str],
+) -> (StatusCode, String) {
+    let body = serde_json::json!({ "client_id": w.client, "role_ids": roles }).to_string();
+    let (status, _, response) = h.post_as(&grants_base(w), secret, idem, &body).await;
+    (status, response)
+}
+
+/// The round trip: create through the API, and the bound it declares is the bound the
+/// assignment path actually enforces. A grant that lists correctly but does not bind
+/// would be the dormant-layer defect this project keeps producing.
+#[tokio::test]
+async fn a_grant_created_through_the_api_lists_and_binds() {
+    let h = Harness::start(50).await;
+    let w = world(&h).await;
+    let (vendor_id, vendor) = mint_key(&h, &w.tenant, &w.environment, "k-vendor").await;
+    let _ = vendor_id;
+
+    let (status, body) = create_grant_api(&h, &w, &vendor, "k-c1", &[&w.granted]).await;
+    assert_eq!(status, StatusCode::CREATED, "create the grant: {body}");
+
+    let (status, _, listed) = h.get_as(&grants_base(&w), &vendor).await;
+    assert_eq!(status, StatusCode::OK, "list the grants: {listed}");
+    assert!(
+        listed.contains(&w.granted),
+        "the created grant must list its role subset: {listed}"
+    );
+    assert!(
+        !listed.contains(&w.ungranted),
+        "listing must not report a role the grant never named: {listed}"
+    );
+
+    // The bound is REAL, not merely recorded.
+    confine(&h, &w.tenant, &w.environment, &w.key_id, &w.org).await;
+    assert_eq!(
+        assign_to_membership(&h, &w, &w.ungranted, "k-c1-deny").await,
+        StatusCode::FORBIDDEN,
+        "a grant created through the API must bind the assignment path"
+    );
+}
+
+/// THE privilege-escalation fence, and the reason it is on confinement rather than on a
+/// permission.
+///
+/// A confined credential holding `write_organizations` can already reach its OWN
+/// organization: `resolve_live_org` is built to let it. If grant management were governed
+/// by the permission alone, that credential could WITHDRAW the grant that bounds it and,
+/// because absence of a grant means unrestricted, silently become able to assign every
+/// role in its organization. The bound would be editable by the party it exists to bind.
+#[tokio::test]
+async fn a_confined_credential_cannot_touch_the_grant_that_bounds_it() {
+    let h = Harness::start(50).await;
+    let w = world(&h).await;
+    let (_vendor_id, vendor) = mint_key(&h, &w.tenant, &w.environment, "k-vendor").await;
+
+    let (status, body) = create_grant_api(&h, &w, &vendor, "k-c2", &[&w.granted]).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "vendor creates the grant: {body}"
+    );
+    let grant_id = id_of(&body);
+
+    // Now confine the OTHER key to that organization: it is the bound party.
+    confine(&h, &w.tenant, &w.environment, &w.key_id, &w.org).await;
+
+    let (status, _, denied) = h
+        .post_as(
+            &grants_base(&w),
+            &w.secret,
+            "k-c2-create",
+            &serde_json::json!({ "client_id": w.client, "role_ids": [w.ungranted] }).to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a confined credential CREATED a grant, so it can widen its own authority: {denied}"
+    );
+
+    let (status, _, denied) = h
+        .delete_as(&format!("{}/{grant_id}", grants_base(&w)), &w.secret)
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a confined credential WITHDREW the grant that bounds it, which makes it \
+         unrestricted: {denied}"
+    );
+
+    // And the bound still holds afterwards, which is the property the two refusals exist
+    // to protect. Asserting the refusals alone would not prove the grant survived.
+    assert_eq!(
+        assign_to_membership(&h, &w, &w.ungranted, "k-c2-after").await,
+        StatusCode::FORBIDDEN,
+        "the grant must still bind after both attempts to remove it"
+    );
+}
+
+/// Same-organization containment. `org_roles` carries its own `organization_id` and the
+/// foreign key only proves a role EXISTS, so without an explicit check a grant could name
+/// a SIBLING organization's role and make it assignable to people who were never in it.
+#[tokio::test]
+async fn a_grant_cannot_name_a_sibling_organizations_role() {
+    let h = Harness::start(50).await;
+    let w = world(&h).await;
+    let (_vendor_id, vendor) = mint_key(&h, &w.tenant, &w.environment, "k-vendor").await;
+
+    let sibling = create_org(&h, &w.tenant, &w.environment, "k-sib-org").await;
+    let foreign = create_role(
+        &h,
+        &w.tenant,
+        &w.environment,
+        &sibling,
+        "support",
+        "k-sib-r",
+    )
+    .await;
+
+    let (status, body) = create_grant_api(&h, &w, &vendor, "k-c3", &[&foreign]).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a grant naming another organization's role must be refused as the uniform \
+         not-found, not created: {body}"
+    );
+}
+
+/// Withdrawing through the API lifts the bound, which is the whole point of the endpoint
+/// and is also the dangerous direction: it WIDENS authority.
+#[tokio::test]
+async fn withdrawing_through_the_api_lifts_the_bound() {
+    let h = Harness::start(50).await;
+    let w = world(&h).await;
+    let (_vendor_id, vendor) = mint_key(&h, &w.tenant, &w.environment, "k-vendor").await;
+
+    let (status, body) = create_grant_api(&h, &w, &vendor, "k-c4", &[&w.granted]).await;
+    assert_eq!(status, StatusCode::CREATED, "create: {body}");
+    let grant_id = id_of(&body);
+    confine(&h, &w.tenant, &w.environment, &w.key_id, &w.org).await;
+    assert_eq!(
+        assign_to_membership(&h, &w, &w.ungranted, "k-c4-before").await,
+        StatusCode::FORBIDDEN,
+        "bounded while the grant lives"
+    );
+
+    let (status, _, body) = h
+        .delete_as(&format!("{}/{grant_id}", grants_base(&w)), &vendor)
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "withdraw: {body}");
+
+    assert_eq!(
+        assign_to_membership(&h, &w, &w.ungranted, "k-c4-after").await,
+        StatusCode::CREATED,
+        "withdrawal must lift the bound"
+    );
+}
