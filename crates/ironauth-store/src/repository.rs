@@ -42721,22 +42721,43 @@ impl ActingOrgMembershipRepo<'_> {
                 target: id,
             },
             async move |tx| {
-                let result = sqlx::query(
+                // RETURNING the endpoints, because the identifier recompute below needs
+                // to know WHO left WHICH organization and the row is gone from the live
+                // set by the time it could be read again.
+                let removed: Option<(String, String)> = sqlx::query_as(
                     "UPDATE org_memberships SET \
                          deleted_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval, \
                          updated_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
                      WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 \
-                     AND deleted_at IS NULL",
+                     AND deleted_at IS NULL \
+                     RETURNING user_id::text, organization_id::text",
                 )
                 .bind(now_micros)
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
                 .bind(scope.environment().to_string())
-                .execute(&mut **tx)
+                .fetch_optional(&mut **tx)
                 .await?;
-                if result.rows_affected() == 0 {
+                let Some((removed_user, removed_org)) = removed else {
                     return Err(StoreError::NotFound);
-                }
+                };
+                // Issue #249: the departing user's ORG-SCOPED identifiers named an
+                // organization they are no longer in. Re-point them, and let a collision
+                // REJECT the removal rather than complete it into a split identifier.
+                //
+                // Only this cascade site, and the asymmetry is the argument. `env` is the
+                // STRICTEST scope, so moving a row onto it can create a collision (which
+                // is refused) but can never hide one. The other two sites ADD a
+                // membership, which unbinds nothing and leaves every row under a key at
+                // least as strict as the one it had, so neither needs a recompute.
+                recompute_org_scoped_identifiers(
+                    tx,
+                    scope,
+                    &removed_org,
+                    &removed_user,
+                    now_micros,
+                )
+                .await?;
                 // CASCADE SITE 1 of 3 (issue #97): the admin removal. Guarded behind
                 // the row having actually been removed, so a repeat remove of an
                 // already-removed membership revokes nothing and stays the uniform
@@ -42750,6 +42771,63 @@ impl ActingOrgMembershipRepo<'_> {
             false,
         )
         .await
+    }
+}
+
+/// Re-point a user's ORG-SCOPED identifier discriminators when they leave `organization`
+/// (issue #249), rejecting the departure if it would create a post-hoc collision.
+///
+/// # The hole this closes
+///
+/// Under `UniquenessMode::OrgScoped` an identifier's `uniqueness_key` is `org:<id>`, and
+/// the add path binds that id to a LIVE membership. Nothing revalidated it afterwards, so
+/// a user could take `alice@example.com` inside organization A, leave A, and keep a row
+/// whose discriminator names an organization they are no longer in. The identifier then
+/// sits in a uniqueness scope nobody can enter, and the environment-wide holder of the
+/// same address never collided with it.
+///
+/// # What it does, and why the collision surfaces as a refusal
+///
+/// The departing user's rows keyed to this organization move to the membership-free
+/// fallback (`env`), which is the same key the add path uses for a user with no
+/// organization. If the environment already holds that canonical identifier for somebody
+/// else, the partial unique index refuses the UPDATE and the whole removal rolls back:
+/// the membership change is REJECTED rather than completed into a state where two live
+/// rows claim one identifier. That is the issue's requirement stated exactly.
+///
+/// Rows under any OTHER organization's key are untouched: leaving A says nothing about a
+/// membership in B, and rewriting those would be the same unbinding defect in reverse.
+///
+/// Inert under the other two modes by construction rather than by a mode check: their
+/// keys are `env` and NULL, neither of which matches `org:<id>`, so the statement finds
+/// no rows.
+async fn recompute_org_scoped_identifiers(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    organization_id: &str,
+    user_id: &str,
+    now_micros: i64,
+) -> Result<(), StoreError> {
+    let result = sqlx::query(
+        "UPDATE user_identifiers SET \
+           uniqueness_key = 'env', \
+           updated_at = TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval \
+         WHERE tenant_id = $1 AND environment_id = $2 AND user_id = $3 \
+           AND uniqueness_key = $4",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(user_id)
+    .bind(format!("org:{organization_id}"))
+    .bind(now_micros)
+    .execute(&mut **tx)
+    .await;
+    match result {
+        Ok(_) => Ok(()),
+        // The environment already holds this canonical identifier for another user, so
+        // the departure cannot complete without two live rows claiming one identifier.
+        Err(error) if is_unique_violation(&error) => Err(StoreError::Conflict),
+        Err(error) => Err(error.into()),
     }
 }
 
