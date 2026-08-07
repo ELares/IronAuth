@@ -188,6 +188,42 @@ pub async fn list_organizations(
     // unchanged; this only binds a credential someone deliberately restricted.
     principal.require_permission(ManagementPermission::Read)?;
     let page = Pagination::resolve(&query, state.default_page_size(), state.max_page_size())?;
+
+    // Confinement narrows the LIST, not just the per-resource read (issue #102).
+    //
+    // A sibling organization answers the uniform not-found on `getOrganization` so that a
+    // confined caller cannot learn whether it exists. An unfiltered list hands over every
+    // organization's id and display name in ONE call, which makes that fence decorative:
+    // the enumeration it prevents is available one endpoint over. Criterion 2 says
+    // "cannot list, read, or mutate", and the list is the half a per-resource guard
+    // cannot cover.
+    //
+    // A confined credential's list is therefore exactly its own organization, or EMPTY
+    // when that organization is no longer live. Empty rather than not-found, because the
+    // collection itself is reachable: the caller is asking what it may administer, and
+    // the answer is legitimately "nothing right now".
+    if let Some(confined) = principal.confined_organization() {
+        let own = state
+            .store()
+            .management()
+            .organizations(scope)
+            .get(confined)
+            .await;
+        let items = match own {
+            Ok(record) => vec![OrganizationView::from_record(record)],
+            Err(StoreError::NotFound) => Vec::new(),
+            Err(_) => return Err(ApiError::Internal),
+        };
+        let list = OrganizationList {
+            items,
+            // No cursor: the page is complete by construction, and emitting one would
+            // invite a follow-up call that could only ever return the same single row.
+            next_cursor: None,
+        };
+        let body = serde_json::to_string(&list).map_err(|_| ApiError::Internal)?;
+        return Ok(json(StatusCode::OK, body));
+    }
+
     let rows = state
         .store()
         .management()

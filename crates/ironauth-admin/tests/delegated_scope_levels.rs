@@ -265,3 +265,87 @@ async fn delegated_mutations_are_attributable_to_the_credential_that_made_them()
          exists for once administration is delegated"
     );
 }
+
+/// Criterion 2 says a confined administrator cannot LIST sibling organizations, and the
+/// list is the half that the per-resource 404 cannot cover.
+///
+/// Answering the uniform not-found on a sibling READ exists so that a confined caller
+/// cannot learn whether that organization exists. An unfiltered LIST hands over every
+/// organization's id and display name in one call, which makes the read fence decorative:
+/// the enumeration it prevents is available one endpoint over.
+#[tokio::test]
+async fn a_confined_credential_lists_only_its_own_organization() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let mine = create_org(&h, &tenant, &environment, "k-org-mine").await;
+    let theirs = create_org(&h, &tenant, &environment, "k-org-theirs").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "k-mint").await;
+    confine(&h, &tenant, &environment, &key_id, &mine).await;
+
+    let base = format!("/v1/tenants/{tenant}/environments/{environment}/organizations");
+    let (status, _, body) = h.get_as(&base, &secret).await;
+    assert_eq!(status, StatusCode::OK, "the confined list: {body}");
+
+    assert!(
+        body.contains(&mine),
+        "a confined credential must still see its OWN organization: {body}"
+    );
+    assert!(
+        !body.contains(&theirs),
+        "a confined credential ENUMERATED a sibling organization through the list, so \
+         the uniform not-found on the individual read is decoration: the id and display \
+         name it hides are available one endpoint over. Body: {body}"
+    );
+}
+
+/// The control for the narrowing above. An UNCONFINED credential still lists every
+/// organization, and a confined one whose organization is gone gets an empty page rather
+/// than a not-found.
+///
+/// Without this, the narrowing could be implemented as "return nothing" and the test
+/// above would still pass.
+#[tokio::test]
+async fn the_narrowing_applies_only_to_a_confined_credential() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let first = create_org(&h, &tenant, &environment, "k-org-1").await;
+    let second = create_org(&h, &tenant, &environment, "k-org-2").await;
+    let (_id, unconfined) = mint_key(&h, &tenant, &environment, "k-mint").await;
+
+    let base = format!("/v1/tenants/{tenant}/environments/{environment}/organizations");
+    let (status, _, body) = h.get_as(&base, &unconfined).await;
+    assert_eq!(status, StatusCode::OK, "the unconfined list: {body}");
+    assert!(
+        body.contains(&first) && body.contains(&second),
+        "an unconfined credential must still see EVERY organization, or the confinement \
+         narrowing has leaked into the vendor's own view: {body}"
+    );
+
+    // A confined credential whose organization is disabled still gets a page, not a 404:
+    // the collection is reachable, and the honest answer is that it administers nothing.
+    let (key_id, confined) = mint_key(&h, &tenant, &environment, "k-mint-2").await;
+    confine(&h, &tenant, &environment, &key_id, &first).await;
+    let (status, _, body) = h
+        .post_as(
+            &format!("{base}/{first}/disable"),
+            &unconfined,
+            "k-disable",
+            "{}",
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "disable the organization: {body}");
+
+    let (status, _, body) = h.get_as(&base, &confined).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a confined credential whose organization is not live must still get a PAGE: \
+         the collection is reachable and the answer is that it administers nothing. \
+         Body: {body}"
+    );
+    assert!(
+        !body.contains(&second),
+        "even with its own organization gone, a confined credential must not see a \
+         sibling: {body}"
+    );
+}
