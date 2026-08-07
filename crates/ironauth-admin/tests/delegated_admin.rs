@@ -115,3 +115,84 @@ async fn a_read_only_credential_lists_users_and_cannot_create_one() {
     );
     let _ = OPERATOR_TOKEN;
 }
+
+#[tokio::test]
+async fn a_user_granted_credential_cannot_touch_organizations() {
+    // The two write permissions are SEPARATE, and this is what that separation buys: a
+    // credential trusted to manage people is not thereby trusted to create or disable the
+    // organizations they belong to. A single `write` permission would have collapsed these.
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "k-mint").await;
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.read", "management.write_users"],
+    )
+    .await;
+
+    let orgs = format!("/v1/tenants/{tenant}/environments/{environment}/organizations");
+
+    // Reading organizations is granted (`management.read`).
+    let (status, _, body) = h.get_as(&orgs, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the read grant does not cover organizations: {body}"
+    );
+
+    // Creating one is not.
+    let (status, _, body) = h
+        .post_as(
+            &orgs,
+            &secret,
+            "k-org-denied",
+            &serde_json::json!({ "display_name": "Denied" }).to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a write_users credential created an ORGANIZATION: the two write permissions have          collapsed into one. Body: {body}"
+    );
+    assert!(
+        body.contains("management.write_organizations"),
+        "the refusal does not name the permission required: {body}"
+    );
+
+    // The SHARED state-change body is enforced too. `disableOrganization` and
+    // `enableOrganization` delegate to one function, so this is the case that would silently
+    // stay open if the check had been copied into each handler and one copy was missed.
+    let (status, _, created) = h
+        .post(
+            &orgs,
+            "k-org-operator",
+            &serde_json::json!({ "display_name": "Operated" }).to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "operator creates the org: {created}"
+    );
+    let org_id = serde_json::from_str::<Value>(&created).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    let (status, _, body) = h
+        .post_as(
+            &format!("{orgs}/{org_id}/disable"),
+            &secret,
+            "k-org-disable",
+            "{}",
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a write_users credential DISABLED an organization through the shared state-change          path: {body}"
+    );
+}
