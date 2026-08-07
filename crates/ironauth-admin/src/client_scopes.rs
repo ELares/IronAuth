@@ -121,7 +121,7 @@ use ironauth_store::{ClientScopePolicy, CorrelationId};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::auth::Principal;
+use crate::auth::{ManagementPermission, Principal};
 use crate::error::{ApiError, ErrorBody};
 use crate::input::parse_json;
 use crate::org_context::{EnvironmentAccess, require_client_scope_policy, resolve_scope};
@@ -278,6 +278,9 @@ pub async fn get_client_allowed_scopes(
     Path((tenant_id, environment_id, client_id)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::Read)?;
     let (id, policy) =
         require_client_scope_policy(&state, scope, &client_id, EnvironmentAccess::Read).await?;
     let body = serde_json::to_string(&ClientAllowedScopesView::new(id.to_string(), policy))
@@ -313,6 +316,9 @@ pub async fn set_client_allowed_scopes(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_config`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteConfig)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     // Address the target FIRST, exactly as `resource_servers.rs` does and for the same
     // reason: a caller who cannot address the client must not be able to tell "that

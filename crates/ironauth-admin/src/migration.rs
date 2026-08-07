@@ -121,7 +121,7 @@ use ironauth_store::{CorrelationId, Scope, StoreError, TenantId};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::auth::Principal;
+use crate::auth::{ManagementPermission, Principal};
 use crate::error::{ApiError, ErrorBody};
 use crate::hash::constant_time_eq;
 use crate::input::parse_json;
@@ -645,6 +645,9 @@ pub async fn get_outbound_verification(
     Path((tenant_id, environment_id)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::Read)?;
     // The SAME precondition the DELETE on this path takes, and for the same reason it
     // is `present` rather than `live`: an operator reading the state of a decommissioned
     // environment must get the truth, and the read and the disable must agree about
@@ -698,6 +701,9 @@ pub async fn set_outbound_verification(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_config`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteConfig)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     // Prove the parent environment is LIVE before sealing anything into it, exactly as
     // every other environment-scoped write does: a write into a soft-deleted
@@ -780,6 +786,9 @@ pub async fn delete_outbound_verification(
     Path((tenant_id, environment_id)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_config`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteConfig)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     // PRESENT, not LIVE, and that asymmetry with `set_outbound_verification` above is
     // the point rather than an oversight (issue #250).

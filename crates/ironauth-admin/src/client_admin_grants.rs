@@ -21,7 +21,7 @@ use axum::http::StatusCode;
 use axum::response::Response;
 use ironauth_store::{ClientAdminGrantId, ClientId, CorrelationId, NewClientAdminGrant, Scope};
 
-use crate::auth::Principal;
+use crate::auth::{ManagementPermission, Principal};
 use crate::error::{ApiError, ErrorBody};
 use crate::input::parse_json;
 use crate::response::{json, no_content};
@@ -101,6 +101,9 @@ pub async fn set_client_admin_consent(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_config`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteConfig)?;
     // An admin consent pre-authorization changes WHICH third-party client can obtain user consent,
     // a security-relevant config surface, so it demands fresh privilege exactly like the other
     // environment-scoped management writes (signup forms, locales, connectors).
@@ -169,6 +172,9 @@ pub async fn get_client_admin_consent(
     Path((tenant_id, environment_id, client_id)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::Read)?;
     let client_id = parse_client_id(&client_id, scope)?;
     let record = state
         .store()
@@ -210,6 +216,9 @@ pub async fn delete_client_admin_consent(
     Path((tenant_id, environment_id, client_id)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_config`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteConfig)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     // The parent-existence precondition, through the ONE expression of it (issues #443,
     // #451). A `client_admin_grants` row survives its

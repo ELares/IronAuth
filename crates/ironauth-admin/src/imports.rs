@@ -135,7 +135,7 @@ use ironauth_store::{
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
-use crate::auth::Principal;
+use crate::auth::{ManagementPermission, Principal};
 use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
 use crate::response::json;
@@ -499,6 +499,10 @@ pub async fn create_identity_import(
     body: Body,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_users`.
+    // USER authority: an import PROVISIONS identities in bulk.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteUsers)?;
     // A bulk import writes identities, credential material, and MFA enrollments straight
     // into an environment, which is at least as security relevant as any single admin
     // user write, so it demands fresh privilege exactly like them.
@@ -654,6 +658,9 @@ pub async fn resume_identity_import(
     body: Body,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_users`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteUsers)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     crate::org_context::require_live_environment(&state, &scope).await?;
     // A malformed or cross-scope run id is the uniform not-found, exactly as the

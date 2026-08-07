@@ -43,7 +43,7 @@ use ironauth_store::{
     ActorRef, CorrelationId, CursorPosition, Scope, StoreError, UserExportRecord, UserState,
 };
 
-use crate::auth::Principal;
+use crate::auth::{ManagementPermission, Principal};
 use crate::error::{ApiError, ErrorBody};
 use crate::response::ndjson;
 use crate::state::AdminState;
@@ -102,6 +102,12 @@ pub async fn export_identities(
     Path((tenant_id, environment_id)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // READ, but the heaviest one on the surface: it drains every identity in the
+    // environment including credential material. It is `management.read` because that
+    // is what it is, and a persona that must not export should not hold read at all.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::Read)?;
 
     // Drain the scope one bounded page at a time, serializing each user to a line of
     // the import format. The page size is the management list ceiling, so a single

@@ -63,7 +63,7 @@ use ironauth_store::{
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::auth::Principal;
+use crate::auth::{ManagementPermission, Principal};
 use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
 use crate::input::parse_json;
@@ -229,6 +229,9 @@ pub async fn assign_org_group_role(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_organizations`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteOrganizations)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
 
     let key = idempotency::required_key(&headers)?;
@@ -337,6 +340,9 @@ pub async fn list_org_group_roles(
     Query(query): Query<ListQuery>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::Read)?;
     let org_id = resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Read).await?;
     // The group is resolved as a live group of THIS organization first, so a group
     // of a sibling organization is the same 404 that reading the group itself gives,
@@ -393,6 +399,9 @@ pub async fn unassign_org_group_role(
     )>,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_organizations`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteOrganizations)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     let org_id =
         resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Write).await?;
@@ -461,6 +470,9 @@ pub async fn assign_org_membership_role(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_organizations`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteOrganizations)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
 
     let key = idempotency::required_key(&headers)?;
@@ -563,6 +575,9 @@ pub async fn list_org_membership_roles(
     Query(query): Query<ListQuery>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::Read)?;
     let org_id = resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Read).await?;
     // The membership is resolved as a live membership of THIS organization first,
     // for the same reason the group lists resolve their group: a membership of a
@@ -622,6 +637,9 @@ pub async fn unassign_org_membership_role(
     )>,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_organizations`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteOrganizations)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     let org_id =
         resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Write).await?;
