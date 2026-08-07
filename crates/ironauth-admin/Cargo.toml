@@ -130,6 +130,11 @@ path = "tests/delegated_scope_levels.rs"
 required-features = ["testing"]
 
 [[test]]
+name = "org_confinement_surface"
+path = "tests/org_confinement_surface.rs"
+required-features = ["testing"]
+
+[[test]]
 name = "management_permissions"
 path = "tests/management_permissions.rs"
 
