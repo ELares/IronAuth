@@ -364,6 +364,8 @@ async fn json_body(response: axum::response::Response) -> serde_json::Value {
 async fn seed_rule(harness: &Harness, selector: RoutingSelector<'_>, ocn_id: &OrgConnectionId) {
     let env = harness.env().clone();
     let scope = harness.scope();
+    let is_domain = matches!(selector, RoutingSelector::Domain(_));
+    let rule_id = RoutingRuleId::generate(&env, &scope);
     harness
         .db()
         .control_store()
@@ -372,7 +374,7 @@ async fn seed_rule(harness: &Harness, selector: RoutingSelector<'_>, ocn_id: &Or
         .routing_rules()
         .create(
             &env,
-            &RoutingRuleId::generate(&env, &scope),
+            &rule_id,
             1_000_000,
             NewRoutingRule {
                 selector,
@@ -383,6 +385,27 @@ async fn seed_rule(harness: &Harness, selector: RoutingSelector<'_>, ocn_id: &Or
         )
         .await
         .expect("create routing rule");
+
+    // Since issue #96 a domain claim starts `pending` and routes NOTHING until ownership is
+    // proven, so a seeded domain rule has to be verified or every routing test below would be
+    // asserting against a rule the router refuses.
+    //
+    // Verifying inside the shared seeder rather than in each test is deliberate: these tests
+    // are about ROUTING, and the verification gate has its own test
+    // (`an_unverified_domain_claim_routes_nothing_until_ownership_is_proven`, in
+    // `ironauth-store`) that drives the pending and failed states directly. Spreading the
+    // proof across fourteen call sites would restate one fact fourteen times.
+    if is_domain {
+        harness
+            .db()
+            .control_store()
+            .scoped(scope)
+            .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+            .routing_rules()
+            .record_domain_verification(&env, &rule_id, true)
+            .await
+            .expect("prove ownership of the seeded domain");
+    }
 }
 
 /// A URL-encoded `POST /login` form body for `identifier` returning to a local authorize.

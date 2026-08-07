@@ -1247,6 +1247,10 @@ pub enum Action {
     /// mapped to an org connection through the management API. The row targets the
     /// `rrl_` rule; the `detail` records the rule kind.
     RoutingRuleCreate,
+    /// A domain rule's ownership verification outcome was recorded (issue #96): the
+    /// transition to `verified` is what makes the rule route at all, so it is audited
+    /// separately from the create that only claimed the domain.
+    RoutingRuleDomainVerification,
     /// Upstream tokens were CAPTURED (issue #77, PR 3): the sealed upstream access and
     /// refresh tokens were persisted after a brokered login. The row targets the `utk_`
     /// vault row; the `detail` records the session and connector, NEVER a token value.
@@ -1510,6 +1514,7 @@ impl Action {
             Action::UpstreamTokenGrantCreate => "upstream_token_grant.create",
             Action::FedcmAssertionIssue => "fedcm.assertion.issue",
             Action::RoutingRuleCreate => "routing_rule.create",
+            Action::RoutingRuleDomainVerification => "routing_rule.domain_verification",
         }
     }
 }

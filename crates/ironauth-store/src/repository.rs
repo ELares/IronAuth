@@ -28633,7 +28633,33 @@ impl RoutingRuleRepo<'_> {
         &self,
         domain_norm: &str,
     ) -> Result<Option<RoutingRuleRecord>, StoreError> {
-        self.by_selector("domain", "domain_norm", domain_norm).await
+        // Its own statement rather than `by_selector` (issue #96), because a domain rule
+        // carries an ownership claim and an app rule does not. Matching REQUIRES
+        // `domain_verification_state = 'verified'`: a `pending` or `failed` claim routes
+        // nothing.
+        //
+        // The gate is HERE, in the one read the router resolves a domain through, rather
+        // than in the caller. A check in the routing module would be a rule the next caller
+        // of this repository could miss, and the failure mode is silent: the login is
+        // brokered to an upstream the claimant does not own and the user sees a normal sign
+        // in. Enforcing it in the query means an unverified claim is not merely ignored, it
+        // is unreachable.
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(&format!(
+            "SELECT {ROUTING_RULE_READ_COLUMNS} FROM routing_rules \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+             AND rule_kind = 'domain' AND enabled \
+             AND domain_verification_state = 'verified' \
+             AND domain_norm = $3"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(domain_norm)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        row.map(|row| routing_rule_record_from_row(&row, self.scope))
+            .transpose()
     }
 
     /// The enabled app rule for `client_id`, or [`None`]. At most one exists per scope.
@@ -28880,6 +28906,85 @@ pub struct ActingRoutingRuleRepo<'a> {
 }
 
 impl ActingRoutingRuleRepo<'_> {
+    /// Record a domain rule's ownership verification OUTCOME (issue #96), auditing
+    /// `routing_rule.domain_verification` in the same transaction.
+    ///
+    /// `verified` is the transition that makes the rule route at all, so it is a write of
+    /// its own rather than a field on the create: claiming a domain and proving you own it
+    /// are different acts by different parties at different times, and collapsing them
+    /// would mean the claimant asserts their own proof.
+    ///
+    /// A `false` outcome records `failed`, which is deliberately DISTINCT from the
+    /// `pending` a fresh claim carries. An operator needs to tell "nobody has checked yet"
+    /// from "we checked and the record was not there", and a failed probe that reset to
+    /// pending would look like a new claim forever.
+    ///
+    /// Verifying is IDEMPOTENT in effect but not in the recorded instant: re-verifying an
+    /// already-verified rule re-stamps `domain_verified_at`, because the freshest proof is
+    /// the useful one when an operator is auditing whether a claim is still good.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id is out of scope, or names no DOMAIN rule in this
+    /// scope (an app or user rule has no ownership to prove and is not addressable here);
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn record_domain_verification(
+        &self,
+        env: &Env,
+        id: &RoutingRuleId,
+        verified: bool,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let rule = *id;
+        let verified_at = epoch_micros(env.clock().now_utc());
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::RoutingRuleDomainVerification,
+                target: &rule,
+            },
+            async move |tx| {
+                // `rule_kind = 'domain'` is in the WHERE rather than checked first, so an
+                // app or user rule is the uniform not-found rather than an error that
+                // distinguishes "wrong kind" from "absent". The CHECK added by migration
+                // 0117 would refuse the write anyway; this makes the refusal a 404 instead
+                // of a database error surfacing as a 500.
+                let updated = sqlx::query(
+                    "UPDATE routing_rules SET \
+                       domain_verification_state = CASE WHEN $4 THEN 'verified' ELSE 'failed' END, \
+                       domain_verified_at = CASE WHEN $4 \
+                         THEN TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval \
+                         ELSE NULL END, \
+                       updated_at = TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval \
+                     WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
+                     AND rule_kind = 'domain'",
+                )
+                .bind(rule.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(verified)
+                .bind(verified_at)
+                .execute(&mut **tx)
+                .await?;
+                if updated.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            // Not poison-after-audit: this write changes one rule's verification state and
+            // nothing downstream is invalidated by it beyond that rule's own routing.
+            false,
+        )
+        .await?;
+        Ok(())
+    }
+
     /// CREATE a routing rule (issue #77), auditing `routing_rule.create` in the same
     /// transaction. A domain selector is normalized and a user selector is blind-
     /// indexed on write, so a stored rule matches a submitted login identically.
@@ -28945,8 +29050,10 @@ impl ActingRoutingRuleRepo<'_> {
                 let result = sqlx::query(
                     "INSERT INTO routing_rules \
                      (id, tenant_id, environment_id, rule_kind, domain_norm, client_id, \
-                      user_bidx, org_connection_id, priority, enabled, created_at, updated_at) \
+                      user_bidx, org_connection_id, priority, enabled, \
+                      domain_verification_state, created_at, updated_at) \
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
+                             CASE WHEN $4 = 'domain' THEN 'pending' ELSE NULL END, \
                              TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval, \
                              TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval)",
                 )
