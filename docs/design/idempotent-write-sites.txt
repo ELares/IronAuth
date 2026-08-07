@@ -45,6 +45,7 @@ crates/ironauth-admin/src/org_group_members.rs:add_org_group_member:1
 crates/ironauth-admin/src/org_groups.rs:create_org_group:1
 crates/ironauth-admin/src/org_role_assignments.rs:assign_org_group_role:1
 crates/ironauth-admin/src/org_role_assignments.rs:assign_org_membership_role:1
+crates/ironauth-admin/src/org_role_assignments.rs:require_role_assignable:0
 crates/ironauth-admin/src/org_role_permissions.rs:assign_org_role_permission:1
 crates/ironauth-admin/src/org_roles.rs:create_org_role:1
 crates/ironauth-admin/src/organizations.rs:create_organization:1

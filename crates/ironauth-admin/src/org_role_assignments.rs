@@ -258,6 +258,7 @@ pub async fn assign_org_group_role(
 
     let request: AssignOrgGroupRoleRequest = parse_json(&body)?;
     let role = parse_role_id(&state, scope, &request.role_id)?;
+    require_role_assignable(&state, &principal, scope, &org_id, &role).await?;
 
     let created_at_micros = state.now_unix_micros();
     let assignment_id = ironauth_store::OrgGroupRoleId::generate(state.env(), &scope);
@@ -516,6 +517,7 @@ pub async fn assign_org_membership_role(
 
     let request: AssignOrgMembershipRoleRequest = parse_json(&body)?;
     let role = parse_role_id(&state, scope, &request.role_id)?;
+    require_role_assignable(&state, &principal, scope, &org_id, &role).await?;
 
     let created_at_micros = state.now_unix_micros();
     let assignment_id = ironauth_store::OrgMembershipRoleId::generate(state.env(), &scope);
@@ -698,4 +700,60 @@ pub async fn unassign_org_membership_role(
         .unassign(state.env(), &org_id, &assignment.id)
         .await?;
     Ok(no_content())
+}
+
+/// Refuse a role that a project grant does not make assignable (issue #102).
+///
+/// Applies to a DELEGATED administrator only, meaning a management credential confined
+/// to one organization (migration 0119). An operator or an unconfined key is the vendor,
+/// who authored the grant in the first place: bounding the author by their own grant
+/// would make a grant impossible to widen, since widening it is itself an assignment of
+/// authority. `confined_organization` is what separates the two, and it is checked BEFORE
+/// the read so the unconfined path costs no query.
+///
+/// Absence of a grant means unrestricted, so this is inert until an operator creates one.
+/// That is what makes migration 0120 safe to apply to a live environment: it changes no
+/// behaviour for anybody until somebody opts in per (application, organization) pair.
+///
+/// # Errors
+///
+/// [`ApiError::WrongScope`] (403) if a grant exists for the organization and does not
+/// name this role. [`ApiError::Internal`] if the grant read fails.
+async fn require_role_assignable(
+    state: &AdminState,
+    principal: &Principal,
+    scope: ironauth_store::Scope,
+    org_id: &ironauth_store::OrganizationId,
+    role: &ironauth_store::OrgRoleId,
+) -> Result<(), ApiError> {
+    if principal.confined_organization().is_none() {
+        return Ok(());
+    }
+    let assignable = state
+        .store()
+        .management()
+        .project_grants(scope)
+        .assignable_role_ids(org_id)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    // `None` is NO grant, which is unrestricted. `Some(empty)` is a grant naming no
+    // roles, which assigns nothing. The two must not collapse; see the repository doc.
+    let Some(allowed) = assignable else {
+        return Ok(());
+    };
+    let role_id = role.to_string();
+    if allowed.iter().any(|granted| granted == &role_id) {
+        return Ok(());
+    }
+    // Names the role that was REFUSED, which the caller already put on the wire, and
+    // not the subset that WOULD have been allowed. Listing the grant back would turn a
+    // denied assignment into a way to enumerate the whole contract, which is the same
+    // rule `require_permission` follows about a credential's own authority.
+    Err(ApiError::WrongScope {
+        expected: "a role within this organization's project grant".to_owned(),
+        actual: format!("role={role_id}"),
+        message: "a project grant bounds which roles this organization's administrators \
+                  may assign, and it does not include that role"
+            .to_owned(),
+    })
 }

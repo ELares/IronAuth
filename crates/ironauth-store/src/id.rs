@@ -182,6 +182,33 @@ impl ScopedKind for OrgMembershipRoleKind {
     const PREFIX: &'static str = "mrl";
 }
 
+/// Marker for a PROJECT GRANT (`pgt_`), the tenant-scoped row binding one
+/// application to one customer organization and bounding which of that
+/// organization's roles a delegated administrator may assign (issue #102). The row
+/// itself is the B2B delegation contract: its ABSENCE means unrestricted, so an id
+/// of this kind names a restriction that exists rather than one that is implied.
+/// Scoped like every other resource so an id minted in one scope parses as a
+/// uniform not-found under another. Not a bearer secret, so its debug form stays
+/// legible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ProjectGrantKind;
+impl ScopedKind for ProjectGrantKind {
+    const PREFIX: &'static str = "pgt";
+}
+
+/// Marker for one ROLE within a project grant (`pgr_`), the tenant-scoped join row
+/// making a single role assignable under that grant (issue #102). Distinct from the
+/// grant itself (`pgt_`) because the two are edited independently: widening a
+/// subset inserts one of these and narrowing it soft-deletes one, while the grant
+/// row outlives both. Scoped like every other resource so an id minted in one scope
+/// parses as a uniform not-found under another. Not a bearer secret, so its debug
+/// form stays legible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ProjectGrantRoleKind;
+impl ScopedKind for ProjectGrantRoleKind {
+    const PREFIX: &'static str = "pgr";
+}
+
 /// Marker for a per-organization authentication policy (`oap_`), the tenant-scoped
 /// policy document governing one organization's authentication requirements (issue
 /// #95, milestone M10). At most one LIVE policy exists per organization, so the
@@ -1436,6 +1463,13 @@ pub type OrgGroupRoleId = ScopedId<OrgGroupRoleKind>;
 /// A direct organization membership-role identifier (`mrl_...`), the join row
 /// granting one role to exactly one membership (issue #97).
 pub type OrgMembershipRoleId = ScopedId<OrgMembershipRoleKind>;
+/// A project-grant identifier (`pgt_...`), the row binding one application to one
+/// customer organization and bounding what that organization's delegated
+/// administrators may assign (issue #102).
+pub type ProjectGrantId = ScopedId<ProjectGrantKind>;
+/// A project-grant role identifier (`pgr_...`), one role made assignable under a
+/// project grant (issue #102).
+pub type ProjectGrantRoleId = ScopedId<ProjectGrantRoleKind>;
 /// A per-organization authentication policy identifier (`oap_...`), the single live
 /// policy document governing one organization's authentication requirements
 /// (issue #95).
