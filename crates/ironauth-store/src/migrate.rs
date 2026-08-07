@@ -998,6 +998,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0117_domain_rule_verification.sql"),
         },
+        Migration {
+            version: 118,
+            name: "management_credential_grants",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0118_management_credential_grants.sql"),
+        },
     ]
 }
 

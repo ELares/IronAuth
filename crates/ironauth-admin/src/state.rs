@@ -942,7 +942,14 @@ impl AdminState {
             .await?
         {
             let actor = ActorRef::service(ServiceId::from_seed_bytes(id.unique_bytes()));
-            Ok(Some(Principal::ManagementKey { scope, actor }))
+            // `grants: None` until the credential read carries the column: an unrestricted
+            // key is exactly what every credential is today, so this preserves behaviour
+            // while the shape exists for the read to fill in.
+            Ok(Some(Principal::ManagementKey {
+                scope,
+                actor,
+                grants: None,
+            }))
         } else {
             Ok(None)
         }
