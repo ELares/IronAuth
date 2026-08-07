@@ -992,6 +992,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0116_webhook_event_type_filter.sql"),
         },
+        Migration {
+            version: 117,
+            name: "domain_rule_verification",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0117_domain_rule_verification.sql"),
+        },
     ]
 }
 

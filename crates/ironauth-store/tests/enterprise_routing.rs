@@ -18,8 +18,8 @@ use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
     ConnectorCapabilities, ConnectorId, CorrelationId, NewConnector, NewOrgConnection,
-    NewRoutingRule, OrgConnectionId, OrganizationId, RoutingRuleId, RoutingSelector, StoreError,
-    export_snapshot,
+    NewRoutingRule, OrgConnectionId, OrganizationId, RoutingRuleId, RoutingSelector, Scope,
+    StoreError, export_snapshot,
 };
 
 const CONNECTOR_SLUG: &str = "acme-oidc";
@@ -103,6 +103,21 @@ async fn seed_binding(
     ocn_id
 }
 
+/// Mark a domain rule VERIFIED, which since issue #96 is what makes it route at all.
+///
+/// A fresh claim is `pending` and the router refuses it, so a test that creates a domain rule
+/// and expects a match has to prove ownership first. That extra line is the point of the
+/// change: claiming a domain and owning it are different acts.
+async fn verify_domain(db: &TestDatabase, env: &Env, scope: Scope, id: &RoutingRuleId) {
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .routing_rules()
+        .record_domain_verification(env, id, true)
+        .await
+        .expect("record domain verification");
+}
+
 #[tokio::test]
 async fn a_domain_rule_resolves_on_the_data_plane() {
     let db = TestDatabase::start().await;
@@ -110,13 +125,14 @@ async fn a_domain_rule_resolves_on_the_data_plane() {
     let scope = db.seed_scope(&env).await;
     let ocn_id = seed_binding(&db, &env, scope).await;
 
+    let rule_id = RoutingRuleId::generate(&env, &scope);
     db.control_store()
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .routing_rules()
         .create(
             &env,
-            &RoutingRuleId::generate(&env, &scope),
+            &rule_id,
             1_000_000,
             NewRoutingRule {
                 selector: RoutingSelector::Domain(ROUTED_DOMAIN),
@@ -127,6 +143,9 @@ async fn a_domain_rule_resolves_on_the_data_plane() {
         )
         .await
         .expect("create domain rule");
+
+    // A fresh claim is `pending` and routes nothing (issue #96); prove ownership.
+    verify_domain(&db, &env, scope, &rule_id).await;
 
     // The data plane resolves the rule by the NORMALIZED domain (a login submitted with
     // a different case still matches).
@@ -262,13 +281,14 @@ async fn a_second_domain_mapping_is_rejected_by_the_per_scope_unique_index() {
     };
 
     // org A claims the domain first.
+    let rule_id = RoutingRuleId::generate(&env, &scope);
     db.control_store()
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .routing_rules()
         .create(
             &env,
-            &RoutingRuleId::generate(&env, &scope),
+            &rule_id,
             1_000_000,
             NewRoutingRule {
                 selector: RoutingSelector::Domain(ROUTED_DOMAIN),
@@ -279,6 +299,10 @@ async fn a_second_domain_mapping_is_rejected_by_the_per_scope_unique_index() {
         )
         .await
         .expect("org A claims the domain");
+
+    // Org A PROVES the claim, which is what makes it route (issue #96). The land grab this
+    // test guards against is now two-step: claiming the domain no longer wins it.
+    verify_domain(&db, &env, scope, &rule_id).await;
 
     // org B attempts to claim the SAME domain: the unique index refuses it.
     let conflict = db
@@ -551,4 +575,89 @@ async fn the_broker_overlay_columns_round_trip_through_a_binding()
         "an unknown overlay class must be refused by the CHECK"
     );
     Ok(())
+}
+
+#[tokio::test]
+async fn an_unverified_domain_claim_routes_nothing_until_ownership_is_proven() {
+    // Issue #96. Before this, a domain rule routed the moment it was CREATED, and the
+    // per-scope unique index meant the first claimant won the domain outright. Any
+    // organization in the environment could claim a domain it did not own and every
+    // identifier-first login for that domain would broker to its upstream IdP, while the
+    // end user saw an ordinary sign in.
+    //
+    // The gate lives in `by_domain` rather than in the routing module on purpose: a check in
+    // the caller is one the next caller can miss, and missing it is silent. Here an
+    // unverified claim is not ignored, it is unreachable.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let ocn_id = seed_binding(&db, &env, scope).await;
+    let normalized = ironauth_store::normalize_routing_domain(ROUTED_DOMAIN).expect("normalize");
+
+    let rule_id = RoutingRuleId::generate(&env, &scope);
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .routing_rules()
+        .create(
+            &env,
+            &rule_id,
+            1_000_000,
+            NewRoutingRule {
+                selector: RoutingSelector::Domain(ROUTED_DOMAIN),
+                org_connection_id: &ocn_id,
+                priority: 0,
+                enabled: true,
+            },
+        )
+        .await
+        .expect("claim the domain");
+
+    // ENABLED, and still routing nothing. `enabled` is the operator's own switch and says
+    // nothing about ownership, so the two are separate gates and this asserts the new one.
+    let pending = db
+        .store()
+        .scoped(scope)
+        .routing_rules()
+        .by_domain(&normalized)
+        .await
+        .expect("by_domain");
+    assert!(
+        pending.is_none(),
+        "a PENDING claim resolved a route: an organization that merely asked for a domain \
+         would capture every identifier-first login at it"
+    );
+
+    // A probe that RAN and did not find the record is `failed`, which must route no more
+    // than `pending` does. The two are distinct states so an operator can tell "not checked
+    // yet" from "checked and absent", and neither is a licence to route.
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .routing_rules()
+        .record_domain_verification(&env, &rule_id, false)
+        .await
+        .expect("record a failed probe");
+    assert!(
+        db.store()
+            .scoped(scope)
+            .routing_rules()
+            .by_domain(&normalized)
+            .await
+            .expect("by_domain")
+            .is_none(),
+        "a FAILED claim resolved a route"
+    );
+
+    // Proving ownership is the only thing that opens it.
+    verify_domain(&db, &env, scope, &rule_id).await;
+    let matched = db
+        .store()
+        .scoped(scope)
+        .routing_rules()
+        .by_domain(&normalized)
+        .await
+        .expect("by_domain")
+        .expect("a verified claim routes");
+    assert_eq!(matched.org_connection_id, ocn_id.to_string());
 }
