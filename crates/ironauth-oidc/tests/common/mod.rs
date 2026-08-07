@@ -1901,6 +1901,22 @@ impl Harness {
     /// the level whose enforcement issue #95 wired. A user seeded WITHOUT calling this is
     /// the control case, because the requirement must bind members only.
     pub async fn require_org_mfa(&self, subject: &str) -> ironauth_store::OrganizationId {
+        self.seed_org_policy(
+            subject,
+            ironauth_store::AuthPolicy {
+                mfa_required: Some(true),
+                ..ironauth_store::AuthPolicy::default()
+            },
+        )
+        .await
+    }
+
+    /// Put `subject` in a fresh organization carrying `policy`, and return that organization.
+    pub async fn seed_org_policy(
+        &self,
+        subject: &str,
+        policy: ironauth_store::AuthPolicy,
+    ) -> ironauth_store::OrganizationId {
         let (actor, corr) = self.seeding_actor();
         let now = i64::try_from(
             self.env
@@ -1950,10 +1966,7 @@ impl Harness {
             .set(
                 &self.env,
                 &org,
-                &ironauth_store::AuthPolicy {
-                    mfa_required: Some(true),
-                    ..ironauth_store::AuthPolicy::default()
-                },
+                &policy,
                 ironauth_store::ORG_POLICY_MAX_SESSION_TTL_SECS,
             )
             .await
