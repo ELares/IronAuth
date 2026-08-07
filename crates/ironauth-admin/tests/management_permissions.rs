@@ -303,6 +303,12 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     ("getOutboundVerification", ManagementPermission::Read),
     ("setClientParRequirement", ManagementPermission::WriteConfig),
     ("setAutoLinkPosture", ManagementPermission::WriteConfig),
+    // The last reachable user operations.
+    ("updateUser", ManagementPermission::WriteUsers),
+    ("setUserState", ManagementPermission::WriteUsers),
+    ("linkUserExternalId", ManagementPermission::WriteUsers),
+    ("unlinkUserExternalId", ManagementPermission::WriteUsers),
+    ("getUserTraits", ManagementPermission::Read),
 ];
 
 /// Operations not yet classified. This list is DEBT and is meant to shrink to nothing.
@@ -345,8 +351,6 @@ const UNCLASSIFIED: &[&str] = &[
     "getSigningRecommendations",
     "getTenant",
     "getUserRiskPosture",
-    "getUserTraits",
-    "linkUserExternalId",
     "listConnectors",
     "listDcrPolicies",
     "listEnvironments",
@@ -370,11 +374,8 @@ const UNCLASSIFIED: &[&str] = &[
     "setBrandFavicon",
     "setBrandLogo",
     "setClientSigningAlgorithm",
-    "setUserState",
     "suspendTenant",
-    "unlinkUserExternalId",
     "updateConnector",
-    "updateUser",
     "verifyDcrClient",
     "verifyMigrationCredential",
 ];
@@ -439,8 +440,58 @@ fn the_unclassified_debt_is_counted_so_it_cannot_grow_unnoticed() {
     // route is a new decision, not a new deferral.
     assert_eq!(
         UNCLASSIFIED.len(),
-        66,
+        61,
         "the unclassified list changed size. It may only SHRINK: an operation added to it is \
          an operation somebody chose not to decide about"
     );
+}
+
+/// The admin source, read at COMPILE time so this cannot be fooled by a working tree that
+/// differs from what was built.
+const ADMIN_SOURCES: &[(&str, &str)] = &[
+    ("users.rs", include_str!("../src/users.rs")),
+    ("organizations.rs", include_str!("../src/organizations.rs")),
+    ("memberships.rs", include_str!("../src/memberships.rs")),
+    ("secrets.rs", include_str!("../src/secrets.rs")),
+    ("variables.rs", include_str!("../src/variables.rs")),
+    ("brands.rs", include_str!("../src/brands.rs")),
+    (
+        "webhook_endpoints.rs",
+        include_str!("../src/webhook_endpoints.rs"),
+    ),
+    ("invitations.rs", include_str!("../src/invitations.rs")),
+    ("bans.rs", include_str!("../src/bans.rs")),
+    ("export.rs", include_str!("../src/export.rs")),
+    ("org_roles.rs", include_str!("../src/org_roles.rs")),
+    ("org_groups.rs", include_str!("../src/org_groups.rs")),
+];
+
+#[test]
+fn every_classified_operation_in_these_files_actually_calls_the_gate() {
+    // The pin above proves every operation has a DECLARED permission. It does not prove the
+    // declaration is enforced, and those are different claims: #591 shipped a state where the
+    // handlers enforced and the table still said "deferred", and the reverse (classified in
+    // the table, no call in the handler) is the dangerous direction because the table then
+    // reads as a control that does not exist.
+    //
+    // This closes that gap for the files listed, by counting `require_permission` calls
+    // against the classified operations each file owns. It is a TEXT scan and its ceiling is
+    // worth stating: it cannot tell WHICH permission a handler demands, only that it demands
+    // one, and it only covers the files enumerated above. The end-to-end tests in
+    // `delegated_admin.rs` are what prove the specific permission on the paths they drive.
+    for (name, source) in ADMIN_SOURCES {
+        let declared = source
+            .matches("Delegated administration (issue #102)")
+            .count();
+        let calls = source.matches("principal.require_permission(").count();
+        assert_eq!(
+            declared, calls,
+            "{name} has {declared} classification comment(s) and {calls} require_permission \
+             call(s). A comment without a call is a control that exists only in prose"
+        );
+        assert!(
+            calls > 0,
+            "{name} is listed here as an enforced file and calls the gate nowhere"
+        );
+    }
 }
