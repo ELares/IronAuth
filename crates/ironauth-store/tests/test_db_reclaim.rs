@@ -15,6 +15,22 @@
 use ironauth_store::test_support::reclaim_leaked_databases_now;
 use sqlx::PgPool;
 
+/// The tests here share ONE cluster, and each drives a sweep across every database the
+/// harness owns. Run at the same time, each one's fixtures are visible to the others'
+/// sweeps, so they must not run at the same time.
+///
+/// This does NOT make a fixture safe on its own, and reading it that way is the trap.
+/// `TestDatabase::start` sweeps once per PROCESS, and cargo runs test binaries
+/// concurrently, so a sweep from a binary this lock cannot reach may still land in the
+/// middle of a fixture here. The lock removes the interference WITHIN this binary; the
+/// retries below cover what is left.
+static CLUSTER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// How many times to re-stage a fixture that a sweep elsewhere reclaimed first. Losing
+/// that race is expected rather than a defect, but losing it repeatedly is not, so the
+/// budget stays small enough that a real regression still fails.
+const ATTEMPTS: usize = 8;
+
 /// A name in the harness's own format, claiming to have been created `age_secs` ago.
 fn aged_name(age_secs: u64, tag: &str) -> String {
     let now = std::time::UNIX_EPOCH
@@ -55,10 +71,11 @@ async fn drop_if_present(pool: &PgPool, name: &str) {
 
 #[tokio::test]
 async fn the_reclaim_takes_aged_leftovers_and_spares_everything_else() {
+    let _serialized = CLUSTER.lock().await;
     let (admin, base) = admin_pool().await;
 
-    // Seven hours old: past the six hour margin, so it is a leftover.
-    let stale = aged_name(7 * 60 * 60, "stale");
+    // Seven hours old: past the six hour margin, so it is a leftover. Staged in the loop
+    // below rather than here, for the reason given there.
     // Sixty seconds old: a run in progress owns databases this young.
     let young = aged_name(60, "young");
     // Right prefix, but no parsable instant: a name from before this format existed.
@@ -66,12 +83,29 @@ async fn the_reclaim_takes_aged_leftovers_and_spares_everything_else() {
     // Not ours at all.
     let foreign = "ironauth_keepme_probe".to_owned();
 
-    for name in [&stale, &young, &legacy, &foreign] {
+    for name in [&young, &legacy, &foreign] {
         drop_if_present(&admin, name).await;
         create(&admin, name).await;
     }
 
-    let reclaimed = reclaim_leaked_databases_now(&base).await;
+    // The three spared fixtures are staged once, above: no sweep touches them, which is
+    // the very thing asserted below. The aged one is different. It is reclaimable by
+    // construction, so a sweep from another test binary can take it before ours runs,
+    // leaving our count at zero and this test red for someone else's correct behaviour.
+    // Re-stage until the count belongs to OUR sweep. Asserting a count we did not earn
+    // is the defect this loop removes: it would pass on another binary's fixture just as
+    // readily as on ours.
+    let mut stale = String::new();
+    let mut reclaimed = 0;
+    for _ in 0..ATTEMPTS {
+        stale = aged_name(7 * 60 * 60, "stale");
+        drop_if_present(&admin, &stale).await;
+        create(&admin, &stale).await;
+        reclaimed = reclaim_leaked_databases_now(&base).await;
+        if reclaimed >= 1 {
+            break;
+        }
+    }
     assert!(reclaimed >= 1, "the aged leftover must be reclaimed");
 
     assert!(
@@ -100,6 +134,7 @@ async fn the_reclaim_takes_aged_leftovers_and_spares_everything_else() {
 
 #[tokio::test]
 async fn a_leftover_still_in_use_is_left_alone() {
+    let _serialized = CLUSTER.lock().await;
     // Age alone does not authorize a drop: a long run whose database has outlived the
     // margin is still USING it, and reclaiming that breaks the very run this protects.
     //
@@ -111,17 +146,31 @@ async fn a_leftover_still_in_use_is_left_alone() {
     // busy database and reaching for `WITH (FORCE)` to make it succeed. That change
     // would silently terminate a concurrent run's sessions, and this is what stops it.
     let (admin, base) = admin_pool().await;
-    let busy = aged_name(9 * 60 * 60, "busy");
-    drop_if_present(&admin, &busy).await;
-    create(&admin, &busy).await;
 
-    // Hold an open connection to it for the duration of the sweep.
-    let busy_url = base
-        .rsplit_once('/')
-        .map_or_else(|| base.clone(), |(prefix, _)| format!("{prefix}/{busy}"));
-    let holder = PgPool::connect(&busy_url)
-        .await
-        .expect("hold a connection to the busy database");
+    // Staging this fixture has a window that cannot be closed, only retried. The database
+    // is aged BY CONSTRUCTION, and the only thing that will protect it is the connection
+    // held below, so between CREATE and CONNECT it is both reclaimable and unprotected.
+    // A sweep from another test binary landing in that window drops it and the connect
+    // then fails with 3D000, which is exactly how this test failed in CI rather than any
+    // fault in the guard it covers. Serializing this binary does not help: the sweep that
+    // wins the race runs in a process this one shares no lock with.
+    let mut busy = String::new();
+    let mut held = None;
+    for _ in 0..ATTEMPTS {
+        busy = aged_name(9 * 60 * 60, "busy");
+        drop_if_present(&admin, &busy).await;
+        create(&admin, &busy).await;
+
+        // Hold an open connection to it for the duration of the sweep.
+        let busy_url = base
+            .rsplit_once('/')
+            .map_or_else(|| base.clone(), |(prefix, _)| format!("{prefix}/{busy}"));
+        if let Ok(pool) = PgPool::connect(&busy_url).await {
+            held = Some(pool);
+            break;
+        }
+    }
+    let holder = held.expect("hold a connection to the busy database");
 
     reclaim_leaked_databases_now(&base).await;
 
@@ -136,6 +185,7 @@ async fn a_leftover_still_in_use_is_left_alone() {
 
 #[tokio::test]
 async fn starting_a_test_database_is_what_triggers_the_reclaim() {
+    let _serialized = CLUSTER.lock().await;
     // THE WIRING, which is the only part the two tests above cannot reach: they drive
     // the reclaim directly, so deleting its call site would leave both of them green
     // and the leak fully restored. This project has shipped three separate defects of
@@ -146,9 +196,21 @@ async fn starting_a_test_database_is_what_triggers_the_reclaim() {
     // use the drivable entry point rather than that latch, so this consumes it whatever
     // order the binary runs in.
     let (admin, _base) = admin_pool().await;
-    let stale = aged_name(8 * 60 * 60, "wiring");
-    drop_if_present(&admin, &stale).await;
-    create(&admin, &stale).await;
+
+    // Same window as above: aged the moment it exists, and nothing here protects it, so a
+    // sweep from another binary can reclaim it before the latch under test ever runs. Then
+    // the fixture is already gone and the assertion below reads as a pass for the wrong
+    // reason, which is worse than the flake. Re-stage until the fixture is present, and
+    // only then let `TestDatabase::start` be the thing that removes it.
+    let mut stale = String::new();
+    for _ in 0..ATTEMPTS {
+        stale = aged_name(8 * 60 * 60, "wiring");
+        drop_if_present(&admin, &stale).await;
+        create(&admin, &stale).await;
+        if exists(&admin, &stale).await {
+            break;
+        }
+    }
     assert!(exists(&admin, &stale).await, "the fixture leftover exists");
 
     let db = ironauth_store::test_support::TestDatabase::start().await;

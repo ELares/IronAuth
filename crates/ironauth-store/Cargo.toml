@@ -96,7 +96,7 @@ testing = []
 [dev-dependencies]
 # The integration and compile-fail tests. tokio drives the async tests; trybuild
 # proves the isolation types reject misuse at compile time.
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }
 trybuild.workspace = true
 # The BYOK offboarding test (issue #49) uses the ironauth-kms driver seam to
 # label a binding and to demonstrate that revoking a customer root fails closed.
