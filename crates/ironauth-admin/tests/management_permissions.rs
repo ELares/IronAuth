@@ -103,6 +103,17 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     ),
     ("listOrganizations", ManagementPermission::Read),
     ("getOrganization", ManagementPermission::Read),
+    // The environment CONFIG surface. A secret write is configuration authority: a credential
+    // that can seal a value can change what every connector authenticates with, so it sits
+    // here rather than being treated as lesser because the value is unreadable afterwards.
+    ("setVariable", ManagementPermission::WriteConfig),
+    ("deleteVariable", ManagementPermission::WriteConfig),
+    ("listVariables", ManagementPermission::Read),
+    ("getVariable", ManagementPermission::Read),
+    ("setSecret", ManagementPermission::WriteConfig),
+    ("deleteSecret", ManagementPermission::WriteConfig),
+    ("listSecrets", ManagementPermission::Read),
+    ("getSecret", ManagementPermission::Read),
 ];
 
 /// Operations not yet classified. This list is DEBT and is meant to shrink to nothing.
@@ -153,10 +164,8 @@ const UNCLASSIFIED: &[&str] = &[
     "deleteOrgRole",
     "deleteOutboundVerification",
     "deletePermission",
-    "deleteSecret",
     "deleteSignupForm",
     "deleteTenant",
-    "deleteVariable",
     "deleteWebhookEndpoint",
     "denySmsCountry",
     "elevateAdminSudo",
@@ -192,7 +201,6 @@ const UNCLASSIFIED: &[&str] = &[
     "getRefreshFamily",
     "getResourceServer",
     "getRiskDecision",
-    "getSecret",
     "getSession",
     "getSigningRecommendations",
     "getSignupForm",
@@ -202,7 +210,6 @@ const UNCLASSIFIED: &[&str] = &[
     "getTraitSchemaVersion",
     "getUserRiskPosture",
     "getUserTraits",
-    "getVariable",
     "liftBan",
     "linkUserExternalId",
     "listBans",
@@ -228,7 +235,6 @@ const UNCLASSIFIED: &[&str] = &[
     "listRefreshFamilies",
     "listResourceServers",
     "listResourceTypes",
-    "listSecrets",
     "listSessions",
     "listSignupQuarantines",
     "listSmsAllowlist",
@@ -237,7 +243,6 @@ const UNCLASSIFIED: &[&str] = &[
     "listTraitSchemaVersions",
     "listUserConsents",
     "listUserIdentifiers",
-    "listVariables",
     "listWebhookDeadLetters",
     "listWebhookDeliveryAttempts",
     "listWebhookEndpoints",
@@ -275,12 +280,10 @@ const UNCLASSIFIED: &[&str] = &[
     "setOrgDefaultRole",
     "setOrgGroupParent",
     "setOutboundVerification",
-    "setSecret",
     "setSignupForm",
     "setSmsOtpConfig",
     "setStepUpPolicy",
     "setUserState",
-    "setVariable",
     "setWebhookEventTypes",
     "suspendTenant",
     "unassignOrgGroupRole",
@@ -357,7 +360,7 @@ fn the_unclassified_debt_is_counted_so_it_cannot_grow_unnoticed() {
     // route is a new decision, not a new deferral.
     assert_eq!(
         UNCLASSIFIED.len(),
-        184,
+        176,
         "the unclassified list changed size. It may only SHRINK: an operation added to it is \
          an operation somebody chose not to decide about"
     );
