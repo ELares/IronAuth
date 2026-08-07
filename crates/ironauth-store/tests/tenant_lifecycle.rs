@@ -1580,3 +1580,73 @@ async fn a_failed_transition_writes_no_audit_row() {
         "a refused transition writes no audit row; got {actions:?}"
     );
 }
+
+#[tokio::test]
+async fn a_credential_grant_round_trips_through_authentication_and_absent_means_unrestricted() {
+    // Issue #102. The grant is only worth anything if it survives the read that builds the
+    // `Principal`: a column written and never read would leave every credential unrestricted
+    // while the row claimed otherwise, which is the worst shape for an authorization control.
+    //
+    // The THREE states are asserted separately because they mean different things and two of
+    // them look alike from a distance: no authentication at all, authenticated-unrestricted
+    // (the pre-0118 world), and authenticated-restricted.
+    let fx = Fixture::start().await;
+    let scope = fx.create_tenant(None).await;
+
+    // 1. UNRESTRICTED: no permissions column written, which is every credential minted before
+    //    migration 0118. `Some(None)` and not `Some(Some(vec![]))`.
+    let (open_id, open_hash) = fx.mint_key(scope, "unrestricted").await;
+    assert_eq!(
+        fx.db
+            .control_store()
+            .management()
+            .credentials(scope)
+            .authenticate_with_grants(&open_id, &open_hash)
+            .await
+            .expect("authenticate"),
+        Some(None),
+        "a credential with no permissions column must read as UNRESTRICTED, not as an empty \
+         grant set: an empty set would revoke every key that predates the column"
+    );
+
+    // 2. RESTRICTED: the slugs come back exactly as stored, in order.
+    let (scoped_id, scoped_hash) = fx.mint_key(scope, "restricted").await;
+    sqlx::query(
+        "UPDATE management_credentials SET permissions = $1 WHERE id = $2 \
+         AND tenant_id = $3 AND environment_id = $4",
+    )
+    .bind(vec!["management.read".to_owned()])
+    .bind(scoped_id.to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .execute(fx.db.owner_pool())
+    .await
+    .expect("write the grant");
+
+    assert_eq!(
+        fx.db
+            .control_store()
+            .management()
+            .credentials(scope)
+            .authenticate_with_grants(&scoped_id, &scoped_hash)
+            .await
+            .expect("authenticate"),
+        Some(Some(vec!["management.read".to_owned()])),
+        "the stored grant did not survive the authentication read"
+    );
+
+    // 3. A WRONG key hash is no authentication at all, and must not be confused with an
+    //    unrestricted one. `None` and `Some(None)` are one character apart in the type and
+    //    opposite in meaning: the first denies everything, the second allows everything.
+    assert_eq!(
+        fx.db
+            .control_store()
+            .management()
+            .credentials(scope)
+            .authenticate_with_grants(&scoped_id, "hash-of-something-else")
+            .await
+            .expect("authenticate"),
+        None,
+        "a bad credential authenticated"
+    );
+}
