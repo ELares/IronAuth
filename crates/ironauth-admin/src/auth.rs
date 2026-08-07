@@ -86,6 +86,85 @@ impl ManagementPermission {
     }
 }
 
+/// The named delegated-administration PERSONAS (issue #102).
+///
+/// A persona is a NAMED BUNDLE of permissions, not a new authority: everything one grants is
+/// expressible as a permission set, and `require_permission` cannot tell a persona-derived
+/// grant from a hand-assembled one. The value is that an operator picks an intent instead of
+/// assembling a set, and that the intent has a definition somebody argued about once rather
+/// than being re-derived per credential.
+///
+/// Confinement is DELIBERATELY NOT part of a persona. Whether an org admin is confined to one
+/// organization is a property of the credential, not of the role: the same persona is
+/// legitimately used both confined (a customer's own administrator) and unconfined (a support
+/// engineer who administers organizations on request). Baking confinement into the persona
+/// would force two personas for one intent and make the wrong one easy to reach for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagementPersona {
+    /// Reset a user's credentials and factors, and nothing else. Criterion 1's help desk.
+    ///
+    /// Holds `Read` and `WriteUsers`. It deliberately does NOT hold `WriteConfig` or
+    /// `WriteOrganizations`: a help desk that can edit policy, connections or roles is not a
+    /// help desk, it is an administrator with a narrower job title.
+    HelpDesk,
+    /// Administer organizations: members, roles, groups and their assignments.
+    ///
+    /// Holds `Read` and `WriteOrganizations`. NOT `WriteUsers`: an org admin governs who
+    /// belongs to an organization and what they hold there, which is different from creating
+    /// and deleting the identities themselves.
+    OrgAdmin,
+    /// Read everything and change nothing. The auditor.
+    ///
+    /// Holds `Read` alone. Worth stating what that includes, because it is not obvious:
+    /// `exportIdentities` is a read, so this persona can drain the environment. A persona
+    /// that must not be able to do that cannot hold read at all today.
+    ReadOnly,
+}
+
+impl ManagementPersona {
+    /// Every persona, so a pin can sweep them.
+    pub const ALL: [ManagementPersona; 3] = [
+        ManagementPersona::HelpDesk,
+        ManagementPersona::OrgAdmin,
+        ManagementPersona::ReadOnly,
+    ];
+
+    /// The permissions this persona grants. Exhaustive with no wildcard, so a persona added
+    /// without a definition fails to compile rather than silently granting nothing.
+    #[must_use]
+    pub const fn grants(self) -> ManagementGrants {
+        match self {
+            ManagementPersona::HelpDesk => ManagementGrants::empty()
+                .insert(ManagementPermission::Read)
+                .insert(ManagementPermission::WriteUsers),
+            ManagementPersona::OrgAdmin => ManagementGrants::empty()
+                .insert(ManagementPermission::Read)
+                .insert(ManagementPermission::WriteOrganizations),
+            ManagementPersona::ReadOnly => {
+                ManagementGrants::empty().insert(ManagementPermission::Read)
+            }
+        }
+    }
+
+    /// The stable slug an operator names the persona by.
+    #[must_use]
+    pub const fn as_slug(self) -> &'static str {
+        match self {
+            ManagementPersona::HelpDesk => "help_desk",
+            ManagementPersona::OrgAdmin => "org_admin",
+            ManagementPersona::ReadOnly => "read_only",
+        }
+    }
+
+    /// Parse a persona slug. An unknown slug is [`None`] and the caller must fail closed.
+    #[must_use]
+    pub fn from_slug(slug: &str) -> Option<Self> {
+        ManagementPersona::ALL
+            .into_iter()
+            .find(|candidate| candidate.as_slug() == slug)
+    }
+}
+
 /// A set of [`ManagementPermission`], as a bitmask.
 ///
 /// A mask rather than a `BTreeSet` because [`Principal`] is `Copy` and is passed by value
@@ -601,5 +680,115 @@ mod grant_tests {
             "the refusal carries something beyond what was REQUIRED; anything extra is a way \
              to map a credential's authority by probing it"
         );
+    }
+}
+
+#[cfg(test)]
+mod persona_tests {
+    use super::{ManagementGrants, ManagementPermission, ManagementPersona};
+
+    #[test]
+    fn every_persona_has_a_distinct_slug_that_round_trips() {
+        let mut slugs: Vec<&str> = ManagementPersona::ALL
+            .into_iter()
+            .map(ManagementPersona::as_slug)
+            .collect();
+        slugs.sort_unstable();
+        let count = slugs.len();
+        slugs.dedup();
+        assert_eq!(slugs.len(), count, "two personas share a slug: {slugs:?}");
+        for persona in ManagementPersona::ALL {
+            assert_eq!(
+                ManagementPersona::from_slug(persona.as_slug()),
+                Some(persona)
+            );
+        }
+        assert_eq!(ManagementPersona::from_slug("administrator"), None);
+    }
+
+    #[test]
+    fn the_help_desk_boundary_holds_in_both_directions() {
+        // Criterion 1 asks for BOTH directions, and the second is the one that matters: a
+        // help desk that can also edit policy or roles is not a help desk, it is an
+        // administrator with a narrower job title.
+        let grants = ManagementPersona::HelpDesk.grants();
+        for held in [ManagementPermission::Read, ManagementPermission::WriteUsers] {
+            assert!(
+                grants.holds(held),
+                "the help desk cannot do its job: missing {}",
+                held.as_slug()
+            );
+        }
+        for denied in [
+            ManagementPermission::WriteConfig,
+            ManagementPermission::WriteOrganizations,
+            ManagementPermission::WriteCredentials,
+        ] {
+            assert!(
+                !grants.holds(denied),
+                "the help desk holds {}, which puts policy, connections or roles inside a \
+                 credential meant only to reset a user's access",
+                denied.as_slug()
+            );
+        }
+    }
+
+    #[test]
+    fn the_org_admin_governs_organizations_and_not_identities() {
+        // The distinction is easy to lose: an org admin decides who BELONGS to an
+        // organization and what they hold there. Creating and deleting the identities
+        // themselves is a different authority, and bundling it in would make every org admin
+        // able to delete users of the environment.
+        let grants = ManagementPersona::OrgAdmin.grants();
+        assert!(grants.holds(ManagementPermission::Read));
+        assert!(grants.holds(ManagementPermission::WriteOrganizations));
+        assert!(
+            !grants.holds(ManagementPermission::WriteUsers),
+            "the org admin can create and delete identities, not merely govern membership"
+        );
+        assert!(!grants.holds(ManagementPermission::WriteConfig));
+        assert!(!grants.holds(ManagementPermission::WriteCredentials));
+    }
+
+    #[test]
+    fn no_persona_grants_credential_authority() {
+        // `WriteCredentials` mints and revokes management keys, so any persona holding it
+        // could escalate to every other authority by minting a key that has it. No named
+        // bundle may include it: granting it must always be a deliberate, separate act.
+        for persona in ManagementPersona::ALL {
+            assert!(
+                !persona
+                    .grants()
+                    .holds(ManagementPermission::WriteCredentials),
+                "persona {} grants credential authority, so holding it is equivalent to \
+                 holding everything",
+                persona.as_slug()
+            );
+        }
+    }
+
+    #[test]
+    fn every_persona_grants_something_and_none_grants_everything() {
+        // A persona granting nothing is indistinguishable from a revoked credential; one
+        // granting everything is indistinguishable from an unrestricted key, and both are
+        // already expressible without a persona.
+        let everything = ManagementPermission::ALL
+            .into_iter()
+            .fold(ManagementGrants::empty(), ManagementGrants::insert);
+        for persona in ManagementPersona::ALL {
+            let grants = persona.grants();
+            assert!(
+                !grants.is_empty(),
+                "persona {} grants nothing",
+                persona.as_slug()
+            );
+            assert_ne!(
+                grants,
+                everything,
+                "persona {} grants every permission, which is what an unrestricted credential \
+                 already is",
+                persona.as_slug()
+            );
+        }
     }
 }
