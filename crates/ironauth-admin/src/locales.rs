@@ -25,7 +25,7 @@ use ironauth_oidc::flow::message::{MessageId, spec_for};
 use ironauth_store::{CorrelationId, LocaleBundleId, NewLocaleBundle, Scope};
 use std::collections::BTreeMap;
 
-use crate::auth::Principal;
+use crate::auth::{ManagementPermission, Principal};
 use crate::error::{ApiError, ErrorBody};
 use crate::input::parse_json;
 use crate::response::{json, no_content};
@@ -171,6 +171,9 @@ pub async fn set_locale(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_config`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteConfig)?;
     // A locale write rewrites the plain text of the auth pages (login, recovery, error copy), a
     // social engineering surface, so it demands fresh privilege exactly like the other environment
     // scoped management writes (organizations, connectors).
@@ -237,6 +240,9 @@ pub async fn get_locale(
     Path((tenant_id, environment_id, locale)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::Read)?;
     let locale = parse_locale(&locale)?;
     let record = state
         .store()
@@ -275,6 +281,9 @@ pub async fn delete_locale(
     Path((tenant_id, environment_id, locale)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_config`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteConfig)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     // The parent-existence precondition, through the ONE expression of it (issues #443,
     // #451). A `locale_bundles` row survives its

@@ -112,7 +112,7 @@ use ironauth_store::{CorrelationId, ResourceServerRecord, TokenFormat};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::auth::Principal;
+use crate::auth::{ManagementPermission, Principal};
 use crate::error::{ApiError, ErrorBody};
 use crate::input::parse_json;
 use crate::org_context::{EnvironmentAccess, require_live_resource_server, resolve_scope};
@@ -371,6 +371,9 @@ pub async fn list_resource_servers(
     Query(query): Query<ListQuery>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::Read)?;
     let page = Pagination::resolve(&query, state.default_page_size(), state.max_page_size())?;
     let rows = state
         .store()
@@ -417,6 +420,9 @@ pub async fn get_resource_server(
     Path((tenant_id, environment_id, resource_server_id)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::Read)?;
     let record =
         require_live_resource_server(&state, scope, &resource_server_id, EnvironmentAccess::Read)
             .await?;
@@ -455,6 +461,9 @@ pub async fn update_resource_server_permission_claims(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_config`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteConfig)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     // Address the target FIRST, exactly as `permissions.rs` does and for the same
     // reason, sharpened here by the 422: a caller who cannot address the row must not
