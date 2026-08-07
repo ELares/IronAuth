@@ -434,3 +434,61 @@ async fn a_user_granted_credential_cannot_rebrand_the_environment() {
         "the refusal does not name the permission required: {body}"
     );
 }
+
+#[tokio::test]
+async fn a_read_only_credential_cannot_approve_a_recovery_or_change_uniqueness() {
+    // Two operations that look procedural and are not.
+    //
+    // Approving a recovery HANDS SOMEONE BACK AN ACCOUNT. It is the single most direct
+    // account-takeover primitive in the management surface: whoever may approve may approve
+    // their own request against anyone's account.
+    //
+    // Applying an identifier uniqueness mode recomputes keys across the WHOLE environment,
+    // changing the rule every identifier obeys. That is configuration, not user data, which
+    // is why it is `write_config` and not `write_users` despite living under identifiers.
+    // ARMED harness: every recovery-approval route 404s until advanced recovery is enabled
+    // and acknowledged, so an unarmed harness would give a 404 that looks like a passing
+    // refusal test while proving nothing about permissions.
+    let h = Harness::start_with_advanced_recovery(50, true).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "k-mint").await;
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+
+    let base = format!("/v1/tenants/{tenant}/environments/{environment}");
+
+    // The read grant covers listing both surfaces.
+    for path in [
+        format!("{base}/recovery-approvals"),
+        format!("{base}/identifiers/uniqueness"),
+    ] {
+        let (status, _, body) = h.get_as(&path, &secret).await;
+        assert_ne!(
+            status,
+            StatusCode::FORBIDDEN,
+            "the read grant did not cover {path}: {body}"
+        );
+    }
+
+    // Approving is refused. The id is bogus, and the 403 therefore also shows the permission
+    // gate runs BEFORE the approval is resolved: a restricted credential gets the same answer
+    // for an id that exists and one that does not, so it cannot probe the queue by comparing
+    // 403 against 404.
+    let (status, _, body) = h
+        .post_as(
+            &format!("{base}/recovery-approvals/rca_000000000000000000000000000000/approve"),
+            &secret,
+            "k-approve",
+            "{}",
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read-only credential reached the recovery APPROVAL path, the most direct \
+         account-takeover primitive on this surface: {body}"
+    );
+    assert!(
+        body.contains("management.write_users"),
+        "the refusal does not name the permission required: {body}"
+    );
+}

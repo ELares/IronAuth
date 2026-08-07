@@ -167,6 +167,37 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     ("setSignupForm", ManagementPermission::WriteConfig),
     ("deleteSignupForm", ManagementPermission::WriteConfig),
     ("getSignupForm", ManagementPermission::Read),
+    // User sub-surfaces: identifiers, trait schemas, signup quarantine and recovery
+    // approvals. Identifier UNIQUENESS and trait schemas are config rather than user
+    // authority, because each changes a rule the whole environment obeys.
+    ("addUserIdentifier", ManagementPermission::WriteUsers),
+    ("removeUserIdentifier", ManagementPermission::WriteUsers),
+    ("listUserIdentifiers", ManagementPermission::Read),
+    (
+        "applyIdentifierUniqueness",
+        ManagementPermission::WriteConfig,
+    ),
+    ("getIdentifierUniqueness", ManagementPermission::Read),
+    (
+        "createTraitSchemaVersion",
+        ManagementPermission::WriteConfig,
+    ),
+    (
+        "activateTraitSchemaVersion",
+        ManagementPermission::WriteConfig,
+    ),
+    ("createTraitMigrationJob", ManagementPermission::WriteConfig),
+    ("listTraitSchemaVersions", ManagementPermission::Read),
+    ("getActiveTraitSchema", ManagementPermission::Read),
+    ("getTraitSchemaVersion", ManagementPermission::Read),
+    ("getTraitMigrationJob", ManagementPermission::Read),
+    ("approveSignupQuarantine", ManagementPermission::WriteUsers),
+    ("rejectSignupQuarantine", ManagementPermission::WriteUsers),
+    ("extendSignupQuarantine", ManagementPermission::WriteUsers),
+    ("listSignupQuarantines", ManagementPermission::Read),
+    ("approveRecoveryApproval", ManagementPermission::WriteUsers),
+    ("rejectRecoveryApproval", ManagementPermission::WriteUsers),
+    ("listRecoveryApprovals", ManagementPermission::Read),
 ];
 
 /// Operations not yet classified. This list is DEBT and is meant to shrink to nothing.
@@ -176,14 +207,9 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
 /// what it does today.
 const UNCLASSIFIED: &[&str] = &[
     "abandonMigrationRun",
-    "activateTraitSchemaVersion",
     "addOrgGroupMember",
-    "addUserIdentifier",
     "allowSmsCountry",
     "applyConfigPromotion",
-    "applyIdentifierUniqueness",
-    "approveRecoveryApproval",
-    "approveSignupQuarantine",
     "assignOrgGroupRole",
     "assignOrgMembershipRole",
     "bulkRevokeSessions",
@@ -197,8 +223,6 @@ const UNCLASSIFIED: &[&str] = &[
     "createOrgGroup",
     "createOrgRole",
     "createTenant",
-    "createTraitMigrationJob",
-    "createTraitSchemaVersion",
     "createWebhookEndpoint",
     "deleteBrandFavicon",
     "deleteBrandLogo",
@@ -214,8 +238,6 @@ const UNCLASSIFIED: &[&str] = &[
     "elevateAdminSudo",
     "exportConfigSnapshot",
     "exportIdentities",
-    "extendSignupQuarantine",
-    "getActiveTraitSchema",
     "getClientAdminConsent",
     "getClientAllowedScopes",
     "getClientAuthDiagnostics",
@@ -227,7 +249,6 @@ const UNCLASSIFIED: &[&str] = &[
     "getEnvironment",
     "getFlowObservation",
     "getFlowVersion",
-    "getIdentifierUniqueness",
     "getMds3Health",
     "getMigrationProgress",
     "getMigrationRun",
@@ -243,8 +264,6 @@ const UNCLASSIFIED: &[&str] = &[
     "getSigningRecommendations",
     "getSmsOtpConfig",
     "getTenant",
-    "getTraitMigrationJob",
-    "getTraitSchemaVersion",
     "getUserRiskPosture",
     "getUserTraits",
     "linkUserExternalId",
@@ -261,17 +280,13 @@ const UNCLASSIFIED: &[&str] = &[
     "listOrgMembershipRoles",
     "listOrgRoles",
     "listQueueDepths",
-    "listRecoveryApprovals",
     "listRefreshFamilies",
     "listResourceTypes",
     "listSessions",
-    "listSignupQuarantines",
     "listSmsAllowlist",
     "listStepUpPolicies",
     "listTenants",
-    "listTraitSchemaVersions",
     "listUserConsents",
-    "listUserIdentifiers",
     "listWebhookDeadLetters",
     "listWebhookDeliveryAttempts",
     "listWebhookEndpoints",
@@ -281,11 +296,8 @@ const UNCLASSIFIED: &[&str] = &[
     "postFlowDryRun",
     "probePasswordHashing",
     "purgeTenant",
-    "rejectRecoveryApproval",
-    "rejectSignupQuarantine",
     "removeOrgGroupMember",
     "removeStepUpPolicy",
-    "removeUserIdentifier",
     "replayWebhookDeadLetters",
     "restoreTenant",
     "resumeIdentityImport",
@@ -381,7 +393,7 @@ fn the_unclassified_debt_is_counted_so_it_cannot_grow_unnoticed() {
     // route is a new decision, not a new deferral.
     assert_eq!(
         UNCLASSIFIED.len(),
-        144,
+        125,
         "the unclassified list changed size. It may only SHRINK: an operation added to it is \
          an operation somebody chose not to decide about"
     );

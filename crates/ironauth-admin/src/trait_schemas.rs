@@ -62,7 +62,7 @@ use ironauth_store::{
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::auth::Principal;
+use crate::auth::{ManagementPermission, Principal};
 use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
 use crate::input::parse_json;
@@ -173,6 +173,9 @@ pub async fn create_trait_schema_version(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_config`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteConfig)?;
     // Authoring a schema version decides what every later identity write is validated against and
     // which of its fields are admin-only, so it demands fresh privilege exactly like the other
     // environment-scoped management writes (locales, signup forms, journey versions).
@@ -274,6 +277,9 @@ pub async fn list_trait_schema_versions(
     Path((tenant_id, environment_id)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::Read)?;
     let records = state
         .store()
         .scoped(scope)
@@ -319,6 +325,9 @@ pub async fn get_active_trait_schema(
     Path((tenant_id, environment_id)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::Read)?;
     let record = state
         .store()
         .scoped(scope)
@@ -355,6 +364,9 @@ pub async fn get_trait_schema_version(
     Path((tenant_id, environment_id, version)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::Read)?;
     let version = parse_version(&version)?;
     let record = state
         .store()
@@ -407,6 +419,9 @@ pub async fn activate_trait_schema_version(
     Path((tenant_id, environment_id, version)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_config`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteConfig)?;
     // Moving the active pointer changes what every identity write is validated against, so it
     // demands fresh privilege exactly like a version create.
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
@@ -601,6 +616,10 @@ pub async fn create_trait_migration_job(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_config`.
+    // CONFIG: a migration job rewrites traits across every identity in the environment.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteConfig)?;
     // A migrate job REWRITES every identity's traits, which is the largest data mutation
     // this surface offers, so it demands fresh privilege exactly as a cutover does.
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
@@ -718,6 +737,9 @@ pub async fn get_trait_migration_job(
 ) -> Result<Response, ApiError> {
     // No liveness fence on a READ, matching every other read across this surface.
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::Read)?;
     let id = ironauth_store::TraitMigrationJobId::parse_in_scope(&job_id, &scope)
         .map_err(|_| ApiError::NotFound)?;
     let job = state

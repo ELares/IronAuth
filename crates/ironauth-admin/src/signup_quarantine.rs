@@ -22,7 +22,7 @@ use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::Response;
 use ironauth_store::{CorrelationId, IdempotencyWrite, Scope, StoreError, UserId};
 
-use crate::auth::Principal;
+use crate::auth::{ManagementPermission, Principal};
 use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
 use crate::input::parse_json;
@@ -115,6 +115,9 @@ pub async fn list_signup_quarantines(
         return Err(ApiError::NotFound);
     }
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::Read)?;
     let page = Pagination::resolve(&query, state.default_page_size(), state.max_page_size())?;
     let rows = state
         .store()
@@ -169,6 +172,10 @@ pub async fn approve_signup_quarantine(
         return Err(ApiError::NotFound);
     }
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_users`.
+    // USER authority: approving a quarantine decides whether a signup becomes a user.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteUsers)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
 
     let key = idempotency::required_key(&headers)?;
@@ -238,6 +245,9 @@ pub async fn reject_signup_quarantine(
         return Err(ApiError::NotFound);
     }
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_users`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteUsers)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
 
     let key = idempotency::required_key(&headers)?;
@@ -311,6 +321,9 @@ pub async fn extend_signup_quarantine(
         return Err(ApiError::NotFound);
     }
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_users`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteUsers)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
 
     let key = idempotency::required_key(&headers)?;
