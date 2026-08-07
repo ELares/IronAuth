@@ -1601,3 +1601,96 @@ async fn bind_scope(
         .await
         .expect("bind environment scope");
 }
+
+#[tokio::test]
+async fn jit_eligibility_needs_both_the_flag_and_an_exact_domain_match() {
+    // Issue #95 criterion 3. Two independent conditions gate provisioning a membership from
+    // an email domain, and each one alone is unsafe:
+    //
+    //   * `allowed_email_domains` alone is a NARROWING FILTER, never a licence. It is an
+    //     unverified operator assertion about which domains an organization accepts.
+    //   * `jit_provisioning` alone would accept every address in the environment.
+    //
+    // Matching is EXACT on the normalized domain. A suffix match would let
+    // `evil-example.com` satisfy a policy naming `example.com`, which is the classic way
+    // domain allow-lists are escaped.
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x9c);
+    let scope = db.seed_scope(&env).await;
+
+    let both = create_org(&db, &env, scope, "Both").await;
+    let flag_off = create_org(&db, &env, scope, "FlagOff").await;
+    let no_domain = create_org(&db, &env, scope, "NoDomain").await;
+
+    set_policy(
+        &db,
+        &env,
+        scope,
+        &both,
+        &AuthPolicy {
+            jit_provisioning: Some(true),
+            allowed_email_domains: Some(["example.com".to_owned()].into_iter().collect()),
+            ..AuthPolicy::default()
+        },
+    )
+    .await
+    .expect("both conditions");
+
+    // The domain matches but JIT is OFF. This is the "rejects when disabled" half.
+    set_policy(
+        &db,
+        &env,
+        scope,
+        &flag_off,
+        &AuthPolicy {
+            jit_provisioning: Some(false),
+            allowed_email_domains: Some(["example.com".to_owned()].into_iter().collect()),
+            ..AuthPolicy::default()
+        },
+    )
+    .await
+    .expect("flag off");
+
+    // JIT is on but the domain is a DIFFERENT one.
+    set_policy(
+        &db,
+        &env,
+        scope,
+        &no_domain,
+        &AuthPolicy {
+            jit_provisioning: Some(true),
+            allowed_email_domains: Some(["other.test".to_owned()].into_iter().collect()),
+            ..AuthPolicy::default()
+        },
+    )
+    .await
+    .expect("other domain");
+
+    let eligible = db
+        .store()
+        .scoped(scope)
+        .org_auth_policies()
+        .jit_eligible_orgs("example.com")
+        .await
+        .expect("jit_eligible_orgs");
+    assert_eq!(
+        eligible,
+        vec![both],
+        "only the organization with BOTH the flag and the exact domain is eligible"
+    );
+
+    // A domain that merely CONTAINS an allowed one must not match. Asserted separately
+    // because a suffix or substring predicate would satisfy the assertion above unchanged.
+    for near_miss in ["evil-example.com", "example.com.evil.test", "xample.com"] {
+        assert!(
+            db.store()
+                .scoped(scope)
+                .org_auth_policies()
+                .jit_eligible_orgs(near_miss)
+                .await
+                .expect("jit_eligible_orgs")
+                .is_empty(),
+            "{near_miss} matched a policy that names example.com: the domain check is not exact"
+        );
+    }
+}

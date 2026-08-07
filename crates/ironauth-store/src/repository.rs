@@ -42691,6 +42691,55 @@ impl OrgAuthPolicyRepo<'_> {
             .ok_or(StoreError::NotFound)
     }
 
+    /// The organizations that would accept `email_domain` for JIT provisioning (issue #95).
+    ///
+    /// An organization qualifies when its policy has `jit_provisioning` TRUE **and** lists the
+    /// domain in `allowed_email_domains`. Both are required: the domain list alone is a
+    /// narrowing filter and never a licence to create a membership, and JIT alone would accept
+    /// every address in the environment.
+    ///
+    /// Matching is EXACT on the normalized domain and never a suffix match, which is what
+    /// `AuthPolicy::allowed_email_domains` documents. A suffix match would make
+    /// `evil-example.com` satisfy a policy that named `example.com`.
+    ///
+    /// The caller must have VERIFIED the address by other means. This list is an operator
+    /// assertion about which domains an organization accepts; it is never authority for the
+    /// address itself, and provisioning from an unverified address would let anyone join an
+    /// organization by claiming one of its addresses.
+    ///
+    /// Ordered by organization id so a user matching several is provisioned deterministically.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn jit_eligible_orgs(
+        &self,
+        email_domain: &str,
+    ) -> Result<Vec<OrganizationId>, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let rows = sqlx::query(
+            "SELECT organization_id FROM org_auth_policies \
+             WHERE tenant_id = $1 AND environment_id = $2 AND deleted_at IS NULL \
+             AND jit_provisioning IS TRUE \
+             AND allowed_email_domains IS NOT NULL \
+             AND $3 = ANY(allowed_email_domains) \
+             ORDER BY organization_id",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(email_domain)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| {
+                let raw: String = row.get("organization_id");
+                OrganizationId::parse_in_scope(&raw, &scope).map_err(StoreError::from)
+            })
+            .collect()
+    }
+
     /// The policy DOCUMENT governing `organization_id`, or `None` when it has none.
     ///
     /// This is the login-path read, and the ONE additional scoped SELECT issue #95
