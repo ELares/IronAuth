@@ -492,3 +492,51 @@ async fn a_read_only_credential_cannot_approve_a_recovery_or_change_uniqueness()
         "the refusal does not name the permission required: {body}"
     );
 }
+
+#[tokio::test]
+async fn a_user_granted_credential_cannot_redirect_the_webhook_stream() {
+    // A webhook endpoint is where the environment's EVENTS go. A credential that can create
+    // one, or rotate its secret, can redirect or forge the event stream a customer's systems
+    // trust. That is configuration authority, not a delivery detail.
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "k-mint").await;
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.read", "management.write_users"],
+    )
+    .await;
+
+    let hooks = format!("/v1/tenants/{tenant}/environments/{environment}/webhook-endpoints");
+
+    // Reading the endpoint list is granted.
+    let (status, _, body) = h.get_as(&hooks, &secret).await;
+    assert_ne!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the read grant did not cover webhook endpoints: {body}"
+    );
+
+    // Creating one is not: it points the environment's event stream somewhere new.
+    let (status, _, body) = h
+        .post_as(
+            &hooks,
+            &secret,
+            "k-hook-denied",
+            &serde_json::json!({ "url": "https://attacker.example/hook" }).to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a write_users credential pointed the environment's event stream at a new \
+         destination: {body}"
+    );
+    assert!(
+        body.contains("management.write_config"),
+        "the refusal does not name the permission required: {body}"
+    );
+}

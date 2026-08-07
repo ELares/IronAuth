@@ -21,7 +21,7 @@ use ironauth_store::{CorrelationId, IdempotencyWrite};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::auth::Principal;
+use crate::auth::{ManagementPermission, Principal};
 use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
 use crate::input::{parse_json, require_non_empty};
@@ -90,6 +90,9 @@ pub async fn list_step_up_policies(
     // environment's policies. A step-up policy names the acr floor guarding a scope, so
     // reading the set tells an attacker exactly which scopes are weakly guarded.
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::Read)?;
     // Deliberately NO liveness fence on the READ. A soft-deleted environment stays
     // READABLE across this surface (only writes refuse it), which
     // `every_environment_scoped_write_refuses_a_soft_deleted_environment` enforces as a
@@ -147,6 +150,9 @@ pub async fn set_step_up_policy(
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_config`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteConfig)?;
     crate::sudo::require_fresh_privilege(&state, scope, principal.actor()).await?;
     require_live_environment(&state, &scope).await?;
 
@@ -215,6 +221,9 @@ pub async fn remove_step_up_policy(
     Path((tenant_id, environment_id, scope_token)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_config`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteConfig)?;
     crate::sudo::require_fresh_privilege(&state, scope, principal.actor()).await?;
     require_live_environment(&state, &scope).await?;
 

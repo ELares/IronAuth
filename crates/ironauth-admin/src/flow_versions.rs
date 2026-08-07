@@ -28,7 +28,7 @@ use ironauth_store::{
     StoreError, validate_journey_artifact,
 };
 
-use crate::auth::Principal;
+use crate::auth::{ManagementPermission, Principal};
 use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
 use crate::input::parse_json;
@@ -166,6 +166,9 @@ pub async fn create_flow_version(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_config`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteConfig)?;
     // Authoring a journey version changes WHICH orchestration a custom flow runs, a
     // security-relevant config surface, so it demands fresh privilege exactly like the other
     // environment-scoped management writes (locales, signup forms).
@@ -275,6 +278,9 @@ pub async fn list_flow_versions(
     Path((tenant_id, environment_id, journey_id)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::Read)?;
     let journey_id = parse_journey_id(&journey_id)?;
     let records = state
         .store()
@@ -316,6 +322,9 @@ pub async fn get_flow_version(
     Path((tenant_id, environment_id, journey_id, version)): Path<(String, String, String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::Read)?;
     let journey_id = parse_journey_id(&journey_id)?;
     let version = parse_version(&version)?;
     let record = state
@@ -366,6 +375,9 @@ pub async fn pin_flow_version(
     Path((tenant_id, environment_id, journey_id, version)): Path<(String, String, String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_config`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteConfig)?;
     // Moving the active pin changes which version a fresh custom flow runs, a security-relevant
     // config surface, so it demands fresh privilege exactly like a version create.
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
