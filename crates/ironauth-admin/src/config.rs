@@ -49,7 +49,7 @@ fn scope_from_path(
     let environment = state
         .store()
         .management()
-        .environments(tenant)
+        .environments(state.bootstrap_operator_id(), tenant)
         .parse_id(environment_id)?;
     Ok((tenant, ironauth_store::Scope::new(tenant, environment)))
 }

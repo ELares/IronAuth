@@ -134,7 +134,7 @@ pub async fn create_project_grant(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     principal.require_permission(ManagementPermission::WriteOrganizations)?;
     require_vendor(&principal)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
@@ -234,7 +234,7 @@ pub async fn list_project_grants(
     principal: Principal,
     Path((tenant_id, environment_id, organization_id)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
-    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     principal.require_permission(ManagementPermission::Read)?;
     require_vendor(&principal)?;
 
@@ -299,7 +299,7 @@ pub async fn withdraw_project_grant(
         String,
     )>,
 ) -> Result<Response, ApiError> {
-    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     principal.require_permission(ManagementPermission::WriteOrganizations)?;
     require_vendor(&principal)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;

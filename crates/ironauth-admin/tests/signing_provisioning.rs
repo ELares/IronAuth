@@ -46,7 +46,11 @@ struct Rig {
 
 impl Rig {
     async fn start(seed: u64) -> Self {
-        let db = TestDatabase::start().await;
+        let mut db = TestDatabase::start().await;
+        // Seed under the operator the management API acts as (issue #185). Each seed
+        // otherwise mints a FRESH operator, so a tenant the harness created would read
+        // as the uniform not-found on the surface under test.
+        db.own_seeded_scopes_by(ironauth_admin::bootstrap_operator_id());
         let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, seed);
         let operator = OperatorId::generate(&env);
         let actor = db.test_actor(&env);

@@ -93,7 +93,7 @@ pub async fn list_queue_depths(
     // No liveness fence on a READ, matching every other read across this surface. A
     // soft-deleted environment's queue depth is precisely what an operator wants to see
     // while deciding whether anything was still in flight when it went away.
-    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): classified `management.read`.
     // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::Read)?;

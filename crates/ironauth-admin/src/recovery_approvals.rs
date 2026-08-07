@@ -39,7 +39,7 @@ use crate::views::{
 
 /// Resolve the (tenant, environment) scope and the acting principal, exactly like the other
 /// per-environment management surfaces.
-fn resolve_scope(
+async fn resolve_scope(
     state: &AdminState,
     principal: &Principal,
     tenant_id: &str,
@@ -53,8 +53,27 @@ fn resolve_scope(
     let environment = state
         .store()
         .management()
-        .environments(tenant)
+        .environments(state.bootstrap_operator_id(), tenant)
         .parse_id(environment_id)?;
+    // Issue #185: the caller's OPERATOR fences the pair. `tenants` and `environments`
+    // sit ABOVE row-level security (RLS fences the pair these tables define), so without
+    // this a caller naming another operator's tenant reached that tenant's environments
+    // and everything under them: measured returning another operator's organization
+    // document in full.
+    //
+    // ADDRESSABILITY, not liveness. A soft-deleted environment must stay readable (see
+    // `EnvironmentAccess`), so this asks only whether the pair exists under this
+    // operator; whether it is live is each endpoint's own question.
+    if !state
+        .store()
+        .management()
+        .environments(state.bootstrap_operator_id(), tenant)
+        .exists_in_any_state(&environment)
+        .await
+        .map_err(|_| ApiError::Internal)?
+    {
+        return Err(ApiError::NotFound);
+    }
     let actor = principal.require_environment(tenant, environment)?;
     Ok((Scope::new(tenant, environment), actor))
 }
@@ -107,7 +126,7 @@ pub async fn list_recovery_approvals(
     if !state.advanced_recovery_enabled() {
         return Err(ApiError::NotFound);
     }
-    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): classified `management.read`.
     // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::Read)?;
@@ -234,7 +253,7 @@ async fn decide(
     if !state.advanced_recovery_enabled() {
         return Err(ApiError::NotFound);
     }
-    let (scope, actor) = resolve_scope(state, principal, tenant_id, environment_id)?;
+    let (scope, actor) = resolve_scope(state, principal, tenant_id, environment_id).await?;
     // Delegated administration (issue #102): classified `management.write_users`.
     // Approving a recovery hands someone back an ACCOUNT, so it is user authority.
     // Enforced in the SHARED body: `approve_recovery_approval` and

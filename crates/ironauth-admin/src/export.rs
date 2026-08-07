@@ -52,7 +52,7 @@ use crate::state::AdminState;
 /// like the user-CRUD surface: the operator passes, a management key must be scoped
 /// to this environment (otherwise the loud wrong-scope error), and a malformed id is
 /// the uniform not-found.
-fn resolve_scope(
+async fn resolve_scope(
     state: &AdminState,
     principal: &Principal,
     tenant_id: &str,
@@ -66,8 +66,27 @@ fn resolve_scope(
     let environment = state
         .store()
         .management()
-        .environments(tenant)
+        .environments(state.bootstrap_operator_id(), tenant)
         .parse_id(environment_id)?;
+    // Issue #185: the caller's OPERATOR fences the pair. `tenants` and `environments`
+    // sit ABOVE row-level security (RLS fences the pair these tables define), so without
+    // this a caller naming another operator's tenant reached that tenant's environments
+    // and everything under them: measured returning another operator's organization
+    // document in full.
+    //
+    // ADDRESSABILITY, not liveness. A soft-deleted environment must stay readable (see
+    // `EnvironmentAccess`), so this asks only whether the pair exists under this
+    // operator; whether it is live is each endpoint's own question.
+    if !state
+        .store()
+        .management()
+        .environments(state.bootstrap_operator_id(), tenant)
+        .exists_in_any_state(&environment)
+        .await
+        .map_err(|_| ApiError::Internal)?
+    {
+        return Err(ApiError::NotFound);
+    }
     let actor = principal.require_environment(tenant, environment)?;
     Ok((Scope::new(tenant, environment), actor))
 }
@@ -101,7 +120,7 @@ pub async fn export_identities(
     principal: Principal,
     Path((tenant_id, environment_id)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): classified `management.read`.
     // READ, but the heaviest one on the surface: it drains every identity in the
     // environment including credential material. It is `management.read` because that

@@ -80,7 +80,7 @@ pub async fn set_client_par_requirement(
     Path((tenant_id, environment_id, client_id)): Path<(String, String, String)>,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): classified `management.write_config`.
     // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::WriteConfig)?;
@@ -172,7 +172,7 @@ pub async fn set_auto_link_posture(
     Path((tenant_id, environment_id)): Path<(String, String)>,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): classified `management.write_config`.
     // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::WriteConfig)?;
@@ -195,7 +195,7 @@ pub async fn set_auto_link_posture(
         .store()
         .management()
         .acting(actor, CorrelationId::generate(state.env()))
-        .environments(scope.tenant())
+        .environments(state.bootstrap_operator_id(), scope.tenant())
         .set_auto_link_posture(
             state.env(),
             &scope.environment(),

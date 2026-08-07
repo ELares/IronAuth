@@ -156,7 +156,7 @@ pub async fn list_secrets(
     Path((tenant_id, environment_id)): Path<(String, String)>,
     Query(query): Query<ListQuery>,
 ) -> Result<Response, ApiError> {
-    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): classified `management.read`.
     // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::Read)?;
@@ -201,7 +201,7 @@ pub async fn get_secret(
     principal: Principal,
     Path((tenant_id, environment_id, name)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
-    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): classified `management.read`.
     // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::Read)?;
@@ -247,7 +247,7 @@ pub async fn set_secret(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): classified `management.write_config`.
     // A secret WRITE is configuration authority: a credential that can seal a
     // value into an environment can change what every connector authenticates
@@ -357,7 +357,7 @@ pub async fn delete_secret(
     principal: Principal,
     Path((tenant_id, environment_id, name)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
-    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): classified `management.write_config`.
     // A secret WRITE is configuration authority: a credential that can seal a
     // value into an environment can change what every connector authenticates

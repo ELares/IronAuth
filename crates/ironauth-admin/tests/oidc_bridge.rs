@@ -77,7 +77,11 @@ impl BridgeHarness {
     }
 
     async fn start_inner(sudo: bool) -> Self {
-        let db = TestDatabase::start().await;
+        let mut db = TestDatabase::start().await;
+        // Seed under the operator the management API acts as (issue #185). Each seed
+        // otherwise mints a FRESH operator, so a tenant the harness created would read
+        // as the uniform not-found on the surface under test.
+        db.own_seeded_scopes_by(ironauth_admin::bootstrap_operator_id());
         let env = Env::system();
         // A throwaway system environment as the admin issuer. Its signing key lives
         // in a PRE-POPULATED registry (the database-free key path), which is exactly
@@ -489,7 +493,11 @@ async fn the_bridge_rejects_everything_when_disarmed() {
     // With no bridge installed (an operator who never armed [admin_spa]), a
     // perfectly valid-looking console token is rejected: no `at+jwt` is accepted at
     // all. This proves the surface is inert by default (fail closed).
-    let db = TestDatabase::start().await;
+    let mut db = TestDatabase::start().await;
+    // Seed under the operator the management API acts as (issue #185). Each seed
+    // otherwise mints a FRESH operator, so a tenant the harness created would read
+    // as the uniform not-found on the surface under test.
+    db.own_seeded_scopes_by(ironauth_admin::bootstrap_operator_id());
     let env = Env::system();
     let admin_scope = Scope::new(TenantId::generate(&env), EnvironmentId::generate(&env));
     let signing_key =

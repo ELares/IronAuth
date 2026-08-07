@@ -341,7 +341,10 @@ async fn set_env_posture(harness: &Harness, posture: Option<&str>) {
         .control_store()
         .management()
         .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
-        .environments(scope.tenant())
+        .environments(
+            harness.db().owning_operator(&scope.tenant()).await,
+            scope.tenant(),
+        )
         .set_auto_link_posture(&env, &env_id, posture)
         .await
         .expect("set posture");

@@ -35,7 +35,7 @@ use crate::views::{LocaleBundleView, SetLocaleRequest};
 /// Resolve and authorize the `(tenant, environment)` scope from the path (issue #86). The
 /// operator passes; a management key must be scoped to exactly this environment (otherwise the
 /// LOUD wrong-scope error). A malformed tenant or environment id is the uniform not-found.
-fn resolve_scope(
+async fn resolve_scope(
     state: &AdminState,
     principal: &Principal,
     tenant_id: &str,
@@ -49,8 +49,27 @@ fn resolve_scope(
     let environment = state
         .store()
         .management()
-        .environments(tenant)
+        .environments(state.bootstrap_operator_id(), tenant)
         .parse_id(environment_id)?;
+    // Issue #185: the caller's OPERATOR fences the pair. `tenants` and `environments`
+    // sit ABOVE row-level security (RLS fences the pair these tables define), so without
+    // this a caller naming another operator's tenant reached that tenant's environments
+    // and everything under them: measured returning another operator's organization
+    // document in full.
+    //
+    // ADDRESSABILITY, not liveness. A soft-deleted environment must stay readable (see
+    // `EnvironmentAccess`), so this asks only whether the pair exists under this
+    // operator; whether it is live is each endpoint's own question.
+    if !state
+        .store()
+        .management()
+        .environments(state.bootstrap_operator_id(), tenant)
+        .exists_in_any_state(&environment)
+        .await
+        .map_err(|_| ApiError::Internal)?
+    {
+        return Err(ApiError::NotFound);
+    }
     let actor = principal.require_environment(tenant, environment)?;
     Ok((Scope::new(tenant, environment), actor))
 }
@@ -170,7 +189,7 @@ pub async fn set_locale(
     Path((tenant_id, environment_id, locale)): Path<(String, String, String)>,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): classified `management.write_config`.
     // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::WriteConfig)?;
@@ -239,7 +258,7 @@ pub async fn get_locale(
     principal: Principal,
     Path((tenant_id, environment_id, locale)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
-    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): classified `management.read`.
     // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::Read)?;
@@ -280,7 +299,7 @@ pub async fn delete_locale(
     principal: Principal,
     Path((tenant_id, environment_id, locale)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
-    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): classified `management.write_config`.
     // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::WriteConfig)?;

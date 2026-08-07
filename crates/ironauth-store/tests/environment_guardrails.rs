@@ -110,7 +110,7 @@ async fn create_environment(
     db.control_store()
         .management()
         .acting(actor(env), CorrelationId::generate(env))
-        .environments(tenant)
+        .environments(db.owning_operator(&tenant).await, tenant)
         .create(
             env,
             &environment_id,
@@ -154,7 +154,7 @@ async fn environment_records_its_typed_kind_and_custom_domain() {
     let record = db
         .control_store()
         .management()
-        .environments(tenant)
+        .environments(db.owning_operator(&tenant).await, tenant)
         .get(&first)
         .await
         .expect("get first environment");
@@ -175,7 +175,7 @@ async fn environment_records_its_typed_kind_and_custom_domain() {
     let record = db
         .control_store()
         .management()
-        .environments(tenant)
+        .environments(db.owning_operator(&tenant).await, tenant)
         .get(&prod)
         .await
         .expect("get prod environment");
@@ -259,7 +259,7 @@ async fn a_foreign_tenant_cannot_see_an_environments_key_or_kind() {
     assert!(matches!(
         db.control_store()
             .management()
-            .environments(tenant_b)
+            .environments(db.owning_operator(&tenant_b).await, tenant_b)
             .get(&env_a)
             .await,
         Err(StoreError::NotFound)
@@ -339,7 +339,7 @@ async fn fifty_plus_environments_create_with_no_count_gate_and_no_schema_growth(
     let listed = db
         .control_store()
         .management()
-        .environments(tenant)
+        .environments(db.owning_operator(&tenant).await, tenant)
         .list(1000, None)
         .await
         .expect("list environments");

@@ -49,6 +49,18 @@ const MANAGEMENT_SCOPE: &str = "ironauth.manage";
 /// with minted identities lands in M5.
 const BOOTSTRAP_SEED: [u8; 16] = [0_u8; 16];
 
+/// The operator id a self-bootstrapping deployment provisions, derived from
+/// [`BOOTSTRAP_SEED`] and therefore identical in every process.
+///
+/// Exposed because a test harness that seeds tenants directly has to give them an owner
+/// the API can actually reach: since issue #185 a tenant owned by anybody else is the
+/// uniform not-found, so a harness minting a fresh operator per scope would build rows
+/// the surface under test cannot see.
+#[must_use]
+pub fn bootstrap_operator_id() -> OperatorId {
+    OperatorId::from_seed_bytes(BOOTSTRAP_SEED)
+}
+
 /// The display name recorded for the bootstrap operator row.
 pub(crate) const BOOTSTRAP_OPERATOR_DISPLAY_NAME: &str = "IronAuth bootstrap operator";
 

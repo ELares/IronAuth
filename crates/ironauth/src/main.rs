@@ -839,7 +839,7 @@ fn resolve_admin_scope(state: &AdminState, tenant_id: &str, environment_id: &str
     let environment = state
         .store()
         .management()
-        .environments(tenant)
+        .environments(state.bootstrap_operator_id(), tenant)
         .parse_id(environment_id)
         .ok()?;
     Some(Scope::new(tenant, environment))

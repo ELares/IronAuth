@@ -71,6 +71,13 @@ const CONTROL_ROLE: &str = "ironauth_control";
 /// `Drop`, so a clone can never pull it out from under a live handle.
 #[derive(Clone)]
 pub struct TestDatabase {
+    /// The operator every seeded scope is owned by, when set.
+    ///
+    /// Each seed otherwise mints a FRESH operator, which since issue #185 makes the
+    /// resulting tenant invisible to any surface acting as a different one. A harness
+    /// driving the management API sets this to that API's own operator so the rows it
+    /// seeds are rows the API can reach.
+    seed_operator: Option<OperatorId>,
     owner_pool: PgPool,
     app_pool: PgPool,
     control_pool: PgPool,
@@ -164,6 +171,7 @@ impl TestDatabase {
         let control_store = Store::from_pool(control_pool.clone()).with_master_key(master.clone());
 
         Self {
+            seed_operator: None,
             owner_pool,
             app_pool,
             control_pool,
@@ -377,13 +385,20 @@ impl TestDatabase {
         kind: &str,
         custom_domain: Option<&str>,
     ) -> Scope {
-        let operator = OperatorId::generate(env);
-        sqlx::query("INSERT INTO operators (id, display_name) VALUES ($1, $2)")
-            .bind(operator.to_string())
-            .bind("test operator")
-            .execute(&self.owner_pool)
-            .await
-            .expect("seed operator");
+        let operator = self
+            .seed_operator
+            .unwrap_or_else(|| OperatorId::generate(env));
+        // Idempotent: when `seed_operator` is set, every seeded scope shares ONE
+        // operator, so the second seed would otherwise collide on the primary key.
+        sqlx::query(
+            "INSERT INTO operators (id, display_name) VALUES ($1, $2) \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(operator.to_string())
+        .bind("test operator")
+        .execute(&self.owner_pool)
+        .await
+        .expect("seed operator");
 
         let tenant = TenantId::generate(env);
         sqlx::query("INSERT INTO tenants (id, operator_id, display_name) VALUES ($1, $2, $3)")
@@ -398,6 +413,34 @@ impl TestDatabase {
             .seed_environment_with_kind(env, tenant, kind, custom_domain)
             .await;
         Scope::new(tenant, environment)
+    }
+
+    /// The operator that owns `tenant`.
+    ///
+    /// Every seeded scope mints its OWN operator, so a test that needs to construct an
+    /// environment repository has to ask rather than assume: since issue #185 that
+    /// repository is fenced by the caller's operator, and guessing the wrong one turns
+    /// every read into the uniform not-found.
+    ///
+    /// # Panics
+    ///
+    /// If no tenant row with that id exists.
+    pub async fn owning_operator(&self, tenant: &TenantId) -> OperatorId {
+        let owner: String = sqlx::query_scalar("SELECT operator_id FROM tenants WHERE id = $1")
+            .bind(tenant.to_string())
+            .fetch_one(&self.owner_pool)
+            .await
+            .expect("read the tenant's owning operator");
+        OperatorId::parse(&owner).expect("a well-formed operator id")
+    }
+
+    /// Own every subsequently seeded scope with `operator` instead of a fresh one.
+    ///
+    /// See [`TestDatabase::seed_operator`]: since issue #185 a tenant owned by an
+    /// operator the caller is not reads as the uniform not-found, so a harness driving a
+    /// surface must seed rows under that surface's OWN operator.
+    pub fn own_seeded_scopes_by(&mut self, operator: OperatorId) {
+        self.seed_operator = Some(operator);
     }
 
     /// Set a scope's data-plane serving state directly, as the owner (issue #46):

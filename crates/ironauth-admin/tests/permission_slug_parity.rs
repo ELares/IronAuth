@@ -628,7 +628,11 @@ async fn postgres_accepts(pool: &PgPool, env: &Env, scope: Scope, slug: &str) ->
 
 #[tokio::test]
 async fn the_rust_validator_and_the_postgres_check_agree_case_by_case() {
-    let db = TestDatabase::start().await;
+    let mut db = TestDatabase::start().await;
+    // Seed under the operator the management API acts as (issue #185). Each seed
+    // otherwise mints a FRESH operator, so a tenant the harness created would read
+    // as the uniform not-found on the surface under test.
+    db.own_seeded_scopes_by(ironauth_admin::bootstrap_operator_id());
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
     let pool = db.control_pool();
@@ -756,7 +760,11 @@ async fn every_slug_the_deployed_permission_check_accepts_is_a_valid_role_slug()
     // a copy agreeing with a copy: a role CHECK that drifted from its Rust twin, or a
     // permission grammar widened past the role charset, would leave the claim standing
     // and false. This file already has a database; the claim is asserted on it.
-    let db = TestDatabase::start().await;
+    let mut db = TestDatabase::start().await;
+    // Seed under the operator the management API acts as (issue #185). Each seed
+    // otherwise mints a FRESH operator, so a tenant the harness created would read
+    // as the uniform not-found on the surface under test.
+    db.own_seeded_scopes_by(ironauth_admin::bootstrap_operator_id());
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
     let pool = db.control_pool();
@@ -824,7 +832,11 @@ async fn the_deployed_check_is_the_grammar_this_issue_specified() {
     // on the RIGHT grammar: two halves widened together would still agree. This pins
     // the deployed constraint text, so a migration edit that changed the rule has to
     // change this line too and say so out loud.
-    let db = TestDatabase::start().await;
+    let mut db = TestDatabase::start().await;
+    // Seed under the operator the management API acts as (issue #185). Each seed
+    // otherwise mints a FRESH operator, so a tenant the harness created would read
+    // as the uniform not-found on the surface under test.
+    db.own_seeded_scopes_by(ironauth_admin::bootstrap_operator_id());
     let pool = db.owner_pool();
 
     let definition: String = sqlx::query(
@@ -862,7 +874,11 @@ async fn the_kind_and_display_name_checks_are_deployed_and_independent() {
     // The parity probe reads any 23514 that does NOT name the slug constraint as a
     // hard failure, which only works if the other two CHECKs are genuinely separate
     // named constraints. This proves they are, and that each refuses on its own.
-    let db = TestDatabase::start().await;
+    let mut db = TestDatabase::start().await;
+    // Seed under the operator the management API acts as (issue #185). Each seed
+    // otherwise mints a FRESH operator, so a tenant the harness created would read
+    // as the uniform not-found on the surface under test.
+    db.own_seeded_scopes_by(ironauth_admin::bootstrap_operator_id());
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
     let pool = db.control_pool();
