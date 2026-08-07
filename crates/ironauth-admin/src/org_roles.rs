@@ -107,7 +107,7 @@ use ironauth_store::{
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::auth::Principal;
+use crate::auth::{ManagementPermission, Principal};
 use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
 use crate::input::{parse_json, require_non_empty, require_slug};
@@ -253,6 +253,9 @@ pub async fn create_org_role(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_organizations`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteOrganizations)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
 
     let key = idempotency::required_key(&headers)?;
@@ -361,6 +364,9 @@ pub async fn list_org_roles(
     Query(query): Query<ListQuery>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::Read)?;
     let org_id = resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Read).await?;
     let page = Pagination::resolve(&query, state.default_page_size(), state.max_page_size())?;
     // `list_for_org` filters on organization_id, so a sibling organization's roles
@@ -413,6 +419,9 @@ pub async fn get_org_role(
     )>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::Read)?;
     let org_id = resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Read).await?;
     let record = require_role_in_org(&state, scope, &org_id, &role_id).await?;
     let body =
@@ -454,6 +463,9 @@ pub async fn update_org_role(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_organizations`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteOrganizations)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     let org_id =
         resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Write).await?;
@@ -522,6 +534,9 @@ pub async fn delete_org_role(
     )>,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_organizations`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteOrganizations)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     let org_id =
         resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Write).await?;
@@ -572,6 +587,9 @@ pub async fn set_org_default_role(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_organizations`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteOrganizations)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     // The ADDRESS of this resource is the ORGANIZATION, and it resolves BEFORE the
     // body is parsed: a caller who cannot reach the organization must not be able to
@@ -643,6 +661,9 @@ pub async fn clear_org_default_role(
     Path((tenant_id, environment_id, organization_id)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_organizations`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteOrganizations)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     let org_id =
         resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Write).await?;

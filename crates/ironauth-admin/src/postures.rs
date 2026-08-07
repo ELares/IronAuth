@@ -28,7 +28,7 @@ use ironauth_store::CorrelationId;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::auth::Principal;
+use crate::auth::{ManagementPermission, Principal};
 use crate::error::{ApiError, ErrorBody};
 use crate::input::parse_json;
 use crate::org_context::{require_live_environment, resolve_scope};
@@ -81,6 +81,9 @@ pub async fn set_client_par_requirement(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_config`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteConfig)?;
     // Tightening or relaxing an authorization-request control is exactly the class of
     // change sudo mode exists for.
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
@@ -170,6 +173,9 @@ pub async fn set_auto_link_posture(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_config`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteConfig)?;
     // Account linking decides when two identities from different sources become ONE
     // account, so loosening it is a privileged change.
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;

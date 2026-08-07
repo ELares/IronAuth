@@ -106,7 +106,7 @@ use ironauth_store::{EffectiveRoleGrant, EffectiveRoleSource};
 use serde::Serialize;
 use utoipa::ToSchema;
 
-use crate::auth::Principal;
+use crate::auth::{ManagementPermission, Principal};
 use crate::error::{ApiError, ErrorBody};
 use crate::org_context::{
     EnvironmentAccess, require_membership_in_org, resolve_live_org, resolve_scope,
@@ -446,6 +446,9 @@ pub async fn get_org_membership_effective_roles(
     )>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::Read)?;
     let org_id = resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Read).await?;
     // The membership is resolved in THIS organization first: a membership of a
     // sibling organization is the uniform not-found, so this view can never report a

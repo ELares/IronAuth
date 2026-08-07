@@ -540,3 +540,78 @@ async fn a_user_granted_credential_cannot_redirect_the_webhook_stream() {
         "the refusal does not name the permission required: {body}"
     );
 }
+
+#[tokio::test]
+async fn a_credential_with_no_read_grant_cannot_export_identities_or_manage_org_roles() {
+    // `exportIdentities` drains every identity in the environment, credential material
+    // included. It is classified `management.read` because that is honestly what it is, and
+    // the consequence is worth stating: a persona that must not be able to export the
+    // environment must not hold `read` at all. There is no narrower read today.
+    //
+    // A write-only credential is the case that shows it: it can create users and cannot read
+    // them back, nor export them.
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "k-mint").await;
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_users"],
+    )
+    .await;
+
+    let base = format!("/v1/tenants/{tenant}/environments/{environment}");
+
+    // It holds write_users, so creating a user works.
+    let (status, _, body) = h
+        .post_as(
+            &format!("{base}/users"),
+            &secret,
+            "k-user",
+            &serde_json::json!({ "identifier": "writeonly@example.test" }).to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "the write grant does not work: {body}"
+    );
+
+    // It does not hold read, so the export is refused.
+    let (status, _, body) = h.get_as(&format!("{base}/export"), &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a credential with no read grant EXPORTED every identity in the environment: {body}"
+    );
+
+    // Nor may it create an organization ROLE, which would let it grant permissions inside an
+    // organization it has no authority over.
+    let (status, _, created) = h
+        .post(
+            &format!("{base}/organizations"),
+            "k-org",
+            &serde_json::json!({ "display_name": "Target" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "seed org: {created}");
+    let org_id = serde_json::from_str::<Value>(&created).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    let (status, _, body) = h
+        .post_as(
+            &format!("{base}/organizations/{org_id}/roles"),
+            &secret,
+            "k-role",
+            &serde_json::json!({ "slug": "admin", "display_name": "Admin" }).to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a write_users credential created an organization ROLE: {body}"
+    );
+}
