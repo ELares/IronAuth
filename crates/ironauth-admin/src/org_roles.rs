@@ -270,8 +270,14 @@ pub async fn create_org_role(
         return Ok(replay);
     }
 
-    let org_id =
-        resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Write).await?;
+    let org_id = resolve_live_org(
+        &state,
+        &principal,
+        scope,
+        &organization_id,
+        EnvironmentAccess::Write,
+    )
+    .await?;
 
     let request: CreateOrgRoleRequest = parse_json(&body)?;
     let slug = require_slug(&request.slug, "slug")?;
@@ -367,7 +373,14 @@ pub async fn list_org_roles(
     // Delegated administration (issue #102): classified `management.read`.
     // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::Read)?;
-    let org_id = resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Read).await?;
+    let org_id = resolve_live_org(
+        &state,
+        &principal,
+        scope,
+        &organization_id,
+        EnvironmentAccess::Read,
+    )
+    .await?;
     let page = Pagination::resolve(&query, state.default_page_size(), state.max_page_size())?;
     // `list_for_org` filters on organization_id, so a sibling organization's roles
     // can never appear on this page.
@@ -422,7 +435,14 @@ pub async fn get_org_role(
     // Delegated administration (issue #102): classified `management.read`.
     // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::Read)?;
-    let org_id = resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Read).await?;
+    let org_id = resolve_live_org(
+        &state,
+        &principal,
+        scope,
+        &organization_id,
+        EnvironmentAccess::Read,
+    )
+    .await?;
     let record = require_role_in_org(&state, scope, &org_id, &role_id).await?;
     let body =
         serde_json::to_string(&OrgRoleView::from_record(record)).map_err(|_| ApiError::Internal)?;
@@ -467,8 +487,14 @@ pub async fn update_org_role(
     // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::WriteOrganizations)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
-    let org_id =
-        resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Write).await?;
+    let org_id = resolve_live_org(
+        &state,
+        &principal,
+        scope,
+        &organization_id,
+        EnvironmentAccess::Write,
+    )
+    .await?;
     // The cross-parent guard, BEFORE the write: a role of a sibling organization
     // presented under this organization's path is the uniform not-found, so the
     // nested path can never rename another organization's role. `organization_id`
@@ -538,8 +564,14 @@ pub async fn delete_org_role(
     // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::WriteOrganizations)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
-    let org_id =
-        resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Write).await?;
+    let org_id = resolve_live_org(
+        &state,
+        &principal,
+        scope,
+        &organization_id,
+        EnvironmentAccess::Write,
+    )
+    .await?;
     // The cross-parent guard: deleting a sibling organization's role through this
     // path is the uniform not-found and removes nothing.
     let record = require_role_in_org(&state, scope, &org_id, &role_id).await?;
@@ -594,8 +626,14 @@ pub async fn set_org_default_role(
     // The ADDRESS of this resource is the ORGANIZATION, and it resolves BEFORE the
     // body is parsed: a caller who cannot reach the organization must not be able to
     // tell a body this endpoint would refuse from one it would accept.
-    let org_id =
-        resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Write).await?;
+    let org_id = resolve_live_org(
+        &state,
+        &principal,
+        scope,
+        &organization_id,
+        EnvironmentAccess::Write,
+    )
+    .await?;
 
     let request: SetOrgDefaultRoleRequest = parse_json(&body)?;
     // Parse ONLY. Whether the id names a live role OF THIS ORGANIZATION is the
@@ -665,8 +703,14 @@ pub async fn clear_org_default_role(
     // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::WriteOrganizations)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
-    let org_id =
-        resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Write).await?;
+    let org_id = resolve_live_org(
+        &state,
+        &principal,
+        scope,
+        &organization_id,
+        EnvironmentAccess::Write,
+    )
+    .await?;
     // The store resolves the outgoing role IN THE SAME STATEMENT that clears it, so
     // there is nothing to name here and no second read to race against. An
     // organization with no live default matches no row and is the uniform not-found.

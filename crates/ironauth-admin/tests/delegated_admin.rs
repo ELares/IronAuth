@@ -30,6 +30,21 @@ async fn mint_key(h: &Harness, tenant: &str, environment: &str, idem: &str) -> (
     )
 }
 
+/// Confine `key_id` to one organization.
+async fn confine(h: &Harness, tenant: &str, environment: &str, key_id: &str, org: &str) {
+    sqlx::query(
+        "UPDATE management_credentials SET organization_id = $1 \
+         WHERE id = $2 AND tenant_id = $3 AND environment_id = $4",
+    )
+    .bind(org)
+    .bind(key_id)
+    .bind(tenant)
+    .bind(environment)
+    .execute(h.db().owner_pool())
+    .await
+    .expect("write the confinement");
+}
+
 /// Restrict `key_id` to exactly `slugs`.
 async fn restrict(h: &Harness, tenant: &str, environment: &str, key_id: &str, slugs: &[&str]) {
     sqlx::query(
@@ -613,5 +628,139 @@ async fn a_credential_with_no_read_grant_cannot_export_identities_or_manage_org_
         status,
         StatusCode::FORBIDDEN,
         "a write_users credential created an organization ROLE: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_confined_credential_reaches_its_own_organization_and_no_other() {
+    // Issue #102 criterion 2. Permissions say WHAT a credential may do; confinement says
+    // WHERE. Without the second dimension a credential granted `write_organizations` may
+    // write EVERY organization in the environment, so an "org admin" persona was not
+    // expressible at all.
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let base = format!("/v1/tenants/{tenant}/environments/{environment}");
+    let orgs = format!("{base}/organizations");
+
+    // Two organizations, both real, so the refusal below is about MEMBERSHIP of the
+    // confinement rather than about the sibling not existing.
+    let mut ids = Vec::new();
+    for (n, name) in ["Mine", "Theirs"].into_iter().enumerate() {
+        let (status, _, created) = h
+            .post(
+                &orgs,
+                &format!("k-org-{n}"),
+                &serde_json::json!({ "display_name": name }).to_string(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "seed {name}: {created}");
+        ids.push(
+            serde_json::from_str::<Value>(&created).expect("json")["id"]
+                .as_str()
+                .expect("id")
+                .to_owned(),
+        );
+    }
+    let (mine, theirs) = (&ids[0], &ids[1]);
+
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "k-mint").await;
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.read", "management.write_organizations"],
+    )
+    .await;
+    confine(&h, &tenant, &environment, &key_id, mine).await;
+
+    // Its OWN organization is reachable, and it holds the permission, so this works.
+    let (status, _, body) = h
+        .post_as(
+            &format!("{orgs}/{mine}/roles"),
+            &secret,
+            "k-mine-role",
+            &serde_json::json!({ "slug": "auditor", "display_name": "Auditor" }).to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "a confined credential was refused inside its OWN organization: {body}"
+    );
+
+    // The sibling is NOT reachable, despite holding the same permission.
+    let (status, _, body) = h
+        .post_as(
+            &format!("{orgs}/{theirs}/roles"),
+            &secret,
+            "k-theirs-role",
+            &serde_json::json!({ "slug": "auditor", "display_name": "Auditor" }).to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a credential confined to one organization reached a SIBLING: permissions alone do \
+         not bound reach, which is why confinement is a separate dimension. Body: {body}"
+    );
+
+    // NOT-FOUND rather than 403, deliberately. A 403 would confirm the sibling EXISTS, so a
+    // confined credential could enumerate the environment's organizations by comparing
+    // statuses. Reading the sibling must be equally uninformative.
+    let (status, _, body) = h.get_as(&format!("{orgs}/{theirs}"), &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "reading a sibling organization did not answer the uniform not-found, so a confined \
+         credential can enumerate what it may not reach: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_confinement_that_will_not_parse_denies_the_credential_rather_than_widening_it() {
+    // The failure direction that matters. A confinement column holding an id this scope
+    // cannot parse (a foreign tenant's organization, or corruption) has two possible
+    // readings: treat it as ABSENT, which silently converts a confined credential into one
+    // with environment-wide reach, or refuse the credential.
+    //
+    // Refusing is the only safe reading. A credential must never end up with MORE authority
+    // than its row claims, and "I could not understand the restriction" is not a licence to
+    // ignore it. This is the same rule the grant parser follows for an unknown permission
+    // slug, in the same direction.
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "k-mint").await;
+
+    // The credential works before the confinement is corrupted.
+    let users = format!("/v1/tenants/{tenant}/environments/{environment}/users");
+    let (status, _, body) = h.get_as(&users, &secret).await;
+    assert_eq!(status, StatusCode::OK, "the key works unconfined: {body}");
+
+    // A confinement the foreign key accepts (a real organization) but which this SCOPE
+    // cannot parse is the hard case, so write a syntactically impossible one directly. The
+    // foreign key is deferred to the end of the statement, so this uses a raw update against
+    // a value that will fail `parse_in_scope`.
+    sqlx::query(
+        "ALTER TABLE management_credentials DROP CONSTRAINT management_credentials_organization_fk",
+    )
+    .execute(h.db().owner_pool())
+    .await
+    .expect("drop the fk for this probe");
+    confine(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        "org_not_a_real_scoped_identifier",
+    )
+    .await;
+
+    let (status, _, body) = h.get_as(&users, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a credential whose confinement could not be parsed AUTHENTICATED, and did so with \
+         environment-wide reach: an unreadable restriction became no restriction. Body: {body}"
     );
 }

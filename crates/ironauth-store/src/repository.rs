@@ -40681,9 +40681,13 @@ impl ManagementCredentialRepo<'_> {
 
     /// Authenticate a management credential AND return its grants (issue #102).
     ///
-    /// `None` means the credential did not authenticate. `Some(None)` means it authenticated
-    /// and is UNRESTRICTED, which is every credential minted before migration 0118 and the
-    /// reason that column is nullable. `Some(Some(slugs))` is a restricted credential.
+    /// `None` means the credential did not authenticate. Otherwise the pair is
+    /// `(permissions, organization)`, each independently optional: `None` permissions is
+    /// UNRESTRICTED and `None` organization is UNCONFINED, which is every credential minted
+    /// before migrations 0118 and 0119 and the reason both columns are nullable.
+    ///
+    /// The two are separate dimensions. A credential may be restricted but unconfined, confined
+    /// but unrestricted, both, or neither.
     ///
     /// The slugs are returned RAW rather than parsed here, because the permission vocabulary
     /// is an `ironauth-admin` concept: the store persists what it was given, and the plane
@@ -40698,13 +40702,13 @@ impl ManagementCredentialRepo<'_> {
         &self,
         id: &ManagementKeyId,
         key_hash: &str,
-    ) -> Result<Option<Option<Vec<String>>>, StoreError> {
+    ) -> Result<Option<(Option<Vec<String>>, Option<String>)>, StoreError> {
         if id.scope() != self.scope {
             return Ok(None);
         }
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
-            "SELECT mc.permissions FROM management_credentials mc \
+            "SELECT mc.permissions, mc.organization_id FROM management_credentials mc \
              JOIN environments e ON e.id = mc.environment_id AND e.tenant_id = mc.tenant_id \
              JOIN tenants t ON t.id = mc.tenant_id \
              WHERE mc.id = $1 AND mc.tenant_id = $2 AND mc.environment_id = $3 \
@@ -40718,7 +40722,12 @@ impl ManagementCredentialRepo<'_> {
         .fetch_optional(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(row.map(|row| row.get::<Option<Vec<String>>, _>("permissions")))
+        Ok(row.map(|row| {
+            (
+                row.get::<Option<Vec<String>>, _>("permissions"),
+                row.get::<Option<String>, _>("organization_id"),
+            )
+        }))
     }
 }
 

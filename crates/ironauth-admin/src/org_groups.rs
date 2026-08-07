@@ -267,8 +267,14 @@ pub async fn create_org_group(
         return Ok(replay);
     }
 
-    let org_id =
-        resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Write).await?;
+    let org_id = resolve_live_org(
+        &state,
+        &principal,
+        scope,
+        &organization_id,
+        EnvironmentAccess::Write,
+    )
+    .await?;
 
     let request: CreateOrgGroupRequest = parse_json(&body)?;
     let slug = require_slug(&request.slug, "slug")?;
@@ -368,7 +374,14 @@ pub async fn list_org_groups(
     // Delegated administration (issue #102): classified `management.read`.
     // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::Read)?;
-    let org_id = resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Read).await?;
+    let org_id = resolve_live_org(
+        &state,
+        &principal,
+        scope,
+        &organization_id,
+        EnvironmentAccess::Read,
+    )
+    .await?;
     let page = Pagination::resolve(&query, state.default_page_size(), state.max_page_size())?;
     // `list_for_org` filters on organization_id, so a sibling organization's groups
     // can never appear on this page.
@@ -423,7 +436,14 @@ pub async fn get_org_group(
     // Delegated administration (issue #102): classified `management.read`.
     // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::Read)?;
-    let org_id = resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Read).await?;
+    let org_id = resolve_live_org(
+        &state,
+        &principal,
+        scope,
+        &organization_id,
+        EnvironmentAccess::Read,
+    )
+    .await?;
     let id = parse_group_id(&state, scope, &group_id)?;
     let record = read_group_in_org(&state, scope, &org_id, &id).await?;
     let body = serde_json::to_string(&OrgGroupView::from_record(record))
@@ -470,8 +490,14 @@ pub async fn update_org_group(
     // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::WriteOrganizations)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
-    let org_id =
-        resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Write).await?;
+    let org_id = resolve_live_org(
+        &state,
+        &principal,
+        scope,
+        &organization_id,
+        EnvironmentAccess::Write,
+    )
+    .await?;
     let id = parse_group_id(&state, scope, &group_id)?;
 
     let request: UpdateOrgGroupRequest = parse_json(&body)?;
@@ -552,8 +578,14 @@ pub async fn set_org_group_parent(
     // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::WriteOrganizations)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
-    let org_id =
-        resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Write).await?;
+    let org_id = resolve_live_org(
+        &state,
+        &principal,
+        scope,
+        &organization_id,
+        EnvironmentAccess::Write,
+    )
+    .await?;
     let id = parse_group_id(&state, scope, &group_id)?;
 
     let request: SetOrgGroupParentRequest = parse_json(&body)?;
@@ -620,8 +652,14 @@ pub async fn delete_org_group(
     // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::WriteOrganizations)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
-    let org_id =
-        resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Write).await?;
+    let org_id = resolve_live_org(
+        &state,
+        &principal,
+        scope,
+        &organization_id,
+        EnvironmentAccess::Write,
+    )
+    .await?;
     let id = parse_group_id(&state, scope, &group_id)?;
     // The organization rides into the DELETE statement as a predicate: a group of a
     // sibling organization matches no row, is the uniform not-found, and is not

@@ -17,7 +17,7 @@
 use axum::extract::FromRequestParts;
 use axum::http::header;
 use axum::http::request::Parts;
-use ironauth_store::{ActorRef, EnvironmentId, Scope, TenantId};
+use ironauth_store::{ActorRef, EnvironmentId, OrganizationId, Scope, TenantId};
 
 use crate::error::ApiError;
 use crate::state::AdminState;
@@ -149,6 +149,18 @@ pub enum Principal {
         /// credential that may do nothing is indistinguishable from a revoked one, and
         /// revocation already has its own expression.
         grants: Option<ManagementGrants>,
+        /// The ONE organization this credential may act within (issue #102), or [`None`] for a
+        /// credential with environment-wide reach.
+        ///
+        /// A second, INDEPENDENT dimension from `grants`. Permissions say what a credential may
+        /// do; this says where. Both are needed for #102's org-admin persona, which is defined
+        /// by holding organizational permissions AND being unable to reach any organization but
+        /// its own: a credential granted `write_organizations` with no confinement may write
+        /// EVERY organization in the environment.
+        ///
+        /// [`None`] is UNCONFINED for the same reason `grants: None` is unrestricted: migration
+        /// 0119 adds the column NULL, so no existing credential loses reach at upgrade.
+        organization: Option<OrganizationId>,
     },
 }
 
@@ -223,6 +235,36 @@ impl Principal {
                         permission.as_slug()
                     ),
                 }),
+            },
+        }
+    }
+
+    /// Require that this principal may act within `organization` (issue #102).
+    ///
+    /// The OPERATOR always passes, and an UNCONFINED management key always passes. A CONFINED
+    /// key passes only for the organization it is confined to.
+    ///
+    /// The refusal is the uniform NOT-FOUND, not the 403 that `require_permission` answers,
+    /// and the difference is deliberate. A permission refusal tells a credential it lacks an
+    /// authority it could be granted, which is useful and leaks nothing. A confinement refusal
+    /// would tell it that some OTHER organization exists, so a confined credential could
+    /// enumerate the environment's organizations by comparing 403 against 404. Answering
+    /// not-found makes an organization it may not reach indistinguishable from one that does
+    /// not exist, which is the same anti-oracle rule the rest of this crate follows.
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::NotFound`] when a confined key names a different organization.
+    pub fn require_organization(&self, organization: &OrganizationId) -> Result<(), ApiError> {
+        match self {
+            Principal::Operator { .. } => Ok(()),
+            Principal::ManagementKey {
+                organization: confined,
+                ..
+            } => match confined {
+                None => Ok(()),
+                Some(allowed) if allowed == organization => Ok(()),
+                Some(_) => Err(ApiError::NotFound),
             },
         }
     }
@@ -476,6 +518,7 @@ mod grant_tests {
             scope,
             actor,
             grants: None,
+            organization: None,
         };
         for permission in ManagementPermission::ALL {
             assert!(
@@ -489,6 +532,7 @@ mod grant_tests {
             scope,
             actor,
             grants: Some(ManagementGrants::empty().insert(ManagementPermission::Read)),
+            organization: None,
         };
         assert!(
             restricted
@@ -520,6 +564,7 @@ mod grant_tests {
                     .insert(ManagementPermission::WriteUsers)
                     .insert(ManagementPermission::WriteConfig),
             ),
+            organization: None,
         };
         let refusal = restricted
             .require_permission(ManagementPermission::WriteCredentials)

@@ -246,8 +246,14 @@ pub async fn assign_org_group_role(
         return Ok(replay);
     }
 
-    let org_id =
-        resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Write).await?;
+    let org_id = resolve_live_org(
+        &state,
+        &principal,
+        scope,
+        &organization_id,
+        EnvironmentAccess::Write,
+    )
+    .await?;
     let group = parse_group_id(&state, scope, &group_id)?;
 
     let request: AssignOrgGroupRoleRequest = parse_json(&body)?;
@@ -343,7 +349,14 @@ pub async fn list_org_group_roles(
     // Delegated administration (issue #102): classified `management.read`.
     // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::Read)?;
-    let org_id = resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Read).await?;
+    let org_id = resolve_live_org(
+        &state,
+        &principal,
+        scope,
+        &organization_id,
+        EnvironmentAccess::Read,
+    )
+    .await?;
     // The group is resolved as a live group of THIS organization first, so a group
     // of a sibling organization is the same 404 that reading the group itself gives,
     // rather than an empty page asserting it exists here and grants nothing.
@@ -403,8 +416,14 @@ pub async fn unassign_org_group_role(
     // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::WriteOrganizations)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
-    let org_id =
-        resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Write).await?;
+    let org_id = resolve_live_org(
+        &state,
+        &principal,
+        scope,
+        &organization_id,
+        EnvironmentAccess::Write,
+    )
+    .await?;
     let group = parse_group_id(&state, scope, &group_id)?;
     let role = parse_role_id(&state, scope, &role_id)?;
 
@@ -485,8 +504,14 @@ pub async fn assign_org_membership_role(
         return Ok(replay);
     }
 
-    let org_id =
-        resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Write).await?;
+    let org_id = resolve_live_org(
+        &state,
+        &principal,
+        scope,
+        &organization_id,
+        EnvironmentAccess::Write,
+    )
+    .await?;
     let membership = parse_membership_id(&state, scope, &membership_id)?;
 
     let request: AssignOrgMembershipRoleRequest = parse_json(&body)?;
@@ -578,7 +603,14 @@ pub async fn list_org_membership_roles(
     // Delegated administration (issue #102): classified `management.read`.
     // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::Read)?;
-    let org_id = resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Read).await?;
+    let org_id = resolve_live_org(
+        &state,
+        &principal,
+        scope,
+        &organization_id,
+        EnvironmentAccess::Read,
+    )
+    .await?;
     // The membership is resolved as a live membership of THIS organization first,
     // for the same reason the group lists resolve their group: a membership of a
     // sibling organization is the same 404 that removing it through this path gives.
@@ -641,8 +673,14 @@ pub async fn unassign_org_membership_role(
     // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::WriteOrganizations)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
-    let org_id =
-        resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Write).await?;
+    let org_id = resolve_live_org(
+        &state,
+        &principal,
+        scope,
+        &organization_id,
+        EnvironmentAccess::Write,
+    )
+    .await?;
     let membership = parse_membership_id(&state, scope, &membership_id)?;
     let role = parse_role_id(&state, scope, &role_id)?;
 

@@ -101,8 +101,14 @@ pub async fn create_membership(
         return Ok(replay);
     }
 
-    let org_id =
-        resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Write).await?;
+    let org_id = resolve_live_org(
+        &state,
+        &principal,
+        scope,
+        &organization_id,
+        EnvironmentAccess::Write,
+    )
+    .await?;
 
     let request: CreateMembershipRequest = parse_json(&body)?;
     // The member must be a user in THIS scope; a malformed or cross-scope id is the
@@ -205,7 +211,14 @@ pub async fn list_memberships(
     // Delegated administration (issue #102): classified `management.read`.
     // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::Read)?;
-    let org_id = resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Read).await?;
+    let org_id = resolve_live_org(
+        &state,
+        &principal,
+        scope,
+        &organization_id,
+        EnvironmentAccess::Read,
+    )
+    .await?;
     let page = Pagination::resolve(&query, state.default_page_size(), state.max_page_size())?;
     let rows = state
         .store()
@@ -261,8 +274,14 @@ pub async fn delete_membership(
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     // The parent organization must resolve in scope (a cross-scope org path segment is
     // the uniform not-found), keeping the nested resource consistent.
-    let org_id =
-        resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Write).await?;
+    let org_id = resolve_live_org(
+        &state,
+        &principal,
+        scope,
+        &organization_id,
+        EnvironmentAccess::Write,
+    )
+    .await?;
     let memberships = state.store().management().org_memberships(scope);
     let id = memberships.parse_id(&membership_id)?;
     // Enforce the NESTED resource: the membership must belong to THIS organization. A

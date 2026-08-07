@@ -274,6 +274,7 @@ pub enum EnvironmentAccess {
 /// soft-deleted.
 pub async fn resolve_live_org(
     state: &AdminState,
+    principal: &Principal,
     scope: Scope,
     organization_id: &str,
     access: EnvironmentAccess,
@@ -310,6 +311,15 @@ pub async fn resolve_live_org(
     let organizations = state.store().management().organizations(scope);
     let id = organizations.parse_id(organization_id)?;
     organizations.get(&id).await?;
+    // Delegated administration (issue #102): a CONFINED management credential may act only
+    // within its own organization. Enforced HERE, in the one resolver the whole organization
+    // surface passes through (33 call sites), rather than per handler: a per-handler rule is
+    // one the 34th handler forgets, and forgetting it is silent.
+    //
+    // It runs AFTER the existence read on purpose, so a confined credential and an
+    // unconfined one see the same not-found for an organization that does not exist. Running
+    // it first would make "absent" and "not yours" distinguishable by timing alone.
+    principal.require_organization(&id)?;
     Ok(id)
 }
 

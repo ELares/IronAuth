@@ -1004,6 +1004,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0118_management_credential_grants.sql"),
         },
+        Migration {
+            version: 119,
+            name: "management_credential_org_confinement",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0119_management_credential_org_confinement.sql"),
+        },
     ]
 }
 
