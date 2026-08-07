@@ -329,3 +329,60 @@ async fn a_user_granted_credential_cannot_change_who_belongs_to_an_organization(
         "the refusal does not name the permission required: {body}"
     );
 }
+
+#[tokio::test]
+async fn a_read_only_credential_cannot_invite_or_ban() {
+    // Both operations are easy to under-classify. An invitation looks like "send an email"
+    // and a ban looks like a moderation action, but the first PROVISIONS an identity plus a
+    // single-use token, and the second denies a real person access. Each is user authority.
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "k-mint").await;
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+
+    let base = format!("/v1/tenants/{tenant}/environments/{environment}");
+
+    // Reading both surfaces is granted.
+    for path in [format!("{base}/invitations"), format!("{base}/abuse/bans")] {
+        let (status, _, body) = h.get_as(&path, &secret).await;
+        assert_ne!(
+            status,
+            StatusCode::FORBIDDEN,
+            "the read grant did not cover {path}: {body}"
+        );
+    }
+
+    // Inviting is not: whoever may invite may populate the environment.
+    let (status, _, body) = h
+        .post_as(
+            &format!("{base}/invitations"),
+            &secret,
+            "k-invite",
+            &serde_json::json!({ "identifier": "invitee@example.test" }).to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read-only credential PROVISIONED an identity through an invitation: {body}"
+    );
+    assert!(
+        body.contains("management.write_users"),
+        "the refusal does not name the permission required: {body}"
+    );
+
+    // Nor is banning: it denies a real person access to the environment.
+    let (status, _, body) = h
+        .post_as(
+            &format!("{base}/abuse/bans"),
+            &secret,
+            "k-ban",
+            &serde_json::json!({ "subject_kind": "ip", "subject": "203.0.113.7" }).to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read-only credential created a BAN: {body}"
+    );
+}

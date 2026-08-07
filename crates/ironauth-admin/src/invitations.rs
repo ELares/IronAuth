@@ -45,7 +45,7 @@ use ironauth_store::{
 use serde::Deserialize;
 use utoipa::IntoParams;
 
-use crate::auth::Principal;
+use crate::auth::{ManagementPermission, Principal};
 use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
 use crate::input::{parse_json, require_non_empty};
@@ -153,6 +153,12 @@ pub async fn create_invitation(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_users`.
+    // An invitation PROVISIONS a user (a pending_verification identity plus a
+    // single-use token), so it is user authority and not a lesser 'send an email'
+    // operation: whoever may invite may populate the environment.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteUsers)?;
     // Sudo mutation gate (issue #73): creating an invitation provisions a pending user
     // and mints a token. Gate before the idempotency replay so a challenge writes nothing.
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
@@ -363,6 +369,9 @@ pub async fn list_invitations(
     Query(query): Query<ListQuery>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::Read)?;
     let page = Pagination::resolve(&query, state.default_page_size(), state.max_page_size())?;
     let rows = state
         .store()
@@ -412,6 +421,9 @@ pub async fn get_invitation(
     Path((tenant_id, environment_id, invitation_id)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::Read)?;
     let id = parse_invitation_id(scope, &invitation_id)?;
     let record = state.store().scoped(scope).invitations().get(&id).await?;
     let body = serde_json::to_string(&InvitationView::from_record(record))
@@ -449,6 +461,12 @@ pub async fn revoke_invitation(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_users`.
+    // An invitation PROVISIONS a user (a pending_verification identity plus a
+    // single-use token), so it is user authority and not a lesser 'send an email'
+    // operation: whoever may invite may populate the environment.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteUsers)?;
     // Sudo mutation gate (issue #73): revoking an invitation is an environment-scoped
     // mutation. Gate before the idempotency replay so a challenge writes nothing.
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
@@ -531,6 +549,12 @@ pub async fn resend_invitation(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_users`.
+    // An invitation PROVISIONS a user (a pending_verification identity plus a
+    // single-use token), so it is user authority and not a lesser 'send an email'
+    // operation: whoever may invite may populate the environment.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteUsers)?;
     // Sudo mutation gate (issue #73): resending an invitation invalidates the prior
     // token and issues a fresh one. Gate before the idempotency replay so a challenge
     // writes nothing.
