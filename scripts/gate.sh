@@ -11,6 +11,9 @@ cd "$(git rev-parse --show-toplevel)"
 echo "==> fmt"
 cargo fmt --all --check
 
+echo "==> msrv audit (no dependency declares a rust-version above the workspace MSRV)"
+./scripts/msrv-audit.sh
+
 echo "==> clippy (pedantic, -D warnings)"
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 
