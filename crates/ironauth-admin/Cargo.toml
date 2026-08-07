@@ -125,6 +125,11 @@ path = "tests/operator_isolation.rs"
 required-features = ["testing"]
 
 [[test]]
+name = "delegated_scope_levels"
+path = "tests/delegated_scope_levels.rs"
+required-features = ["testing"]
+
+[[test]]
 name = "management_permissions"
 path = "tests/management_permissions.rs"
 
