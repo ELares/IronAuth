@@ -40,7 +40,7 @@ use ironauth_store::{
     ResolvedIdempotencyWrite, StoreError,
 };
 
-use crate::auth::Principal;
+use crate::auth::{ManagementPermission, Principal};
 use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
 use crate::input::{parse_json, require_non_empty};
@@ -82,6 +82,10 @@ pub async fn create_organization(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_organizations`.
+    // An UNRESTRICTED credential (every key minted before migration 0118) passes
+    // unchanged; this only binds a credential someone deliberately restricted.
+    principal.require_permission(ManagementPermission::WriteOrganizations)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
 
     let key = idempotency::required_key(&headers)?;
@@ -179,6 +183,10 @@ pub async fn list_organizations(
     Query(query): Query<ListQuery>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // An UNRESTRICTED credential (every key minted before migration 0118) passes
+    // unchanged; this only binds a credential someone deliberately restricted.
+    principal.require_permission(ManagementPermission::Read)?;
     let page = Pagination::resolve(&query, state.default_page_size(), state.max_page_size())?;
     let rows = state
         .store()
@@ -225,6 +233,10 @@ pub async fn get_organization(
     Path((tenant_id, environment_id, organization_id)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // An UNRESTRICTED credential (every key minted before migration 0118) passes
+    // unchanged; this only binds a credential someone deliberately restricted.
+    principal.require_permission(ManagementPermission::Read)?;
     // Addressed through the shared resolution like every other route under this prefix
     // (issue #411), with [`EnvironmentAccess::Read`]: a decommissioned environment stays
     // auditable, so this read is deliberately NOT behind the environment fence. It
@@ -272,6 +284,10 @@ pub async fn delete_organization(
     Path((tenant_id, environment_id, organization_id)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_organizations`.
+    // An UNRESTRICTED credential (every key minted before migration 0118) passes
+    // unchanged; this only binds a credential someone deliberately restricted.
+    principal.require_permission(ManagementPermission::WriteOrganizations)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     // Addressed through the SAME resolution every other organization-nested write uses
     // (issue #411), which is what puts this route behind the one environment fence
@@ -318,6 +334,11 @@ async fn set_organization_state(
         headers,
     } = toggle;
     let (scope, actor) = resolve_scope(state, principal, tenant_id, environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_organizations`.
+    // Enforced in the SHARED body rather than in `disable_organization` and
+    // `enable_organization` separately: two copies of one rule is one place to forget it,
+    // and a third state added later would inherit the check for free.
+    principal.require_permission(ManagementPermission::WriteOrganizations)?;
     crate::sudo::require_fresh_privilege(state, scope, actor).await?;
     // The same shared resolution the delete above uses (issue #411). It replaces a bare
     // `parse_id`, and the read it adds is one this handler already performed at the end

@@ -82,6 +82,27 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     ("deleteUser", ManagementPermission::WriteUsers),
     ("listUsers", ManagementPermission::Read),
     ("getUser", ManagementPermission::Read),
+    // The organization surface. `disableOrganization` and `enableOrganization` are enforced in
+    // their SHARED body, so both carry the same requirement by construction rather than by two
+    // edits staying in agreement.
+    (
+        "createOrganization",
+        ManagementPermission::WriteOrganizations,
+    ),
+    (
+        "deleteOrganization",
+        ManagementPermission::WriteOrganizations,
+    ),
+    (
+        "disableOrganization",
+        ManagementPermission::WriteOrganizations,
+    ),
+    (
+        "enableOrganization",
+        ManagementPermission::WriteOrganizations,
+    ),
+    ("listOrganizations", ManagementPermission::Read),
+    ("getOrganization", ManagementPermission::Read),
 ];
 
 /// Operations not yet classified. This list is DEBT and is meant to shrink to nothing.
@@ -115,7 +136,6 @@ const UNCLASSIFIED: &[&str] = &[
     "createMembership",
     "createOrgGroup",
     "createOrgRole",
-    "createOrganization",
     "createPermission",
     "createTenant",
     "createTraitMigrationJob",
@@ -131,7 +151,6 @@ const UNCLASSIFIED: &[&str] = &[
     "deleteMembership",
     "deleteOrgGroup",
     "deleteOrgRole",
-    "deleteOrganization",
     "deleteOutboundVerification",
     "deletePermission",
     "deleteSecret",
@@ -140,9 +159,7 @@ const UNCLASSIFIED: &[&str] = &[
     "deleteVariable",
     "deleteWebhookEndpoint",
     "denySmsCountry",
-    "disableOrganization",
     "elevateAdminSudo",
-    "enableOrganization",
     "exportConfigSnapshot",
     "exportIdentities",
     "extendSignupQuarantine",
@@ -169,7 +186,6 @@ const UNCLASSIFIED: &[&str] = &[
     "getOrgGroup",
     "getOrgMembershipEffectiveRoles",
     "getOrgRole",
-    "getOrganization",
     "getOutboundVerification",
     "getPermission",
     "getPolicyDecisionTraces",
@@ -206,7 +222,6 @@ const UNCLASSIFIED: &[&str] = &[
     "listOrgMembershipRoles",
     "listOrgRolePermissions",
     "listOrgRoles",
-    "listOrganizations",
     "listPermissions",
     "listQueueDepths",
     "listRecoveryApprovals",
@@ -342,7 +357,7 @@ fn the_unclassified_debt_is_counted_so_it_cannot_grow_unnoticed() {
     // route is a new decision, not a new deferral.
     assert_eq!(
         UNCLASSIFIED.len(),
-        190,
+        184,
         "the unclassified list changed size. It may only SHRINK: an operation added to it is \
          an operation somebody chose not to decide about"
     );
