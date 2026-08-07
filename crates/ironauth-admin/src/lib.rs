@@ -119,7 +119,7 @@ use axum::middleware::from_fn;
 use axum::response::Response;
 use axum::routing::{delete, get, post, put};
 
-pub use auth::{ManagementGrants, ManagementPermission, Principal};
+pub use auth::{ManagementGrants, ManagementPermission, ManagementPersona, Principal};
 pub use backfill::{BackfillError, BackfillReport, backfill_signing_algorithms};
 pub use error::{ApiError, ErrorBody};
 /// The permission-slug grammar (issue #98), exported because its PARITY ORACLE lives
