@@ -42,7 +42,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::{
-    auth::Principal,
+    auth::{ManagementPermission, Principal},
     error::{ApiError, ErrorBody},
     idempotency,
     input::parse_json,
@@ -125,6 +125,9 @@ pub async fn list_user_identifiers(
     Path((tenant_id, environment_id, user_id)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::Read)?;
     // A READ, so a soft-deleted environment stays readable: an operator auditing a
     // decommissioned environment needs to see what login handles it held.
     let id = resolve_user(&state, scope, &user_id, EnvironmentAccess::Read).await?;
@@ -179,6 +182,9 @@ pub async fn add_user_identifier(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_users`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteUsers)?;
     sudo::require_fresh_privilege(&state, scope, actor).await?;
 
     let key = idempotency::required_key(&headers)?;
@@ -307,6 +313,9 @@ pub async fn remove_user_identifier(
     )>,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_users`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteUsers)?;
     sudo::require_fresh_privilege(&state, scope, actor).await?;
     // A WRITE, so `resolve_user` carries the environment liveness fence (issue #451).
     let id = resolve_user(&state, scope, &user_id, EnvironmentAccess::Write).await?;
@@ -400,6 +409,9 @@ pub async fn get_identifier_uniqueness(
     Query(query): Query<UniquenessQuery>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::Read)?;
     let configured = uniqueness_setting(state.identifier_uniqueness());
     // A READ, so a soft-deleted environment answers as if live, like every other read on
     // this surface: an operator deciding whether a decommissioned environment can be
@@ -451,6 +463,12 @@ pub async fn apply_identifier_uniqueness(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_config`.
+    // CONFIG rather than user authority: applying a uniqueness mode recomputes keys
+    // across the WHOLE environment, so it changes the rule every identifier obeys, not
+    // one person's data.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteConfig)?;
     sudo::require_fresh_privilege(&state, scope, actor).await?;
 
     // This request carries NO body: the mode comes from the deployment config and the

@@ -26,7 +26,7 @@ use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::Response;
 use ironauth_store::{CorrelationId, IdempotencyWrite, RecoveryFlowId, Scope, StoreError};
 
-use crate::auth::Principal;
+use crate::auth::{ManagementPermission, Principal};
 use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
 use crate::pagination::{ListQuery, Pagination};
@@ -108,6 +108,9 @@ pub async fn list_recovery_approvals(
         return Err(ApiError::NotFound);
     }
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::Read)?;
     let page = Pagination::resolve(&query, state.default_page_size(), state.max_page_size())?;
     let rows = state
         .store()
@@ -232,6 +235,12 @@ async fn decide(
         return Err(ApiError::NotFound);
     }
     let (scope, actor) = resolve_scope(state, principal, tenant_id, environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_users`.
+    // Approving a recovery hands someone back an ACCOUNT, so it is user authority.
+    // Enforced in the SHARED body: `approve_recovery_approval` and
+    // `reject_recovery_approval` both route here, so one check covers both and a third
+    // decision added later inherits it rather than needing a third edit.
+    principal.require_permission(ManagementPermission::WriteUsers)?;
     crate::sudo::require_fresh_privilege(state, scope, actor).await?;
 
     let key = idempotency::required_key(headers)?;
