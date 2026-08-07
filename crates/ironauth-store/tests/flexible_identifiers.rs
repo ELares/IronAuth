@@ -22,6 +22,18 @@ use sqlx::Row;
 
 const PASSWORD_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$aGFzaGhhc2hoYXNo";
 
+/// Microseconds since the epoch on this env's clock.
+fn now_micros(env: &Env) -> i64 {
+    i64::try_from(
+        env.clock()
+            .now_utc()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .expect("after epoch")
+            .as_micros(),
+    )
+    .expect("fits i64")
+}
+
 /// Register a bootstrap user with a usable password in `scope`, returning its id.
 async fn register_user(db: &TestDatabase, env: &Env, scope: Scope, handle: &str) -> UserId {
     db.store()
@@ -1200,5 +1212,179 @@ async fn an_org_scoped_discriminator_must_name_an_organization_the_user_belongs_
         matches!(spoofed, Err(StoreError::InvalidIdentifier)),
         "a non-member used another organization as the discriminator and escaped the \
          uniqueness collision, got {spoofed:?}"
+    );
+}
+
+/// Leaving an organization RE-POINTS the identifiers that named it, and a departure that
+/// would collide is REFUSED (issue #249).
+///
+/// The hole: under `OrgScoped` the discriminator is `org:<id>` and the add path binds it
+/// to a live membership, but nothing revalidated it afterwards. A user could take an
+/// address inside an organization, leave, and keep a row naming an organization they are
+/// no longer in, sitting in a uniqueness scope nobody can enter.
+#[tokio::test]
+async fn leaving_an_organization_repoints_its_identifiers_and_refuses_a_collision() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x91);
+    let scope = db.seed_scope(&env).await;
+    let inside = register_user(&db, &env, scope, "inside").await;
+    let outside = register_user(&db, &env, scope, "outside").await;
+
+    let org = OrganizationId::generate(&env, &scope);
+    db.control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .organizations(scope)
+        .create(&env, &org, now_micros(&env), "Globex", None)
+        .await
+        .expect("create organization");
+    let membership_id = OrgMembershipId::generate(&env, &scope);
+    db.control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .org_memberships(scope)
+        .create(
+            &env,
+            NewMembership {
+                id: &membership_id,
+                organization_id: &org,
+                user_id: &inside,
+                metadata: None,
+            },
+            now_micros(&env),
+            None,
+        )
+        .await
+        .expect("add the membership");
+
+    // The member takes the address INSIDE the organization: key `org:<id>`.
+    add_identifier_org(
+        &db,
+        &env,
+        scope,
+        &inside,
+        IdentifierType::Email,
+        "team@example.com",
+        UniquenessMode::OrgScoped,
+        Some(org.to_string().as_str()),
+    )
+    .await
+    .expect("the member takes the address inside the organization");
+
+    // A membership-free user takes the SAME address at the environment scope. The two
+    // coexist because the discriminators differ, which is the whole point of org-scoped
+    // uniqueness.
+    add_identifier(
+        &db,
+        &env,
+        scope,
+        &outside,
+        IdentifierType::Email,
+        "team@example.com",
+        UniquenessMode::OrgScoped,
+    )
+    .await
+    .expect("the membership-free user takes the same address environment-wide");
+
+    // Now the member LEAVES. Their row would move to the environment key, where the
+    // address is already taken, so the removal must be refused outright rather than
+    // completed into two live rows claiming one identifier.
+    let removal = db
+        .control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .org_memberships(scope)
+        .remove(&env, &membership_id)
+        .await;
+    assert!(
+        matches!(removal, Err(StoreError::Conflict)),
+        "a departure that would collide must be REFUSED, got {removal:?}"
+    );
+
+    // And the refusal rolled back: the membership is still live, so the caller is not
+    // left in a half-applied state where the user left but kept the organization key.
+    let still_there = db
+        .control_store()
+        .management()
+        .org_memberships(scope)
+        .get(&membership_id)
+        .await;
+    assert!(
+        still_there.is_ok(),
+        "the refused removal must roll back the membership too, got {still_there:?}"
+    );
+}
+
+/// The same departure with NO competing address succeeds, and the row lands on the
+/// environment key. Without this the test above would pass on an implementation that
+/// simply refused every departure.
+#[tokio::test]
+async fn leaving_an_organization_succeeds_when_nothing_claims_the_address() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x92);
+    let scope = db.seed_scope(&env).await;
+    let member = register_user(&db, &env, scope, "member").await;
+
+    let org = OrganizationId::generate(&env, &scope);
+    db.control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .organizations(scope)
+        .create(&env, &org, now_micros(&env), "Globex", None)
+        .await
+        .expect("create organization");
+    let membership_id = OrgMembershipId::generate(&env, &scope);
+    db.control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .org_memberships(scope)
+        .create(
+            &env,
+            NewMembership {
+                id: &membership_id,
+                organization_id: &org,
+                user_id: &member,
+                metadata: None,
+            },
+            now_micros(&env),
+            None,
+        )
+        .await
+        .expect("add the membership");
+    add_identifier_org(
+        &db,
+        &env,
+        scope,
+        &member,
+        IdentifierType::Email,
+        "solo@example.com",
+        UniquenessMode::OrgScoped,
+        Some(org.to_string().as_str()),
+    )
+    .await
+    .expect("take the address inside the organization");
+
+    db.control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .org_memberships(scope)
+        .remove(&env, &membership_id)
+        .await
+        .expect("an uncontested departure succeeds");
+
+    let key: String = sqlx::query_scalar(
+        "SELECT uniqueness_key FROM user_identifiers \
+         WHERE tenant_id = $1 AND environment_id = $2 AND user_id = $3",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(member.to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("read the discriminator");
+    assert_eq!(
+        key, "env",
+        "a departed member's identifier must leave the organization scope it named, or \
+         it sits in a uniqueness scope nobody can enter"
     );
 }
