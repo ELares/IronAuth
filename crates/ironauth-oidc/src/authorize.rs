@@ -1696,6 +1696,28 @@ async fn evaluate_step_up(
     // converting a working re-login into a lockout.
     let session_is_federated = methods.contains(&authn::AuthMethod::Federated)
         && !authn::performed_second_factor(&methods);
+
+    // The ORGANIZATION baseline (issue #95), OR-ed into the scope baseline now that the
+    // subject is known. It could not be assembled with the rest of the requirement: at that
+    // point nobody has identified, so there was no organization to consult.
+    //
+    // Requiring is a FLOOR, so OR is the only correct combinator: an organization can
+    // tighten the baseline and can never relax it.
+    //
+    // A read fault is BEST EFFORT here, which is this endpoint's documented contract for a
+    // policy read (see `requirement_for_request`): the authorization endpoint ignores a
+    // fault and the token/refresh path is the one that fails closed. Inventing a stricter
+    // rule for this single read would let a store blip lock out an organization's members at
+    // the primary gate while every other policy source stayed best-effort.
+    //
+    // The cost, stated rather than hidden: an org read fault is NOT carried into the token
+    // path's fail-closed check, because `RequirementForRequest` is assembled before the
+    // subject is known and has no slot for it.
+    let mfa_baseline_required =
+        match step_up::org_baseline_mfa_required(state, scope, &subject).await {
+            Ok(org_requires) => mfa_baseline_required || org_requires,
+            Err(()) => mfa_baseline_required,
+        };
     let remediation = if let Some((acr_unmet, age_lapsed)) = explicit_step_up {
         step_up::decide_remediation(
             state,

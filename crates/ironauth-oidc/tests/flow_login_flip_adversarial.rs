@@ -319,3 +319,73 @@ async fn a_tampered_custom_tag_on_a_login_row_does_not_ride_the_mint() {
         "CRITICAL if nonzero: a forced-terminal login row minted an empty-subject session"
     );
 }
+
+// ------------------------------------------------------------------------------------------
+// Probe: an ORGANIZATION's MFA requirement binds ITS MEMBERS, and only them (issue #95).
+// ------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn an_org_mfa_requirement_holds_its_members_and_leaves_everyone_else_alone() {
+    // Issue #95 criterion 1. `org_auth_policies` shipped with a complete resolver
+    // (`ironauth_store::org_policy::resolve`) that NOTHING called: an operator could set
+    // `mfa_required = true` on an organization, get a 2xx and an audit row, and no member was
+    // ever asked for a second factor.
+    //
+    // The scope baseline is deliberately NOT set here. Every other MFA test in this file
+    // arms `set_tenant_min_class("mfa")`, which would mask the organization entirely: with
+    // the scope requiring MFA, both users would be challenged and the test would pass no
+    // matter what the org policy did. The organization is the ONLY source of the
+    // requirement in this test, which is what makes it measure the new wiring.
+    let harness = setup().await;
+
+    let member = harness.seed_user("org-member@example.test", PASSWORD).await;
+    harness.seed_active_totp(&member).await;
+    let outsider = harness.seed_user("no-org@example.test", PASSWORD).await;
+    harness.seed_active_totp(&outsider).await;
+
+    harness.require_org_mfa(&member).await;
+
+    // THE MEMBER is held on the second-factor challenge by the organization's policy alone.
+    let (flow_id, token) = create_login(&harness, Transport::Api).await;
+    let held = try_drive(
+        &harness,
+        &flow_id,
+        &token,
+        &[
+            ("identifier", "org-member@example.test"),
+            ("password", PASSWORD),
+        ],
+    )
+    .await
+    .expect("primary submission drives");
+    assert_eq!(
+        expect_render_state(&held),
+        FlowStateTag::MfaChallenge,
+        "a member of an MFA-required organization minted on the primary factor alone: the \
+         organization's policy is being written, audited, and ignored"
+    );
+    assert!(
+        !minted_a_session(&Ok(held)),
+        "no session may exist at the challenge hold"
+    );
+
+    // THE OUTSIDER, in the SAME environment with the SAME journey, is unaffected. Without
+    // this half the test would pass against an implementation that required MFA of everyone,
+    // which is the obvious wrong way to make the first half green.
+    let (flow_id, token) = create_login(&harness, Transport::Api).await;
+    let completed = try_drive(
+        &harness,
+        &flow_id,
+        &token,
+        &[
+            ("identifier", "no-org@example.test"),
+            ("password", PASSWORD),
+        ],
+    )
+    .await;
+    assert!(
+        minted_a_session(&completed),
+        "a user who belongs to NO organization was challenged by another organization's \
+         policy: the requirement is leaking beyond its members"
+    );
+}
