@@ -1911,6 +1911,48 @@ impl Harness {
         .await
     }
 
+    /// A fresh organization carrying `policy` with NO members, for just-in-time provisioning
+    /// (issue #95): the point is that membership is EARNED at login rather than seeded.
+    pub async fn seed_unjoined_org(
+        &self,
+        policy: ironauth_store::AuthPolicy,
+    ) -> ironauth_store::OrganizationId {
+        let (actor, corr) = self.seeding_actor();
+        let now = i64::try_from(
+            self.env
+                .clock()
+                .now_utc()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .expect("after epoch")
+                .as_micros(),
+        )
+        .expect("fits i64");
+        let org = ironauth_store::OrganizationId::generate(&self.env, &self.scope);
+        self.db()
+            .control_store()
+            .management()
+            .acting(actor, corr)
+            .organizations(self.scope)
+            .create(&self.env, &org, now, "Unjoined", None)
+            .await
+            .expect("create organization");
+        let (actor, corr) = self.seeding_actor();
+        self.db()
+            .control_store()
+            .management()
+            .acting(actor, corr)
+            .org_auth_policies(self.scope)
+            .set(
+                &self.env,
+                &org,
+                &policy,
+                ironauth_store::ORG_POLICY_MAX_SESSION_TTL_SECS,
+            )
+            .await
+            .expect("set the organization policy");
+        org
+    }
+
     /// Put `subject` in a fresh organization carrying `policy`, and return that organization.
     pub async fn seed_org_policy(
         &self,
