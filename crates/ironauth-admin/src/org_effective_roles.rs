@@ -449,7 +449,14 @@ pub async fn get_org_membership_effective_roles(
     // Delegated administration (issue #102): classified `management.read`.
     // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::Read)?;
-    let org_id = resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Read).await?;
+    let org_id = resolve_live_org(
+        &state,
+        &principal,
+        scope,
+        &organization_id,
+        EnvironmentAccess::Read,
+    )
+    .await?;
     // The membership is resolved in THIS organization first: a membership of a
     // sibling organization is the uniform not-found, so this view can never report a
     // member of another organization's authorization picture.

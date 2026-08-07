@@ -174,8 +174,14 @@ pub async fn add_org_group_member(
         return Ok(replay);
     }
 
-    let org_id =
-        resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Write).await?;
+    let org_id = resolve_live_org(
+        &state,
+        &principal,
+        scope,
+        &organization_id,
+        EnvironmentAccess::Write,
+    )
+    .await?;
     let group = parse_group_id(&state, scope, &group_id)?;
 
     let request: AddOrgGroupMemberRequest = parse_json(&body)?;
@@ -273,7 +279,14 @@ pub async fn list_org_group_members(
     // Delegated administration (issue #102): classified `management.read`.
     // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::Read)?;
-    let org_id = resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Read).await?;
+    let org_id = resolve_live_org(
+        &state,
+        &principal,
+        scope,
+        &organization_id,
+        EnvironmentAccess::Read,
+    )
+    .await?;
     // The group is resolved as a LIVE group of THIS organization before the page is
     // read, so listing the members of a group of a SIBLING organization is the same
     // 404 that reading the group itself gives, rather than a 200 with an empty page
@@ -335,8 +348,14 @@ pub async fn remove_org_group_member(
     // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::WriteOrganizations)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
-    let org_id =
-        resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Write).await?;
+    let org_id = resolve_live_org(
+        &state,
+        &principal,
+        scope,
+        &organization_id,
+        EnvironmentAccess::Write,
+    )
+    .await?;
     let group = parse_group_id(&state, scope, &group_id)?;
     let membership = parse_membership_id(&state, scope, &membership_id)?;
 

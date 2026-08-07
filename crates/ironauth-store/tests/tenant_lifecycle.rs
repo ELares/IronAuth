@@ -1604,9 +1604,10 @@ async fn a_credential_grant_round_trips_through_authentication_and_absent_means_
             .authenticate_with_grants(&open_id, &open_hash)
             .await
             .expect("authenticate"),
-        Some(None),
-        "a credential with no permissions column must read as UNRESTRICTED, not as an empty \
-         grant set: an empty set would revoke every key that predates the column"
+        Some((None, None)),
+        "a credential with no permissions and no confinement must read as UNRESTRICTED and \
+         UNCONFINED, not as an empty grant set: an empty set would revoke every key that \
+         predates the columns"
     );
 
     // 2. RESTRICTED: the slugs come back exactly as stored, in order.
@@ -1631,8 +1632,10 @@ async fn a_credential_grant_round_trips_through_authentication_and_absent_means_
             .authenticate_with_grants(&scoped_id, &scoped_hash)
             .await
             .expect("authenticate"),
-        Some(Some(vec!["management.read".to_owned()])),
-        "the stored grant did not survive the authentication read"
+        Some((Some(vec!["management.read".to_owned()]), None)),
+        "the stored grant did not survive the authentication read, or the confinement was \
+         invented: the two dimensions are independent and a restricted credential is not \
+         thereby confined"
     );
 
     // 3. A WRONG key hash is no authentication at all, and must not be confused with an

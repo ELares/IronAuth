@@ -35,6 +35,7 @@ use serde_json::Value;
 use crate::auth::{ManagementGrants, ManagementPermission, Principal};
 use crate::error::ApiError;
 use crate::hash::{constant_time_eq, sha256_hex};
+use ironauth_store::OrganizationId;
 
 /// The OAuth scope value a console `at+jwt` must carry to reach the management
 /// plane (issue #90, PR 2). An ordinary end-user login token for the SAME admin
@@ -933,7 +934,7 @@ impl AdminState {
         };
         let scope = id.scope();
         let hash = sha256_hex(token.as_bytes());
-        let Some(stored) = self
+        let Some((stored, confined_to)) = self
             .inner
             .store
             .management()
@@ -962,10 +963,22 @@ impl AdminState {
                 Some(held)
             }
         };
+        // A confinement naming an organization that will not parse IN THIS SCOPE is a
+        // foreign-tenant or malformed id. It reads as unconfined ONLY if we ignored it, which
+        // would silently widen the credential, so it fails closed instead: the credential does
+        // not authenticate at all rather than authenticating with more reach than its row says.
+        let organization = match confined_to {
+            None => None,
+            Some(raw) => match OrganizationId::parse_in_scope(&raw, &scope) {
+                Ok(id) => Some(id),
+                Err(_) => return Ok(None),
+            },
+        };
         Ok(Some(Principal::ManagementKey {
             scope,
             actor,
             grants,
+            organization,
         }))
     }
 }

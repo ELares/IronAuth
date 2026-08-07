@@ -247,7 +247,14 @@ pub async fn get_organization(
     // live and hands back only its id, and the projection below needs the record. That
     // is paid deliberately, because the alternative is the private copy this change
     // exists to remove.
-    let id = resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Read).await?;
+    let id = resolve_live_org(
+        &state,
+        &principal,
+        scope,
+        &organization_id,
+        EnvironmentAccess::Read,
+    )
+    .await?;
     let record = state
         .store()
         .management()
@@ -295,7 +302,14 @@ pub async fn delete_organization(
     // organization that the delete below would have performed as its own predicate
     // anyway: a soft-deleted organization was already the uniform not-found from the
     // delete's zero-row result and is now the same not-found from this read.
-    let id = resolve_live_org(&state, scope, &organization_id, EnvironmentAccess::Write).await?;
+    let id = resolve_live_org(
+        &state,
+        &principal,
+        scope,
+        &organization_id,
+        EnvironmentAccess::Write,
+    )
+    .await?;
     state
         .store()
         .management()
@@ -344,7 +358,14 @@ async fn set_organization_state(
     // `parse_id`, and the read it adds is one this handler already performed at the end
     // to render the response, so a soft-deleted organization answered the uniform
     // not-found before this line existed and answers it here now.
-    let id = resolve_live_org(state, scope, organization_id, EnvironmentAccess::Write).await?;
+    let id = resolve_live_org(
+        state,
+        principal,
+        scope,
+        organization_id,
+        EnvironmentAccess::Write,
+    )
+    .await?;
 
     // The Idempotency-Key gate (issue #345's sweep). Both toggles are naturally
     // idempotent, so this is not a data-safety fix: it is what makes a retry after a
