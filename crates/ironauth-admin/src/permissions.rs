@@ -100,7 +100,7 @@ use ironauth_store::{
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::auth::Principal;
+use crate::auth::{ManagementPermission, Principal};
 use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
 use crate::input::{parse_json, require_non_empty, require_permission_slug};
@@ -320,6 +320,9 @@ pub async fn create_permission(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_organizations`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteOrganizations)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
 
     let key = idempotency::required_key(&headers)?;
@@ -437,6 +440,9 @@ pub async fn list_permissions(
     Query(query): Query<ListQuery>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::Read)?;
     let page = Pagination::resolve(&query, state.default_page_size(), state.max_page_size())?;
     // The `permission` half of the vocabulary. Nothing in issue #98 writes any other
     // kind, so today this filter selects every row; it is passed explicitly because
@@ -487,6 +493,9 @@ pub async fn get_permission(
     Path((tenant_id, environment_id, permission_id)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::Read)?;
     let record =
         require_live_permission(&state, scope, &permission_id, EnvironmentAccess::Read).await?;
     let body = serde_json::to_string(&PermissionView::from_record(record))
@@ -523,6 +532,9 @@ pub async fn update_permission(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_organizations`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteOrganizations)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     // Address the target FIRST. An empty body supplies no mutable field, so the
     // store write is skipped entirely and this read is the only guard left; and a
@@ -586,6 +598,9 @@ pub async fn delete_permission(
     Path((tenant_id, environment_id, permission_id)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_organizations`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteOrganizations)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     // Addressed through the SAME resolution as the read and the update, rather than the
     // bare parse this used to do. The store's own delete already resolves the row as LIVE
