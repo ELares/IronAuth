@@ -1893,6 +1893,74 @@ impl Harness {
     /// step-up gate composes with. `min_class` is one of `any`/`mfa`/`passkey`/
     /// `attested_passkey`. Used by the trusted-device tests (issue #71) to require the
     /// tenant baseline MFA a remembered device can satisfy.
+    /// Put `subject` in a fresh organization whose policy REQUIRES a second factor
+    /// (issue #95), and return that organization.
+    ///
+    /// The counterpart of [`set_tenant_min_class`](Self::set_tenant_min_class) one level
+    /// down: that seeds the scope baseline, this seeds an ORGANIZATION baseline, which is
+    /// the level whose enforcement issue #95 wired. A user seeded WITHOUT calling this is
+    /// the control case, because the requirement must bind members only.
+    pub async fn require_org_mfa(&self, subject: &str) -> ironauth_store::OrganizationId {
+        let (actor, corr) = self.seeding_actor();
+        let now = i64::try_from(
+            self.env
+                .clock()
+                .now_utc()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .expect("after epoch")
+                .as_micros(),
+        )
+        .expect("fits i64");
+        let org = ironauth_store::OrganizationId::generate(&self.env, &self.scope);
+        let user = ironauth_store::UserId::parse_in_scope(subject, &self.scope)
+            .expect("the seeded subject is a well formed user id in this scope");
+        self.db()
+            .control_store()
+            .management()
+            .acting(actor, corr)
+            .organizations(self.scope)
+            .create(&self.env, &org, now, "Acme", None)
+            .await
+            .expect("create organization");
+        let (actor, corr) = self.seeding_actor();
+        self.db()
+            .control_store()
+            .management()
+            .acting(actor, corr)
+            .org_memberships(self.scope)
+            .create(
+                &self.env,
+                ironauth_store::NewMembership {
+                    id: &ironauth_store::OrgMembershipId::generate(&self.env, &self.scope),
+                    organization_id: &org,
+                    user_id: &user,
+                    metadata: None,
+                },
+                now,
+                None,
+            )
+            .await
+            .expect("add the member");
+        let (actor, corr) = self.seeding_actor();
+        self.db()
+            .control_store()
+            .management()
+            .acting(actor, corr)
+            .org_auth_policies(self.scope)
+            .set(
+                &self.env,
+                &org,
+                &ironauth_store::AuthPolicy {
+                    mfa_required: Some(true),
+                    ..ironauth_store::AuthPolicy::default()
+                },
+                ironauth_store::ORG_POLICY_MAX_SESSION_TTL_SECS,
+            )
+            .await
+            .expect("set the organization policy");
+        org
+    }
+
     pub async fn set_tenant_min_class(&self, min_class: &str) {
         let (actor, corr) = self.seeding_actor();
         self.store()

@@ -112,7 +112,25 @@ pub(super) async fn plan_after_primary(
     // `/authorize` gate's job (a native passkey ceremony is out of the flow's JSON scope);
     // they are enforced when the completed primary session resumes `/authorize`, which never
     // issues an over qualified token.
-    if crate::step_up::required_credential_class(state, scope).await != CredentialClass::Mfa {
+    // The scope baseline OR the ORGANIZATION baseline (issue #95). Both are consulted here
+    // because this is a SECOND, independent MFA decision: `/authorize` gates on
+    // `mfa_baseline_required` and the login journey gates on this plan, and a requirement
+    // honoured by only one of them is bypassable through the other. Wiring the organization
+    // into just the `/authorize` side would have produced exactly that: a security control
+    // that looks enforced and is not.
+    //
+    // Requiring is a floor, so OR is the only correct combinator; an organization can tighten
+    // the baseline and can never relax it.
+    //
+    // A read fault reads as "no organization requirement" rather than failing the login,
+    // matching the best-effort contract the authorization endpoint already documents for a
+    // policy read. The remediation below is reached identically either way.
+    let scope_requires =
+        crate::step_up::required_credential_class(state, scope).await == CredentialClass::Mfa;
+    let org_requires = crate::step_up::org_baseline_mfa_required(state, scope, subject)
+        .await
+        .unwrap_or(false);
+    if !scope_requires && !org_requires {
         return MfaPlan::Complete;
     }
     // A GENUINE second factor already performed (a real TOTP/recovery code or a user

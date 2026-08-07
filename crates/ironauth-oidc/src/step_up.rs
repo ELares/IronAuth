@@ -436,6 +436,67 @@ pub(crate) struct RequirementForRequest {
 /// floor, [`authn::CredentialClass::Any`], which constrains nothing), or `Err(())` on
 /// a store fault so the caller can fail closed. A malformed `min_class` token is
 /// ignored (it can only ever under-constrain, never over-claim).
+/// Whether any organization the SUBJECT belongs to requires a genuine second factor
+/// (issue #95).
+///
+/// This is the wiring the resolver in `ironauth_store::org_policy` was built for and never
+/// had: `resolve` and `PolicyLevels` shipped complete, with commutative combinators and a
+/// documented level order, and nothing called them. An operator could set
+/// `mfa_required = true` on an organization, receive a 2xx and an audit row, and no member
+/// was ever asked for a second factor.
+///
+/// It is evaluated HERE, after the subject is known, rather than in
+/// [`requirement_for_request`]: at request-assembly time nobody has identified yet, so
+/// there is no organization to consult. The org contribution can only be OR-ed in once we
+/// know who is authenticating.
+///
+/// The result rides the `mfa_baseline_required` channel and NEVER an `mfa` acr floor, for
+/// the reason that channel exists: the acr ladder ranks `phr` above `mfa`, so an `mfa`
+/// floor is silently satisfiable by a presence-only passkey that performed no second factor.
+/// Riding the flag also inherits the remembered-device path and the conditional-credential
+/// skip unchanged, so an org requirement behaves exactly like the scope baseline.
+///
+/// STRICTEST WINS across memberships: a user in two organizations, one requiring MFA and one
+/// silent, is required. Requiring is a security floor, so a second membership can only ever
+/// tighten it, and a user cannot escape an organization's requirement by joining another.
+///
+/// Fails CLOSED. A read fault returns `Err(())` which the caller surfaces on the same
+/// `policy_read_faulted` channel as the credential-class read, because a policy we could not
+/// read is not a policy that does not apply.
+pub(crate) async fn org_baseline_mfa_required(
+    state: &OidcState,
+    scope: Scope,
+    subject: &ironauth_store::UserId,
+) -> Result<bool, ()> {
+    let memberships = state
+        .store()
+        .scoped(scope)
+        .org_memberships()
+        .list_for_user(subject)
+        .await
+        .map_err(|_| ())?;
+    for membership in &memberships {
+        // `document_for_org` returns `None` for an organization with no policy, which is
+        // the identity element of the resolver's combinators rather than an error.
+        let document = state
+            .store()
+            .scoped(scope)
+            .org_auth_policies()
+            .document_for_org(&membership.organization_id)
+            .await
+            .map_err(|_| ())?;
+        let Some(document) = document else { continue };
+        let levels = ironauth_store::PolicyLevels {
+            organization: Some(document),
+            ..ironauth_store::PolicyLevels::default()
+        };
+        if ironauth_store::resolve_org_policy(&levels).mfa_required() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub(crate) async fn credential_class_floor(
     state: &OidcState,
     scope: Scope,
