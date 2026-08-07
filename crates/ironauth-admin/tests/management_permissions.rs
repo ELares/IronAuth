@@ -55,6 +55,10 @@ fn documented_operations() -> BTreeSet<String> {
 
 /// Operations whose required permission is DECIDED.
 ///
+/// The SESSION surface is in the same position and for the same reason: `revoke_session`,
+/// `bulk_revoke_sessions`, `list_sessions` and their neighbours all call `require_operator`,
+/// so a management key cannot reach them either. Checked, not assumed, before deferring them.
+///
 /// The credential surface is classified but NOT enforced, and that is not an oversight:
 /// `create_key`, `list_keys`, `get_key` and `delete_key` all call `require_operator`, so a
 /// management key can never reach them and a permission check there could never refuse
@@ -134,6 +138,17 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     ("deletePermission", ManagementPermission::WriteOrganizations),
     ("listPermissions", ManagementPermission::Read),
     ("getPermission", ManagementPermission::Read),
+    // Bans and invitations, both USER authority. An invitation provisions a
+    // `pending_verification` identity and a single-use token, so whoever may invite may
+    // populate the environment; it is not a lesser "send an email" operation.
+    ("createBan", ManagementPermission::WriteUsers),
+    ("liftBan", ManagementPermission::WriteUsers),
+    ("listBans", ManagementPermission::Read),
+    ("createInvitation", ManagementPermission::WriteUsers),
+    ("revokeInvitation", ManagementPermission::WriteUsers),
+    ("resendInvitation", ManagementPermission::WriteUsers),
+    ("listInvitations", ManagementPermission::Read),
+    ("getInvitation", ManagementPermission::Read),
 ];
 
 /// Operations not yet classified. This list is DEBT and is meant to shrink to nothing.
@@ -155,14 +170,12 @@ const UNCLASSIFIED: &[&str] = &[
     "assignOrgMembershipRole",
     "bulkRevokeSessions",
     "clearOrgDefaultRole",
-    "createBan",
     "createConnector",
     "createDcrInitialAccessToken",
     "createDcrPolicy",
     "createEnvironment",
     "createFlowVersion",
     "createIdentityImport",
-    "createInvitation",
     "createOrgGroup",
     "createOrgRole",
     "createTenant",
@@ -201,7 +214,6 @@ const UNCLASSIFIED: &[&str] = &[
     "getFlowObservation",
     "getFlowVersion",
     "getIdentifierUniqueness",
-    "getInvitation",
     "getLocale",
     "getMds3Health",
     "getMigrationProgress",
@@ -224,15 +236,12 @@ const UNCLASSIFIED: &[&str] = &[
     "getTraitSchemaVersion",
     "getUserRiskPosture",
     "getUserTraits",
-    "liftBan",
     "linkUserExternalId",
-    "listBans",
     "listBrands",
     "listConnectors",
     "listDcrPolicies",
     "listEnvironments",
     "listFlowVersions",
-    "listInvitations",
     "listMigrationRunViolations",
     "listMigrationRuns",
     "listOperators",
@@ -269,12 +278,10 @@ const UNCLASSIFIED: &[&str] = &[
     "removeStepUpPolicy",
     "removeUserIdentifier",
     "replayWebhookDeadLetters",
-    "resendInvitation",
     "restoreTenant",
     "resumeIdentityImport",
     "resumeTenant",
     "resumeWebhookEndpoint",
-    "revokeInvitation",
     "revokeSession",
     "revokeUserConsent",
     "revokeUserSessions",
@@ -369,7 +376,7 @@ fn the_unclassified_debt_is_counted_so_it_cannot_grow_unnoticed() {
     // route is a new decision, not a new deferral.
     assert_eq!(
         UNCLASSIFIED.len(),
-        165,
+        157,
         "the unclassified list changed size. It may only SHRINK: an operation added to it is \
          an operation somebody chose not to decide about"
     );
