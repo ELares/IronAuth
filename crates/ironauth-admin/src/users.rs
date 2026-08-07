@@ -34,7 +34,7 @@ use ironauth_store::{
 use serde::Deserialize;
 use utoipa::IntoParams;
 
-use crate::auth::Principal;
+use crate::auth::{ManagementPermission, Principal};
 use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
 use crate::input::{parse_json, require_non_empty};
@@ -216,6 +216,11 @@ pub async fn create_user(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): this operation is classified
+    // `management.write_users` in the permission pin, and this is where that
+    // declaration becomes enforcement. An UNRESTRICTED credential (every key minted
+    // before migration 0118) passes unchanged.
+    principal.require_permission(ManagementPermission::WriteUsers)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
 
     let key = idempotency::required_key(&headers)?;
@@ -373,6 +378,11 @@ pub async fn list_users(
     Query(query): Query<ListQuery>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // A read is still an authority: listing users is how an operator learns who
+    // exists, so a credential restricted away from it must not be able to enumerate
+    // them. An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::Read)?;
     let page = Pagination::resolve(&query, state.default_page_size(), state.max_page_size())?;
     let rows = state
         .store()
@@ -424,6 +434,11 @@ pub async fn get_user(
     Path((tenant_id, environment_id, user_id)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // A read is still an authority: listing users is how an operator learns who
+    // exists, so a credential restricted away from it must not be able to enumerate
+    // them. An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::Read)?;
     let id = resolve_user(&state, scope, &user_id, EnvironmentAccess::Read).await?;
     let record = state.store().scoped(scope).users().get(&id).await?;
     let body =
@@ -601,6 +616,11 @@ pub async fn delete_user(
     Query(hard): Query<HardKillQuery>,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): this operation is classified
+    // `management.write_users` in the permission pin, and this is where that
+    // declaration becomes enforcement. An UNRESTRICTED credential (every key minted
+    // before migration 0118) passes unchanged.
+    principal.require_permission(ManagementPermission::WriteUsers)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     let id = resolve_user(&state, scope, &user_id, EnvironmentAccess::Write).await?;
     state

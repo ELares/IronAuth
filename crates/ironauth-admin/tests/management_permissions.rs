@@ -55,6 +55,12 @@ fn documented_operations() -> BTreeSet<String> {
 
 /// Operations whose required permission is DECIDED.
 ///
+/// The credential surface is classified but NOT enforced, and that is not an oversight:
+/// `create_key`, `list_keys`, `get_key` and `delete_key` all call `require_operator`, so a
+/// management key can never reach them and a permission check there could never refuse
+/// anything. Adding one would be inert code that reads like a control. The classification
+/// stands as the declaration of what authority those operations represent.
+///
 /// Started with the credential surface because it is the one that can escalate: a key able to
 /// mint or revoke keys can reach every other authority, so it must not be reachable by a
 /// credential granted ordinary configuration rights. That is why `WriteCredentials` is a
@@ -70,6 +76,12 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     ),
     ("getManagementKey", ManagementPermission::Read),
     ("listManagementKeys", ManagementPermission::Read),
+    // The user surface: the first operations where the declaration is actually ENFORCED,
+    // because unlike the credential surface these are reachable by a management key.
+    ("createUser", ManagementPermission::WriteUsers),
+    ("deleteUser", ManagementPermission::WriteUsers),
+    ("listUsers", ManagementPermission::Read),
+    ("getUser", ManagementPermission::Read),
 ];
 
 /// Operations not yet classified. This list is DEBT and is meant to shrink to nothing.
@@ -108,7 +120,6 @@ const UNCLASSIFIED: &[&str] = &[
     "createTenant",
     "createTraitMigrationJob",
     "createTraitSchemaVersion",
-    "createUser",
     "createWebhookEndpoint",
     "deleteBrand",
     "deleteBrandFavicon",
@@ -126,7 +137,6 @@ const UNCLASSIFIED: &[&str] = &[
     "deleteSecret",
     "deleteSignupForm",
     "deleteTenant",
-    "deleteUser",
     "deleteVariable",
     "deleteWebhookEndpoint",
     "denySmsCountry",
@@ -174,7 +184,6 @@ const UNCLASSIFIED: &[&str] = &[
     "getTenant",
     "getTraitMigrationJob",
     "getTraitSchemaVersion",
-    "getUser",
     "getUserRiskPosture",
     "getUserTraits",
     "getVariable",
@@ -213,7 +222,6 @@ const UNCLASSIFIED: &[&str] = &[
     "listTraitSchemaVersions",
     "listUserConsents",
     "listUserIdentifiers",
-    "listUsers",
     "listVariables",
     "listWebhookDeadLetters",
     "listWebhookDeliveryAttempts",
@@ -334,7 +342,7 @@ fn the_unclassified_debt_is_counted_so_it_cannot_grow_unnoticed() {
     // route is a new decision, not a new deferral.
     assert_eq!(
         UNCLASSIFIED.len(),
-        194,
+        190,
         "the unclassified list changed size. It may only SHRINK: an operation added to it is \
          an operation somebody chose not to decide about"
     );

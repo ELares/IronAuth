@@ -110,6 +110,11 @@ sqlx = { workspace = true }
 # Database-free OpenAPI contract test: proves the served spec is OpenAPI 3.1 with
 # stable operation ids and that the committed artifact matches. Always runs.
 [[test]]
+name = "delegated_admin"
+path = "tests/delegated_admin.rs"
+required-features = ["testing"]
+
+[[test]]
 name = "management_permissions"
 path = "tests/management_permissions.rs"
 
