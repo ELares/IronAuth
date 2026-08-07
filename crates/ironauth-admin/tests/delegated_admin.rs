@@ -196,3 +196,59 @@ async fn a_user_granted_credential_cannot_touch_organizations() {
         "a write_users credential DISABLED an organization through the shared state-change          path: {body}"
     );
 }
+
+#[tokio::test]
+async fn a_user_granted_credential_cannot_write_a_secret() {
+    // The sharpest case for `WriteConfig` being separate. A secret write is not a lesser
+    // operation because the value is unreadable afterwards: a credential that can seal a value
+    // into an environment can change what every connector authenticates WITH. A permission
+    // model that let a user-management credential do that would hand it the environment.
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "k-mint").await;
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.read", "management.write_users"],
+    )
+    .await;
+
+    let base = format!("/v1/tenants/{tenant}/environments/{environment}/secrets");
+
+    // Listing secret METADATA is granted by `management.read`, so the request must get PAST
+    // the permission gate. It then meets this harness's own limit: the secret surface needs a
+    // data-plane connection (issue #235) and fails closed with 422 without one.
+    //
+    // So the assertion is "not 403" rather than "200". Asserting 200 would be asserting that
+    // this harness installs a registry, which is a different fact and not the one under test;
+    // the write below is what carries the actual permission claim.
+    let (status, _, body) = h.get_as(&base, &secret).await;
+    assert_ne!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the read grant did not cover secret metadata: {body}"
+    );
+
+    // Writing one is not granted. Note the request carries NO Idempotency-Key, which this
+    // endpoint requires: the 403 below therefore also proves the permission check runs BEFORE
+    // that requirement, so a restricted credential is refused on authority rather than being
+    // told how to shape a request it may not make.
+    let (status, _, body) = h
+        .put_as(
+            &format!("{base}/STRIPE_KEY"),
+            &secret,
+            &serde_json::json!({ "value": "sk_live_denied" }).to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a write_users credential SEALED a secret: it can now change what every connector in          the environment authenticates with. Body: {body}"
+    );
+    assert!(
+        body.contains("management.write_config"),
+        "the refusal does not name the permission required: {body}"
+    );
+}

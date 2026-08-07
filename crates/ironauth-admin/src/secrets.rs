@@ -51,7 +51,7 @@ use ironauth_store::{CorrelationId, EnvironmentSecretMetadata, StoreError};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::auth::Principal;
+use crate::auth::{ManagementPermission, Principal};
 use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
 use crate::input::parse_json;
@@ -157,6 +157,9 @@ pub async fn list_secrets(
     Query(query): Query<ListQuery>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::Read)?;
     let page = Pagination::resolve(&query, state.default_page_size(), state.max_page_size())?;
     let rows = data_plane_store(&state)?
         .scoped(scope)
@@ -199,6 +202,9 @@ pub async fn get_secret(
     Path((tenant_id, environment_id, name)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::Read)?;
     let record = data_plane_store(&state)?
         .scoped(scope)
         .environment_secrets()
@@ -242,6 +248,13 @@ pub async fn set_secret(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_config`.
+    // A secret WRITE is configuration authority: a credential that can seal a
+    // value into an environment can change what every connector authenticates
+    // with, so it is gated with the rest of the config surface rather than
+    // treated as a lesser operation because the value is unreadable afterwards.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteConfig)?;
     sudo::require_fresh_privilege(&state, scope, actor).await?;
 
     let key = idempotency::required_key(&headers)?;
@@ -345,6 +358,13 @@ pub async fn delete_secret(
     Path((tenant_id, environment_id, name)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_config`.
+    // A secret WRITE is configuration authority: a credential that can seal a
+    // value into an environment can change what every connector authenticates
+    // with, so it is gated with the rest of the config surface rather than
+    // treated as a lesser operation because the value is unreadable afterwards.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteConfig)?;
     sudo::require_fresh_privilege(&state, scope, actor).await?;
 
     // A soft-deleted environment refuses every WRITE, and a delete is a write. Reads stay
