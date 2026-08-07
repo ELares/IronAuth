@@ -37005,6 +37005,17 @@ impl<'a> ManagementStore<'a> {
         }
     }
 
+    /// Project grants (issue #102): what a DELEGATED administrator of an organization
+    /// may assign. Reads only; the write surface is audited and lives on the acting
+    /// store.
+    #[must_use]
+    pub fn project_grants(&self, scope: Scope) -> ProjectGrantRepo<'a> {
+        ProjectGrantRepo {
+            store: self.store,
+            scope,
+        }
+    }
+
     /// List every `(tenant, environment)` scope known to the control plane (issue #34):
     /// the set a per-scope background worker (the back-channel logout delivery worker)
     /// iterates to drain each scope's queue. Requires the control-plane role (it reads
@@ -54999,6 +55010,84 @@ impl<'a> ActingStore<'a> {
             scope: self.scope,
             acting: self.acting,
         }
+    }
+}
+
+/// Reads of the project-grant tables (issue #102, migration 0120): the bound on what a
+/// DELEGATED administrator of one organization may assign.
+///
+/// Control plane only. Migration 0120 grants the data plane nothing on either table,
+/// because a grant has already had its say by the time a token is minted, in the form of
+/// which assignment rows exist.
+pub struct ProjectGrantRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl ProjectGrantRepo<'_> {
+    /// The set of role ids a delegated administrator of `organization` may assign, or
+    /// `None` when that organization is under NO live grant and is therefore
+    /// unrestricted.
+    ///
+    /// `None` and `Some(empty)` are DIFFERENT answers and the difference is the whole
+    /// contract. `None` means no grant exists, so nothing here bounds the caller and the
+    /// organization is administered exactly as it was before migration 0120 shipped.
+    /// `Some(empty)` means a grant exists and names no roles, so the caller may assign
+    /// NOTHING. Collapsing the two, in either direction, is the defect this signature is
+    /// shaped to prevent: reading absence as "assign nothing" breaks every existing
+    /// delegated administrator at upgrade, and reading an empty subset as "assign
+    /// anything" makes the most restrictive contract in the model unexpressible.
+    ///
+    /// The union across grants is deliberate. An organization may hold grants on several
+    /// applications, and a role assignable under any one of them is assignable: a role is
+    /// held by a USER within an organization (migration 0089), not per application, so
+    /// intersecting would make holding two grants strictly weaker than holding one, which
+    /// no operator would predict.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] if the scoped transaction or either statement fails.
+    pub async fn assignable_role_ids(
+        &self,
+        organization: &OrganizationId,
+    ) -> Result<Option<Vec<String>>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        // Does a live grant exist at all? Asked SEPARATELY from the roles below rather
+        // than inferred from an empty join, because an empty join cannot distinguish
+        // "no grant" from "a grant naming no roles" and those are the two answers that
+        // must never be confused.
+        let granted: Option<i64> = sqlx::query_scalar(
+            "SELECT count(*) FROM project_grants \
+             WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
+               AND deleted_at IS NULL",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(organization.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        if granted.unwrap_or(0) == 0 {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        // The union over every live grant this organization holds. The join to
+        // project_grants repeats the liveness filter so a role belonging to a WITHDRAWN
+        // grant stops being assignable the moment the grant is withdrawn, without
+        // anything having to walk the subset and soft-delete each member.
+        let roles: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT r.role_id::text FROM project_grant_roles r \
+             JOIN project_grants g ON g.id = r.grant_id \
+             WHERE r.tenant_id = $1 AND r.environment_id = $2 \
+               AND r.organization_id = $3 AND r.deleted_at IS NULL \
+               AND g.deleted_at IS NULL",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(organization.to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some(roles))
     }
 }
 

@@ -115,6 +115,11 @@ path = "tests/delegated_admin.rs"
 required-features = ["testing"]
 
 [[test]]
+name = "project_grants"
+path = "tests/project_grants.rs"
+required-features = ["testing"]
+
+[[test]]
 name = "management_permissions"
 path = "tests/management_permissions.rs"
 

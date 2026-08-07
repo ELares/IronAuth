@@ -318,6 +318,20 @@ impl Principal {
         }
     }
 
+    /// The organization this principal is CONFINED to, if any (issue #102).
+    ///
+    /// `None` covers two different principals that are alike for every purpose a caller
+    /// of this method has: an operator, and an unconfined management key. Both act across
+    /// the whole environment, so neither is a delegated administrator of one customer and
+    /// neither is bounded by a project grant.
+    #[must_use]
+    pub const fn confined_organization(&self) -> Option<&OrganizationId> {
+        match self {
+            Principal::Operator { .. } => None,
+            Principal::ManagementKey { organization, .. } => organization.as_ref(),
+        }
+    }
+
     /// Require that this principal may act within `organization` (issue #102).
     ///
     /// The OPERATOR always passes, and an UNCONFINED management key always passes. A CONFINED
