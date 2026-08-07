@@ -35,7 +35,7 @@ use axum::response::Response;
 use serde::Serialize;
 use utoipa::ToSchema;
 
-use crate::auth::Principal;
+use crate::auth::{ManagementPermission, Principal};
 use crate::error::{ApiError, ErrorBody};
 use crate::org_context::resolve_scope;
 use crate::response::json;
@@ -94,6 +94,9 @@ pub async fn list_queue_depths(
     // soft-deleted environment's queue depth is precisely what an operator wants to see
     // while deciding whether anything was still in flight when it went away.
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::Read)?;
     let queue = state.store().scoped(scope);
     // The consumers that actually have rows here, rather than a hard-coded list of the
     // names this binary happens to register. A hand-written list would silently omit any

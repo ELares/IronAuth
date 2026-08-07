@@ -25,7 +25,7 @@ use ironauth_store::{
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::auth::Principal;
+use crate::auth::{ManagementPermission, Principal};
 use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
 use crate::input::{parse_json, require_non_empty};
@@ -117,6 +117,9 @@ pub async fn list_webhook_endpoints(
     // No liveness fence on a READ: a soft-deleted environment stays readable across this
     // surface and only writes refuse it, which the whole-surface sweep enforces.
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::Read)?;
     let endpoints = state
         .store()
         .scoped(scope)
@@ -162,6 +165,9 @@ pub async fn create_webhook_endpoint(
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_config`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteConfig)?;
     crate::sudo::require_fresh_privilege(&state, scope, principal.actor()).await?;
     require_live_environment(&state, &scope).await?;
 
@@ -292,6 +298,9 @@ pub async fn rotate_webhook_endpoint_secret(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_config`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteConfig)?;
     crate::sudo::require_fresh_privilege(&state, scope, principal.actor()).await?;
     require_live_environment(&state, &scope).await?;
     let id = state
@@ -374,6 +383,9 @@ pub async fn delete_webhook_endpoint(
     Path((tenant_id, environment_id, endpoint_id)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_config`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteConfig)?;
     crate::sudo::require_fresh_privilege(&state, scope, principal.actor()).await?;
     require_live_environment(&state, &scope).await?;
     // Parsed under the CALLER's scope, so an endpoint id from another environment is the
@@ -508,6 +520,9 @@ pub async fn list_webhook_delivery_attempts(
 ) -> Result<Response, ApiError> {
     // No liveness fence on a READ, matching every other read across this surface.
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::Read)?;
     let id = state
         .store()
         .scoped(scope)
@@ -564,6 +579,9 @@ pub async fn list_webhook_dead_letters(
     // No liveness fence on a READ, matching the endpoint listing: a soft-deleted
     // environment stays readable across this surface and only writes refuse it.
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::Read)?;
     let id = state
         .store()
         .scoped(scope)
@@ -634,6 +652,9 @@ pub async fn replay_webhook_dead_letters(
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_config`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteConfig)?;
     crate::sudo::require_fresh_privilege(&state, scope, principal.actor()).await?;
     require_live_environment(&state, &scope).await?;
     let id = state
@@ -730,6 +751,9 @@ pub async fn set_webhook_event_types(
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_config`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteConfig)?;
     crate::sudo::require_fresh_privilege(&state, scope, principal.actor()).await?;
     require_live_environment(&state, &scope).await?;
     let id = state
@@ -801,6 +825,11 @@ async fn set_endpoint_state(
         headers,
     } = toggle;
     let (scope, actor) = resolve_scope(state, principal, tenant_id, environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_config`.
+    // Enforced in the SHARED body, so `pause_webhook_endpoint` and
+    // `resume_webhook_endpoint` carry the same requirement by construction rather than
+    // by two edits staying in agreement.
+    principal.require_permission(ManagementPermission::WriteConfig)?;
     crate::sudo::require_fresh_privilege(state, scope, principal.actor()).await?;
     require_live_environment(state, &scope).await?;
     let id = state

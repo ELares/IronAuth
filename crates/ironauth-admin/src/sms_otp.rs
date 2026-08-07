@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::{
-    auth::Principal,
+    auth::{ManagementPermission, Principal},
     error::{ApiError, ErrorBody},
     input::parse_json,
     org_context::{require_live_environment, resolve_scope},
@@ -111,6 +111,9 @@ pub async fn get_sms_otp_config(
     Path((tenant_id, environment_id)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::Read)?;
     // An environment with no row is DISABLED, which is the shipped default rather than a
     // not-found: reporting 404 here would make "never configured" indistinguishable from
     // "absent environment" on a read an operator uses to decide what to configure.
@@ -150,6 +153,9 @@ pub async fn set_sms_otp_config(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_config`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteConfig)?;
     sudo::require_fresh_privilege(&state, scope, actor).await?;
     require_live_environment(&state, &scope).await?;
     let request: SetSmsConfigRequest = parse_json(&body)?;
@@ -197,6 +203,9 @@ pub async fn list_sms_allowlist(
     Path((tenant_id, environment_id)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::Read)?;
     let items = state.store().scoped(scope).sms_otp().allowlist().await?;
     let body =
         serde_json::to_string(&SmsAllowlistView { items }).map_err(|_| ApiError::Internal)?;
@@ -229,6 +238,9 @@ pub async fn allow_sms_country(
     Path((tenant_id, environment_id, country_code)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_config`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteConfig)?;
     sudo::require_fresh_privilege(&state, scope, actor).await?;
     require_live_environment(&state, &scope).await?;
     let country_code = require_country_code(&country_code)?;
@@ -268,6 +280,9 @@ pub async fn deny_sms_country(
     Path((tenant_id, environment_id, country_code)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_config`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteConfig)?;
     sudo::require_fresh_privilege(&state, scope, actor).await?;
     require_live_environment(&state, &scope).await?;
     let country_code = require_country_code(&country_code)?;
