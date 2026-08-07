@@ -32,7 +32,7 @@ use ironauth_store::{
 };
 use serde_json::Value;
 
-use crate::auth::Principal;
+use crate::auth::{ManagementGrants, ManagementPermission, Principal};
 use crate::error::ApiError;
 use crate::hash::{constant_time_eq, sha256_hex};
 
@@ -933,26 +933,40 @@ impl AdminState {
         };
         let scope = id.scope();
         let hash = sha256_hex(token.as_bytes());
-        if self
+        let Some(stored) = self
             .inner
             .store
             .management()
             .credentials(scope)
-            .authenticate(&id, &hash)
+            .authenticate_with_grants(&id, &hash)
             .await?
-        {
-            let actor = ActorRef::service(ServiceId::from_seed_bytes(id.unique_bytes()));
-            // `grants: None` until the credential read carries the column: an unrestricted
-            // key is exactly what every credential is today, so this preserves behaviour
-            // while the shape exists for the read to fill in.
-            Ok(Some(Principal::ManagementKey {
-                scope,
-                actor,
-                grants: None,
-            }))
-        } else {
-            Ok(None)
-        }
+        else {
+            return Ok(None);
+        };
+        let actor = ActorRef::service(ServiceId::from_seed_bytes(id.unique_bytes()));
+        // `None` is UNRESTRICTED, which is every credential minted before migration 0118.
+        let grants = match stored {
+            None => None,
+            Some(slugs) => {
+                let mut held = ManagementGrants::empty();
+                for slug in &slugs {
+                    // FAIL CLOSED on a slug this binary does not know. A grant row naming an
+                    // unrecognized permission is not a licence: skipping it silently would
+                    // leave the credential holding LESS than the row says, which is the safe
+                    // direction, but treating the row as unrestricted would be catastrophic.
+                    // So an unknown slug contributes nothing and the rest still apply.
+                    if let Some(permission) = ManagementPermission::from_slug(slug) {
+                        held = held.insert(permission);
+                    }
+                }
+                Some(held)
+            }
+        };
+        Ok(Some(Principal::ManagementKey {
+            scope,
+            actor,
+            grants,
+        }))
     }
 }
 
