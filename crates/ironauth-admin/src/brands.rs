@@ -75,7 +75,7 @@ use ironauth_oidc::branding::{BrandSlots, DesignTokens, SlotId};
 use ironauth_store::{BrandId, CorrelationId, NewBrand, Scope};
 use std::collections::BTreeMap;
 
-use crate::auth::Principal;
+use crate::auth::{ManagementPermission, Principal};
 use crate::error::{ApiError, ErrorBody};
 use crate::input::parse_json;
 use crate::response::{json, no_content};
@@ -345,6 +345,9 @@ pub async fn list_brands(
     Path((tenant_id, environment_id)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::Read)?;
     let records = state.store().scoped(scope).brands().list_all().await?;
     let items = records
         .iter()
@@ -385,6 +388,9 @@ pub async fn set_brand(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_config`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteConfig)?;
     // A brand write rewrites the visible chrome of the auth pages (a social-engineering
     // surface), so it demands fresh privilege exactly like the brand asset uploads and the
     // locale writes.
@@ -482,6 +488,9 @@ pub async fn get_brand(
     Path((tenant_id, environment_id, slug)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::Read)?;
     let slug = parse_slug(&slug)?;
     let record = state
         .store()
@@ -519,6 +528,9 @@ pub async fn delete_brand(
     Path((tenant_id, environment_id, slug)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_config`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteConfig)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     // The parent-existence precondition, through the ONE expression of it (issues #443, #451):
     // a `brands` row survives its environment's soft delete, so without this the delete would

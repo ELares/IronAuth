@@ -386,3 +386,51 @@ async fn a_read_only_credential_cannot_invite_or_ban() {
         "a read-only credential created a BAN: {body}"
     );
 }
+
+#[tokio::test]
+async fn a_user_granted_credential_cannot_rebrand_the_environment() {
+    // Branding looks cosmetic and is not. The brand is what an end user SEES on the login
+    // page, so a credential that can change it can make the environment's sign-in surface say
+    // anything, which is a phishing primitive rather than a styling preference. It is
+    // configuration authority.
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "k-mint").await;
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.read", "management.write_users"],
+    )
+    .await;
+
+    let brands = format!("/v1/tenants/{tenant}/environments/{environment}/brands");
+
+    // Reading brands is granted by `management.read`.
+    let (status, _, body) = h.get_as(&brands, &secret).await;
+    assert_ne!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the read grant did not cover brands: {body}"
+    );
+
+    // Setting one is not.
+    let (status, _, body) = h
+        .put_as(
+            &format!("{brands}/default"),
+            &secret,
+            &serde_json::json!({ "display_name": "Not Acme" }).to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a write_users credential REBRANDED the environment: it can now change what every \
+         end user sees on the login page. Body: {body}"
+    );
+    assert!(
+        body.contains("management.write_config"),
+        "the refusal does not name the permission required: {body}"
+    );
+}
