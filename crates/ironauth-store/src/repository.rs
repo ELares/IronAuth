@@ -1311,6 +1311,27 @@ pub struct ActingStore<'a> {
 }
 
 impl<'a> ActingStore<'a> {
+    /// The mutating organization-membership repository for this scope and actor.
+    ///
+    /// Exposed on the DATA plane because migration 0084 grants `ironauth_app`
+    /// `SELECT, INSERT` on `org_memberships` (line 180): the role has always been able to
+    /// write one, only the acting accessor was management-only. Just-in-time provisioning
+    /// (issue #95) creates a membership from the LOGIN path, which runs as the data plane, so
+    /// routing it through the management store would need a control-plane connection the OIDC
+    /// plane does not hold.
+    ///
+    /// The grant is `INSERT` and a column-scoped `UPDATE` only. Removing a membership stays
+    /// management-only, which is the right asymmetry: a login may earn a membership and must
+    /// never be able to revoke one.
+    #[must_use]
+    pub fn org_memberships(&self) -> ActingOrgMembershipRepo<'a> {
+        ActingOrgMembershipRepo {
+            store: self.store,
+            acting: self.acting,
+            scope: self.scope,
+        }
+    }
+
     /// The mutating OAuth client repository for this scope and actor.
     #[must_use]
     pub fn clients(&self) -> ActingClientRepo<'a> {
@@ -42689,6 +42710,33 @@ impl OrgAuthPolicyRepo<'_> {
         self.read_for_org(organization_id)
             .await?
             .ok_or(StoreError::NotFound)
+    }
+
+    /// Whether ANY organization in this scope has JIT provisioning enabled (issue #95).
+    ///
+    /// The cheap gate in front of the per-login JIT path. Provisioning needs the user's
+    /// VERIFIED email domains, and reading those means opening sealed identifier rows, which
+    /// is real work to do on every single sign-in for a feature that is off in most
+    /// deployments. This is one indexed predicate that answers `false` in all of them, so the
+    /// identifier read only happens where an operator has actually asked for JIT.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn any_jit_provisioning_enabled(&self) -> Result<bool, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let found = sqlx::query(
+            "SELECT 1 AS present FROM org_auth_policies \
+             WHERE tenant_id = $1 AND environment_id = $2 AND deleted_at IS NULL \
+             AND jit_provisioning IS TRUE LIMIT 1",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(found.is_some())
     }
 
     /// The organizations that would accept `email_domain` for JIT provisioning (issue #95).

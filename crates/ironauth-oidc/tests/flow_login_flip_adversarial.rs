@@ -468,3 +468,136 @@ async fn an_org_session_lifetime_shortens_its_members_sessions_and_no_one_elses(
          expires at {member_expiry}, outsider at {outsider_expiry}"
     );
 }
+
+/// Whether `subject` holds a live membership in `org`.
+async fn is_member(harness: &Harness, org: &ironauth_store::OrganizationId, subject: &str) -> bool {
+    let user = ironauth_store::UserId::parse_in_scope(subject, &harness.scope())
+        .expect("a well formed subject");
+    harness
+        .store()
+        .scoped(harness.scope())
+        .org_memberships()
+        .exists(org, &user)
+        .await
+        .expect("membership lookup")
+}
+
+#[tokio::test]
+async fn a_verified_domain_earns_a_membership_at_login_and_an_unverified_one_never_does() {
+    // Issue #95 criterion 3. Two organizations accept `jit.test`, and only ONE of them has
+    // `jit_provisioning` on. The domain list alone is a narrowing filter and never a licence,
+    // so the disabled organization must gain no member.
+    //
+    // The disabled case does NOT fail the login, deliberately: refusing the whole
+    // authentication would let one organization's policy lock out a user with a perfectly
+    // good local account. The user signs in, simply without that membership.
+    let harness = setup().await;
+    let subject = harness.seed_user("jit-user@jit.test", PASSWORD).await;
+    let user = ironauth_store::UserId::parse_in_scope(&subject, &harness.scope())
+        .expect("a well formed subject");
+
+    let enabled = harness
+        .seed_unjoined_org(ironauth_store::AuthPolicy {
+            jit_provisioning: Some(true),
+            allowed_email_domains: Some(["jit.test".to_owned()].into_iter().collect()),
+            ..ironauth_store::AuthPolicy::default()
+        })
+        .await;
+    let disabled = harness
+        .seed_unjoined_org(ironauth_store::AuthPolicy {
+            jit_provisioning: Some(false),
+            allowed_email_domains: Some(["jit.test".to_owned()].into_iter().collect()),
+            ..ironauth_store::AuthPolicy::default()
+        })
+        .await;
+
+    // The VERIFIED email is what makes the domain usable. `allowed_email_domains` is an
+    // unverified operator assertion, so provisioning from an unproven address would let
+    // anyone join by claiming one of the organization's addresses.
+    add_email(&harness, &user, "jit-user@jit.test", true).await;
+
+    assert!(
+        !is_member(&harness, &enabled, &subject).await,
+        "the membership must be EARNED at login, not seeded"
+    );
+
+    let (flow_id, token) = create_login(&harness, Transport::Api).await;
+    let completed = try_drive(
+        &harness,
+        &flow_id,
+        &token,
+        &[("identifier", "jit-user@jit.test"), ("password", PASSWORD)],
+    )
+    .await;
+    assert!(
+        minted_a_session(&completed),
+        "the login succeeds; JIT never turns a good credential into a refusal"
+    );
+
+    assert!(
+        is_member(&harness, &enabled, &subject).await,
+        "the enabled organization did not gain the member at login"
+    );
+    assert!(
+        !is_member(&harness, &disabled, &subject).await,
+        "an organization with jit_provisioning OFF gained a member from a domain match alone"
+    );
+
+    // A second user at the SAME domain whose address is UNVERIFIED. Without this the test
+    // name's second half is a claim nothing checks: every address above is verified, so
+    // deleting the verified requirement would change nothing and the mutation would survive.
+    //
+    // This is the case that matters most. `allowed_email_domains` is an operator assertion
+    // about which domains an organization accepts, never proof that the person holds the
+    // address, so provisioning from an unproven one would let anyone join by claiming it.
+    let claimant = harness.seed_user("claimant@example.test", PASSWORD).await;
+    let claimant_id = ironauth_store::UserId::parse_in_scope(&claimant, &harness.scope())
+        .expect("a well formed subject");
+    add_email(&harness, &claimant_id, "claimant@jit.test", false).await;
+
+    let (flow_id, token) = create_login(&harness, Transport::Api).await;
+    let completed = try_drive(
+        &harness,
+        &flow_id,
+        &token,
+        &[
+            ("identifier", "claimant@example.test"),
+            ("password", PASSWORD),
+        ],
+    )
+    .await;
+    assert!(minted_a_session(&completed), "the claimant still signs in");
+    assert!(
+        !is_member(&harness, &enabled, &claimant).await,
+        "an UNVERIFIED address earned a membership: anyone could join this organization by \
+         claiming one of its addresses"
+    );
+}
+
+/// Seed an email identifier for `subject`.
+async fn add_email(harness: &Harness, subject: &ironauth_store::UserId, raw: &str, verified: bool) {
+    let env = harness.env().clone();
+    harness
+        .store()
+        .scoped(harness.scope())
+        .acting(
+            harness.db().test_actor(&env),
+            ironauth_store::CorrelationId::generate(&env),
+        )
+        .user_identifiers()
+        .add(
+            &env,
+            ironauth_store::NewUserIdentifier {
+                id: &ironauth_store::UserIdentifierId::generate(&env, &harness.scope()),
+                user_id: subject,
+                identifier_type: ironauth_store::IdentifierType::Email,
+                raw,
+                verified,
+                mode: ironauth_store::UniquenessMode::EnvironmentWide,
+                org: None,
+            },
+            None,
+        )
+        .await
+        .expect("add email identifier");
+}

@@ -523,6 +523,12 @@ pub async fn establish_session(
     // cannot have memberships to consult, so it reads as "no organization policy" and the
     // deployment defaults stand; it is not a reason to refuse a session that every other
     // check has already accepted.
+    // Just-in-time organization membership (issue #95), BEFORE the policy read below so a
+    // membership earned on this very login governs the session it is establishing. Doing it
+    // after would leave the first session ungoverned and only bind from the second, which is
+    // the kind of off-by-one that shows up as "the policy did not apply" once and never again.
+    jit_provision_memberships(state, scope, subject, actor).await;
+
     let org_policy = match ironauth_store::UserId::parse_in_scope(subject, &scope) {
         Ok(user_id) => crate::step_up::org_session_policy(state, scope, &user_id)
             .await
@@ -1026,6 +1032,115 @@ pub fn forbidden_page() -> Response {
             "This request could not be verified. Start the sign-in from the application again.",
         ),
     )
+}
+
+/// Create memberships for every organization that accepts one of the user's VERIFIED email
+/// domains for just-in-time provisioning (issue #95).
+///
+/// Runs at session establishment, once the subject is known and their identifiers are
+/// verifiable. Best effort throughout: this grants ACCESS to an organization, and a store
+/// fault is never a reason to grant it, nor is it a reason to refuse a login every other check
+/// has already accepted. On any error the user simply signs in without the membership.
+///
+/// # The disabled case does NOT fail the login
+///
+/// A domain that matches an organization whose `jit_provisioning` is off yields no membership
+/// and no error. Refusing the whole authentication would let one organization's policy lock
+/// out a user with a perfectly good local account, which is a lockout rather than a policy.
+/// The eligibility query enforces the flag, so a disabled organization never appears here.
+///
+/// # Only VERIFIED emails
+///
+/// `allowed_email_domains` is an unverified operator assertion about which domains an
+/// organization accepts. It is a narrowing filter on an address already proven, never
+/// authority for the address itself. Provisioning from an unverified identifier would let
+/// anyone join an organization by claiming one of its addresses.
+async fn jit_provision_memberships(
+    state: &OidcState,
+    scope: Scope,
+    subject: &str,
+    actor: ActorRef,
+) {
+    // The cheap gate first: one indexed predicate that is false in every deployment not using
+    // JIT, so the sealed identifier read below never happens there.
+    match state
+        .store()
+        .scoped(scope)
+        .org_auth_policies()
+        .any_jit_provisioning_enabled()
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) | Err(_) => return,
+    }
+    let Ok(user_id) = ironauth_store::UserId::parse_in_scope(subject, &scope) else {
+        return;
+    };
+    let Ok(identifiers) = state
+        .store()
+        .scoped(scope)
+        .user_identifiers()
+        .list_for_user(&user_id)
+        .await
+    else {
+        return;
+    };
+    let mut domains: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for record in &identifiers {
+        if !record.verified || record.identifier_type != ironauth_store::IdentifierType::Email {
+            continue;
+        }
+        // The domain is normalized through the SAME seam the policy stores its list with, so
+        // the comparison is between two canonical forms rather than two spellings.
+        if let Some((_, domain)) = record.raw.rsplit_once('@') {
+            if let Some(normalized) = ironauth_store::normalize_routing_domain(domain) {
+                domains.insert(normalized);
+            }
+        }
+    }
+    for domain in &domains {
+        let Ok(orgs) = state
+            .store()
+            .scoped(scope)
+            .org_auth_policies()
+            .jit_eligible_orgs(domain)
+            .await
+        else {
+            continue;
+        };
+        for org in &orgs {
+            // An existing membership is left alone, so a returning user is not re-provisioned
+            // on every sign-in and no duplicate audit row is written. A read fault also skips:
+            // this grants ACCESS, and a store fault is never a reason to grant it.
+            let absent = state
+                .store()
+                .scoped(scope)
+                .org_memberships()
+                .exists(org, &user_id)
+                .await;
+            if !matches!(absent, Ok(false)) {
+                continue;
+            }
+            let now = epoch_micros(state.now());
+            let _ = state
+                .store()
+                .scoped(scope)
+                .acting(actor, CorrelationId::generate(state.env()))
+                .org_memberships()
+                .create(
+                    state.env(),
+                    ironauth_store::NewMembership {
+                        id: &ironauth_store::OrgMembershipId::generate(state.env(), &scope),
+                        organization_id: org,
+                        user_id: &user_id,
+                        metadata: None,
+                    },
+                    now,
+                    None,
+                )
+                .await;
+        }
+    }
 }
 
 /// The shorter of a deployment window and an organization's override, in seconds.
