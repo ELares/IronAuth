@@ -17365,6 +17365,20 @@ impl ActingUserIdentifierRepo<'_> {
                 target: id,
             },
             async move |tx| {
+                // BIND the org-scoped discriminator to real membership (issue #249). Under
+                // `OrgScoped` the uniqueness key is `org:<id>`, and without this the id is
+                // whatever the caller passed: a caller who could influence it could pick a
+                // discriminator that collides with nothing and claim an identifier already
+                // taken in the organization they actually belong to.
+                //
+                // Only when the mode actually USES `org`. Environment-wide mode ignores it,
+                // so requiring membership there would reject callers that pass an org
+                // harmlessly and change behaviour that has nothing to do with this fix.
+                if matches!(mode, UniquenessMode::OrgScoped) {
+                    if let Some(org_id) = org {
+                        require_live_membership(tx, scope, org_id, user_id).await?;
+                    }
+                }
                 let (dek_version, dek) = fetch_active_dek(tx, scope, master).await?;
                 let raw_sealed = dek.seal(
                     env.entropy(),
@@ -45564,6 +45578,48 @@ async fn require_live_group_in_org(
 /// assignment: the `role_id` foreign key is id-only, so nothing in the database would
 /// stop a group of one organization from being granted a role of a sibling
 /// organization in the same environment.
+/// Require that `user_id` is a LIVE member of `organization_id` (issue #249).
+///
+/// The org-scoped uniqueness discriminator used to be computed from a caller-supplied
+/// `org` string with nothing tying it to real membership. Under
+/// [`UniquenessMode::OrgScoped`] that made the uniqueness key SPOOFABLE: a caller who
+/// could influence `org` could pick a discriminator that collides with nothing and take
+/// an identifier already claimed in the organization they actually belong to.
+///
+/// It was inert while the shipped default was environment-wide, which ignores `org`
+/// entirely. It stops being inert the moment an environment selects org-scoped mode, so
+/// the binding belongs here rather than in a later issue.
+///
+/// Checked INSIDE the write transaction so the membership cannot be revoked between the
+/// check and the insert: the discriminator and the membership that justifies it commit
+/// together or not at all.
+async fn require_live_membership(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    organization_id: &str,
+    user_id: &UserId,
+) -> Result<(), StoreError> {
+    let found = sqlx::query(
+        "SELECT 1 AS present FROM org_memberships \
+         WHERE tenant_id = $1 AND environment_id = $2 \
+         AND organization_id = $3 AND user_id = $4 AND deleted_at IS NULL",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(organization_id)
+    .bind(user_id.to_string())
+    .fetch_optional(&mut **tx)
+    .await?;
+    if found.is_some() {
+        Ok(())
+    } else {
+        // A caller-facing validation error, not the uniform not-found: naming an
+        // organization the user does not belong to is a wiring bug or an attempt to pick a
+        // discriminator, and both deserve to be told apart from "no such identifier".
+        Err(StoreError::InvalidIdentifier)
+    }
+}
+
 async fn require_live_role_in_org(
     tx: &mut Transaction<'_, Postgres>,
     scope: Scope,
