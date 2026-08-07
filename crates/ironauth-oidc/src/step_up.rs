@@ -436,38 +436,42 @@ pub(crate) struct RequirementForRequest {
 /// floor, [`authn::CredentialClass::Any`], which constrains nothing), or `Err(())` on
 /// a store fault so the caller can fail closed. A malformed `min_class` token is
 /// ignored (it can only ever under-constrain, never over-claim).
-/// Whether any organization the SUBJECT belongs to requires a genuine second factor
-/// (issue #95).
+/// What the SUBJECT's organizations demand of their session, aggregated (issue #95).
+///
+/// One read serving both org-level enforcement points, so the memberships and their policy
+/// documents are fetched ONCE rather than once per dimension.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct OrgSessionPolicy {
+    /// Any organization requires a genuine second factor.
+    pub(crate) mfa_required: bool,
+    /// The SHORTEST absolute session lifetime any organization asked for, in seconds.
+    pub(crate) session_ttl_secs: Option<u32>,
+    /// The SHORTEST idle session window any organization asked for, in seconds.
+    pub(crate) session_idle_ttl_secs: Option<u32>,
+}
+
+/// Resolve the organization level of the policy for `subject` (issue #95).
 ///
 /// This is the wiring the resolver in `ironauth_store::org_policy` was built for and never
 /// had: `resolve` and `PolicyLevels` shipped complete, with commutative combinators and a
-/// documented level order, and nothing called them. An operator could set
-/// `mfa_required = true` on an organization, receive a 2xx and an audit row, and no member
-/// was ever asked for a second factor.
+/// documented level order, and nothing called them. An operator could set a policy on an
+/// organization, receive a 2xx and an audit row, and nothing about authentication changed.
 ///
-/// It is evaluated HERE, after the subject is known, rather than in
-/// [`requirement_for_request`]: at request-assembly time nobody has identified yet, so
-/// there is no organization to consult. The org contribution can only be OR-ed in once we
-/// know who is authenticating.
+/// It is evaluated wherever the SUBJECT is known, never at request assembly: at that point
+/// nobody has identified, so there is no organization to consult.
 ///
-/// The result rides the `mfa_baseline_required` channel and NEVER an `mfa` acr floor, for
-/// the reason that channel exists: the acr ladder ranks `phr` above `mfa`, so an `mfa`
-/// floor is silently satisfiable by a presence-only passkey that performed no second factor.
-/// Riding the flag also inherits the remembered-device path and the conditional-credential
-/// skip unchanged, so an org requirement behaves exactly like the scope baseline.
+/// STRICTEST WINS across memberships, per dimension. A user in two organizations gets the OR
+/// of their MFA requirements and the MIN of their session lifetimes, because every dimension
+/// here is a floor or a ceiling that a second membership may tighten and never relax. A user
+/// must not escape one organization's policy by joining another.
 ///
-/// STRICTEST WINS across memberships: a user in two organizations, one requiring MFA and one
-/// silent, is required. Requiring is a security floor, so a second membership can only ever
-/// tighten it, and a user cannot escape an organization's requirement by joining another.
-///
-/// Fails CLOSED. A read fault returns `Err(())` which the caller surfaces on the same
-/// `policy_read_faulted` channel as the credential-class read, because a policy we could not
-/// read is not a policy that does not apply.
-pub(crate) async fn org_baseline_mfa_required(
+/// Fails CLOSED to `Err(())`; each caller applies its own endpoint's documented contract for
+/// a policy read fault.
+pub(crate) async fn org_session_policy(
     state: &OidcState,
     scope: Scope,
     subject: &ironauth_store::UserId,
-) -> Result<bool, ()> {
+) -> Result<OrgSessionPolicy, ()> {
     let memberships = state
         .store()
         .scoped(scope)
@@ -475,9 +479,10 @@ pub(crate) async fn org_baseline_mfa_required(
         .list_for_user(subject)
         .await
         .map_err(|_| ())?;
+    let mut aggregate = OrgSessionPolicy::default();
     for membership in &memberships {
-        // `document_for_org` returns `None` for an organization with no policy, which is
-        // the identity element of the resolver's combinators rather than an error.
+        // `document_for_org` returns `None` for an organization with no policy, which is the
+        // identity element of the resolver's combinators rather than an error.
         let document = state
             .store()
             .scoped(scope)
@@ -490,11 +495,43 @@ pub(crate) async fn org_baseline_mfa_required(
             organization: Some(document),
             ..ironauth_store::PolicyLevels::default()
         };
-        if ironauth_store::resolve_org_policy(&levels).mfa_required() {
-            return Ok(true);
-        }
+        let resolved = ironauth_store::resolve_org_policy(&levels);
+        aggregate.mfa_required = aggregate.mfa_required || resolved.mfa_required();
+        aggregate.session_ttl_secs =
+            shortest(aggregate.session_ttl_secs, resolved.session_ttl_secs());
+        aggregate.session_idle_ttl_secs = shortest(
+            aggregate.session_idle_ttl_secs,
+            resolved.session_idle_ttl_secs(),
+        );
     }
-    Ok(false)
+    Ok(aggregate)
+}
+
+/// The shorter of two optional windows, treating absent as "no opinion" rather than as zero.
+fn shortest(current: Option<u32>, candidate: Option<u32>) -> Option<u32> {
+    match (current, candidate) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(only), None) | (None, Some(only)) => Some(only),
+        (None, None) => None,
+    }
+}
+
+/// Whether any organization the SUBJECT belongs to requires a genuine second factor
+/// (issue #95).
+///
+/// The result rides the `mfa_baseline_required` channel and NEVER an `mfa` acr floor, for
+/// the reason that channel exists: the acr ladder ranks `phr` above `mfa`, so an `mfa`
+/// floor is silently satisfiable by a presence-only passkey that performed no second factor.
+/// Riding the flag also inherits the remembered-device path and the conditional-credential
+/// skip unchanged, so an org requirement behaves exactly like the scope baseline.
+pub(crate) async fn org_baseline_mfa_required(
+    state: &OidcState,
+    scope: Scope,
+    subject: &ironauth_store::UserId,
+) -> Result<bool, ()> {
+    Ok(org_session_policy(state, scope, subject)
+        .await?
+        .mfa_required)
 }
 
 pub(crate) async fn credential_class_floor(

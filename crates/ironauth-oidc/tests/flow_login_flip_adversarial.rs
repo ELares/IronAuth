@@ -389,3 +389,82 @@ async fn an_org_mfa_requirement_holds_its_members_and_leaves_everyone_else_alone
          policy: the requirement is leaking beyond its members"
     );
 }
+
+/// The absolute expiry of the newest session for `subject`, in epoch microseconds.
+async fn latest_session_absolute_expiry(harness: &Harness, subject: &str) -> i64 {
+    use sqlx::Row;
+    let row = sqlx::query(
+        "SELECT (EXTRACT(EPOCH FROM absolute_expires_at) * 1000000)::bigint AS us \
+         FROM sessions WHERE subject = $1 ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(subject)
+    .fetch_one(harness.db().owner_pool())
+    .await
+    .expect("a session row");
+    row.get("us")
+}
+
+#[tokio::test]
+async fn an_org_session_lifetime_shortens_its_members_sessions_and_no_one_elses() {
+    // Issue #95 criterion 4. `ResolvedAuthPolicy::effective_session_ttl_secs` shipped with the
+    // resolver and had no caller, so an organization could set a session lifetime, get a 2xx
+    // and an audit row, and its members' sessions still ran for the deployment default.
+    //
+    // The override may only ever SHORTEN. A policy that lengthened a session would let an
+    // organization outlive the deployment's own ceiling, which is not theirs to raise.
+    let harness = setup().await;
+
+    let member = harness.seed_user("ttl-member@example.test", PASSWORD).await;
+    let outsider = harness
+        .seed_user("ttl-outsider@example.test", PASSWORD)
+        .await;
+
+    // Sixty seconds is far below any plausible deployment default, so a session that honours
+    // it is unmistakably the organization's doing rather than the default.
+    harness
+        .seed_org_policy(
+            &member,
+            ironauth_store::AuthPolicy {
+                session_ttl_secs: Some(60),
+                ..ironauth_store::AuthPolicy::default()
+            },
+        )
+        .await;
+
+    let (flow_id, token) = create_login(&harness, Transport::Api).await;
+    let completed = try_drive(
+        &harness,
+        &flow_id,
+        &token,
+        &[
+            ("identifier", "ttl-member@example.test"),
+            ("password", PASSWORD),
+        ],
+    )
+    .await;
+    assert!(minted_a_session(&completed), "the member signs in");
+
+    let (flow_id, token) = create_login(&harness, Transport::Api).await;
+    let completed = try_drive(
+        &harness,
+        &flow_id,
+        &token,
+        &[
+            ("identifier", "ttl-outsider@example.test"),
+            ("password", PASSWORD),
+        ],
+    )
+    .await;
+    assert!(minted_a_session(&completed), "the outsider signs in");
+
+    let member_expiry = latest_session_absolute_expiry(&harness, &member).await;
+    let outsider_expiry = latest_session_absolute_expiry(&harness, &outsider).await;
+
+    // The comparison is between the TWO sessions rather than against a literal, so the test
+    // does not encode the deployment default and keeps meaning if that default changes.
+    assert!(
+        member_expiry < outsider_expiry,
+        "the member's session was not shortened by their organization's policy: member \
+         expires at {member_expiry}, outsider at {outsider_expiry}"
+    );
+}

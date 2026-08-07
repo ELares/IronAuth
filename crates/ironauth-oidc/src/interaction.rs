@@ -511,8 +511,28 @@ pub async fn establish_session(
     }
     let now = state.now();
     let session_id = SessionId::generate(state.env(), &scope);
-    let idle_micros = epoch_micros(now.checked_add(state.session_idle_ttl()).unwrap_or(now));
-    let absolute_micros = epoch_micros(now.checked_add(state.session_ttl()).unwrap_or(now));
+    // The ORGANIZATION session lifetime override (issue #95), narrowing the deployment
+    // defaults. `effective_session_ttl_secs` takes the deployment value and returns the
+    // shorter of the two, so an organization may only ever SHORTEN a session: a policy that
+    // tried to lengthen one would let an organization outlive the deployment's own ceiling.
+    //
+    // A read fault leaves the deployment defaults in place rather than failing the login,
+    // matching the best-effort contract for a policy read on this path. The session is then
+    // no longer-lived than it would have been without any organization policy at all.
+    // `subject` is the `usr_` id string on this path. An id that will not parse in scope
+    // cannot have memberships to consult, so it reads as "no organization policy" and the
+    // deployment defaults stand; it is not a reason to refuse a session that every other
+    // check has already accepted.
+    let org_policy = match ironauth_store::UserId::parse_in_scope(subject, &scope) {
+        Ok(user_id) => crate::step_up::org_session_policy(state, scope, &user_id)
+            .await
+            .unwrap_or_default(),
+        Err(_) => crate::step_up::OrgSessionPolicy::default(),
+    };
+    let idle_ttl = narrowed(state.session_idle_ttl(), org_policy.session_idle_ttl_secs);
+    let absolute_ttl = narrowed(state.session_ttl(), org_policy.session_ttl_secs);
+    let idle_micros = epoch_micros(now.checked_add(idle_ttl).unwrap_or(now));
+    let absolute_micros = epoch_micros(now.checked_add(absolute_ttl).unwrap_or(now));
     // The session the browser already holds, if any: the one this privilege
     // transition rotates AWAY (session-fixation defense).
     let prior = prior_session_id(headers, scope);
@@ -1006,6 +1026,18 @@ pub fn forbidden_page() -> Response {
             "This request could not be verified. Start the sign-in from the application again.",
         ),
     )
+}
+
+/// The shorter of a deployment window and an organization's override, in seconds.
+///
+/// Absent means the organization stated nothing, which leaves the deployment value alone.
+/// This can only ever return something no longer than `deployment`, which is the property
+/// that keeps an organization from extending a session past the deployment's ceiling.
+fn narrowed(deployment: std::time::Duration, org_secs: Option<u32>) -> std::time::Duration {
+    match org_secs {
+        Some(secs) => deployment.min(std::time::Duration::from_secs(u64::from(secs))),
+        None => deployment,
+    }
 }
 
 #[cfg(test)]
