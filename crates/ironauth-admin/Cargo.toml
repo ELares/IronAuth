@@ -120,6 +120,11 @@ path = "tests/project_grants.rs"
 required-features = ["testing"]
 
 [[test]]
+name = "operator_isolation"
+path = "tests/operator_isolation.rs"
+required-features = ["testing"]
+
+[[test]]
 name = "management_permissions"
 path = "tests/management_permissions.rs"
 

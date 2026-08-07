@@ -74,7 +74,7 @@ pub struct HardKillQuery {
 /// operator passes; a management key must be scoped to exactly this environment
 /// (otherwise the LOUD wrong-scope error). A malformed tenant or environment id is
 /// the uniform not-found.
-fn resolve_scope(
+async fn resolve_scope(
     state: &AdminState,
     principal: &Principal,
     tenant_id: &str,
@@ -88,8 +88,27 @@ fn resolve_scope(
     let environment = state
         .store()
         .management()
-        .environments(tenant)
+        .environments(state.bootstrap_operator_id(), tenant)
         .parse_id(environment_id)?;
+    // Issue #185: the caller's OPERATOR fences the pair. `tenants` and `environments`
+    // sit ABOVE row-level security (RLS fences the pair these tables define), so without
+    // this a caller naming another operator's tenant reached that tenant's environments
+    // and everything under them: measured returning another operator's organization
+    // document in full.
+    //
+    // ADDRESSABILITY, not liveness. A soft-deleted environment must stay readable (see
+    // `EnvironmentAccess`), so this asks only whether the pair exists under this
+    // operator; whether it is live is each endpoint's own question.
+    if !state
+        .store()
+        .management()
+        .environments(state.bootstrap_operator_id(), tenant)
+        .exists_in_any_state(&environment)
+        .await
+        .map_err(|_| ApiError::Internal)?
+    {
+        return Err(ApiError::NotFound);
+    }
     let actor = principal.require_environment(tenant, environment)?;
     Ok((Scope::new(tenant, environment), actor))
 }
@@ -215,7 +234,7 @@ pub async fn create_user(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): this operation is classified
     // `management.write_users` in the permission pin, and this is where that
     // declaration becomes enforcement. An UNRESTRICTED credential (every key minted
@@ -377,7 +396,7 @@ pub async fn list_users(
     Query(filter): Query<UserFilterQuery>,
     Query(query): Query<ListQuery>,
 ) -> Result<Response, ApiError> {
-    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): classified `management.read`.
     // A read is still an authority: listing users is how an operator learns who
     // exists, so a credential restricted away from it must not be able to enumerate
@@ -433,7 +452,7 @@ pub async fn get_user(
     principal: Principal,
     Path((tenant_id, environment_id, user_id)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
-    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): classified `management.read`.
     // A read is still an authority: listing users is how an operator learns who
     // exists, so a credential restricted away from it must not be able to enumerate
@@ -489,7 +508,7 @@ pub async fn get_user_traits(
     principal: Principal,
     Path((tenant_id, environment_id, user_id)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
-    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): classified `management.read`.
     // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::Read)?;
@@ -536,7 +555,7 @@ pub async fn update_user(
     Path((tenant_id, environment_id, user_id)): Path<(String, String, String)>,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): classified `management.write_users`.
     // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::WriteUsers)?;
@@ -621,7 +640,7 @@ pub async fn delete_user(
     Path((tenant_id, environment_id, user_id)): Path<(String, String, String)>,
     Query(hard): Query<HardKillQuery>,
 ) -> Result<Response, ApiError> {
-    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): this operation is classified
     // `management.write_users` in the permission pin, and this is where that
     // declaration becomes enforcement. An UNRESTRICTED credential (every key minted
@@ -672,7 +691,7 @@ pub async fn set_user_state(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): classified `management.write_users`.
     // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::WriteUsers)?;
@@ -813,7 +832,7 @@ pub async fn link_user_external_id(
     Path((tenant_id, environment_id, user_id)): Path<(String, String, String)>,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): classified `management.write_users`.
     // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::WriteUsers)?;
@@ -882,7 +901,7 @@ pub async fn unlink_user_external_id(
     principal: Principal,
     Path((tenant_id, environment_id, user_id)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
-    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): classified `management.write_users`.
     // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::WriteUsers)?;

@@ -212,7 +212,7 @@ use crate::state::AdminState;
 /// [`ApiError::NotFound`] for a malformed or absent tenant or environment;
 /// [`ApiError::WrongScope`] for a credential that is not authorized for this
 /// environment or is on the wrong plane.
-pub fn resolve_scope(
+pub async fn resolve_scope(
     state: &AdminState,
     principal: &Principal,
     tenant_id: &str,
@@ -226,8 +226,27 @@ pub fn resolve_scope(
     let environment = state
         .store()
         .management()
-        .environments(tenant)
+        .environments(state.bootstrap_operator_id(), tenant)
         .parse_id(environment_id)?;
+    // Issue #185: the caller's OPERATOR fences the pair. `tenants` and `environments`
+    // sit ABOVE row-level security (RLS fences the pair these tables define), so without
+    // this a caller naming another operator's tenant reached that tenant's environments
+    // and everything under them: measured returning another operator's organization
+    // document in full.
+    //
+    // ADDRESSABILITY, not liveness. A soft-deleted environment must stay readable (see
+    // `EnvironmentAccess`), so this asks only whether the pair exists under this
+    // operator; whether it is live is each endpoint's own question.
+    if !state
+        .store()
+        .management()
+        .environments(state.bootstrap_operator_id(), tenant)
+        .exists_in_any_state(&environment)
+        .await
+        .map_err(|_| ApiError::Internal)?
+    {
+        return Err(ApiError::NotFound);
+    }
     let actor = principal.require_environment(tenant, environment)?;
     Ok((Scope::new(tenant, environment), actor))
 }
@@ -401,7 +420,7 @@ pub async fn require_live_environment(state: &AdminState, scope: &Scope) -> Resu
     state
         .store()
         .management()
-        .environments(scope.tenant())
+        .environments(state.bootstrap_operator_id(), scope.tenant())
         .get(&scope.environment())
         .await?;
     Ok(())
@@ -441,7 +460,7 @@ pub async fn require_present_environment(
     let present = state
         .store()
         .management()
-        .environments(scope.tenant())
+        .environments(state.bootstrap_operator_id(), scope.tenant())
         .exists_in_any_state(&scope.environment())
         .await?;
     if present {

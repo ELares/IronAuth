@@ -254,7 +254,7 @@ impl Fixture {
             .control_store()
             .management()
             .acting(self.actor, CorrelationId::generate(&self.env))
-            .environments(tenant)
+            .environments(self.operator, tenant)
             .create(
                 &self.env,
                 &environment,
@@ -279,7 +279,7 @@ impl Fixture {
             .control_store()
             .management()
             .acting(self.actor, CorrelationId::generate(&self.env))
-            .environments(scope.tenant())
+            .environments(self.operator, scope.tenant())
             .delete(&self.env, &scope.environment())
             .await
     }
@@ -291,7 +291,7 @@ impl Fixture {
         self.db
             .control_store()
             .management()
-            .environments(scope.tenant())
+            .environments(self.operator, scope.tenant())
             .get(&scope.environment())
             .await
             .is_ok()
@@ -390,7 +390,7 @@ impl Fixture {
         self.db
             .control_store()
             .management()
-            .environments(scope.tenant())
+            .environments(self.operator, scope.tenant())
             .get(&scope.environment())
             .await
             .expect("get environment")
@@ -1480,7 +1480,7 @@ async fn a_new_environment_is_refused_under_a_non_active_tenant() {
             fx.db
                 .control_store()
                 .management()
-                .environments(would_be.tenant())
+                .environments(fx.operator, would_be.tenant())
                 .get(&would_be.environment())
                 .await,
             Err(StoreError::NotFound)

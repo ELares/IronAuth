@@ -54,7 +54,11 @@ impl Fixture {
     /// and seed one empty target environment.
     async fn start() -> Self {
         let env = Env::system();
-        let db = TestDatabase::start().await;
+        let mut db = TestDatabase::start().await;
+        // Seed under the operator the management API acts as (issue #185). Each seed
+        // otherwise mints a FRESH operator, and the surface this CLI drives would then
+        // answer the uniform not-found for every tenant the harness created.
+        db.own_seeded_scopes_by(ironauth_admin::bootstrap_operator_id());
         let config = AdminConfig {
             bootstrap_operator_token: Some(Secret::Literal(SecretString::new(OPERATOR_TOKEN))),
             max_page_size: 200,

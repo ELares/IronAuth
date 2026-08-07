@@ -89,7 +89,7 @@ pub async fn list_step_up_policies(
     // (tenant, environment), so a management key scoped elsewhere cannot read this
     // environment's policies. A step-up policy names the acr floor guarding a scope, so
     // reading the set tells an attacker exactly which scopes are weakly guarded.
-    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): classified `management.read`.
     // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::Read)?;
@@ -149,7 +149,7 @@ pub async fn set_step_up_policy(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
-    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): classified `management.write_config`.
     // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::WriteConfig)?;
@@ -220,7 +220,7 @@ pub async fn remove_step_up_policy(
     principal: Principal,
     Path((tenant_id, environment_id, scope_token)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
-    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): classified `management.write_config`.
     // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::WriteConfig)?;

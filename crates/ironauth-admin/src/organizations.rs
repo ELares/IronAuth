@@ -81,7 +81,7 @@ pub async fn create_organization(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): classified `management.write_organizations`.
     // An UNRESTRICTED credential (every key minted before migration 0118) passes
     // unchanged; this only binds a credential someone deliberately restricted.
@@ -182,7 +182,7 @@ pub async fn list_organizations(
     Path((tenant_id, environment_id)): Path<(String, String)>,
     Query(query): Query<ListQuery>,
 ) -> Result<Response, ApiError> {
-    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): classified `management.read`.
     // An UNRESTRICTED credential (every key minted before migration 0118) passes
     // unchanged; this only binds a credential someone deliberately restricted.
@@ -232,7 +232,7 @@ pub async fn get_organization(
     principal: Principal,
     Path((tenant_id, environment_id, organization_id)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
-    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): classified `management.read`.
     // An UNRESTRICTED credential (every key minted before migration 0118) passes
     // unchanged; this only binds a credential someone deliberately restricted.
@@ -290,7 +290,7 @@ pub async fn delete_organization(
     principal: Principal,
     Path((tenant_id, environment_id, organization_id)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
-    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): classified `management.write_organizations`.
     // An UNRESTRICTED credential (every key minted before migration 0118) passes
     // unchanged; this only binds a credential someone deliberately restricted.
@@ -347,7 +347,7 @@ async fn set_organization_state(
         uri,
         headers,
     } = toggle;
-    let (scope, actor) = resolve_scope(state, principal, tenant_id, environment_id)?;
+    let (scope, actor) = resolve_scope(state, principal, tenant_id, environment_id).await?;
     // Delegated administration (issue #102): classified `management.write_organizations`.
     // Enforced in the SHARED body rather than in `disable_organization` and
     // `enable_organization` separately: two copies of one rule is one place to forget it,

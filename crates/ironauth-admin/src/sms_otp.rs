@@ -110,7 +110,7 @@ pub async fn get_sms_otp_config(
     principal: Principal,
     Path((tenant_id, environment_id)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): classified `management.read`.
     // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::Read)?;
@@ -152,7 +152,7 @@ pub async fn set_sms_otp_config(
     Path((tenant_id, environment_id)): Path<(String, String)>,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): classified `management.write_config`.
     // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::WriteConfig)?;
@@ -202,7 +202,7 @@ pub async fn list_sms_allowlist(
     principal: Principal,
     Path((tenant_id, environment_id)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): classified `management.read`.
     // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::Read)?;
@@ -237,7 +237,7 @@ pub async fn allow_sms_country(
     principal: Principal,
     Path((tenant_id, environment_id, country_code)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
-    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): classified `management.write_config`.
     // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::WriteConfig)?;
@@ -279,7 +279,7 @@ pub async fn deny_sms_country(
     principal: Principal,
     Path((tenant_id, environment_id, country_code)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
-    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): classified `management.write_config`.
     // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::WriteConfig)?;

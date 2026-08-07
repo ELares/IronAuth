@@ -36848,9 +36848,10 @@ impl<'a> ManagementStore<'a> {
 
     /// The read-only environment repository under `tenant`.
     #[must_use]
-    pub fn environments(&self, tenant: TenantId) -> EnvironmentRepo<'a> {
+    pub fn environments(&self, operator: OperatorId, tenant: TenantId) -> EnvironmentRepo<'a> {
         EnvironmentRepo {
             store: self.store,
+            operator,
             tenant,
         }
     }
@@ -37092,10 +37093,15 @@ impl<'a> ActingManagementStore<'a> {
 
     /// The mutating environment repository under `tenant`.
     #[must_use]
-    pub fn environments(&self, tenant: TenantId) -> ActingEnvironmentRepo<'a> {
+    pub fn environments(
+        &self,
+        operator: OperatorId,
+        tenant: TenantId,
+    ) -> ActingEnvironmentRepo<'a> {
         ActingEnvironmentRepo {
             store: self.store,
             acting: self.acting,
+            operator,
             tenant,
         }
     }
@@ -37350,6 +37356,11 @@ impl TenantRepo<'_> {
 /// Read-only environments under one tenant.
 pub struct EnvironmentRepo<'a> {
     store: &'a Store,
+    /// The operator the CALLER is, which is what connects a tenant in the path to the
+    /// party asking (issue #185). `tenants` and `environments` sit ABOVE row-level
+    /// security, since RLS fences the `(tenant, environment)` pair these tables define,
+    /// so this predicate is the only thing fencing them.
+    operator: OperatorId,
     tenant: TenantId,
 }
 
@@ -37376,10 +37387,14 @@ impl EnvironmentRepo<'_> {
             "SELECT id, tenant_id, display_name, kind, custom_domain, region, \
              (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us \
              FROM environments \
-             WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL",
+             WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL \
+               AND EXISTS (SELECT 1 FROM tenants t \
+                           WHERE t.id = environments.tenant_id \
+                             AND t.operator_id = $3 AND t.deleted_at IS NULL)",
         )
         .bind(id.to_string())
         .bind(self.tenant.to_string())
+        .bind(self.operator.to_string())
         .fetch_optional(self.store.pool())
         .await?
         .ok_or(StoreError::NotFound)?;
@@ -37409,12 +37424,18 @@ impl EnvironmentRepo<'_> {
     ///
     /// [`StoreError::Database`] on a persistence failure.
     pub async fn exists_in_any_state(&self, id: &EnvironmentId) -> Result<bool, StoreError> {
-        let row =
-            sqlx::query("SELECT 1 AS present FROM environments WHERE id = $1 AND tenant_id = $2")
-                .bind(id.to_string())
-                .bind(self.tenant.to_string())
-                .fetch_optional(self.store.pool())
-                .await?;
+        let row = sqlx::query(
+            "SELECT 1 AS present FROM environments \
+                 WHERE id = $1 AND tenant_id = $2 \
+                   AND EXISTS (SELECT 1 FROM tenants t \
+                               WHERE t.id = environments.tenant_id \
+                                 AND t.operator_id = $3 AND t.deleted_at IS NULL)",
+        )
+        .bind(id.to_string())
+        .bind(self.tenant.to_string())
+        .bind(self.operator.to_string())
+        .fetch_optional(self.store.pool())
+        .await?;
         Ok(row.is_some())
     }
 
@@ -37435,6 +37456,9 @@ impl EnvironmentRepo<'_> {
              (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us \
              FROM environments \
              WHERE tenant_id = $1 AND deleted_at IS NULL \
+               AND EXISTS (SELECT 1 FROM tenants t \
+                           WHERE t.id = environments.tenant_id \
+                             AND t.operator_id = $5 AND t.deleted_at IS NULL) \
              AND ($2::bigint IS NULL OR (created_at, id) > \
                   (TIMESTAMPTZ 'epoch' + ($2::text || ' microseconds')::interval, $3::text)) \
              ORDER BY created_at, id LIMIT $4",
@@ -37443,6 +37467,7 @@ impl EnvironmentRepo<'_> {
         .bind(after_micros)
         .bind(after_id)
         .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
+        .bind(self.operator.to_string())
         .fetch_all(self.store.pool())
         .await?;
         rows.iter().map(environment_from_row).collect()
@@ -41975,6 +42000,10 @@ impl ActingTenantRepo<'_> {
 pub struct ActingEnvironmentRepo<'a> {
     store: &'a Store,
     acting: ActingContext,
+    /// See [`EnvironmentRepo::operator`]: a write beneath a foreign tenant is the worse
+    /// half of issue #185, because minting a management key there hands the caller a
+    /// credential INTO another operator's environment.
+    operator: OperatorId,
     tenant: TenantId,
 }
 
@@ -42016,6 +42045,7 @@ impl ActingEnvironmentRepo<'_> {
             return Err(StoreError::NotFound);
         }
         let tenant = self.tenant;
+        let operator = self.operator;
         write_audited(
             AuditedWrite {
                 store: self.store,
@@ -42041,14 +42071,34 @@ impl ActingEnvironmentRepo<'_> {
                 // control plane maps to a loud 409. A tenant that does not exist AT ALL
                 // is left to the foreign-key rejection on the insert (the pre-existing
                 // behavior), so an absent parent stays distinct from a suspended one.
+                //
+                // The owner is read alongside and checked SEPARATELY rather than as a
+                // conjunct on this query (issue #185), because the two are not
+                // equivalent HERE: a missing row falls through to the INSERT below and
+                // leans on the foreign key to refuse an absent tenant, and a FOREIGN
+                // tenant EXISTS, so the key would be satisfied and the environment
+                // created under somebody else's tenant.
+                //
+                // What is measured, stated exactly, because a mutation corrected me.
+                // Both forms pass the admin-level test: `create_environment` resolves its
+                // tenant through the operator-filtered `TenantRepo` first and answers the
+                // uniform not-found before this transaction opens, so no HTTP request
+                // reaches the difference. This is therefore a STORE-level backstop for a
+                // caller that reaches the repository directly, and the admin harness
+                // cannot tell the two spellings apart. It is kept in the safer form
+                // rather than the tidier one on the argument above, not on a measurement.
                 let parent = sqlx::query(
-                    "SELECT status, (deleted_at IS NULL AND purged_at IS NULL) AS live \
+                    "SELECT status, operator_id, \
+                            (deleted_at IS NULL AND purged_at IS NULL) AS live \
                      FROM tenants WHERE id = $1",
                 )
                 .bind(tenant.to_string())
                 .fetch_optional(&mut **tx)
                 .await?;
                 if let Some(row) = parent {
+                    if row.get::<String, _>("operator_id") != operator.to_string() {
+                        return Err(StoreError::NotFound);
+                    }
                     let active = row.get::<String, _>("status") == TenantStatus::Active.as_str();
                     let live: bool = row.get("live");
                     if !(active && live) {

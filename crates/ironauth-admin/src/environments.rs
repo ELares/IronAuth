@@ -164,7 +164,7 @@ pub async fn create_environment(
         .store()
         .management()
         .acting(actor, CorrelationId::generate(state.env()))
-        .environments(tenant)
+        .environments(state.bootstrap_operator_id(), tenant)
         .create(
             state.env(),
             &environment_id,
@@ -232,7 +232,7 @@ pub async fn list_environments(
     let rows = state
         .store()
         .management()
-        .environments(tenant)
+        .environments(state.bootstrap_operator_id(), tenant)
         .list(page.fetch_limit(), page.after())
         .await?;
     let (rows, next_cursor) = page.finish(rows, |record| {
@@ -275,7 +275,10 @@ pub async fn get_environment(
         .management()
         .tenants(state.bootstrap_operator_id())
         .parse_id(&tenant_id)?;
-    let environments = state.store().management().environments(tenant);
+    let environments = state
+        .store()
+        .management()
+        .environments(state.bootstrap_operator_id(), tenant);
     let environment = environments.parse_id(&environment_id)?;
     // The LOUD wrong-scope behavior: a management key against another environment
     // or tenant fails naming expected vs actual. The operator passes.
@@ -320,7 +323,7 @@ pub async fn delete_environment(
     let environment: EnvironmentId = state
         .store()
         .management()
-        .environments(tenant)
+        .environments(state.bootstrap_operator_id(), tenant)
         .parse_id(&environment_id)?;
     // Sudo mutation gate (issue #73): deleting an environment is an environment-scoped
     // mutation. Gate before the delete write so a challenge leaves nothing removed.
@@ -329,7 +332,7 @@ pub async fn delete_environment(
         .store()
         .management()
         .acting(actor, CorrelationId::generate(state.env()))
-        .environments(tenant)
+        .environments(state.bootstrap_operator_id(), tenant)
         .delete(state.env(), &environment)
         .await?;
     Ok(no_content())

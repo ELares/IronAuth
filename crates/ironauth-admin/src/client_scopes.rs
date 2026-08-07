@@ -277,7 +277,7 @@ pub async fn get_client_allowed_scopes(
     principal: Principal,
     Path((tenant_id, environment_id, client_id)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
-    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): classified `management.read`.
     // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::Read)?;
@@ -315,7 +315,7 @@ pub async fn set_client_allowed_scopes(
     Path((tenant_id, environment_id, client_id)): Path<(String, String, String)>,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): classified `management.write_config`.
     // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::WriteConfig)?;

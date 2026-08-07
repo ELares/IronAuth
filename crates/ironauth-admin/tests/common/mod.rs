@@ -53,7 +53,11 @@ impl Harness {
     /// (issue #46), for the tenant-lifecycle residency tests. An empty set (the
     /// default via [`Harness::start`]) leaves residency pinning unavailable.
     pub async fn start_with_regions(default_page_size: u32, allowed_regions: Vec<String>) -> Self {
-        let db = TestDatabase::start().await;
+        let mut db = TestDatabase::start().await;
+        // Seed under the operator this API actually acts as (issue #185). Left to
+        // itself each seed mints a FRESH operator, so every seeded tenant would be
+        // another operator's and the surface under test could not see it.
+        db.own_seeded_scopes_by(ironauth_admin::bootstrap_operator_id());
         let config = AdminConfig {
             bootstrap_operator_token: Some(Secret::Literal(SecretString::new(OPERATOR_TOKEN))),
             max_page_size: 200,
@@ -82,7 +86,11 @@ impl Harness {
         default_page_size: u32,
         offboarding_retention_secs: u64,
     ) -> Self {
-        let db = TestDatabase::start().await;
+        let mut db = TestDatabase::start().await;
+        // Seed under the operator this API actually acts as (issue #185). Left to
+        // itself each seed mints a FRESH operator, so every seeded tenant would be
+        // another operator's and the surface under test could not see it.
+        db.own_seeded_scopes_by(ironauth_admin::bootstrap_operator_id());
         let config = AdminConfig {
             bootstrap_operator_token: Some(Secret::Literal(SecretString::new(OPERATOR_TOKEN))),
             max_page_size: 200,
@@ -108,7 +116,11 @@ impl Harness {
     /// how a create's SECOND write is made to fail on real infrastructure without a
     /// production failure-injection knob in the admin crate.
     pub async fn start_with_env(default_page_size: u32, env: Env) -> Self {
-        let db = TestDatabase::start().await;
+        let mut db = TestDatabase::start().await;
+        // Seed under the operator this API actually acts as (issue #185). Left to
+        // itself each seed mints a FRESH operator, so every seeded tenant would be
+        // another operator's and the surface under test could not see it.
+        db.own_seeded_scopes_by(ironauth_admin::bootstrap_operator_id());
         let config = AdminConfig {
             bootstrap_operator_token: Some(Secret::Literal(SecretString::new(OPERATOR_TOKEN))),
             max_page_size: 200,
@@ -132,7 +144,11 @@ impl Harness {
     /// This bounds tree DEPTH only. It caps nothing that is counted: the number of
     /// groups an organization may hold is uncapped by covenant, at every depth level.
     pub async fn start_with_group_depth(default_page_size: u32, max_group_depth: u32) -> Self {
-        let db = TestDatabase::start().await;
+        let mut db = TestDatabase::start().await;
+        // Seed under the operator this API actually acts as (issue #185). Left to
+        // itself each seed mints a FRESH operator, so every seeded tenant would be
+        // another operator's and the surface under test could not see it.
+        db.own_seeded_scopes_by(ironauth_admin::bootstrap_operator_id());
         let config = AdminConfig {
             bootstrap_operator_token: Some(Secret::Literal(SecretString::new(OPERATOR_TOKEN))),
             max_page_size: 200,
@@ -164,7 +180,11 @@ impl Harness {
         default_page_size: u32,
         identifiers: &IdentifiersConfig,
     ) -> Self {
-        let db = TestDatabase::start().await;
+        let mut db = TestDatabase::start().await;
+        // Seed under the operator this API actually acts as (issue #185). Left to
+        // itself each seed mints a FRESH operator, so every seeded tenant would be
+        // another operator's and the surface under test could not see it.
+        db.own_seeded_scopes_by(ironauth_admin::bootstrap_operator_id());
         let config = AdminConfig {
             bootstrap_operator_token: Some(Secret::Literal(SecretString::new(OPERATOR_TOKEN))),
             max_page_size: 200,
@@ -193,7 +213,11 @@ impl Harness {
         default_page_size: u32,
         token_claims: &ironauth_config::TokenClaimsConfig,
     ) -> Self {
-        let db = TestDatabase::start().await;
+        let mut db = TestDatabase::start().await;
+        // Seed under the operator this API actually acts as (issue #185). Left to
+        // itself each seed mints a FRESH operator, so every seeded tenant would be
+        // another operator's and the surface under test could not see it.
+        db.own_seeded_scopes_by(ironauth_admin::bootstrap_operator_id());
         let config = AdminConfig {
             bootstrap_operator_token: Some(Secret::Literal(SecretString::new(OPERATOR_TOKEN))),
             max_page_size: 200,
@@ -216,7 +240,11 @@ impl Harness {
     /// `armed = false` leaves the feature off (its default), so a test can assert the
     /// endpoints 404 with the flag off.
     pub async fn start_with_signup_quarantine(default_page_size: u32, armed: bool) -> Self {
-        let db = TestDatabase::start().await;
+        let mut db = TestDatabase::start().await;
+        // Seed under the operator this API actually acts as (issue #185). Left to
+        // itself each seed mints a FRESH operator, so every seeded tenant would be
+        // another operator's and the surface under test could not see it.
+        db.own_seeded_scopes_by(ironauth_admin::bootstrap_operator_id());
         let config = AdminConfig {
             bootstrap_operator_token: Some(Secret::Literal(SecretString::new(OPERATOR_TOKEN))),
             max_page_size: 200,
@@ -239,7 +267,11 @@ impl Harness {
     /// of 404. `armed = false` leaves the feature off (its default), so a test can assert the
     /// endpoints 404 with the flag off.
     pub async fn start_with_advanced_recovery(default_page_size: u32, armed: bool) -> Self {
-        let db = TestDatabase::start().await;
+        let mut db = TestDatabase::start().await;
+        // Seed under the operator this API actually acts as (issue #185). Left to
+        // itself each seed mints a FRESH operator, so every seeded tenant would be
+        // another operator's and the surface under test could not see it.
+        db.own_seeded_scopes_by(ironauth_admin::bootstrap_operator_id());
         let config = AdminConfig {
             bootstrap_operator_token: Some(Secret::Literal(SecretString::new(OPERATOR_TOKEN))),
             max_page_size: 200,
@@ -268,7 +300,11 @@ impl Harness {
     pub async fn start_with_sudo(
         window_secs: u64,
     ) -> (Self, std::sync::Arc<ironauth_env::ManualClock>) {
-        let db = TestDatabase::start().await;
+        let mut db = TestDatabase::start().await;
+        // Seed under the operator this API actually acts as (issue #185). Left to
+        // itself each seed mints a FRESH operator, so every seeded tenant would be
+        // another operator's and the surface under test could not see it.
+        db.own_seeded_scopes_by(ironauth_admin::bootstrap_operator_id());
         // A fixed, non-zero epoch start so recorded instants are plausible timestamps.
         let start = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
         let (env, clock) = Env::deterministic(start, 73);
@@ -303,7 +339,11 @@ impl Harness {
     /// therefore disabled, which is what makes the cross-environment test meaningful.
     /// Callers seed users into [`Harness::outbound_scope`].
     pub async fn start_with_outbound_verification(token: &str) -> Self {
-        let db = TestDatabase::start().await;
+        let mut db = TestDatabase::start().await;
+        // Seed under the operator this API actually acts as (issue #185). Left to
+        // itself each seed mints a FRESH operator, so every seeded tenant would be
+        // another operator's and the surface under test could not see it.
+        db.own_seeded_scopes_by(ironauth_admin::bootstrap_operator_id());
         let config = AdminConfig {
             bootstrap_operator_token: Some(Secret::Literal(SecretString::new(OPERATOR_TOKEN))),
             max_page_size: 200,
@@ -356,7 +396,11 @@ impl Harness {
     /// wraps the SAME data-plane store `store()` returns, so a scope this harness seeds
     /// keys into resolves through the wizard.
     pub async fn start_with_signing_registry(default_page_size: u32) -> Self {
-        let db = TestDatabase::start().await;
+        let mut db = TestDatabase::start().await;
+        // Seed under the operator this API actually acts as (issue #185). Left to
+        // itself each seed mints a FRESH operator, so every seeded tenant would be
+        // another operator's and the surface under test could not see it.
+        db.own_seeded_scopes_by(ironauth_admin::bootstrap_operator_id());
         let config = AdminConfig {
             bootstrap_operator_token: Some(Secret::Literal(SecretString::new(OPERATOR_TOKEN))),
             max_page_size: 200,
@@ -402,7 +446,11 @@ impl Harness {
     /// database, the tenant and environment are created through the first one exactly as an
     /// operator would, and the second is bound to what that produced.
     pub async fn start_fully_armed(default_page_size: u32, outbound_token: &str) -> Self {
-        let db = TestDatabase::start().await;
+        let mut db = TestDatabase::start().await;
+        // Seed under the operator this API actually acts as (issue #185). Left to
+        // itself each seed mints a FRESH operator, so every seeded tenant would be
+        // another operator's and the surface under test could not see it.
+        db.own_seeded_scopes_by(ironauth_admin::bootstrap_operator_id());
         let bootstrap = AdminConfig {
             bootstrap_operator_token: Some(Secret::Literal(SecretString::new(OPERATOR_TOKEN))),
             max_page_size: 200,
@@ -551,7 +599,11 @@ impl Harness {
         default_page_size: u32,
         runtime: std::sync::Arc<ironauth_oidc::FederationRuntime>,
     ) -> Self {
-        let db = TestDatabase::start().await;
+        let mut db = TestDatabase::start().await;
+        // Seed under the operator this API actually acts as (issue #185). Left to
+        // itself each seed mints a FRESH operator, so every seeded tenant would be
+        // another operator's and the surface under test could not see it.
+        db.own_seeded_scopes_by(ironauth_admin::bootstrap_operator_id());
         let config = AdminConfig {
             bootstrap_operator_token: Some(Secret::Literal(SecretString::new(OPERATOR_TOKEN))),
             max_page_size: 200,

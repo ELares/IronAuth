@@ -306,7 +306,7 @@ fn scope_from_path(
     let environment = state
         .store()
         .management()
-        .environments(tenant)
+        .environments(state.bootstrap_operator_id(), tenant)
         .parse_id(environment_id)?;
     Ok(Scope::new(tenant, environment))
 }
@@ -644,7 +644,7 @@ pub async fn get_outbound_verification(
     principal: Principal,
     Path((tenant_id, environment_id)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): classified `management.read`.
     // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::Read)?;
@@ -700,7 +700,7 @@ pub async fn set_outbound_verification(
     Path((tenant_id, environment_id)): Path<(String, String)>,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): classified `management.write_config`.
     // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::WriteConfig)?;
@@ -785,7 +785,7 @@ pub async fn delete_outbound_verification(
     principal: Principal,
     Path((tenant_id, environment_id)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): classified `management.write_config`.
     // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::WriteConfig)?;

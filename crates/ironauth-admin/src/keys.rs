@@ -43,7 +43,7 @@ fn generate_secret(env: &Env) -> String {
 }
 
 /// Resolve the `(tenant, environment)` scope from the path, parsing both ids.
-fn scope_from_path(
+async fn scope_from_path(
     state: &AdminState,
     tenant_id: &str,
     environment_id: &str,
@@ -56,8 +56,22 @@ fn scope_from_path(
     let environment = state
         .store()
         .management()
-        .environments(tenant)
+        .environments(state.bootstrap_operator_id(), tenant)
         .parse_id(environment_id)?;
+    // Issue #185, the same operator fence the shared `resolve_scope` carries. This
+    // module keeps its own resolver, so the fix does not reach it by inheritance and the
+    // key LIST answered under another operator's environment until this was added. The
+    // mint path was already fenced, because it reads the environment before writing.
+    if !state
+        .store()
+        .management()
+        .environments(state.bootstrap_operator_id(), tenant)
+        .exists_in_any_state(&environment)
+        .await
+        .map_err(|_| ApiError::Internal)?
+    {
+        return Err(ApiError::NotFound);
+    }
     Ok((tenant, Scope::new(tenant, environment)))
 }
 
@@ -94,7 +108,7 @@ pub async fn create_key(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let actor = principal.require_operator()?;
-    let (_tenant, scope) = scope_from_path(&state, &tenant_id, &environment_id)?;
+    let (_tenant, scope) = scope_from_path(&state, &tenant_id, &environment_id).await?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
 
     let key = idempotency::required_key(&headers)?;
@@ -207,7 +221,7 @@ pub async fn list_keys(
     Query(query): Query<ListQuery>,
 ) -> Result<Response, ApiError> {
     principal.require_operator()?;
-    let (_tenant, scope) = scope_from_path(&state, &tenant_id, &environment_id)?;
+    let (_tenant, scope) = scope_from_path(&state, &tenant_id, &environment_id).await?;
     let page = Pagination::resolve(&query, state.default_page_size(), state.max_page_size())?;
     let rows = state
         .store()
@@ -251,7 +265,7 @@ pub async fn get_key(
     Path((tenant_id, environment_id, key_id)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
     principal.require_operator()?;
-    let (_tenant, scope) = scope_from_path(&state, &tenant_id, &environment_id)?;
+    let (_tenant, scope) = scope_from_path(&state, &tenant_id, &environment_id).await?;
     let credentials = state.store().management().credentials(scope);
     // A key minted in another scope parses as the uniform not-found (anti-oracle).
     let id = credentials.parse_id(&key_id)?;
@@ -286,7 +300,7 @@ pub async fn delete_key(
     Path((tenant_id, environment_id, key_id)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
     let actor = principal.require_operator()?;
-    let (_tenant, scope) = scope_from_path(&state, &tenant_id, &environment_id)?;
+    let (_tenant, scope) = scope_from_path(&state, &tenant_id, &environment_id).await?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     let id: ManagementKeyId = state
         .store()
