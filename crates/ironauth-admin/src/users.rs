@@ -490,6 +490,9 @@ pub async fn get_user_traits(
     Path((tenant_id, environment_id, user_id)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::Read)?;
     let id = resolve_user(&state, scope, &user_id, EnvironmentAccess::Read).await?;
     // The user must exist, or a trait-free identity and an ABSENT one would answer alike and
     // the route would be a silent existence oracle in the wrong direction (200 for a user
@@ -534,6 +537,9 @@ pub async fn update_user(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_users`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteUsers)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     let id = resolve_user(&state, scope, &user_id, EnvironmentAccess::Write).await?;
     let request: UpdateUserRequest = parse_json(&body)?;
@@ -667,6 +673,9 @@ pub async fn set_user_state(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_users`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteUsers)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
 
     let key = idempotency::required_key(&headers)?;
@@ -805,6 +814,9 @@ pub async fn link_user_external_id(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_users`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteUsers)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     // The PARENT-EXISTENCE precondition (issue #409). `resolve_scope` proves only that
     // the two path segments PARSE. An external id is PII, so linking one SEALS it, and
@@ -871,6 +883,9 @@ pub async fn unlink_user_external_id(
     Path((tenant_id, environment_id, user_id)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Delegated administration (issue #102): classified `management.write_users`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteUsers)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     let id = resolve_user(&state, scope, &user_id, EnvironmentAccess::Write).await?;
     state
