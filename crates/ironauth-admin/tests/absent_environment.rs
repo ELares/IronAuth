@@ -1042,6 +1042,21 @@ fn org_membership_cases(base: &str, ids: &Ids) -> Vec<Case> {
             path: format!("{base}/organizations/{org}/memberships/{membership}/roles/{role}"),
             body: None,
         },
+        // Project grants (issue #102). The environment fence must answer BEFORE the
+        // confinement fence these handlers add: an absent environment is not a place to
+        // report that a credential is confined.
+        Case {
+            label: "project_grants.createProjectGrant",
+            method: "POST",
+            path: format!("{base}/organizations/{org}/project-grants"),
+            body: Some("{\"client_id\":\"cli_absent\",\"role_ids\":[]}".to_owned()),
+        },
+        Case {
+            label: "project_grants.withdrawProjectGrant",
+            method: "DELETE",
+            path: format!("{base}/organizations/{org}/project-grants/pgt_absent"),
+            body: None,
+        },
     ]
 }
 

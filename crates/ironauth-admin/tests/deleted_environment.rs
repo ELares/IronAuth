@@ -103,6 +103,8 @@ use axum::http::{HeaderMap, Request, StatusCode, header};
 use axum::response::IntoResponse;
 use common::{Harness, OPERATOR_TOKEN, bearer};
 use ironauth_admin::ApiError;
+use ironauth_env::Env;
+use ironauth_store::{ActorRef, CorrelationId, EnvironmentId, Scope, ServiceId, TenantId};
 use serde_json::Value;
 use sqlx::PgPool;
 
@@ -301,6 +303,12 @@ struct Fixture {
     permission: String,
     /// Seeded unmapped.
     spare_permission: String,
+    /// A second application, so the create case is a 201 rather than a 409 against the
+    /// live grant the seed already holds: migration 0120 allows at most one LIVE grant
+    /// per (client, organization) pair.
+    spare_client: String,
+    /// Seeded live: the target of the withdrawal case.
+    grant: String,
 }
 
 impl Fixture {
@@ -404,6 +412,9 @@ impl Fixture {
             spare_membership,
         ] = <[String; 6]>::try_from(org_rows).expect("six organization rows were seeded");
 
+        let (spare_client, grant) =
+            Self::seed_project_grant(h, tenant, environment, &base, &role, key).await;
+
         let fixture = Self {
             base,
             org,
@@ -416,9 +427,67 @@ impl Fixture {
             spare_user,
             permission,
             spare_permission,
+            spare_client,
+            grant,
         };
         fixture.seed_relations(h, key).await;
         fixture
+    }
+
+    /// Two applications and one live project grant (issue #102), returning the SPARE
+    /// application and the grant.
+    ///
+    /// The clients go through the STORE because clients have no create endpoint. The
+    /// grant goes through the API, so the seed drives the same path a caller would and a
+    /// broken create surfaces here rather than as a puzzling withdrawal failure later.
+    ///
+    /// Two applications rather than one because migration 0120 permits at most one LIVE
+    /// grant per (client, organization) pair: the create case needs an application this
+    /// organization does not already hold a grant on, or it would answer 409 and pin a
+    /// conflict instead of a create.
+    ///
+    /// Split out from [`Fixture::seed`] only because the two together exceed the crate's
+    /// function-length lint.
+    async fn seed_project_grant(
+        h: &Harness,
+        tenant: &str,
+        environment: &str,
+        base: &str,
+        role: &str,
+        key: &str,
+    ) -> (String, String) {
+        let scope = Scope::new(
+            TenantId::parse(tenant).expect("tenant id"),
+            EnvironmentId::parse(environment).expect("environment id"),
+        );
+        let sys = Env::system();
+        let mut clients = Vec::new();
+        for name in ["vendor-app", "vendor-app-spare"] {
+            clients.push(
+                h.store()
+                    .scoped(scope)
+                    .acting(
+                        ActorRef::service(ServiceId::generate(&sys)),
+                        CorrelationId::generate(&sys),
+                    )
+                    .clients()
+                    .create(&sys, name)
+                    .await
+                    .expect("seed a client")
+                    .to_string(),
+            );
+        }
+        let [client, spare_client] =
+            <[String; 2]>::try_from(clients).expect("two clients were seeded");
+        let grant = seed_row(
+            h,
+            &format!("{base}/project-grants"),
+            &format!("{key}-pgt"),
+            &serde_json::json!({ "client_id": client, "role_ids": [role] }).to_string(),
+            "project grant",
+        )
+        .await;
+        (spare_client, grant)
     }
 
     /// Bind the entities together, so every WITHDRAWAL case has something live to
@@ -517,6 +586,7 @@ impl Fixture {
             role,
             spare_role,
             permission,
+            grant,
             ..
         } = self;
         vec![
@@ -535,6 +605,16 @@ impl Fixture {
                 path: format!("{base}/roles"),
                 body: None,
                 intent: Intent::Read(vec![role.clone(), spare_role.clone()]),
+                live: StatusCode::OK,
+            },
+            Case {
+                label: "project_grants.listProjectGrants",
+                method: "GET",
+                path: format!("{base}/project-grants"),
+                body: None,
+                // Names the seeded grant, so a 200 carrying an EMPTY page fails here
+                // rather than passing as an audit of a surface that answers nothing.
+                intent: Intent::Read(vec![grant.clone()]),
                 live: StatusCode::OK,
             },
             Case {
@@ -652,6 +732,23 @@ impl Fixture {
         let spare_role_ref = serde_json::json!({ "role_id": spare_role }).to_string();
         let relabel = serde_json::json!({ "display_name": "Relabelled" }).to_string();
         vec![
+            // A SECOND grant, on the spare application: migration 0120 allows at most
+            // one LIVE grant per (client, organization) pair, so reusing `client` here
+            // would answer 409 and the case would pin a conflict rather than a create.
+            Case {
+                label: "project_grants.createProjectGrant",
+                method: "POST",
+                path: format!("{}/project-grants", self.base),
+                body: Some(
+                    serde_json::json!({
+                        "client_id": self.spare_client,
+                        "role_ids": [&self.spare_role],
+                    })
+                    .to_string(),
+                ),
+                intent: Intent::Write,
+                live: StatusCode::CREATED,
+            },
             Case {
                 label: "org_groups.createOrgGroup",
                 method: "POST",
@@ -790,10 +887,19 @@ impl Fixture {
             child_group,
             membership,
             permission,
+            grant,
             ..
         } = self;
         vec![
             // --- The WRITES that destroy, each undoing one of the amendments above.
+            Case {
+                label: "project_grants.withdrawProjectGrant",
+                method: "DELETE",
+                path: format!("{base}/project-grants/{grant}"),
+                body: None,
+                intent: Intent::Write,
+                live: StatusCode::NO_CONTENT,
+            },
             Case {
                 label: "org_role_assignments.unassignOrgMembershipRole",
                 method: "DELETE",
@@ -948,6 +1054,8 @@ fn every_documented_organization_operation_is_driven_by_a_case() {
         spare_user: "usr_x".to_owned(),
         permission: "prm_x".to_owned(),
         spare_permission: "prm_y".to_owned(),
+        spare_client: "cli_y".to_owned(),
+        grant: "pgt_x".to_owned(),
     };
     let cases = fixture.cases();
     let documented = documented_organization_operations();

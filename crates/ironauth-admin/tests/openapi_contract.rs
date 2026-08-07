@@ -112,6 +112,7 @@ fn operation_ids_are_the_stable_set() {
             "createOrgRole",
             "createOrganization",
             "createPermission",
+            "createProjectGrant",
             "createTenant",
             "createTraitMigrationJob",
             "createTraitSchemaVersion",
@@ -209,6 +210,7 @@ fn operation_ids_are_the_stable_set() {
             "listOrgRoles",
             "listOrganizations",
             "listPermissions",
+            "listProjectGrants",
             "listQueueDepths",
             "listRecoveryApprovals",
             "listRefreshFamilies",
@@ -282,6 +284,7 @@ fn operation_ids_are_the_stable_set() {
             "updateUser",
             "verifyDcrClient",
             "verifyMigrationCredential",
+            "withdrawProjectGrant",
         ]
     );
 }
@@ -471,6 +474,7 @@ fn documented_paths_are_the_expected_set() {
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/roles/{role_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships/{membership_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships/{membership_id}/roles/{role_id}",
+            "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/project-grants/{grant_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}/permissions/{permission_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/permissions/{permission_id}",
@@ -532,6 +536,7 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships/{membership_id}/effective-roles",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships/{membership_id}/roles",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/project-grants",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}/permissions",
@@ -602,6 +607,7 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/roles",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships/{membership_id}/roles",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/project-grants",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}/permissions",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/password-hashing/probe",
@@ -742,7 +748,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        198,
+        201,
         "the documented route count is pinned"
     );
 

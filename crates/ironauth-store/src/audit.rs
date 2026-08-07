@@ -251,6 +251,15 @@ pub enum Action {
     /// resolvable (the retention rule above). The target is the removed
     /// membership.
     OrganizationMembershipRemove,
+    /// A project grant was created, binding one application to one customer
+    /// organization with the subset of roles its delegated administrators may assign
+    /// (issue #102). The target is the `pgt_` id.
+    ProjectGrantCreate,
+    /// A project grant was withdrawn (issue #102). This WIDENS what the organization's
+    /// delegated administrators may assign, because absence of a grant means
+    /// unrestricted, so it is the more dangerous of the two and is audited as its own
+    /// action rather than as a generic delete.
+    ProjectGrantWithdraw,
     /// A named role was DEFINED in an organization (issue #97). The target is the
     /// new role. A role in M10 is a name only; what it grants is issue #98.
     OrganizationRoleCreate,
@@ -1308,6 +1317,8 @@ impl Action {
             Action::OrganizationStateChange => "organization.state_change",
             Action::OrganizationMembershipAdd => "organization.membership.add",
             Action::OrganizationMembershipRemove => "organization.membership.remove",
+            Action::ProjectGrantCreate => "project_grant.create",
+            Action::ProjectGrantWithdraw => "project_grant.withdraw",
             Action::OrganizationRoleCreate => "organization.role.create",
             Action::OrganizationRoleUpdate => "organization.role.update",
             Action::OrganizationRoleDelete => "organization.role.delete",

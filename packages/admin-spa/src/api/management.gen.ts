@@ -1486,6 +1486,38 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/project-grants": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["listProjectGrants"];
+        put?: never;
+        post: operations["createProjectGrant"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/project-grants/{grant_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete: operations["withdrawProjectGrant"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles": {
         parameters: {
             query?: never;
@@ -3394,6 +3426,17 @@ export interface components {
              */
             slug: string;
         };
+        /** @description A project grant to create. */
+        CreateProjectGrantRequest: {
+            /** @description The application the grant is about (a `cli_` id). */
+            client_id: string;
+            /**
+             * @description The roles a delegated administrator of this organization may assign. MAY be
+             *     empty, which means they may assign nothing; that is a real contract and is not
+             *     the same as having no grant at all.
+             */
+            role_ids?: string[];
+        };
         /** @description The body to create a tenant. The first environment is created with it. */
         CreateTenantRequest: {
             /**
@@ -5114,6 +5157,27 @@ export interface components {
             items: components["schemas"]["PolicyTraceView"][];
             /** @description True when the result hit the limit and older matching traces were left out. */
             truncated: boolean;
+        };
+        /** @description A page of project grants. */
+        ProjectGrantListView: {
+            /** @description The live grants of this organization, oldest first. */
+            items: components["schemas"]["ProjectGrantView"][];
+        };
+        /** @description A project grant as returned to a caller. */
+        ProjectGrantView: {
+            /** @description The application the grant is about. */
+            client_id: string;
+            /**
+             * Format: int64
+             * @description Creation time in milliseconds since the epoch.
+             */
+            created_at_unix_ms: number;
+            /** @description The grant identifier (`pgt_...`). */
+            id: string;
+            /** @description The organization it bounds. */
+            organization_id: string;
+            /** @description The roles assignable under it. */
+            role_ids: string[];
         };
         /** @description Every consumer's queue depth in this environment. */
         QueueDepthList: {
@@ -14005,6 +14069,202 @@ export interface operations {
                 };
             };
             /** @description Not found (no such live assignment: absent, already withdrawn, another scope's, another organization's, or a pair whose two halves belong to different organizations). The environment must be live too: an absent or soft-deleted one answers this same not-found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listProjectGrants: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The live grants of this organization, oldest first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectGrantListView"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope, or a confined credential attempted to read the grant that bounds it */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The organization is not a live row of this scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    createProjectGrant: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Required. Replaying a POST with the same key returns the original response without re-executing. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateProjectGrantRequest"];
+            };
+        };
+        responses: {
+            /** @description Created. The organization's delegated administrators may now assign only the roles named here */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectGrantView"];
+                };
+            };
+            /** @description Malformed request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope, or a confined credential attempted to manage the grant that bounds it */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found: the organization, the client, or a named role is not a live row of this organization (uniform across absent, deleted, another scope's, and another organization's) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description A live grant already binds this application and organization */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Idempotency-Key reused with a different request */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    withdrawProjectGrant: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+                /** @description The grant identifier (pgt_...) */
+                grant_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Withdrawn. This WIDENS what the organization's delegated administrators may assign, because absence of a grant means unrestricted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope, or a confined credential attempted to withdraw the grant that bounds it */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The organization or the grant is not a live row of this scope */
             404: {
                 headers: {
                     [name: string]: unknown;
