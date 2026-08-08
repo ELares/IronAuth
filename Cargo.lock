@@ -1235,6 +1235,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "ironauth-env",
  "metrics",
  "rustls-native-certs",
  "tokio",
