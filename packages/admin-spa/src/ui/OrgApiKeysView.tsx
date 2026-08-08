@@ -20,13 +20,15 @@
 // to be able to tell "revoked at 14:02" from "no such key", and hiding the row makes
 // a rotation look like a replacement.
 
+import { useState } from "preact/hooks";
 import {
   type OrgApiKeyView,
+  createOrgApiKey,
   fetchOrgApiKeys,
   revokeOrgApiKey,
 } from "../api/client";
 import { AsyncBoundary, ConfirmButton, MutationFeedback } from "./ResourceView";
-import { type OrgScope, sudoFor } from "./orgPanels";
+import { type OrgScope, inputValue, sudoFor } from "./orgPanels";
 import { useAsyncResource, useMutation } from "./useResource";
 
 export function OrgApiKeysPanel({
@@ -43,6 +45,23 @@ export function OrgApiKeysPanel({
   // unmounted, so a mutation owned by a row would have its outcome destroyed by its
   // own success. Same placement, and same reason, as OrgDefaultRolePanel.
   const mutation = useMutation();
+  // DISPLAY ONCE, and the exact rule matters because I got the comment wrong first.
+  //
+  // The created key lives here and nowhere else. Its OWN creation reloads the list
+  // WITHOUT clearing it, because the whole point is that the operator can still see
+  // it beside the row that now exists. Every OTHER reload clears it: revoking, or
+  // remounting under a different scope.
+  //
+  // It is deliberately not part of the list rows. A row is re-rendered from the
+  // server on every reload, and a key held there would either vanish inconsistently
+  // or, worse, survive in the DOM long after the operator stopped looking at it. The
+  // server cannot return it again, so the panel must not behave as though it could.
+  const [issued, setIssued] = useState<{ id: string; key: string } | null>(null);
+  const [name, setName] = useState("");
+  const reloadClearingKey = () => {
+    setIssued(null);
+    reload();
+  };
 
   return (
     <div class="resource-subsection">
@@ -52,6 +71,60 @@ export function OrgApiKeysPanel({
         when it is created, and is never recoverable afterwards: this list carries only
         the handle. Revoked keys stay listed so a rotation is legible.
       </p>
+      <form
+        class="resource-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          const trimmed = name.trim();
+          if (trimmed === "") {
+            return;
+          }
+          void mutation
+            .run(async () => {
+              const created = await createOrgApiKey(
+                tenantId,
+                environmentId,
+                organizationId,
+                trimmed,
+              );
+              // `key` is absent on an idempotent replay. Showing nothing is correct
+              // there: the key was issued once and this is not that once.
+              setIssued(
+                created.key === undefined || created.key === null
+                  ? null
+                  : { id: created.id, key: created.key },
+              );
+            }, "Key created.")
+            .then((ok) => {
+              if (ok) {
+                setName("");
+                reload();
+              }
+            });
+        }}
+      >
+        <label>
+          New key name
+          <input
+            type="text"
+            value={name}
+            disabled={mutation.state.pending}
+            onInput={(event) => setName(inputValue(event))}
+          />
+        </label>
+        <button type="submit" disabled={mutation.state.pending}>
+          Create key
+        </button>
+      </form>
+      {issued === null ? null : (
+        <div class="resource-callout">
+          <p>
+            Copy this key now. It is shown once and cannot be recovered, including by
+            reloading this page.
+          </p>
+          <code class="resource-secret">{issued.key}</code>
+        </div>
+      )}
       <AsyncBoundary
         state={state}
         loadingLabel="Loading the API keys of the organization"
@@ -98,7 +171,7 @@ export function OrgApiKeysPanel({
                         // revoke worked.
                         .then((ok) => {
                           if (ok) {
-                            reload();
+                            reloadClearingKey();
                           }
                         })
                     }

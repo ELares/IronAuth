@@ -2167,6 +2167,46 @@ export async function fetchOrgApiKeys(
   return data?.items ?? [];
 }
 
+// What creating a key returns (operationId createOrganizationApiKey, issue #99).
+// `key` is present exactly once, on the original 201, and absent on an idempotent
+// replay. Nothing can recover it afterwards.
+export interface OrgApiKeyCreated {
+  id: string;
+  display_name: string;
+  key?: string | null;
+  key_already_issued: boolean;
+}
+
+// Create an API key for an organization (issue #99). The caller must treat `key` as
+// display-once: it is not readable from any later request, including a replay of this
+// one.
+export async function createOrgApiKey(
+  tenantId: string,
+  environmentId: string,
+  organizationId: string,
+  displayName: string,
+): Promise<OrgApiKeyCreated> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.POST(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/api-keys",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          organization_id: organizationId,
+        },
+        header: { "Idempotency-Key": idempotencyKey() },
+      },
+      body: { display_name: displayName },
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
 // Revoke one API key (operationId revokeOrganizationApiKey, issue #99). The key stops
 // verifying on the very next request; the ROW is retained so the revocation stays
 // legible in the listing.
