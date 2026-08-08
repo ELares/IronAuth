@@ -42,6 +42,33 @@ for path in "$HANDLER" "$TOKENS" "$REPO" "$INTROSPECT"; do
   fi
 done
 
+# Emit every line of the named `impl` block in $1, tagged `path:lineno:content`.
+#
+# The API-KEY verification path (issue #99, criterion 5) lives in `ApiKeyRepo::verify`, whose
+# function name carries no distinguishing token, so the CC extractor below cannot reach it: it
+# matches on `fn *client_credentials*` and `verify` does not. Scanning by IMPL BLOCK is what
+# covers it, and it covers every method added to that repository later without anyone having to
+# remember to extend a name pattern.
+#
+# This is the gap that made criterion 5 only half enforced. `introspection.rs` was already
+# scanned in full for the token verification path, and the api_keys verification path added in
+# PR #627 was not scanned at all: the covenant held by construction (the table has no counter
+# and no `last_used_at`) and nothing stopped a later edit from adding one.
+extract_impl_region() {
+  awk -v want="$2" '
+    !in_impl {
+      if ($0 ~ "^impl +" want "(<|\\b)") { in_impl = 1; depth = 0; opened = 0 } else { next }
+    }
+    in_impl {
+      print FILENAME ":" NR ":" $0
+      o = gsub(/\{/, "{"); c = gsub(/\}/, "}")
+      depth += o - c
+      if (o > 0) opened = 1
+      if (opened && depth <= 0) in_impl = 0
+    }
+  ' "$1"
+}
+
 # Emit, for every `fn *client_credentials*` in $1, the signature line through the
 # body's closing brace, each line tagged `path:lineno:content` so a hit points at the
 # real location. Brace-depth tracking is sufficient here: it scopes the scan to the
@@ -73,14 +100,36 @@ corpus="$(
     awk '{ print FILENAME ":" NR ":" $0 }' "$INTROSPECT"
     extract_cc_regions "$TOKENS"
     extract_cc_regions "$REPO"
+    extract_impl_region "$REPO" "ApiKeyRepo"
+    extract_impl_region "$REPO" "ActingApiKeyRepo"
   }
 )"
 
 # Forbidden hooks: any metrics counter/gauge/histogram macro, or a
-# billing/metering/quota/rate-limit symbol. Word-boundaried and case-insensitive so
-# a renamed spelling (Meter, QuotaGuard, bill_for, chargeUsage) is still caught. A
-# genuine false positive may carry "no-m2m-metering-allow: <reason>" on the line.
-FORBIDDEN='metrics::(counter|gauge|histogram)|counter!|gauge!|histogram!|\b(meter|metering|billing|billable|quota|chargeable|usage_count|rate_limit|ratelimit)\b'
+# billing/metering/quota/rate-limit symbol, case-insensitive.
+#
+# The boundary is `[^A-Za-z0-9]`, NOT `\b`. This is the whole difference between a covenant
+# and a covenant-shaped comment: `_` is a word character, so `\bquota\b` cannot match
+# `monthly_quota`, `\bmeter\b` cannot match `usage_meter`, and `\bbillable\b` cannot match
+# `_billable`. Every snake_case spelling, which is to say every spelling this codebase actually
+# uses, walked straight through.
+#
+# The previous comment claimed `bill_for` and `chargeUsage` were caught. Neither was: the list
+# held `billing`/`billable` but not `bill`, and `chargeable` but not `charge`.
+#
+# `chargeUsage` needs a second pass. A camelCase join has no non-alphanumeric character at the
+# seam, so no boundary can express it, and dropping the boundary entirely is not an option:
+# `parameter` contains `meter`. CAMEL below is therefore matched case-SENSITIVELY, on a
+# lowercase letter followed by a capitalised stem, which is precise enough to carry no false
+# positives and catches the spelling a Rust or TypeScript author would actually write.
+#
+# A genuine false positive may carry "no-m2m-metering-allow: <reason>" on the line.
+BOUNDARY_L='(^|[^A-Za-z0-9])'
+BOUNDARY_R='([^A-Za-z0-9]|$)'
+STEMS='meter|metering|billing|billable|bill|quota|chargeable|charge|usage_count|usage|rate_limit|ratelimit'
+FORBIDDEN="metrics::(counter|gauge|histogram)|counter!|gauge!|histogram!|${BOUNDARY_L}(${STEMS})${BOUNDARY_R}"
+# The camelCase seam, case SENSITIVE: `chargeUsage`, `requestQuota`, `perCallBilling`.
+CAMEL='[a-z](Meter|Metering|Billing|Billable|Bill|Quota|Chargeable|Charge|Usage|RateLimit)'
 
 # Scan CODE, not prose: a comment-only line (the covenant documentation itself names
 # these words) is excluded. Each corpus line is `path:lineno:content`; drop lines whose
@@ -91,6 +140,17 @@ hits=$(printf '%s\n' "$corpus" \
   | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' \
   | grep -v 'no-m2m-metering-allow' \
   || true)
+# The camelCase pass is separate because it is the ONE pattern that must not be
+# case-folded: `-i` would make `[a-z](Usage)` match `chargeusage` and, worse,
+# `parameter`-shaped words through the lowercase stems.
+camel_hits=$(printf '%s\n' "$corpus" \
+  | grep -E "$CAMEL" \
+  | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' \
+  | grep -v 'no-m2m-metering-allow' \
+  || true)
+if [ -n "$camel_hits" ]; then
+  hits="$(printf '%s\n%s' "$hits" "$camel_hits" | grep -v '^$' || true)"
+fi
 
 if [ -n "$hits" ]; then
   echo "no-m2m-metering: a metering/billing/quota hook is on the M2M issuance or"
