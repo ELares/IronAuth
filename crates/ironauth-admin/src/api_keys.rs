@@ -188,13 +188,12 @@ pub async fn create_organization_api_key(
     // organization, which is strictly higher authority than editing its configuration, and
     // the permission vocabulary already separates the two.
     //
-    // NOTHING PROVES THIS IS THE PERMISSION DEMANDED. `management_permissions.rs` classifies
-    // this operation as `WriteCredentials` and separately asserts the handler calls
-    // `require_permission` at all, but as its own comment says, it "cannot tell WHICH
-    // permission a handler demands, only that it demands one". A mutation downgrading this to
-    // `Read` survives both. Proving the specific permission needs an end-to-end test driving
-    // a credential that holds `Read` and not `WriteCredentials`, in the style of
-    // `delegated_admin.rs`, and this endpoint does not have one yet.
+    // PROVEN, not merely classified.
+    // `a_read_only_credential_can_list_api_keys_and_cannot_mint_or_kill_one` in
+    // `delegated_admin.rs` drives a credential holding `management.read` and asserts the
+    // refusal NAMES `management.write_credentials`. That is what pins the specific
+    // permission: `management_permissions.rs` only asserts that some permission is demanded,
+    // as its own comment says, and a downgrade to `Read` used to survive every pin.
     principal.require_permission(ManagementPermission::WriteCredentials)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
 
