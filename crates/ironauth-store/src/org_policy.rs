@@ -1756,6 +1756,89 @@ mod tests {
         );
     }
 
+    /// Session lifetime resolves through ALL FOUR levels, with a test at each (issue
+    /// #103, criterion 3).
+    ///
+    /// `PolicyLevels` has carried four slots for a while and `resolve` walks them in
+    /// order, but production populates only the ORGANIZATION one today (see
+    /// `step_up.rs`). So the four-level behaviour was structurally present and never
+    /// driven, which is the state where a later change silently reorders or drops a level
+    /// and nothing notices.
+    ///
+    /// The semantics being pinned are NARROWING, not last-writer-wins: a level may only
+    /// SHORTEN a session, never lengthen one. That is what makes the ordering safe to
+    /// extend, because a new level added below cannot be used to escape a floor set
+    /// above it.
+    #[test]
+    fn a_session_lifetime_stated_at_any_single_level_resolves() {
+        for (index, level) in ["tenant", "environment", "organization", "client"]
+            .iter()
+            .enumerate()
+        {
+            let mut slots: Vec<Option<AuthPolicy>> = vec![None, None, None, None];
+            slots[index] = Some(AuthPolicy {
+                session_ttl_secs: Some(600),
+                ..AuthPolicy::default()
+            });
+            let resolved = resolve(&levels_from(&slots));
+            assert_eq!(
+                resolved.session_ttl_secs(),
+                Some(600),
+                "a lifetime stated at the {level} level alone must resolve; a level that \
+                 is structurally present but never consulted is the defect this covers"
+            );
+        }
+    }
+
+    /// With every level stating one, the SHORTEST wins regardless of which level it is.
+    ///
+    /// Not "the most specific level wins". If the innermost level took precedence, a
+    /// client could lengthen a session its tenant had deliberately shortened, which
+    /// inverts the direction of a security control.
+    #[test]
+    fn the_shortest_session_lifetime_wins_whichever_level_states_it() {
+        // Each iteration makes a DIFFERENT level the shortest, so passing cannot be an
+        // artefact of one level happening to be consulted last.
+        for shortest_at in 0..4 {
+            let slots: Vec<Option<AuthPolicy>> = (0..4)
+                .map(|index| {
+                    Some(AuthPolicy {
+                        session_ttl_secs: Some(if index == shortest_at { 60 } else { 3600 }),
+                        ..AuthPolicy::default()
+                    })
+                })
+                .collect();
+            let resolved = resolve(&levels_from(&slots));
+            assert_eq!(
+                resolved.session_ttl_secs(),
+                Some(60),
+                "the shortest lifetime must win when stated at level {shortest_at}; a \
+                 level that can LENGTHEN what another shortened turns a security control \
+                 into a suggestion"
+            );
+        }
+    }
+
+    /// The idle window resolves on the same rule, checked separately because it is a
+    /// separate field and a fix applied to one half has silently missed the other before.
+    #[test]
+    fn the_idle_window_narrows_across_levels_too() {
+        let slots: Vec<Option<AuthPolicy>> = vec![
+            Some(AuthPolicy {
+                session_idle_ttl_secs: Some(900),
+                ..AuthPolicy::default()
+            }),
+            None,
+            Some(AuthPolicy {
+                session_idle_ttl_secs: Some(120),
+                ..AuthPolicy::default()
+            }),
+            None,
+        ];
+        let resolved = resolve(&levels_from(&slots));
+        assert_eq!(resolved.session_idle_ttl_secs(), Some(120));
+    }
+
     #[test]
     fn a_zero_session_lifetime_is_refused_on_both_halves() {
         // The FLOOR, and the half the guard originally left to the storage engine.
