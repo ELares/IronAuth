@@ -505,6 +505,10 @@ pub fn management_router(state: AdminState) -> Router {
             post(routing_rules::create_routing_rule).get(routing_rules::list_routing_rules),
         )
         .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/routing-rules/{rule_id}/verify-domain",
+            post(routing_rules::verify_routing_rule_domain),
+        )
+        .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/project-grants/{grant_id}",
             delete(project_grants::withdraw_project_grant),
         )

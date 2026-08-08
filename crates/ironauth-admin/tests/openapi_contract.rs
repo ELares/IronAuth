@@ -286,6 +286,7 @@ fn operation_ids_are_the_stable_set() {
             "updateUser",
             "verifyDcrClient",
             "verifyMigrationCredential",
+            "verifyRoutingRuleDomain",
             "withdrawProjectGrant",
         ]
     );
@@ -618,6 +619,7 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/recovery-approvals/{flow_id}/approve",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/recovery-approvals/{flow_id}/reject",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/routing-rules",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/routing-rules/{rule_id}/verify-domain",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/sessions/revoke",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/sessions/{session_id}/revoke",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/signup-quarantine/{user_id}/approve",
@@ -752,7 +754,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        203,
+        204,
         "the documented route count is pinned"
     );
 

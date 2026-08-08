@@ -39,6 +39,8 @@ pub struct Harness {
     // (issue #58), when built through `start_with_outbound_verification`. The endpoint
     // is bound to exactly this scope; a request to any other scope is a uniform 404.
     outbound_scope: Option<Scope>,
+    /// The injected DNS TXT lookup, when this harness was built with one (issue #96).
+    txt: Option<std::sync::Arc<FixedTxt>>,
 }
 
 impl Harness {
@@ -72,7 +74,52 @@ impl Harness {
             db,
             router,
             outbound_scope: None,
+            txt: None,
         }
+    }
+
+    /// Start with an injected DNS TXT lookup (issue #96).
+    ///
+    /// `records` is what every domain "publishes"; `Err` is a resolver that could not
+    /// answer. Injected rather than real, because driving a verification decision through
+    /// production DNS would need a domain this suite controls, and the point is to test
+    /// the DECISION, not the network.
+    pub async fn start_with_txt(
+        default_page_size: u32,
+        answer: Result<Vec<String>, String>,
+    ) -> Self {
+        let lookup = std::sync::Arc::new(FixedTxt(std::sync::Mutex::new(answer)));
+        let mut db = TestDatabase::start().await;
+        db.own_seeded_scopes_by(ironauth_admin::bootstrap_operator_id());
+        let config = AdminConfig {
+            bootstrap_operator_token: Some(Secret::Literal(SecretString::new(OPERATOR_TOKEN))),
+            max_page_size: 200,
+            default_page_size,
+            ..AdminConfig::default()
+        };
+        let state = AdminState::new(db.control_store().clone(), Env::system(), &config)
+            .expect("admin state builds")
+            .with_txt_lookup(std::sync::Arc::clone(&lookup)
+                as std::sync::Arc<dyn ironauth_fetch::txt::TxtLookup>);
+        let router = management_router(state);
+        Self {
+            db,
+            router,
+            outbound_scope: None,
+            txt: Some(lookup),
+        }
+    }
+
+    /// Replace what every domain "publishes". The verification token is minted when the
+    /// rule is created, so a test can only publish the REAL token after that.
+    pub fn set_txt(&self, answer: Result<Vec<String>, String>) {
+        *self
+            .txt
+            .as_ref()
+            .expect("this harness was built with a txt lookup")
+            .0
+            .lock()
+            .expect("not poisoned") = answer;
     }
 
     /// Start a fresh database and router with a caller-chosen tenant-offboarding
@@ -105,6 +152,7 @@ impl Harness {
             db,
             router,
             outbound_scope: None,
+            txt: None,
         }
     }
 
@@ -134,6 +182,7 @@ impl Harness {
             db,
             router,
             outbound_scope: None,
+            txt: None,
         }
     }
 
@@ -163,6 +212,7 @@ impl Harness {
             db,
             router,
             outbound_scope: None,
+            txt: None,
         }
     }
 
@@ -199,6 +249,7 @@ impl Harness {
             db,
             router,
             outbound_scope: None,
+            txt: None,
         }
     }
 
@@ -232,6 +283,7 @@ impl Harness {
             db,
             router,
             outbound_scope: None,
+            txt: None,
         }
     }
 
@@ -259,6 +311,7 @@ impl Harness {
             db,
             router,
             outbound_scope: None,
+            txt: None,
         }
     }
 
@@ -286,6 +339,7 @@ impl Harness {
             db,
             router,
             outbound_scope: None,
+            txt: None,
         }
     }
 
@@ -324,6 +378,7 @@ impl Harness {
                 db,
                 router,
                 outbound_scope: None,
+                txt: None,
             },
             clock,
         )
@@ -357,6 +412,7 @@ impl Harness {
             db,
             router,
             outbound_scope: None,
+            txt: None,
         };
         let scope = harness.seed_scope().await;
         harness.arm_outbound_verification(scope, token).await;
@@ -420,6 +476,7 @@ impl Harness {
             db,
             router,
             outbound_scope: None,
+            txt: None,
         }
     }
 
@@ -463,6 +520,7 @@ impl Harness {
             db,
             router: management_router(opening_state),
             outbound_scope: None,
+            txt: None,
         };
         let (tenant, environment) = opening.create_tenant("armed", "armed-tenant").await;
         let scope = Scope::new(
@@ -494,17 +552,25 @@ impl Harness {
             std::time::Duration::from_secs(300),
             std::time::Duration::from_secs(30),
         ));
+        let armed_txt = std::sync::Arc::new(FixedTxt(std::sync::Mutex::new(Ok(Vec::new()))));
         let state = AdminState::new(db.control_store().clone(), Env::system(), &config)
             .expect("admin state builds")
             .with_signing_registry(registry)
             .with_federation(federation)
             .with_signup_quarantine_enabled(true)
-            .with_advanced_recovery_enabled(true);
+            .with_advanced_recovery_enabled(true)
+            // "Fully armed" includes a DNS resolver (issue #96). Without one the verify
+            // endpoint answers 503 and the whole-surface sweep reads a deployment gap as
+            // a server error. It answers NO records, so verification legitimately fails
+            // rather than being faked.
+            .with_txt_lookup(std::sync::Arc::clone(&armed_txt)
+                as std::sync::Arc<dyn ironauth_fetch::txt::TxtLookup>);
         let router = management_router(state);
         let harness = Self {
             db,
             router,
             outbound_scope: None,
+            txt: Some(armed_txt),
         };
         // Outbound verification is armed in THAT environment's own sealed secret
         // (issue #250), not in config, so the whole-surface sweeps drive the endpoint
@@ -618,6 +684,7 @@ impl Harness {
             db,
             router,
             outbound_scope: None,
+            txt: None,
         }
     }
 
@@ -885,6 +952,17 @@ impl Harness {
     }
 
     /// An authenticated operator POST with an Idempotency-Key and JSON body.
+    /// POST with no body and no idempotency key, for the endpoints that take neither.
+    pub async fn post_empty(&self, path: &str) -> (StatusCode, HeaderMap, String) {
+        let request = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header(header::AUTHORIZATION, bearer(OPERATOR_TOKEN))
+            .body(Body::empty())
+            .expect("request builds");
+        self.send(request).await
+    }
+
     pub async fn post(
         &self,
         path: &str,
@@ -1126,5 +1204,22 @@ pub fn assert_rate_limit_headers(headers: &HeaderMap) {
             headers.contains_key(name),
             "missing rate-limit header {name}"
         );
+    }
+}
+
+/// A DNS TXT lookup with a fixed answer, for tests that drive a verification decision.
+pub struct FixedTxt(std::sync::Mutex<Result<Vec<String>, String>>);
+
+impl ironauth_fetch::txt::TxtLookup for FixedTxt {
+    fn txt<'a>(
+        &'a self,
+        _domain: &'a str,
+    ) -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<Vec<String>>> + Send + 'a>> {
+        Box::pin(async move {
+            match &*self.0.lock().expect("the fixed answer is not poisoned") {
+                Ok(records) => Ok(records.clone()),
+                Err(message) => Err(std::io::Error::other(message.clone())),
+            }
+        })
     }
 }

@@ -673,6 +673,9 @@ async fn build_admin_state(
             // mounted (so signing keys exist to verify against). Absent config leaves the
             // bridge disarmed: the management API then accepts no at+jwt at all (fail closed).
             let state = install_admin_oidc_bridge(state, config, data_plane_registry);
+            // Domain verification (issue #96): without a resolver the verify endpoint
+            // answers 503 rather than reporting a domain unverified.
+            let state = arm_domain_verification(state, env);
             Some(state)
         }
         Err(error) => {
@@ -746,6 +749,36 @@ fn install_signing_registry(
          signing-algorithm endpoint validates against the environment's actually signable set"
     );
     state.with_signing_registry(registry)
+}
+
+/// Install the DNS TXT lookup domain verification performs (issue #96).
+///
+/// Without this the verify endpoint answers 503 rather than reporting a domain
+/// unverified: a deployment with no resolver cannot prove domain control, and saying
+/// "not verified" would send an operator to debug their DNS instead of their deployment.
+///
+/// A resolver that cannot be built is NOT fatal to boot. Domain verification is one
+/// optional feature, and refusing to start the whole identity provider because
+/// `/etc/resolv.conf` is unreadable would take down authentication to protect a
+/// convenience.
+fn arm_domain_verification(state: AdminState, env: &ironauth_env::Env) -> AdminState {
+    match ironauth_fetch::txt::SystemTxtLookup::from_system_conf(env.clone()) {
+        Ok(lookup) => {
+            tracing::info!(
+                "domain verification armed (issue #96): enterprise routing rules can prove \
+                 domain control through a DNS TXT record"
+            );
+            state.with_txt_lookup(std::sync::Arc::new(lookup))
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "no DNS resolver: enterprise domain verification will answer 503 until one \
+                 is available (issue #96)"
+            );
+            state
+        }
+    }
 }
 
 /// Arm the OIDC-session credential bridge on the management state (issue #90, PR 2).

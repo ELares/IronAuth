@@ -24,6 +24,7 @@ use ironauth_config::{
     TokenClaimsConfig,
 };
 use ironauth_env::Env;
+use ironauth_fetch::txt::TxtLookup;
 use ironauth_jose::{ExpectedTyp, JwsAlgorithm, TokenTyp, TrustedKey, VerificationPolicy, verify};
 use ironauth_oidc::IssuerRegistry;
 use ironauth_store::{
@@ -224,6 +225,8 @@ struct Inner {
     // None (the default) leaves the wizard's write endpoint failing closed (it cannot
     // confirm signability), so the feature is inert until the boot path installs it.
     signing_registry: Option<Arc<IssuerRegistry>>,
+    /// The DNS TXT lookup domain verification performs (issue #96).
+    txt_lookup: Option<Arc<dyn TxtLookup>>,
 }
 
 /// The ONE place the operator-visible uniqueness setting becomes the store's mode
@@ -325,6 +328,7 @@ impl AdminState {
                 advanced_recovery_enabled: false,
                 admin_oidc_bridge: None,
                 signing_registry: None,
+                txt_lookup: None,
             }),
         })
     }
@@ -359,6 +363,25 @@ impl AdminState {
             inner.signing_registry = Some(registry);
         }
         self
+    }
+
+    /// Install the DNS TXT lookup domain verification performs (issue #96).
+    ///
+    /// `None` when the boot path installed none, and the verify endpoint then refuses
+    /// rather than pretending: a deployment with no resolver cannot prove domain control,
+    /// and answering "not verified" would be indistinguishable from a real refusal.
+    #[must_use]
+    pub fn with_txt_lookup(mut self, lookup: Arc<dyn TxtLookup>) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.txt_lookup = Some(lookup);
+        }
+        self
+    }
+
+    /// The installed DNS TXT lookup, if any.
+    #[must_use]
+    pub fn txt_lookup(&self) -> Option<&Arc<dyn TxtLookup>> {
+        self.inner.txt_lookup.as_ref()
     }
 
     /// The shared data-plane issuer registry (issue #93), or `None` when the boot path

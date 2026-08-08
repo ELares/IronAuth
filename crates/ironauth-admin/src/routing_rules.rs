@@ -282,3 +282,112 @@ pub async fn create_routing_rule(
         .map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::CREATED, body_string))
 }
+
+#[utoipa::path(
+    post,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/routing-rules/{rule_id}/verify-domain",
+    operation_id = "verifyRoutingRuleDomain",
+    tag = "connectors",
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("rule_id" = String, Path, description = "The routing rule identifier (rrl_...)")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "The lookup ran. `domain_verification_state` is `verified` if the published TXT record carried this rule's token, `failed` if the lookup succeeded and no record matched", body = RoutingRuleView),
+        (status = 401, description = "Missing or invalid credential", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "The environment or the rule is not a live row of this scope, or the rule is not a domain rule", body = ErrorBody),
+        (status = 502, description = "The lookup could not be performed or its answer could not be trusted. The state is UNCHANGED: a resolver failure is not evidence about the domain", body = ErrorBody),
+        (status = 503, description = "No DNS resolver is installed, so domain control cannot be proven in this deployment", body = ErrorBody)
+    )
+)]
+pub async fn verify_routing_rule_domain(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, rule_id)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
+    // Delegated administration (issue #102): classified `management.write_config`.
+    principal.require_permission(ManagementPermission::WriteConfig)?;
+    crate::org_context::require_live_environment(&state, &scope).await?;
+
+    let id = RoutingRuleId::parse_in_scope(&rule_id, &scope).map_err(|_| ApiError::NotFound)?;
+    let records = state
+        .store()
+        .scoped(scope)
+        .routing_rules()
+        .list_all()
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    let rule = records
+        .into_iter()
+        .find(|record| record.id == id)
+        .ok_or(ApiError::NotFound)?;
+
+    // Both of these are the uniform not-found rather than a distinct error: an app rule
+    // has no domain to prove, and a rule with no token is one the store could not have
+    // created. Neither is a state a caller can act on differently.
+    let (Some(domain), Some(token)) = (
+        rule.domain_norm.clone(),
+        rule.domain_verification_token.clone(),
+    ) else {
+        return Err(ApiError::NotFound);
+    };
+
+    // The resolver check comes AFTER the rule resolves, deliberately. A request naming a
+    // rule that does not exist is the uniform not-found whatever this deployment's
+    // resolver situation is, and answering 503 first would leak that the rule exists and
+    // would report a deployment gap for a request that was never going to work anyway.
+    let Some(lookup) = state.txt_lookup().cloned() else {
+        // Refused rather than answered. A deployment with no resolver cannot prove domain
+        // control, and reporting `failed` would be indistinguishable from a real refusal
+        // and would leave an operator debugging their DNS instead of their deployment.
+        return Err(ApiError::NotConfigured(
+            "no DNS resolver is installed, so domain control cannot be verified".to_owned(),
+        ));
+    };
+
+    let published = lookup.txt(&domain).await.map_err(|error| {
+        // The state is deliberately UNCHANGED. A timeout, a SERVFAIL or a malformed
+        // answer says nothing about the domain, and writing `failed` here would tell an
+        // operator their DNS is wrong when the resolver simply did not answer.
+        ApiError::UpstreamUnavailable(format!("the domain lookup could not be completed: {error}"))
+    })?;
+
+    // EXACT equality against the whole record value. Not `contains`: a substring match
+    // would let anyone who can publish a TXT record on the domain embed somebody else's
+    // token inside a longer string, and more practically it would match a record that
+    // merely quotes the token in a comment.
+    let verified = published.iter().any(|record| record == &token);
+
+    state
+        .store()
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(state.env()))
+        .routing_rules()
+        .record_domain_verification(state.env(), &id, verified)
+        .await
+        .map_err(|error| match error {
+            StoreError::NotFound => ApiError::NotFound,
+            _ => ApiError::Internal,
+        })?;
+
+    // Read back, for the same reason create does: the store owns the state and the
+    // timestamp, and a hand-built body is where the two drift.
+    let records = state
+        .store()
+        .scoped(scope)
+        .routing_rules()
+        .list_all()
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    let updated = records
+        .into_iter()
+        .find(|record| record.id == id)
+        .ok_or(ApiError::Internal)?;
+    let body = serde_json::to_string(&RoutingRuleView::from_record(updated))
+        .map_err(|_| ApiError::Internal)?;
+    Ok(json(StatusCode::OK, body))
+}
