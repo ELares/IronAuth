@@ -6,6 +6,31 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **An organization can shorten the access tokens its clients receive (issue #103, bet 1,
+  criterion 1).** Migration 0122 adds `org_auth_policies.access_token_ttl_secs`, nullable
+  with no default and `CHECK (… IS NULL OR … > 0)`, granted `UPDATE` to `ironauth_control`
+  alone. `AuthPolicy` carries the field, `resolve_org_policy` folds it through all four
+  levels with the same `fold_min` narrowing as the session pair, and
+  `OidcState::resolve_access_token_target` narrows the resolved lifetime by the owning
+  organization's, behind the `org-scoped-clients` experimental flag.
+
+  - A token lifetime is NOT a session lifetime, which is why this is a new column rather
+    than a reading of `session_ttl_secs`. `establish_session` takes no client and `sessions`
+    carries no `client_id`, so an override that follows a CLIENT'S owner is expressible on
+    the token and nowhere else. Migration 0122's header carries the full argument.
+  - The narrowing lives in the TARGET RESOLVER, not in the two mints. `target.ttl` is also
+    what the token response advertises as `expires_in`, so narrowing at the mint would hand
+    a client a token that expired before the lifetime it was told, and would have to be
+    applied twice (the JWT and opaque mints are separate call sites).
+  - `ActingClientRepo::set_owning_organization` is the write that makes a client
+    org-scoped, and `ClientRepo::owning_organization` is the read the issuance path uses.
+    Migration 0121's column had no reader and no writer until now. The write is CONTROL
+    plane only, per 0121's column-scoped grant: the authorization path reads this column on
+    every mint and must not be able to rewrite the ownership it is about to obey.
+  - `AuthPolicyError::NonPositiveTokenLifetime` and the `token_ttl=` field in
+    `audit_detail` join the existing vocabulary. A policy dimension the audit cannot see is
+    not audited, and the audit detail carries the DIRECTION only, never an identifier.
+
 - **`outbox_messages` finally has retention, and it keys on the TERMINAL columns
   (issue #104, PR 3).** Migration 0099 shipped the table saying "no role is granted DELETE,
   and there is no reaper", and PR 2 multiplied its growth rate by roughly

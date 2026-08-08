@@ -1045,6 +1045,11 @@ pub enum Action {
     /// with through the management seam, validated against the environment's actually
     /// signable set. The row targets the `cli_` client.
     ClientIdTokenAlgSet,
+    /// A client's OWNING ORGANIZATION was set or cleared (issue #103, migration 0121):
+    /// the client passed from environment-owned to organization-owned or back. The row
+    /// targets the `cli_` client, and the detail names which way it moved. It never
+    /// carries the organization identifier, matching every other write in this file.
+    ClientOwningOrganizationSet,
     /// An admin sudo elevation was RECORDED (issue #73): a management credential
     /// completed a re-authentication that opens a freshness window for admin
     /// mutations in a (tenant, environment). The row targets the `elv_` elevation; the
@@ -1477,6 +1482,7 @@ impl Action {
             Action::ScopeStepUpPolicyRemove => "step_up.scope_policy.remove",
             Action::ClientStepUpPolicySet => "client.step_up_policy.set",
             Action::ClientIdTokenAlgSet => "client.id_token_signed_response_alg.set",
+            Action::ClientOwningOrganizationSet => "client.owning_organization.set",
             Action::AdminPrivilegeElevated => "admin.privilege.elevated",
             Action::AdminPrivilegeChallenged => "admin.privilege.challenged",
             Action::CredentialClassPolicySet => "credential_class.policy.set",

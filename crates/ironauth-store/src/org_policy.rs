@@ -182,6 +182,13 @@ pub struct AuthPolicy {
     pub session_ttl_secs: Option<u32>,
     /// The idle session window in seconds.
     pub session_idle_ttl_secs: Option<u32>,
+    /// The organization's ACCESS TOKEN lifetime override, in seconds (issue #103).
+    ///
+    /// Separate from `session_ttl_secs` because the two attach to different things: a
+    /// session belongs to the user's authentication and is client-agnostic, while an
+    /// access token is issued TO a client. An override that follows a CLIENT'S owner is
+    /// therefore expressible here and not on the session.
+    pub access_token_ttl_secs: Option<u32>,
 }
 
 impl AuthPolicy {
@@ -317,6 +324,7 @@ pub struct ResolvedAuthPolicy {
     invitations_enabled: Option<bool>,
     session_ttl_secs: Option<u32>,
     session_idle_ttl_secs: Option<u32>,
+    access_token_ttl_secs: Option<u32>,
 }
 
 impl ResolvedAuthPolicy {
@@ -403,6 +411,13 @@ impl ResolvedAuthPolicy {
     #[must_use]
     pub fn session_idle_ttl_secs(&self) -> Option<u32> {
         self.session_idle_ttl_secs
+    }
+
+    /// The resolved access-token lifetime, or `None` when no level stated one (in which
+    /// case the deployment's configured token lifetime applies unchanged).
+    #[must_use]
+    pub fn access_token_ttl_secs(&self) -> Option<u32> {
+        self.access_token_ttl_secs
     }
 
     /// The absolute session lifetime to actually apply, given the deployment's own
@@ -496,6 +511,7 @@ pub fn resolve(levels: &PolicyLevels) -> ResolvedAuthPolicy {
     let mut invitations_enabled: Option<bool> = None;
     let mut session_ttl_secs: Option<u32> = None;
     let mut session_idle_ttl_secs: Option<u32> = None;
+    let mut access_token_ttl_secs: Option<u32> = None;
     let mut factors: Option<BTreeSet<String>> = None;
     let mut domains: Option<BTreeSet<String>> = None;
 
@@ -510,6 +526,7 @@ pub fn resolve(levels: &PolicyLevels) -> ResolvedAuthPolicy {
         fold_and(&mut invitations_enabled, level.invitations_enabled);
         fold_min(&mut session_ttl_secs, level.session_ttl_secs);
         fold_min(&mut session_idle_ttl_secs, level.session_idle_ttl_secs);
+        fold_min(&mut access_token_ttl_secs, level.access_token_ttl_secs);
         fold_intersect(&mut factors, level.allowed_factors.as_ref());
         fold_intersect(&mut domains, level.allowed_email_domains.as_ref());
     }
@@ -530,6 +547,7 @@ pub fn resolve(levels: &PolicyLevels) -> ResolvedAuthPolicy {
         invitations_enabled,
         session_ttl_secs,
         session_idle_ttl_secs,
+        access_token_ttl_secs,
     }
 }
 
@@ -601,6 +619,9 @@ pub enum AuthPolicyError {
     NonPositiveSessionLifetime,
     /// An email-domain entry is not a plain registrable hostname.
     InvalidEmailDomain,
+    /// A stated ACCESS TOKEN lifetime is ZERO, which would issue a token that is
+    /// already expired. Unconstrained is spelled by omitting the dimension.
+    NonPositiveTokenLifetime,
 }
 
 impl AuthPolicyError {
@@ -631,6 +652,9 @@ impl AuthPolicyError {
             }
             AuthPolicyError::InvalidEmailDomain => {
                 "allowed_email_domains contains a value that is not a registrable domain"
+            }
+            AuthPolicyError::NonPositiveTokenLifetime => {
+                "a token lifetime is zero (omit it to leave the lifetime unconstrained)"
             }
         }
     }
@@ -791,6 +815,21 @@ pub fn validate(
         errors.push(AuthPolicyError::NonPositiveSessionLifetime);
     }
 
+    // The same floor for the ACCESS TOKEN lifetime, kept a SEPARATE error rather than
+    // folded into the one above so a refusal names the dimension the operator actually
+    // stated. `org_auth_policies_access_token_ttl_positive` is the latch behind it.
+    //
+    // There is deliberately NO ceiling to match `SessionTtlAboveCeiling`. A session
+    // lifetime is applied directly, so an absurd one would be honored and has to be
+    // refused at the boundary; a token lifetime is only ever folded with `min` against the
+    // environment and resource-server lifetimes on the issuance path, so the largest value
+    // this column can hold still resolves to the environment's. Adding a ceiling would
+    // refuse a document that cannot do any harm, and would have to be kept in step with a
+    // deployment setting this table has no view of.
+    if policy.access_token_ttl_secs == Some(0) {
+        errors.push(AuthPolicyError::NonPositiveTokenLifetime);
+    }
+
     // Row-local only: an organization may state ONE of the pair and inherit the
     // other, which no single-document check (and no CHECK constraint) can see. The
     // resolved pair is where that case is caught.
@@ -869,7 +908,7 @@ pub fn audit_detail(policy: &AuthPolicy) -> String {
 
     format!(
         "mfa_required={} factors={} domains={} jit={} invitations={} session_ttl={} \
-         session_idle={}",
+         session_idle={} token_ttl={}",
         flag(policy.mfa_required),
         list(policy.allowed_factors.as_ref(), "restricted"),
         list(policy.allowed_email_domains.as_ref(), "set"),
@@ -877,6 +916,7 @@ pub fn audit_detail(policy: &AuthPolicy) -> String {
         flag(policy.invitations_enabled),
         secs(policy.session_ttl_secs),
         secs(policy.session_idle_ttl_secs),
+        secs(policy.access_token_ttl_secs),
     )
 }
 
@@ -976,6 +1016,11 @@ mod tests {
                 None
             },
             session_idle_ttl_secs: if rng.flip() {
+                Some(u32::try_from(rng.below(100_000) + 1).expect("fits u32"))
+            } else {
+                None
+            },
+            access_token_ttl_secs: if rng.flip() {
                 Some(u32::try_from(rng.below(100_000) + 1).expect("fits u32"))
             } else {
                 None
@@ -1118,6 +1163,10 @@ mod tests {
         );
         for (old, new) in [
             (before.session_ttl_secs(), after.session_ttl_secs()),
+            (
+                before.access_token_ttl_secs(),
+                after.access_token_ttl_secs(),
+            ),
             (
                 before.session_idle_ttl_secs(),
                 after.session_idle_ttl_secs(),
@@ -1671,89 +1720,151 @@ mod tests {
             invitations_enabled: Some(true),
             session_ttl_secs: Some(3_600),
             session_idle_ttl_secs: Some(900),
+            access_token_ttl_secs: Some(300),
         };
         assert_eq!(validate(&good, ORG_POLICY_MAX_SESSION_TTL_SECS), Ok(()));
+    }
+
+    /// Assert that `policy` is refused with EXACTLY `expected` and nothing else, and report
+    /// the refusal so the caller can collect what it actually reached.
+    ///
+    /// Returning the variant rather than taking it on trust is the point: the closed-set
+    /// comparison below is then built from the assertions that ran, not from a second
+    /// hand-written list beside them that can drift out of step with the first.
+    fn refuses(policy: &AuthPolicy, expected: AuthPolicyError) -> AuthPolicyError {
+        assert_eq!(
+            validate(policy, ORG_POLICY_MAX_SESSION_TTL_SECS),
+            Err(vec![expected]),
+            "expected exactly {expected:?}"
+        );
+        expected
     }
 
     #[test]
     fn every_refusal_is_reachable_and_value_free() {
         let ceiling = ORG_POLICY_MAX_SESSION_TTL_SECS;
+        let mut reached: BTreeSet<AuthPolicyError> = BTreeSet::new();
 
+        reached.insert(refuses(
+            &AuthPolicy {
+                allowed_factors: Some(set(&["pwd", "not_a_factor"])),
+                ..AuthPolicy::default()
+            },
+            AuthPolicyError::UnknownFactor,
+        ));
+        reached.insert(refuses(
+            &AuthPolicy {
+                allowed_factors: Some(BTreeSet::new()),
+                ..AuthPolicy::default()
+            },
+            AuthPolicyError::EmptyFactorList,
+        ));
+        reached.insert(refuses(
+            &AuthPolicy {
+                allowed_email_domains: Some(BTreeSet::new()),
+                ..AuthPolicy::default()
+            },
+            AuthPolicyError::EmptyDomainList,
+        ));
+        // The intra-document contradiction, on the exact set that is the trap: email_otp
+        // and sms carry no `mfa` amr.
+        reached.insert(refuses(
+            &AuthPolicy {
+                mfa_required: Some(true),
+                allowed_factors: Some(set(&["pwd", "email_otp", "sms"])),
+                ..AuthPolicy::default()
+            },
+            AuthPolicyError::MfaRequiredWithNoSecondFactor,
+        ));
+        reached.insert(refuses(
+            &AuthPolicy {
+                session_ttl_secs: Some(600),
+                session_idle_ttl_secs: Some(900),
+                ..AuthPolicy::default()
+            },
+            AuthPolicyError::IdleExceedsAbsolute,
+        ));
+        reached.insert(refuses(
+            &AuthPolicy {
+                session_ttl_secs: Some(ceiling + 1),
+                ..AuthPolicy::default()
+            },
+            AuthPolicyError::SessionTtlAboveCeiling,
+        ));
+        // The idle half is checked against the ceiling too.
+        reached.insert(refuses(
+            &AuthPolicy {
+                session_idle_ttl_secs: Some(ceiling + 1),
+                ..AuthPolicy::default()
+            },
+            AuthPolicyError::SessionTtlAboveCeiling,
+        ));
+        reached.insert(refuses(
+            &AuthPolicy {
+                session_ttl_secs: Some(0),
+                ..AuthPolicy::default()
+            },
+            AuthPolicyError::NonPositiveSessionLifetime,
+        ));
+        reached.insert(refuses(
+            &AuthPolicy {
+                allowed_email_domains: Some(set(&["not a domain"])),
+                ..AuthPolicy::default()
+            },
+            AuthPolicyError::InvalidEmailDomain,
+        ));
+        // The TOKEN floor names the token dimension, not the session one.
+        reached.insert(refuses(
+            &AuthPolicy {
+                access_token_ttl_secs: Some(0),
+                ..AuthPolicy::default()
+            },
+            AuthPolicyError::NonPositiveTokenLifetime,
+        ));
+
+        // What makes the name of this test TRUE rather than aspirational. Before issue #103
+        // the body reached six of the eight variants and the two it missed were invisible,
+        // because a hand-written list of cases cannot notice a variant it was never told
+        // about. A variant added later and left undriven fails HERE, by name.
         assert_eq!(
-            validate(
-                &AuthPolicy {
-                    allowed_factors: Some(set(&["pwd", "not_a_factor"])),
-                    ..AuthPolicy::default()
-                },
-                ceiling
-            ),
-            Err(vec![AuthPolicyError::UnknownFactor])
+            reached,
+            all_refusals(),
+            "a refusal exists that nothing drives"
         );
-        assert_eq!(
-            validate(
-                &AuthPolicy {
-                    allowed_factors: Some(BTreeSet::new()),
-                    ..AuthPolicy::default()
-                },
-                ceiling
-            ),
-            Err(vec![AuthPolicyError::EmptyFactorList])
-        );
-        assert_eq!(
-            validate(
-                &AuthPolicy {
-                    allowed_email_domains: Some(BTreeSet::new()),
-                    ..AuthPolicy::default()
-                },
-                ceiling
-            ),
-            Err(vec![AuthPolicyError::EmptyDomainList])
-        );
-        // The intra-document contradiction, on the exact set that is the trap:
-        // email_otp and sms carry no `mfa` amr.
-        assert_eq!(
-            validate(
-                &AuthPolicy {
-                    mfa_required: Some(true),
-                    allowed_factors: Some(set(&["pwd", "email_otp", "sms"])),
-                    ..AuthPolicy::default()
-                },
-                ceiling
-            ),
-            Err(vec![AuthPolicyError::MfaRequiredWithNoSecondFactor])
-        );
-        assert_eq!(
-            validate(
-                &AuthPolicy {
-                    session_ttl_secs: Some(600),
-                    session_idle_ttl_secs: Some(900),
-                    ..AuthPolicy::default()
-                },
-                ceiling
-            ),
-            Err(vec![AuthPolicyError::IdleExceedsAbsolute])
-        );
-        assert_eq!(
-            validate(
-                &AuthPolicy {
-                    session_ttl_secs: Some(ceiling + 1),
-                    ..AuthPolicy::default()
-                },
-                ceiling
-            ),
-            Err(vec![AuthPolicyError::SessionTtlAboveCeiling])
-        );
-        assert_eq!(
-            validate(
-                &AuthPolicy {
-                    session_idle_ttl_secs: Some(ceiling + 1),
-                    ..AuthPolicy::default()
-                },
-                ceiling
-            ),
-            Err(vec![AuthPolicyError::SessionTtlAboveCeiling]),
-            "the idle half is checked against the ceiling too"
-        );
+    }
+
+    /// The CLOSED set of refusals, pinned by an exhaustive match rather than by a count.
+    ///
+    /// The match below carries no wildcard arm, so adding a variant to `AuthPolicyError`
+    /// stops compiling here until the author lists it, and listing it makes the assertion
+    /// above fail until the author also drives it. A count would let a rename slip
+    /// through; a wildcard would let an addition slip through.
+    fn all_refusals() -> BTreeSet<AuthPolicyError> {
+        let all = [
+            AuthPolicyError::UnknownFactor,
+            AuthPolicyError::EmptyFactorList,
+            AuthPolicyError::EmptyDomainList,
+            AuthPolicyError::MfaRequiredWithNoSecondFactor,
+            AuthPolicyError::IdleExceedsAbsolute,
+            AuthPolicyError::SessionTtlAboveCeiling,
+            AuthPolicyError::NonPositiveSessionLifetime,
+            AuthPolicyError::InvalidEmailDomain,
+            AuthPolicyError::NonPositiveTokenLifetime,
+        ];
+        for error in all {
+            match error {
+                AuthPolicyError::UnknownFactor
+                | AuthPolicyError::EmptyFactorList
+                | AuthPolicyError::EmptyDomainList
+                | AuthPolicyError::MfaRequiredWithNoSecondFactor
+                | AuthPolicyError::IdleExceedsAbsolute
+                | AuthPolicyError::SessionTtlAboveCeiling
+                | AuthPolicyError::NonPositiveSessionLifetime
+                | AuthPolicyError::InvalidEmailDomain
+                | AuthPolicyError::NonPositiveTokenLifetime => {}
+            }
+        }
+        all.into_iter().collect()
     }
 
     /// Session lifetime resolves through ALL FOUR levels, with a test at each (issue
@@ -1837,6 +1948,98 @@ mod tests {
         ];
         let resolved = resolve(&levels_from(&slots));
         assert_eq!(resolved.session_idle_ttl_secs(), Some(120));
+    }
+
+    /// The ACCESS TOKEN lifetime resolves through the same four levels and by the same
+    /// narrowing rule as the session pair (issue #103, bet 1, criterion 1).
+    ///
+    /// Driven at EVERY level rather than only at the organization one, even though
+    /// production populates only that slot today (`step_up.rs`), for the reason recorded
+    /// on the session tests: a slot nothing drives is a slot a later change can reorder
+    /// or drop silently.
+    #[test]
+    fn the_token_lifetime_narrows_across_every_level() {
+        for shortest in 0..4 {
+            let slots: Vec<Option<AuthPolicy>> = (0..4)
+                .map(|index| {
+                    Some(AuthPolicy {
+                        access_token_ttl_secs: Some(if index == shortest { 300 } else { 3_600 }),
+                        ..AuthPolicy::default()
+                    })
+                })
+                .collect();
+            let resolved = resolve(&levels_from(&slots));
+            assert_eq!(
+                resolved.access_token_ttl_secs(),
+                Some(300),
+                "level {shortest} stated the shortest lifetime and did not win"
+            );
+        }
+    }
+
+    /// A level can only SHORTEN a token lifetime. Adding one that states a LONGER value
+    /// leaves the resolved lifetime where it was.
+    ///
+    /// This is the property that makes the fold safe to compose with the environment
+    /// default and the resource-server ceiling on the issuance path: whatever order those
+    /// three are applied in, the answer is the minimum, so no level is a way to obtain a
+    /// longer-lived token than another level already permitted.
+    #[test]
+    fn a_longer_level_never_lengthens_a_token_lifetime() {
+        let short = Some(AuthPolicy {
+            access_token_ttl_secs: Some(300),
+            ..AuthPolicy::default()
+        });
+        let long = Some(AuthPolicy {
+            access_token_ttl_secs: Some(86_400),
+            ..AuthPolicy::default()
+        });
+        let before = resolve(&levels_from(&[short.clone(), None, None, None]));
+        let after = resolve(&levels_from(&[short, None, long.clone(), None]));
+        assert_eq!(before.access_token_ttl_secs(), Some(300));
+        assert_eq!(after.access_token_ttl_secs(), Some(300));
+
+        // And the lone long level, so the test cannot be passing because the value was
+        // never readable in the first place.
+        let alone = resolve(&levels_from(&[None, None, long, None]));
+        assert_eq!(alone.access_token_ttl_secs(), Some(86_400));
+    }
+
+    /// The token lifetime is INDEPENDENT of the session pair: stating one states neither
+    /// of the others.
+    ///
+    /// Migration 0122 argues at length that a token and a session are different things.
+    /// If the resolver quietly tied them together that argument would be wrong in the
+    /// code while remaining right in the comment, which is the shape this project keeps
+    /// producing.
+    #[test]
+    fn a_token_lifetime_states_nothing_about_the_session() {
+        let resolved = resolve(&levels_from(&[
+            None,
+            None,
+            Some(AuthPolicy {
+                access_token_ttl_secs: Some(300),
+                ..AuthPolicy::default()
+            }),
+            None,
+        ]));
+        assert_eq!(resolved.access_token_ttl_secs(), Some(300));
+        assert_eq!(resolved.session_ttl_secs(), None);
+        assert_eq!(resolved.session_idle_ttl_secs(), None);
+
+        // And the converse: a session lifetime states no token lifetime, so the
+        // deployment's configured token lifetime survives an organization that only ever
+        // shortened its sessions.
+        let session_only = resolve(&levels_from(&[
+            None,
+            None,
+            Some(AuthPolicy {
+                session_ttl_secs: Some(600),
+                ..AuthPolicy::default()
+            }),
+            None,
+        ]));
+        assert_eq!(session_only.access_token_ttl_secs(), None);
     }
 
     #[test]
@@ -2091,6 +2294,7 @@ mod tests {
             invitations_enabled: Some(true),
             session_ttl_secs: Some(60),
             session_idle_ttl_secs: Some(30),
+            access_token_ttl_secs: Some(15),
             allowed_email_domains: None,
         };
         assert_eq!(normalize(&untouched), untouched);
@@ -2106,12 +2310,13 @@ mod tests {
             invitations_enabled: None,
             session_ttl_secs: Some(3_600),
             session_idle_ttl_secs: Some(900),
+            access_token_ttl_secs: Some(300),
         };
         let detail = audit_detail(&stated);
         assert_eq!(
             detail,
             "mfa_required=true factors=restricted domains=set jit=false invitations=inherit \
-             session_ttl=3600 session_idle=900"
+             session_ttl=3600 session_idle=900 token_ttl=300"
         );
         // No domain string and no factor token ever reaches the audit log.
         assert!(!detail.contains("acme.example"));
@@ -2121,7 +2326,7 @@ mod tests {
         assert_eq!(
             audit_detail(&AuthPolicy::default()),
             "mfa_required=inherit factors=inherit domains=inherit jit=inherit \
-             invitations=inherit session_ttl=inherit session_idle=inherit"
+             invitations=inherit session_ttl=inherit session_idle=inherit token_ttl=inherit"
         );
     }
 

@@ -35,8 +35,8 @@ use ironauth_jose::{
 };
 use ironauth_quota::QuotaEnforcer;
 use ironauth_store::{
-    AbuseBanId, AbuseSubject, ActorRef, AuthPath, CorrelationId, GuardrailSet, NewBan, Scope,
-    ServiceId, Store, TokenFormat,
+    AbuseBanId, AbuseSubject, ActorRef, AuthPath, ClientId, CorrelationId, GuardrailSet, NewBan,
+    OrganizationId, Scope, ServiceId, Store, TokenFormat,
 };
 
 use crate::util::epoch_micros;
@@ -227,6 +227,12 @@ pub struct OidcState {
     // never reads an external signal. The per-source config that SHAPES ingestion lives in
     // `RiskConfig` (config data cannot arm the surface).
     risk_signals_enabled: bool,
+    // Whether the experimental org-scoped-clients surface is armed (issue #103, milestone
+    // M10). Kept OUTSIDE `Inner` and set through the builder for the SAME anti-bypass reason
+    // as fedcm/risk-signals. Default: false, so an organization's `access_token_ttl_secs`
+    // narrows nothing and every client's token lifetime is exactly what it is today, even
+    // for a client that already carries an `organization_id`.
+    org_scoped_clients_enabled: bool,
     // Whether the experimental signup fraud-review-queue surface is armed (issue #82, PR 2).
     // Kept OUTSIDE `Inner` and set through the builder for the SAME anti-bypass reason as
     // fedcm/risk-signals: it is NOT a plain `OidcConfig` toggle an operator can flip (that
@@ -904,6 +910,7 @@ impl OidcState {
             global_token_revocation_enabled: false,
             fedcm_enabled: false,
             risk_signals_enabled: false,
+            org_scoped_clients_enabled: false,
             signup_quarantine_enabled: false,
             third_party_admin_consent_required_override: None,
             advanced_recovery_enabled: false,
@@ -1043,6 +1050,27 @@ impl OidcState {
     #[must_use]
     pub fn risk_signals_enabled(&self) -> bool {
         self.risk_signals_enabled
+    }
+
+    /// Arm the experimental org-scoped-clients surface (issue #103, milestone M10).
+    ///
+    /// `main.rs` reads the feature registry (which requires the experimental
+    /// acknowledgement naming the exact version) and passes the result here, for the same
+    /// anti-bypass reason as risk signals: an operator must not be able to change every
+    /// org-owned client's token lifetime from a plain config toggle.
+    ///
+    /// When false (the default) `resolve_access_token_target` never reads a client's owning
+    /// organization, so an organization policy that states a token lifetime narrows nothing.
+    #[must_use]
+    pub fn with_org_scoped_clients_enabled(mut self, enabled: bool) -> Self {
+        self.org_scoped_clients_enabled = enabled;
+        self
+    }
+
+    /// Whether the experimental org-scoped-clients surface is armed (issue #103).
+    #[must_use]
+    pub fn org_scoped_clients_enabled(&self) -> bool {
+        self.org_scoped_clients_enabled
     }
 
     /// Arm the experimental signup fraud-review-queue surface (issue #82, PR 2).
@@ -2148,8 +2176,12 @@ impl OidcState {
     ///   jwt-bearer grants): the ENVIRONMENT DEFAULT applies, EXACTLY as before #28.
     ///   The token's `aud` is a SINGLE audience, the `client_id` (so `UserInfo`'s
     ///   `aud == client` check keeps working), the format is the environment default,
-    ///   and the lifetime is the environment access-token lifetime. This branch is
-    ///   infallible.
+    ///   and the lifetime is the environment access-token lifetime. This branch was
+    ///   infallible until issue #103: with the org-scoped-clients flag ARMED it reads the
+    ///   client's owning organization and can answer
+    ///   [`ResourceTargetError::ServerError`]. With the flag off it is infallible exactly
+    ///   as before, and every caller already maps the error to a token-endpoint
+    ///   `server_error`.
     /// - **One or more `resources`**: EACH resource MUST name a registered resource
     ///   server's `audience` in this scope; an unknown resource is
     ///   [`ResourceTargetError::InvalidTarget`] (RFC 8707 section 2.2), never a silent
@@ -2196,7 +2228,12 @@ impl OidcState {
             return Ok(AccessTokenTarget {
                 audiences: vec![client_id.to_owned()],
                 format: self.inner.default_access_token_format,
-                ttl: self.inner.access_token_ttl,
+                ttl: self
+                    .organization_access_token_ttl(scope, client_id)
+                    .await?
+                    .map_or(self.inner.access_token_ttl, |org_ttl| {
+                        self.inner.access_token_ttl.min(org_ttl)
+                    }),
                 // Opted out BY CONSTRUCTION (issue #98): this branch reads no
                 // `resource_servers` row, so there is no row that could carry an
                 // opt-in. It is also the safe default, and it is what makes the
@@ -2253,12 +2290,101 @@ impl OidcState {
                 audiences.push(server.audience);
             }
         }
+        // A FOURTH narrowing fold (issue #103), applied after the per-resource one and by
+        // the same rule: the owning organization's token lifetime can only SHORTEN what
+        // the resource servers already agreed, never lengthen it. Folded here rather than
+        // at the mint because `target.ttl` is also what the token response advertises as
+        // `expires_in`; narrowing at the mint alone would hand the client a token that
+        // expires before the lifetime it was told.
+        let resolved_ttl = ttl.unwrap_or(self.inner.access_token_ttl);
+        let resolved_ttl = self
+            .organization_access_token_ttl(scope, client_id)
+            .await?
+            .map_or(resolved_ttl, |org_ttl| resolved_ttl.min(org_ttl));
         Ok(AccessTokenTarget {
             audiences,
             format: format.unwrap_or(self.inner.default_access_token_format),
-            ttl: ttl.unwrap_or(self.inner.access_token_ttl),
+            ttl: resolved_ttl,
             permission_claims,
         })
+    }
+
+    /// The access-token lifetime stated by the organization that OWNS `client_id` (issue
+    /// #103), or `None` when no lifetime applies, which is the answer in every one of these
+    /// cases: the experimental surface is disarmed, the client identifier does not parse in
+    /// this scope, the client is environment-owned (`organization_id IS NULL`, the permanent
+    /// default), the organization has no policy row, or its policy states no token lifetime.
+    ///
+    /// Only ever used to NARROW. The caller takes the minimum of this and the lifetime it
+    /// already resolved, so an organization can shorten its clients' tokens and can never
+    /// lengthen one past the environment or resource-server ceiling.
+    ///
+    /// # Cost, and why the flag check comes first
+    ///
+    /// Two reads on the issuance path per mint: the client's owner and, only if it has one,
+    /// that organization's policy. The disarmed check is the FIRST statement so a deployment
+    /// that has not opted in pays nothing at all, not even the client read. An armed
+    /// deployment pays one read for every client and two for an owned one.
+    ///
+    /// # A soft-deleted organization keeps narrowing
+    ///
+    /// `document_for_org` filters on the POLICY row's `deleted_at`, not the organization's,
+    /// so an organization that is soft-deleted while its clients still point at it goes on
+    /// shortening their tokens until either the policy or the ownership is withdrawn. That
+    /// is the fail-safe direction and it is deliberate: the alternative would let deleting
+    /// an organization silently LENGTHEN live credentials, which is a security control
+    /// disappearing as a side effect of an unrelated administrative act.
+    ///
+    /// # Errors
+    ///
+    /// [`ResourceTargetError::ServerError`] if the client's owner cannot be read, does not
+    /// parse, or its policy cannot be read. Fails CLOSED for the same reason the audience
+    /// resolution above does: the alternative is issuing the long-lived token that this
+    /// policy exists to prevent, and a store blip must not be a way to get one.
+    async fn organization_access_token_ttl(
+        &self,
+        scope: &Scope,
+        client_id: &str,
+    ) -> Result<Option<Duration>, ResourceTargetError> {
+        if !self.org_scoped_clients_enabled {
+            return Ok(None);
+        }
+        // A client identifier that does not parse in this scope owns no row, so there is no
+        // organization to read and nothing to narrow. This is NOT the fail-closed case: the
+        // caller has not yet authenticated the client here, and every grant that reaches a
+        // mint has already resolved a real client.
+        let Ok(parsed) = ClientId::parse_in_scope(client_id, scope) else {
+            return Ok(None);
+        };
+        let owner = self
+            .inner
+            .store
+            .scoped(*scope)
+            .clients()
+            .owning_organization(&parsed)
+            .await
+            .map_err(|_| ResourceTargetError::ServerError)?;
+        let Some(owner) = owner else { return Ok(None) };
+        let owner = OrganizationId::parse_in_scope(&owner, scope)
+            .map_err(|_| ResourceTargetError::ServerError)?;
+        let document = self
+            .inner
+            .store
+            .scoped(*scope)
+            .org_auth_policies()
+            .document_for_org(&owner)
+            .await
+            .map_err(|_| ResourceTargetError::ServerError)?;
+        let Some(document) = document else {
+            return Ok(None);
+        };
+        let levels = ironauth_store::PolicyLevels {
+            organization: Some(document),
+            ..ironauth_store::PolicyLevels::default()
+        };
+        Ok(ironauth_store::resolve_org_policy(&levels)
+            .access_token_ttl_secs()
+            .map(|secs| Duration::from_secs(u64::from(secs))))
     }
 
     /// Validate that EVERY requested resource names a registered resource server in

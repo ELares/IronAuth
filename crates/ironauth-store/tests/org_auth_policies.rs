@@ -328,10 +328,18 @@ fn random_corpus_document(rng: &mut Rng) -> AuthPolicy {
         invitations_enabled: None,
         session_ttl_secs,
         session_idle_ttl_secs,
+        // `duration` answers `Some(0)` a quarter of the time, so the zero this column's
+        // CHECK refuses is genuinely reached and the agreement between the CHECK and the
+        // Rust validator is measured for it rather than assumed from the session pair.
+        access_token_ttl_secs: duration(rng),
     }
 }
 
 /// A document that exercises every dimension at once.
+///
+/// Every field is STATED, never inherited: a fixture that leaves a dimension `None` cannot
+/// tell a column that round-trips from a column nothing writes, which is exactly the shape
+/// migration 0121's schema test exists to catch.
 fn full_document() -> AuthPolicy {
     AuthPolicy {
         mfa_required: Some(true),
@@ -341,6 +349,7 @@ fn full_document() -> AuthPolicy {
         invitations_enabled: Some(true),
         session_ttl_secs: Some(3_600),
         session_idle_ttl_secs: Some(900),
+        access_token_ttl_secs: Some(300),
     }
 }
 
@@ -409,7 +418,7 @@ async fn a_policy_is_stated_read_back_and_removed_with_its_audit_vocabulary() {
     assert_eq!(
         detail,
         "mfa_required=true factors=restricted domains=set jit=false invitations=true \
-         session_ttl=3600 session_idle=900"
+         session_ttl=3600 session_idle=900 token_ttl=300"
     );
     assert!(!detail.contains("acme.example"));
     assert!(!detail.contains("totp"));
@@ -787,8 +796,9 @@ async fn engine_refuses_with_a_check(
     let outcome = sqlx::query(
         "INSERT INTO org_auth_policies \
          (id, tenant_id, environment_id, organization_id, mfa_required, allowed_factors, \
-          allowed_email_domains, session_ttl_secs, session_idle_ttl_secs) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+          allowed_email_domains, session_ttl_secs, session_idle_ttl_secs, \
+          access_token_ttl_secs) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
     )
     .bind(OrgAuthPolicyId::generate(env, &scope).to_string())
     .bind(scope.tenant().to_string())
@@ -799,6 +809,11 @@ async fn engine_refuses_with_a_check(
     .bind(list(document.allowed_email_domains.as_ref()))
     .bind(secs(document.session_ttl_secs))
     .bind(secs(document.session_idle_ttl_secs))
+    // Bound so the CHECK behind the new column is actually reached. Omitting it would
+    // leave the column NULL on every corpus row, the CHECK would never fire, and the
+    // agreement this helper measures would be an agreement about a column the engine was
+    // never shown.
+    .bind(secs(document.access_token_ttl_secs))
     .execute(db.owner_pool())
     .await;
 
