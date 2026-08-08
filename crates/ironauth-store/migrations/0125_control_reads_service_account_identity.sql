@@ -1,0 +1,13 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+--
+-- The control plane resolves permissions for a service-account membership (issue #99).
+--
+-- `EFFECTIVE_CLOSURE_CTE` now LEFT JOINs `service_accounts` to establish that the principal a
+-- membership names still exists. `service_accounts` was an app-plane table (0017 granted only
+-- ironauth_app), so the control plane read it as a permission error rather than as an empty
+-- join, and every permission resolution failed.
+--
+-- The grant is column scoped to exactly the three identity columns that join reads. The
+-- control plane has no business seeing a service account's client binding or its secret
+-- material, and a later column added to this table must not become readable by accident.
+GRANT SELECT (id, tenant_id, environment_id) ON service_accounts TO ironauth_control;

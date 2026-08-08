@@ -1040,6 +1040,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0124_membership_principal_arc.sql"),
         },
+        Migration {
+            version: 125,
+            name: "control_reads_service_account_identity",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0125_control_reads_service_account_identity.sql"),
+        },
     ]
 }
 
