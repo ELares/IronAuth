@@ -1062,6 +1062,12 @@ fn org_membership_cases(base: &str, ids: &Ids) -> Vec<Case> {
             ),
         },
         Case {
+            label: "api_keys.createOrganizationApiKey",
+            method: "POST",
+            path: format!("{base}/organizations/{org}/api-keys"),
+            body: Some("{\"display_name\":\"absent\"}".to_owned()),
+        },
+        Case {
             label: "project_grants.createProjectGrant",
             method: "POST",
             path: format!("{base}/organizations/{org}/project-grants"),

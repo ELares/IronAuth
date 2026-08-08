@@ -12,6 +12,7 @@
 # table carries must be a row that is flagged here. Two un-joined writes behind one
 # Idempotency-Key is issue #247's defect: a failure between them leaves a partial
 # state the replay store cannot see.
+crates/ironauth-admin/src/api_keys.rs:create_organization_api_key:1
 crates/ironauth-admin/src/bans.rs:create_ban:1
 crates/ironauth-admin/src/bans.rs:lift_ban:1
 crates/ironauth-admin/src/bans.rs:resolve_scope:0

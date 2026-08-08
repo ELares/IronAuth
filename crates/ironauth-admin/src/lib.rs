@@ -504,7 +504,8 @@ pub fn management_router(state: AdminState) -> Router {
         // are audited, so this is the HTTP layer catching up rather than new capability.
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/api-keys",
-            axum::routing::get(api_keys::list_organization_api_keys),
+            axum::routing::get(api_keys::list_organization_api_keys)
+                .post(api_keys::create_organization_api_key),
         )
         // Enterprise inbound routing (issue #96). The store and the data plane have
         // shipped since migration 0059; this is the first time an operator can reach it.

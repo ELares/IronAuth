@@ -608,6 +608,14 @@ impl Fixture {
                 live: StatusCode::OK,
             },
             Case {
+                label: "api_keys.createOrganizationApiKey",
+                method: "POST",
+                path: format!("{base}/api-keys"),
+                body: Some("{\"display_name\":\"sweep key\"}".to_owned()),
+                intent: Intent::Write,
+                live: StatusCode::CREATED,
+            },
+            Case {
                 label: "api_keys.listOrganizationApiKeys",
                 method: "GET",
                 path: format!("{base}/api-keys"),

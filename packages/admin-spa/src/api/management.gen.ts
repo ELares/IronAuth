@@ -1200,7 +1200,7 @@ export interface paths {
         };
         get: operations["listOrganizationApiKeys"];
         put?: never;
-        post?: never;
+        post: operations["createOrganizationApiKey"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2765,6 +2765,20 @@ export interface components {
              */
             membership_id: string;
         };
+        /** @description The creation response: the ONLY place the key itself ever appears. */
+        ApiKeyCreated: {
+            /** @description The operator-facing label. */
+            display_name: string;
+            /** @description The non-secret `akey_` handle. */
+            id: string;
+            /**
+             * @description The key. Present exactly once, on the original 201. Copy it now; nothing can recover
+             *     it afterwards, including a replay of this very request.
+             */
+            key?: string | null;
+            /** @description True on an idempotent REPLAY, where the key is deliberately absent. */
+            key_already_issued: boolean;
+        };
         /** @description A page of keys. */
         ApiKeyListView: {
             /** @description This owner's keys, newest first, revoked ones included. */
@@ -3212,6 +3226,11 @@ export interface components {
              *     nothing was audited and no cascade ran.
              */
             revoked: boolean;
+        };
+        /** @description The create request. */
+        CreateApiKeyRequest: {
+            /** @description The operator-facing label. Never secret and never part of the key. */
+            display_name: string;
         };
         /** @description The request body to place a ban. */
         CreateBanRequest: {
@@ -12640,6 +12659,94 @@ export interface operations {
             };
             /** @description The organization is not a live row of this scope */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    createOrganizationApiKey: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Required. Replaying a POST with the same key returns the original response WITHOUT the key material. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateApiKeyRequest"];
+            };
+        };
+        responses: {
+            /** @description Idempotent replay, carrying no `key`: it was issued once and is not recoverable */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiKeyCreated"];
+                };
+            };
+            /** @description Created. The `key` field is the only time the key is returned */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiKeyCreated"];
+                };
+            };
+            /** @description Malformed request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The organization is not a live row of this scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Idempotency-Key reused with a different request */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

@@ -219,3 +219,99 @@ async fn a_bad_credential_is_refused_rather_than_shown_an_empty_list() {
         "a bad credential must be 401, not an empty listing: {body}"
     );
 }
+
+/// Creating returns the key EXACTLY once, and a replay returns the record without it.
+///
+/// The replay half is the one that matters. `idempotency_keys.response_body` is plaintext
+/// retained 24 hours, so storing the created body verbatim would put a live credential there,
+/// which is the recoverable copy migration 0123 exists to prevent. The stored body elides the
+/// key and replays as 200, following `keys.rs`.
+#[tokio::test]
+async fn creating_returns_the_key_once_and_a_replay_never_repeats_it() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let org = create_org(&h, &tenant, &environment, "ck1").await;
+    let path =
+        format!("/v1/tenants/{tenant}/environments/{environment}/organizations/{org}/api-keys");
+    let request = serde_json::json!({ "display_name": "ci deploy" }).to_string();
+
+    let (status, _, body) = h.post(&path, "create-key-1", &request).await;
+    assert_eq!(status, StatusCode::CREATED, "create: {body}");
+    let created: Value = serde_json::from_str(&body).expect("json");
+    let key = created["key"]
+        .as_str()
+        .expect("the key is returned once")
+        .to_owned();
+    assert!(key.starts_with("ira_ak_"), "an API key prefix: {key}");
+    assert_eq!(created["key_already_issued"], false);
+
+    // The SAME idempotency key: a replay, carrying no key material and no second credential.
+    let (status, _, replay_body) = h.post(&path, "create-key-1", &request).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "replay is 200, not 201: {replay_body}"
+    );
+    let replay: Value = serde_json::from_str(&replay_body).expect("json");
+    assert_eq!(replay["key_already_issued"], true);
+    assert!(
+        replay.get("key").is_none(),
+        "the replay returned the key again: {replay_body}"
+    );
+    assert_eq!(replay["id"], created["id"], "the replay names the same key");
+
+    // Exactly one key exists, and the listing still never carries the material.
+    let (status, _, listed) = h.get(&path).await;
+    assert_eq!(status, StatusCode::OK, "list: {listed}");
+    let items = serde_json::from_str::<Value>(&listed).expect("json")["items"]
+        .as_array()
+        .expect("items")
+        .len();
+    assert_eq!(items, 1, "the retry minted a second credential: {listed}");
+    assert!(
+        !listed.contains(&key),
+        "the listing carries the key: {listed}"
+    );
+}
+
+/// The created key actually WORKS: it verifies through the data plane's own path.
+///
+/// Without this the endpoint could return a well-formed string that authenticates nothing,
+/// and every other assertion here would still pass.
+#[tokio::test]
+async fn the_created_key_verifies_through_the_data_plane() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let org = create_org(&h, &tenant, &environment, "ck2").await;
+    let path =
+        format!("/v1/tenants/{tenant}/environments/{environment}/organizations/{org}/api-keys");
+    let (status, _, body) = h
+        .post(
+            &path,
+            "create-key-2",
+            &serde_json::json!({ "display_name": "verifies" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "create: {body}");
+    let key = serde_json::from_str::<Value>(&body).expect("json")["key"]
+        .as_str()
+        .expect("key")
+        .to_owned();
+
+    let env = Env::system();
+    let resolved = h
+        .db()
+        .store()
+        .scoped(scope_of(&tenant, &environment))
+        .api_keys()
+        .verify(&key, now_micros(&env))
+        .await
+        .expect("verify");
+    let resolved = resolved.expect("the created key must verify");
+    assert_eq!(
+        resolved.owner,
+        ApiKeyOwner::Organization(
+            OrganizationId::parse_in_scope(&org, &scope_of(&tenant, &environment)).expect("org")
+        )
+    );
+}
