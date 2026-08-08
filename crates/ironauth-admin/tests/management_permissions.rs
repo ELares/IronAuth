@@ -503,6 +503,20 @@ const PERMISSION_PROVEN: &[&str] = &[
     "rotateOrganizationApiKey",
 ];
 
+/// Not every unproven operation CAN be proven the same way.
+///
+/// The management-key operations (`createManagementKey`, `deleteManagementKey`) are the most
+/// dangerous on this surface: minting one is self-escalation for a restricted credential. I
+/// tried to prove their permission with the read-only pattern and could not, because
+/// `/v1/tenants/{t}/environments/{e}/keys` requires the OPERATOR plane. A restricted
+/// environment-scoped key is refused with `wrong_scope` before any permission check runs, so
+/// the plane fence MASKS the permission and the pattern cannot distinguish
+/// `WriteCredentials` from `Read` there.
+///
+/// That is a safe masking, not a hole: the plane check is strictly stronger. But it means the
+/// unproven count cannot be driven to zero with one technique, and an operator-plane
+/// equivalent of `restrict` would be needed to prove those operations at all.
+///
 /// Classification is NOT proof, and the size of that gap is counted so it cannot hide.
 ///
 /// 147 operations declare a required permission and 3 have that permission proven. The other
