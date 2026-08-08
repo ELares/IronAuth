@@ -48,6 +48,7 @@
 //! database is needed only to run the integration tests.
 
 pub mod abuse;
+pub mod api_key;
 pub mod audit;
 pub mod brand;
 pub mod classification;

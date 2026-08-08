@@ -88,6 +88,8 @@ Every opaque credential is `<prefix><handle><delimiter><secret>`, where:
 | --- | --- | --- | --- | --- |
 | `ira_at_` | Opaque ACCESS token | `tok_` scoped `jti` (48 bytes, Base64url no-pad, 64 chars) | 32 random bytes (256 bits), Base64url no-pad (43 chars) | Shipped (issue #29) |
 | `ira_rt_` | Opaque REFRESH token | (adopts the same scheme) | 32 random bytes (256 bits), Base64url no-pad (43 chars) | RESERVED for issue #21 (not yet issued) |
+| `ira_ak_` | API KEY (service account or organization owned) | `akey_` scoped id (48 bytes, Base64url no-pad, 64 chars) | 32 random bytes (256 bits), Base64url no-pad (43 chars) | Shipped (issue #99) |
+| `ira_pat_` | PERSONAL ACCESS TOKEN (user owned) | `akey_` scoped id (48 bytes, Base64url no-pad, 64 chars) | 32 random bytes (256 bits), Base64url no-pad (43 chars) | Shipped (issue #99) |
 
 The `ira_rt_` prefix is reserved here for consistency so that the refresh-token
 work (issue #21) adopts the same scope-declaring scheme; refresh-token storage and
@@ -108,9 +110,23 @@ ira_rt_tok_[A-Za-z0-9_-]{64}~[A-Za-z0-9_-]{43}
 # Both classes in one pattern
 ira_(at|rt)_tok_[A-Za-z0-9_-]{64}~[A-Za-z0-9_-]{43}
 
+# API key (ira_ak_, issue #99): prefix, akey_ scoped handle, ~, 256-bit secret
+ira_ak_akey_[A-Za-z0-9_-]{64}~[A-Za-z0-9_-]{43}
+
+# Personal access token (ira_pat_, issue #99; same scheme, different owner class)
+ira_pat_akey_[A-Za-z0-9_-]{64}~[A-Za-z0-9_-]{43}
+
+# Every long-lived key class in one pattern
+ira_(ak|pat)_akey_[A-Za-z0-9_-]{64}~[A-Za-z0-9_-]{43}
+
 # High-signal prefix-only match (catches any future body shape)
-ira_(at|rt)_[A-Za-z0-9_~-]+
+ira_(at|rt|ak|pat)_[A-Za-z0-9_~-]+
 ```
+
+`ira_ak_` and `ira_pat_` are ONE format with two prefixes, and the split is for the
+scanner's benefit rather than the verifier's. They verify identically and share a
+table; a leaked `ira_pat_` is an individual's access and a leaked `ira_ak_` is a
+machine identity's, and the two differ in who must be told and how fast.
 
 The handle is exactly 64 characters (a `tok_` scoped identifier's 48-byte payload
 encoded as URL-safe Base64 without padding, `ceil(48 * 4 / 3) = 64`) and the secret
