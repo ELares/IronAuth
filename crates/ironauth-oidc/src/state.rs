@@ -34,6 +34,7 @@ use ironauth_jose::{
     VerificationPolicy, VerifiedToken, access_token_hash, validate_dpop_proof, verify,
 };
 use ironauth_quota::QuotaEnforcer;
+use ironauth_store::org_provisioning::OrgProvisioningSeam;
 use ironauth_store::{
     AbuseBanId, AbuseSubject, ActorRef, AuthPath, ClientId, CorrelationId, GuardrailSet, NewBan,
     OrganizationId, Scope, ServiceId, Store, TokenFormat,
@@ -233,6 +234,11 @@ pub struct OidcState {
     // narrows nothing and every client's token lifetime is exactly what it is today, even
     // for a client that already carries an `organization_id`.
     org_scoped_clients_enabled: bool,
+    // The ONE data-plane-to-control-plane crossing (issue #96, criterion 5): present only when
+    // the deployment enabled `self_service_organizations` AND a control DSN was configured. Held
+    // as an `Option` rather than behind a bool so the capability is ABSENT, not merely disabled,
+    // in every deployment that did not ask for it. See `ironauth_store::org_provisioning`.
+    org_provisioning: Option<Arc<OrgProvisioningSeam>>,
     // Whether the experimental signup fraud-review-queue surface is armed (issue #82, PR 2).
     // Kept OUTSIDE `Inner` and set through the builder for the SAME anti-bypass reason as
     // fedcm/risk-signals: it is NOT a plain `OidcConfig` toggle an operator can flip (that
@@ -911,6 +917,7 @@ impl OidcState {
             fedcm_enabled: false,
             risk_signals_enabled: false,
             org_scoped_clients_enabled: false,
+            org_provisioning: None,
             signup_quarantine_enabled: false,
             third_party_admin_consent_required_override: None,
             advanced_recovery_enabled: false,
@@ -1071,6 +1078,29 @@ impl OidcState {
     #[must_use]
     pub fn org_scoped_clients_enabled(&self) -> bool {
         self.org_scoped_clients_enabled
+    }
+
+    /// Install the organization-provisioning seam (issue #96, criterion 5).
+    ///
+    /// The boot path passes `Some` only when `oidc.self_service_organizations` is on AND a
+    /// control-plane store was connected. Everywhere else this stays `None`, which is what makes
+    /// the create control absent rather than disabled: the picker cannot render a control it has
+    /// no way to honour, and a create submission with no seam is the uniform refusal.
+    #[must_use]
+    pub fn with_org_provisioning(mut self, seam: Option<Arc<OrgProvisioningSeam>>) -> Self {
+        self.org_provisioning = seam;
+        self
+    }
+
+    /// The organization-provisioning seam, or `None` when this deployment did not enable it.
+    ///
+    /// Returning the seam rather than a bool is deliberate: the seam exposes exactly one
+    /// operation and lends out no store, so handing it to the step that needs it grants nothing
+    /// beyond that operation. A `bool` accessor plus a separately reachable store would be the
+    /// escape hatch this design exists to avoid.
+    #[must_use]
+    pub fn org_provisioning(&self) -> Option<&Arc<OrgProvisioningSeam>> {
+        self.org_provisioning.as_ref()
     }
 
     /// Arm the experimental signup fraud-review-queue surface (issue #82, PR 2).

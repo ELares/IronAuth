@@ -67,6 +67,7 @@ pub mod interchange;
 pub mod locale_bundle;
 mod migrate;
 pub mod org_policy;
+pub mod org_provisioning;
 pub mod outbox;
 pub mod pow_challenge;
 pub mod promotion;

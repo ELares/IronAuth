@@ -279,6 +279,12 @@ pub const ORG_PICKER_PROMPT: MessageId = MessageId(1_090_001);
 /// finite for arbitrary organization names.
 pub const ORG_PICKER_OPTION_LABEL: MessageId = MessageId(1_090_002);
 
+/// The organization-creation name field label (issue #96, criterion 5). Rendered only when the
+/// deployment installed the provisioning seam.
+pub const ORG_PICKER_CREATE_NAME_LABEL: MessageId = MessageId(1_090_003);
+/// The organization-creation submit label (issue #96, criterion 5).
+pub const ORG_PICKER_CREATE_LABEL: MessageId = MessageId(1_090_004);
+
 /// The login success note.
 pub const LOGIN_SUCCESS: MessageId = MessageId(1_500_001);
 /// The registration success note (a new account was created and signed in).
@@ -730,6 +736,20 @@ pub const REGISTRY: &[MessageSpec] = &[
         kind: MessageKind::Info,
         text: "Continue",
         context_keys: &["name"],
+    },
+    MessageSpec {
+        id: ORG_PICKER_CREATE_NAME_LABEL,
+        name: "org_picker.create.name.label",
+        kind: MessageKind::Info,
+        text: "New organization name",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: ORG_PICKER_CREATE_LABEL,
+        name: "org_picker.create.label",
+        kind: MessageKind::Info,
+        text: "Create organization",
+        context_keys: &[],
     },
     MessageSpec {
         id: LOGIN_SUCCESS,

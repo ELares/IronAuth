@@ -357,7 +357,10 @@ fn push_org_picker_golden(corpus: &mut Vec<GoldenFlow>, transport: Transport, id
         transport,
         Journey::Login,
         FlowStateTag::OrgPicker,
-        org_picker::picker_nodes(transport, id, &orgs),
+        // `false`: the golden corpus pins the shape every deployment renders. The create
+        // controls appear only where the provisioning seam is installed (issue #96, criterion 5),
+        // which is off by default, and their own tests drive that shape.
+        org_picker::picker_nodes(transport, id, &orgs, false),
         Vec::new(),
         None,
     ));

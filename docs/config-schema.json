@@ -1201,6 +1201,11 @@
           },
           "description": "The minimal risk engine (issue #79): the explainable signals, the LOW/MED/HIGH\nscoring, the block/challenge/notify action vocabulary, the risk-driven step-up\nthreshold, and the new-device notification. OFF by default (fully inert). See\n[`RiskConfig`]."
         },
+        "self_service_organizations": {
+          "default": false,
+          "description": "Whether an authenticated subject may CREATE an organization from the login discovery\nstep (issue #96, criterion 5). Default `false`.\n\nOff means the create control never renders and a create submission is the uniform\ninvalid-submission refusal, so an untouched deployment behaves exactly as it did before\nthis setting existed. It also means the boot path constructs no\n`OrgProvisioningSeam`, so the one data-plane-to-control-plane crossing in the codebase is\nABSENT rather than merely unused.\n\nTurning it on is a product decision, not a convenience: it lets any subject who can\nauthenticate mint organizations. The step renders only after the primary factor has\nsucceeded, so it is not an unauthenticated surface, but a deployment where accounts are\nself-registered should weigh that before enabling it. It also requires a control-plane\nDSN, because organization creation is a control-plane write; without one the setting is\ninert and the boot path says so.",
+          "type": "boolean"
+        },
         "session_device_binding": {
           "default": false,
           "description": "Bind the session to the device / user agent it was established from (issue\n#32). The safe default (`false`) leaves it OFF (the tunability principle).\nEnable it to fail closed when the device/user-agent fingerprint changes.",
@@ -2775,6 +2780,7 @@
           "velocity_med_threshold": 10,
           "velocity_window_secs": 300
         },
+        "self_service_organizations": false,
         "session_device_binding": false,
         "session_idle_ttl_secs": 3600,
         "session_management_enabled": false,
