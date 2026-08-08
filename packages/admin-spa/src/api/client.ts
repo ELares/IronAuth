@@ -2207,6 +2207,38 @@ export async function createOrgApiKey(
   return data;
 }
 
+// Rotate one API key (operationId rotateOrganizationApiKey, issue #99). ONE request,
+// because the store revokes the old key and issues the new one in ONE transaction:
+// splitting it into create-then-revoke here would reintroduce the window where both
+// are live, which is the failure a rotation performed to contain a leak exists to
+// prevent. The replacement inherits the label and expiry.
+export async function rotateOrgApiKey(
+  tenantId: string,
+  environmentId: string,
+  organizationId: string,
+  keyId: string,
+): Promise<OrgApiKeyCreated> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.POST(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/api-keys/{key_id}/rotate",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          organization_id: organizationId,
+          key_id: keyId,
+        },
+        header: { "Idempotency-Key": idempotencyKey() },
+      },
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
 // Revoke one API key (operationId revokeOrganizationApiKey, issue #99). The key stops
 // verifying on the very next request; the ROW is retained so the revocation stays
 // legible in the listing.
