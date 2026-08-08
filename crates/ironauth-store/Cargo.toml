@@ -580,6 +580,12 @@ name = "org_memberships"
 path = "tests/org_memberships.rs"
 required-features = ["testing"]
 
+# Needs a real database (DATABASE_URL).
+[[test]]
+name = "permission_parity"
+path = "tests/permission_parity.rs"
+required-features = ["testing"]
+
 # Organization roles (issue #97, store PR 1): the role half of the M10 role model.
 # Create/get/list/rename/delete with its audit vocabulary, the live-vs-deleted slug
 # uniqueness, the uniform not-found across absent / deleted / foreign-org /
