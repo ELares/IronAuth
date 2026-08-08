@@ -764,3 +764,128 @@ async fn a_confinement_that_will_not_parse_denies_the_credential_rather_than_wid
          environment-wide reach: an unreadable restriction became no restriction. Body: {body}"
     );
 }
+
+/// A read-only credential may LIST API keys and may not create, rotate or revoke one.
+///
+/// This closes a gap I documented in three separate handlers and did not close at the time.
+/// `management_permissions.rs` classifies these operations as `WriteCredentials` and
+/// separately asserts each handler calls `require_permission`, but nothing compares the two:
+/// its own comment says it "cannot tell WHICH permission a handler demands, only that it
+/// demands one". A mutation downgrading any of them to `Read` passed every pin.
+///
+/// The refusal-body assertions are what make this verify the SPECIFIC permission rather than
+/// merely some permission. A handler demanding `Read` would answer 200 here, and one
+/// demanding the wrong write permission would name that one instead.
+#[tokio::test]
+async fn a_read_only_credential_can_list_api_keys_and_cannot_mint_or_kill_one() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "ak-mint").await;
+
+    // An organization, and one key inside it, created while the credential is still
+    // unrestricted. The restriction below is what the test is about; the fixture must exist
+    // before it applies.
+    let orgs = format!("/v1/tenants/{tenant}/environments/{environment}/organizations");
+    let (status, _, body) = h
+        .post(
+            &orgs,
+            "ak-org",
+            &serde_json::json!({ "display_name": "Acme" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "create org: {body}");
+    let org = serde_json::from_str::<serde_json::Value>(&body).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    let base = format!("{orgs}/{org}/api-keys");
+    let (status, _, body) = h
+        .post(
+            &base,
+            "ak-seed",
+            &serde_json::json!({ "display_name": "seed" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "seed key: {body}");
+    let seeded = serde_json::from_str::<serde_json::Value>(&body).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+
+    // The READ it holds still works.
+    let (status, _, body) = h.get_as(&base, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a read-granted key was refused the key listing it holds: {body}"
+    );
+
+    // CREATE is refused, and the refusal names write_credentials rather than any other write.
+    let (status, _, body) = h
+        .post_as(
+            &base,
+            &secret,
+            "ak-denied-create",
+            &serde_json::json!({ "display_name": "should not exist" }).to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read-only credential MINTED an API key: {body}"
+    );
+    assert!(
+        body.contains("management.write_credentials"),
+        "the refusal does not name write_credentials, so the handler may be demanding a \
+         different permission than the classification records: {body}"
+    );
+
+    // ROTATE is refused, and names the same permission.
+    let (status, _, body) = h
+        .post_as(
+            &format!("{base}/{seeded}/rotate"),
+            &secret,
+            "ak-denied-rotate",
+            "",
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read-only credential ROTATED an API key: {body}"
+    );
+    assert!(
+        body.contains("management.write_credentials"),
+        "rotate: {body}"
+    );
+
+    // REVOKE is refused, and names the same permission.
+    let (status, _, body) = h.delete_as(&format!("{base}/{seeded}"), &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read-only credential REVOKED an API key: {body}"
+    );
+    assert!(
+        body.contains("management.write_credentials"),
+        "revoke: {body}"
+    );
+
+    // And nothing changed: the seeded key is still live and still the only one.
+    let (_, _, listed) = h.get_as(&base, &secret).await;
+    let items = serde_json::from_str::<serde_json::Value>(&listed).expect("json")["items"]
+        .as_array()
+        .expect("items")
+        .clone();
+    assert_eq!(
+        items.len(),
+        1,
+        "a refused write changed the key set: {listed}"
+    );
+    assert!(
+        items[0].get("revoked_at_unix_ms").is_none(),
+        "the refused revoke revoked it anyway: {listed}"
+    );
+}
