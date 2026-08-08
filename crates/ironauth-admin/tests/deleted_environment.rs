@@ -616,6 +616,14 @@ impl Fixture {
                 live: StatusCode::CREATED,
             },
             Case {
+                label: "api_keys.rotateOrganizationApiKey",
+                method: "POST",
+                path: format!("{base}/api-keys/akey_absent/rotate"),
+                body: None,
+                intent: Intent::Write,
+                live: StatusCode::NOT_FOUND,
+            },
+            Case {
                 label: "api_keys.revokeOrganizationApiKey",
                 method: "DELETE",
                 path: format!("{base}/api-keys/akey_absent"),

@@ -355,3 +355,135 @@ pub async fn revoke_organization_api_key(
         Err(_) => Err(ApiError::Internal),
     }
 }
+
+#[utoipa::path(
+    post,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/api-keys/{key_id}/rotate",
+    operation_id = "rotateOrganizationApiKey",
+    tag = "org-roles",
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("organization_id" = String, Path, description = "The organization identifier"),
+        ("key_id" = String, Path, description = "The akey_ handle of the key being replaced"),
+        ("Idempotency-Key" = String, Header, description = "Required. Replaying returns the \
+         original response WITHOUT the key material.")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 201, description = "Rotated. The old key is revoked and the new one is returned, once, in the same transaction", body = ApiKeyCreated),
+        (status = 200, description = "Idempotent replay, carrying no `key`", body = ApiKeyCreated),
+        (status = 401, description = "Missing or invalid credential", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "The organization or the key is not a live row of this scope, or the key is already revoked", body = ErrorBody),
+        (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
+    )
+)]
+pub async fn rotate_organization_api_key(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, organization_id, key_id)): Path<(
+        String,
+        String,
+        String,
+        String,
+    )>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
+    // Delegated administration (issue #102): WRITE CREDENTIALS, as create and revoke.
+    principal.require_permission(ManagementPermission::WriteCredentials)?;
+    crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
+
+    let idem_key = idempotency::required_key(&headers)?;
+    // No request body: the PATH carries everything, so it is the whole discriminator. Two
+    // rotations of DIFFERENT keys under one idempotency key therefore differ, and a genuine
+    // retry of the same one matches.
+    let fingerprint = idempotency::fingerprint("POST", uri.path(), &[]);
+    let credential_ref = principal.credential_ref();
+    if let Some(replay) =
+        idempotency::replay_if_stored(&state, &credential_ref, &idem_key, &fingerprint).await?
+    {
+        return Ok(replay);
+    }
+
+    let org_id = resolve_live_org(
+        &state,
+        &principal,
+        scope,
+        &organization_id,
+        EnvironmentAccess::Write,
+    )
+    .await?;
+    let old = ApiKeyId::parse_in_scope(&key_id, &scope).map_err(|_| ApiError::NotFound)?;
+
+    // The key must belong to THIS organization, for the reason recorded on revoke: the store
+    // operation is environment-scoped, so without this the organization in the URL is
+    // decorative and a confined admin could rotate a sibling organization's credentials.
+    let existing = state
+        .store()
+        .scoped(scope)
+        .api_keys()
+        .list_for_owner(&ApiKeyOwner::Organization(org_id))
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    let Some(previous) = existing.into_iter().find(|record| record.id == old) else {
+        return Err(ApiError::NotFound);
+    };
+
+    // The replacement inherits the label. Rotation replaces the SECRET, not the identity of
+    // the integration, and making the caller re-supply a name invites a rotation that silently
+    // renames the thing an operator is watching.
+    let minted = mint_api_key(state.env(), &scope, ApiKeyKindTag::ApiKey);
+    let created = ApiKeyCreated {
+        id: minted.id.to_string(),
+        display_name: previous.display_name.clone(),
+        key: Some(minted.plaintext.clone()),
+        key_already_issued: false,
+    };
+    let created_body = serde_json::to_string(&created).map_err(|_| ApiError::Internal)?;
+    let stored = ApiKeyCreated {
+        id: minted.id.to_string(),
+        display_name: previous.display_name.clone(),
+        key: None,
+        key_already_issued: true,
+    };
+    let stored_body = serde_json::to_string(&stored).map_err(|_| ApiError::Internal)?;
+
+    // ONE request, because `rotate` is ONE transaction. Exposing this as create-then-revoke
+    // over two calls would hand the window back: a client that crashed between them would
+    // leave the old key live alongside the new one, which is the failure a rotation performed
+    // to contain a leak exists to prevent.
+    let result = state
+        .store()
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(state.env()))
+        .api_keys()
+        .rotate(
+            state.env(),
+            &old,
+            NewApiKey {
+                id: &minted.id,
+                key_digest: &minted.digest,
+                owner: &ApiKeyOwner::Organization(org_id),
+                display_name: &previous.display_name,
+                expires_at_unix_micros: previous.expires_at_unix_micros,
+            },
+            state.now_unix_micros(),
+            Some(IdempotencyWrite {
+                credential_ref: &credential_ref,
+                key: &idem_key,
+                request_fingerprint: &fingerprint,
+                response_status: 200,
+                response_body: &stored_body,
+            }),
+        )
+        .await;
+
+    match result {
+        Ok(()) => Ok(json(StatusCode::CREATED, created_body)),
+        Err(StoreError::NotFound) => Err(ApiError::NotFound),
+        Err(_) => Err(ApiError::Internal),
+    }
+}

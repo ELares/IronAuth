@@ -511,6 +511,10 @@ pub fn management_router(state: AdminState) -> Router {
             "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/api-keys/{key_id}",
             delete(api_keys::revoke_organization_api_key),
         )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/api-keys/{key_id}/rotate",
+            post(api_keys::rotate_organization_api_key),
+        )
         // Enterprise inbound routing (issue #96). The store and the data plane have
         // shipped since migration 0059; this is the first time an operator can reach it.
         .route(

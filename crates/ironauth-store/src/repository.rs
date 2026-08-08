@@ -56531,6 +56531,12 @@ impl ActingApiKeyRepo<'_> {
     /// Both audit rows are written inside the same transaction, so the trail cannot show a
     /// revocation whose replacement never existed.
     ///
+    /// # `idempotency` carries the same obligation as on `create`, and a sharper one
+    ///
+    /// A retried rotate without a replay row is worse than a retried create. The first attempt
+    /// already revoked the old key, so the retry issues a SECOND new credential and the caller
+    /// cannot tell which of the two it was handed. Both live, one untracked.
+    ///
     /// # Errors
     ///
     /// [`StoreError::NotFound`] if `old` is absent from this scope, already revoked, or if the
@@ -56547,6 +56553,7 @@ impl ActingApiKeyRepo<'_> {
         old: &ApiKeyId,
         replacement: NewApiKey<'_>,
         now_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
         if old.scope() != self.scope || replacement.id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -56636,6 +56643,11 @@ impl ActingApiKeyRepo<'_> {
             None,
         )
         .await?;
+        // The replay row joins the revoke and the issue in ONE transaction. A retried rotate
+        // without it is worse than a retried create: the first attempt already killed the old
+        // key, so the retry mints a SECOND new credential and the caller cannot tell which of
+        // the two is the one it was handed.
+        insert_idempotency(&mut tx, idempotency).await?;
         tx.commit().await?;
         Ok(())
     }

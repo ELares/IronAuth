@@ -256,6 +256,7 @@ fn operation_ids_are_the_stable_set() {
             "revokeSession",
             "revokeUserConsent",
             "revokeUserSessions",
+            "rotateOrganizationApiKey",
             "rotateWebhookEndpointSecret",
             "setAutoLinkPosture",
             "setBrand",
@@ -610,6 +611,7 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/migration/verify-credential",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/api-keys",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/api-keys/{key_id}/rotate",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/disable",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/enable",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups",
@@ -760,7 +762,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        207,
+        208,
         "the documented route count is pinned"
     );
 
