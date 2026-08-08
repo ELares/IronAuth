@@ -63,14 +63,22 @@ echo "==> admin SPA embed freshness"
 scripts/admin-spa-embed.sh
 
 echo "==> admin SPA bindings freshness (generated from the OpenAPI document)"
-# SKIPPED when `openapi-typescript` is absent, which it is on a plain developer machine.
-# Announced rather than silent: a skip nobody sees is how a gate comes to cover less than
-# its output implies, which is the failure this whole block exists to fix. CI installs the
-# tool and runs it for real.
-if command -v openapi-typescript >/dev/null 2>&1; then
+# The precondition is the LOCAL npm bin, not a global one.
+#
+# The first version of this guard tested `command -v openapi-typescript`, which is the wrong
+# question: `scripts/admin-spa-bindings.sh` runs `npm run codegen` from `packages/admin-spa`,
+# so it uses `node_modules/.bin`. With the dependencies installed the script succeeds while
+# that guard still reports absent, and the gate would have skipped a check it could run. A
+# skip that fires when the tool IS available is worse than the silent skip this block replaced,
+# because the announcement makes it look considered.
+#
+# The skip now names the command that removes it. An announced skip nobody can act on is only
+# half the value.
+if [ -x packages/admin-spa/node_modules/.bin/openapi-typescript ]; then
     scripts/admin-spa-bindings.sh
 else
-    echo "admin-spa-bindings: openapi-typescript absent, SKIPPED (CI runs it)"
+    echo "admin-spa-bindings: SKIPPED, packages/admin-spa dependencies are not installed."
+    echo "                    Run: (cd packages/admin-spa && npm install)  [CI runs this check]"
 fi
 echo "==> idempotent write audit (no admin handler splits two store writes behind one Idempotency-Key)"
 scripts/idempotent-write-audit.sh
