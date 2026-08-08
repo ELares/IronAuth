@@ -64,10 +64,31 @@ CREATE UNIQUE INDEX org_policy_inheritance_field_live_uniq
 -- Entitlements. The critical finding the review records: features need NO new slug
 -- table. `permissions` (migration 0091) already carries a namespaced slug grammar with
 -- `.` as the delimiter, described there as "namespaced BY CONSTRUCTION, not by
--- convention". A feature is a permission slug in a reserved first segment, which is
--- exactly what keeps features from becoming a second universe.
+-- convention". A feature is a permission, which is exactly what keeps features from
+-- becoming a second universe.
 --
--- So bet 3 adds only the BUNDLE: a plan, and which feature slugs it grants.
+-- CORRECTION to the first draft of this file, which said a feature is "a permission slug
+-- in a reserved first segment". Nothing reserved any segment: there was no prefix, no
+-- CHECK, and no way for the schema to tell a feature from an ordinary permission. The
+-- sentence described a mechanism that did not exist, and the FOREIGN KEY below would have
+-- let a plan bundle `billing.invoice.delete` as cheerfully as `plan.seats`.
+--
+-- The reserved namespace ALREADY SHIPS and it is not a slug prefix. Migration 0091's
+-- `permissions.kind` carries `CHECK (kind IN ('permission', 'entitlement'))` from day
+-- one, and its live-unique index is keyed on `(tenant_id, environment_id, kind, slug)`
+-- precisely so `plan.enterprise` can exist as an entitlement while a permission of the
+-- same slug exists independently. 0091 wrote that headroom for this bet and the first
+-- draft of this candidate did not use it.
+--
+-- So bet 3 adds only the BUNDLE: a plan, and which ENTITLEMENT slugs it grants.
+
+-- Required by Postgres for the composite foreign key below: a REFERENCES clause needs a
+-- unique constraint on exactly the referenced column list. `id` is already the primary
+-- key, so this adds no new uniqueness and cannot fail on existing data; it exists solely
+-- to make `(id, kind)` a legal target. Additive, and it takes no lock beyond the index
+-- build.
+ALTER TABLE permissions
+    ADD CONSTRAINT permissions_id_kind_uniq UNIQUE (id, kind);
 
 CREATE TABLE org_plans (
     id              text        NOT NULL PRIMARY KEY,
@@ -89,25 +110,37 @@ CREATE UNIQUE INDEX org_plans_slug_live_uniq
     ON org_plans (tenant_id, environment_id, slug)
     WHERE deleted_at IS NULL;
 
--- A plan grants feature slugs. The FOREIGN KEY to `permissions` is the whole point: a
--- feature is a permission, so a plan cannot grant a feature that does not exist in the
--- vocabulary, and `isEntitled` can resolve permissions and features through ONE join
--- rather than reconciling two systems.
+-- A plan grants ENTITLEMENT slugs. The composite FOREIGN KEY is the whole point, and it
+-- is composite for a reason a plain `REFERENCES permissions (id)` cannot achieve: a plan
+-- must be unable to bundle an ordinary PERMISSION.
+--
+-- `permission_kind` is pinned to `'entitlement'` by its own CHECK and carried into the
+-- foreign key, so the referenced row must be an entitlement. There is no value a writer
+-- can put in the column that reaches a `kind = 'permission'` row, and the enforcement is
+-- structural rather than a rule some later insert path has to remember. Getting this
+-- wrong in the other direction is the expensive mistake: a plan that could bundle
+-- `billing.invoice.delete` would turn a BILLING artifact into a grant of authority, and
+-- an operator adding a plan would be writing an access-control policy without knowing it.
 CREATE TABLE org_plan_features (
     id              text        NOT NULL PRIMARY KEY,
     tenant_id       text        NOT NULL,
     environment_id  text        NOT NULL,
     plan_id         text        NOT NULL,
     permission_id   text        NOT NULL,
+    -- Constant by construction. A column rather than a literal in the FK because
+    -- Postgres has no way to state "reference only rows whose kind is X" without one.
+    permission_kind text        NOT NULL DEFAULT 'entitlement',
     created_at      timestamptz NOT NULL DEFAULT now(),
     updated_at      timestamptz NOT NULL DEFAULT now(),
     deleted_at      timestamptz,
     CONSTRAINT org_plan_features_scope_nonempty
         CHECK (tenant_id <> '' AND environment_id <> ''),
+    CONSTRAINT org_plan_features_kind_is_entitlement
+        CHECK (permission_kind = 'entitlement'),
     FOREIGN KEY (tenant_id) REFERENCES tenants (id),
     FOREIGN KEY (environment_id, tenant_id) REFERENCES environments (id, tenant_id),
     FOREIGN KEY (plan_id) REFERENCES org_plans (id),
-    FOREIGN KEY (permission_id) REFERENCES permissions (id)
+    FOREIGN KEY (permission_id, permission_kind) REFERENCES permissions (id, kind)
 );
 
 CREATE UNIQUE INDEX org_plan_features_pair_live_uniq

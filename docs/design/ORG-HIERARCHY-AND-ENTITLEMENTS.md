@@ -64,18 +64,43 @@ universe". The confirmation is that features need **no new slug table at all**.
 
 `permissions` (migration 0091) already carries a namespaced slug grammar with `.` as the
 delimiter, described in that migration as "namespaced BY CONSTRUCTION, not by convention",
-with `billing.invoice.read` given as the shape. A feature slug is a permission slug in a
-reserved first segment. That is the whole mechanism.
+with `billing.invoice.read` given as the shape. A feature slug is an ordinary permission
+slug, and what distinguishes it is `permissions.kind`.
+
+**Correcting the first version of this section**, which said "a feature slug is a
+permission slug in a reserved first segment. That is the whole mechanism." No segment was
+reserved. There was no prefix, no CHECK, and nothing that could tell a feature from a
+permission, so the sentence named a mechanism that did not exist.
+
+The reserved namespace already ships and it is not a slug prefix. Migration 0091 gives
+`permissions.kind` a `CHECK (kind IN ('permission', 'entitlement'))` from day one and keys
+its live-unique index on `(tenant_id, environment_id, kind, slug)`, expressly so
+`plan.enterprise` can exist as an entitlement while a permission of the same slug exists
+independently. 0091 wrote that headroom for this bet; the first draft of the candidate did
+not use it.
 
 So bet 3 adds only the bundle: `org_plans`, `org_plan_features`, and
 `org_plan_assignments`.
 
 ### What keeps the two from drifting
 
-`org_plan_features.permission_id` is a foreign key to `permissions`. A plan therefore
-cannot grant a feature the vocabulary does not define, and that is asserted, not asserted-
-about: `a_plan_can_only_grant_a_feature_the_permission_vocabulary_defines` inserts an
-orphan and requires the database to refuse it.
+`org_plan_features` carries a **composite** foreign key to `permissions (id, kind)`,
+against a `permission_kind` column pinned to `'entitlement'` by its own CHECK. Two things
+follow, and both are asserted rather than asserted-about.
+
+A plan cannot grant a feature the vocabulary does not define:
+`a_plan_can_only_grant_a_feature_the_permission_vocabulary_defines` inserts an orphan and
+requires the database to refuse it.
+
+A plan cannot bundle an ordinary PERMISSION:
+`a_plan_can_bundle_an_entitlement_and_never_an_ordinary_permission` seeds one row of each
+kind, bundles the entitlement successfully, then tries the permission under every value
+`permission_kind` can legally hold and requires both to be refused. A plain
+`REFERENCES permissions (id)`, which is what the first draft had, permits it.
+
+That second one is not tidiness. A plan is a **billing** artifact an operator edits to sell
+a tier; a permission is a grant of authority. If one can carry the other, adding a plan
+means writing an access-control policy without knowing it.
 
 This is the difference between the products that got this right and the ones that did not.
 Where features are their own table with their own names, a plan can grant `export_csv`
@@ -96,10 +121,13 @@ Because 1 and 2 both terminate in `permissions.id`, the composition is a union o
 permission ids, not a reconciliation between two vocabularies. A caller asks once and the
 resolver decides whether the grant arrived by role or by plan.
 
-The deliberate consequence, worth stating because it will look like an omission: a feature
-and a permission are indistinguishable at the point of the check. That is the design. An
-operator who wants them distinguishable in the UI uses the namespace, which is visible in
-the slug.
+A feature and a permission are interchangeable at the point of the CHECK and distinct at
+the point of ADMINISTRATION, and that split is the design rather than an unresolved
+tension. The check unions permission ids and does not care how the grant arrived, which is
+what makes one query sufficient. Administration cares a great deal: `kind` is what stops a
+plan from bundling authority, and `permissions.kind` is immutable by GRANT (0091 never
+lists it in an UPDATE column list), so a row cannot be reclassified into the other
+category after the fact.
 
 ### Not in scope
 
