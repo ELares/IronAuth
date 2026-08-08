@@ -63,6 +63,7 @@ async fn issue(
                 expires_at_unix_micros: None,
             },
             now_micros(env),
+            None,
         )
         .await
         .expect("create the key");
@@ -255,6 +256,7 @@ async fn a_revoked_key_never_verifies_and_revoking_twice_audits_once() {
                 expires_at_unix_micros: None,
             },
             now_micros(&env),
+            None,
         )
         .await
         .expect("create");
@@ -317,6 +319,7 @@ async fn an_expired_key_does_not_verify() {
                 expires_at_unix_micros: Some(now + 1_000_000),
             },
             now,
+            None,
         )
         .await
         .expect("create");
@@ -367,6 +370,7 @@ async fn the_data_plane_cannot_create_a_key() {
                 expires_at_unix_micros: None,
             },
             now_micros(&env),
+            None,
         )
         .await;
     assert!(
@@ -429,6 +433,7 @@ async fn rotation_kills_the_old_key_and_issues_the_new_one() {
                 expires_at_unix_micros: None,
             },
             now_micros(&env),
+            None,
         )
         .await
         .expect("create the original");
@@ -525,6 +530,7 @@ async fn rotating_from_a_dead_key_is_refused_and_issues_nothing() {
                 expires_at_unix_micros: None,
             },
             now_micros(&env),
+            None,
         )
         .await
         .expect("create");
@@ -601,6 +607,7 @@ async fn the_list_shows_one_owners_keys_including_revoked_and_no_others() {
                     expires_at_unix_micros: None,
                 },
                 now_micros(&env),
+                None,
             )
             .await
             .expect("create");
@@ -844,4 +851,75 @@ async fn a_service_account_owned_key_verifies_and_dies_with_its_principal() {
             .is_some(),
         "the refused delete must leave the key working"
     );
+}
+
+/// A retried create under the SAME idempotency key mints ONE credential, not two.
+///
+/// The parameter exists for this and nothing else. Without the replay row, a client whose
+/// request times out and retries ends up holding one key while a SECOND, equally valid key
+/// exists that it never saw and cannot revoke, discoverable only by an operator reading a
+/// listing. That is a live credential nobody is tracking.
+///
+/// The replay row lands in the same transaction as the key, so the two cannot disagree about
+/// whether the request already happened.
+#[tokio::test]
+async fn a_retried_create_under_one_idempotency_key_mints_exactly_one_key() {
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    let user = seed_user(&db, &env, scope, "retry@example.test").await;
+    let owner = ApiKeyOwner::User(user);
+
+    // TWO DIFFERENT minted keys under one idempotency key, which is what a retry actually
+    // looks like: the handler mints fresh material on each attempt and only the replay row
+    // knows the request already happened.
+    //
+    // The first version of this test reused ONE minted key, so the second insert failed on
+    // the digest primary key and the test passed with the idempotency write deleted. It was
+    // measuring the primary key, not the property it claimed.
+    let mut outcomes = Vec::new();
+    for _ in 0..2 {
+        let minted = mint_api_key(&env, &scope, ApiKeyKindTag::PersonalAccessToken);
+        outcomes.push(
+            db.control_store()
+                .scoped(scope)
+                .acting(db.test_actor(&env), CorrelationId::generate(&env))
+                .api_keys()
+                .create(
+                    &env,
+                    NewApiKey {
+                        id: &minted.id,
+                        key_digest: &minted.digest,
+                        owner: &owner,
+                        display_name: "retried",
+                        expires_at_unix_micros: None,
+                    },
+                    now_micros(&env),
+                    Some(ironauth_store::IdempotencyWrite {
+                        credential_ref: "cred-99",
+                        key: "retry-key",
+                        request_fingerprint: "fp-99",
+                        response_status: 200,
+                        response_body: "{}",
+                    }),
+                )
+                .await,
+        );
+    }
+    assert!(outcomes[0].is_ok(), "the first create succeeds");
+    assert!(
+        outcomes[1].is_err(),
+        "the second create under the same idempotency key must be refused at the store, \
+         so the handler replays instead of minting again"
+    );
+
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM api_keys WHERE tenant_id = $1 AND environment_id = $2",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("count keys");
+    assert_eq!(count, 1, "a retried create minted a SECOND live credential");
 }

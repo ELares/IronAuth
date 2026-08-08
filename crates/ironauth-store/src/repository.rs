@@ -56355,6 +56355,19 @@ impl ActingApiKeyRepo<'_> {
     /// `api_key::mint_api_key`, returned once by the caller, and never crosses this boundary,
     /// so there is no argument a future logging change could accidentally record.
     ///
+    /// # `idempotency` is not optional in practice
+    ///
+    /// It is an `Option` to match every sibling, but an HTTP caller must pass `Some`. A
+    /// retried POST that reaches this twice mints TWO live credentials, and the client holds
+    /// one of them: the other is valid, invisible to whoever created it, and discoverable only
+    /// by an operator reading a listing. The replay row is written in the SAME transaction as
+    /// the key, so the two cannot disagree about whether the request already happened.
+    ///
+    /// What the caller stores as the replay BODY is its own decision and it matters:
+    /// `idempotency_keys.response_body` is plaintext retained 24 hours, so a body carrying the
+    /// key would be exactly the recoverable copy migration 0123 exists to prevent. See
+    /// `keys.rs`, which stores a body with the secret elided and replays as 200.
+    ///
     /// # Errors
     ///
     /// [`StoreError::NotFound`] if the id or the owner is out of this scope;
@@ -56365,6 +56378,7 @@ impl ActingApiKeyRepo<'_> {
         env: &Env,
         spec: NewApiKey<'_>,
         now_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
         if spec.id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -56420,6 +56434,11 @@ impl ActingApiKeyRepo<'_> {
                 .bind(now_micros)
                 .execute(&mut **tx)
                 .await?;
+                // The replay row lands in the SAME transaction as the key. That is the whole
+                // point: a retried POST must not mint a SECOND live credential. Without it a
+                // client that times out and retries ends up holding one key while a second,
+                // equally valid one exists that it never saw and cannot revoke.
+                insert_idempotency(tx, idempotency).await?;
                 Ok(())
             },
             // No poison-after-audit: this write creates a credential rather than destroying
