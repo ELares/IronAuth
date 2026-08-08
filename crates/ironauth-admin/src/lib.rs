@@ -41,6 +41,7 @@
 //! FORCE-RLS backstop not enforced (a startup warning says so). See
 //! `ironauth_store::Store::management` and `docs/adr/0005-management-api.md`.
 
+mod api_keys;
 mod auth;
 mod backfill;
 mod bans;
@@ -497,6 +498,13 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/project-grants",
             post(project_grants::create_project_grant).get(project_grants::list_project_grants),
+        )
+        // API keys owned by an organization (issue #99, criterion 6). Read-only for now;
+        // create, rotate and revoke follow. The store operations behind them all exist and
+        // are audited, so this is the HTTP layer catching up rather than new capability.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/api-keys",
+            axum::routing::get(api_keys::list_organization_api_keys),
         )
         // Enterprise inbound routing (issue #96). The store and the data plane have
         // shipped since migration 0059; this is the first time an operator can reach it.

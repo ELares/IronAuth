@@ -144,6 +144,11 @@ name = "management_permissions"
 path = "tests/management_permissions.rs"
 
 [[test]]
+name = "api_keys"
+path = "tests/api_keys.rs"
+required-features = ["testing"]
+
+[[test]]
 name = "openapi_contract"
 path = "tests/openapi_contract.rs"
 

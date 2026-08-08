@@ -273,6 +273,7 @@ use crate::views::{
         crate::routing_rules::list_routing_rules,
         crate::project_grants::create_project_grant,
         crate::project_grants::list_project_grants,
+        crate::api_keys::list_organization_api_keys,
         crate::project_grants::withdraw_project_grant,
         crate::org_role_assignments::assign_org_group_role,
         crate::org_role_assignments::list_org_group_roles,

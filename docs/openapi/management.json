@@ -8569,6 +8569,90 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/api-keys": {
+      "get": {
+        "tags": [
+          "org-roles"
+        ],
+        "operationId": "listOrganizationApiKeys",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "The organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "This organization's keys, newest first, revoked ones included",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiKeyListView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The organization is not a live row of this scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/default-role": {
       "put": {
         "tags": [
@@ -20143,6 +20227,56 @@
             "type": "string",
             "description": "The organization membership to bind (`omb_...`), NOT a user id. It must be a\nLIVE membership of THIS organization; anything else (absent, removed,\nanother scope's, another organization's) is the uniform not-found.",
             "example": "omb_..."
+          }
+        }
+      },
+      "ApiKeyListView": {
+        "type": "object",
+        "description": "A page of keys.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ApiKeyView"
+            },
+            "description": "This owner's keys, newest first, revoked ones included."
+          }
+        }
+      },
+      "ApiKeyView": {
+        "type": "object",
+        "description": "One key, as the management surface renders it.",
+        "required": [
+          "id",
+          "display_name"
+        ],
+        "properties": {
+          "display_name": {
+            "type": "string",
+            "description": "The operator-facing label."
+          },
+          "expires_at_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Expiry in milliseconds since the epoch, absent for a key that does not expire."
+          },
+          "id": {
+            "type": "string",
+            "description": "The non-secret `akey_` handle. Every other operation names the key by this."
+          },
+          "revoked_at_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Revocation time in milliseconds since the epoch, absent while the key is live."
           }
         }
       },
