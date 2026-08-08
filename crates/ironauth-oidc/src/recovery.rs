@@ -546,15 +546,13 @@ async fn notify_all_channels(
         .list_for_user(subject)
         .await
         .unwrap_or_default();
+    let permitted = annotated_recovery_channels(state, scope).await;
     let mut count = 0;
     for identifier in identifiers {
         if !identifier.verified {
             continue;
         }
-        if matches!(
-            identifier.identifier_type,
-            IdentifierType::Email | IdentifierType::Phone
-        ) {
+        if permitted.permits(identifier.identifier_type) {
             // The known-recipient path (a verified, resolved channel), so the send goes
             // out; anti-enumeration suppression is decided earlier, at existence lookup.
             state.dispatch_verification(
@@ -1081,5 +1079,75 @@ mod tests {
             factor_change_decision(recover, target, None, Some(hold_until), hold_until, &order),
             FactorChangeDecision::AllowedByDelay
         );
+    }
+}
+
+/// Which identifier types the ACTIVE trait schema declares as recovery channels (issue #53,
+/// criterion 2).
+///
+/// # The annotation was published and enforced nowhere
+///
+/// `recovery_channels` is parsed into `TraitAnnotations` and, before this, was read by exactly
+/// one thing: the admin schema-introspection view. An operator could annotate a schema, see the
+/// annotation echoed back by the API, and have recovery ignore it completely. That is the
+/// store-ships-surface-never-mounts shape, and it is worse than an unimplemented feature because
+/// the surface asserts the control exists.
+///
+/// # It can only NARROW, and absence means today's behaviour
+///
+/// A schema that annotates nothing, or no active schema at all, yields [`RecoveryChannels::Any`]
+/// and every verified email and phone is notified exactly as before. Only a schema that names
+/// its recovery channels narrows the set. Getting this backwards would be severe: a deployment
+/// that never wrote an annotation would silently stop sending recovery notifications, and the
+/// failure is invisible until someone needs to recover an account.
+///
+/// A read fault is also [`RecoveryChannels::Any`]. This path NOTIFIES an account owner that
+/// their account is being recovered, so failing it closed would suppress the warning, which is
+/// the opposite of safe here.
+async fn annotated_recovery_channels(state: &OidcState, scope: Scope) -> RecoveryChannels {
+    let Ok(Some(active)) = state.store().scoped(scope).trait_schemas().active().await else {
+        return RecoveryChannels::Any;
+    };
+    let Ok(schema) = ironauth_store::trait_schema::TraitSchema::compile(&active.schema_json) else {
+        // A stored schema that will not compile is a persistence corruption, not a caller
+        // fault, and it must not silence a recovery alert.
+        return RecoveryChannels::Any;
+    };
+    let annotated = schema.annotations().recovery_channels;
+    if annotated.is_empty() {
+        return RecoveryChannels::Any;
+    }
+    RecoveryChannels::Only {
+        email: annotated.iter().any(|name| name == "email"),
+        phone: annotated.iter().any(|name| name == "phone"),
+    }
+}
+
+/// The recovery channels a notification may reach (issue #53, criterion 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryChannels {
+    /// No active schema, or none that annotates a recovery channel: every verified email and
+    /// phone, which is the behaviour that predates the annotation being honoured.
+    Any,
+    /// The active schema named its channels. A field name is matched against the identifier
+    /// TYPE's wire name, which is why only `email` and `phone` are meaningful here: those are
+    /// the only two types this path could ever have dispatched to.
+    Only { email: bool, phone: bool },
+}
+
+impl RecoveryChannels {
+    /// Whether `kind` may receive a recovery notification.
+    fn permits(self, kind: IdentifierType) -> bool {
+        match self {
+            Self::Any => matches!(kind, IdentifierType::Email | IdentifierType::Phone),
+            Self::Only { email, phone } => match kind {
+                IdentifierType::Email => email,
+                IdentifierType::Phone => phone,
+                // Exhaustive rather than a wildcard, so a new identifier type has to be
+                // decided here rather than defaulting into silence. A username is not a
+                // channel anything can be delivered to, which is why it is false.
+                IdentifierType::Username => false,
+            },
+        }
     }
 }
