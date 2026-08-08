@@ -43,7 +43,7 @@ argon2.workspace = true
 bcrypt = "0.19"
 # scrypt (RFC 7914) PHC-string verify, and the key-derivation half of Firebase's
 # modified scrypt.
-scrypt = "0.11"
+scrypt = "0.12"
 # PBKDF2 (RFC 8018 / PKCS#5 v2.1) PHC-string verify over HMAC-SHA256/512.
 pbkdf2 = { version = "0.12", features = ["simple", "sha2"] }
 # The PHC string parser and the PasswordVerifier trait shared by argon2, scrypt,
