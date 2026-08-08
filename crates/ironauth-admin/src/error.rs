@@ -137,6 +137,23 @@ pub enum ApiError {
     /// a 400): the value parses and is in the wizard set, but the target environment
     /// cannot honor it. Renders 422.
     Unprocessable(String),
+    /// A dependency this request needs is not installed in this deployment (issue #96):
+    /// domain verification with no DNS resolver. Renders 503.
+    ///
+    /// DISTINCT from a 500 and from a plain refusal, deliberately. Reporting the domain
+    /// as unverified would be indistinguishable from a real refusal and would send an
+    /// operator to debug their DNS instead of their deployment; a 500 would claim the
+    /// request was at fault. Nothing is broken and nothing the caller sent is wrong: the
+    /// capability is absent.
+    NotConfigured(String),
+    /// An UPSTREAM the request depends on could not be reached or could not be trusted
+    /// (issue #96): a DNS lookup that timed out, was truncated, or came back malformed.
+    /// Renders 502.
+    ///
+    /// The point of this class is that it carries NO verdict about the thing being
+    /// checked. A resolver failure says nothing about whether a domain is verified, so a
+    /// caller must not read it as "not verified", and no state is written.
+    UpstreamUnavailable(String),
     /// A config write failed one or more typed environment guardrails (issue #42):
     /// for example creating a production environment with no custom domain. Renders
     /// 422 with the stable code of every failed guardrail. Distinct from a plain
@@ -183,6 +200,8 @@ impl ApiError {
             | ApiError::GuardrailViolation(_)
             | ApiError::TraitsInvalid(_)
             | ApiError::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            ApiError::UpstreamUnavailable(_) => StatusCode::BAD_GATEWAY,
+            ApiError::NotConfigured(_) => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -191,6 +210,10 @@ impl ApiError {
     fn body(&self) -> ErrorBody {
         match self {
             ApiError::BadRequest(message) => ErrorBody::plain("bad_request", message.clone()),
+            ApiError::NotConfigured(message) => ErrorBody::plain("not_configured", message.clone()),
+            ApiError::UpstreamUnavailable(message) => {
+                ErrorBody::plain("upstream_unavailable", message.clone())
+            }
             ApiError::Unauthorized(message) => ErrorBody::plain("unauthorized", message.clone()),
             ApiError::WrongScope {
                 expected,

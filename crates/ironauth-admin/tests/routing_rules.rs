@@ -254,3 +254,215 @@ async fn a_second_claim_on_the_same_domain_is_a_typed_conflict() {
          silent second route: {body}"
     );
 }
+
+/// Create a domain rule through the API and return `(rule_id, token)`.
+async fn seed_domain_rule(h: &Harness, tenant: &str, environment: &str) -> (String, String) {
+    let connection = seed_connection(h, tenant, environment).await;
+    let base = format!("/v1/tenants/{tenant}/environments/{environment}/routing-rules");
+    let (status, _, body) = h
+        .post(
+            &base,
+            "k-rule",
+            &serde_json::json!({
+                "kind": "domain",
+                "value": "acme.example",
+                "org_connection_id": connection,
+            })
+            .to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "create the domain rule: {body}"
+    );
+    let value: Value = serde_json::from_str(&body).expect("json");
+    (
+        value["id"].as_str().expect("id").to_owned(),
+        value["domain_verification_token"]
+            .as_str()
+            .expect("token")
+            .to_owned(),
+    )
+}
+
+fn verify_path(tenant: &str, environment: &str, rule: &str) -> String {
+    format!("/v1/tenants/{tenant}/environments/{environment}/routing-rules/{rule}/verify-domain")
+}
+
+/// The published token verifies the domain.
+///
+/// The token is published AFTER the rule exists, because it is minted at creation: an
+/// answer fixed in advance could only ever be a constant compared against a constant.
+#[tokio::test]
+async fn a_published_token_verifies_the_domain() {
+    let h = Harness::start_with_txt(50, Ok(Vec::new())).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (rule, token) = seed_domain_rule(&h, &tenant, &environment).await;
+
+    // Unpublished first: the control. Without it a always-verifies implementation passes.
+    let (status, _, body) = h
+        .post_empty(&verify_path(&tenant, &environment, &rule))
+        .await;
+    assert_eq!(status, StatusCode::OK, "the lookup ran: {body}");
+    assert_eq!(
+        field(&body, "domain_verification_state"),
+        Value::String("failed".to_owned()),
+        "an unpublished domain must NOT verify: {body}"
+    );
+
+    h.set_txt(Ok(vec!["v=spf1 -all".to_owned(), token]));
+    let (status, _, body) = h
+        .post_empty(&verify_path(&tenant, &environment, &rule))
+        .await;
+    assert_eq!(status, StatusCode::OK, "the lookup ran: {body}");
+    assert_eq!(
+        field(&body, "domain_verification_state"),
+        Value::String("verified".to_owned()),
+        "the published token must verify the domain, alongside unrelated records: {body}"
+    );
+}
+
+/// Somebody else's token does not verify this domain.
+///
+/// This is the attack the token exists to stop: a record that is well formed and present
+/// but is not THIS rule's token.
+#[tokio::test]
+async fn another_rules_token_does_not_verify_this_domain() {
+    let h = Harness::start_with_txt(50, Ok(Vec::new())).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (rule, token) = seed_domain_rule(&h, &tenant, &environment).await;
+
+    // A token of the right SHAPE, differing in its final character.
+    let mut forged = token.clone();
+    forged.pop();
+    forged.push(if token.ends_with('A') { 'B' } else { 'A' });
+    assert_ne!(forged, token, "the forged token must actually differ");
+
+    h.set_txt(Ok(vec![forged]));
+    let (status, _, body) = h
+        .post_empty(&verify_path(&tenant, &environment, &rule))
+        .await;
+    assert_eq!(status, StatusCode::OK, "the lookup ran: {body}");
+    assert_eq!(
+        field(&body, "domain_verification_state"),
+        Value::String("failed".to_owned()),
+        "a token that is not this rule's must not verify it: {body}"
+    );
+}
+
+/// A record that CONTAINS the token but is not equal to it does not verify.
+///
+/// Substring matching would let anyone able to publish on the domain bury somebody
+/// else's token inside a longer string, and would match a record that merely quotes it.
+#[tokio::test]
+async fn a_record_merely_containing_the_token_does_not_verify() {
+    let h = Harness::start_with_txt(50, Ok(Vec::new())).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (rule, token) = seed_domain_rule(&h, &tenant, &environment).await;
+
+    h.set_txt(Ok(vec![format!(
+        "note: our token is {token} (do not remove)"
+    )]));
+    let (status, _, body) = h
+        .post_empty(&verify_path(&tenant, &environment, &rule))
+        .await;
+    assert_eq!(status, StatusCode::OK, "the lookup ran: {body}");
+    assert_eq!(
+        field(&body, "domain_verification_state"),
+        Value::String("failed".to_owned()),
+        "only an EXACT record value proves control: {body}"
+    );
+}
+
+/// A resolver failure leaves the state UNCHANGED and says so.
+///
+/// Writing `failed` here would tell an operator their DNS is wrong when the resolver
+/// simply did not answer, and would undo a verification that already succeeded.
+#[tokio::test]
+async fn a_resolver_failure_changes_nothing_and_is_not_reported_as_unverified() {
+    let h = Harness::start_with_txt(50, Ok(Vec::new())).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (rule, token) = seed_domain_rule(&h, &tenant, &environment).await;
+
+    // Verify for real first, so there is a state worth preserving.
+    h.set_txt(Ok(vec![token]));
+    let (status, _, body) = h
+        .post_empty(&verify_path(&tenant, &environment, &rule))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        field(&body, "domain_verification_state"),
+        Value::String("verified".to_owned())
+    );
+
+    h.set_txt(Err("the resolver did not answer".to_owned()));
+    let (status, _, body) = h
+        .post_empty(&verify_path(&tenant, &environment, &rule))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_GATEWAY,
+        "a resolver failure is an upstream error, not a verdict about the domain: {body}"
+    );
+
+    let base = format!("/v1/tenants/{tenant}/environments/{environment}/routing-rules");
+    let (_, _, listed) = h.get(&base).await;
+    assert!(
+        listed.contains("\"domain_verification_state\":\"verified\""),
+        "the earlier verification must survive a later resolver failure: {listed}"
+    );
+}
+
+/// With no resolver installed the endpoint refuses rather than reporting unverified.
+#[tokio::test]
+async fn with_no_resolver_the_endpoint_refuses_rather_than_reporting_unverified() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (rule, _token) = seed_domain_rule(&h, &tenant, &environment).await;
+
+    let (status, _, body) = h
+        .post_empty(&verify_path(&tenant, &environment, &rule))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a deployment with no resolver cannot prove domain control, and saying \"not \
+         verified\" would send an operator to debug their DNS instead: {body}"
+    );
+}
+
+/// An APP rule has no domain to prove, so verification does not apply to it.
+#[tokio::test]
+async fn verifying_an_app_rule_is_the_uniform_not_found() {
+    let h = Harness::start_with_txt(50, Ok(Vec::new())).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let connection = seed_connection(&h, &tenant, &environment).await;
+    let base = format!("/v1/tenants/{tenant}/environments/{environment}/routing-rules");
+    let (status, _, body) = h
+        .post(
+            &base,
+            "k-app",
+            &serde_json::json!({
+                "kind": "app",
+                "value": "cli_whatever",
+                "org_connection_id": connection,
+            })
+            .to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let rule = serde_json::from_str::<Value>(&body).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    let (status, _, body) = h
+        .post_empty(&verify_path(&tenant, &environment, &rule))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "an app rule has no domain to verify: {body}"
+    );
+}

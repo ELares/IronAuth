@@ -305,6 +305,8 @@ struct Fixture {
     client: String,
     /// A real `ocn_` binding, so the routing-rule create addresses a live target.
     org_connection: String,
+    /// A real domain rule, so the verify case addresses a live one (issue #96).
+    routing_rule: String,
     /// A LIVE grant, so the withdrawal case measures the environment fence rather than
     /// an id that never resolved (issue #102).
     project_grant: String,
@@ -542,6 +544,24 @@ impl Fixture {
             .await
             .expect("seed org connection");
         let org_connection = org_connection.to_string();
+
+        // A real domain rule, so the verify case addresses one that EXISTS. A synthetic
+        // id is the uniform not-found at a live environment too, which would make
+        // driving it at a soft-deleted one measure nothing.
+        let (status, _, body) = h
+            .post(
+                &format!("{base}/routing-rules"),
+                "seed-routing-rule",
+                &serde_json::json!({
+                    "kind": "domain",
+                    "value": "sweep-seed.example",
+                    "org_connection_id": org_connection,
+                })
+                .to_string(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "create routing rule: {body}");
+        let routing_rule = field(&body, "/id", "seed routing rule");
 
         // A real endpoint, so the delete case addresses an id that PARSES in this scope.
         // A synthetic one is the uniform not-found at a live environment too, which would
@@ -1007,6 +1027,7 @@ impl Fixture {
             tenant,
             environment,
             org_connection,
+            routing_rule,
             project_grant,
             doomed_tenant,
             doomed_environment,
@@ -1058,6 +1079,7 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
         operator,
         client,
         org_connection,
+        routing_rule,
         project_grant,
         connector,
         webhook_endpoint,
@@ -1830,6 +1852,11 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             "GET",
             format!("{base}/routing-rules"),
         ),
+        Case::empty(
+            "routing_rules.verifyRoutingRuleDomain",
+            "POST",
+            format!("{base}/routing-rules/{routing_rule}/verify-domain"),
+        ),
         Case::json(
             "routing_rules.createRoutingRule",
             "POST",
@@ -2248,6 +2275,7 @@ fn every_documented_operation_is_driven_by_a_case() {
         operator: "opr_0".to_owned(),
         client: "cli_0".to_owned(),
         org_connection: "ocn_0".to_owned(),
+        routing_rule: "rrl_0".to_owned(),
         project_grant: "pgt_0".to_owned(),
         connector: "con_0".to_owned(),
         webhook_endpoint: "whe_0".to_owned(),

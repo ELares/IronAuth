@@ -1047,6 +1047,12 @@ fn org_membership_cases(base: &str, ids: &Ids) -> Vec<Case> {
         // report that a credential is confined.
         // Enterprise inbound routing (issue #96).
         Case {
+            label: "routing_rules.verifyRoutingRuleDomain",
+            method: "POST",
+            path: format!("{base}/routing-rules/rrl_absent/verify-domain"),
+            body: None,
+        },
+        Case {
             label: "routing_rules.createRoutingRule",
             method: "POST",
             path: format!("{base}/routing-rules"),
