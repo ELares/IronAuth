@@ -661,3 +661,148 @@ async fn an_unverified_domain_claim_routes_nothing_until_ownership_is_proven() {
         .expect("a verified claim routes");
     assert_eq!(matched.org_connection_id, ocn_id.to_string());
 }
+
+/// A domain rule is born with a token to publish; other kinds carry none (issue #96).
+///
+/// Migration 0117 gave `routing_rules` a `domain_verification_token` column and nothing
+/// ever wrote it, so a domain rule landed in `pending` with NOTHING for the operator to
+/// put in DNS. The state machine was therefore unreachable past its first state: no
+/// token, no TXT record, no path to `verified`, and `by_domain` only routes `verified`
+/// rules. A column that cannot be filled is worse than an absent one, because the schema
+/// reads as though the mechanism exists.
+#[tokio::test]
+async fn a_domain_rule_is_born_with_a_publishable_token_and_other_kinds_are_not() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let ocn = seed_binding(&db, &env, scope).await;
+    let control = db.control_store();
+
+    let domain_rule = RoutingRuleId::generate(&env, &scope);
+    control
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .routing_rules()
+        .create(
+            &env,
+            &domain_rule,
+            1_000_000,
+            NewRoutingRule {
+                selector: RoutingSelector::Domain(ROUTED_DOMAIN),
+                org_connection_id: &ocn,
+                priority: 10,
+                enabled: true,
+            },
+        )
+        .await
+        .expect("create the domain rule");
+
+    let app_rule = RoutingRuleId::generate(&env, &scope);
+    control
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .routing_rules()
+        .create(
+            &env,
+            &app_rule,
+            1_000_000,
+            NewRoutingRule {
+                selector: RoutingSelector::App("cli_whatever"),
+                org_connection_id: &ocn,
+                priority: 20,
+                enabled: true,
+            },
+        )
+        .await
+        .expect("create the app rule");
+
+    let rules = control
+        .scoped(scope)
+        .routing_rules()
+        .list_all()
+        .await
+        .expect("list the rules");
+
+    let domain = rules
+        .iter()
+        .find(|r| r.id == domain_rule)
+        .expect("the domain rule is listed");
+    assert_eq!(
+        domain.domain_verification_state.as_deref(),
+        Some("pending"),
+        "a domain rule starts unverified"
+    );
+    let token = domain
+        .domain_verification_token
+        .as_deref()
+        .expect("a domain rule must carry a token to publish, or it can never be verified");
+    assert!(
+        token.starts_with("ironauth-domain-verification="),
+        "the token must be publishable as a TXT record value: {token}"
+    );
+    assert!(
+        token.len() > "ironauth-domain-verification=".len() + 32,
+        "the token must carry real entropy so a third party cannot pre-publish it for a \
+         domain they do not control: {token}"
+    );
+
+    let app = rules
+        .iter()
+        .find(|r| r.id == app_rule)
+        .expect("the app rule is listed");
+    assert!(
+        app.domain_verification_token.is_none() && app.domain_verification_state.is_none(),
+        "only a DOMAIN rule has a domain to verify; an app rule carrying a token would \
+         imply a ceremony that does not apply to it"
+    );
+}
+
+/// Two rules do not share a token.
+#[tokio::test]
+async fn each_domain_rule_gets_its_own_token() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let ocn = seed_binding(&db, &env, scope).await;
+    let control = db.control_store();
+
+    let mut tokens = Vec::new();
+    for (n, domain) in ["one.example", "two.example"].iter().enumerate() {
+        let id = RoutingRuleId::generate(&env, &scope);
+        control
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .routing_rules()
+            .create(
+                &env,
+                &id,
+                1_000_000,
+                NewRoutingRule {
+                    selector: RoutingSelector::Domain(domain),
+                    org_connection_id: &ocn,
+                    priority: i32::try_from(n).expect("fits") + 1,
+                    enabled: true,
+                },
+            )
+            .await
+            .expect("create the domain rule");
+        let rules = control
+            .scoped(scope)
+            .routing_rules()
+            .list_all()
+            .await
+            .expect("list");
+        tokens.push(
+            rules
+                .iter()
+                .find(|r| r.id == id)
+                .and_then(|r| r.domain_verification_token.clone())
+                .expect("a token"),
+        );
+    }
+    assert_ne!(
+        tokens[0], tokens[1],
+        "two domains must not share a verification token, or publishing one proves the \
+         other"
+    );
+}
