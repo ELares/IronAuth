@@ -269,6 +269,10 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
         "createProjectGrant",
         ManagementPermission::WriteOrganizations,
     ),
+    // Enterprise inbound routing (issue #96): routing decides WHERE a login is sent,
+    // which is environment configuration rather than organization membership.
+    ("createRoutingRule", ManagementPermission::WriteConfig),
+    ("listRoutingRules", ManagementPermission::Read),
     ("listProjectGrants", ManagementPermission::Read),
     (
         "withdrawProjectGrant",

@@ -95,6 +95,7 @@ mod recovery_approvals;
 mod resource_servers;
 mod resource_types;
 mod response;
+mod routing_rules;
 mod secrets;
 mod sessions;
 mod signing_algorithm;
@@ -496,6 +497,12 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/project-grants",
             post(project_grants::create_project_grant).get(project_grants::list_project_grants),
+        )
+        // Enterprise inbound routing (issue #96). The store and the data plane have
+        // shipped since migration 0059; this is the first time an operator can reach it.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/routing-rules",
+            post(routing_rules::create_routing_rule).get(routing_rules::list_routing_rules),
         )
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/project-grants/{grant_id}",

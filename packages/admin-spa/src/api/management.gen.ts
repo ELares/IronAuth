@@ -1793,6 +1793,22 @@ export interface paths {
         patch: operations["updateResourceServerPermissionClaims"];
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/routing-rules": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["listRoutingRules"];
+        put?: never;
+        post: operations["createRoutingRule"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/secrets": {
         parameters: {
             query?: never;
@@ -3436,6 +3452,29 @@ export interface components {
              *     the same as having no grant at all.
              */
             role_ids?: string[];
+        };
+        /** @description A routing rule to create. */
+        CreateRoutingRuleRequest: {
+            /**
+             * @description Whether the rule is enabled. A domain rule that is enabled still routes nothing
+             *     until its domain is verified.
+             */
+            enabled?: boolean;
+            /** @description The selector kind: `domain`, `app`, or `user`. */
+            kind: string;
+            /** @description The `ocn_` organization connection a matching login routes to. */
+            org_connection_id: string;
+            /**
+             * Format: int32
+             * @description Evaluation priority; lower is considered first.
+             */
+            priority?: number;
+            /**
+             * @description The selector value: an email domain, a client id, or a login identifier,
+             *     according to `kind`. A `user` value is blind-indexed by the store and never
+             *     stored in plaintext.
+             */
+            value: string;
         };
         /** @description The body to create a tenant. The first environment is created with it. */
         CreateTenantRequest: {
@@ -5516,6 +5555,46 @@ export interface components {
             level: string;
             /** @description The signal name. */
             name: string;
+        };
+        /** @description A page of routing rules. */
+        RoutingRuleListView: {
+            /** @description Every rule in this environment, by evaluation priority. */
+            items: components["schemas"]["RoutingRuleView"][];
+        };
+        /** @description A routing rule as returned to a caller. */
+        RoutingRuleView: {
+            /** @description The client id, present only for an `app` rule. */
+            client_id?: string | null;
+            /**
+             * Format: int64
+             * @description Creation time in milliseconds since the epoch.
+             */
+            created_at_unix_ms: number;
+            /** @description The normalized email domain, present only for a `domain` rule. */
+            domain?: string | null;
+            /**
+             * @description The domain verification state (`pending`, `verified`, `failed`), present only for
+             *     a `domain` rule. Routing consults only `verified`.
+             */
+            domain_verification_state?: string | null;
+            /**
+             * @description The value to publish as a DNS TXT record on the domain, present only for a
+             *     `domain` rule. Public by design: publishing it IS the proof of control.
+             */
+            domain_verification_token?: string | null;
+            /** @description Whether the rule is enabled. */
+            enabled: boolean;
+            /** @description The rule identifier (`rrl_...`). */
+            id: string;
+            /** @description The selector kind (`domain`, `app`, or `user`). */
+            kind: string;
+            /** @description The organization connection a matching login routes to. */
+            org_connection_id: string;
+            /**
+             * Format: int32
+             * @description Evaluation priority.
+             */
+            priority: number;
         };
         /** @description One page of environment secret metadata. */
         SecretList: {
@@ -15807,6 +15886,144 @@ export interface operations {
                 };
             };
             /** @description Cannot enable permission claims on an opaque resource server */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listRoutingRules: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Every routing rule in this environment, by evaluation priority */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RoutingRuleListView"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment is not a live row of this scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    createRoutingRule: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Required. Replaying a POST with the same key returns the original response without re-executing. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateRoutingRuleRequest"];
+            };
+        };
+        responses: {
+            /** @description Created. A DOMAIN rule is created pending and routes nothing until its token is published in DNS and verified */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RoutingRuleView"];
+                };
+            };
+            /** @description Malformed request, or an unknown selector kind */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment or the organization connection is not a live row of this scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description That domain or client is already routed in this environment */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Idempotency-Key reused with a different request */
             422: {
                 headers: {
                     [name: string]: unknown;

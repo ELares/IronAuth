@@ -113,6 +113,7 @@ fn operation_ids_are_the_stable_set() {
             "createOrganization",
             "createPermission",
             "createProjectGrant",
+            "createRoutingRule",
             "createTenant",
             "createTraitMigrationJob",
             "createTraitSchemaVersion",
@@ -216,6 +217,7 @@ fn operation_ids_are_the_stable_set() {
             "listRefreshFamilies",
             "listResourceServers",
             "listResourceTypes",
+            "listRoutingRules",
             "listSecrets",
             "listSessions",
             "listSignupQuarantines",
@@ -548,6 +550,7 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/refresh-families/{family_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/resource-servers",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/resource-servers/{resource_server_id}",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/routing-rules",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/secrets",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/secrets/{name}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/sessions",
@@ -614,6 +617,7 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/permissions",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/recovery-approvals/{flow_id}/approve",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/recovery-approvals/{flow_id}/reject",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/routing-rules",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/sessions/revoke",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/sessions/{session_id}/revoke",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/signup-quarantine/{user_id}/approve",
@@ -748,7 +752,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        201,
+        203,
         "the documented route count is pinned"
     );
 

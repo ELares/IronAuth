@@ -1045,6 +1045,16 @@ fn org_membership_cases(base: &str, ids: &Ids) -> Vec<Case> {
         // Project grants (issue #102). The environment fence must answer BEFORE the
         // confinement fence these handlers add: an absent environment is not a place to
         // report that a credential is confined.
+        // Enterprise inbound routing (issue #96).
+        Case {
+            label: "routing_rules.createRoutingRule",
+            method: "POST",
+            path: format!("{base}/routing-rules"),
+            body: Some(
+                "{\"kind\":\"domain\",\"value\":\"absent.example\",\"org_connection_id\":\"ocn_absent\"}"
+                    .to_owned(),
+            ),
+        },
         Case {
             label: "project_grants.createProjectGrant",
             method: "POST",
