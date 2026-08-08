@@ -310,6 +310,7 @@ struct Fixture {
     /// A LIVE grant, so the withdrawal case measures the environment fence rather than
     /// an id that never resolved (issue #102).
     project_grant: String,
+    api_key: String,
     connector: String,
     webhook_endpoint: String,
     family: String,
@@ -683,6 +684,19 @@ impl Fixture {
             .await;
         assert_eq!(status, StatusCode::CREATED, "create project grant: {body}");
         let project_grant = field(&body, "/id", "seed project grant");
+        // A REAL key, for the same reason as the grant above: revoking a handle that does
+        // not exist answers the uniform not-found at a LIVE environment too, so driving that
+        // at a soft-deleted one measures nothing about the fence. The sweep caught exactly
+        // that when this case first used a bogus handle.
+        let (status, _, body) = h
+            .post(
+                &format!("{base}/organizations/{organization}/api-keys"),
+                "seed-api-key",
+                &serde_json::json!({ "display_name": "sweep key" }).to_string(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "create api key: {body}");
+        let api_key = field(&body, "/id", "seed api key");
         let session = h.seed_session(scope, &user).await;
         let family = h
             .seed_refresh_family(scope, &user, &client, &session, false)
@@ -1029,6 +1043,7 @@ impl Fixture {
             org_connection,
             routing_rule,
             project_grant,
+            api_key,
             doomed_tenant,
             doomed_environment,
             operator,
@@ -1081,6 +1096,7 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
         org_connection,
         routing_rule,
         project_grant,
+        api_key,
         connector,
         webhook_endpoint,
         family,
@@ -1878,6 +1894,14 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             "GET",
             format!("{org_base}/api-keys"),
         ),
+        // A handle that does not exist. This sweep asserts the ENVIRONMENT fence, not the
+        // key lookup, so a 404 for an unknown key on a live environment and the uniform
+        // refusal on a deleted one are exactly the pair it wants to compare.
+        Case::empty(
+            "api_keys.revokeOrganizationApiKey",
+            "DELETE",
+            format!("{org_base}/api-keys/{api_key}"),
+        ),
         Case::empty(
             "project_grants.listProjectGrants",
             "GET",
@@ -2288,6 +2312,7 @@ fn every_documented_operation_is_driven_by_a_case() {
         org_connection: "ocn_0".to_owned(),
         routing_rule: "rrl_0".to_owned(),
         project_grant: "pgt_0".to_owned(),
+        api_key: "akey_0".to_owned(),
         connector: "con_0".to_owned(),
         webhook_endpoint: "whe_0".to_owned(),
         family: "rfm_0".to_owned(),

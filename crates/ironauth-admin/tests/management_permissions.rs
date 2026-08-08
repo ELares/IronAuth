@@ -279,6 +279,10 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
         ManagementPermission::WriteCredentials,
     ),
     ("listOrganizationApiKeys", ManagementPermission::Read),
+    (
+        "revokeOrganizationApiKey",
+        ManagementPermission::WriteCredentials,
+    ),
     ("listProjectGrants", ManagementPermission::Read),
     (
         "withdrawProjectGrant",

@@ -315,3 +315,107 @@ async fn the_created_key_verifies_through_the_data_plane() {
         )
     );
 }
+
+/// Revoking kills the key immediately and leaves it listed with its revocation time.
+#[tokio::test]
+async fn revoking_kills_the_key_and_leaves_it_visible() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let org = create_org(&h, &tenant, &environment, "rv1").await;
+    let base =
+        format!("/v1/tenants/{tenant}/environments/{environment}/organizations/{org}/api-keys");
+    let (status, _, body) = h
+        .post(
+            &base,
+            "rv-1",
+            &serde_json::json!({ "display_name": "doomed" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "create: {body}");
+    let created: Value = serde_json::from_str(&body).expect("json");
+    let id = created["id"].as_str().expect("id").to_owned();
+    let key = created["key"].as_str().expect("key").to_owned();
+
+    let env = Env::system();
+    let scope = scope_of(&tenant, &environment);
+    assert!(
+        h.db()
+            .store()
+            .scoped(scope)
+            .api_keys()
+            .verify(&key, now_micros(&env))
+            .await
+            .expect("verify")
+            .is_some(),
+        "the key works before revocation"
+    );
+
+    let (status, _, body) = h.delete(&format!("{base}/{id}")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "revoke: {body}");
+    assert!(
+        h.db()
+            .store()
+            .scoped(scope)
+            .api_keys()
+            .verify(&key, now_micros(&env))
+            .await
+            .expect("verify")
+            .is_none(),
+        "the key must stop verifying on the very next request"
+    );
+
+    let (_, _, listed) = h.get(&base).await;
+    let items = serde_json::from_str::<Value>(&listed).expect("json")["items"].clone();
+    let entry = items
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|item| item["id"] == id.as_str())
+        .expect("the revoked key is still listed");
+    assert!(
+        entry["revoked_at_unix_ms"].is_i64(),
+        "a revoked key stays listed with its revocation time: {entry}"
+    );
+}
+
+/// One organization cannot revoke another's key, even by guessing the handle.
+///
+/// `revoke` is scoped to the ENVIRONMENT, so without the ownership check the URL's
+/// organization would be decorative and a delegated admin confined to org A could kill org B's
+/// credentials. The refusal is the uniform not-found, so it is not an existence oracle either.
+#[tokio::test]
+async fn one_organization_cannot_revoke_anothers_key() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let mine = create_org(&h, &tenant, &environment, "rv2").await;
+    let theirs = create_org(&h, &tenant, &environment, "rv3").await;
+    let (_, victim) = issue_org_key(&h, &tenant, &environment, &theirs, "victim").await;
+
+    let (status, _, body) = h
+        .delete(&format!(
+            "/v1/tenants/{tenant}/environments/{environment}/organizations/{mine}/api-keys/{victim}"
+        ))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "one organization revoked another's key: {body}"
+    );
+
+    let (_, _, listed) = h
+        .get(&format!(
+            "/v1/tenants/{tenant}/environments/{environment}/organizations/{theirs}/api-keys"
+        ))
+        .await;
+    let entry = serde_json::from_str::<Value>(&listed).expect("json")["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|item| item["id"] == victim.as_str())
+        .expect("the victim key still exists")
+        .clone();
+    assert!(
+        entry.get("revoked_at_unix_ms").is_none(),
+        "the refused revoke revoked it anyway: {entry}"
+    );
+}

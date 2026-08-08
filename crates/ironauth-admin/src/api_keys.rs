@@ -23,7 +23,9 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::Response;
 use ironauth_store::api_key::{ApiKeyKindTag, mint_api_key};
-use ironauth_store::{ApiKeyOwner, CorrelationId, IdempotencyWrite, NewApiKey, StoreError};
+use ironauth_store::{
+    ApiKeyId, ApiKeyOwner, CorrelationId, IdempotencyWrite, NewApiKey, StoreError,
+};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -32,7 +34,7 @@ use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
 use crate::input::parse_json;
 use crate::org_context::{EnvironmentAccess, resolve_live_org, resolve_scope};
-use crate::response::json;
+use crate::response::{json, no_content};
 use crate::state::AdminState;
 
 /// One key, as the management surface renders it.
@@ -266,6 +268,89 @@ pub async fn create_organization_api_key(
 
     match result {
         Ok(()) => Ok(json(StatusCode::CREATED, created_body)),
+        Err(StoreError::NotFound) => Err(ApiError::NotFound),
+        Err(_) => Err(ApiError::Internal),
+    }
+}
+
+#[utoipa::path(
+    delete,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/api-keys/{key_id}",
+    operation_id = "revokeOrganizationApiKey",
+    tag = "org-roles",
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("organization_id" = String, Path, description = "The organization identifier"),
+        ("key_id" = String, Path, description = "The akey_ handle, never the key itself")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 204, description = "Revoked. The key stops verifying on the very next request, and the row is retained so the revocation stays legible"),
+        (status = 401, description = "Missing or invalid credential", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "The organization or the key is not a live row of this scope", body = ErrorBody)
+    )
+)]
+pub async fn revoke_organization_api_key(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, organization_id, key_id)): Path<(
+        String,
+        String,
+        String,
+        String,
+    )>,
+) -> Result<Response, ApiError> {
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
+    // Delegated administration (issue #102): WRITE CREDENTIALS, matching create. Revoking is
+    // the other half of the credential lifecycle, and an administrator who may mint a key
+    // must be able to kill it; splitting the two would leave whoever contains a leak needing
+    // an authority they were not given for the act that caused it.
+    principal.require_permission(ManagementPermission::WriteCredentials)?;
+    crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
+
+    let org_id = resolve_live_org(
+        &state,
+        &principal,
+        scope,
+        &organization_id,
+        EnvironmentAccess::Write,
+    )
+    .await?;
+    let id = ApiKeyId::parse_in_scope(&key_id, &scope).map_err(|_| ApiError::NotFound)?;
+
+    // The key must belong to THIS organization. `revoke` is scoped to the environment and
+    // would otherwise happily kill a sibling organization's key from this organization's URL,
+    // which is a cross-tenant-ish authorization hole inside one environment: a delegated
+    // admin confined to org A could revoke org B's credentials by guessing a handle.
+    //
+    // Checked by listing rather than by a targeted read, because `list_for_owner` is the one
+    // place ownership is already expressed and a second ownership query would be a second
+    // definition of the same thing.
+    let owned = state
+        .store()
+        .scoped(scope)
+        .api_keys()
+        .list_for_owner(&ApiKeyOwner::Organization(org_id))
+        .await
+        .map_err(|_| ApiError::Internal)?
+        .into_iter()
+        .any(|record| record.id == id);
+    if !owned {
+        return Err(ApiError::NotFound);
+    }
+
+    let result = state
+        .store()
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(state.env()))
+        .api_keys()
+        .revoke(state.env(), &id, state.now_unix_micros())
+        .await;
+
+    match result {
+        Ok(()) => Ok(no_content()),
         Err(StoreError::NotFound) => Err(ApiError::NotFound),
         Err(_) => Err(ApiError::Internal),
     }
