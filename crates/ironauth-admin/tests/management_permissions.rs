@@ -478,6 +478,59 @@ fn the_unclassified_debt_is_counted_so_it_cannot_grow_unnoticed() {
     );
 }
 
+/// The operations whose SPECIFIC required permission is proven end to end.
+///
+/// Classification is not proof, and this list is the difference. `CLASSIFIED` records what
+/// each operation is INTENDED to require, and
+/// `every_classified_operation_in_these_files_actually_calls_the_gate` asserts the handler
+/// demands SOMETHING. Neither compares the two, as that test's own comment says. A handler
+/// classified `WriteCredentials` that actually demands `Read` passes both.
+///
+/// An entry here means a test drives a credential holding a DIFFERENT permission and asserts
+/// the refusal names the required one. Only `delegated_admin.rs` and
+/// `delegated_scope_levels.rs` do that.
+///
+/// Deliberately NOT derived by scanning those files. A scan would have to guess which test
+/// covers which operation from paths and slugs, and a wrong guess here manufactures exactly
+/// the false coverage claim this list exists to prevent. Hand-maintained, and only for
+/// operations somebody actually checked.
+const PERMISSION_PROVEN: &[&str] = &[
+    // Proven in `a_read_only_credential_can_list_api_keys_and_cannot_mint_or_kill_one`,
+    // verified by mutation: downgrading all three to `Read` fails that test and passes every
+    // other pin.
+    "createOrganizationApiKey",
+    "revokeOrganizationApiKey",
+    "rotateOrganizationApiKey",
+];
+
+/// Classification is NOT proof, and the size of that gap is counted so it cannot hide.
+///
+/// 147 operations declare a required permission and 3 have that permission proven. The other
+/// 144 are not known to be wrong; they are UNCHECKED, which is a different thing and worth a
+/// number rather than a shrug.
+///
+/// This pin may only improve: `PERMISSION_PROVEN` may grow, and the ratio may not get worse
+/// without somebody editing this assertion and noticing what they are doing.
+#[test]
+fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
+    for operation in PERMISSION_PROVEN {
+        assert!(
+            CLASSIFIED.iter().any(|(name, _)| name == operation),
+            "{operation} is listed as permission-proven but is not classified at all"
+        );
+    }
+    assert_eq!(
+        CLASSIFIED.len(),
+        147,
+        "the classified set changed size; update the unproven count below with it"
+    );
+    let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();
+    assert!(
+        unproven <= 144,
+        "the number of operations whose specific permission is UNPROVEN rose to {unproven}.          It may only fall. Add a `delegated_admin.rs` test that drives a credential holding a          different permission and asserts the refusal names the required one, then list the          operation in PERMISSION_PROVEN"
+    );
+}
+
 /// The admin source, read at COMPILE time so this cannot be fooled by a working tree that
 /// differs from what was built.
 const ADMIN_SOURCES: &[(&str, &str)] = &[
