@@ -173,9 +173,21 @@ fi
 # NOT match inside `monthly_quota` because `_` is a word character. A mutation adding
 # exactly that column survived the word-boundaried pattern, so this one matches the stem
 # anywhere in an identifier.
-FORBIDDEN_COLUMN='(meter|metering|billing|billable|quota|chargeable|usage_count|seat_count|rate_limit|ratelimit)'
+#
+# `last_used` is in the list and is the subtlest entry. It is not billing and it is not a
+# counter, so it reads as harmless operational telemetry, which is exactly why migration
+# 0123's header argues at length for leaving it out: a monotonically written column on the
+# VERIFICATION path is a write amplification on every authenticated request and the first
+# step toward usage accounting. That argument lived in a comment and was enforced nowhere.
+# Planting `last_used_at` on `api_keys` survived this scan until the stem was added.
+FORBIDDEN_COLUMN='(meter|metering|billing|billable|quota|chargeable|usage_count|seat_count|last_used|rate_limit|ratelimit)'
 
-M2M_TABLES='service_accounts opaque_access_tokens'
+# `api_keys` (issue #99) is the table criterion 5 most obviously concerns and it was NOT
+# here: the schema half was added before the table existed and nobody extended the list.
+# Its migration argues at length that `last_used_at` is deliberately absent because a
+# monotonically written column on the verification path is the first step toward usage
+# accounting. That argument was in a comment and enforced nowhere.
+M2M_TABLES='service_accounts opaque_access_tokens api_keys'
 schema_hits=""
 for table in $M2M_TABLES; do
   ddl_file=$(grep -l "CREATE TABLE ${table}" crates/ironauth-store/migrations/*.sql | head -1)
