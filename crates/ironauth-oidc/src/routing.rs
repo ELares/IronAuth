@@ -97,6 +97,11 @@ mod tests {
             org_connection_id: org_connection_id.to_owned(),
             priority: 0,
             enabled: true,
+            // Placeholders like the rest: this fixture exists to carry an
+            // org_connection_id into a routing decision, which never reads the
+            // verification columns. A rule only REACHES routing once verified.
+            domain_verification_state: None,
+            domain_verification_token: None,
             created_at_unix_micros: 0,
             updated_at_unix_micros: 0,
         }

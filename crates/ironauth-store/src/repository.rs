@@ -28339,6 +28339,17 @@ pub struct RoutingRuleRecord {
     pub user_bidx: Option<Vec<u8>>,
     /// The `ocn_` org connection a matching login routes to.
     pub org_connection_id: String,
+    /// The domain verification state (`pending`, `verified` or `failed`), present iff
+    /// `rule_kind` is `domain` (migration 0117). Routing consults ONLY `verified`.
+    pub domain_verification_state: Option<String>,
+    /// The token the operator publishes as a DNS TXT record to prove control of the
+    /// domain, present iff `rule_kind` is `domain`.
+    ///
+    /// PUBLIC by design and stored in the clear: its whole purpose is to be published in
+    /// public DNS, so there is nothing here to digest. It is unguessable so that a third
+    /// party cannot pre-publish a record for a domain they do not control, not because
+    /// its disclosure matters.
+    pub domain_verification_token: Option<String>,
     /// The evaluation priority.
     pub priority: i32,
     /// Whether the rule is active.
@@ -28358,6 +28369,7 @@ const ORG_CONNECTION_READ_COLUMNS: &str = "id, organization_id, connector_id, ov
 /// The columns a routing-rule read projects (issue #77).
 const ROUTING_RULE_READ_COLUMNS: &str = "id, rule_kind, domain_norm, client_id, user_bidx, \
      org_connection_id, priority, enabled, \
+     domain_verification_state, domain_verification_token, \
      (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us, \
      (EXTRACT(EPOCH FROM updated_at) * 1000000)::bigint AS updated_us";
 
@@ -28393,6 +28405,8 @@ fn routing_rule_record_from_row(
     let id = RoutingRuleId::parse_in_scope(&id_text, &scope).map_err(|_| StoreError::NotFound)?;
     Ok(RoutingRuleRecord {
         id,
+        domain_verification_state: row.try_get("domain_verification_state")?,
+        domain_verification_token: row.try_get("domain_verification_token")?,
         rule_kind: row.get("rule_kind"),
         domain_norm: row.get("domain_norm"),
         client_id: row.get("client_id"),
@@ -29042,6 +29056,9 @@ impl ActingRoutingRuleRepo<'_> {
         if id.scope() != self.scope || params.org_connection_id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
+        // Minted BEFORE the transaction for the same reason the selector is resolved
+        // there: the value must be knowable without the write having happened.
+        let verification_token = mint_domain_verification_token(env);
         // Resolve the selector to its (rule_kind, domain_norm, client_id, user_bidx)
         // columns BEFORE the transaction, so a shapeless selector fails cleanly.
         let (rule_kind, domain_norm, client_id_sel, user_bidx): (
@@ -29087,9 +29104,11 @@ impl ActingRoutingRuleRepo<'_> {
                     "INSERT INTO routing_rules \
                      (id, tenant_id, environment_id, rule_kind, domain_norm, client_id, \
                       user_bidx, org_connection_id, priority, enabled, \
-                      domain_verification_state, created_at, updated_at) \
+                      domain_verification_state, domain_verification_token, \
+                      created_at, updated_at) \
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
                              CASE WHEN $4 = 'domain' THEN 'pending' ELSE NULL END, \
+                             CASE WHEN $4 = 'domain' THEN $12 ELSE NULL END, \
                              TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval, \
                              TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval)",
                 )
@@ -29104,6 +29123,7 @@ impl ActingRoutingRuleRepo<'_> {
                 .bind(priority)
                 .bind(enabled)
                 .bind(created_at_micros)
+                .bind(&verification_token)
                 .execute(&mut **tx)
                 .await;
                 match result {
@@ -33445,6 +33465,26 @@ pub fn mint_invitation_token_for(env: &Env, id: InvitationId) -> MintedInvitatio
     );
     let digest = invitation_token_digest(&token);
     MintedInvitationToken { token, digest, id }
+}
+
+/// Mint the token an operator publishes as a DNS TXT record to prove control of a
+/// domain (issue #96, migration 0117).
+///
+/// PUBLIC by design: stored in the clear and returned by the management surface, because
+/// publishing it in DNS is the entire mechanism. It carries 256 bits of entropy so a
+/// third party cannot pre-publish a record for a domain they do not control, which is the
+/// only property that matters; its disclosure is not a concern.
+///
+/// Migration 0117 gave `routing_rules` this column and nothing filled it, so a domain
+/// rule sat in `pending` with no token to publish and could never leave that state.
+#[must_use]
+pub fn mint_domain_verification_token(env: &Env) -> String {
+    let mut bytes = [0_u8; 32];
+    env.entropy().fill_bytes(&mut bytes);
+    format!(
+        "ironauth-domain-verification={}",
+        URL_SAFE_NO_PAD.encode(bytes)
+    )
 }
 
 /// A user invitation as the management surface reports it (issue #60). It NEVER
