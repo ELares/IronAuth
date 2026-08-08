@@ -806,3 +806,78 @@ async fn each_domain_rule_gets_its_own_token() {
          other"
     );
 }
+
+/// Disabling a CONNECTION stops its domain routing, so logins fall back (issue #96).
+///
+/// The rule's `enabled` flag and the connection's are different switches, and only the
+/// rule's was consulted. Disabling a connection is how an operator turns an upstream off;
+/// it has to mean users at that verified domain go back to the organization's other
+/// methods. Before this, the rule kept matching and routed them into a connection
+/// somebody had deliberately switched off, which locks them out rather than falling back.
+#[tokio::test]
+async fn disabling_the_connection_stops_its_domain_routing() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let ocn = seed_binding(&db, &env, scope).await;
+    let control = db.control_store();
+
+    let rule = RoutingRuleId::generate(&env, &scope);
+    control
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .routing_rules()
+        .create(
+            &env,
+            &rule,
+            1_000_000,
+            NewRoutingRule {
+                selector: RoutingSelector::Domain(ROUTED_DOMAIN),
+                org_connection_id: &ocn,
+                priority: 10,
+                enabled: true,
+            },
+        )
+        .await
+        .expect("create the domain rule");
+    control
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .routing_rules()
+        .record_domain_verification(&env, &rule, true)
+        .await
+        .expect("verify the domain");
+
+    // The control: while the connection is enabled the domain routes.
+    let routed = control
+        .scoped(scope)
+        .routing_rules()
+        .by_domain(ROUTED_DOMAIN)
+        .await
+        .expect("read");
+    assert!(
+        routed.is_some(),
+        "a verified domain on an ENABLED connection must route, or the assertion below \
+         passes for the wrong reason"
+    );
+
+    // Disable the connection the way an operator would: the column, nothing else.
+    sqlx::query("UPDATE org_connections SET enabled = false WHERE id = $1")
+        .bind(ocn.to_string())
+        .execute(db.owner_pool())
+        .await
+        .expect("disable the connection");
+
+    let routed = control
+        .scoped(scope)
+        .routing_rules()
+        .by_domain(ROUTED_DOMAIN)
+        .await
+        .expect("read");
+    assert!(
+        routed.is_none(),
+        "a DISABLED connection must stop its domain routing so the login falls back to \
+         the organization's other methods; routing into a connection an operator turned \
+         off locks those users out instead. Got {routed:?}"
+    );
+}

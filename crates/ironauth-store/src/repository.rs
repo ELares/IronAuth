@@ -28694,13 +28694,30 @@ impl RoutingRuleRepo<'_> {
         // brokered to an upstream the claimant does not own and the user sees a normal sign
         // in. Enforcing it in the query means an unverified claim is not merely ignored, it
         // is unreachable.
+        //
+        // The CONNECTION must be enabled too (issue #96, criterion 6), and that is a
+        // different flag from the rule's. Disabling a connection is how an operator turns
+        // an upstream off, and it has to mean logins at that domain FALL BACK to the
+        // organization's other methods. Without this conjunct the rule kept matching and
+        // routed users at a verified domain into a connection somebody had deliberately
+        // switched off, which is an availability defect rather than a policy one: the
+        // operator's intent was "stop using this", not "lock these users out".
+        //
+        // Enforced in the query rather than downstream because a caller that resolves a
+        // rule has already decided to federate; handing it a disabled target and asking
+        // it to notice is the shape that produced this bug.
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(&format!(
             "SELECT {ROUTING_RULE_READ_COLUMNS} FROM routing_rules \
              WHERE tenant_id = $1 AND environment_id = $2 \
              AND rule_kind = 'domain' AND enabled \
              AND domain_verification_state = 'verified' \
-             AND domain_norm = $3"
+             AND domain_norm = $3 \
+             AND EXISTS (SELECT 1 FROM org_connections c \
+                         WHERE c.id = routing_rules.org_connection_id \
+                           AND c.tenant_id = routing_rules.tenant_id \
+                           AND c.environment_id = routing_rules.environment_id \
+                           AND c.enabled)"
         ))
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
